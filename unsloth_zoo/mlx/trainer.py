@@ -65,6 +65,13 @@ from .utils import (
     normalize_vlm_processor_chat_template,
     collect_mlx_texts,
     save_lora_adapters,
+    save_trainable_adapters,
+    save_optimizer_state,
+    load_optimizer_state,
+    save_trainer_state,
+    load_trainer_state,
+    collect_mlx_lora_adapter_tensors,
+    iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -119,11 +126,9 @@ class MLXTrainingConfig:
     optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.001
     max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf).
-    # None (default) keeps the cheap MLX default of 1.0 unless the user
-    # passes max_grad_norm > 0, in which case global-norm clipping wins.
-    # 0.0 disables. A positive float opts in explicitly and overrides
-    # max_grad_norm with a warning.
+    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf). None
+    # defaults to 1.0 unless max_grad_norm > 0 (global-norm wins); 0.0
+    # disables; a positive float opts in and overrides max_grad_norm.
     max_grad_value: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
@@ -212,11 +217,9 @@ class MLXTrainer:
             )
             self.args.packing = False
 
-        # Safety: freeze non-LoRA parameters if LoRA layers are detected.
-        # mlx-lm calls model.freeze() BEFORE linear_to_lora_layers(), but users
-        # might forget. Without this, LayerNorm weights remain trainable and
-        # adaptive optimizers (Adafactor, AdamW) produce NaN on the first step
-        # because their 1D second-moment initialization is numerically unstable.
+        # Freeze non-LoRA params when LoRA is detected. Otherwise LayerNorm
+        # weights stay trainable and adaptive optimizers NaN on step 1 (their
+        # 1D second-moment init is numerically unstable).
         self._ensure_lora_frozen(model)
 
         # Training state
@@ -262,34 +265,33 @@ class MLXTrainer:
 
     @staticmethod
     def _ensure_lora_frozen(model):
-        """Freeze accidentally trainable norm parameters when LoRA is active.
+        """Freeze accidentally trainable norm params when LoRA is active.
 
-        Without this, LayerNorm/RMSNorm weights remain trainable, and
-        adaptive optimizers produce NaN on 1D tensors at initialization
-        (the second-moment estimate starts at 0, causing division by ~eps).
-
-        Only freezes norm parameters — does NOT touch projector, vision, or
-        other intentionally trainable non-LoRA parameters.
+        LayerNorm/RMSNorm weights left trainable make adaptive optimizers NaN
+        on 1D tensors at init (second-moment starts at 0 -> divide by ~eps).
+        Only norms are frozen; projector/vision/other intentional non-LoRA
+        params are left alone.
         """
         trainable = dict(tree_flatten(model.trainable_parameters()))
-        has_lora = any("lora" in k for k in trainable)
+        if not trainable:
+            return  # nothing trainable; stub models may lack model.parameters().
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        has_lora = any(name in trainable for name in adapter_tensors)
         if not has_lora:
             return  # Not a LoRA model — don't touch
 
-        # Only freeze params that look like accidentally unfrozen norms.
-        # Projector weights, vision tower weights, etc. are intentionally
-        # trainable when train_projector/train_vision is used.
+        # Only freeze accidentally-unfrozen norms; leave components the user
+        # explicitly unfroze (train_projector, train_vision) alone.
         _NORM_FRAGMENTS = (".norm.", "norm.weight", "norm.bias",
                            ".ln_", "ln_f.weight", "ln_f.bias")
-        # Don't freeze norms inside components the user explicitly unfroze
-        # (projector via train_projector, vision tower via train_vision).
         _INTENTIONAL_COMPONENTS = (
             "multi_modal_projector", "mm_projector", "connector", "aligner",
             "vision_tower", "vision_model", "vision_encoder",
         )
+        adapter_keys = set(adapter_tensors)
         suspect = [
             k for k in trainable
-            if "lora" not in k
+            if k not in adapter_keys
             and any(frag in k for frag in _NORM_FRAGMENTS)
             and not any(comp in k for comp in _INTENTIONAL_COMPONENTS)
         ]
@@ -359,12 +361,7 @@ class MLXTrainer:
         optimizer.learning_rate = self._schedule_value(schedule, step)
 
     def _build_optimizer(self, total_steps):
-        """Create MLX optimizer with LR schedule from config.
-
-        For optimizers that support weight_decay, wraps with
-        optim.decay_weight to exclude bias and norm parameters
-        (matching HuggingFace Trainer behavior).
-        """
+        """Create MLX optimizer with LR schedule from config."""
         schedule = self._build_schedule(total_steps)
         initial_lr = self._schedule_value(schedule, 0)
         self._lr_schedule = schedule if callable(schedule) else None
@@ -393,8 +390,8 @@ class MLXTrainer:
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
-            # to False, which makes early warmup updates much larger.
+            # Match HF/PyTorch AdamW: MLX defaults bias_correction to False,
+            # which makes early warmup updates much larger.
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
                 weight_decay=wd,
@@ -416,12 +413,11 @@ class MLXTrainer:
 
     @staticmethod
     def _adafactor_unsupported_parameters(model):
-        """Return trainable params that MLX Adafactor cannot update safely.
+        """Return trainable params MLX Adafactor cannot update safely.
 
-        MLX Adafactor currently treats every tensor with ndim >= 2 as factored
-        and reconstructs the update with a matrix multiply. That is correct for
-        2-D matrices, but rank-3/rank-4 tensors from vision patch embeddings,
-        convolutions, and some projectors fail or broadcast incorrectly.
+        It treats ndim >= 2 as factored and reconstructs via matmul (correct
+        for 2-D), but rank-3/4 tensors from vision patch embeddings, convs, and
+        some projectors fail or broadcast incorrectly.
         """
         unsupported = []
         try:
@@ -436,11 +432,7 @@ class MLXTrainer:
         return unsupported
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
-        """Run evaluation loop.
-
-        Returns:
-            (avg_loss, perplexity) tuple.
-        """
+        """Run evaluation loop; returns (avg_loss, perplexity)."""
         self.model.eval()
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
@@ -471,15 +463,10 @@ class MLXTrainer:
             return None
 
     def _configure_memory_limits(self):
-        """Apply conservative Metal memory limits so failed runs exit cleanly.
+        """Apply conservative Metal memory caps so failed runs exit cleanly.
 
-        MLX exposes hard Metal allocator caps. Using them is much safer than
-        letting a large multimodal compile/eval run pressure the whole machine
-        into paging or a kernel panic. The default is intentionally conservative:
-        cap MLX to ~85% of Apple's recommended working-set size unless the user
-        overrides or disables it.
-
-        Disable shortcuts:
+        Defaults to ~85% of Apple's recommended working-set size to avoid
+        paging/kernel-panic on large multimodal runs. Disable shortcuts:
           - args.disable_memory_limits=True  ─► skip every cap (memory, cache, wired)
           - args.memory_limit_gb <= 0        ─► skip memory_limit AND wired_limit
           - args.wired_limit_gb  <= 0        ─► skip wired_limit only
@@ -500,13 +487,11 @@ class MLXTrainer:
             return {}
 
         configured = {}
-        # why: prior values must be restored after training; otherwise the
-        # process-global cap leaks into later operations.
+        # Prior values are restored after training; the cap is process-global.
         self._prior_metal_limits = {}
 
         # memory_limit_gb: None → 85% of recommended; <= 0 → disable BOTH this
-        # and the wired cap (the wired default is min(recommended, memory_limit)
-        # so disabling memory should also drop wired unless explicitly set).
+        # and the wired cap (wired default is min(recommended, memory_limit)).
         memory_limit_gb = getattr(args, "memory_limit_gb", None)
         memory_disabled = memory_limit_gb is not None and memory_limit_gb <= 0
         if memory_limit_gb is None:
@@ -526,8 +511,8 @@ class MLXTrainer:
 
         wired_limit_gb = getattr(args, "wired_limit_gb", None)
         if wired_limit_gb is None:
-            # Inherit "disabled" from memory_limit when the user didn't set one
-            # explicitly, so memory_limit_gb=-1 disables wired too.
+            # Inherit "disabled" from memory_limit so memory_limit_gb=-1
+            # disables wired too.
             if memory_disabled:
                 wired_limit_gb = None
             else:
@@ -560,16 +545,11 @@ class MLXTrainer:
             pass
         self._prior_metal_limits = {}
 
-    def train(self):
-        """Run MLX-native training loop.
-
-        Follows mlx-lm's compiled step pattern with proper gradient accumulation:
-        one compiled function handles forward+backward, accumulates gradients across
-        micro-batches, and conditionally applies optimizer update.
-
-        Returns:
-            dict with training metrics (train_loss, train_runtime, etc.)
-        """
+    def train(self, resume_from_checkpoint: str | None = None):
+        """Run MLX-native training loop following mlx-lm's compiled-step pattern
+        with gradient accumulation. Returns a dict of training metrics."""
+        # Stash for _train_inner. None = fresh start, a path = resume.
+        self._resume_from_checkpoint = resume_from_checkpoint
         args = self.args
         model = self.model
         args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
@@ -630,10 +610,17 @@ class MLXTrainer:
         config = getattr(model, "_config", {})
         model_type = config.get("model_type", "") if isinstance(config, dict) else ""
         if "qwen3_5" in model_type:
-            from .loader import _fix_qwen35_attention_cache
+            from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
             _fix_qwen35_attention_cache(model)
-            from ..gated_delta_vjp import patch_gated_delta
+            _disable_fused_mrope(model)
+            from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
             patch_gated_delta()
+            patch_gated_delta_vlm()
+        # Qwen3-VL's language tower uses the same fused MRoPE kernel with no
+        # VJP; flip it off so training takes the differentiable fallback.
+        if "qwen3_vl" in model_type:
+            from .loader import _disable_fused_mrope
+            _disable_fused_mrope(model)
 
         try:
             return self._train_inner()
@@ -648,7 +635,7 @@ class MLXTrainer:
         model = self.model
         is_vlm = self._is_vlm
 
-        # Pick loss function — returns (loss, ntoks) tuples
+        # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
 
         if is_vlm:
@@ -702,6 +689,40 @@ class MLXTrainer:
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
 
+        # Resume from checkpoint: load adapter weights, optimizer state,
+        # and trainer state (step counter + loss history). Adapters were
+        # already loaded by the Studio worker into the model before train()
+        # was called, so we only handle optimizer and trainer state here.
+        # The step offset is applied below at loop start so the LR scheduler
+        # and dataloader fast-forward to the right position.
+        _resume_step = 0
+        _resume_from = getattr(self, "_resume_from_checkpoint", None)
+        if _resume_from:
+            try:
+                # 1. Load trained adapter weights into the model. The model
+                #    already has LoRA wrappers applied (Studio pipeline does
+                #    get_peft_model before training); strict=False ensures
+                #    only the LoRA params match and base weights are untouched.
+                model.load_weights(
+                    f"{_resume_from}/adapters.safetensors", strict=False,
+                )
+                # 2. Restore optimizer state (Adam moments m,v, step counter).
+                load_optimizer_state(optimizer, _resume_from)
+                # 3. Restore trainer scalars (step counter, loss history).
+                ts = load_trainer_state(_resume_from)
+                _resume_step = int(ts.get("global_step", 0))
+                self._train_loss_history = list(ts.get("train_loss_history", []))
+                print(
+                    f"Unsloth: Resuming from {_resume_from} "
+                    f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
+                )
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    f"Unsloth: resume_from_checkpoint={_resume_from!r} but "
+                    f"resume state files are missing ({e}). Refusing to "
+                    f"silently restart from step 0."
+                ) from e
+
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
@@ -723,17 +744,11 @@ class MLXTrainer:
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
 
-        # Build step functions following mlx-lm's pattern.
-        # Resolution rule:
-        #   * max_grad_value=None (default) -> cheap MLX elementwise clip
-        #     at 1.0, unless the user also passed max_grad_norm > 0 -- in
-        #     that case the user opted into global-norm clipping (HF/TRL
-        #     parity) and elementwise is disabled to avoid double-clip.
-        #   * max_grad_value explicit (float or 0.0) -> honor exactly;
-        #     if both modes are positive, elementwise wins (warn).
-        # max_grad_norm uses MLX's clip_grad_norm helper which materially
-        # increases peak memory on bf16 VLM runs, hence the elementwise
-        # default.
+        # Clip resolution: max_grad_value=None -> elementwise clip at 1.0
+        # unless max_grad_norm > 0 (then global-norm wins, HF/TRL parity);
+        # explicit max_grad_value is honored, and if both positive elementwise
+        # wins (warn). Elementwise is the default because MLX's clip_grad_norm
+        # materially increases peak memory on bf16 VLM runs.
         max_grad_norm = float(args.max_grad_norm or 0.0)
         _raw_mgv = getattr(args, "max_grad_value", None)  # TODO: expose MLX grad-clip in Studio UI for power users
         _user_set_mgv = _raw_mgv is not None
@@ -753,10 +768,8 @@ class MLXTrainer:
             max_grad_value = 1.0
         _clip_grad_value = max_grad_value > 0
         state = [model.state, optimizer.state, mx.random.state]
-        # The direct grad_accum==1 fast path delegates clipping to
-        # mlx.optimizers.clip_grad_norm(). That helper is exact, but on current
-        # MLX it can materially increase peak memory on real bf16 VLM runs.
-        # Keep the shortcut only for unclipped updates.
+        # grad_accum==1 fast path: only for unclipped updates, since
+        # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
             grad_accum == 1 and
             not _needs_grad_scaling and
@@ -764,18 +777,25 @@ class MLXTrainer:
         )
 
         def _grad_leaf_scale(name, safe_toks_f, clip_scale=None, dtype=None):
-            """Return the exact scalar applied to one grad leaf before update.
+            """Return the scalar applied to one grad leaf before update.
 
-            Pass ``dtype`` (the leaf grad's dtype) to keep the final
-            ``value * scale`` in the leaf's native dtype — otherwise an fp32
-            scale promotes a bf16/fp16 grad tree to fp32, which then forces
-            optimizer.update to promote params/m/v to fp32 too.
+            Pass ``dtype`` (the leaf grad's dtype) so an fp32 scale doesn't
+            promote a bf16/fp16 grad tree to fp32 (which would force
+            optimizer.update to promote params/m/v too).
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            if use_lora_plus and "lora_b" in name:
+            # Suffix-anchor so lora_b_router.weight doesn't pick up the LoRA+ mult.
+            if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
                 scale = scale * lora_plus_ratio
-            if use_embedding_lr and ("embed_tokens" in name or "lm_head" in name):
-                scale = scale * embedding_lr_ratio
+            # Segment-anchor so not_lm_head_router.weight doesn't pick up embed LR.
+            if use_embedding_lr:
+                _segments = name.split(".")
+                _is_embed_or_lm_head = (
+                    "embed_tokens" in _segments
+                    or "lm_head" in _segments
+                )
+                if _is_embed_or_lm_head:
+                    scale = scale * embedding_lr_ratio
             if clip_scale is not None:
                 scale = scale * clip_scale
             if dtype is not None and scale.dtype != dtype:
@@ -823,18 +843,16 @@ class MLXTrainer:
             return grad_norm
 
         def _can_report_optimizer_state_norm():
-            # For Adam-family optimizers, recover ||g|| from the second moment
-            # after the update: v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2.
-            # This avoids adding a second consumer to the lazy backward graph.
+            # Adam-family: recover ||g|| from the second moment after update
+            # (v_t = beta2*v_{t-1} + (1-beta2)*g_t^2), avoiding a second
+            # consumer on the lazy backward graph.
             return getattr(optimizer, "betas", None)
 
         def _apply_update(grad, toks_f):
-            """Common gradient post-processing and optimizer update.
-
-            Scale accumulated gradients by supervised-token count, then apply
-            the selected clipping mode. Global norm clipping uses MLX's helper
-            and reports that norm. Non-global modes report after update from
-            Adam's optimizer state so the backward graph stays single-consumer.
+            """Scale accumulated grads by supervised-token count, apply the
+            selected clipping mode, and update. Global-norm clipping reports
+            its norm; non-global modes report after update from Adam state to
+            keep the backward graph single-consumer.
             """
             safe_toks_f = mx.maximum(
                 toks_f, mx.array(1.0, dtype=mx.float32)
@@ -862,23 +880,17 @@ class MLXTrainer:
             return grad_norm
 
         def _apply_update_direct(grad):
-            """Fast exact path for the common ``grad_accum == 1`` case.
+            """Fast exact path for ``grad_accum == 1`` with no per-leaf scaling.
 
-            When gradients are updated immediately and there is no additional
-            per-leaf scaling (LoRA+ / embedding LR), the older
-            ``grad * ntoks`` then ``/ ntoks`` round-trip only serves to
-            promote the whole tree into ``float32`` before clipping. That
-            significantly increases peak memory on large bf16/fp16 runs while
-            leaving the mathematical update unchanged.
-
-            In this case the raw gradients already represent the final
-            per-token average, so we can clip/update the original tree directly.
+            The raw grads already are the per-token average, so skip the
+            ``*ntoks`` then ``/ntoks`` round-trip (which only promotes the tree
+            to float32 and spikes peak memory) and clip/update directly.
             """
             grad_norm = None
             if max_grad_norm > 0:
                 grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
-                # Elementwise clip per leaf — free memory (no cross-leaf reduction).
+                # Elementwise clip per leaf — no cross-leaf reduction.
                 grad = tree_map(
                     lambda g: mx.clip(g, -max_grad_value, max_grad_value),
                     grad,
@@ -886,9 +898,7 @@ class MLXTrainer:
             optimizer.update(model, grad)
             return grad_norm
 
-        # Unified step function for both VLM and text training.
-        # VLM: batch_data is a dict → loss_and_grad_fn(model, batch_dict)
-        # Text: batch_data is a tuple → loss_and_grad_fn(model, batch, lengths, labels)
+        # Unified step for VLM (dict batch) and text (tuple batch) training.
         def step_fn(batch_data, prev_state, do_update):
             if isinstance(batch_data, dict):
                 (lvalue, toks), grad = loss_and_grad_fn(model, batch_data)
@@ -902,15 +912,12 @@ class MLXTrainer:
             toks_f = toks.astype(mx.float32)
             grad_norm = mx.array(0.0, dtype=mx.float32)
 
-            # Scale-and-accumulate in a single tree_map per micro-batch, casting
-            # the scalar to each leaf's dtype so bf16/fp16 grad trees stay in
-            # their native dtype (avoids fp32 promotion that 3xs grad memory
-            # and forces optimizer.update to promote params/m/v to fp32).
+            # Scale-and-accumulate per micro-batch, casting the scalar to each
+            # leaf's dtype so bf16/fp16 grad trees avoid fp32 promotion.
             if prev_state is not None:
                 prev_grad, prev_toks = prev_state
-                # Accumulated gradients are optimizer state, not something to
-                # differentiate through on the next compiled micro-batch. This
-                # keeps custom VJP losses such as CCE from retaining/corrupting
+                # stop_gradient: accumulated grads are state, not something to
+                # differentiate through; keeps CCE-style VJPs from corrupting
                 # the carried bf16 accumulation graph.
                 prev_grad = tree_map(mx.stop_gradient, prev_grad)
                 prev_toks = mx.stop_gradient(prev_toks)
@@ -1063,9 +1070,27 @@ class MLXTrainer:
         trained_tokens = 0
         train_time = 0
         grad_accum_state = None
-        batch_idx = 0
+        # When resuming, start batch_idx at the resume position so
+        # batches[batch_idx % len(batches)] lands on the same batch the
+        # original run would have seen next.
+        batch_idx = _resume_step * grad_accum
 
-        for it in range(1, total_steps * grad_accum + 1):
+        # Streaming mode: fast-forward the iterator to the resume position.
+        # The seed is the same and create_batches/iterate_*_batches is
+        # deterministic, so consuming N batches gives us the same data
+        # ordering the killed run would have produced.
+        if _resume_step > 0 and batch_iter is not None:
+            for _ in range(_resume_step * grad_accum):
+                try:
+                    next(batch_iter)
+                except StopIteration:
+                    raise RuntimeError(
+                        f"Unsloth: streaming dataset exhausted while "
+                        f"fast-forwarding to resume step {_resume_step}. "
+                        f"Dataset may be shorter than the killed run consumed."
+                    ) from None
+
+        for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
             if self.stop_requested:
                 print("Unsloth: Stop requested — ending training early.")
                 break
@@ -1235,8 +1260,27 @@ class MLXTrainer:
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                save_lora_adapters(model, ckpt_dir)
-                print(f"  Saved checkpoint to {ckpt_dir}")
+                try:
+                    save_trainable_adapters(model, ckpt_dir)
+                except ValueError as e:
+                    print(f"  Unsloth: skipped checkpoint ({e})")
+                else:
+                    # Also write optimizer + trainer state so resume_from_checkpoint
+                    # can restore Adam moments, step counter, and loss history.
+                    # Adapter save was successful -- treat the extra writes as
+                    # best-effort: log on failure but don't undo the adapter save.
+                    try:
+                        save_optimizer_state(optimizer, ckpt_dir)
+                        save_trainer_state(
+                            {
+                                "global_step": current_step,
+                                "train_loss_history": list(self._train_loss_history),
+                            },
+                            ckpt_dir,
+                        )
+                    except Exception as e:
+                        print(f"  Unsloth: checkpoint saved without resume state ({e})")
+                    print(f"  Saved checkpoint to {ckpt_dir}")
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
@@ -1380,46 +1424,53 @@ class MLXTrainer:
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
-        from .utils import save_merged_model
+        from .utils import (
+            _coerce_mlx_lora_scale,
+            _get_mlx_dropout_probability,
+            _infer_mlx_lora_rank,
+            save_merged_model,
+        )
         output_dir = output_dir or self.args.output_dir
 
-        trainable = dict(tree_flatten(self.model.trainable_parameters()))
-        has_lora = any("lora" in k for k in trainable)
+        # Detect LoRA from module structure so reloaded/frozen adapters
+        # still take the adapter-save path.
+        adapter_tensors = collect_mlx_lora_adapter_tensors(self.model)
+        has_lora = bool(adapter_tensors)
 
         if has_lora:
             hf_repo = getattr(self.model, "_hf_repo", None) or ""
 
 
-            _lora_rank, _lora_scale, _lora_dropout = 8, 1.0, 0.0
-            for _, m in self.model.named_modules():
-                if hasattr(m, "lora_a"):
-                    _lora_rank = m.lora_a.shape[-1]
-                    _lora_scale = getattr(m, "scale", 1.0)
-
-                    _drop = getattr(m, "dropout", None)
-                    _lora_dropout = getattr(_drop, "p", 0.0) if _drop else 0.0
-                    break
-
+            # Infer rank/scale/dropout from the first reloadable module; leave
+            # None on failure rather than persisting mis-scaling placeholders
+            # (_enrich_mlx_adapter_config gets a second shot).
+            _lora_rank = _lora_scale = _lora_dropout = None
+            for _, m in iter_mlx_lora_modules(self.model):
+                inferred_rank = _infer_mlx_lora_rank(m)
+                if inferred_rank is None:
+                    continue
+                _lora_rank = inferred_rank
+                # _coerce handles LoRASwitchLinear's per-expert mx.array where
+                # raw float()/.item() raise.
+                _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
+                _lora_dropout = _get_mlx_dropout_probability(
+                    getattr(m, "dropout", None)
+                )
+                break
 
             from .utils import _get_transformer_layers
             layers = _get_transformer_layers(self.model)
-            _num_layers = len(layers) if layers else -1
+            # mlx-lm.load_adapters() attr-accesses config.num_layers, so the
+            # key MUST be present; -1 is the legacy "all layers" sentinel.
+            try:
+                _num_layers = len(layers) if layers is not None else -1
+            except TypeError:
+                _num_layers = -1
+            if _num_layers <= 0:
+                _num_layers = -1
 
-            # Save in mlx-lm's expected format so load_adapters() works
-            self.model.save_lora_adapters(output_dir, adapter_config={
-                # mlx-lm format (load_adapters expects these)
-                "num_layers": _num_layers,
-                "lora_parameters": {
-                    "rank": _lora_rank,
-                    "scale": _lora_scale,
-                    "dropout": _lora_dropout,
-                },
+            adapter_config = {
                 "fine_tune_type": "lora",
-                # mlx-vlm format (expects rank/scale at top level)
-                "rank": _lora_rank,
-                "scale": _lora_scale,
-                "dropout": _lora_dropout,
-                # Shared fields
                 "peft_type": "LORA",
                 "base_model_name_or_path": hf_repo,
                 "learning_rate": self.args.learning_rate,
@@ -1435,9 +1486,51 @@ class MLXTrainer:
                 "base_quantized_source": getattr(
                     self.model, "_unsloth_quantized_source", None,
                 ),
-            })
-            # why: VLM processors include the inner tokenizer; double-save
-            # rewrites the same files. Skip when the processor will cover it.
+            }
+            # Always emit num_layers for mlx-lm.load_adapters() attr-access.
+            adapter_config["num_layers"] = _num_layers
+            if _lora_rank is not None:
+                adapter_config["lora_parameters"] = {
+                    "rank": _lora_rank,
+                    "scale": _lora_scale,
+                    "dropout": _lora_dropout,
+                }
+                # mlx-vlm reads top-level rank/scale/dropout instead.
+                adapter_config["rank"] = _lora_rank
+                adapter_config["scale"] = _lora_scale
+                adapter_config["dropout"] = _lora_dropout
+
+            # Keep intentionally-trained non-LoRA tensors OUTSIDE any LoRA
+            # module; drop wrapped base weights INSIDE one (else q_proj.weight
+            # under a LoRA-wrapped q_proj re-leaks the Studio reload bug). Uses
+            # the shared filter to match save_trainable_adapters / _merged.
+            trainable = dict(tree_flatten(self.model.trainable_parameters()))
+            adapter_keys = set(adapter_tensors)
+            lora_module_prefixes = tuple(
+                f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
+                if name
+            )
+            from .utils import _is_base_tensor_inside_lora_module
+            has_root_lora_module = any(
+                name == "" for name, _ in iter_mlx_lora_modules(self.model)
+            )
+            has_non_lora_trainable = any(
+                key not in adapter_keys
+                and not _is_base_tensor_inside_lora_module(
+                    key, lora_module_prefixes, has_root_lora_module,
+                )
+                for key in trainable
+            )
+            if has_non_lora_trainable:
+                save_trainable_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
+                )
+            else:
+                save_lora_adapters(
+                    self.model, output_dir, adapter_config=adapter_config,
+                )
+            # VLM processors include the inner tokenizer; skip the separate
+            # tokenizer save when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
             _processor_saves_tokenizer = (
                 _processor is not None and hasattr(_processor, "save_pretrained")
@@ -1469,14 +1562,10 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             model_name=None, model_type=None):
     """Create padded batches with label masks for train_on_responses_only.
 
-    Tokenizes each dataset item, applies the masking closure to get labels,
-    sorts by length, and produces right-padded 3-tuple batches.
-
-    Returns:
-        List of (batch, lengths, labels) tuples where:
-        - batch: mx.array (BS, padded_len) — input_ids padded with 0
-        - lengths: mx.array (BS, 2) — [1, actual_len - 1] per sequence
-        - labels: mx.array (BS, padded_len) — labels padded with -100
+    Tokenizes, masks, sorts by length, and right-pads into 3-tuples:
+    - batch: mx.array (BS, padded_len) — input_ids padded with 0
+    - lengths: mx.array (BS, 2) — [1, actual_len - 1] per sequence
+    - labels: mx.array (BS, padded_len) — labels padded with -100
     """
     eos_id = tokenizer.eos_token_id
     tokenizer = normalize_mlx_chat_template(
@@ -1507,8 +1596,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             if text:
                 all_texts.append(text)
 
-    # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe;
-    #    slow tokenizers degrade gracefully via the GIL)
+    # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe).
     def _process_text(text):
         encoded = tokenizer.encode(text)
         if eos_id is not None and (not encoded or encoded[-1] != eos_id):
@@ -1547,8 +1635,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if not batch_items:
             continue
         max_len = max(len(ids) for ids, _ in batch_items)
-        # Match mlx-lm iterate_batches: +1 gives the autoregressive
-        # shift headroom so post-shift length is a clean _PAD_MULTIPLE.
+        # +1 (like mlx-lm iterate_batches) gives autoregressive shift headroom
+        # so post-shift length is a clean _PAD_MULTIPLE.
         padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
         padded_len = min(padded_len, max_seq_length)
 
@@ -1585,10 +1673,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
 
 def _check_all_masked(batches, max_check=100):
-    """Safety check: raise if all labels in the first N batches are -100.
-
-    Mirrors fix_zero_training_loss from the HF path.
-    """
+    """Raise if all labels in the first N batches are -100 (mirrors
+    fix_zero_training_loss from the HF path)."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -1628,11 +1714,7 @@ def _check_all_masked(batches, max_check=100):
 
 
 def _check_vlm_all_masked(batches, max_check=100):
-    """Safety check for VLM batches: raise if all labels are -100.
-
-    Same purpose as _check_all_masked but for VLM batch dicts
-    (which have a "labels" key instead of a 3-tuple structure).
-    """
+    """_check_all_masked for VLM batch dicts (a "labels" key, not a 3-tuple)."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -1685,24 +1767,21 @@ def train_on_responses_only(
 ):
     """Mask instruction tokens from loss — train only on assistant responses.
 
-    Call after MLXTrainer(...), before trainer.train(). Works for both
-    text and VLM models. Mirrors the HF/unsloth API.
+    Call after MLXTrainer(...), before trainer.train(). Works for text and
+    VLM models; mirrors the HF/unsloth API.
 
     Args:
-        trainer: MLXTrainer instance (can be None when return_function=True
-            and tokenizer is provided).
-        instruction_part: String marking start of user/instruction turns
-            (e.g. "<|start_header_id|>user<|end_header_id|>\\n\\n").
-        response_part: String marking start of assistant/response turns
-            (e.g. "<|start_header_id|>assistant<|end_header_id|>\\n\\n").
-        force_match: Match newlines as well (forwarded to HF implementation).
-        tokenizer: Optional tokenizer override. If None, uses trainer.tokenizer.
-        return_function: If True, return the masking closure without touching
-            the trainer.
-        num_proc: Accepted for API compatibility with the HF path, unused on MLX.
+        trainer: MLXTrainer (may be None when return_function=True and a
+            tokenizer is given).
+        instruction_part: String marking the start of user/instruction turns.
+        response_part: String marking the start of assistant/response turns.
+        force_match: Match newlines too (forwarded to the HF implementation).
+        tokenizer: Optional override; defaults to trainer.tokenizer.
+        return_function: If True, return the masking closure only.
+        num_proc: Accepted for HF API compat, unused on MLX.
 
     Returns:
-        The trainer (for chaining), or the masking closure if return_function=True.
+        The trainer (for chaining), or the closure if return_function=True.
     """
     from ..dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
@@ -1718,9 +1797,8 @@ def train_on_responses_only(
             "kwarg or via trainer.tokenizer."
         )
 
-    # Unwrap to get a callable HF tokenizer.
-    # mlx-lm: TokenizerWrapper._tokenizer -> HF tokenizer
-    # VLM processors: processor.tokenizer -> HF tokenizer
+    # Unwrap to a callable HF tokenizer (mlx-lm TokenizerWrapper._tokenizer,
+    # or VLM processor.tokenizer).
     if hasattr(_tokenizer, "_tokenizer"):
         _tokenizer = _tokenizer._tokenizer
     elif hasattr(_tokenizer, "tokenizer"):

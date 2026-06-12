@@ -27,16 +27,21 @@ import mlx.nn as nn
 import mlx.utils
 import copy
 import inspect
+import importlib
 import json
 import numpy as np
 import os
 import sys
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 
 from .cce import _get_runtime_cce
+
+
+_LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
 
 
 def _safe_token_denominator(ntoks):
@@ -46,8 +51,7 @@ def _safe_token_denominator(ntoks):
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 
-    VLMs: model.language_model.model.layers
-    Text: model.layers or model.model.layers
+    VLMs: model.language_model.model.layers; text: model.(model.)layers.
     """
     m = getattr(model, 'language_model', model)
     m = getattr(m, 'model', m)
@@ -82,7 +86,7 @@ def _get_vision_encoder_layers(model):
 
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
-        return  # already applied
+        return  # already patched
     layer_cls._orig_call = layer_cls.__call__
     fn = layer_cls.__call__
 
@@ -105,11 +109,10 @@ def _unpatch_layer_class_gc(layer_cls):
 def apply_gradient_checkpointing(model):
     """Apply gradient checkpointing to language and vision tower layers.
 
-    Patches each layer class's ``__call__`` with ``mx.checkpoint`` so MLX
-    recomputes the layer's forward during backward instead of storing
-    activations. Trades ~30% extra compute for substantial memory savings —
-    critical for VLMs where vision tower backward at native image
-    resolution can otherwise materialize tens of GB of activation tape.
+    Patches each layer class's ``__call__`` with ``mx.checkpoint`` to recompute
+    the forward during backward instead of storing activations. Trades ~30%
+    extra compute for large memory savings — critical for VLM vision towers at
+    native resolution, which can otherwise materialize tens of GB.
     """
     lm_layers = _get_transformer_layers(model)
     if lm_layers is not None and len(lm_layers) > 0:
@@ -133,10 +136,8 @@ def remove_gradient_checkpointing(model):
 def _get_text_model(model):
     """Get the inner text model, unwrapping multimodal wrappers if present.
 
-    Standard models (Llama, Qwen): model itself is the text model.
-    Multimodal wrappers (Gemma 4): model.language_model is the text model.
-
-    Returns the text model that has .model (backbone) and optionally .lm_head.
+    Standard models (Llama, Qwen) are themselves the text model; multimodal
+    wrappers (Gemma 4) expose it at model.language_model.
     """
     if hasattr(model, "language_model"):
         return model.language_model
@@ -218,12 +219,9 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
 def _get_lm_head_layer(model):
     """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
 
-    Checks for a separate lm_head first (untied models like Qwen), then
-    falls back to embed_tokens (tied models like Gemma/Llama).
-    Handles multimodal wrappers (e.g. Gemma 4) via _get_text_model.
-
-    Returns the layer object (not its weight), so callers can access
-    .weight, .scales, .biases, .group_size, .bits for quantized layers.
+    Prefers a separate lm_head (untied models like Qwen), else falls back to
+    embed_tokens (tied models like Gemma/Llama). Returns the layer object (not
+    its weight) so callers can read .weight/.scales/.biases/.group_size/.bits.
     """
     tm = _get_text_model(model)
     if hasattr(tm, "lm_head") and tm.lm_head is not None:
@@ -249,35 +247,51 @@ def _get_logit_softcap(model):
 
 
 def _is_lm_head_trainable(model):
-    """Check if the LM head weight is trainable (not frozen by LoRA).
+    """Whether the LM head weight is trainable (not frozen by LoRA).
 
-    For LoRA training, the LM head weight is frozen — computing its gradient
-    in CCE is a wasted V x chunk_size x H matmul per chunk. Returns False
-    when the weight should be wrapped with mx.stop_gradient.
+    When frozen, its CCE gradient is a wasted V x chunk_size x H matmul per
+    chunk, so callers wrap the weight with mx.stop_gradient (returns False).
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    # Module-anchored so unrelated trainables containing the substring
+    # "lora" are not treated as adapter state.
+    adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
+    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped lm_head (would
+    # defeat the CCE memory guard) while keeping intentional trainables
+    # like `lm_head.bias`. Shares the filter with save_trainable_adapters.
+    _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
+    lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
+    has_root_lora_module = any(name == "" for name in _lora_module_names)
     for key in trainable:
-        if 'lora' not in key:
-            if 'lm_head' in key or 'embed_tokens.weight' in key:
-                return True
-    return len(trainable) == 0  # no LoRA = full fine-tuning = trainable
+        if key in adapter_keys:
+            continue
+        if _is_base_tensor_inside_lora_module(
+            key, lora_module_prefixes, has_root_lora_module,
+        ):
+            continue
+        # Segment-match (not substring) so e.g.
+        # `decoder.not_lm_head_router.weight` is not classified as lm_head.
+        segments = key.split(".")
+        is_lm_head_param = "lm_head" in segments
+        is_embed_tokens_weight = (
+            len(segments) >= 2
+            and segments[-2] == "embed_tokens"
+            and segments[-1] == "weight"
+        )
+        if is_lm_head_param or is_embed_tokens_weight:
+            return True
+    return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
 def make_cce_loss_fn(model):
-    """Create a CCE loss function using the bundled chunked cross-entropy engine.
+    """Create a chunked cross-entropy (CCE) loss function.
 
-    CCE computes cross-entropy directly from hidden states and the LM head weight,
-    avoiding full logit materialization. This saves significant memory for large
-    vocabularies.
+    CCE computes loss directly from hidden states and the LM head weight,
+    avoiding full logit materialization (big memory savings for large vocabs).
 
-    Args:
-        model: MLX model.
-
-    Returns:
-        A function (model, batch, lengths, labels=None) -> (loss, ntoks).
-        When labels is provided, uses labels[:,1:] for targets with
-        (targets != -100) as the loss mask.
-        The function has a ``_unsloth_cce_backend`` attribute for logging.
+    Returns a function (model, batch, lengths, labels=None) -> (loss, ntoks).
+    With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
+    The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
     softcap = _get_logit_softcap(model)
     if softcap > 0:
@@ -314,12 +328,11 @@ def make_cce_loss_fn(model):
         return backbone.embed_tokens
 
     if use_quantized:
-        # Backstop: the quantized CCE backward returns mx.zeros for the
-        # weight gradient (dequant→grad→requant is not implemented). That's
-        # fine when the LM head is frozen (LoRA on a quantized base — the
-        # gradient flows through grad_hidden into the LoRA adapters), but
-        # full fine-tuning would silently skip the LM head update. The
-        # loader rejects this combination earlier; this is a safety net.
+        # Backstop: quantized CCE backward zeros the weight gradient
+        # (dequant->grad->requant unimplemented). Fine when the LM head is
+        # frozen (LoRA on a quantized base flows grad through grad_hidden), but
+        # full fine-tuning would silently skip the LM head update. The loader
+        # rejects this earlier; this is a safety net.
         if getattr(model, "_unsloth_full_finetuning", False):
             raise ValueError(
                 "Unsloth: full_finetuning=True with a quantized LM head is "
@@ -354,14 +367,18 @@ def make_cce_loss_fn(model):
             bi = layer.biases if _has_biases else mx.zeros_like(layer.scales)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Widen unsigned dtypes so mx.where can inject the signed -100
+            # (mx.where on uint crashes the torch-backed shim).
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -387,14 +404,17 @@ def make_cce_loss_fn(model):
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+            # Same widen-to-int64 rationale as the quantized branch above.
+            targets = _normalize_cce_label_dtype(targets)
             if labels is None:
                 mask = length_mask
             else:
                 mask = mx.logical_and(targets != -100, length_mask)
-            masked_targets = mx.where(mask, targets, -100)
+            ignore = mx.array(-100, dtype=targets.dtype)
+            masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -404,16 +424,12 @@ def make_cce_loss_fn(model):
 
 
 def make_baseline_loss_fn():
-    """Create a standard cross-entropy loss function.
+    """Create a standard cross-entropy loss function (full logits via LM head).
 
-    Uses the full logit computation through the LM head, then applies
-    nn.losses.cross_entropy. Used when use_cce=False.
-
-    Returns:
-        A function (model, batch, lengths, labels=None) -> (loss, ntoks).
-        When labels is provided, uses labels[:,1:] for targets with
-        (targets != -100) as the loss mask. The labels=None branch is
-        byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
+    Used when use_cce=False. Returns a function
+    (model, batch, lengths, labels=None) -> (loss, ntoks). With labels, uses
+    labels[:,1:] and (targets != -100) as mask. The labels=None branch is
+    byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
@@ -429,14 +445,18 @@ def make_baseline_loss_fn():
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
-        targets = labels[:, 1:]
+        # Widen unsigned dtypes so mx.where(..., -100, ...) and the
+        # `targets != -100` compare both see signed int64.
+        targets = _normalize_cce_label_dtype(labels[:, 1:])
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
         mask = mx.logical_and(targets != -100, length_mask).astype(mx.float32)
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -450,7 +470,7 @@ def make_baseline_loss_fn():
 # ---------------------------------------------------------------------------
 
 # Image/vision special tokens that should never contribute to loss.
-# Mirrors unsloth's IMAGE_TOKENS list from vision_utils.py.
+# Mirrors unsloth's IMAGE_TOKENS list in vision_utils.py.
 _IMAGE_TOKEN_STRINGS = (
     "<|image|>",           # Llama 3.2 Vision, Phi 3.5, Gemma4
     "<|vision_start|>",    # Qwen
@@ -481,7 +501,7 @@ def _get_image_token_ids(model):
         try:
             tok_ids = tokenizer.convert_tokens_to_ids([tok_str])
             if tok_ids and tok_ids[0] is not None:
-                # Some tokenizers return the unk_token_id for unknown tokens
+                # Some tokenizers return unk_token_id for unknown tokens
                 unk_id = getattr(tokenizer, "unk_token_id", None)
                 if tok_ids[0] != unk_id:
                     ids.append(tok_ids[0])
@@ -500,41 +520,73 @@ def _get_image_token_ids(model):
     return ids  # plain Python list; avoids mx.eval in the hot path
 
 
+def _normalize_cce_label_dtype(labels):
+    """Widen unsigned label dtypes to int64 so masking can inject -100.
+
+    uint8/16/32 fit losslessly in int64. uint64 values in (2**63, 2**64)
+    wrap negative on cast and are routed to a positive out-of-vocab
+    sentinel (1<<62) so runtime CCE's validity check NaN-poisons those
+    rows instead of letting an overflowed uint64 like 2**64-100 collide
+    with ignore_index=-100. Signed/float dtypes pass through unchanged.
+    """
+    if labels is None:
+        return labels
+    dtype = getattr(labels, "dtype", None)
+    if dtype is None:
+        return labels
+    uint64_dtype = getattr(mx, "uint64", None)
+    if uint64_dtype is not None and dtype == uint64_dtype:
+        # Cast to signed int64 first; direct uint64 comparisons crash the
+        # torch-backed shim ("gt_cpu" / "where_cpu" not implemented).
+        # `labels_i64 < 0` then catches every uint64 >= 2**63 (including
+        # 2**64-100 which would otherwise collide with -100).
+        labels_i64 = labels.astype(mx.int64)
+        invalid_sentinel = mx.array((1 << 62), dtype=mx.int64)
+        return mx.where(labels_i64 < 0, invalid_sentinel, labels_i64)
+    unsigned_dtypes = tuple(
+        d for d in (
+            getattr(mx, "uint8", None),
+            getattr(mx, "uint16", None),
+            getattr(mx, "uint32", None),
+        )
+        if d is not None
+    )
+    if dtype in unsigned_dtypes:
+        return labels.astype(mx.int64)
+    return labels
+
+
 def _mask_image_tokens(targets, image_token_ids):
     """Set image token positions in targets to -100 (ignore_index).
 
-    Prevents the model from training to predict image placeholder tokens,
-    which are fixed special tokens that provide no useful gradient signal.
-
-    Args:
-        targets: mx.array of token IDs.
-        image_token_ids: plain Python list of int token IDs, or None.
+    Image placeholder tokens are fixed specials with no useful gradient signal.
+    image_token_ids is a plain Python list of ints, or None.
     """
     if not image_token_ids:
         return targets
-    # Build a mask: True where target is any image token
+    targets = _normalize_cce_label_dtype(targets)
     is_image = targets == image_token_ids[0]
     for tok_id in image_token_ids[1:]:
         is_image = is_image | (targets == tok_id)
-    return mx.where(is_image, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(is_image, ignore, targets)
 
 
 def _mask_prompt_tokens(targets, assistant_token_id):
-    """Mask all tokens before the first assistant response in each sequence.
+    """Mask tokens before the first assistant response (train_on_completions_only).
 
-    Scans each row of targets for assistant_token_id. All positions before
-    the first occurrence are set to -100 (ignore_index). If the token is
-    not found, the entire sequence is left unmasked (assumes all completion).
-
-    This implements train_on_completions_only for VLM training.
+    Per row, positions before the first assistant_token_id become -100. If the
+    token is absent, the row is left unmasked (assumed all completion).
     """
     if assistant_token_id <= 0:
         return targets
+    targets = _normalize_cce_label_dtype(targets)
     is_assistant = (targets == assistant_token_id)
     cumulative = mx.cumsum(is_assistant.astype(mx.int32), axis=1)
     has_assistant = mx.any(is_assistant, axis=1, keepdims=True)
     prompt_mask = mx.logical_and(has_assistant, cumulative == 0)
-    return mx.where(prompt_mask, -100, targets)
+    ignore = mx.array(-100, dtype=targets.dtype)
+    return mx.where(prompt_mask, ignore, targets)
 
 
 def _is_vlm_model(model) -> bool:
@@ -605,9 +657,13 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
 
         # Forward pass — let the model create its own causal mask.
         # Pass extra keys (e.g. image_grid_thw for Qwen) that some models need.
+        # Strip the private raw-input-ids carrier so the backbone never sees it.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
-            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+            if k not in (
+                "input_ids", "pixel_values", "attention_mask", "labels",
+                _RAW_INPUT_IDS_FOR_LABELS,
+            )
             and v is not None
         }
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
@@ -616,16 +672,19 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
         logits = logits.astype(mx.float32)
 
         if labels is not None:
-            # train_on_responses_only: labels encode instruction/padding masking.
-            # Still mask image placeholder tokens.
-            targets = labels[:, 1:]
+            # labels encode instruction/padding masking; still mask image tokens
+            targets = _normalize_cce_label_dtype(labels[:, 1:])
             targets = _mask_image_tokens(targets, _image_token_ids)
             logits, targets = _align_logits_with_labels(logits, targets)
             mask = (targets != -100).astype(mx.float32)
         else:
-            targets = input_ids[:, 1:]
+            # Prefer the raw (pre-narrow) input_ids so wide invalid ids
+            # (e.g. np.uint32(2**32-100)) reach runtime CCE as out-of-vocab
+            # sentinels instead of wrapping to -100 via the int32 narrow.
+            target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+            targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
-            # Handle sequence length mismatch from vision token injection
+            # Vision token injection can change seq length
             logits, targets = _align_logits_with_labels(logits, targets)
 
             # Build mask from attention_mask (shifted to match targets)
@@ -635,15 +694,20 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
             else:
                 length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-            # Mask image placeholder tokens and prompt tokens
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
-            # Update length_mask to exclude masked positions
-            mask = mx.where(targets == -100, 0, length_mask)
+            # Exclude masked positions from length_mask
+            mask = mx.where(
+                targets == -100,
+                mx.array(0, dtype=length_mask.dtype),
+                length_mask,
+            )
 
-        # Replace -100 with 0 before CE — MLX has no ignore_index;
+        # Replace -100 with 0 before CE, MLX has no ignore_index;
         # the mask already zeros out these positions in the loss.
-        safe_targets = mx.where(targets == -100, 0, targets)
+        safe_targets = mx.where(
+            targets == -100, mx.array(0, dtype=targets.dtype), targets,
+        )
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -656,7 +720,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0):
 def _unpack_embed_result(embed_result, model):
     """Unpack get_input_embeddings result into embeds + backbone kwargs.
 
-    Handles both plain mx.array returns and InputEmbeddingsFeatures dataclass
+    Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
     (gemma4 per_layer_inputs, qwen3-vl position_ids/deepstack, etc.).
     """
     backbone_kwargs = {}
@@ -689,11 +753,10 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: get_input_embeddings stashes position_ids on the
-    # language model wrapper; the inner backbone needs them explicitly.
-    # When no position_ids were stashed (e.g. text-only samples or simple
-    # images without grid_thw), generate sequential ones so the backbone
-    # doesn't crash accessing cache.offset with cache=None.
+    # Qwen-VL: get_input_embeddings stashes position_ids on the language model
+    # wrapper; the inner backbone needs them explicitly. When none were stashed
+    # (text-only or simple images without grid_thw), generate sequential ones
+    # so the backbone doesn't crash on cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None:
         _MISSING = object()
@@ -760,9 +823,13 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         fwd_attn_mask = attention_mask[:, :-1]
 
     # Collect extra keys (e.g. image_grid_thw for Qwen) that some models need.
+    # Strip the private raw-input-ids carrier so the embedder/backbone never sees it.
     extra_kwargs = {
         k: v for k, v in batch_dict.items()
-        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        if k not in (
+            "input_ids", "pixel_values", "attention_mask", "labels",
+            _RAW_INPUT_IDS_FOR_LABELS,
+        )
         and v is not None
     }
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
@@ -785,27 +852,27 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     )
 
     if labels is not None:
-        # train_on_responses_only: labels already encode instruction and
-        # padding masking. Still need to mask image placeholder tokens
-        # since they provide no useful gradient signal.
+        # labels already encode instruction/padding masking; still mask image tokens
         targets = labels[:, 1:]
         masked_targets = _mask_image_tokens(targets, image_token_ids)
         ntoks = (masked_targets != -100).sum()
     else:
-        targets = input_ids[:, 1:]
+        # Prefer the raw (pre-narrow) input_ids so wide invalid ids
+        # (e.g. np.uint32(2**32-100)) reach runtime CCE as out-of-vocab
+        # sentinels instead of wrapping to -100 via the int32 narrow.
+        target_source = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, input_ids)
+        targets = _normalize_cce_label_dtype(target_source[:, 1:])
 
         if attention_mask is not None:
             length_mask = attention_mask[:, 1:][:, :targets.shape[1]]
         else:
             length_mask = mx.ones_like(targets, dtype=mx.float32)
 
-        masked_targets = mx.where(length_mask, targets, -100)
+        ignore = mx.array(-100, dtype=targets.dtype)
+        masked_targets = mx.where(length_mask, targets, ignore)
 
-        # Mask image placeholder tokens — they're fixed special tokens that
-        # provide no useful gradient signal.
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
-
-        # Completion-only masking: mask prompt tokens before first assistant response
+        # Completion-only: mask prompt before first assistant response
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
@@ -881,6 +948,28 @@ def _normalize_int_tuple(values):
     return tuple(int(x) for x in values)
 
 
+def _normalize_numpy_cce_labels(labels):
+    """numpy-side analogue of `_normalize_cce_label_dtype` for VLM expand paths.
+
+    np.uint64 values above 2**63-1 would OverflowError when packed into the
+    int64 buffer used by `_expand_image_token_sequences` / `_expand_token_runs`;
+    route them to a positive 1<<62 sentinel (so an overflowed 2**64-100 cannot
+    silently masquerade as ignore_index=-100) and downcast other unsigned
+    dtypes to int64.
+    """
+    labels_np = np.asarray(labels)
+    if labels_np.dtype == np.uint64:
+        overflow_mask = labels_np > np.uint64((1 << 63) - 1)
+        return np.where(
+            overflow_mask,
+            np.int64(1 << 62),
+            labels_np.astype(np.int64),
+        )
+    if np.issubdtype(labels_np.dtype, np.unsignedinteger):
+        return labels_np.astype(np.int64)
+    return labels_np
+
+
 def _expand_image_token_sequences(
     input_ids,
     attention_mask,
@@ -894,7 +983,7 @@ def _expand_image_token_sequences(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -924,8 +1013,10 @@ def _expand_image_token_sequences(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive without OverflowError before the
+    # runtime CCE validity check; CCE owns dtype narrowing post-validate.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -952,7 +1043,7 @@ def _expand_token_runs(
         if attention_mask is not None
         else np.ones_like(input_ids_np, dtype=np.int32)
     )
-    labels_np = np.asarray(labels) if labels is not None else None
+    labels_np = _normalize_numpy_cce_labels(labels) if labels is not None else None
 
     expanded_ids = []
     expanded_masks = []
@@ -996,8 +1087,9 @@ def _expand_token_runs(
 
     padded_ids = np.zeros((len(expanded_ids), max_len), dtype=np.int32)
     padded_masks = np.zeros((len(expanded_masks), max_len), dtype=np.int32)
+    # int64 so wide invalid labels survive expansion without OverflowError.
     padded_labels = (
-        np.full((len(expanded_labels), max_len), -100, dtype=np.int32)
+        np.full((len(expanded_labels), max_len), -100, dtype=np.int64)
         if expanded_labels is not None else None
     )
     for row_idx, (row_ids, row_mask) in enumerate(zip(expanded_ids, expanded_masks)):
@@ -1326,15 +1418,24 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
             _labels = batch_dict.get("labels")
+            _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+            # Labels absent: expand the raw pre-narrow carrier so labels-free
+            # paths still see wide invalid ids for NaN-poisoning. Labels
+            # present: pop the now-stale carrier so a pre-expansion copy
+            # cannot break _apply_response_mask_to_vlm_batch with a shape mismatch.
+            _label_source = _labels if _labels is not None else _raw_labels
             _expanded = _expand_image_token_sequences(
                 input_ids=input_ids,
                 attention_mask=batch_dict.get("attention_mask"),
                 image_token_id=int(_config_get(config, "image_token_index")),
                 repeat_count=int(_config_get(config, "num_image_tokens")),
-                labels=_labels,
+                labels=_label_source,
             )
             if _labels is not None:
                 batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+            elif _raw_labels is not None:
+                batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
             else:
                 batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1367,14 +1468,21 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                         image_idx += 1
                     replacements.append(tuple(batch_replacements))
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1439,14 +1547,21 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                 replacements.append(tuple(batch_replacements))
             if replacements:
                 _labels = batch_dict.get("labels")
+                _raw_labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS)
+                # See multi_modality branch above for why we expand the raw
+                # carrier when labels are absent and pop it when labels exist.
+                _label_source = _labels if _labels is not None else _raw_labels
                 _expanded = _expand_token_runs(
                     input_ids=input_ids,
                     attention_mask=batch_dict.get("attention_mask"),
                     replacements_by_batch=tuple(replacements),
-                    labels=_labels,
+                    labels=_label_source,
                 )
                 if _labels is not None:
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict["labels"] = _expanded
+                    batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+                elif _raw_labels is not None:
+                    batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
@@ -1456,22 +1571,13 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
 def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     """Create a CCE loss function for VLMs.
 
-    Uses model.get_input_embeddings() to get merged vision+text embeddings,
-    then runs through the language model backbone to get hidden states before
-    the LM head, and applies CCE.
+    Uses model.get_input_embeddings() for merged vision+text embeddings, runs
+    the backbone to pre-lm_head hidden states, and applies CCE. Falls back to
+    baseline loss when get_input_embeddings is unavailable.
 
-    Falls back to baseline loss if get_input_embeddings is not available.
-
-    Args:
-        model: VLM model.
-        assistant_token_id: Token ID marking start of assistant responses.
-            When > 0, all tokens before the first occurrence are masked
-            from the loss (completion-only training).
-
-    Returns:
-        A function (model, batch_dict) -> (loss, ntoks).
+    assistant_token_id > 0 enables completion-only training (mask tokens before
+    the first occurrence). Returns a function (model, batch_dict) -> (loss, ntoks).
     """
-    # Check if the model supports get_input_embeddings
     if not hasattr(model, "get_input_embeddings"):
         import warnings
         warnings.warn(
@@ -1494,8 +1600,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
-    # Evaluate once — trainability doesn't change during training.
-    # Must be called after LoRA setup.
+    # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
     _image_token_ids = _get_image_token_ids(model)
@@ -1506,9 +1611,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
         print(f"Unsloth: Completion-only training (assistant_token_id={_assistant_token_id}).")
 
     if use_quantized:
-        # Backstop: same as the text CCE path — full FT against a quantized
-        # LM head silently skips the LM head update. Reject loudly here in
-        # case the loader-level check is bypassed.
+        # Backstop (as in the text CCE path): full FT against a quantized LM
+        # head silently skips the LM head update. Reject loudly here in case
+        # the loader-level check is bypassed.
         if getattr(model, "_unsloth_full_finetuning", False):
             raise ValueError(
                 "Unsloth: full_finetuning=True with a quantized VLM LM head "
@@ -1542,7 +1647,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -1563,7 +1668,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
-            targets_flat = masked_targets.reshape((-1,)).astype(mx.int32)
+            targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -1573,16 +1678,15 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0):
 
 
 def _get_vlm_image_size(config, processor):
-    """Get target image size for uniform resizing, matching GPU collator.
+    """Get target image size for uniform resizing, matching the GPU collator.
 
-    Tries vision_config.image_size (dict OR dataclass), then
+    Tries vision_config.image_size (dict or dataclass), then
     processor.image_processor.size, falls back to 512.
 
-    Note: Qwen2.5-VL's processor.image_processor.size has
-    {'shortest_edge': 3136, 'longest_edge': 12845056} — those are
-    *area pixel counts* (min_pixels / max_pixels), not dimensions.
-    Reading them as "height" produces a 3136x3136 upsample → 50k patches
-    per image → OOM. Skip area-style ``size`` dicts.
+    Note: Qwen2.5-VL's image_processor.size holds *area pixel counts*
+    (shortest_edge/longest_edge = min/max pixels), not dimensions. Reading
+    them as height would 3136x3136-upsample -> 50k patches -> OOM, so skip
+    area-style ``size`` dicts.
     """
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
@@ -2142,6 +2246,12 @@ def _format_vlm_images_for_processor(all_images):
     return all_images
 
 
+# Private key used to pass raw (pre-int32-narrowing) input_ids through
+# the VLM batch dict to labels-free / response-mask paths. Stripped from
+# model forward kwargs so the backbone never sees it.
+_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
+
+
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
@@ -2161,11 +2271,22 @@ def _to_mx_vlm_batch(inputs):
             batch[key] = value
 
     if "input_ids" in batch:
+        # Preserve raw input_ids under a private key BEFORE the int32 narrow
+        # so labels-free / response-mask paths can derive labels from the
+        # original processor output (wide invalid ids like uint32(2**32-100)
+        # would otherwise wrap to -100 and be treated as ignore_index).
+        if "labels" not in batch:
+            batch[_RAW_INPUT_IDS_FOR_LABELS] = _normalize_cce_label_dtype(
+                batch["input_ids"]
+            )
         batch["input_ids"] = batch["input_ids"].astype(mx.int32)
     if "attention_mask" in batch:
         batch["attention_mask"] = batch["attention_mask"].astype(mx.int32)
+    # Do NOT narrow labels to int32: runtime CCE validates the original
+    # dtype before its own narrow. Unsigned dtypes still need widening to
+    # int64 so the masking helpers can mx.where the signed -100 sentinel.
     if "labels" in batch:
-        batch["labels"] = batch["labels"].astype(mx.int32)
+        batch["labels"] = _normalize_cce_label_dtype(batch["labels"])
 
     return batch
 
@@ -2219,9 +2340,22 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
     prompt_inputs = _processor_vlm_inputs(
         processor, prompt_texts, all_images, max_seq_length
     )
+
+    # Build labels BEFORE _to_mx_vlm_batch narrows to int32 so wide invalid
+    # ids (e.g. uint32 wrap) reach the runtime CCE validity check intact.
+    # A direct int64 cast of uint64 would wrap 2**64-100 onto -100; saturate
+    # those rows to a positive out-of-vocab sentinel instead.
+    _raw_input_ids = np.asarray(combined_inputs["input_ids"])
+    if _raw_input_ids.dtype == np.uint64:
+        labels_np = np.where(
+            _raw_input_ids > np.uint64((1 << 63) - 1),
+            np.int64(1 << 62),
+            _raw_input_ids.astype(np.int64),
+        ).copy()
+    else:
+        labels_np = _raw_input_ids.astype(np.int64, copy=True)
     batch = _to_mx_vlm_batch(combined_inputs)
 
-    labels_np = np.array(batch["input_ids"].tolist(), dtype=np.int32)
     prompt_batch = _to_mx_vlm_batch(prompt_inputs)
     prompt_mask = prompt_batch.get("attention_mask")
     prompt_ids = prompt_batch["input_ids"]
@@ -2233,19 +2367,21 @@ def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image
         labels_np[row, :prompt_len] = -100
     labels = mx.array(labels_np)
     if "attention_mask" in batch:
-        labels = mx.where(batch["attention_mask"] == 0, mx.array(-100), labels)
-    batch["labels"] = labels.astype(mx.int32)
+        labels = mx.where(
+            batch["attention_mask"] == 0,
+            mx.array(-100, dtype=labels.dtype),
+            labels,
+        )
+    batch["labels"] = labels
     return batch
 
 
 def _collate_vlm_batch(items, processor, max_seq_length, image_size, formatting_func=None):
     """Collate a batch of VLM samples using the processor directly.
 
-    Mirrors Unsloth's GPU UnslothVisionDataCollator:
-    1. Extract images from messages or top-level keys
-    2. Resize to uniform size
-    3. apply_chat_template for text
-    4. Single processor() call handles tokenization + image processing + padding
+    Mirrors Unsloth's GPU UnslothVisionDataCollator: extract images, resize
+    to uniform size, apply_chat_template, then one processor() call for
+    tokenization + image processing + padding.
     """
     normalize_vlm_processor_chat_template(processor, strict=False)
     formatted_items = []
@@ -2300,17 +2436,25 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn):
     dataset_utils.train_on_responses_only, and stores the result as
     an mx.array in batch_dict["labels"].
     """
-    input_ids = batch_dict["input_ids"]
-    ids_list = input_ids.tolist()
+    # Prefer the raw (pre-int32-narrowing) input_ids so the masking closure
+    # sees original processor ids; wide invalid ids like uint32(2**32-100)
+    # would otherwise have already wrapped to -100 in batch_dict["input_ids"].
+    raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
+    ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
     result = mask_fn({"input_ids": ids_list})
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
+    # Route unsigned label dtypes through both normalizers so mx.where with
+    # -100 does not crash on uint* under the shim and wide invalid ids reach
+    # runtime CCE as sentinels instead of wrapping to -100.
+    labels_np = _normalize_numpy_cce_labels(labels_list)
+    labels_array = _normalize_cce_label_dtype(mx.array(labels_np))
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
-        labels_array = mx.where(attention_mask == 0, mx.array(-100), mx.array(labels_list))
-    else:
-        labels_array = mx.array(labels_list)
+        ignore = mx.array(-100, dtype=labels_array.dtype)
+        labels_array = mx.where(attention_mask == 0, ignore, labels_array)
     batch_dict["labels"] = labels_array
     return batch_dict
 
@@ -2541,27 +2685,248 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         yield batch, lengths_info, None
 
 
-def save_lora_adapters(model, path, adapter_config=None):
-    """Save LoRA adapter weights to disk.
-
-    Args:
-        model: MLX model with LoRA layers.
-        path: Directory to save adapters.
-        adapter_config: Optional dict with LoRA config metadata.
-    """
+def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
+    # Refuse to write adapter_config.json without adapters.safetensors next
+    # to it; mlx-lm reload chokes on the missing weights file.
+    if not tensors:
+        raise ValueError(
+            "Unsloth: _save_adapter_artifacts() requires non-empty "
+            "tensors; use save_lora_adapters() or "
+            "save_trainable_adapters() at the public entry point."
+        )
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    # Collect only trainable (LoRA) parameters — flatten nested dict for safetensors
-    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-
-    if trainable:
-        mx.save_safetensors(str(path / "adapters.safetensors"), trainable)
+    mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
 
     adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
-        with open(path / "adapter_config.json", "w") as f:
+        with open(path / "adapter_config.json", "w", encoding="utf-8") as f:
             json.dump(adapter_config, f, indent=2)
+
+
+def _extract_mlx_lora_parameters(model):
+    """Extract global rank, scale, and dropout from the model's first LoRA module."""
+    rank, scale, dropout = 8, 1.0, 0.0
+    for _, m in iter_mlx_lora_modules(model):
+        a_tensor = m.lora_a
+        a_shape = tuple(getattr(a_tensor, "shape", ()))
+        # Switch LoRA layouts vary across mlx-lm versions; lora_b's last axis is
+        # always `rank`, so prefer it when num_experts is declared. Plain
+        # LoRALinear uses (in_dims, rank) where rank is shape[-1].
+        b_tensor = getattr(m, "lora_b", None)
+        b_shape = tuple(getattr(b_tensor, "shape", ())) if b_tensor is not None else ()
+        if hasattr(m, "num_experts") and len(b_shape) >= 3:
+            rank = int(b_shape[-1])
+        elif len(a_shape) >= 3:
+            rank = int(a_shape[-2])
+        elif len(a_shape) >= 2:
+            rank = int(a_shape[-1])
+        scale = getattr(m, "scale", 1.0)
+
+        drop = getattr(m, "dropout", None)
+        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
+        if drop is None:
+            dropout = 0.0
+        else:
+            keep = getattr(drop, "_p_1", None)
+            if keep is not None:
+                try:
+                    dropout = float(1.0 - float(keep))
+                except (TypeError, ValueError):
+                    dropout = 0.0
+            else:
+                p = getattr(drop, "p", None)
+                try:
+                    dropout = float(p) if p is not None else 0.0
+                except (TypeError, ValueError):
+                    dropout = 0.0
+        break
+    return rank, scale, dropout
+
+
+def iter_mlx_lora_modules(model):
+    """Yield (module_name, module) for each module that owns a complete LoRA pair.
+
+    mlx-lm reload only recreates lowercase lora_a / lora_b wrappers, so we
+    skip uppercase or half-built modules that cannot be reloaded.
+    """
+    for module_name, module in model.named_modules():
+        if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
+            yield module_name, module
+
+
+def collect_mlx_lora_adapter_tensors(model):
+    """Collect tensors for every module exposing a complete LoRA attr pair.
+
+    Anchors on the modules themselves so substring-`lora_` paths (e.g.
+    ``router.lora_gate.weight``) are not exported, and so callers can
+    still detect LoRA after reload/freeze when trainable_parameters()
+    no longer lists adapter tensors.
+    """
+    parameters = dict(mlx.utils.tree_flatten(model.parameters()))
+    adapter_keys = set()
+    for module_name, module in iter_mlx_lora_modules(model):
+        prefix = f"{module_name}." if module_name else ""
+        adapter_keys.add(f"{prefix}lora_a")
+        adapter_keys.add(f"{prefix}lora_b")
+        # Include DoRA magnitude `m`, gated on the DoRA class name so a
+        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
+        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+            adapter_keys.add(f"{prefix}m")
+    return {name: value for name, value in parameters.items() if name in adapter_keys}
+
+
+# Wrapped base / quantization tensor suffixes (LoRALinear, DoRALinear,
+# LoRAEmbedding) that are reload-leaked state we must drop from adapter
+# saves. `.linear.bias` and `.bias` are intentionally NOT here: those are
+# legitimate trainable user state.
+_LORA_WRAPPED_BASE_SUFFIXES = (
+    ".weight",
+    ".scales",
+    ".biases",
+    ".linear.weight",
+    ".linear.scales",
+    ".linear.biases",
+    ".embedding.weight",
+    ".embedding.scales",
+    ".embedding.biases",
+)
+
+# Same wrapped-base set for the rare root-level LoRA wrapper case where
+# the empty module prefix means we cannot match by suffix alone.
+_ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
+    "weight", "scales", "biases",
+    "linear.weight", "linear.scales", "linear.biases",
+    "embedding.weight", "embedding.scales", "embedding.biases",
+})
+
+
+def _is_base_tensor_inside_lora_module(
+    key, lora_module_prefixes, has_root_lora_module=False,
+):
+    """True when `key` looks like the wrapped base tensor of a LoRA module.
+
+    Prefix-match against LoRA module names + suffix whitelist of base /
+    quantization tensor names. `has_root_lora_module` separately covers
+    a root-level wrapper where the empty-name prefix is intentionally
+    omitted from `lora_module_prefixes` to avoid matching every key.
+    """
+    matches_prefix = lora_module_prefixes and any(
+        key.startswith(p) for p in lora_module_prefixes
+    )
+    if matches_prefix:
+        return key.endswith(_LORA_WRAPPED_BASE_SUFFIXES)
+    if has_root_lora_module:
+        return key in _ROOT_LORA_WRAPPED_BASE_KEYS
+    return False
+
+
+def save_trainable_adapters(model, path, adapter_config=None):
+    """Save the current trainable parameter tree for training checkpoints.
+
+    Includes all LoRA adapter tensors (frozen or not). Excludes wrapped
+    base weights INSIDE a LoRA module (reload-leaked state that would
+    reintroduce the original Studio adapter-export bloat).
+    """
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+    _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
+    lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
+    has_root_lora_module = any(name == "" for name in _lora_module_names)
+
+    tensors = dict(adapter_tensors)
+    for key, value in trainable.items():
+        if key in adapter_tensors:
+            continue
+        if _is_base_tensor_inside_lora_module(
+            key, lora_module_prefixes, has_root_lora_module,
+        ):
+            continue
+        tensors[key] = value
+
+    if not tensors:
+        raise ValueError(
+            "Unsloth: save_trainable_adapters() found no trainable or LoRA "
+            "parameters to save. The model may be fully frozen without LoRA."
+        )
+    _save_adapter_artifacts(model, path, tensors, adapter_config=adapter_config)
+
+
+def save_optimizer_state(optimizer, path):
+    """Save MLX optimizer state (Adam/AdamW m,v moments, step, learning_rate)
+    to ``<path>/optimizer_state.safetensors`` so training can resume from a
+    checkpoint with identical optimizer dynamics.
+
+    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``.
+    ``tree_flatten`` produces dotted-name string keys (e.g.
+    ``"layers.0.lora_a.weight.m"``), all values are arrays, so the whole tree
+    serializes cleanly with ``mx.save_safetensors``. Round-trip preserves
+    bytes exactly for the optimizer's ``.state`` dict.
+    """
+    import os
+    os.makedirs(path, exist_ok=True)
+    flat = dict(mlx.utils.tree_flatten(optimizer.state))
+    mx.save_safetensors(f"{path}/optimizer_state.safetensors", flat)
+
+
+def load_optimizer_state(optimizer, path):
+    """Inverse of save_optimizer_state. Loads
+    ``<path>/optimizer_state.safetensors`` and replaces ``optimizer.state``
+    with the unflattened tree.
+
+    Raises FileNotFoundError if the file is missing -- a resume request with
+    no optimizer state is a hard error, not silent fall-back, because resuming
+    with a fresh optimizer would silently restart Adam's moment estimates.
+    """
+    state_path = f"{path}/optimizer_state.safetensors"
+    flat = mx.load(state_path)
+    optimizer.state = mlx.utils.tree_unflatten(list(flat.items()))
+
+
+def save_trainer_state(trainer_state, path):
+    """Save trainer scalar state to ``<path>/trainer_state.json``.
+
+    ``trainer_state`` is a plain dict (JSON-serializable). Currently:
+      - ``global_step``: int, the step the checkpoint represents
+      - ``train_loss_history``: list[float], for UI continuity
+    Kept separate from the safetensors blob because these are scalars/lists,
+    not tensors, and JSON is easier to inspect.
+    """
+    import json
+    import os
+    os.makedirs(path, exist_ok=True)
+    with open(f"{path}/trainer_state.json", "w") as f:
+        json.dump(trainer_state, f, indent=2)
+
+
+def load_trainer_state(path):
+    """Inverse of save_trainer_state. Returns the dict, or raises
+    FileNotFoundError if not present (resume requires it)."""
+    import json
+    with open(f"{path}/trainer_state.json", "r") as f:
+        return json.load(f)
+
+
+def save_lora_adapters(model, path, adapter_config=None):
+    """Save LoRA adapter weights (lora_a / lora_b only) to disk.
+
+    Args:
+        model: MLX model with LoRA-wrapped modules.
+        path: Directory to save adapters.
+        adapter_config: Optional dict with LoRA config metadata.
+    """
+    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+    if not adapter_tensors:
+        raise ValueError(
+            "Unsloth: no MLX LoRA adapter tensors were found to save. "
+            "The model may have no LoRA layers, or adapters may have been "
+            "merged. Use save_trainable_adapters() to checkpoint non-LoRA "
+            "trainable state instead."
+        )
+    _save_adapter_artifacts(
+        model, path, adapter_tensors, adapter_config=adapter_config
+    )
 
 
 def _infer_snapshot_commit(path):
@@ -2664,6 +3029,122 @@ def _get_mlx_config_quantization(model):
     return config.get("quantization") or config.get("quantization_config")
 
 
+def _get_mlx_dropout_probability(drop):
+    if drop is None:
+        return 0.0
+    # MLX nn.Dropout stores keep-prob as _p_1; shims may also set a stale .p,
+    # so _p_1 wins when numeric and we fall back to .p otherwise.
+    p1 = getattr(drop, "_p_1", None)
+    if p1 is not None:
+        try:
+            return float(1.0 - float(p1))
+        except (TypeError, ValueError):
+            pass
+    p = getattr(drop, "p", None)
+    if p is not None:
+        try:
+            return float(p)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _coerce_mlx_lora_scale(scale, default=1.0):
+    """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
+
+    LoRASwitchLinear stores per-expert mx.array scales; raw float()/.item()
+    raise. Read the first broadcast value (= alpha/r for every expert) so
+    we don't silently lose the trained alpha/r by defaulting to 1.0.
+    """
+    if scale is None:
+        return float(default)
+
+    try:
+        return float(scale)
+    except Exception:
+        pass
+
+    if hasattr(scale, "item"):
+        try:
+            return float(scale.item())
+        except Exception:
+            pass
+
+    # LoRASwitchLinear per-expert mx.array: first broadcast value = alpha/r.
+    try:
+        flat = scale.reshape((-1,))
+        first = flat[0]
+        if hasattr(first, "item"):
+            return float(first.item())
+        return float(first)
+    except Exception:
+        return float(default)
+
+
+def _infer_mlx_lora_rank(module):
+    lora_a = getattr(module, "lora_a", None)
+    lora_b = getattr(module, "lora_b", None)
+
+    # mlx-lm sometimes wraps tensors in nn.Linear layers; unwrap to .weight.
+    is_layer = False
+    if lora_a is not None and not hasattr(lora_a, "shape") and hasattr(lora_a, "weight"):
+        lora_a = lora_a.weight
+        is_layer = True
+    if lora_b is not None and not hasattr(lora_b, "shape") and hasattr(lora_b, "weight"):
+        lora_b = lora_b.weight
+        is_layer = True
+
+    lora_a_shape = tuple(lora_a.shape) if lora_a is not None and hasattr(lora_a, "shape") else ()
+    lora_b_shape = tuple(lora_b.shape) if lora_b is not None and hasattr(lora_b, "shape") else ()
+    # Both halves required; a half-built module is not a reliable rank source.
+    if not lora_a_shape or not lora_b_shape:
+        return None
+
+    # MoE/switch: lora_a (..., rank, in_dims); lora_b (..., out_dims, rank).
+    if len(lora_a_shape) >= 3:
+        if len(lora_b_shape) != len(lora_a_shape):
+            return None
+        rank = lora_a_shape[-2]
+        if lora_b_shape[-1] != rank:
+            return None
+        if lora_a_shape[:-2] != lora_b_shape[:-2]:
+            return None
+        return int(rank)
+
+    if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
+        return None
+
+    # Standard 2D LoRA, two conventions:
+    # 1. mlx-lm layer: lora_a (rank, in), lora_b (out, rank)
+    if is_layer:
+        if lora_a_shape[0] == lora_b_shape[-1]:
+            return int(lora_a_shape[0])
+        return None
+
+    # 2. Raw array: lora_a (in, rank), lora_b (rank, out)
+    if lora_a_shape[-1] == lora_b_shape[0]:
+        return int(lora_a_shape[-1])
+
+    return None
+
+
+def _sync_mlx_lora_keys(adapter_config, lora_parameters):
+    """Mirror `unsloth_mlx_lora_module_paths` into `lora_parameters["keys"]`.
+
+    mlx-lm.load_adapters() reads `lora_parameters.keys` to pick which
+    submodules to wrap on reload. Mirror the authoritative path list when
+    present (an empty list is its own valid pin); otherwise drop a stale
+    caller-supplied `keys` so mlx-lm falls back to its scan default.
+    """
+    if "unsloth_mlx_lora_module_paths" in adapter_config:
+        lora_parameters["keys"] = list(
+            adapter_config.get("unsloth_mlx_lora_module_paths") or []
+        )
+    else:
+        lora_parameters.pop("keys", None)
+    return lora_parameters
+
+
 def _enrich_mlx_adapter_config(model, adapter_config):
     adapter_config = dict(adapter_config or {})
     hf_repo = getattr(model, "_hf_repo", None) or adapter_config.get("base_model_name_or_path")
@@ -2723,35 +3204,280 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
-    # why: record LoRA module paths so reload recreates vision/projector LoRA
-    # layers (mlx-lm.load_adapters only knows the language tower).
+    # Only stamp LoRA fields when the live model has LoRA modules (or the
+    # caller declared a lora/dora artifact); otherwise mlx-lm.load_adapters()
+    # would inject LoRA wrappers before binding full-precision weights and
+    # break reload.
+    has_lora_modules = any(True for _ in iter_mlx_lora_modules(model))
+    declared_lora_artifact = (
+        has_lora_modules
+        and adapter_config.get("fine_tune_type") in {"lora", "dora"}
+    )
+    # Override a stale caller fine_tune_type="full" when LoRA modules are
+    # live, else mlx-lm reload would skip LoRA wrapping and drop tensors.
+    if has_lora_modules and adapter_config.get("fine_tune_type") == "full":
+        adapter_config["fine_tune_type"] = "lora"
+        declared_lora_artifact = True
+    # Detect DoRA so we stamp 'dora' instead of 'lora'; otherwise mlx-lm's
+    # load_adapters() rebuilds plain LoRA and the saved q_proj.m magnitude
+    # tensor silently drops via strict=False.
+    has_dora_modules = any(
+        type(module).__name__.startswith("DoRA")
+        for _, module in iter_mlx_lora_modules(model)
+    )
+    if has_lora_modules or declared_lora_artifact:
+        # Saved tensor shapes are authoritative: always re-derive
+        # rank/scale/dropout from live modules so a stale caller
+        # `lora_parameters` (e.g. rank=99) cannot survive. The path-
+        # filtered walker below owns the explicit-paths case so we do
+        # not borrow rank from an unselected module.
+        _has_explicit_paths_hint = "unsloth_mlx_lora_module_paths" in adapter_config
+        if has_lora_modules and not _has_explicit_paths_hint:
+            rank, scale, dropout = _extract_mlx_lora_parameters(model)
+            adapter_config["lora_parameters"] = {
+                "rank": rank,
+                "scale": scale,
+                "dropout": dropout,
+            }
+        elif "lora_parameters" not in adapter_config and not _has_explicit_paths_hint:
+            rank, scale, dropout = _extract_mlx_lora_parameters(model)
+            adapter_config["lora_parameters"] = {
+                "rank": rank,
+                "scale": scale,
+                "dropout": dropout,
+            }
+        # Mirror lora_parameters to top-level for mlx-vlm; overwrite
+        # caller-supplied top-level rank/scale/dropout so stale values
+        # cannot shadow the canonical ones.
+        if "lora_parameters" in adapter_config:
+            lora_parameters = adapter_config["lora_parameters"]
+            for key in ("rank", "scale", "dropout"):
+                if key in lora_parameters:
+                    adapter_config[key] = lora_parameters[key]
+        # mlx-lm.load_adapters() reads num_layers off the config.
+        if "num_layers" not in adapter_config:
+            try:
+                layers = _get_transformer_layers(model)
+                if layers and len(layers) > 0:
+                    adapter_config["num_layers"] = len(layers)
+            except Exception:
+                pass
+        # Derive fine_tune_type from the live model so a stale caller value
+        # (e.g. 'dora' over plain LoRA) cannot survive; otherwise mlx-lm
+        # would expect a `m` tensor and drop every adapter via strict=False.
+        adapter_config["fine_tune_type"] = "dora" if has_dora_modules else "lora"
+        adapter_config["peft_type"] = "LORA"
+    else:
+        # Full fine-tune: stamp 'full' explicitly so reload routes to the
+        # no-LoRA path (mlx-lm defaults missing fine_tune_type to 'lora').
+        adapter_config["fine_tune_type"] = "full"
+        for _stale in (
+            "peft_type", "lora_parameters", "rank", "scale", "dropout",
+            "num_layers", "unsloth_mlx_lora_module_paths",
+        ):
+            adapter_config.pop(_stale, None)
+
+    # Persist module paths + rank/scale/dropout so reload reproduces logits.
+    # The walker below backfills lora_parameters via _infer_mlx_lora_rank
+    # and respects explicit caller path filters.
     try:
+        # Reuse the loader-side normalizer so save/load accept the same
+        # shapes (str / list / tuple / set / dict / pathlib.Path).
+        from .loader import _normalize_mlx_lora_module_paths
+        # distinguish "caller passed nothing" from "caller passed [] / None".
+        has_explicit_paths = "unsloth_mlx_lora_module_paths" in adapter_config
+        raw_explicit_paths = (
+            adapter_config.get("unsloth_mlx_lora_module_paths")
+            if has_explicit_paths else None
+        )
+        if has_explicit_paths:
+            explicit_paths = _normalize_mlx_lora_module_paths(raw_explicit_paths)
+            adapter_config["unsloth_mlx_lora_module_paths"] = explicit_paths
+        else:
+            explicit_paths = None
+        # Empty explicit list pins caller topology but should NOT suppress
+        # global parameter inference; treat empty as "no filter".
+        explicit_path_set = set(explicit_paths) if explicit_paths else None
+
         lora_paths = []
-        for name, module in model.named_modules():
-            if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
-                lora_paths.append(name)
-        if lora_paths:
+        lora_rank = None
+        lora_scale = None
+        lora_dropout = None
+        # Track whether an explicit filter selected any real live module:
+        # if it did but rank inference failed, refusing the caller fallback
+        # below is what prevents persisting stale rank=8 placeholders.
+        selected_lora_seen = False
+        for name, module in iter_mlx_lora_modules(model):
+            lora_paths.append(name)
+            inferred_rank = _infer_mlx_lora_rank(module)
+            # Only infer from caller-selected modules so an unrelated LoRA
+            # cannot write the wrong language-tower params.
+            if explicit_path_set is not None and name not in explicit_path_set:
+                continue
+            selected_lora_seen = True
+            if inferred_rank is None:
+                continue
+            if lora_rank is None:
+                lora_rank = inferred_rank
+                lora_scale = _coerce_mlx_lora_scale(
+                    getattr(module, "scale", 1.0),
+                )
+                lora_dropout = _get_mlx_dropout_probability(
+                    getattr(module, "dropout", None)
+                )
+
+        # Auto-fill only when the caller did not supply the key.
+        if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
-    except Exception:
-        pass
+
+        # Live LoRA module state describes the tensors being saved, so an
+        # inferable live rank ALWAYS overrides caller scalar metadata.
+        existing_lora_parameters = dict(adapter_config.get("lora_parameters") or {})
+        has_caller_lora_metadata = any(
+            key in existing_lora_parameters or key in adapter_config
+            for key in ("rank", "scale", "dropout")
+        )
+        # When the caller pinned explicit paths that selected real modules
+        # but rank inference failed everywhere, do NOT fall back to caller
+        # metadata; it is stale by construction.
+        allow_caller_metadata_fallback = not (
+            explicit_path_set is not None
+            and selected_lora_seen
+            and lora_rank is None
+        )
+
+        if lora_rank is not None:
+            lora_parameters = existing_lora_parameters
+            lora_parameters.update({
+                "rank": lora_rank,
+                "scale": lora_scale,
+                "dropout": lora_dropout,
+            })
+            # Mirror the authoritative path list under `keys` so mlx-lm.
+            # load_adapters() does not interpret a missing `keys` as "scan
+            # every Linear/Embedding/Switch layer".
+            lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
+            adapter_config["lora_parameters"] = lora_parameters
+            adapter_config["rank"] = lora_rank
+            adapter_config["scale"] = lora_scale
+            adapter_config["dropout"] = lora_dropout
+            adapter_config.setdefault("peft_type", "LORA")
+            adapter_config.setdefault("fine_tune_type", "lora")
+            # mlx-lm.load_adapters() attr-accesses `config.num_layers` on
+            # a SimpleNamespace, so the key MUST be present. -1 is the
+            # legacy "all layers" sentinel for the no-detect case.
+            if "num_layers" not in adapter_config:
+                layers = _get_transformer_layers(model)
+                try:
+                    n_layers = len(layers) if layers is not None else -1
+                except TypeError:
+                    n_layers = -1
+                if n_layers <= 0:
+                    n_layers = -1
+                adapter_config["num_layers"] = n_layers
+        elif has_caller_lora_metadata and allow_caller_metadata_fallback:
+            # Caller-supplied metadata path: copy top-level rank/scale/dropout
+            # into lora_parameters (or vice versa) and backfill missing keys
+            # from inferred values so mlx-lm.load_adapters sees a complete dict.
+            lora_parameters = existing_lora_parameters
+            for key in ("rank", "scale", "dropout"):
+                if key not in lora_parameters and key in adapter_config:
+                    lora_parameters[key] = adapter_config[key]
+            # Rank first because it gates the final write below.
+            inferred_fallbacks = (
+                ("rank", lora_rank, None),
+                ("scale", lora_scale, 1.0),
+                ("dropout", lora_dropout, 0.0),
+            )
+            for key, inferred_value, default_value in inferred_fallbacks:
+                if key in lora_parameters:
+                    continue
+                if inferred_value is None and default_value is None:
+                    # No inferred value AND no safe default (rank); leave absent.
+                    continue
+                lora_parameters[key] = (
+                    inferred_value if inferred_value is not None else default_value
+                )
+            if "rank" in lora_parameters:
+                lora_parameters = _sync_mlx_lora_keys(adapter_config, lora_parameters)
+                adapter_config["lora_parameters"] = lora_parameters
+                for key in ("rank", "scale", "dropout"):
+                    if key in lora_parameters:
+                        adapter_config[key] = lora_parameters[key]
+                adapter_config.setdefault("peft_type", "LORA")
+                adapter_config.setdefault("fine_tune_type", "lora")
+                # Same -1 sentinel as the main branch.
+                if "num_layers" not in adapter_config:
+                    layers = _get_transformer_layers(model)
+                    try:
+                        n_layers = len(layers) if layers is not None else -1
+                    except TypeError:
+                        n_layers = -1
+                    if n_layers <= 0:
+                        n_layers = -1
+                    adapter_config["num_layers"] = n_layers
+    except (TypeError, ValueError, AttributeError) as _enrich_exc:
+        # Surface enrichment failures so the user knows adapter_config
+        # metadata may be incomplete on reload.
+        import warnings as _warnings
+        _warnings.warn(
+            f"Unsloth MLX: skipped LoRA metadata enrichment "
+            f"({_enrich_exc!r}); reloaded adapters may use placeholder "
+            f"rank/scale until adapter_config is rewritten.",
+            stacklevel=2,
+        )
     return adapter_config
+
+
+def _config_to_plain_python(value):
+    """Recursively convert config dataclasses and containers to plain Python."""
+    import dataclasses
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = dataclasses.asdict(value)
+    elif isinstance(value, dict):
+        value = copy.deepcopy(value)
+    elif isinstance(value, (list, tuple)):
+        return [_config_to_plain_python(item) for item in value]
+    else:
+        return value
+
+    if isinstance(value, dict):
+        return {
+            key: _config_to_plain_python(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _get_model_config(model):
     """Extract config dict from an MLX model.
 
     mlx-lm stores the raw config dict at model._config when loaded.
+    mlx-vlm exposes config dataclasses at model.config.
     Falls back to reconstructing from model.args dataclass.
     """
+    import dataclasses
+
     # Prefer the raw config dict stashed by our loader
     if hasattr(model, "_config") and isinstance(model._config, dict):
-        return dict(model._config)
+        return _config_to_plain_python(model._config)
+
+    if hasattr(model, "config"):
+        config = model.config
+        if isinstance(config, dict) or (
+            dataclasses.is_dataclass(config) and not isinstance(config, type)
+        ):
+            return _config_to_plain_python(config)
+        if hasattr(config, "to_dict"):
+            config = config.to_dict()
+            if isinstance(config, dict):
+                return _config_to_plain_python(config)
 
     # Reconstruct from the ModelArgs dataclass
     if hasattr(model, "args"):
-        import dataclasses
-        if dataclasses.is_dataclass(model.args):
-            return dataclasses.asdict(model.args)
+        if dataclasses.is_dataclass(model.args) and not isinstance(model.args, type):
+            return _config_to_plain_python(model.args)
 
     return {}
 
@@ -2760,6 +3486,467 @@ def _get_src_path(model):
     """Get the original model source path/repo for copying auxiliary files."""
     return getattr(model, "_src_path", None)
 
+
+def _save_mlx_config(config, config_path, *, is_vlm=False):
+    """Save MLX config using the backend-aware upstream helper."""
+    config = copy.deepcopy(config)
+    if is_vlm:
+        if "quantization" in config:
+            config["quantization_config"] = config["quantization"]
+        from mlx_vlm.utils import save_config as save_vlm_config
+        save_vlm_config(config, config_path)
+    else:
+        from mlx_lm.utils import save_config as save_lm_config
+        save_lm_config(config, config_path)
+
+
+def _has_vision_config(config):
+    """Return whether a raw or thinker-wrapped VLM config has vision settings."""
+    if not isinstance(config, dict):
+        return False
+    thinker_config = config.get("thinker_config")
+    return (
+        "vision_config" in config
+        or (
+            isinstance(thinker_config, dict)
+            and "vision_config" in thinker_config
+        )
+    )
+
+
+class _MlxVlmSanitizeProxy:
+    """Minimal instance shim for mlx-vlm class sanitize methods."""
+    def __init__(self, config):
+        self.config = config
+        self.args = config
+
+
+def _copy_mlx_vlm_sanitize_weights(weights):
+    """Copy MLX arrays before replaying sanitizer transforms."""
+    return {
+        key: mx.array(value) if isinstance(value, mx.array) else value
+        for key, value in weights.items()
+    }
+
+
+def _call_mlx_vlm_sanitize(cls, config, weights):
+    """Call an mlx-vlm sanitize method with its expected signature."""
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None:
+        return weights
+
+    weights = _copy_mlx_vlm_sanitize_weights(weights)
+    params = inspect.signature(sanitize).parameters
+    if len(params) == 1:
+        return sanitize(weights)
+    return sanitize(_MlxVlmSanitizeProxy(config), weights)
+
+
+def _add_mlx_vlm_sanitize_step(steps, module):
+    """Append a real mlx-vlm module sanitizer once, preserving order."""
+    if module is None or getattr(module, "sanitize", None) is None:
+        return
+    if all(existing is not module for existing, _ in steps):
+        steps.append((module, None))
+
+
+def _get_mlx_vlm_model_sanitize_pipelines(model):
+    """Build sanitizer pipelines from a loaded mlx-vlm model and submodules."""
+    if model is None:
+        return []
+
+    # Submodule-only sanitizers (wrapper without its own sanitize) still
+    # need replay pipelines, so the wrapper step is optional.
+    model_step = [(model, None)] if getattr(model, "sanitize", None) is not None else []
+    pipelines = [model_step] if model_step else []
+
+    extra_steps = []
+    for attr in ("thinker", "vision_tower", "vision_model", "vision_encoder", "visual"):
+        _add_mlx_vlm_sanitize_step(extra_steps, getattr(model, attr, None))
+
+    thinker = getattr(model, "thinker", None)
+    for attr in ("vision_tower", "vision_model", "vision_encoder", "visual"):
+        _add_mlx_vlm_sanitize_step(extra_steps, getattr(thinker, attr, None))
+
+    for idx in range(len(extra_steps)):
+        pipelines.append(model_step + extra_steps[: idx + 1])
+
+    return pipelines
+
+
+def _get_nested_config(config, *names):
+    """Walk nested config attributes, returning None for missing segments."""
+    cur = config
+    for name in names:
+        cur = getattr(cur, name, None)
+        if cur is None:
+            return None
+    return cur
+
+
+def _build_mlx_vlm_sanitize_steps(config):
+    """Build class-based mlx-vlm sanitizer steps from a saved VLM config."""
+    if not _has_vision_config(config):
+        return []
+
+    try:
+        from mlx_vlm.utils import get_model_and_args, update_module_configs
+
+        config_copy = copy.deepcopy(config)
+        model_module, model_type = get_model_and_args(config_copy)
+        config_copy.setdefault("text_config", config_copy.pop("llm_config", {}))
+        config_copy.setdefault("vision_config", {})
+        config_copy.setdefault("audio_config", {})
+
+        model_config = model_module.ModelConfig.from_dict(config_copy)
+        try:
+            model_config = update_module_configs(
+                model_config,
+                model_module,
+                config_copy,
+                ["text", "vision", "perceiver", "projector", "audio"],
+            )
+        except Exception:
+            pass
+    except Exception:
+        return []
+
+    steps = []
+    if hasattr(model_module, "Model"):
+        steps.append((model_module.Model, model_config))
+
+    thinker_config = _get_nested_config(model_config, "thinker_config")
+    if thinker_config is not None:
+        thinker_cls = getattr(model_module, "Thinker", None)
+        if thinker_cls is None:
+            try:
+                thinker_mod = importlib.import_module(
+                    f"mlx_vlm.models.{model_type}.thinker"
+                )
+                thinker_cls = getattr(thinker_mod, "Thinker", None)
+            except Exception:
+                thinker_cls = None
+        if thinker_cls is not None:
+            steps.append((thinker_cls, thinker_config))
+
+    vision_config = (
+        _get_nested_config(model_config, "vision_config")
+        or _get_nested_config(model_config, "thinker_config", "vision_config")
+    )
+    if vision_config is not None and hasattr(model_module, "VisionModel"):
+        steps.append((model_module.VisionModel, vision_config))
+
+    return [
+        (cls, step_config)
+        for cls, step_config in steps
+        if getattr(cls, "sanitize", None) is not None
+    ]
+
+
+def _build_mlx_vlm_sanitize_pipelines(config, model=None):
+    """Combine real-model and config-derived sanitizer replay pipelines."""
+    pipelines = _get_mlx_vlm_model_sanitize_pipelines(model)
+    class_steps = _build_mlx_vlm_sanitize_steps(config)
+    if class_steps:
+        pipelines.append(class_steps)
+    return pipelines
+
+
+def _apply_mlx_vlm_sanitizers(steps, weights):
+    """Replay a sanitizer pipeline and return None if any step rejects it."""
+    sanitized = dict(weights)
+    for cls, config in steps:
+        try:
+            sanitized = _call_mlx_vlm_sanitize(cls, config, sanitized)
+        except Exception:
+            return None
+    return sanitized
+
+
+def _vlm_gguf_name_candidates(name):
+    """Yield HF/llama.cpp tensor-name candidates for an MLX VLM tensor."""
+    candidates = []
+
+    def add(value):
+        if value not in candidates:
+            candidates.append(value)
+
+    if name.startswith("thinker.vision_tower."):
+        suffix = name[len("thinker.vision_tower."):]
+        add(f"thinker.visual.{suffix}")
+    if name.startswith("model.vision_tower."):
+        suffix = name[len("model.vision_tower."):]
+        add(f"model.visual.{suffix}")
+    if name.startswith("vision_tower."):
+        suffix = name[len("vision_tower."):]
+        add(f"visual.{suffix}")
+        add(f"model.visual.{suffix}")
+        add(f"model.language_model.visual.{suffix}")
+        add(f"vit.{suffix}")
+
+    add(name)
+    return candidates
+
+
+def _vlm_gguf_tensor_candidates(tensor):
+    """Yield HF-layout tensor candidates for an MLX VLM tensor."""
+    candidates = []
+    shape = getattr(tensor, "shape", ())
+
+    if len(shape) == 5:
+        candidates.append(mx.transpose(tensor, (0, 4, 1, 2, 3)))
+    elif len(shape) == 4:
+        candidates.append(mx.transpose(tensor, (0, 3, 1, 2)))
+
+    if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
+        candidates.append(tensor - 1)
+
+    candidates.append(tensor)
+    return candidates
+
+
+def _has_vlm_gguf_tensor_candidate(tensor):
+    """Return whether a tensor shape can require HF-layout recovery."""
+    shape = getattr(tensor, "shape", ())
+    if len(shape) in (4, 5):
+        return True
+    if len(shape) == 1:
+        dtype = getattr(tensor, "dtype", None)
+        return dtype is not None and mx.issubdtype(dtype, mx.floating)
+    return False
+
+
+def _has_vlm_gguf_rewrite_candidate(name, tensor):
+    """Return whether a tensor can differ between mlx-vlm and GGUF layouts."""
+    if any(candidate_name != name for candidate_name in _vlm_gguf_name_candidates(name)):
+        return True
+    return _has_vlm_gguf_tensor_candidate(tensor)
+
+
+def _mlx_arrays_match(actual, expected):
+    """Compare MLX-like arrays without assuming a concrete backend type."""
+    shape = getattr(actual, "shape", None)
+    if shape != getattr(expected, "shape", None):
+        return False
+    if actual is expected:
+        return True
+    if shape is None:
+        return actual == expected
+    try:
+        result = mx.all(actual == expected)
+        item = getattr(result, "item", None)
+        return bool(item() if callable(item) else result)
+    except Exception:
+        return False
+
+
+def _is_mlx_vlm_sanitize_step(value):
+    """Return whether a value is one sanitizer step tuple."""
+    return isinstance(value, tuple) and len(value) == 2
+
+
+def _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
+    """Normalize legacy step lists and multi-pipeline sanitizer inputs."""
+    if not sanitize_steps:
+        return []
+    if all(_is_mlx_vlm_sanitize_step(step) for step in sanitize_steps):
+        return [sanitize_steps]
+    return sanitize_steps
+
+
+def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
+    """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
+    if not _has_vlm_gguf_rewrite_candidate(name, tensor):
+        return name, tensor, False
+
+    for candidate_name in _vlm_gguf_name_candidates(name):
+        for candidate_tensor in _vlm_gguf_tensor_candidates(tensor):
+            for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
+                sanitized = _apply_mlx_vlm_sanitizers(
+                    pipeline,
+                    {candidate_name: candidate_tensor},
+                )
+                if not sanitized or len(sanitized) != 1:
+                    continue
+                sanitized_name, sanitized_tensor = next(iter(sanitized.items()))
+                if sanitized_name != name:
+                    continue
+                if not _mlx_arrays_match(sanitized_tensor, tensor):
+                    continue
+                changed = (
+                    candidate_name != name
+                    or not _mlx_arrays_match(candidate_tensor, tensor)
+                )
+                if not changed:
+                    continue
+                return candidate_name, candidate_tensor, True
+
+    return name, tensor, False
+
+
+def _sync_gguf_nextn_layer_config(config, model):
+    """Align speculative-layer config metadata with exported MLX layers."""
+    if model is None or not isinstance(config, dict):
+        return False
+
+    layers = _get_transformer_layers(model)
+    if layers is None:
+        return False
+    try:
+        actual_layers = len(layers)
+    except Exception:
+        return False
+
+    thinker_config = config.get("thinker_config")
+    text_configs = [
+        config.get("text_config"),
+        config.get("language_config"),
+        (
+            thinker_config.get("text_config")
+            if isinstance(thinker_config, dict)
+            else None
+        ),
+    ]
+    changed = False
+    for text_config in text_configs:
+        if not isinstance(text_config, dict):
+            continue
+        num_hidden_layers = text_config.get("num_hidden_layers")
+        if not isinstance(num_hidden_layers, int):
+            continue
+
+        actual_nextn = actual_layers - num_hidden_layers
+        for key in (
+            "num_nextn_predict_layers",
+            "mtp_num_hidden_layers",
+            "nextn_predict_layers",
+        ):
+            num_nextn = text_config.get(key)
+            if not isinstance(num_nextn, int) or num_nextn <= 0:
+                continue
+            if actual_layers < num_hidden_layers:
+                continue
+            if actual_nextn >= num_nextn:
+                continue
+            if actual_nextn > 0:
+                text_config[key] = actual_nextn
+            else:
+                text_config.pop(key, None)
+            changed = True
+
+    return changed
+
+
+def _prepare_vlm_gguf_export_directory(path, model=None):
+    """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
+    path = Path(path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return 0
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    config_changed = _sync_gguf_nextn_layer_config(config, model)
+    sanitize_steps = _build_mlx_vlm_sanitize_pipelines(config, model=model)
+    if not sanitize_steps:
+        if config_changed:
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=4)
+        return 0
+
+    rewritten = 0
+    name_map = {}
+    for file in sorted(path.glob("*.safetensors")):
+        tensors = mx.load(str(file))
+        updated = {}
+        file_rewritten = 0
+        for name, tensor in tensors.items():
+            new_name, tensor, changed = _rewrite_mlx_vlm_tensor_for_gguf(
+                name, tensor, sanitize_steps
+            )
+            if new_name in updated:
+                raise RuntimeError(
+                    f"Unsloth: duplicate tensor name after GGUF VLM rewrite: {new_name}"
+                )
+            updated[new_name] = tensor
+            name_map[name] = new_name
+            file_rewritten += int(changed)
+        if file_rewritten:
+            # mx.load() arrays may be file-backed; saving over the source can
+            # truncate them before they materialize, so write beside and replace.
+            mx.eval(*updated.values())
+            tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
+            mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
+            os.replace(tmp_file, file)
+            rewritten += file_rewritten
+
+    index_path = path / "model.safetensors.index.json"
+    if rewritten and index_path.exists():
+        with open(index_path, "r") as f:
+            index_data = json.load(f)
+        weight_map = {}
+        for name, shard in index_data.get("weight_map", {}).items():
+            new_name = name_map.get(name, name)
+            if new_name in weight_map:
+                raise RuntimeError(
+                    f"Unsloth: duplicate index tensor name after GGUF VLM rewrite: {new_name}"
+                )
+            weight_map[new_name] = shard
+        index_data["weight_map"] = dict(sorted(weight_map.items()))
+        with open(index_path, "w") as f:
+            json.dump(index_data, f, indent=4)
+
+    if config_changed:
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=4)
+
+    return rewritten
+
+
+_CORE_SAVE_FILENAMES = {
+    "config.json",
+    "model.safetensors.index.json",
+    "README.md",
+    ".gitattributes",
+}
+_MODEL_WEIGHT_SUFFIXES = (
+    ".safetensors",
+    ".bin",
+    ".gguf",
+    ".h5",
+    ".msgpack",
+    ".onnx",
+    ".pt",
+    ".pth",
+)
+_MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+
+
+def _copy_source_sidecars(src_path, path):
+    """Copy non-weight source sidecars that tokenizer/model saves may omit."""
+    copied = 0
+    src_path = Path(src_path)
+    path = Path(path)
+    if not src_path.is_dir():
+        return copied
+    for source in src_path.iterdir():
+        if not source.is_file():
+            continue
+        name = source.name
+        if name in _CORE_SAVE_FILENAMES:
+            continue
+        if name.startswith("model-") or name.startswith("pytorch_model"):
+            continue
+        suffix = source.suffix
+        if suffix in _MODEL_WEIGHT_SUFFIXES:
+            continue
+        if suffix not in _MODEL_SIDECAR_SUFFIXES:
+            continue
+        target = path / name
+        if target.exists():
+            continue
+        shutil.copy2(source, target)
+        copied += 1
+    return copied
 
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
@@ -2777,13 +3964,13 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             base quantization (smaller checkpoint, only meaningful when
             the base was quantized).
     """
-    from mlx_lm.utils import save_model, save_config, create_model_card
+    from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    # Fuse LoRA weights into base model using mlx-lm's pattern
+    # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
     fused_linears = [
         (n, m.fuse(dequantize=dequantize))
@@ -2794,6 +3981,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         model.update_modules(tree_unflatten(fused_linears))
 
     if dequantize:
+        model = dequantize_model(model)
         cfg = getattr(model, "_config", None)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
@@ -2806,32 +3994,218 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save config.json
     config = _get_model_config(model)
     if config:
-        save_config(config, config_path=path / "config.json")
+        is_vlm = _is_vlm_model(model) or _has_vision_config(config)
+        _save_mlx_config(
+            config,
+            path / "config.json",
+            is_vlm=is_vlm,
+        )
 
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
 
-    # Copy auxiliary files (generation_config.json, *.py) from source
     src_path = _get_src_path(model)
     if src_path is not None:
-        src_path = Path(src_path)
-        if src_path.exists():
-            import glob as globmod
-            for pattern in ["generation_config.json", "*.py"]:
-                for f in globmod.glob(str(src_path / pattern)):
-                    shutil.copy(f, path)
+        _copy_source_sidecars(src_path, path)
 
     # Model card
     hf_repo = getattr(model, "_hf_repo", None)
     try:
         create_model_card(path, hf_repo)
     except Exception:
-        # Fails if hf_repo doesn't exist on Hub — create a minimal card
+        # hf_repo missing on Hub — write a minimal card
         readme = path / "README.md"
         if not readme.exists():
             readme.write_text("---\nlibrary_name: mlx\ntags:\n- mlx\n- unsloth\n---\n")
 
     print(f"Unsloth: Merged model saved to {path}")
+
+
+def _ensure_hub_repo_visibility(api, repo_id, private):
+    """create_repo + update_repo_settings + verify on failure.
+
+    private=None  : skip the visibility update entirely (Hub policy).
+    private=False : soft-fail on update error (stuck-private is not a leak).
+    private=True  : verify via repo_info on update failure; only raise when
+                    the repo is confirmed non-private (covers tokens lacking
+                    write:repo_settings on a just-created private repo).
+    """
+    _create_repo_kwargs = {"repo_id": repo_id, "exist_ok": True}
+    if private is not None:
+        _create_repo_kwargs["private"] = bool(private)
+    api.create_repo(**_create_repo_kwargs)
+
+    if private is None:
+        return
+
+    try:
+        api.update_repo_settings(
+            repo_id=repo_id,
+            private=bool(private),
+            repo_type="model",
+        )
+        return
+    except Exception as exc:
+        if not bool(private):
+            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+            return
+
+        # private=True: verify before blocking the upload.
+        try:
+            info = api.repo_info(repo_id=repo_id, repo_type="model")
+            if bool(getattr(info, "private", False)):
+                return
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "Unsloth: private=True was requested but the Hub "
+            f"repo {repo_id!r} visibility could not be confirmed "
+            "private (likely token lacks `write:repo_settings` or "
+            "the repo is owned by another user). Refusing to upload "
+            "to avoid publishing artifacts to an existing public "
+            "repository."
+        ) from exc
+
+
+# Module-level constants so _caller_wants_commit_metadata can distinguish
+# "caller explicitly wants this Unsloth default" from "caller wants their
+# own commit string"; same pattern as push_to_hub_merged.
+_LORA_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
+_LORA_DEFAULT_COMMIT_DESCRIPTION = "Upload LoRA adapters trained with Unsloth 2x faster"
+
+
+def _push_lora_adapters_to_hub(
+    save_directory,
+    repo_id=None,
+    token=None,
+    private=None,
+    tags=None,
+    commit_message=None,
+    commit_description=None,
+    create_pr=False,
+    revision=None,
+):
+    """Upload an already-written LoRA adapter directory to the Hub.
+
+    Mirrors push_to_hub_merged's repo / commit / privacy / tag / upload
+    semantics, but skips the merged save_model fallback so it does not
+    overwrite adapters.safetensors with a full merged model.
+    """
+    from huggingface_hub import HfApi
+
+    save_directory = Path(save_directory)
+    if repo_id is None:
+        repo_id = save_directory.name
+
+    # Capture caller intent BEFORE backfilling defaults. Treat the Unsloth
+    # default strings the same as None so an outer wrapper that forwards
+    # the default verbatim is not mistaken for a custom request (the
+    # upload_large_folder fallback cannot preserve commit metadata).
+    _caller_wants_commit_metadata = bool(
+        create_pr
+        or commit_message not in (None, _LORA_DEFAULT_COMMIT_MESSAGE)
+        or commit_description not in (None, _LORA_DEFAULT_COMMIT_DESCRIPTION)
+    )
+
+    # Match push_to_hub_merged's commit conventions so the history is
+    # recognizable across CUDA and MLX backends.
+    if commit_message is None:
+        commit_message = _LORA_DEFAULT_COMMIT_MESSAGE
+    if "Unsloth" not in commit_message:
+        commit_message = (commit_message + " (Trained with Unsloth)").lstrip()
+    if commit_description is None:
+        commit_description = _LORA_DEFAULT_COMMIT_DESCRIPTION
+    elif "Unsloth 2x faster" not in commit_description:
+        commit_description += " (Trained with Unsloth 2x faster)"
+
+    api = HfApi(token=token)
+    _ensure_hub_repo_visibility(api, repo_id, private)
+
+    if tags:
+        try:
+            from huggingface_hub import ModelCard
+            card_path = save_directory / "README.md"
+            # Seed a minimal card: fresh adapter dirs have no README, so
+            # ModelCard.load() would otherwise raise and tags would be lost.
+            if not card_path.exists():
+                card_path.write_text(
+                    "---\n"
+                    "library_name: mlx\n"
+                    "tags:\n"
+                    "- mlx\n"
+                    "- unsloth\n"
+                    "---\n",
+                    encoding="utf-8",
+                )
+            card = ModelCard.load(card_path)
+            existing = list(getattr(card.data, "tags", None) or [])
+            merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
+            card.data.tags = merged
+            card.save(card_path)
+        except Exception as exc:
+            print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
+
+    # Allow-list adapter-relevant files only; prevents accidentally pushing
+    # stale merged-model artifacts or external GGUF exports under the LoRA
+    # adapter repo (data-leak guard for the public-by-default case).
+    _lora_allow_patterns = [
+        "adapters.safetensors",
+        "adapter_config.json",
+        # `adapter_model.safetensors` is intentionally excluded: MLX writes
+        # `adapters.safetensors`, so a matching PEFT file is stale by
+        # definition and would corrupt the remote artifact.
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "chat_template.jinja",
+        "chat_template.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "spiece.model",
+        "config.json",
+        "generation_config.json",
+        "README.md",
+        ".gitattributes",
+    ]
+
+    # Prefer upload_folder for LoRA dirs (small, single commit honours
+    # commit_message / create_pr / revision); upload_large_folder is the
+    # last-resort fallback when upload_folder is unavailable.
+    try:
+        api.upload_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            commit_description=commit_description,
+            create_pr=create_pr,
+            revision=revision,
+            allow_patterns=_lora_allow_patterns,
+        )
+    except (AttributeError, TypeError) as exc:
+        # Refuse to fall back to upload_large_folder when the caller asked
+        # for commit metadata it cannot preserve.
+        if _caller_wants_commit_metadata:
+            raise RuntimeError(
+                "Unsloth: upload_folder() failed but commit metadata or "
+                "create_pr=True was requested; upload_large_folder() "
+                "cannot preserve commit_message, commit_description, or "
+                "create a PR. Upgrade huggingface_hub or retry without "
+                "those kwargs."
+            ) from exc
+        api.upload_large_folder(
+            folder_path=str(save_directory),
+            repo_id=repo_id,
+            repo_type="model",
+            revision=revision,
+            allow_patterns=_lora_allow_patterns,
+        )
+    print(f"Unsloth: Pushed LoRA adapters to https://huggingface.co/{repo_id}")
 
 
 def save_pretrained_merged(
@@ -2843,6 +4217,11 @@ def save_pretrained_merged(
     token=None,
     private=None,
     tags=None,
+    repo_id=None,
+    commit_message=None,
+    commit_description=None,
+    create_pr=False,
+    revision=None,
 ):
     """Save the model in HF-compatible format using the requested method.
 
@@ -2862,6 +4241,11 @@ def save_pretrained_merged(
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
         tags: Additional tags for the model card.
+        repo_id: HuggingFace repo ID. If None, uses save_directory name.
+        commit_message: Commit title for the upload.
+        commit_description: Optional longer commit body.
+        create_pr: If True, push to a PR branch instead of main.
+        revision: Target branch (defaults to main).
     """
     method = (save_method or "lora").lower().replace(" ", "_")
     if method not in ("lora", "merged_16bit", "merged_4bit"):
@@ -2870,15 +4254,40 @@ def save_pretrained_merged(
             f"Use 'lora', 'merged_16bit', or 'merged_4bit'."
         )
 
-    has_lora = any(hasattr(m, "fuse") for _, m in model.named_modules())
-
     if method == "lora":
-        if not has_lora:
+        adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+        if not adapter_tensors:
             raise ValueError(
                 "Unsloth: save_method='lora' but the model has no LoRA "
                 "layers — there's nothing to save. Use 'merged_16bit' instead."
             )
-        save_lora_adapters(model, save_directory)
+        # Preserve intentionally trainable non-LoRA tensors OUTSIDE any
+        # LoRA module; exclude wrapped base weights INSIDE a LoRA module
+        # so reload-trainable q_proj.weight cannot leak through the save.
+        trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+        adapter_keys = set(adapter_tensors)
+        lora_module_prefixes = tuple(
+            f"{name}." for name, _ in iter_mlx_lora_modules(model) if name
+        )
+        # Route to save_trainable_adapters when an external param or an
+        # intentionally trainable non-base param under a LoRA module (e.g.
+        # q_proj.bias) is present. _is_base_tensor_inside_lora_module
+        # treats wrapped `.weight`/`.scales`/`.biases` (+ `.linear.*`) as
+        # reload-leaks; everything else under a LoRA prefix is user state.
+        has_root_lora_module = any(
+            name == "" for name, _ in iter_mlx_lora_modules(model)
+        )
+        has_non_lora_trainable = any(
+            key not in adapter_keys
+            and not _is_base_tensor_inside_lora_module(
+                key, lora_module_prefixes, has_root_lora_module,
+            )
+            for key in trainable
+        )
+        if has_non_lora_trainable:
+            save_trainable_adapters(model, save_directory)
+        else:
+            save_lora_adapters(model, save_directory)
         try:
             tokenizer.save_pretrained(str(save_directory))
         except Exception:
@@ -2892,10 +4301,33 @@ def save_pretrained_merged(
         )
 
     if push_to_hub:
-        push_to_hub_merged(
-            model, tokenizer, save_directory,
-            token=token, private=private, tags=tags,
-        )
+        if method == "lora":
+            # LoRA artifacts must NOT route through push_to_hub_merged: it
+            # would fall back to save_merged_model() (no index.json) and
+            # overwrite adapters.safetensors with a full merged model.
+            _push_lora_adapters_to_hub(
+                save_directory,
+                repo_id=repo_id,
+                token=token,
+                private=private,
+                tags=tags,
+                commit_message=commit_message,
+                commit_description=commit_description,
+                create_pr=create_pr,
+                revision=revision,
+            )
+        else:
+            push_to_hub_merged(
+                model, tokenizer, save_directory,
+                repo_id=repo_id,
+                token=token, private=private, tags=tags,
+                commit_message=commit_message or "Trained with Unsloth",
+                commit_description=commit_description or (
+                    "Upload model trained with Unsloth 2x faster"
+                ),
+                create_pr=create_pr,
+                revision=revision,
+            )
 
 
 def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
@@ -2909,7 +4341,7 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
             check=True,
         )
 
-    # Install Python dependencies — use gguf from the cloned repo to stay in sync
+    # Install deps; prefer gguf from the cloned repo to stay in sync
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
     if os.path.exists(gguf_py_dir):
         subprocess.run(
@@ -2992,6 +4424,7 @@ def save_pretrained_gguf(
         quantize_gguf,
         install_llama_cpp,
         check_llama_cpp,
+        LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
 
@@ -3015,7 +4448,7 @@ def save_pretrained_gguf(
         if quant_type in ("bf16", "f16", "f32"):
             first_conversion = quant_type
         else:
-            # All k-quants and q8_0 go through bf16 intermediate then llama-quantize
+            # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
@@ -3031,19 +4464,28 @@ def save_pretrained_gguf(
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir) / "merged"
+        is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
+        if is_vlm_model:
+            rewritten = _prepare_vlm_gguf_export_directory(tmp_path, model=model)
+            if rewritten:
+                print(
+                    "Unsloth: Rewrote "
+                    f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
+                )
 
         # Step 2: Ensure llama.cpp is installed and gguf package is available
-        llama_cpp_folder = "llama.cpp"
+        llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
-            check_llama_cpp(llama_cpp_folder)
+            quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
-            _install_llama_cpp_macos(llama_cpp_folder)
+            quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+        llama_cpp_folder = os.path.dirname(converter_location)
 
-        # Ensure gguf Python package is installed (may be missing if
-        # llama.cpp was built in a different venv)
+        # Ensure gguf is installed (may be missing if llama.cpp was built
+        # in a different venv)
         try:
             import gguf  # noqa: F401
         except ImportError:
@@ -3067,7 +4509,17 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        result = _download_convert_hf_to_gguf()  # no args — uses defaults
+        with _LLAMA_CPP_PATCHER_ENV_LOCK:
+            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+            if old_scripts_dir is None:
+                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
+            try:
+                result = _download_convert_hf_to_gguf()
+            finally:
+                if old_scripts_dir is None:
+                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
+                else:
+                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
@@ -3084,7 +4536,6 @@ def save_pretrained_gguf(
 
         # Step 5: Convert HF -> GGUF
         print(f"Unsloth: Converting to GGUF format...")
-        is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
         kwargs = dict(
             model_name=output_base,
             input_folder=str(tmp_path),
@@ -3102,7 +4553,7 @@ def save_pretrained_gguf(
 
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
-            quantizer = os.path.join(llama_cpp_folder, "llama-quantize")
+            quantizer = quantizer_location
             base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
 
@@ -3127,6 +4578,10 @@ def save_pretrained_gguf(
     print(f"Unsloth: GGUF export complete -> {save_directory}")
 
 
+_PUSH_MERGED_DEFAULT_COMMIT_MESSAGE = "Trained with Unsloth"
+_PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION = "Upload model trained with Unsloth 2x faster"
+
+
 def push_to_hub_merged(
     model,
     tokenizer,
@@ -3135,8 +4590,8 @@ def push_to_hub_merged(
     token=None,
     private=None,
     tags=None,
-    commit_message="Trained with Unsloth",
-    commit_description="Upload model trained with Unsloth 2x faster",
+    commit_message=_PUSH_MERGED_DEFAULT_COMMIT_MESSAGE,
+    commit_description=_PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION,
     create_pr=False,
     revision=None,
 ):
@@ -3167,6 +4622,17 @@ def push_to_hub_merged(
     if repo_id is None:
         repo_id = save_directory.name
 
+    # Capture caller intent BEFORE backfilling defaults; upload_large_folder
+    # cannot preserve commit_message / commit_description / create_pr (only
+    # those three force the upload_folder route). Treat None and the
+    # Unsloth default strings the same so a wrapper forwarding the default
+    # is not mistaken for a custom request.
+    _caller_wants_commit_metadata = bool(
+        create_pr
+        or commit_message not in (None, _PUSH_MERGED_DEFAULT_COMMIT_MESSAGE)
+        or commit_description not in (None, _PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION)
+    )
+
     # Match the GPU path's "(Trained with Unsloth)" suffix convention so
     # the commit history is recognizable across both backends.
     if commit_message is None:
@@ -3179,56 +4645,81 @@ def push_to_hub_merged(
         commit_description += " (Trained with Unsloth 2x faster)"
 
     api = HfApi(token=token)
-    api.create_repo(
-        repo_id=repo_id,
-        private=bool(private) if private is not None else False,
-        exist_ok=True,
-    )
-    # create_repo(exist_ok=True) is a no-op when the repo already exists,
-    # so toggling `private` on a re-push wouldn't change visibility unless
-    # we update it explicitly.
-    if private is not None:
-        try:
-            api.update_repo_settings(
-                repo_id=repo_id,
-                private=bool(private),
-                repo_type="model",
-            )
-        except Exception as exc:
-            print(f"Unsloth: Could not update repo visibility ({exc}); continuing.")
+    _ensure_hub_repo_visibility(api, repo_id, private)
 
     if tags:
         try:
             from huggingface_hub import ModelCard
             card_path = save_directory / "README.md"
-            if card_path.exists():
-                card = ModelCard.load(card_path)
-                existing = list(getattr(card.data, "tags", None) or [])
-                merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
-                card.data.tags = merged
-                card.save(card_path)
+            # Seed a minimal card: fresh dirs without one would crash
+            # ModelCard.load() and silently lose the requested tags.
+            if not card_path.exists():
+                card_path.write_text(
+                    "---\n"
+                    "library_name: mlx\n"
+                    "tags:\n"
+                    "- mlx\n"
+                    "- unsloth\n"
+                    "---\n",
+                    encoding="utf-8",
+                )
+            card = ModelCard.load(card_path)
+            existing = list(getattr(card.data, "tags", None) or [])
+            merged = list(dict.fromkeys(existing + list(tags) + ["mlx", "unsloth"]))
+            card.data.tags = merged
+            card.save(card_path)
         except Exception as exc:
             print(f"Unsloth: Could not set tags in model card ({exc}); continuing.")
 
-    # why: upload_large_folder resumes and chunks; upload_folder fails
-    # mid-push on large VLM merges.
-    try:
-        api.upload_large_folder(
-            folder_path=str(save_directory),
-            repo_id=repo_id,
-            repo_type="model",
-            revision=revision,
-        )
-    except (AttributeError, TypeError):
-        api.upload_folder(
-            folder_path=str(save_directory),
-            repo_id=repo_id,
-            repo_type="model",
-            commit_message=commit_message,
-            commit_description=commit_description,
-            create_pr=create_pr,
-            revision=revision,
-        )
+    # upload_large_folder resumes / chunks (good for multi-GB merges) but
+    # drops commit_message / commit_description / create_pr; route through
+    # upload_folder when the caller asked for any of those.
+    if _caller_wants_commit_metadata:
+        try:
+            api.upload_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+                commit_description=commit_description,
+                create_pr=create_pr,
+                revision=revision,
+            )
+        except (AttributeError, TypeError) as exc:
+            # Refuse to fall back to upload_large_folder; it cannot preserve
+            # commit_message / commit_description / create_pr.
+            if _caller_wants_commit_metadata:
+                raise RuntimeError(
+                    "Unsloth: upload_folder() failed but commit metadata "
+                    "or create_pr=True was requested; upload_large_folder() "
+                    "cannot preserve commit_message, commit_description, or "
+                    "create a PR. Upgrade huggingface_hub or retry without "
+                    "those kwargs."
+                ) from exc
+            api.upload_large_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+            )
+    else:
+        try:
+            api.upload_large_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+            )
+        except (AttributeError, TypeError):
+            api.upload_folder(
+                folder_path=str(save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+                commit_description=commit_description,
+                create_pr=create_pr,
+                revision=revision,
+            )
     print(f"Unsloth: Pushed to https://huggingface.co/{repo_id}")
 
 
@@ -3240,6 +4731,7 @@ def push_to_hub_gguf(
     quantization_method="fast_quantized",
     token=None,
     private=None,
+    first_conversion=None,
 ):
     """Export to GGUF and push to HuggingFace Hub.
 
@@ -3251,17 +4743,28 @@ def push_to_hub_gguf(
         quantization_method: GGUF quantization type.
         token: HuggingFace token.
         private: Whether repo should be private.
+        first_conversion: Optional intermediate GGUF dtype passed through to
+            save_pretrained_gguf. Placed after the pre-existing arguments so
+            positional callers keep their meaning.
     """
     from huggingface_hub import HfApi
 
     save_directory = Path(save_directory)
 
     # Export to GGUF
-    save_pretrained_gguf(model, tokenizer, save_directory, quantization_method)
+    save_pretrained_gguf(
+        model,
+        tokenizer,
+        save_directory,
+        quantization_method=quantization_method,
+        first_conversion=first_conversion,
+    )
 
     # Upload GGUF files
     api = HfApi(token=token)
-    api.create_repo(repo_id=repo_id, exist_ok=True, private=private)
+    # Same fail-loud private=True rule as the LoRA / merged paths so a
+    # private=True request never silently leaks GGUF shards public.
+    _ensure_hub_repo_visibility(api, repo_id, private)
 
     gguf_files = list(save_directory.glob("*.gguf"))
     for gguf_file in gguf_files:

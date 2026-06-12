@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
+import inspect
 from typing import Optional, Callable
 from .common import TEMPORARY_PATCHES
 from .utils import (
@@ -25,11 +26,11 @@ from .utils import (
 )
 
 def patch_MinistralAttention():
-    """
-    Fix dtype mismatch in MinistralAttention where RoPE is applied to Q/K
-    but not V. In 4-bit (BNB) mode, cos/sin can promote Q/K to a different
-    dtype than V, causing scaled_dot_product_attention to fail with:
-      ValueError: Expected query, key, and value to have the same dtype
+    """Fix dtype mismatch in MinistralAttention: RoPE applies to Q/K but not V.
+
+    In 4-bit (BNB) mode cos/sin can promote Q/K to a different dtype than V,
+    causing scaled_dot_product_attention to fail with "Expected query, key,
+    and value to have the same dtype".
     """
     try:
         import transformers.models.ministral.modeling_ministral
@@ -60,9 +61,8 @@ def patch_MinistralAttention():
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Fix dtype mismatch: RoPE may promote Q/K dtype via cos/sin multiplication
-        # while V stays in the original dtype from the linear projection.
-        # In 4-bit BNB mode, this causes Q/K to be float32 while V is float16/bfloat16.
+        # RoPE may promote Q/K dtype via cos/sin while V keeps the projection
+        # dtype (4-bit BNB: Q/K float32, V float16/bfloat16). Realign V.
         if value_states.dtype != query_states.dtype:
             value_states = value_states.to(query_states.dtype)
 
@@ -90,13 +90,18 @@ def patch_MinistralAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    # Wrap so check_args_kwargs accepts removed params (e.g. cache_position in v5)
+    # Wrap so check_args_kwargs accepts removed params (e.g. cache_position in
+    # v5), but keep the original signature so inspect.signature (used by
+    # transformers._validate_model_kwargs) still sees the real parameters.
+    target_cls = transformers.models.ministral.modeling_ministral.MinistralAttention
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
 
     patch_function(
-        transformers.models.ministral.modeling_ministral.MinistralAttention,
+        target_cls,
         "forward",
         forward,
         match_level="relaxed",
@@ -106,12 +111,11 @@ TEMPORARY_PATCHES.append(patch_MinistralAttention)
 
 
 def patch_MinistralModel_forward():
-    """
-    Fix MinistralModel.forward to handle sliding_window=None gracefully.
-    When the config has no sliding_window set (or it is None), the model
-    should skip creating a sliding window causal mask since calling
-    create_sliding_window_causal_mask raises ValueError.
-    This also handles the case where all layer_types are 'full_attention'.
+    """Handle sliding_window=None in MinistralModel.forward.
+
+    With no sliding_window set, skip the sliding-window causal mask, since
+    create_sliding_window_causal_mask raises ValueError. Also covers the case
+    where all layer_types are 'full_attention'.
     """
     try:
         from transformers.models.ministral.modeling_ministral import MinistralModel
@@ -132,18 +136,16 @@ def patch_MinistralModel_forward():
         *args,
         **kwargs,
     ):
-        # Check if sliding_window is properly set
         sw = getattr(self.config, "sliding_window", None)
         has_sliding_layers = any(
             lt == "sliding_attention"
             for lt in (getattr(self.config, "layer_types", None) or [])
         )
         if sw is None and not has_sliding_layers:
-            # All layers are full_attention and no sliding_window is set.
-            # Set sliding_window to max_position_embeddings so
-            # create_sliding_window_causal_mask does not raise. The mask will
-            # not actually be used by full_attention layers, but the value must
-            # be large enough to avoid unintended attention truncation.
+            # All full_attention, no sliding_window: set it to
+            # max_position_embeddings so create_sliding_window_causal_mask does
+            # not raise. The mask is unused, but must be large enough to avoid
+            # unintended attention truncation.
             self.config.sliding_window = getattr(
                 self.config, "max_position_embeddings", 32768
             )

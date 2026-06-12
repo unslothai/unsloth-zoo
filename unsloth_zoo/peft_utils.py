@@ -43,6 +43,9 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "vision_embedder",          # multimodal embedders kept in full precision
+    "embed_vision",
+    "embed_audio",
     "score",                    # *ForSequenceClassification head
     "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
     "qa_outputs",               # *ForQuestionAnswering head
@@ -75,7 +78,6 @@ def get_peft_regex(
     pass
 
     from collections import Counter
-    # Get only linear layers
     modules = model.named_modules()
     linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
 
@@ -90,7 +92,7 @@ def get_peft_regex(
 
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
 
-    # Isolate lm_head / projection matrices if count == 1
+    # Isolate lm_head / projection matrices (count == 1)
     if target_modules is None:
         only_linear_modules = []
         projection_modules  = {}
@@ -105,7 +107,6 @@ def get_peft_regex(
         only_linear_modules = list(target_modules)
     pass
 
-    # Create regex matcher
     regex_model_parts = []
     if finetune_vision_layers:     regex_model_parts += vision_tags
     if finetune_language_layers:   regex_model_parts += language_tags
@@ -215,13 +216,19 @@ def requires_grad_for_gradient_checkpointing(model):
         if type_output is torch.Tensor:
             output.requires_grad_(True)
         else:
-            try: # For dataclass from HF, try on loss or logits 
+            try: # For HF dataclass, try loss or logits
                 if hasattr(output, "loss") and output.loss is not None:
                     output.loss.requires_grad_(True)
-                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels 
+                elif hasattr(output, "logits") and output.logits is not None: # RL like GRPO has no loss (no labels)
                     output.logits.requires_grad_(True)
+                elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+                    # Encoder / decoder-style embedding backbones (e.g. Qwen3-Embedding) return a
+                    # BaseModelOutputWithPast with only last_hidden_state (no loss/logits) when called
+                    # for sentence embeddings. Make it require grad so gradient checkpointing works.
+                    # See https://github.com/unslothai/unsloth/issues/5360
+                    output.last_hidden_state.requires_grad_(True)
                 else:
-                    raise ValueError("Neither loss nor logits are available for grad post hook.")
+                    raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
     pass
@@ -236,9 +243,9 @@ def requires_grad_for_gradient_checkpointing(model):
                 return
             pass
         pass
-        # Kwargs-only path (VLMs like Idefics3, SmolVLM2, Llava, Qwen2VL, etc.)
-        # Look for the float tensor by name. inputs_embeds is universal across VLMs;
-        # hidden_states covers vision encoders; pixel_values covers image inputs.
+        # Kwargs-only path (VLMs like Idefics3, SmolVLM2, Llava, Qwen2VL, etc.):
+        # inputs_embeds is universal; hidden_states covers vision encoders;
+        # pixel_values covers image inputs.
         for key in ("inputs_embeds", "hidden_states", "pixel_values"):
             tensor = kwargs.get(key)
             if tensor is not None and type(tensor) is torch.Tensor:

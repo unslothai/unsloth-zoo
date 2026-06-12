@@ -163,13 +163,11 @@ class _SquareWrapper:
         self.parameter_name = parameter_name
         self.base_layer = type("_Base", (), {})()
         if parameter_name == "down_proj":
-            # down_proj: (E, hidden_dim, intermediate_dim). Force in == out by
-            # setting intermediate_dim == hidden_dim.
+            # down_proj (E, hidden_dim, intermediate_dim): force in == out
             self.base_layer.intermediate_dim = dim
             self.base_layer.hidden_dim = dim
         elif parameter_name == "gate_up_proj":
-            # gate_up_proj: input_dim = hidden_dim, output_dim = 2*intermediate_dim.
-            # Make square by intermediate_dim = hidden_dim/2.
+            # gate_up_proj in=hidden_dim, out=2*intermediate_dim: square via intermediate_dim=hidden_dim/2
             self.base_layer.hidden_dim = dim
             self.base_layer.intermediate_dim = dim // 2
         self._did_swap_in_out_features = did_swap

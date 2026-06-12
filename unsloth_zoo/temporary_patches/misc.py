@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import inspect
 import importlib
+from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
 from .utils import (
@@ -40,9 +41,8 @@ import re
 import os
 
 def patch_ministral3_config_mapping():
-    # Fix for Ministral-3 VL models which have text_config.model_type = "ministral3"
-    # but transformers CONFIG_MAPPING doesn't have "ministral3" as a key
-    # The correct text config is MinistralConfig (model_type = "ministral")
+    # Ministral-3 VL models set text_config.model_type="ministral3", which is
+    # missing from CONFIG_MAPPING; the correct config is MinistralConfig.
     try:
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
         from transformers import MinistralConfig
@@ -56,9 +56,9 @@ TEMPORARY_PATCHES.append(patch_ministral3_config_mapping)
 
 
 def patch_tokenizer_convert_added_tokens():
-    # Fix for tokenizer_config.json files that have additional_special_tokens as dicts
-    # without the "__type": "AddedToken" field. These dicts have a "content" key instead.
-    # transformers expects either strings or AddedToken objects, so we need to convert them.
+    # Some tokenizer_config.json files store additional_special_tokens as dicts
+    # with a "content" key but no "__type": "AddedToken"; convert them to
+    # AddedToken since transformers expects strings or AddedToken objects.
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase, AddedToken
     except Exception as e:
@@ -70,7 +70,7 @@ def patch_tokenizer_convert_added_tokens():
 
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
-        # Only convert if "content" is a string (AddedToken expects str), not a nested dict
+        # Only convert when "content" is a string (AddedToken expects str).
         if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
             return AddedToken(**obj)
         return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
@@ -82,9 +82,8 @@ TEMPORARY_PATCHES.append(patch_tokenizer_convert_added_tokens)
 
 
 def patch_tokenizer_extra_special_tokens():
-    # Fix for tokenizer_config.json files that have extra_special_tokens as a list
-    # instead of a dict. transformers expects extra_special_tokens to be a dict.
-    # This is a bug in some Mistral model tokenizer configs.
+    # Some Mistral tokenizer configs store extra_special_tokens as a list, but
+    # transformers expects a dict.
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     except Exception as e:
@@ -95,11 +94,9 @@ def patch_tokenizer_extra_special_tokens():
         return
 
     def patched_init(self, **kwargs):
-        # Convert extra_special_tokens from list to empty dict if needed
         extra_special_tokens = kwargs.get("extra_special_tokens", {})
         if isinstance(extra_special_tokens, list):
-            # extra_special_tokens should be a dict, but some models have it as a list
-            # Convert to empty dict to avoid errors, the tokens are still in added_tokens_decoder
+            # Coerce list to empty dict; the tokens remain in added_tokens_decoder.
             kwargs["extra_special_tokens"] = {}
         return original_init(self, **kwargs)
 
@@ -183,6 +180,36 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         kwargs = process_output_options(self, locals(), kwargs)
 
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            seq_len = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+            device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
+            codebook_indices = torch.arange(seq_len, device=device) + past_seen_tokens
+        else:
+            codebook_indices = cache_position
+
+        if inputs_embeds is None and input_ids is not None and backbone_last_hidden_state is not None:
+            # Precompute inputs_embeds so self.model skips upstream's in-place
+            # first-token replacement. Zoo's GC hook can make frozen embeddings
+            # leaf tensors, so detach before CopySlices carries backbone grads.
+            codebook_idxs = torch.clamp(codebook_indices - 1, min=0)
+            offset = codebook_idxs * self.model.vocab_size
+            inputs_embeds = self.model.embed_tokens(input_ids + offset)
+            if inputs_embeds.requires_grad and inputs_embeds.is_leaf:
+                # Cheap detach when backbone supplies grads; clone only when the
+                # GC sentinel itself must survive.
+                inputs_embeds = (
+                    inputs_embeds.detach()
+                    if backbone_last_hidden_state.requires_grad
+                    else inputs_embeds.clone()
+                )
+            inputs_embeds[:, 0] = backbone_last_hidden_state.to(
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+            input_ids = None
+            backbone_last_hidden_state = None
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids = input_ids,
@@ -211,7 +238,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
             slice_indices = logits_to_keep
 
         logits = self.codebooks_head(
-            hidden_states[:, slice_indices, :], cache_position[slice_indices] if cache_position is not None else None
+            hidden_states[:, slice_indices, :], codebook_indices[slice_indices]
         )
         logits = logits.contiguous()
 
@@ -231,11 +258,15 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         })
     pass
 
-    # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts any
-    # removed params (output_attentions, output_hidden_states, cache_position)
+    # Wrap with (self, *args, **kwargs) so check_args_kwargs accepts removed
+    # params, but copy the original signature onto the wrapper so
+    # transformers._validate_model_kwargs (used by generate) still sees the
+    # real named parameters like backbone_last_hidden_state.
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
@@ -308,28 +339,26 @@ def patch_CsmForConditionalGeneration_forward():
                 logits=backbone_logits, labels=backbone_labels, vocab_size=self.config.vocab_size, **kwargs
             )
 
-            # for the depth decoder, we need to select the frames to train on
-            # those are frames where the label is not uniformly `ignore_index` along the codebook dimension
+            # Depth decoder trains on frames whose labels are not uniformly
+            # ignore_index across the codebook dimension.
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
             depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
-            # add place holder in position 0 that will be replaced by the backbone_last_hidden_state
+            # Position 0 placeholder, replaced later by backbone_last_hidden_state.
             depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
 
             train_idxs = train_mask.nonzero(as_tuple=True)
             backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
             depth_decoder_labels = labels[train_mask]
 
-            # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
+            # Pass kwargs to the depth decoder so it sees num_items_in_batch.
             depth_decoder_kwargs = kwargs.copy()
-            # backbone loss num_items is based on the 0th codebooks index
-            # while depth loss num_items is based on the the remaining 31 codebooks
-            # therefore num_items_in_batch should be multiplied by 31
+            # Backbone num_items is the 0th codebook; depth covers the remaining
+            # 31 codebooks, so scale num_items_in_batch by 31.
             if 'num_items_in_batch' in depth_decoder_kwargs:
                 depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
 
-            # make sure return_dict is set to True
             depth_decoder_kwargs.pop('return_dict', None)
-            # Move output_attentions and output_hidden_states since transformers 4.54 deletes them
+            # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
             depth_decoder_kwargs["output_attentions"   ] = output_attentions
             depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
 
@@ -341,7 +370,6 @@ def patch_CsmForConditionalGeneration_forward():
                 # output_hidden_states=output_hidden_states,
                 return_dict = True,
                 labels = depth_decoder_labels,
-                # Fix: explicitly pass kwargs to depth decoder to get access to num_items_in_batch
                 **depth_decoder_kwargs,
             )
 
@@ -367,12 +395,154 @@ def patch_CsmForConditionalGeneration_forward():
         })
     pass
 
+    # Preserve the original signature so inspect.signature (used by
+    # transformers._validate_model_kwargs) still sees the real named parameters.
+    _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
+    forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_forward)
+
+
+def _tie_csm_audio_embeddings(model):
+    if not getattr(getattr(model, "config", None), "tie_codebooks_embeddings", True):
+        return model
+    try:
+        audio_embeddings = model.backbone_model.embed_tokens.embed_audio_tokens
+        depth_embeddings = model.depth_decoder.model.embed_tokens
+        if audio_embeddings.weight.shape == depth_embeddings.weight.shape:
+            # Keep CSM's configured codebook tie alive when tie_word_embeddings=False.
+            audio_embeddings.weight = depth_embeddings.weight
+    except Exception:
+        pass
+    return model
+pass
+
+
+def patch_CsmForConditionalGeneration_tie_weights():
+    try:
+        import transformers.models.csm.modeling_csm
+    except Exception as e:
+        return raise_error("CsmForConditionalGeneration.tie_weights", e)
+
+    target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
+    storage_name = _get_unique_storage_name(target_cls, "tie_weights")
+    if hasattr(target_cls, storage_name):
+        original_tie_weights = getattr(target_cls, storage_name)
+    else:
+        original_tie_weights = target_cls.tie_weights
+        setattr(target_cls, storage_name, original_tie_weights)
+    pass
+
+    def tie_weights(self, *args, **kwargs):
+        output = original_tie_weights(self, *args, **kwargs)
+        _tie_csm_audio_embeddings(self)
+        return output
+    pass
+    try:
+        tie_weights.__signature__ = inspect.signature(original_tie_weights)
+    except Exception:
+        pass
+    target_cls.tie_weights = tie_weights
+pass
+TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_tie_weights)
+
+
+def _label_csm_audio_eos_tokens(input_ids, labels, audio_eos_token_id):
+    if input_ids is None or labels is None or audio_eos_token_id is None:
+        return labels
+    try:
+        eos_mask = input_ids == audio_eos_token_id
+        previous_label_is_audio = labels[..., :-1] != -100
+        if torch.is_tensor(labels):
+            previous_label_is_audio = torch.nn.functional.pad(previous_label_is_audio, (1, 0), value=False)
+        else:
+            import numpy as np
+            previous_label_is_audio = np.concatenate(
+                [np.zeros_like(labels[..., :1], dtype=bool), previous_label_is_audio],
+                axis=-1,
+            )
+        labels[eos_mask & previous_label_is_audio] = audio_eos_token_id
+    except Exception:
+        pass
+    return labels
+pass
+
+
+def _get_csm_processor_audio_eos_token_id(processor):
+    audio_eos_token_id = getattr(processor, "audio_eos_token_id", None)
+    if audio_eos_token_id is not None:
+        return audio_eos_token_id
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return None
+
+    audio_eos_token_id = getattr(tokenizer, "audio_eos_token_id", None)
+    if audio_eos_token_id is not None:
+        return audio_eos_token_id
+
+    audio_eos_token = getattr(processor, "audio_eos_token", getattr(tokenizer, "audio_eos_token", "<|audio_eos|>"))
+    try:
+        return tokenizer.convert_tokens_to_ids(audio_eos_token)
+    except Exception:
+        return None
+pass
+
+
+def _label_csm_processor_output(processor, output):
+    if not isinstance(output, Mapping) or "input_ids" not in output or "labels" not in output:
+        return output
+    output["labels"] = _label_csm_audio_eos_tokens(
+        output.get("input_ids"),
+        output.get("labels"),
+        _get_csm_processor_audio_eos_token_id(processor),
+    )
+    return output
+pass
+
+
+def patch_CsmProcessor_apply_chat_template():
+    try:
+        import transformers.models.csm.processing_csm
+    except Exception as e:
+        return raise_error("CsmProcessor", e)
+
+    target_cls = transformers.models.csm.processing_csm.CsmProcessor
+    apply_storage_name = _get_unique_storage_name(target_cls, "apply_chat_template")
+    if hasattr(target_cls, apply_storage_name):
+        original_apply_chat_template = getattr(target_cls, apply_storage_name)
+    else:
+        original_apply_chat_template = target_cls.apply_chat_template
+        setattr(target_cls, apply_storage_name, original_apply_chat_template)
+    pass
+    call_storage_name = _get_unique_storage_name(target_cls, "__call__")
+    if hasattr(target_cls, call_storage_name):
+        original_call = getattr(target_cls, call_storage_name)
+    else:
+        original_call = target_cls.__call__
+        setattr(target_cls, call_storage_name, original_call)
+    pass
+
+    def apply_chat_template(self, *args, **kwargs):
+        return _label_csm_processor_output(self, original_apply_chat_template(self, *args, **kwargs))
+    pass
+
+    def __call__(self, *args, **kwargs):
+        return _label_csm_processor_output(self, original_call(self, *args, **kwargs))
+    pass
+    try:
+        apply_chat_template.__signature__ = inspect.signature(original_apply_chat_template)
+        __call__.__signature__ = inspect.signature(original_call)
+    except Exception:
+        pass
+    target_cls.apply_chat_template = apply_chat_template
+    target_cls.__call__ = __call__
+pass
+TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
@@ -445,10 +615,9 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
     masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
-    # Multi-GPU device_map flex_attention fix: cache_position[0] returns a
-    # 0-dim tensor on one device, but inner_mask may run on another device.
-    # Move offset tensors to the executing device inside the closure instead of
-    # using .item(), which would cause a graph break under torch.compile tracing.
+    # Multi-GPU device_map flex_attention fix: offset tensors may live on a
+    # different device than inner_mask runs on. Move them inside the closure
+    # rather than .item() (which graph-breaks under torch.compile tracing).
     if hasattr(masking_utils, "add_offsets_to_mask_function"):
         _original_add_offsets = getattr(
             masking_utils,
@@ -466,9 +635,9 @@ def patch_transformers_masks():
             return inner_mask
         masking_utils.add_offsets_to_mask_function = add_offsets_wrapper
 
-    # Fix padding/packed mask functions for multi-GPU: captured tensors may be
-    # on a different device than the indices passed during flex_attention vmap.
-    # Cache per-device copies to avoid repeated cross-device transfers.
+    # Multi-GPU fix: captured mask tensors may be on a different device than
+    # the flex_attention vmap indices. Cache per-device copies to avoid
+    # repeated cross-device transfers.
     if hasattr(masking_utils, "padding_mask_function"):
         masking_utils._unsloth_original_padding_mask_function = getattr(
             masking_utils,
@@ -513,11 +682,10 @@ TEMPORARY_PATCHES.append(patch_transformers_masks)
 def patch_sdpa_bool_causal_mask():
     """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
 
-    Upstream bug: pytorch/pytorch#162588. Cutlass SDPA returns garbage
-    gradients on bool causal masks at seq_len >= 2**16 (bf16, head_dim=256,
-    no flash-attn). Drop pure causal bool masks and call with is_causal=True;
-    convert non-pure bool masks to float additive bias. Below 2**16 we skip
-    the wrapper since the bug cannot fire.
+    Upstream bug pytorch/pytorch#162588: Cutlass SDPA returns garbage gradients
+    on bool causal masks at seq_len >= 2**16 (bf16, head_dim=256, no flash-attn).
+    Drop pure causal bool masks (is_causal=True); convert non-pure bool masks to
+    float additive bias. Skipped below 2**16 where the bug cannot fire.
     """
     if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
         return
@@ -548,10 +716,9 @@ def patch_sdpa_bool_causal_mask():
     ):
         m = attention_mask
 
-        # Below 2**16 the Cutlass bool-mask overflow cannot fire
-        # (pytorch/pytorch#162588), so skip the wrapper. The pure-causal
-        # rewrite picks a heavier SDPA backend and costs ~2.5 GB on
-        # Gemma4-31B LoRA SFT (8192 seq_len).
+        # Below 2**16 the Cutlass bool-mask overflow (pytorch/pytorch#162588)
+        # cannot fire, so skip the wrapper. The pure-causal rewrite picks a
+        # heavier SDPA backend (~2.5 GB on Gemma4-31B LoRA SFT, 8192 seq_len).
         _q_len = query.shape[2] if query.dim() >= 3 else 0
         _mask_key_len = m.shape[-1] if isinstance(m, torch.Tensor) and m.dim() >= 1 else 0
         if _q_len < 65536 and _mask_key_len < 65536:
@@ -606,8 +773,8 @@ def patch_sdpa_bool_causal_mask():
                 **kwargs,
             )
 
-        # Pure lower-triangular check via two O(1) probes: upper-tri is False
-        # and last row sees first col. Packed/padded masks fail the second.
+        # Pure lower-triangular check via two O(1) probes: upper-tri False and
+        # last row sees first col. Packed/padded masks fail the second.
         S = m.shape[-1]
         is_pure_causal = (
             (S < 2)
@@ -625,8 +792,8 @@ def patch_sdpa_bool_causal_mask():
                 **kwargs,
             )
 
-        # Non-pure bool mask (packed sequences, custom patterns): convert to float
-        # additive bias so SDPA dispatches to the working (non-bool) kernel.
+        # Non-pure bool mask: convert to float additive bias so SDPA dispatches
+        # to the working (non-bool) kernel.
         m_float = torch.where(m, 0.0, torch.finfo(query.dtype).min).to(query.dtype)
         return _orig(
             module, query, key, value, m_float,
@@ -642,13 +809,12 @@ TEMPORARY_PATCHES.append(patch_sdpa_bool_causal_mask)
 
 
 def patch_modernbert_attention_mask():
-    """Fix ModernBERT attn_bias stride alignment for SDPA backward pass.
+    """Fix ModernBERT attn_bias stride alignment for the SDPA backward pass.
 
-    The attention mask created by _prepare_4d_attention_mask uses .expand()
-    which creates non-contiguous strides. The SDPA compiled backward kernel
-    requires strides to be multiples of 4. Fix: patch _update_attention_mask
-    on ModernBertModel to return contiguous masks BEFORE they enter
-    torch.compile regions, so the inductor backward graph uses aligned strides.
+    _prepare_4d_attention_mask uses .expand(), giving non-contiguous strides,
+    but the compiled SDPA backward kernel needs strides that are multiples of 4.
+    Patch _update_attention_mask to return contiguous masks before they enter
+    torch.compile regions so the inductor backward graph uses aligned strides.
     """
     try:
         import transformers.models.modernbert.modeling_modernbert as modernbert_module
@@ -665,8 +831,7 @@ def patch_modernbert_attention_mask():
 
     def _update_attention_mask_contiguous(self, attention_mask, output_attentions=False):
         global_attention_mask, sliding_window_mask = original_update(self, attention_mask, output_attentions=output_attentions)
-        # Make masks contiguous so SDPA backward (including compiled graphs)
-        # gets strides that are multiples of 4
+        # Make masks contiguous so SDPA backward gets multiple-of-4 strides.
         if global_attention_mask is not None and not global_attention_mask.is_contiguous():
             global_attention_mask = global_attention_mask.contiguous()
         if sliding_window_mask is not None and not sliding_window_mask.is_contiguous():
@@ -691,19 +856,11 @@ def patch_CsmForConditionalGeneration_merge():
         input_values_cutoffs: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """
-        Merges the input_ids and input_values to produce a single inputs_embeds tensor:
-        1 - Infers the codec model on the input_values to retreive codebook token.
-        2 - Embeds codebook tokens and places them at the correct positions in the inputs_embeds tensor.
-        3 - If labels are provided, expands them to match codebook dimensions and position the target codebook tokens in the inputs_embeds tensor.
+        """Merge input_ids and input_values into a single inputs_embeds tensor.
 
-        Args:
-            input_ids (`torch.Tensor` of shape `(batch_size, sequence_length)`):
-                The input ids to embed.
-            input_values (`torch.Tensor` of shape `(batch_size, channels, audio_sequence_length)`):
-                The audio input values to embed.
-            input_values_cutoffs (`torch.Tensor` of shape `(batch_size, max_num_audio)`):
-                The cutoffs of the audio input values relative to its batch index, padded with -1 when no audio.
+        Runs the codec model on input_values to get codebook tokens, embeds and
+        positions them, and (if labels are given) expands labels to codebook
+        dimensions. input_values_cutoffs are per-batch cutoffs padded with -1.
         """
         inputs_embeds = self.embed_text_tokens(input_ids)
 
@@ -758,7 +915,6 @@ def patch_CsmForConditionalGeneration_merge():
             if labels is not None:
                 labels_expanded = labels.unsqueeze(-1).repeat(1, 1, self.config.num_codebooks)
                 labels_expanded[audio_token_mask] = batched_audio_token_ids[audio_codes_mask]
-                # fix make sure to set eos_token_id as a valid label to predict
                 labels_expanded[audio_eos_token_mask] = audio_eos_frame_ids
                 # mask depth decoder
                 depth_decoder_ignore_frames_idxs = (labels == -101).nonzero(as_tuple=True)
@@ -773,14 +929,13 @@ TEMPORARY_PATCHES.append(patch_CsmForConditionalGeneration_merge)
 
 
 def patch_causal_conv1d_cuda_probe():
-    """Probe causal_conv1d CUDA kernels and force slow path if broken.
+    """Probe causal_conv1d CUDA kernels and force the slow path if broken.
 
-    On GPUs whose compute capability is not supported by pre-built causal_conv1d
-    CUDA kernels (e.g. sm_100 on B200), `import causal_conv1d` succeeds but calling
-    `causal_conv1d_fn(...)` fails at runtime with "no kernel image is available".
-    This probe runs a tiny forward pass at startup to detect the failure, then
-    nullifies causal_conv1d_fn/causal_conv1d_update everywhere so all Mamba-family
-    models fall back to their pure-PyTorch slow paths.
+    On unsupported compute capabilities (e.g. sm_100 on B200), import succeeds
+    but calling causal_conv1d_fn(...) fails with "no kernel image is available".
+    A tiny startup forward pass detects this, then nullifies
+    causal_conv1d_fn/causal_conv1d_update so Mamba-family models fall back to
+    their pure-PyTorch slow paths.
     """
     try:
         import causal_conv1d
@@ -837,9 +992,9 @@ def patch_causal_conv1d_cuda_probe():
         pass
     pass
 
-    # 3. Dynamically scan all loaded modules and nullify broken causal_conv1d
-    #    references. Uses identity checks (is) against the original function objects
-    #    to avoid clobbering vllm's independent Triton-based causal_conv1d_fn/update.
+    # 3. Scan loaded modules and nullify broken causal_conv1d references. Uses
+    #    identity checks (is) against the originals so vllm's independent
+    #    Triton-based causal_conv1d_fn/update is left untouched.
     _original_fn = causal_conv1d_fn
     _original_update = causal_conv1d_update
 
@@ -1078,7 +1233,7 @@ def fix_mamba_ssm_float32():
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 
-    # Find dst +=|= tl.dot(a, b)
+    # Find `dst = tl.dot(a, b)` / `dst += tl.dot(a, b)`
     matches = list(re.finditer(
         r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
         file)
@@ -1190,15 +1345,10 @@ def patch_SiglipEncoderLayer():
         attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = False,
     ) -> tuple[torch.FloatTensor]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`):
-                Input to the layer of shape `(batch, seq_len, embed_dim)`.
-            attention_mask (`torch.FloatTensor`):
-                Attention mask of shape `(batch, 1, q_len, k_v_seq_len)` where padding elements are indicated by very large negative values.
-            output_attentions (`bool`, *optional*, defaults to `False`):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
+        """SiglipEncoderLayer forward forced to float32 internals.
+
+        hidden_states: (batch, seq_len, embed_dim); attention_mask:
+        (batch, 1, q_len, kv_seq_len) with padding as large negatives.
         """
         hidden_states = hidden_states.to(torch.float32)
         residual = hidden_states
@@ -1231,13 +1381,12 @@ TEMPORARY_PATCHES.append(patch_SiglipEncoderLayer)
 
 
 def patch_Lfm2VlMultiModalProjector():
-    """Fix Lfm2VlMultiModalProjector unconditionally creating LayerNorm.
+    """Backport the transformers 5.0.0 fix for Lfm2VlMultiModalProjector.
 
     transformers 4.57.6 ignores config.projector_use_layernorm and always
-    creates nn.LayerNorm + applies it in forward. The model checkpoint for
-    LFM2.5-VL-1.6B has projector_use_layernorm=False and ships no layer_norm
-    weights, so the LayerNorm gets randomly initialized and corrupts features.
-    Fixed in transformers 5.0.0. This patch backports the fix.
+    creates + applies nn.LayerNorm. LFM2.5-VL-1.6B has it False and ships no
+    layer_norm weights, so the LayerNorm is randomly initialized and corrupts
+    features.
     """
     try:
         import transformers.models.lfm2_vl.modeling_lfm2_vl as lfm2_vl_module
@@ -1279,11 +1428,11 @@ TEMPORARY_PATCHES.append(patch_Lfm2VlMultiModalProjector)
 
 
 def patch_peft_dispatch_bnb_4bit():
-    """Fix PEFT dispatch_bnb_4bit accessing compress_statistics on non-Params4bit weights.
+    """Fix PEFT dispatch_bnb_4bit reading compress_statistics on non-Params4bit weights.
 
-    In transformers 5.0+, BNB quantization loading order changed so weights may still be
-    nn.Parameter (not Params4bit) when PEFT tries to access .compress_statistics and .quant_type.
-    This wraps the original dispatch to catch AttributeError and provide defaults.
+    transformers 5.0+ changed BNB load order, so weights may still be
+    nn.Parameter (not Params4bit) when PEFT reads .compress_statistics /
+    .quant_type. Wrap dispatch to catch AttributeError and supply defaults.
     """
     try:
         import peft.tuners.lora.bnb as peft_bnb
@@ -1299,8 +1448,7 @@ def patch_peft_dispatch_bnb_4bit():
             return original_dispatch(target, adapter_name, **kwargs)
         except AttributeError as e:
             if "compress_statistics" in str(e) or "quant_type" in str(e):
-                # Transformers 5.0+: weight not yet quantized as Params4bit
-                # Retry after ensuring weight has needed attributes
+                # transformers 5.0+: weight not yet Params4bit; backfill attrs and retry.
                 w = target.weight
                 if not hasattr(w, "compress_statistics"):
                     w.compress_statistics = getattr(
@@ -1316,14 +1464,12 @@ def patch_peft_dispatch_bnb_4bit():
 pass
 TEMPORARY_PATCHES.append(patch_peft_dispatch_bnb_4bit)
 
-
 def patch_trl_push_to_hub_token():
-    """Ensure to_dict() always includes push_to_hub_token for TRL compat.
+    """Make TrainingArguments.to_dict() always include push_to_hub_token.
 
-    TRL 0.22.x through 0.27.1 do bare dict_args.pop("push_to_hub_token") in
-    SFTTrainer.__init__ and IterativeSFTTrainer.__init__. On transformers 5.0+,
-    TrainingArguments.to_dict() no longer includes push_to_hub_token, so the
-    bare pop raises KeyError. Fix: monkey-patch to_dict() to always include it.
+    TRL 0.22.x-0.27.1 bare-pop "push_to_hub_token" in SFTTrainer /
+    IterativeSFTTrainer __init__, but transformers 5.0+ drops it from
+    to_dict(), so the pop raises KeyError.
     """
     try:
         from unsloth_zoo.utils import Version
@@ -1350,14 +1496,10 @@ TEMPORARY_PATCHES.append(patch_trl_push_to_hub_token)
 def patch_trl_vision_model_mapping():
     """Fix DPO vision model detection for TRL 0.22.x + transformers 5.0+.
 
-    TRL 0.22.x does a bare import of MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES from
-    transformers.models.auto.modeling_auto. This name was removed in transformers
-    5.0.0, replaced by MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES. The import
-    failure prevents DPO trainer from loading at all.
-
-    Fix: inject the old name as an alias of the new name into the transformers
-    auto modeling module BEFORE TRL imports it, so the bare import succeeds.
-    Also patch already-loaded DPO module if it fell back to empty dict.
+    transformers 5.0.0 renamed MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES to
+    MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES, breaking TRL 0.22.x's bare
+    import and preventing the DPO trainer from loading. Inject the old name as
+    an alias before TRL imports it, and patch an already-loaded DPO module.
     """
     try:
         import transformers.models.auto.modeling_auto as auto_mod
@@ -1386,12 +1528,10 @@ TEMPORARY_PATCHES.append(patch_trl_vision_model_mapping)
 def patch_vllm_safe_apply_chat_template():
     """Fix vLLM safe_apply_chat_template for transformers 5.0+.
 
-    transformers 5.0.0 changed apply_chat_template(tokenize=True) to default
-    return_dict=True, returning BatchEncoding instead of list[int]. vLLM's
-    safe_apply_chat_template doesn't pass return_dict=False, causing TypeError
-    in _validate_model_input when max(BatchEncoding) returns a string key.
-
-    Fix: wrap the original function to inject return_dict=False when tokenize=True.
+    transformers 5.0.0 made apply_chat_template(tokenize=True) default
+    return_dict=True (BatchEncoding instead of list[int]); vLLM doesn't pass
+    return_dict=False, causing a TypeError in _validate_model_input. Wrap to
+    inject return_dict=False when tokenize=True.
     """
     try:
         from unsloth_zoo.utils import Version
@@ -1467,11 +1607,9 @@ TEMPORARY_PATCHES.append(patch_apply_chat_template_return_dict)
 def patch_qwen2vl_image_processor_pixel_attrs():
     """Add max_pixels/min_pixels property shims to Qwen2VLImageProcessor.
 
-    transformers 5.x removed these as direct instance attributes (they
-    are now stored inside self.size["longest_edge"/"shortest_edge"]).
-    vLLM 0.15.x accesses image_processor.max_pixels directly.
-    Only patch on transformers >= 5.0.0 to avoid breaking 4.x where
-    __init__ sets self.max_pixels as an instance attribute.
+    transformers 5.x moved these into self.size["longest_edge"/"shortest_edge"]
+    but vLLM 0.15.x reads image_processor.max_pixels directly. Only patched on
+    transformers >= 5.0.0 (4.x already sets them as instance attributes).
     """
     try:
         from unsloth_zoo.utils import Version
