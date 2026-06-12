@@ -35,7 +35,10 @@ if not _METAL:
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 
 TEXT_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
-VLM_MODEL = "mlx-community/SmolVLM-256M-Instruct-4bit"
+# Qwen2-VL: smallest VLM whose processor resolves cleanly under current
+# transformers (the mlx-community SmolVLM-256M repo ships a preprocessor
+# config AutoImageProcessor cannot map).
+VLM_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 
 
 def _chat_dataset(n=12):

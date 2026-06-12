@@ -2417,9 +2417,11 @@ def train_on_responses_only(
         )
 
     # Unwrap to a callable HF tokenizer (mlx-lm TokenizerWrapper._tokenizer,
-    # or VLM processor.tokenizer). HF fast tokenizers already speak the API
-    # and their _tokenizer is the Rust backend, so leave those as-is.
-    if not hasattr(_tokenizer, "convert_tokens_to_ids"):
+    # or VLM processor.tokenizer). The HF masking impl calls tokenizer(...),
+    # and mlx-lm's TokenizerWrapper proxies attributes but is not callable,
+    # so require both. HF fast tokenizers already speak the API and their
+    # _tokenizer is the Rust backend, so leave those as-is.
+    if not (callable(_tokenizer) and hasattr(_tokenizer, "convert_tokens_to_ids")):
         if hasattr(_tokenizer, "_tokenizer"):
             _tokenizer = _tokenizer._tokenizer
         elif hasattr(_tokenizer, "tokenizer"):

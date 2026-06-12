@@ -543,3 +543,59 @@ def test_thread5_vlm_ignore_ids_resolve_with_fast_tokenizer():
     # 200 comes from the tokenizer's image_token; 201 from config.
     assert 200 in ids
     assert 201 in ids
+
+
+# ===========================================================================
+# Thread 5 follow-up: train_on_responses_only must hand the HF masking impl
+# a CALLABLE tokenizer. mlx-lm's TokenizerWrapper proxies attributes via
+# __getattr__ (so hasattr(convert_tokens_to_ids) is True) but defines no
+# __call__, and the HF impl invokes tokenizer(...) directly.
+# ===========================================================================
+
+def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
+    import unsloth_zoo.dataset_utils as dataset_utils
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class _CallableTokenizer(_SpaceTokenizer):
+        def __call__(self, text, **kwargs):
+            return {"input_ids": self.encode(text)}
+
+    inner = _CallableTokenizer()
+
+    class _ProxyWrapper:
+        """mlx-lm TokenizerWrapper shape: proxies attributes, not callable."""
+
+        def __init__(self, tokenizer):
+            self._tokenizer = tokenizer
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_tokenizer"), name)
+
+    received = {}
+
+    def fake_hf(trainer, *, instruction_part=None, response_part=None,
+                force_match=True, tokenizer=None, return_function=False,
+                num_proc=None):
+        received["tokenizer"] = tokenizer
+        return lambda batch: batch
+
+    monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    trainer_mod.train_on_responses_only(
+        None,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        tokenizer=_ProxyWrapper(inner),
+        return_function=True,
+    )
+    assert received["tokenizer"] is inner, (
+        "non-callable proxy wrapper must unwrap to its inner HF tokenizer"
+    )
+    # A real fast tokenizer (callable + HF API) must pass through untouched.
+    trainer_mod.train_on_responses_only(
+        None,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        tokenizer=inner,
+        return_function=True,
+    )
+    assert received["tokenizer"] is inner
