@@ -286,3 +286,44 @@ def test_patched_update_routes_training_to_kernel_path(monkeypatch):
     y, s = gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=None)
     mx.eval(y, s)
     assert called.get("kernel"), "training call did not route to kernel VJP"
+
+
+def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
+    fake_mlx_lm, monkeypatch,
+):
+    """patch_gated_delta_vlm covers mlx_vlm >= 0.6's own module (a distinct
+    function the identity sweep leaves alone), and the sweep must treat the
+    sibling patch as owned, not foreign."""
+    calls = {}
+
+    def vlm_original(q, k, v, a, b, A_log, dt_bias,
+                     state=None, mask=None, use_kernel=True):
+        calls["inference"] = state
+        return "y", state
+
+    vlm_gd = types.ModuleType("mlx_vlm.models.qwen3_5.gated_delta")
+    vlm_gd.gated_delta_update = vlm_original
+    vlm_pkg = types.ModuleType("mlx_vlm.models.qwen3_5")
+    vlm_pkg.gated_delta = vlm_gd
+    vlm_pkg.language = fake_mlx_lm.consumers["mlx_vlm.models.qwen3_5.language"]
+    vlm_pkg.language.gated_delta_update = vlm_original
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5", vlm_pkg)
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.qwen3_5.gated_delta", vlm_gd,
+    )
+
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm
+    patch_gated_delta_vlm()
+
+    patched = vlm_gd.gated_delta_update
+    assert patched is not vlm_original
+    assert vlm_pkg.language.gated_delta_update is patched
+    assert vlm_gd._unsloth_gated_delta_patched
+
+    # Inference (state provided) delegates to the original implementation.
+    y, state = patched(*[object()] * 7, state="kv-cache")
+    assert (y, state) == ("y", "kv-cache") and calls["inference"] == "kv-cache"
+
+    # The sweep recognizes the sibling patch instead of warning "foreign".
+    _patch()
+    assert vlm_pkg.language.gated_delta_update is patched
