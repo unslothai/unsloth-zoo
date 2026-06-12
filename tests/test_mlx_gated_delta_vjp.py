@@ -327,3 +327,18 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     # The sweep recognizes the sibling patch instead of warning "foreign".
     _patch()
     assert vlm_pkg.language.gated_delta_update is patched
+
+
+@requires_metal
+def test_kernel_dispatch_guards_partial_threadgroup_rows():
+    """Dv not divisible by the threadgroup row count must fall back to the
+    ops VJP: the backward kernel's shared-memory pre-reduction would read
+    uninitialized slots in a partial trailing threadgroup."""
+    import unsloth_zoo.gated_delta_vjp as gv
+
+    q = mx.zeros((1, 8, 2, 32))
+    g = mx.zeros((1, 8, 2))
+    ok_v = mx.zeros((1, 8, 2, 16))
+    bad_v = mx.zeros((1, 8, 2, 30))
+    assert gv.gated_delta_kernel_supported(q, g, None, ok_v)
+    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v)

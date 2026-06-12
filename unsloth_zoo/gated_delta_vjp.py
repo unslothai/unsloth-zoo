@@ -287,7 +287,7 @@ def patch_gated_delta():
             # (fast, O(chunks) graph); fall back to the ops VJP when the call
             # shape is outside kernel support.
             if is_training_call:
-                if gated_delta_kernel_supported(q, g, mask):
+                if gated_delta_kernel_supported(q, g, mask, v):
                     return gated_delta_kernel_efficient(
                         q, k, v, g, beta, state, mask,
                     )
@@ -379,7 +379,7 @@ def patch_gated_delta_vlm():
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-        if gated_delta_kernel_supported(q, g, mask):
+        if gated_delta_kernel_supported(q, g, mask, v):
             return gated_delta_kernel_efficient(q, k, v, g, beta, state, mask)
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
@@ -704,12 +704,18 @@ def _get_kernels(vectorized=False):
     return _GD_KERNELS[vectorized]
 
 
-def gated_delta_kernel_supported(q, g, mask) -> bool:
-    """Whether the fused-kernel VJP path can handle this call."""
+def gated_delta_kernel_supported(q, g, mask, v=None) -> bool:
+    """Whether the fused-kernel VJP path can handle this call.
+
+    Dv must divide evenly into threadgroup rows: the backward kernel's
+    shared-memory pre-reduction reads every row slot in a threadgroup, and
+    a partial trailing group would read uninitialized slots.
+    """
     return (
         mask is None
         and g.ndim in (3, 4)
         and q.shape[-1] % 32 == 0
+        and (v is None or v.shape[-1] % _KERNEL_THREADGROUP_Y == 0)
         and mx.default_device() == mx.gpu
         and mx.metal.is_available()
     )
