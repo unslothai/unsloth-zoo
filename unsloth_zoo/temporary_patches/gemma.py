@@ -189,11 +189,23 @@ def patch_Gemma3Processor():
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
-        text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
-        # Fix double BOS tokens
+        # Tokenize WITHOUT padding: stripping a double BOS after padding only
+        # shortens rows that still start with [bos, bos] (under left padding,
+        # just the longest row), re-ragging the batch and desyncing
+        # attention_mask. Strip first, then pad once.
+        text_kwargs = dict(output_kwargs["text_kwargs"])
+        pad_kwargs = {k: text_kwargs.pop(k) for k in ("padding", "max_length", "pad_to_multiple_of", "padding_side") if k in text_kwargs}
+        text_inputs = self.tokenizer(text=text, **text_kwargs)
+        # Fix double BOS tokens, keeping attention_mask in sync
         double_bos_token_id = [self.tokenizer.bos_token_id]*2
         input_ids = text_inputs["input_ids"]
-        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
+        stripped = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
+        if "attention_mask" in text_inputs:
+            text_inputs["attention_mask"] = [m[1:] if len(k) != len(x) else m for x, k, m in zip(input_ids, stripped, text_inputs["attention_mask"])]
+        text_inputs["input_ids"] = stripped
+        if pad_kwargs.get("padding", False) not in (False, None, "do_not_pad"):
+            pad_params = inspect.signature(self.tokenizer.pad).parameters
+            text_inputs = self.tokenizer.pad(text_inputs, **{k: v for k, v in pad_kwargs.items() if k in pad_params})
 
         # Add token type ids manually, as tokenizer can't do arbitrary position token types
         # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!

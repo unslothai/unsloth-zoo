@@ -1426,12 +1426,13 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.weight.input_scale_ub = kwargs['input_scale_ub']
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
-                    # FP8 dynamic quantized. transformers 5.0+ renamed
-                    # bias -> has_bias and removed device.
-                    if Version("transformers") < Version("5.0.0"):
-                        fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'], device=get_target_device())
-                    else:
-                        fp8_kwargs = dict(in_features=0, out_features=0, has_bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'])
+                    # FP8 dynamic quantized. FP8Linear's signature drifts across
+                    # transformers versions (4.x: bias/dtype/device; 5.x:
+                    # has_bias, no dtype/device), so keep only accepted kwargs.
+                    fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, has_bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'], device=get_target_device())
+                    fp8_params = inspect.signature(FP8Linear.__init__).parameters
+                    if not any(p.kind is p.VAR_KEYWORD for p in fp8_params.values()):
+                        fp8_kwargs = {k: v for k, v in fp8_kwargs.items() if k in fp8_params}
                     layer = FP8Linear(**fp8_kwargs)
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
