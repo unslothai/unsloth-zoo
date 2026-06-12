@@ -86,3 +86,8 @@ jobs:
         # Real LoRA training smoke: tiny 4-bit model through FastMLXModel +
         # MLXTrainer, exercising the PR 684 trainer rework end to end.
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
+
+      - name: tests/test_mlx_pr684_full_validation_metal.py
+        # Deep behavior checks: resume determinism, completion-only training,
+        # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
+        run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
