@@ -22,6 +22,10 @@ device-resident self-conditioning). Per streaming request it (a) streams the com
 normal OpenAI deltas and (b) streams per-step "diffusion_frame" events so the 256-token canvas resolves
 in place in the chat bubble, like the terminal. Set DG_ARTIFACT=1 to also append a replay HTML artifact.
 
+The model's thought channel (``<|channel>thought ... <channel|>``) is split out of the committed text
+and emitted as OpenAI-style ``reasoning_content`` (matching llama-server's reasoning extraction), so
+chat UIs fold it into a collapsible thinking section instead of showing raw channel markers.
+
 Exposes /v1/models and /v1/chat/completions (streaming SSE + non-streaming) plus /health. The model loads
 once; requests are serialized (the decoder is single-sequence / stateful SC).
 
@@ -76,6 +80,58 @@ def _chunk(cid, created, delta, finish=None):
 
 def _sse(obj):
     return f"data: {json.dumps(obj)}\n\n"
+
+
+# DiffusionGemma thought markers. The chat template's native format is
+# ``<|channel>thought\n ... <channel|>``, but the model also free-runs DeepSeek-style
+# ``<think> ... </think>`` when thinking is not explicitly templated, so both are split.
+_THOUGHT_MARKERS = (
+    ("<|channel>thought", "<channel|>"),
+    ("<think>", "</think>"),
+)
+
+
+def _split_thought_channels(full):
+    """Split raw committed text into ``(reasoning, content)``, dropping the thought markers.
+
+    Handles text with no markers (all content), an unterminated thought (everything after the
+    start marker is reasoning -- e.g. a length-truncated generation), multiple thought blocks,
+    and either marker dialect. Marker text never reaches either channel."""
+    reasoning, content = [], []
+    rest = full
+    while True:
+        best = None  # earliest start marker wins
+        for start, end in _THOUGHT_MARKERS:
+            i = rest.find(start)
+            if i >= 0 and (best is None or i < best[0]):
+                best = (i, start, end)
+        if best is None:
+            content.append(rest)
+            break
+        i, start, end = best
+        content.append(rest[:i])
+        body = rest[i + len(start):]
+        j = body.find(end)
+        if j < 0:
+            reasoning.append(body)
+            break
+        reasoning.append(body[:j])
+        rest = body[j + len(end):]
+    return "".join(reasoning).strip("\n"), "".join(content)
+
+
+def _marker_holdback(full):
+    """Length of a trailing partial thought marker in *full* to withhold from streaming until the
+    next commit disambiguates it (a block boundary can land mid-marker)."""
+    longest = 0
+    for pair in _THOUGHT_MARKERS:
+        for marker in pair:
+            upper = min(len(marker) - 1, len(full))
+            for k in range(upper, 0, -1):
+                if full.endswith(marker[:k]):
+                    longest = max(longest, k)
+                    break
+    return longest
 
 
 def _timings_from_stats(stats):
@@ -189,9 +245,13 @@ async def chat(req: Request):
                 "usage": {"prompt_tokens": exc.needed, "completion_tokens": 0, "total_tokens": exc.needed},
             })
         _, P, G = _timings_from_stats(stats_box)
+        reasoning, content = _split_thought_channels(text)
+        message = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning_content"] = reasoning
         return JSONResponse({
             "id": cid, "object": "chat.completion", "created": created, "model": MODEL_ID,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+            "choices": [{"index": 0, "message": message,
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": P, "completion_tokens": G, "total_tokens": P + G},
         })
@@ -225,7 +285,12 @@ async def chat(req: Request):
 
         threading.Thread(target=work, daemon=True).start()
         yield _sse(_chunk(cid, created, {"role": "assistant"}))
-        sent = ""
+        # Committed text is split into the thought channel (streamed as reasoning_content, like
+        # llama-server's reasoning extraction) and the answer (normal content deltas). Each channel
+        # diffs against what it already sent; a trailing partial marker is withheld until the next
+        # commit so marker text never leaks into either channel.
+        sent_reasoning = ""
+        sent_content = ""
         while True:
             kind, payload = await q.get()
             if kind == "frame":
@@ -236,11 +301,21 @@ async def chat(req: Request):
                             "block": block, "step": step, "total": total, "text": text})
                 continue
             if kind in ("delta", "done"):
-                new = payload[len(sent):]
-                if new:
+                if kind == "done":
+                    reasoning, content = _split_thought_channels(payload)
+                else:
+                    cut = _marker_holdback(payload)
+                    safe = payload[: len(payload) - cut] if cut else payload
+                    reasoning, content = _split_thought_channels(safe)
+                new_r = reasoning[len(sent_reasoning):]
+                if new_r:
+                    yield _sse(_chunk(cid, created, {"reasoning_content": new_r}))
+                    sent_reasoning = reasoning
+                new_c = content[len(sent_content):]
+                if new_c:
                     # committed block: normal assistant text (what the transcript keeps).
-                    yield _sse(_chunk(cid, created, {"content": new}))
-                    sent = payload
+                    yield _sse(_chunk(cid, created, {"content": new_c}))
+                    sent_content = content
                 if kind == "done":
                     if _WANT_ARTIFACT:
                         art = _artifact(frames)
