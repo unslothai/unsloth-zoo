@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiffusionGemma denoising</title>
+<style>
+  :root { --bg:#0b0f17; --panel:#121826; --line:#1e2738; --ink:#e6e9f2; --dim:#8a93a6; --accent:#a78bfa; --accent2:#34d399; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; background:var(--bg); color:var(--ink);
+    font-family: ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { padding:14px; }
+  .head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:8px; }
+  .title { font-weight:600; font-size:14px; letter-spacing:.2px; }
+  .title .dot { color:var(--accent); }
+  .meta { font-variant-numeric:tabular-nums; font-size:12px; color:var(--dim); white-space:nowrap; }
+  .bar { height:6px; border-radius:6px; background:var(--line); overflow:hidden; margin:6px 0 10px; }
+  .bar > i { display:block; height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent2));
+    transition:width .08s linear; }
+  .canvas { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px;
+    min-height:150px; }
+  pre.cv { margin:0; white-space:pre-wrap; word-break:break-word; font-size:13px; line-height:1.5;
+    font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace; color:var(--ink);
+    transition:opacity .12s ease; }
+  .controls { display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  button { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:8px;
+    padding:6px 11px; font-size:12px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  input[type=range] { flex:1; min-width:120px; accent-color:var(--accent); }
+  .speed b { color:var(--accent); }
+  .foot { color:var(--dim); font-size:11px; margin-top:9px; line-height:1.4; }
+  .badge { color:var(--accent2); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <div class="title"><span class="dot">&#9632;</span> DiffusionGemma <span style="color:var(--dim)">&middot; block diffusion (GGUF, llama.cpp)</span></div>
+    <div class="meta" id="meta">block 0 &middot; step 0/0</div>
+  </div>
+  <div class="bar"><i id="prog"></i></div>
+  <div class="canvas"><pre class="cv" id="cv"></pre></div>
+  <div class="controls">
+    <button id="play">Pause</button>
+    <button id="restart">Restart</button>
+    <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+    <span class="meta speed">speed <button data-ms="180">0.5x</button><button data-ms="90">1x</button><button data-ms="45">2x</button></span>
+  </div>
+  <div class="foot">
+    Watching the 256-token canvas resolve out of noise: the model's argmax over the whole block, repainted
+    each denoising step, until it settles and the block commits. Optimized path: on-device sampling
+    reductions + device-resident self-conditioning. <span class="badge" id="fcount"></span>
+  </div>
+</div>
+
+<script type="application/json" id="dg-frames">__FRAMES_JSON__</script>
+<script>
+(function () {
+  var FRAMES = [];
+  try { FRAMES = JSON.parse(document.getElementById("dg-frames").textContent || "[]"); } catch (e) { FRAMES = []; }
+  var cv = document.getElementById("cv"), meta = document.getElementById("meta"),
+      prog = document.getElementById("prog"), scrub = document.getElementById("scrub"),
+      playBtn = document.getElementById("play"), restartBtn = document.getElementById("restart"),
+      fcount = document.getElementById("fcount");
+
+  if (!FRAMES.length) { cv.textContent = "(no diffusion frames captured)"; return; }
+  scrub.max = String(FRAMES.length - 1);
+  fcount.textContent = FRAMES.length + " frames";
+
+  var idx = 0, playing = true, stepMs = 90, timer = null, holding = false;
+
+  function render(i) {
+    var f = FRAMES[i] || {};
+    cv.textContent = (f.x != null ? f.x : "");
+    // unsettled early steps read as noise: ramp opacity up as the step approaches the block's total
+    var frac = f.t ? Math.min(1, f.s / f.t) : 1;
+    cv.style.opacity = (0.55 + 0.45 * frac).toFixed(2);
+    meta.textContent = "block " + (f.b || 0) + " · step " + (f.s || 0) + "/" + (f.t || 0);
+    prog.style.width = (100 * frac).toFixed(1) + "%";
+    scrub.value = String(i);
+  }
+
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms); }
+  function tick() {
+    if (!playing) return;
+    if (idx >= FRAMES.length - 1) {           // hold on the settled canvas, then loop
+      if (!holding) { holding = true; schedule(1400); return; }
+      holding = false; idx = 0; render(idx); schedule(700); return;
+    }
+    idx += 1; render(idx); schedule(stepMs);
+  }
+  function setPlaying(p) { playing = p; playBtn.textContent = p ? "Pause" : "Play"; if (p) { holding = false; schedule(stepMs); } else { clearTimeout(timer); } }
+
+  playBtn.onclick = function () { setPlaying(!playing); };
+  restartBtn.onclick = function () { idx = 0; render(idx); setPlaying(true); };
+  scrub.oninput = function () { setPlaying(false); idx = parseInt(scrub.value, 10) || 0; render(idx); };
+  Array.prototype.forEach.call(document.querySelectorAll(".speed button"), function (b) {
+    b.onclick = function () { stepMs = parseInt(b.getAttribute("data-ms"), 10) || 90; if (playing) schedule(stepMs); };
+  });
+
+  render(0);
+  schedule(700);
+})();
+</script>
+</body>
+</html>
