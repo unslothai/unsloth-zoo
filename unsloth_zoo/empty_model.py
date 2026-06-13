@@ -576,10 +576,23 @@ def set_additional_modules(new_model, quant_state_dict, config):
     def _unwrap_tensor(val):
         return getattr(val, "data", val)
 
-    if hasattr(new_model, "language_model"):
+    # Locate the text submodule that holds `embed_tokens`. Three layouts are
+    # observed across transformers >= 5.0:
+    #   1. new_model.language_model.embed_tokens    (old VL: Gemma3, Mistral3,
+    #      Llama-VL via *ForConditionalGeneration with `language_model` exposed
+    #      directly on the outer class).
+    #   2. new_model.model.embed_tokens            (text-only models and
+    #      Qwen3-VL which folds embed_tokens onto the outer .model wrapper).
+    #   3. new_model.model.language_model.embed_tokens (Qwen2.5-VL: outer is
+    #      Qwen2_5_VLForConditionalGeneration, .model is Qwen2_5_VLModel which
+    #      stores the text model under .language_model).
+    # The prefix has to match the key path in quant_state_dict so the embed/
+    # norm/lm_head lookups below resolve correctly.
+    if hasattr(new_model, "language_model") and hasattr(new_model.language_model, "embed_tokens"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
-    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model") \
+         and hasattr(new_model.model.language_model, "embed_tokens"):
         language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     else:

@@ -743,6 +743,267 @@ def patch_vllm_graph_capture():
 pass
 
 
+def patch_vllm_decompose_size_nodes():
+    """
+    Workaround for vLLM upstream bug: ``_decompose_size_nodes`` only rewrites
+    top-level ``user.args`` references to size nodes, missing the ones nested
+    inside ``slice(start, stop, step)``, tuples/lists, and kwargs. The trailing
+    ``graph.graph.erase_node(node)`` then trips ``torch.fx`` with
+    ``RuntimeError: Tried to erase Node size_N but it still had K users``.
+    Manifests on Qwen3-(4B)-GRPO, Advanced Llama3.2 GRPO LoRA, Qwen3 8B FP8 GRPO,
+    Llama FP8 GRPO, Qwen2.5-7B VL GRPO during ``FastVisionModel.from_pretrained
+    (fast_inference=True)``. Qwen3-VL-(8B) Vision-GRPO is unaffected because its
+    graph only emits ``getitem(size, idx)`` users (handled by the upstream
+    ``if`` branch). Canonical upstream fix: vllm-project/vllm#42543 (open at
+    SHA 51fd86e). Port the recursive rewrite + add a kwargs sweep PR #42543
+    misses + final ``if node.users: warn-and-skip`` safety net.
+
+    Opt out with ``UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH=1``.
+    """
+    if os.environ.get("UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH", "0") == "1":
+        return
+    try:
+        import vllm
+    except ImportError:
+        return
+    if not (Version("0.11.0") <= Version(vllm_version) < Version("0.99")):
+        return
+    try:
+        import vllm.compilation.backends as _B
+    except Exception:
+        return
+    if not hasattr(_B, "_decompose_size_nodes"):
+        return
+    _orig = _B._decompose_size_nodes
+    if getattr(_orig, "_unsloth_patched", False):
+        return
+    try:
+        import operator
+        from torch import fx
+    except Exception:
+        return
+
+    def _substitute_scalar(value, node, replacement):
+        # Recursive scalar substitute: replace every `node` reference
+        # inside `value` (which may be a slice, tuple, list, or plain
+        # fx.Node) with `replacement`. Used for the single-dim
+        # `tensor.size(dim)` case where `node` is a SymInt that callers
+        # plug into slices, tuples, kwargs etc.
+        if isinstance(value, fx.Node) and value is node:
+            return replacement
+        if isinstance(value, slice):
+            return slice(
+                _substitute_scalar(value.start, node, replacement),
+                _substitute_scalar(value.stop,  node, replacement),
+                _substitute_scalar(value.step,  node, replacement),
+            )
+        if isinstance(value, (tuple, list)):
+            return type(value)(_substitute_scalar(x, node, replacement) for x in value)
+        return value
+
+    def _replace_in_args(args, node, dims, _depth=0):
+        # Whole-size `tensor.size()` case (returns a Size tuple).
+        # `node` is expected to appear in user.args / user.kwargs in
+        # one of two shapes we are confident about:
+        #   1. As a varargs spread: `fn(t.size(), other)` -- expand
+        #      dims inline at the TOP level. This matches the upstream
+        #      call sites of getitem-on-size.
+        #   2. As a getitem consumer: `getitem(t.size(), i)` -- handled
+        #      at the call site via `user.args[1]` indexing and never
+        #      reaches this helper.
+        # Anything nested inside a tuple / list / kwargs is NOT safe to
+        # silently expand: it would shift element positions in ways the
+        # consumer never asked for. Leave it unchanged so the
+        # `node.users` safety net surfaces it cleanly.
+        out = []
+        for a in args:
+            if isinstance(a, fx.Node) and a is node and _depth == 0:
+                out.extend(dims)
+            elif isinstance(a, (tuple, list)):
+                out.append(type(a)(_replace_in_args(list(a), node, dims, _depth + 1)))
+            else:
+                out.append(a)
+        return out
+
+    def _decompose_size_nodes(graph):
+        size_nodes = list(graph.graph.find_nodes(op="call_method", target="size"))
+        for node in size_nodes:
+            tensor_node = node.args[0]
+            ev = tensor_node.meta.get("example_value")
+            if ev is None:
+                continue
+            # `tensor.size(dim)` returns a single SymInt; `tensor.size()`
+            # returns the full Size tuple. Behaviour at user sites is
+            # entirely different -- the single-dim form gets plugged into
+            # slices, tuples, kwargs and must substitute element-wise.
+            single_dim_idx = None
+            if len(node.args) >= 2 and isinstance(node.args[1], int):
+                single_dim_idx = node.args[1]
+            dims = []
+            with graph.graph.inserting_after(tensor_node):
+                for i in range(ev.dim()):
+                    dv = ev.shape[i]
+                    if isinstance(dv, torch.SymInt):
+                        dn = graph.graph.call_function(
+                            torch.ops.aten.sym_size.int, args = (tensor_node, i),
+                        )
+                        dn.meta["example_value"] = dv
+                        dims.append(dn)
+                    else:
+                        dims.append(int(dv))
+            if single_dim_idx is not None:
+                # Single-dim mode: `node` represents a scalar. Replace
+                # every reference to it (including inside slices) with
+                # the corresponding `dims[single_dim_idx]` entry.
+                replacement = dims[single_dim_idx]
+                for user in list(node.users):
+                    user.args = tuple(
+                        _substitute_scalar(a, node, replacement) for a in user.args
+                    )
+                    if user.kwargs:
+                        user.kwargs = {
+                            k: _substitute_scalar(v, node, replacement)
+                            for k, v in user.kwargs.items()
+                        }
+            else:
+                for user in list(node.users):
+                    if (
+                        user.op == "call_function"
+                        and user.target is operator.getitem
+                        and len(user.args) == 2
+                        and user.args[0] is node
+                    ):
+                        user.replace_all_uses_with(dims[user.args[1]])
+                        graph.graph.erase_node(user)
+                    else:
+                        user.args = tuple(_replace_in_args(list(user.args), node, dims))
+                        if user.kwargs:
+                            new_kwargs = {}
+                            for k, v in user.kwargs.items():
+                                if isinstance(v, (tuple, list)):
+                                    new_kwargs[k] = type(v)(_replace_in_args(list(v), node, dims))
+                                elif isinstance(v, fx.Node) and v is node:
+                                    # `kw=size_node` -- the kwarg expects the
+                                    # full shape tuple (e.g. torch.reshape(...,
+                                    # shape=x.size())), not a single dimension.
+                                    # Picking dims[0] would shrink shape to a
+                                    # scalar and produce invalid graph
+                                    # semantics. Pass the decomposed dims as
+                                    # a tuple, matching torch.Size semantics.
+                                    new_kwargs[k] = tuple(dims)
+                                else:
+                                    new_kwargs[k] = _replace_in_args([v], node, dims)[0]
+                            user.kwargs = new_kwargs
+            if node.users:
+                # The recursive rewrite did not replace every reference.
+                # Raise cleanly without calling `graph.graph.erase_node`
+                # again: by this point we have already mutated
+                # `user.args` / `user.kwargs` for the users we *did*
+                # rewrite, and a stray erase_node would amplify the
+                # partial-rewrite damage on the fx graph. Surface the
+                # original ground-truth error message vllm would have
+                # raised so a vllm-side fix can be debugged from the
+                # stacktrace alone.
+                raise RuntimeError(
+                    f"Unsloth: vllm _decompose_size_nodes left {node.name} "
+                    f"with users {dict(node.users)} after the recursive "
+                    f"rewrite. This indicates a node-reference shape we "
+                    f"did not handle (please report). See "
+                    f"vllm-project/vllm#42543 + unsloth-zoo "
+                    f"patch_vllm_decompose_size_nodes. Set "
+                    f"UNSLOTH_DISABLE_VLLM_DECOMPOSE_SIZE_PATCH=1 to "
+                    f"opt out and surface upstream's original error."
+                )
+            graph.graph.erase_node(node)
+    pass
+
+    _decompose_size_nodes._unsloth_patched = True
+    _B._decompose_size_nodes = _decompose_size_nodes
+    logger.info("Unsloth: patched vllm.compilation.backends._decompose_size_nodes (vllm#42543).")
+pass
+
+
+def _flashinfer_toolchain_present() -> bool:
+    """Return True iff nvcc and ninja are both available.
+
+    Duplicated check from `load_vllm` so `_poison_flashinfer_if_unusable`
+    can run BEFORE `load_vllm` is called (the env var
+    `UNSLOTH_VLLM_NO_FLASHINFER` is only flipped to "1" inside `load_vllm`,
+    so gating the poison on it alone made it a no-op in the normal
+    `patch_vllm` -> `load_vllm` chain).
+    """
+    _has_nvcc = (
+        shutil.which("nvcc") is not None
+        or os.path.isfile(os.path.join(os.environ.get("CUDA_HOME", ""), "bin", "nvcc"))
+        or os.path.isfile(os.path.join(os.environ.get("CUDA_PATH", ""), "bin", "nvcc"))
+        or os.path.isfile("/usr/local/cuda/bin/nvcc")
+    )
+    _has_ninja = shutil.which("ninja") is not None
+    return bool(_has_nvcc and _has_ninja)
+
+
+def _poison_flashinfer_if_unusable() -> None:
+    """Block ``import flashinfer`` early when nvcc / ninja are missing.
+
+    vllm's ``vllm.utils.flashinfer.has_flashinfer`` is ``@functools.cache``-
+    decorated, so the first caller wins for the lifetime of the process.
+    The poison previously lived inside ``load_vllm``; any caller that
+    materialised a VllmConfig before reaching that line would cache
+    ``has_flashinfer() == True`` and the backend selector would still
+    pick FLASHINFER. Run the same nvcc+ninja preflight here so the
+    poison fires under `patch_vllm` even when the user has not set
+    `UNSLOTH_VLLM_NO_FLASHINFER` manually.
+    """
+    # Explicit user opt-out: skip the poison entirely.
+    if os.environ.get("UNSLOTH_VLLM_FORCE_FLASHINFER", "0") == "1":
+        return
+    # Explicit user opt-in still works.
+    forced = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "1"
+    # Otherwise probe the toolchain ourselves. The probe is cheap.
+    if not forced and _flashinfer_toolchain_present():
+        return
+    # Refuse to clobber an already-loaded flashinfer. If the user (or
+    # some other library) imported flashinfer BEFORE patch_vllm ran, the
+    # module is presumably usable in that environment. Overwriting
+    # `sys.modules["flashinfer"]` with `None` would break their code at
+    # the next attribute access. Log a warning so the situation is
+    # visible and skip the poison.
+    existing = sys.modules.get("flashinfer")
+    if existing is not None and getattr(existing, "__file__", None):
+        logger.warning(
+            "Unsloth: flashinfer is already imported (%s); skipping the "
+            "auto-disable poison so we do not break the live reference. "
+            "Set UNSLOTH_VLLM_NO_FLASHINFER=1 before importing flashinfer "
+            "to force the off path.",
+            getattr(existing, "__file__", "?"),
+        )
+        return
+    # Mark for downstream code that may read the env var.
+    os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
+    # Atomic-ish swap: set the sentinel FIRST so any parallel importer
+    # racing against us sees `None` rather than a missing key.
+    try:
+        sys.modules["flashinfer"] = None
+        for _name in list(sys.modules):
+            if _name.startswith("flashinfer.") and _name != "flashinfer":
+                # Re-pin the children after the parent sentinel is in
+                # place; an `import flashinfer.foo` after this point
+                # will get the parent's `None` and raise ImportError.
+                sys.modules[_name] = None
+    except Exception:
+        pass
+    try:
+        from vllm.utils import flashinfer as _vllm_fi
+        if hasattr(_vllm_fi, "has_flashinfer") and \
+                hasattr(_vllm_fi.has_flashinfer, "cache_clear"):
+            _vllm_fi.has_flashinfer.cache_clear()
+    except Exception:
+        # vllm < 0.10.x lacks `vllm.utils.flashinfer`. Poison still
+        # works via the sys.modules sentinel; the cache_clear was
+        # belt + suspenders.
+        pass
+
+
 def patch_vllm(debug = True):
     # Disable vLLM multiprocessing so we can access model_executor.
     logger.info(f'Unsloth: Patching vLLM')
@@ -750,6 +1011,7 @@ def patch_vllm(debug = True):
     if debug or os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
     # os.environ["VLLM_TRACE_FUNCTION"] = "1"
+    _poison_flashinfer_if_unusable()
     patch_vllm_set_inductor_config()
     patch_bitsandbytes_quant_state()
     patch_vllm_bitsandbytes()
@@ -771,6 +1033,7 @@ def patch_vllm(debug = True):
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
+    patch_vllm_decompose_size_nodes()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -1801,6 +2064,13 @@ def load_vllm(
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
+    # FP8 + CUDA graph capture trips `cudaErrorNotPermitted` during
+    # `torch.cuda.graph.capture_end()` on Blackwell (observed on B200 with
+    # Qwen3_8B_FP8_GRPO and Llama_FP8_GRPO). Allow the env var
+    # `UNSLOTH_VLLM_ENFORCE_EAGER=1` to skip CUDA graph capture so the
+    # affected models can train, at the cost of slower inference.
+    if not enforce_eager and os.getenv("UNSLOTH_VLLM_ENFORCE_EAGER", "0") == "1":
+        enforce_eager = True
 
     free_memory, total_memory = get_mem_info()
     # If T4 ie 15GB, we use 0.85 since it'll rarely OOM. Other GPUs 0.9
@@ -1992,11 +2262,38 @@ def load_vllm(
                 f"    ninja - pip install ninja\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
-            # Clear any externally-set FlashInfer env vars so vLLM uses defaults
-            if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
-                del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
+            # Force vLLM off FlashInfer when nvcc/ninja are missing.
+            # Env-var nudging is not enough: `VLLM_ATTENTION_BACKEND` is
+            # not recognised by vllm 0.19.1 (envs.py reports "Unknown
+            # vLLM environment variable detected") and vLLM still picks
+            # FLASHINFER from `['FLASHINFER', 'FLASH_ATTN', 'TRITON_ATTN',
+            # 'FLEX_ATTENTION']` on sm_100/sm_120, then JIT-compiles the
+            # trtllm-gen kernels and crashes inside `vllm.LLM()`. Block
+            # `import flashinfer` at the module level so vLLM's
+            # `try: import flashinfer except ImportError` branch in
+            # `vllm.platforms.cuda.get_attn_backend_cls` picks FLASH_ATTN
+            # instead. Also clear any user-set env vars and propagate to
+            # UNSLOTH_VLLM_NO_FLASHINFER for the rest of unsloth_zoo.
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
+            # A user-forced VLLM_ATTENTION_BACKEND=FLASHINFER would keep
+            # vLLM pinned to FLASHINFER even after we poison the import,
+            # so vllm.LLM() still tries to load it and crashes. Drop the
+            # override here so vLLM's own `try: import flashinfer except
+            # ImportError` branch picks FLASH_ATTN instead.
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
-                del os.environ["VLLM_ATTENTION_BACKEND"]
+                os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+            try:
+                # Drop any cached flashinfer module then mark it None so
+                # `import flashinfer` raises ImportError. None-in-sys.modules
+                # is the documented Python idiom for "this module fails to
+                # import"; see https://docs.python.org/3/reference/import.html.
+                for _name in list(sys.modules):
+                    if _name == "flashinfer" or _name.startswith("flashinfer."):
+                        del sys.modules[_name]
+                sys.modules["flashinfer"] = None
+            except Exception:
+                pass
         else:
             # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
