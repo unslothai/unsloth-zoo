@@ -667,6 +667,37 @@ def patch_vllm_enable_sleep_mode():
 pass
 
 
+def patch_vllm_reset_caches_on_sleep():
+    # Vision GRPO + standby crashes: the multimodal (P0 sender / P1 receiver)
+    # and encoder caches hold GPU-backed tensors whose memory sleep() unmaps,
+    # so the next access faults (cudaErrorIllegalAddress at empty_cache) or the
+    # caches desync ("Expected a cached item for mm_hash=..."). Clear them before
+    # each sleep, while their CUDA memory is still mapped, keeping P0/P1 in sync.
+    # No-op and cheap for text models (caches absent / null-guarded).
+    import functools
+    if getattr(vllm.LLM, "_unsloth_reset_caches_on_sleep", False): return
+    _orig_sleep = vllm.LLM.sleep
+
+    def _reset_caches(llm):
+        for owner, name in ((llm, "reset_mm_cache"),
+                            (getattr(llm, "llm_engine", None), "reset_encoder_cache")):
+            fn = getattr(owner, name, None)
+            if fn is None: continue
+            try: fn()
+            except Exception as e: logger.debug(f"Unsloth: {name} pre-sleep skipped: {e}")
+
+    @functools.wraps(_orig_sleep)
+    def new_sleep(self, *args, **kwargs):
+        _reset_caches(self)
+        gc.collect()
+        return _orig_sleep(self, *args, **kwargs)
+
+    vllm.LLM.sleep = new_sleep
+    vllm.LLM._unsloth_reset_caches_on_sleep = True
+    logger.info("Unsloth: patched vLLM LLM.sleep to reset multimodal/encoder caches.")
+pass
+
+
 def patch_vllm_graph_capture():
     """Temporarily disable gc.collect to speed up CUDA graph capture with torch.compile."""
     from contextlib import contextmanager
@@ -1032,6 +1063,7 @@ def patch_vllm(debug = True):
             )
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
+        patch_vllm_reset_caches_on_sleep()
     patch_vllm_graph_capture()
     patch_vllm_decompose_size_nodes()
     global LORA_REQUEST_ID
@@ -2063,6 +2095,17 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
+    # vLLM standby (sleep mode) corrupts the CuMemAllocator sleep/wake cycle for
+    # multimodal models (cudaErrorIllegalAddress at empty_cache on the first
+    # sleep), regardless of VRAM headroom. Text models are unaffected. Disable
+    # standby for vision models; override with UNSLOTH_VLLM_STANDBY_VISION=1.
+    if unsloth_vllm_standby and is_vision_model and \
+        os.getenv("UNSLOTH_VLLM_STANDBY_VISION", "0") == "0":
+        logger.warning(
+            "Unsloth: vLLM standby (sleep mode) is unstable for multimodal models; "
+            "disabling it for this vision run. Set UNSLOTH_VLLM_STANDBY_VISION=1 to force."
+        )
+        unsloth_vllm_standby = False
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
     # FP8 + CUDA graph capture trips `cudaErrorNotPermitted` during
