@@ -83,6 +83,32 @@ def _resolve_bin(server_bin=None):
     return os.path.abspath(cand)
 
 
+def _bundled_cuda_lib_dirs():
+    """CUDA runtime lib dirs bundled in this venv (pip nvidia-* wheels + torch).
+
+    Prefer these over a system CUDA toolkit that happens to be on the library path: on
+    Linux/WSL2 the system libcudart (e.g. CUDA 13.3) crashes inside the NVIDIA PTX JIT
+    compiler during cudaGetDeviceCount ("munmap_chunk(): invalid pointer"), while the
+    bundled cu13 runtime works. Linux analogue of the Windows torch\\lib issue (#6273).
+    Returns existing directories only."""
+    dirs = []
+    try:
+        # this file: <site-packages>/unsloth_zoo/diffusion_studio/visual_engine.py
+        sp = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        nvidia_root = os.path.join(sp, "nvidia")
+        if os.path.isdir(nvidia_root):
+            for name in sorted(os.listdir(nvidia_root)):  # cu13 sorts first -> libcudart resolves here
+                lib = os.path.join(nvidia_root, name, "lib")
+                if os.path.isdir(lib):
+                    dirs.append(lib)
+        torch_lib = os.path.join(sp, "torch", "lib")
+        if os.path.isdir(torch_lib):
+            dirs.append(torch_lib)
+    except Exception:
+        pass
+    return dirs
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
@@ -92,8 +118,17 @@ class VisualServer:
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), NGL="99", MAXTOK=str(maxtok))
-        env["LD_LIBRARY_PATH"] = os.path.dirname(self.server_bin) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        # MAXTOK is the per-turn diffusion canvas; it is NON-CAUSAL, so the compute buffer grows
+        # ~quadratically with canvas size (the full model context, e.g. 32768, reserves a ~77 GB
+        # buffer -> cudaMalloc OOM on a 24 GB GPU). On a single consumer GPU, fall back to the
+        # server's MAXTOK=0 auto-size path (probe the largest canvas that fits VRAM).
+        _dg_maxtok = int(maxtok) if 0 < int(maxtok) <= 8192 else 0
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), NGL="99", MAXTOK=str(_dg_maxtok))
+        # Prepend the binary dir AND the bundled CUDA runtime libs (pip nvidia-* / torch) so the
+        # visual-server loads the matching cu13 runtime instead of a system CUDA toolkit that
+        # crashes in the WSL PTX JIT during cudaGetDeviceCount. Linux analogue of #6273.
+        _libpath = [os.path.dirname(self.server_bin)] + _bundled_cuda_lib_dirs()
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(_libpath + [env.get("LD_LIBRARY_PATH", "")]).strip(os.pathsep)
         self.env = env
         self.p = None
         self._spawn()
