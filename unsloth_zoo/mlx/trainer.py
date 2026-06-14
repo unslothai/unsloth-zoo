@@ -382,13 +382,21 @@ class MLXTrainingConfig:
     weight_decay: float = 0.001
     adam_beta1: float | None = None
     adam_beta2: float | None = None
-    max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
+    # Global L2 norm clip (transformers/CUDA max_grad_norm). Disabled by
+    # default on MLX: the per-leaf cap below is the default instead, since
+    # global norm's cross-tree reduction costs more peak memory (measured
+    # ~1 GB more at 3B, scaling with size). Set this for CUDA-exact clipping;
+    # note per-leaf and global agree when no spike binds but diverge on
+    # gradient spikes (per-leaf cannot see an aggregate norm spread across
+    # many tensors).
+    max_grad_norm: float = 0.0
     # Elementwise clip to `[-v, +v]`. None means "not requested";
     # positive values override other clipping modes to preserve API meaning.
     max_grad_value: float | None = None
-    # Proportional per-leaf L2 norm cap. This preserves each tensor's gradient
-    # direction and avoids max_grad_norm's cross-tree memory overhead.
-    # None uses MLX's cheap default of 1.0 unless another clip knob is explicit.
+    # Proportional per-leaf L2 norm cap and the MLX default (1.0 when no clip
+    # knob is set). Preserves each tensor's direction and avoids max_grad_norm's
+    # cross-tree memory overhead, but is not a drop-in for global max_grad_norm
+    # (see above). None uses the 1.0 default unless another clip knob is explicit.
     max_grad_leaf_norm: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
