@@ -2621,8 +2621,16 @@ def encode_conversations_with_harmony(
             convos.append(Message.from_role_and_content(Role.USER, message["content"]))
         elif message["role"] == "assistant":
             if "thinking" in message:
-                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = Message.from_role_and_content(Role.ASSISTANT, message["thinking"])
                 x = x.with_channel("analysis")
+                convos.append(x)
+                # An assistant turn can carry both reasoning and a final answer; emit the
+                # final-channel response too so it is not dropped from the encoded conversation.
+                if message.get("content"):
+                    final = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                    final = final.with_channel("final")
+                    convos.append(final)
+                continue
             elif "tool_calls" in message:
                 x = Message.from_role_and_content(Role.ASSISTANT, message["tool_calls"][0]["arguments"])
                 x = x.with_channel("commentary").with_recipient(f"functions.{message['tool_calls'][0]['name']}").with_content_type("json")

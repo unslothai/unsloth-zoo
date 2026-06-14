@@ -416,6 +416,107 @@ def test_encode_conversations_with_harmony_partial_build_lists_missing_symbol(
         gpt_oss.encode_conversations_with_harmony([])
 
 
+def _encode_and_capture_messages(monkeypatch, gpt_oss, messages):
+    # Run the encoder with the fake harmony stubs and return the per-channel assistant
+    # Message objects that were appended to the conversation (the system message is index 0).
+    encoding = _Encoding()
+    _install_fake_harmony(monkeypatch, gpt_oss, lambda name: encoding)
+    gpt_oss.encode_conversations_with_harmony(messages)
+    conversation = encoding.calls[0][1]
+    return [m for m in conversation if m.role == _Role.ASSISTANT]
+
+
+def test_assistant_thinking_with_content_emits_analysis_and_final(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # Core regression for unsloth-zoo#246: the analysis channel must carry the reasoning
+    # from message["thinking"], and the answer in message["content"] must still be emitted
+    # on the final channel rather than dropped.
+    messages = [
+        {"role": "assistant", "thinking": "let me reason", "content": "the answer"},
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    analysis = [m for m in assistant_messages if m.channel == "analysis"]
+    final = [m for m in assistant_messages if m.channel == "final"]
+
+    assert len(analysis) == 1
+    assert analysis[0].content == "let me reason"
+    assert len(final) == 1
+    assert final[0].content == "the answer"
+
+
+def test_assistant_thinking_only_emits_single_analysis(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # A pure-reasoning turn (thinking present, no/empty content) must produce only the
+    # analysis message carrying the reasoning, and no final message.
+    messages = [
+        {"role": "assistant", "thinking": "just reasoning", "content": ""},
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0].channel == "analysis"
+    assert assistant_messages[0].content == "just reasoning"
+
+
+def test_assistant_plain_content_unchanged_final_only(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # No thinking and no tool_calls: exactly one final-channel message from content.
+    messages = [
+        {"role": "assistant", "content": "plain answer"},
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0].channel == "final"
+    assert assistant_messages[0].content == "plain answer"
+
+
+def test_mixed_multi_turn_preserves_channels_and_branches(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # user -> assistant(thinking+content) -> tool -> assistant(final): confirm channel
+    # ordering and that the tool_calls / tool branches stay untouched.
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "thinking": "reason about it", "content": "first answer"},
+        {"role": "tool", "name": "lookup", "content": "tool result"},
+        {"role": "assistant", "content": "final answer"},
+    ]
+    encoding = _Encoding()
+    _install_fake_harmony(monkeypatch, gpt_oss_module, lambda name: encoding)
+    gpt_oss_module.encode_conversations_with_harmony(messages)
+    conversation = encoding.calls[0][1]
+
+    # Drop the leading system message, then assert the channel sequence.
+    body = [m for m in conversation if m.role != _Role.SYSTEM]
+    channels = [m.channel for m in body]
+    assert channels == [None, "analysis", "final", "commentary", "final"]
+
+    analysis = body[1]
+    assert analysis.content == "reason about it"
+    first_final = body[2]
+    assert first_final.content == "first answer"
+
+    tool_message = body[3]
+    assert tool_message.channel == "commentary"
+    assert tool_message.recipient == "assistant"
+    assert tool_message.content == "tool result"
+
+
 def test_encode_conversations_with_harmony_load_failure_retried_then_cached(
     monkeypatch,
     harmony_state,
