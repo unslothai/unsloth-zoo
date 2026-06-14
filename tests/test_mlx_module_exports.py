@@ -14,9 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PR-A integration: every MLX-using unsloth_zoo module imports under the shim
-and exposes the symbols PR-B's Studio code calls. A `_Noop` /
-NotImplementedError failure points at a TODO in mlx_simulation/.
+"""Verify every MLX-using unsloth_zoo module imports under the shim
+and exposes the symbols Studio integrations rely on.
+
+If a test fails with `_Noop` / NotImplementedError, the failing
+symbol identifies a TODO in mlx_simulation/.
 """
 
 from __future__ import annotations
@@ -43,14 +45,14 @@ def _install_shim():
     "unsloth_zoo.mlx.cce.runtime_cce",
     "unsloth_zoo.gated_delta_vjp",
 ])
-def test_pr_a_module_imports(module_path):
+def test_mlx_module_imports(module_path):
     import importlib
     mod = importlib.import_module(module_path)
     assert mod is not None
 
 
 # ---------------------------------------------------------------------------
-# 2. PR-B contract: FastMLXModel and the dynamically-attached save methods
+# 2. Studio backend contract: FastMLXModel and the dynamically-attached save methods
 #    must be reachable.
 # ---------------------------------------------------------------------------
 
@@ -82,9 +84,10 @@ def test_full_finetune_dtype_default_matches_torch_bf16():
 
 
 def test_fast_mlx_model_save_helpers_exist():
-    """PR-B calls save_pretrained_merged / save_lora_adapters / push_to_hub_merged
-    on the FastMLXModel instance; the helpers are module-level in loader.py and
-    attached via types.MethodType after load.
+    """Studio backend calls model.save_pretrained_merged / save_lora_adapters /
+    push_to_hub_merged on the FastMLXModel INSTANCE returned by
+    FastMLXModel.from_pretrained.  The helpers are module-level in
+    loader.py and attached via types.MethodType after load.
     """
     import unsloth_zoo.mlx.loader as ml
     # Free functions must exist.
@@ -103,7 +106,7 @@ def test_trainer_classes():
         MLXTrainer,
         MLXTrainingConfig,
     )
-    # train_on_responses_only is the third symbol PR-B imports
+    # train_on_responses_only is the third symbol Studio backend imports
     import unsloth_zoo.mlx.trainer as mt
     assert hasattr(mt, "train_on_responses_only") or hasattr(mt, "MLXTrainer")
 
@@ -115,7 +118,7 @@ def test_trainer_classes():
 def test_mlx_loader_dequantize_replace_callable():
     """The dequantize-and-replace helper used by FastMLXModel.from_pretrained."""
     import unsloth_zoo.mlx.loader as ml
-    # PR-A names this `_dequantize_selected_mlx_modules`.
+    # The loader names this `_dequantize_selected_mlx_modules`.
     assert hasattr(ml, "_dequantize_selected_mlx_modules"), (
         "expected _dequantize_selected_mlx_modules in unsloth_zoo.mlx.loader. "
         f"Got dequant-related: {[a for a in dir(ml) if 'dequant' in a.lower()]}"
@@ -217,4 +220,7 @@ def test_adam_optimizers_enable_bias_correction():
             args=MLXTrainingConfig(optim=optim_name),
         )
         optimizer = trainer._build_optimizer(total_steps=10)
-        assert optimizer._kw["bias_correction"] is True
+        if hasattr(optimizer, "_kw"):
+            assert optimizer._kw["bias_correction"] is True
+        else:
+            assert optimizer.bias_correction is True

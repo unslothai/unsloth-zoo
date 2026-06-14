@@ -77,3 +77,17 @@ jobs:
         # Exercises the MLX-on-torch shim end-to-end against the real mlx runtime
         # on Apple Silicon; on Linux runners it would run against tests/mlx_simulation/ stubs.
         run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v
+
+      - name: tests/test_qwen35_vjp_metal.py
+        # Metal VJP regressions for the qwen3_5 training patches (issue 6002).
+        run: python -m pytest tests/test_qwen35_vjp_metal.py -v -rs
+
+      - name: tests/test_mlx_training_e2e_metal.py
+        # Real LoRA training smoke: tiny 4-bit model through FastMLXModel +
+        # MLXTrainer, exercising the PR 684 trainer rework end to end.
+        run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
+
+      - name: tests/test_mlx_pr684_full_validation_metal.py
+        # Deep behavior checks: resume determinism, completion-only training,
+        # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
+        run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs

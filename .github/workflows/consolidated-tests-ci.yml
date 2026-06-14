@@ -106,14 +106,14 @@ jobs:
             tests/test_mlx_finetune_last_n_layers.py \
             -v
 
-      - name: pytest tests/test_pr_a_imports + zoo-specific CPU tests
+      - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
         # test_pypi_version_sync from reaching pypi.org.
         continue-on-error: true
         run: |
           python -m pytest \
-            tests/test_pr_a_imports.py \
+            tests/test_mlx_module_exports.py \
             tests/test_rl_replacements_cpu.py \
             tests/test_temporary_patches_imports.py \
             tests/test_zoo_history_regressions.py \

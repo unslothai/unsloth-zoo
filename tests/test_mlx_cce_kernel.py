@@ -14,8 +14,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PR-A end-to-end component exercises through the shim: constructs inputs and
-runs the function bodies (deeper than test_pr_a_imports.py)."""
+"""End-to-end MLX CCE kernel exercises through the simulation shim.
+
+Goes one level deeper than test_mlx_module_exports.py: actually
+constructs inputs and runs the function bodies, one critical CCE
+code path per test.
+"""
 
 from __future__ import annotations
 
@@ -195,7 +199,7 @@ def test_custom_function_forward_and_backward():
 
 
 # ---------------------------------------------------------------------------
-# 4. mx.array isinstance contract that PR-A relies on.
+# 4. mx.array isinstance contract that MLX trainer relies on.
 # ---------------------------------------------------------------------------
 
 def test_torch_tensor_is_mx_array():
