@@ -2570,7 +2570,51 @@ def merge_and_overwrite_lora(
 
 
     # Step 7: Check for errors
-    effective_loras = len(lora_weights)
+    # Only count LoRA modules that have at least one corresponding safetensor key.
+    # Some LoRA keys may target sub-modules that don't exist in the base
+    # safetensors (e.g. vision-tower adapters on a VLM whose base weights
+    # omit the vision tower).  Excluding those prevents a false-positive
+    # mismatch while keeping the sanity check meaningful.
+    from collections import Counter as _SanityCounter
+
+    _effective_lora_set: set = set()
+    _sub_votes = _SanityCounter()
+    for _lw_key in lora_weights:
+        if not isinstance(_lw_key, str):
+            continue
+        _k_parts = _lw_key.split(".")
+        _direct_ok = False
+        for _sf in safetensor_keys_seen:
+            _sf_parts = _sf[: -len(".weight")].split(".")
+            _cs = 0
+            for _i in range(1, min(len(_k_parts), len(_sf_parts)) + 1):
+                if _k_parts[-_i] == _sf_parts[-_i]:
+                    _cs = _i
+                else:
+                    break
+            if _cs >= 3:
+                _lp = ".".join(_k_parts[: -_cs]) + "." if _cs < len(_k_parts) else ""
+                _sp = ".".join(_sf_parts[: -_cs]) + "." if _cs < len(_sf_parts) else ""
+                if _lp == _sp:
+                    _direct_ok = True
+                    break
+                elif _lp and _sp:
+                    _sub_votes[(_lp, _sp)] += 1
+        if _direct_ok:
+            _effective_lora_set.add(_lw_key)
+
+    if _sub_votes:
+        (_best_lp, _best_sp), _ = _sub_votes.most_common(1)[0]
+        for _lw_key in lora_weights:
+            if not isinstance(_lw_key, str):
+                continue
+            if _lw_key in _effective_lora_set:
+                continue
+            if _lw_key.startswith(_best_lp):
+                _effective_lora_set.add(_lw_key)
+
+    effective_loras = len(_effective_lora_set)
+
     # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
     # though only one tensor exists on disk. If we see both logical modules but only one backing
     # tensor key across shards, treat them as a single merged target to avoid an off-by-one on the
@@ -3127,6 +3171,12 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     remapped; unmatched keys (e.g. fused MoE params) inherit the most common
     inferred prefix.
 
+    Also handles the case where LoRA keys and safetensor keys have differently
+    ordered path components (e.g. LoRA has ``model.language_model.`` but
+    safetensor has ``language_model.model.`` in Ministral 3 / Mistral 3 VLMs)
+    by discovering a dominant prefix substitution rule from common suffix
+    matches across all unmatched keys, and applying it globally.
+
     Returns the remapped ``defaultdict``, or ``None`` if nothing was remapped.
     """
     if not safetensor_keys:
@@ -3158,16 +3208,58 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             inferred_prefixes.append(candidates[0])
             changed = True
         else:
-            # No match or ambiguous -- defer to fallback
+            # No exact/prefix match -- defer to global substitution below
             unmatched_keys.append((k, v))
+
+    # Discover a dominant prefix substitution by comparing unmatched LoRA
+    # key prefixes against safetensor key prefixes. This avoids per-key
+    # false matches when different sub-modules (e.g. vision vs language)
+    # share the same trailing path components.
+    if unmatched_keys:
+        from collections import Counter as _Counter2
+        substitution_votes = _Counter2()
+        for k, _ in unmatched_keys:
+            if not isinstance(k, str):
+                continue
+            k_parts = k.split(".")
+            for sf in safetensor_keys:
+                sf_parts = sf[: -len(".weight")].split(".")
+                # Find the longest common suffix between the LoRA key and this safetensor key
+                common_suffix_len = 0
+                for i in range(1, min(len(k_parts), len(sf_parts)) + 1):
+                    if k_parts[-i] == sf_parts[-i]:
+                        common_suffix_len = i
+                    else:
+                        break
+                if common_suffix_len >= 3:  # require at least 3 trailing components
+                    # Record the prefix substitution implied by this match
+                    lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
+                    sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
+                    if lora_prefix and sf_prefix and lora_prefix != sf_prefix:
+                        substitution_votes[(lora_prefix, sf_prefix)] += 1
+
+        # Apply the most-voted substitution to ALL unmatched keys whose
+        # LoRA key starts with that prefix.
+        if substitution_votes:
+            (best_lora_prefix, best_sf_prefix), best_vote_count = substitution_votes.most_common(1)[0]
+            remaining_unmatched = []
+            for k, v in unmatched_keys:
+                if k.startswith(best_lora_prefix):
+                    new_key = best_sf_prefix + k[len(best_lora_prefix):]
+                    remapped[new_key] = v
+                    inferred_prefixes.append(best_sf_prefix)
+                    changed = True
+                else:
+                    remaining_unmatched.append((k, v))
+            unmatched_keys = remaining_unmatched
 
     if not changed:
         return None
 
-    # Unmatched keys (e.g. fused MoE params): use the most common inferred prefix
+    # Apply most common inferred prefix to any still-unmatched keys
     if unmatched_keys and inferred_prefixes:
-        from collections import Counter
-        common_prefix = Counter(inferred_prefixes).most_common(1)[0][0]
+        from collections import Counter as _Counter
+        common_prefix = _Counter(inferred_prefixes).most_common(1)[0][0]
         for k, v in unmatched_keys:
             remapped[common_prefix + k] = v
     else:
