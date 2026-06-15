@@ -2126,8 +2126,7 @@ def convert_to_gguf(
 
     # Check if arch is supported
     supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
-    if supported_types:
-        assert("architectures" in config_file)
+    if supported_types and "architectures" in config_file:
         arch = config_file["architectures"][0]
         if arch not in supported_types:
             raise NotImplementedError(
@@ -2137,8 +2136,11 @@ def convert_to_gguf(
     pass
 
     if is_vlm and supported_vision_archs is not None:
-        arch = config_file["architectures"][0]
-        if arch not in supported_vision_archs:
+        if "architectures" in config_file:
+            arch = config_file["architectures"][0]
+        else:
+            arch = None  # MLX-style config; skip mmproj arch check
+        if arch is not None and arch not in supported_vision_archs:
                 is_vlm = False
                 print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
 

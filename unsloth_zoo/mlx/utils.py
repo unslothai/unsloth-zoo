@@ -5100,6 +5100,33 @@ def save_pretrained_gguf(
                     f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
                 )
 
+        # Strip MTP/nextn config keys so llama.cpp converter
+        # doesn't inflate block_count / inject nextn_predict_layers.
+        # Also restore architectures from the original HF config since
+        # mlx-vlm's save_config strips that key.
+        _config_path = tmp_path / "config.json"
+        if _config_path.exists():
+            _cfg = json.loads(_config_path.read_text())
+            _changed = False
+            for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
+                if _cfg.pop(_key, None) is not None:
+                    _changed = True
+                _tc = _cfg.get("text_config")
+                if _tc and _tc.pop(_key, None) is not None:
+                    _changed = True
+            # Restore architectures from the original HF config
+            if "architectures" not in _cfg:
+                _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
+                if _orig_cfg_path:
+                    _orig_cfg_file = os.path.join(_orig_cfg_path, "config.json")
+                    if os.path.exists(_orig_cfg_file):
+                        _orig_cfg = json.load(open(_orig_cfg_file))
+                        if "architectures" in _orig_cfg:
+                            _cfg["architectures"] = _orig_cfg["architectures"]
+                            _changed = True
+            if _changed:
+                _config_path.write_text(json.dumps(_cfg, indent=2))
+
         # Step 2: Ensure llama.cpp is installed and gguf package is available
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
