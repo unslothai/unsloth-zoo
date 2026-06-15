@@ -1,0 +1,95 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""CPU regression for the fused-3D MoE merge on narrow-expert layouts.
+
+Gemma-4 26B-A4B is a narrow-expert MoE: per expert gate_up is
+(2*intermediate, hidden) with 2*intermediate < hidden, and down is
+(hidden, intermediate). _merge_moe_experts_file infers the fused layout
+from a tensor-shape magnitude check and passes it as is_transposed; that
+check assumes 2*intermediate > hidden, so it mislabels these tensors as
+transposed and the per-expert delta is added with the wrong orientation,
+falling back to the base weight and silently dropping the LoRA delta.
+
+These tests feed the fused mergers a narrow-expert standard layout, both
+with no hint and with the WRONG is_transposed=True hint, and require the
+delta to be applied correctly (the LoRA-dimension layout must win).
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from unsloth_zoo.saving_utils import (
+    LoraStats,
+    _MOE_MERGE_STATE,
+    _merge_moe_fused_down_proj_expert,
+    _merge_moe_fused_gate_up_expert,
+    _reset_moe_merge_state,
+)
+
+SEED = 5410
+# Narrow expert (Gemma-4 26B-A4B ratio): 2*intermediate < hidden.
+NUM_EXPERTS, RANK, HIDDEN, INTERMEDIATE, ALPHA = 4, 2, 16, 3, 8.0
+
+
+def _build(dtype=torch.float32):
+    torch.manual_seed(SEED)
+    TR = NUM_EXPERTS * RANK
+    twoI = 2 * INTERMEDIATE
+    gate_up_W = torch.randn(NUM_EXPERTS, twoI, HIDDEN, dtype=dtype)          # (E, 2I, H)
+    down_W    = torch.randn(NUM_EXPERTS, HIDDEN, INTERMEDIATE, dtype=dtype)  # (E, H, I)
+    # standard PEFT fused: lora_A=(E*r, in), lora_B=(out, E*r)
+    A_gu = torch.randn(TR, HIDDEN, dtype=dtype) * 0.05
+    B_gu = torch.randn(twoI, TR, dtype=dtype) * 0.05
+    A_dn = torch.randn(TR, INTERMEDIATE, dtype=dtype) * 0.05
+    B_dn = torch.randn(HIDDEN, TR, dtype=dtype) * 0.05
+    return gate_up_W, down_W, A_gu, B_gu, A_dn, B_dn
+
+
+def _reference(W, A, B, alpha):
+    out = W.clone().to(torch.float64)
+    for e in range(NUM_EXPERTS):
+        s, t = e * RANK, (e + 1) * RANK
+        out[e] += alpha * (B[:, s:t].to(torch.float64) @ A[s:t, :].to(torch.float64))
+    return out
+
+
+# is_transposed=True is the wrong value the magnitude heuristic produces here.
+@pytest.mark.parametrize("hint", [None, True])
+def test_fused_narrow_expert_merge_applies_delta(hint):
+    gate_up_W, down_W, A_gu, B_gu, A_dn, B_dn = _build()
+    stats_gu = LoraStats(module=None, lora_A=A_gu, lora_B=B_gu, alpha=ALPHA)
+    stats_dn = LoraStats(module=None, lora_A=A_dn, lora_B=B_dn, alpha=ALPHA)
+    kw = {} if hint is None else {"is_transposed": hint}
+
+    _reset_moe_merge_state()
+    gu_out = _merge_moe_fused_gate_up_expert(gate_up_W.clone(), stats_gu, torch.float32, **kw)
+    dn_out = _merge_moe_fused_down_proj_expert(down_W.clone(), stats_dn, torch.float32, **kw)
+
+    gu_ref = _reference(gate_up_W, A_gu, B_gu, ALPHA)
+    dn_ref = _reference(down_W, A_dn, B_dn, ALPHA)
+    gu_err = (gu_out.cpu().to(torch.float64) - gu_ref).abs().max().item()
+    dn_err = (dn_out.cpu().to(torch.float64) - dn_ref).abs().max().item()
+
+    assert _MOE_MERGE_STATE["fallback"] == 0, _MOE_MERGE_STATE["first_error"]
+    assert _MOE_MERGE_STATE["applied"] == 2
+    assert gu_err < 1e-4 and dn_err < 1e-4, f"gate_up={gu_err:.2e} down={dn_err:.2e}"
+    # delta must actually be applied, not the base written through
+    assert not torch.equal(gu_out.cpu(), gate_up_W)
+    assert not torch.equal(dn_out.cpu(), down_W)
+    _reset_moe_merge_state()
