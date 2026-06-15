@@ -2570,73 +2570,11 @@ def merge_and_overwrite_lora(
 
 
     # Step 7: Check for errors
-    # Only count LoRA modules that have at least one corresponding safetensor key.
-    # Some LoRA keys may target sub-modules that don't exist in the base
-    # safetensors (e.g. vision-tower adapters on a VLM whose base weights
-    # omit the vision tower).  Excluding those prevents a false-positive
-    # mismatch while keeping the sanity check meaningful.
-    from collections import Counter as _SanityCounter
-
-    _effective_lora_set: set = set()
-    _sub_votes = _SanityCounter()
-    _prefix_remap_keys = []
-    for _lw_key in lora_weights:
-        if not isinstance(_lw_key, str):
-            continue
-        # O(1) direct match first
-        if (_lw_key + ".weight") in safetensor_keys_seen:
-            _effective_lora_set.add(_lw_key)
-            continue
-        _k_parts = _lw_key.split(".")
-        _direct_ok = False
-        for _sf in safetensor_keys_seen:
-            if not _sf.endswith(".weight"):
-                continue
-            _sf_parts = _sf[: -len(".weight")].split(".")
-            _cs = 0
-            for _i in range(1, min(len(_k_parts), len(_sf_parts)) + 1):
-                if _k_parts[-_i] == _sf_parts[-_i]:
-                    _cs = _i
-                else:
-                    break
-            # Match requires either >=3 trailing components in common,
-            # or the common suffix covers the entire safetensor key
-            # (handles shallow targets like lm_head, embed_tokens).
-            if _cs >= 3 or (_cs > 0 and _cs == len(_sf_parts)):
-                _lp = ".".join(_k_parts[: -_cs]) + "." if _cs < len(_k_parts) else ""
-                _sp = ".".join(_sf_parts[: -_cs]) + "." if _cs < len(_sf_parts) else ""
-                if _lp == _sp:
-                    _direct_ok = True
-                    break
-                elif _lp and _sp:
-                    _sub_votes[(_lp, _sp)] += 1
-                elif not _lp and _sp:
-                    # Prefix-only remap: the entire LoRA key is a suffix of
-                    # the safetensor key. Will be handled by
-                    # _infer_prefix_and_remap later.
-                    _prefix_remap_keys.append(_lw_key)
-                    break
-        if _direct_ok:
-            _effective_lora_set.add(_lw_key)
-
-    # Apply ALL substitution votes, not just the most common one.
-    # Each distinct prefix pair identifies a separate namespace that
-    # _infer_prefix_and_remap handles independently.
-    if _sub_votes:
-        for (_lp, _sp), _ in _sub_votes.most_common():
-            for _lw_key in lora_weights:
-                if not isinstance(_lw_key, str):
-                    continue
-                if _lw_key in _effective_lora_set:
-                    continue
-                if _lw_key.startswith(_lp):
-                    _effective_lora_set.add(_lw_key)
-
-    # Prefix-only remapped keys (entire LoRA key is a suffix of safetensor key)
-    for _lw_key in _prefix_remap_keys:
-        _effective_lora_set.add(_lw_key)
-
-    effective_loras = len(_effective_lora_set)
+    # The remap above already aligns LoRA keys to the saved tensors, so every
+    # mergeable module is counted by n_saved_modules. Re-deriving "backed" keys
+    # here only drifts from the merge's own resolution (.linear, tied embeds,
+    # fused MoE) and caused false mismatches, so count all LoRA modules.
+    effective_loras = len(lora_weights)
 
     # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
     # though only one tensor exists on disk. If we see both logical modules but only one backing
