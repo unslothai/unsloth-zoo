@@ -142,6 +142,16 @@ def _resolve_response_mask_tokenizer(tokenizer):
     return tokenizer
 
 
+def _text_completion_only_loss_arg(args):
+    """Resolve SFT-compatible completion-only loss defaults."""
+    value = getattr(args, "completion_only_loss", None)
+    if value is not None:
+        return value
+    if bool(getattr(args, "train_on_completions", False)):
+        return True
+    return None
+
+
 def _normalize_mlx_optimizer_name(name):
     opt_name = str(name or "adamw").strip().lower()
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
@@ -1600,6 +1610,7 @@ class MLXTrainer:
                             seed=args.seed,
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
+                            completion_only_loss=text_completion_only_loss,
                         )
                     return create_batches(
                         dataset=eval_dataset,
@@ -2002,6 +2013,7 @@ class MLXTrainer:
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -2030,6 +2042,7 @@ class MLXTrainer:
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
+                    completion_only_loss=text_completion_only_loss,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -2045,6 +2058,7 @@ class MLXTrainer:
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
                     num_epochs=vlm_num_epochs,
+                    completion_only_loss=text_completion_only_loss,
                 )
                 if _vlm_mask_fn is not None and batches:
                     _check_vlm_all_masked(batches)

@@ -350,13 +350,13 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     trainer.model = Model()
     trainer.stop_requested = False
 
-    def loss_fn(_model, name):
+    def loss_fn(_model, name, _lengths, _labels):
         if name == "small":
             return mx.array(1.0), mx.array(2)
         return mx.array(3.0), mx.array(6)
 
     loss, ppl = trainer._evaluate(
-        {"small": [("small",)], "large": [("large",)]},
+        {"small": [("small", None, None)], "large": [("large", None, None)]},
         loss_fn,
         is_vlm=False,
     )
