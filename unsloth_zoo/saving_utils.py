@@ -3842,7 +3842,8 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
         out.write(header_bytes)
         for k, src_off0, nbytes, is_resized in layout:
             if is_resized:
-                out.write(memoryview(res_t[k].view(torch.uint8).numpy()))
+                # reshape(-1) so 0-dim scalars (e.g. Gemma-4 audio min/max) view as bytes
+                out.write(memoryview(res_t[k].reshape(-1).view(torch.uint8).numpy()))
             else:
                 src.seek(src_data_start + src_off0)
                 remaining = nbytes
