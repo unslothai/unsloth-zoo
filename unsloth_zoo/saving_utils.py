@@ -2579,12 +2579,19 @@ def merge_and_overwrite_lora(
 
     _effective_lora_set: set = set()
     _sub_votes = _SanityCounter()
+    _prefix_remap_keys = []
     for _lw_key in lora_weights:
         if not isinstance(_lw_key, str):
+            continue
+        # O(1) direct match first
+        if (_lw_key + ".weight") in safetensor_keys_seen:
+            _effective_lora_set.add(_lw_key)
             continue
         _k_parts = _lw_key.split(".")
         _direct_ok = False
         for _sf in safetensor_keys_seen:
+            if not _sf.endswith(".weight"):
+                continue
             _sf_parts = _sf[: -len(".weight")].split(".")
             _cs = 0
             for _i in range(1, min(len(_k_parts), len(_sf_parts)) + 1):
@@ -2592,7 +2599,10 @@ def merge_and_overwrite_lora(
                     _cs = _i
                 else:
                     break
-            if _cs >= 3:
+            # Match requires either >=3 trailing components in common,
+            # or the common suffix covers the entire safetensor key
+            # (handles shallow targets like lm_head, embed_tokens).
+            if _cs >= 3 or (_cs > 0 and _cs == len(_sf_parts)):
                 _lp = ".".join(_k_parts[: -_cs]) + "." if _cs < len(_k_parts) else ""
                 _sp = ".".join(_sf_parts[: -_cs]) + "." if _cs < len(_sf_parts) else ""
                 if _lp == _sp:
@@ -2600,18 +2610,31 @@ def merge_and_overwrite_lora(
                     break
                 elif _lp and _sp:
                     _sub_votes[(_lp, _sp)] += 1
+                elif not _lp and _sp:
+                    # Prefix-only remap: the entire LoRA key is a suffix of
+                    # the safetensor key. Will be handled by
+                    # _infer_prefix_and_remap later.
+                    _prefix_remap_keys.append(_lw_key)
+                    break
         if _direct_ok:
             _effective_lora_set.add(_lw_key)
 
+    # Apply ALL substitution votes, not just the most common one.
+    # Each distinct prefix pair identifies a separate namespace that
+    # _infer_prefix_and_remap handles independently.
     if _sub_votes:
-        (_best_lp, _best_sp), _ = _sub_votes.most_common(1)[0]
-        for _lw_key in lora_weights:
-            if not isinstance(_lw_key, str):
-                continue
-            if _lw_key in _effective_lora_set:
-                continue
-            if _lw_key.startswith(_best_lp):
-                _effective_lora_set.add(_lw_key)
+        for (_lp, _sp), _ in _sub_votes.most_common():
+            for _lw_key in lora_weights:
+                if not isinstance(_lw_key, str):
+                    continue
+                if _lw_key in _effective_lora_set:
+                    continue
+                if _lw_key.startswith(_lp):
+                    _effective_lora_set.add(_lw_key)
+
+    # Prefix-only remapped keys (entire LoRA key is a suffix of safetensor key)
+    for _lw_key in _prefix_remap_keys:
+        _effective_lora_set.add(_lw_key)
 
     effective_loras = len(_effective_lora_set)
 
@@ -3223,6 +3246,8 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
                 continue
             k_parts = k.split(".")
             for sf in safetensor_keys:
+                if not sf.endswith(".weight"):
+                    continue
                 sf_parts = sf[: -len(".weight")].split(".")
                 # Find the longest common suffix between the LoRA key and this safetensor key
                 common_suffix_len = 0
@@ -3238,19 +3263,26 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
                     if lora_prefix and sf_prefix and lora_prefix != sf_prefix:
                         substitution_votes[(lora_prefix, sf_prefix)] += 1
 
-        # Apply the most-voted substitution to ALL unmatched keys whose
-        # LoRA key starts with that prefix.
+        # Apply ALL valid prefix substitutions, not just the top vote.
+        # Multiple namespaces (e.g. language + vision) may each need a
+        # different remap, and most_common(1) would drop the non-dominant.
         if substitution_votes:
-            (best_lora_prefix, best_sf_prefix), best_vote_count = substitution_votes.most_common(1)[0]
-            remaining_unmatched = []
-            for k, v in unmatched_keys:
-                if k.startswith(best_lora_prefix):
-                    new_key = best_sf_prefix + k[len(best_lora_prefix):]
-                    remapped[new_key] = v
-                    inferred_prefixes.append(best_sf_prefix)
-                    changed = True
-                else:
-                    remaining_unmatched.append((k, v))
+            remaining_unmatched = list(unmatched_keys)
+            applied_prefixes = set()
+            for (lora_prefix, sf_prefix), _ in substitution_votes.most_common():
+                if lora_prefix in applied_prefixes:
+                    continue
+                applied_prefixes.add(lora_prefix)
+                still_unmatched = []
+                for k, v in remaining_unmatched:
+                    if k.startswith(lora_prefix):
+                        new_key = sf_prefix + k[len(lora_prefix):]
+                        remapped[new_key] = v
+                        inferred_prefixes.append(sf_prefix)
+                        changed = True
+                    else:
+                        still_unmatched.append((k, v))
+                remaining_unmatched = still_unmatched
             unmatched_keys = remaining_unmatched
 
     if not changed:
