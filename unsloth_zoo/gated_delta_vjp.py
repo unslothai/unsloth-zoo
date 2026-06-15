@@ -357,9 +357,27 @@ def patch_gated_delta_vlm():
     """
     try:
         from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+    except ImportError:
+        try:
+            from mlx_vlm.models.qwen3_5 import language as vlm_language
+        except ImportError:
+            return
+        patch_gated_delta()
+        from mlx_lm.models import gated_delta
+        if (
+            getattr(vlm_language, "gated_delta_update", None)
+            is not gated_delta.gated_delta_update
+        ):
+            vlm_language.gated_delta_update = gated_delta.gated_delta_update
+            print(
+                "Unsloth: Rebound legacy mlx-vlm GatedDeltaNet to mlx-lm "
+                "patched VJP."
+            )
+        return
+    try:
         from mlx_vlm.models.qwen3_5 import language as vlm_language
     except ImportError:
-        return
+        vlm_language = None
     from mlx_lm.models import gated_delta
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
@@ -388,7 +406,8 @@ def patch_gated_delta_vlm():
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
     vlm_gated_delta.gated_delta_update = patched_vlm_gated_delta_update
-    vlm_language.gated_delta_update = patched_vlm_gated_delta_update
+    if vlm_language is not None:
+        vlm_language.gated_delta_update = patched_vlm_gated_delta_update
     vlm_gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
 
