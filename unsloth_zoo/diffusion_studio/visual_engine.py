@@ -117,16 +117,24 @@ def _bundled_cuda_lib_dirs():
     ``torch/lib`` is excluded: its bundled ``libgomp``/``libstdc++`` could shadow the C++ binary's
     system libs, and the runtime is already in the ``nvidia-*`` wheels (Windows differs -- there
     ``torch/lib`` ships the only ``cudart64_*.dll``, on ``PATH``). Returns ``[]`` if none found."""
-    import sys
-    import glob as _glob
+    import sysconfig
 
-    dirs = []
-    pattern = os.path.join(
-        sys.prefix, "lib", "python*", "site-packages", "nvidia", "*", "lib"
-    )
-    for d in sorted(_glob.glob(pattern)):
-        if os.path.isdir(d) and d not in dirs:
-            dirs.append(d)
+    roots, dirs = [], []
+    # where unsloth_zoo is actually installed (<site-packages>/unsloth_zoo/diffusion_studio/..),
+    # then the env's purelib -- covers normal, non-standard-prefix and editable installs.
+    roots.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    try:
+        roots.append(sysconfig.get_paths()["purelib"])
+    except Exception:
+        pass
+    for root in roots:
+        nvidia = os.path.join(root, "nvidia")
+        if not os.path.isdir(nvidia):
+            continue
+        for name in sorted(os.listdir(nvidia)):  # cu13 sorts ahead of cudnn/nccl/...
+            lib = os.path.join(nvidia, name, "lib")
+            if os.path.isdir(lib) and lib not in dirs:
+                dirs.append(lib)
     return dirs
 
 
