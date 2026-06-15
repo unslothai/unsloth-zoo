@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-PR-A gated_delta_vjp end-to-end through the shim.
+"""gated_delta_vjp end-to-end through the shim.
 
 Exercises:
   * mx.custom_function decorator + .vjp registration
@@ -24,8 +23,8 @@ Exercises:
   * .astype(mx.float32) at ~30 sites
   * mx.where / mx.expand_dims / mx.zeros_like
 
-If forward + backward both produce finite tensors with the right shapes,
-PR-A's VJP path is exercisable on Linux+CUDA.
+If forward + backward both produce finite tensors with the right
+shapes, the VJP path is exercisable on Linux+CUDA.
 """
 
 from __future__ import annotations
