@@ -17,11 +17,14 @@ Run on an Apple Silicon machine (CI installs unsloth-zoo with ``pip install -e .
 Target runtime: well under ~2 minutes on an M1.
 """
 
-import mlx.core as mx
-import mlx.nn as nn
 import pytest
 
-_HAS_METAL = mx.metal.is_available() and mx.default_device() == mx.gpu
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    _HAS_METAL = mx.metal.is_available() and mx.default_device() == mx.gpu
+except Exception:
+    _HAS_METAL = False
 _SKIP_REASON = (
     "Requires Apple Silicon Metal GPU (mx.metal.is_available() and default "
     "device == gpu); the qwen3_5 VJP crash is Metal-kernel-specific and cannot "
