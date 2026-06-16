@@ -43,21 +43,23 @@ from unsloth_zoo.saving_utils import (
 )
 
 SEED = 5410
-# Narrow expert (Gemma-4 26B-A4B ratio): 2*intermediate < hidden.
-NUM_EXPERTS, RANK, HIDDEN, INTERMEDIATE, ALPHA = 4, 2, 16, 3, 8.0
+NUM_EXPERTS, RANK, ALPHA = 4, 2, 8.0
+# Narrow-expert ratios (2*intermediate < hidden), scaled down from real models.
+# Both Gemma-4 26B-A4B and Qwen3.5-35B-A3B fall in this class.
+GEOMS = {"gemma4_26B_A4B": (16, 3), "qwen3_5_35B_A3B": (18, 4)}  # (hidden, intermediate)
 
 
-def _build(dtype=torch.float32):
+def _build(hidden, intermediate, dtype=torch.float32):
     torch.manual_seed(SEED)
     TR = NUM_EXPERTS * RANK
-    twoI = 2 * INTERMEDIATE
-    gate_up_W = torch.randn(NUM_EXPERTS, twoI, HIDDEN, dtype=dtype)          # (E, 2I, H)
-    down_W    = torch.randn(NUM_EXPERTS, HIDDEN, INTERMEDIATE, dtype=dtype)  # (E, H, I)
+    twoI = 2 * intermediate
+    gate_up_W = torch.randn(NUM_EXPERTS, twoI, hidden, dtype=dtype)          # (E, 2I, H)
+    down_W    = torch.randn(NUM_EXPERTS, hidden, intermediate, dtype=dtype)  # (E, H, I)
     # standard PEFT fused: lora_A=(E*r, in), lora_B=(out, E*r)
-    A_gu = torch.randn(TR, HIDDEN, dtype=dtype) * 0.05
+    A_gu = torch.randn(TR, hidden, dtype=dtype) * 0.05
     B_gu = torch.randn(twoI, TR, dtype=dtype) * 0.05
-    A_dn = torch.randn(TR, INTERMEDIATE, dtype=dtype) * 0.05
-    B_dn = torch.randn(HIDDEN, TR, dtype=dtype) * 0.05
+    A_dn = torch.randn(TR, intermediate, dtype=dtype) * 0.05
+    B_dn = torch.randn(hidden, TR, dtype=dtype) * 0.05
     return gate_up_W, down_W, A_gu, B_gu, A_dn, B_dn
 
 
@@ -69,10 +71,12 @@ def _reference(W, A, B, alpha):
     return out
 
 
-# is_transposed=True is the wrong value the magnitude heuristic produces here.
+# is_transposed=True is the wrong value the magnitude heuristic produces for these.
+@pytest.mark.parametrize("model", sorted(GEOMS))
 @pytest.mark.parametrize("hint", [None, True])
-def test_fused_narrow_expert_merge_applies_delta(hint):
-    gate_up_W, down_W, A_gu, B_gu, A_dn, B_dn = _build()
+def test_fused_narrow_expert_merge_applies_delta(model, hint):
+    hidden, intermediate = GEOMS[model]
+    gate_up_W, down_W, A_gu, B_gu, A_dn, B_dn = _build(hidden, intermediate)
     stats_gu = LoraStats(module=None, lora_A=A_gu, lora_B=B_gu, alpha=ALPHA)
     stats_dn = LoraStats(module=None, lora_A=A_dn, lora_B=B_dn, alpha=ALPHA)
     kw = {} if hint is None else {"is_transposed": hint}
