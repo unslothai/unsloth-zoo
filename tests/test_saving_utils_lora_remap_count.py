@@ -88,6 +88,42 @@ def test_remap_qwen35_extra_prefix_still_works():
     assert out.get("model.language_model.layers.0.self_attn.q_proj") == "model.layers.0.self_attn.q_proj"
 
 
+def test_remap_strips_extra_wrapper_prefix_onto_base_tensor():
+    """A LoRA carrying an extra leading wrapper (model.vision_tower.*) strips onto the
+    base tensor (vision_tower.*) when that tensor exists on disk."""
+    disk = ["vision_tower.transformer.layers.0.attention.q_proj.weight"]
+    out = _infer_prefix_and_remap(
+        _lw(["model.vision_tower.transformer.layers.0.attention.q_proj"]), disk)
+    assert out is not None
+    tgt = "vision_tower.transformer.layers.0.attention.q_proj"
+    assert out.get(tgt) == "model.vision_tower.transformer.layers.0.attention.q_proj"
+
+
+def test_remap_mixed_language_reorder_and_vision_strip():
+    """Composite VLM where the language half reorders (model.language_model.* ->
+    language_model.model.*) and the vision half only drops the leading model.. Both
+    namespaces resolve onto their own base tensors, neither onto a nonexistent key."""
+    disk = (
+        [f"language_model.model.layers.0.self_attn.{p}.weight" for p in ("q_proj", "k_proj")]
+        + [f"vision_tower.transformer.layers.0.attention.{p}.weight" for p in ("q_proj", "k_proj")]
+    )
+    lora = (
+        [f"model.language_model.layers.0.self_attn.{p}" for p in ("q_proj", "k_proj")]
+        + [f"model.vision_tower.transformer.layers.0.attention.{p}" for p in ("q_proj", "k_proj")]
+    )
+    out = _infer_prefix_and_remap(_lw(lora), disk)
+    assert out is not None
+    for p in ("q_proj", "k_proj"):
+        assert out.get(f"language_model.model.layers.0.self_attn.{p}") == \
+            f"model.language_model.layers.0.self_attn.{p}"
+        assert out.get(f"vision_tower.transformer.layers.0.attention.{p}") == \
+            f"model.vision_tower.transformer.layers.0.attention.{p}"
+    # No invented keys: every remapped target backs a real on-disk tensor.
+    for tgt in out:
+        if isinstance(tgt, str):
+            assert (tgt + ".weight") in set(disk)
+
+
 # ---------------------------------------------------------------------------
 # _count_backed_lora_modules: count matches what the merge loop would write
 # ---------------------------------------------------------------------------

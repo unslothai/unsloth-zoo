@@ -3224,17 +3224,48 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
                 remaining_unmatched = still_unmatched
             unmatched_keys = remaining_unmatched
 
+    from collections import Counter as _Counter
+    common_prefix = _Counter(inferred_prefixes).most_common(1)[0][0] if inferred_prefixes else None
+
+    # A LoRA target can carry an extra wrapper prefix the base tensor lacks (e.g.
+    # model.vision_tower.* vs vision_tower.* on a Mistral 3 VLM, where the language
+    # half reorders but the vision half only drops the leading model.). Strip leading
+    # components onto the first existing tensor. This never crosses namespaces because
+    # it accepts only an exact on-disk match, and it resolves these keys regardless of
+    # whether the reorder vote above fired.
+    if unmatched_keys:
+        still_unmatched = []
+        for k, v in unmatched_keys:
+            target = None
+            if isinstance(k, str):
+                parts = k.split(".")
+                for i in range(1, len(parts)):
+                    cand = ".".join(parts[i:])
+                    if (cand + ".weight") in sf_key_set and cand not in remapped:
+                        target = cand
+                        break
+            if target is not None:
+                remapped[target] = v
+                changed = True
+            else:
+                still_unmatched.append((k, v))
+        unmatched_keys = still_unmatched
+
     if not changed:
         return None
 
-    # Apply most common inferred prefix to any still-unmatched keys
-    if unmatched_keys and inferred_prefixes:
-        from collections import Counter as _Counter
-        common_prefix = _Counter(inferred_prefixes).most_common(1)[0][0]
-        for k, v in unmatched_keys:
+    # Apply the most common inferred prefix to any remaining unmatched keys, but only
+    # when that lands on a real tensor; otherwise leave the key untouched so the merge
+    # skips a genuinely unbacked target (e.g. a vision adapter with no base tensor)
+    # instead of rewriting it onto a wrong or nonexistent key.
+    for k, v in unmatched_keys:
+        if (
+            common_prefix is not None and isinstance(k, str)
+            and (common_prefix + k + ".weight") in sf_key_set
+            and (common_prefix + k) not in remapped
+        ):
             remapped[common_prefix + k] = v
-    else:
-        for k, v in unmatched_keys:
+        else:
             remapped[k] = v
 
     return remapped
