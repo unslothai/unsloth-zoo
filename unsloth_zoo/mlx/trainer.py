@@ -385,9 +385,15 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
         except ValueError:
             continue
         checkpoints.append((step, child))
+    if len(checkpoints) <= save_total_limit:
+        return
     checkpoints.sort()
     for _, stale in checkpoints[:-save_total_limit]:
-        shutil.rmtree(stale, ignore_errors=True)
+        try:
+            shutil.rmtree(stale)
+        except Exception as exc:
+            print(f"  Unsloth: failed to prune old checkpoint {stale}: {exc}")
+            continue
         print(f"  Unsloth: pruned old checkpoint {stale} "
               f"(save_total_limit={save_total_limit})")
 
