@@ -3175,27 +3175,37 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     if unmatched_keys:
         from collections import Counter as _Counter2
         substitution_votes = _Counter2()
+        # A substitution is only recorded when the trailing 3 components match (the
+        # common_suffix_len >= 3 gate below), so group safetensor keys by their 3-component
+        # suffix and compare each unmatched key only against that bucket. This turns the
+        # scan from O(unmatched * safetensors) into roughly O(unmatched + safetensors),
+        # which matters when a whole namespace is unmatched on a large VLM.
+        sf_parts_by_suffix3 = defaultdict(list)
+        for sf in safetensor_keys:
+            if not sf.endswith(".weight"):
+                continue
+            sf_parts = sf[: -len(".weight")].split(".")
+            if len(sf_parts) >= 3:
+                sf_parts_by_suffix3[tuple(sf_parts[-3:])].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
-            for sf in safetensor_keys:
-                if not sf.endswith(".weight"):
-                    continue
-                sf_parts = sf[: -len(".weight")].split(".")
-                # Find the longest common suffix between the LoRA key and this safetensor key
-                common_suffix_len = 0
-                for i in range(1, min(len(k_parts), len(sf_parts)) + 1):
+            if len(k_parts) < 3:
+                continue
+            for sf_parts in sf_parts_by_suffix3.get(tuple(k_parts[-3:]), ()):
+                # The trailing 3 already match; extend the common suffix as far as it goes.
+                common_suffix_len = 3
+                for i in range(4, min(len(k_parts), len(sf_parts)) + 1):
                     if k_parts[-i] == sf_parts[-i]:
                         common_suffix_len = i
                     else:
                         break
-                if common_suffix_len >= 3:  # require at least 3 trailing components
-                    # Record the prefix substitution implied by this match
-                    lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
-                    sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
-                    if lora_prefix and sf_prefix and lora_prefix != sf_prefix:
-                        substitution_votes[(lora_prefix, sf_prefix)] += 1
+                # Record the prefix substitution implied by this match
+                lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
+                sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
+                if lora_prefix and sf_prefix and lora_prefix != sf_prefix:
+                    substitution_votes[(lora_prefix, sf_prefix)] += 1
 
         # Apply prefix substitutions, but only true reorderings of the same path
         # components (e.g. model.language_model. <-> language_model.model.), never
@@ -3332,12 +3342,15 @@ pass
 def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_name, tie_word_embeddings):
     """Count LoRA modules backed by a saved tensor, mirroring the key resolution of
     the merge loop in _merge_and_overwrite_lora (remap, Gemma4 .linear, fused MoE
-    experts, and the tied lm_head -> embed_tokens bridge). The tied bridge is keyed on
-    the DISK embed prefix and only fires when that embed is not itself a target, exactly
-    like the merge, so the count equals the number of tensors the merge writes and the
-    Step-7 sanity check needs no extra tied discount. Genuinely unbacked targets (e.g. a
-    vision tower absent from the base safetensors, or a bare lm_head whose composite-VLM
-    embed lives at a deep prefix the merge cannot bridge) are excluded.
+    experts, mxfp4 packed experts, and the tied lm_head -> embed_tokens bridge). The
+    tied bridge is keyed on the DISK embed prefix and only fires when that embed is not
+    itself a target, exactly like the merge, so the count equals the number of tensors
+    the merge writes and the Step-7 sanity check needs no extra tied discount. Genuinely
+    unbacked targets (e.g. a vision tower absent from the base safetensors, or a bare
+    lm_head whose composite-VLM embed lives at a deep prefix the merge cannot bridge) are
+    excluded. Known merge limitation, faithfully mirrored here: when only lm_head.weight
+    is on disk (not embed_tokens.weight), a tied embed_tokens target is dropped by the
+    merge and likewise not counted, so the save succeeds without that delta.
     """
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, safetensor_keys_seen, model_class_name = model_class_name,
@@ -3349,6 +3362,11 @@ def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_n
         if (key + ".weight") in safetensor_keys_seen:
             return True
         if (key + ".linear.weight") in safetensor_keys_seen:   # Gemma4 ClippableLinear
+            return True
+        # mxfp4 packed experts: the base shard stores <module>_blocks / _scales and the
+        # merge dequantizes them to <module> on save (_merge_and_overwrite_lora_mxfp4),
+        # so a LoRA on such a module has no .weight on disk.
+        if (key + "_blocks") in safetensor_keys_seen and (key + "_scales") in safetensor_keys_seen:
             return True
         if ".experts" in key or ".moe" in key:                 # fused / per-expert MoE
             prefix = key[: -len(".base_layer")] if key.endswith(".base_layer") else key

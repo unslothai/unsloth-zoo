@@ -207,3 +207,53 @@ def test_count_composite_tied_bare_lm_head_unbridgeable_dropped():
     and counts, see test_count_tied_bare_lm_head_with_layer)."""
     assert _count(["lm_head"], ["model.language_model.embed_tokens.weight"],
                   model_class_name="PreTrainedModel", tie=True) == 0
+
+
+def test_count_mxfp4_packed_experts():
+    """MXFP4 base: fused experts are stored packed as <module>_blocks / _scales and the
+    merge dequantizes them to <module> on save, so a LoRA on such a module has no .weight
+    on disk. It must still be counted as backed (the merge writes and counts it)."""
+    keys = ["model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.self_attn.q_proj"]
+    disk = ["model.layers.0.mlp.experts.gate_up_proj_blocks", "model.layers.0.mlp.experts.gate_up_proj_scales",
+            "model.layers.0.mlp.experts.down_proj_blocks", "model.layers.0.mlp.experts.down_proj_scales",
+            "model.layers.0.self_attn.q_proj.weight"]
+    assert _count(keys, disk) == 3
+
+
+def test_count_mxfp4_blocks_without_scales_not_counted():
+    """A packed module missing its _scales tensor is skipped by the merge (it cannot be
+    dequantized), so it must not be counted as backed."""
+    keys = ["model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.self_attn.q_proj"]
+    disk = ["model.layers.0.mlp.experts.gate_up_proj_blocks",  # no matching _scales
+            "model.layers.0.self_attn.q_proj.weight"]
+    assert _count(keys, disk) == 1
+
+
+def test_count_cross_namespace_same_trailing_path_union():
+    """Sharded composite checkpoint where two namespaces (language reorder + vision strip)
+    share the same trailing module path but live in different shards. Counting against the
+    union of all shard keys must still resolve each LoRA onto its own tensor (count 2), not
+    collapse them into an ambiguous unbacked pair."""
+    keys = ["model.language_model.layers.0.self_attn.q_proj",
+            "model.vision_tower.transformer.layers.0.self_attn.q_proj"]
+    union = ["language_model.model.layers.0.self_attn.q_proj.weight",
+             "vision_tower.transformer.layers.0.self_attn.q_proj.weight"]
+    assert _count(keys, union) == 2
+
+
+def test_remap_cross_namespace_union_resolves_both():
+    """The remap, given the union of both shards' keys, routes the language key to its
+    reordered tensor and the vision key to its stripped tensor, never crossing namespaces."""
+    union = ["language_model.model.layers.0.self_attn.q_proj.weight",
+             "vision_tower.transformer.layers.0.self_attn.q_proj.weight"]
+    out = _infer_prefix_and_remap(
+        _lw(["model.language_model.layers.0.self_attn.q_proj",
+             "model.vision_tower.transformer.layers.0.self_attn.q_proj"]),
+        union,
+    )
+    assert out is not None
+    assert out.get("language_model.model.layers.0.self_attn.q_proj") == \
+        "model.language_model.layers.0.self_attn.q_proj"
+    assert out.get("vision_tower.transformer.layers.0.self_attn.q_proj") == \
+        "model.vision_tower.transformer.layers.0.self_attn.q_proj"
