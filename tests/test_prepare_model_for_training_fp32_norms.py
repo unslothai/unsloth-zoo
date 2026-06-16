@@ -386,9 +386,12 @@ def test_wrapper_unpickles_in_fresh_interpreter(tmp_path):
     torch.save(m, str(blob))
 
     tests_dir = os.path.dirname(os.path.abspath(__file__))
+    # Import unsloth_zoo, not unsloth: reconstruction only needs the __reduce__
+    # target in unsloth_zoo.training_utils, and unsloth is GPU-only so it cannot
+    # import on the CPU CI runner.
     script = (
         "import sys; sys.path.insert(0, %r);"
-        "import unsloth, torch;"
+        "import unsloth_zoo, torch;"
         "m = torch.load(%r, weights_only=False);"
         "assert type(m).__qualname__.endswith('WithUnslothBf16Autocast'), type(m).__qualname__;"
         "out = m(torch.zeros(2, 8, dtype=torch.bfloat16));"
@@ -796,9 +799,12 @@ def test_instance_forward_wrapper_unpickles_in_fresh_interpreter(tmp_path):
     torch.save(m, str(blob))
 
     tests_dir = os.path.dirname(os.path.abspath(__file__))
+    # Import unsloth_zoo, not unsloth: reconstruction only needs the __reduce__
+    # target in unsloth_zoo.training_utils, and unsloth is GPU-only so it cannot
+    # import on the CPU CI runner.
     script = (
         "import sys; sys.path.insert(0, %r);"
-        "import unsloth, torch;"
+        "import unsloth_zoo, torch;"
         "m = torch.load(%r, weights_only=False);"
         "out = m(torch.zeros(2, 8, dtype=torch.bfloat16));"
         "assert tuple(out.shape) == (2, 8);"
