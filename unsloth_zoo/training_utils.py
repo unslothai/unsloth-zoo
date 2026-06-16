@@ -32,6 +32,8 @@ from .gradient_checkpointing import (
 )
 import os
 import re
+import sys
+import functools
 
 __all__ = [
     "fix_zero_training_loss",
@@ -89,6 +91,169 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
             )
     pass
 pass
+
+
+# Cache of generated autocast subclasses keyed by (base_class, compute_dtype):
+# stable identity per base class + one module-level symbol so pickle can resolve it.
+_BF16_AUTOCAST_SUBCLASSES = {}
+
+
+def _find_tensor_device_type(*values):
+    """Device type of the first tensor in args/kwargs, recursing into dict/list/tuple
+    (HF batches are dicts; VLM inputs nest tensors). None if no tensor found."""
+    from collections.abc import Mapping
+    stack = list(values)
+    while stack:
+        value = stack.pop()
+        if torch.is_tensor(value):
+            return value.device.type
+        if isinstance(value, Mapping):
+            stack.extend(value.values())
+        elif isinstance(value, (tuple, list)):
+            stack.extend(value)
+    return None
+
+
+def _call_forward_with_bf16_autocast(forward, model, args, kwargs, compute_dtype):
+    """Run forward inside torch.amp.autocast(compute_dtype). Device is sniffed from
+    inputs, else model params, else "cuda". Defers to an active outer autocast and to
+    unsupported devices (meta). Shared by the subclass and instance-forward paths."""
+    device_type = _find_tensor_device_type(*args, *kwargs.values())
+    if device_type is None:
+        try:
+            device_type = next(model.parameters()).device.type
+        except StopIteration:
+            device_type = "cuda"
+    # Check availability first: is_autocast_enabled raises on e.g. "meta"; available returns False.
+    if not torch.amp.is_autocast_available(device_type):
+        return forward(*args, **kwargs)
+    if torch.is_autocast_enabled(device_type):
+        return forward(*args, **kwargs)
+    with torch.amp.autocast(device_type=device_type, dtype=compute_dtype):
+        return forward(*args, **kwargs)
+
+
+def _reconstruct_bf16_autocast_model(base_cls, compute_dtype, instance_mode=False):
+    """Pickle/deepcopy reconstructor: rebuild the subclass from the importable base
+    class and return a blank instance for __setstate__. Driving off the base class
+    (not the generated symbol) lets unpickling work in a fresh interpreter."""
+    cls = _make_bf16_autocast_subclass(base_cls, compute_dtype, instance_mode)
+    return cls.__new__(cls)
+
+
+def _bf16_autocast_reduce(self):
+    """__reduce__ for generated subclasses: serialize via the base class + nn.Module
+    state so no generated symbol or instance-bound function is needed at unpickle."""
+    cls = type(self)
+    base_cls = cls.__dict__.get("_unsloth_autocast_base", cls.__mro__[1])
+    compute_dtype = cls.__dict__.get("_unsloth_autocast_dtype", torch.bfloat16)
+    instance_mode = cls.__dict__.get("_unsloth_autocast_instance_mode", False)
+    getstate = getattr(self, "__getstate__", None)
+    state = getstate() if getstate is not None else self.__dict__
+    return (_reconstruct_bf16_autocast_model,
+            (base_cls, compute_dtype, instance_mode), state)
+
+
+def _bf16_autocast_instance_forward(self, *args, **kwargs):
+    """Class-level forward for instance_mode: wraps the original instance forward
+    (saved on self._unsloth_autocast_orig_forward) in autocast. Module-scoped (not a
+    closure) and read from self, so it pickles by import path and rebinds on deepcopy."""
+    orig = self.__dict__["_unsloth_autocast_orig_forward"]
+    compute_dtype = type(self).__dict__.get(
+        "_unsloth_autocast_dtype", torch.bfloat16)
+    return _call_forward_with_bf16_autocast(orig, self, args, kwargs, compute_dtype)
+
+
+def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
+    """Build (or fetch from cache) a subclass of cls whose forward runs in
+    torch.amp.autocast(compute_dtype). Default wraps the base forward;
+    instance_forward=True wraps the per-instance forward saved on the model (Unsloth
+    runtime patching). __reduce__ serializes via the importable base class and forward
+    is a class attribute, so torch.save(model) loads in a fresh process. The subclass
+    is registered as a module-level symbol so the class itself also pickles by name."""
+    cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype, instance_forward))
+    if cached is not None:
+        return cached
+
+    if instance_forward:
+        # Generic signature: the per-instance forward is not known at (cached) class
+        # creation, so remove_unused_columns keeps all columns on this rare path.
+        _wrapped = _bf16_autocast_instance_forward
+    else:
+        _orig_forward = cls.forward
+
+        @functools.wraps(_orig_forward)
+        def _wrapped(self, *args, **kwargs):
+            return _call_forward_with_bf16_autocast(
+                lambda *a, **k: _orig_forward(self, *a, **k),
+                self, args, kwargs, compute_dtype,
+            )
+
+    # pickle_name is unique for module-level registration; the subclass keeps the
+    # original __name__ so save_pretrained records the base class in architectures.
+    pickle_name = cls.__name__ + "WithUnslothBf16Autocast"
+    module = sys.modules[__name__]
+    if hasattr(module, pickle_name) and getattr(module, pickle_name) is not None:
+        pickle_name = f"{pickle_name}_{len(_BF16_AUTOCAST_SUBCLASSES)}"
+
+    new_cls = type(pickle_name, (cls,), {
+        "forward": _wrapped,
+        "__module__": __name__,
+        "__reduce__": _bf16_autocast_reduce,
+        "_unsloth_autocast_base": cls,
+        "_unsloth_autocast_dtype": compute_dtype,
+        "_unsloth_autocast_instance_mode": instance_forward,
+    })
+    new_cls.__name__ = cls.__name__
+    new_cls.__qualname__ = pickle_name
+    setattr(module, pickle_name, new_cls)
+    _BF16_AUTOCAST_SUBCLASSES[(cls, compute_dtype, instance_forward)] = new_cls
+    return new_cls
+
+
+def _wrap_forward_in_bf16_autocast(model, compute_dtype):
+    """With fp32 norm weights the norm forward returns fp32, which trips the next
+    bf16 linear's dtype check; wrap model.forward in autocast(compute_dtype) so
+    linear/matmul inputs downcast at the op boundary (the standard PEFT/Accelerate
+    pattern). Idempotent and defers to an active outer autocast. Implemented by
+    subclassing type(model) (not reassigning forward) so the wrap survives
+    deepcopy/pickle/torch.save; functools.wraps preserves the forward signature for
+    HF Trainer's remove_unused_columns."""
+    if compute_dtype in (None, torch.float32):
+        return model
+    if getattr(model, "_unsloth_bf16_autocast_wrapped", False):
+        return model
+
+    instance_forward = model.__dict__.get("forward")
+    if instance_forward is not None:
+        # An instance-level forward (e.g. Unsloth runtime patching) shadows a class
+        # override, so changing __class__ alone would not intercept it. Move it to
+        # _unsloth_autocast_orig_forward and route through the instance_mode subclass,
+        # keeping forward a class attribute so the model stays picklable/deepcopy-safe.
+        model._unsloth_autocast_orig_forward = instance_forward
+        del model.__dict__["forward"]
+        model.__class__ = _make_bf16_autocast_subclass(
+            type(model), compute_dtype, instance_forward=True)
+    else:
+        model.__class__ = _make_bf16_autocast_subclass(type(model), compute_dtype)
+    model._unsloth_bf16_autocast_wrapped = True
+    return model
+
+
+def _unwrap_forward_in_bf16_autocast(model):
+    """Undo _wrap_forward_in_bf16_autocast, so reusing a model across prepare modes
+    (bf16 full-FT then fp32) does not leave a stale autocast forcing bf16 on fp32."""
+    if not getattr(model, "_unsloth_bf16_autocast_wrapped", False):
+        return model
+    base_cls = getattr(type(model), "_unsloth_autocast_base", None)
+    orig_forward = model.__dict__.pop("_unsloth_autocast_orig_forward", None)
+    if base_cls is not None:
+        model.__class__ = base_cls
+    if orig_forward is not None:
+        # restore the original instance-level forward
+        model.forward = orig_forward
+    model._unsloth_bf16_autocast_wrapped = False
+    return model
 
 
 def _iter_configs(config):
@@ -188,9 +353,41 @@ def prepare_model_for_training(
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
     pass
+    # Defer to an external norm dtype policy (e.g. UNSLOTH_HIGH_PRECISION_LAYERNORM
+    # tags modules with _pre_set_compute_dtype); record those param ids and skip them.
+    _externally_managed_param_ids = set()
+    # Also detect norms by owning-module class name, catching custom norms whose
+    # param names lack a token (e.g. Gemma audio tower norm_out/norm_pre_attn).
+    _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
+    _norm_param_ids = set()
+    for _, _module in model.named_modules():
+        if hasattr(_module, "_pre_set_compute_dtype"):
+            # The external policy casts the module recursively, so all descendants are managed.
+            for _p in _module.parameters(recurse=True):
+                _externally_managed_param_ids.add(id(_p))
+        if _norm_class_re.search(type(_module).__name__):
+            for _, _p in _module.named_parameters(recurse=False):
+                _norm_param_ids.add(id(_p))
+    # Rollback switch (default off): 1 keeps norm weights at their loaded dtype (pre-fix).
+    _disable_float32_norm_upcast = (
+        os.environ.get("UNSLOTH_DISABLE_FLOAT32_UPCAST", "0") == "1")
+
+    def _is_norm_parameter(nm, p):
+        # Union matcher: owning-module class name OR known param-name substrings.
+        return (
+            id(p) in _norm_param_ids
+            or "norm." in nm
+            or "_layernorm" in nm
+            or "layer_norm" in nm
+            or "norm1." in nm
+            or "norm2." in nm
+        )
+
     for name, param in model.named_parameters():
+        original_name = name
         upcast = False
         requires_grad = False
+        _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
             if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
                 upcast = True
@@ -198,18 +395,16 @@ def prepare_model_for_training(
             else:
                 requires_grad = False
         else:
-            if train_layernorms and ("norm." in name or "_layernorm" in name):
-                requires_grad = True
-                upcast = True # Must upcast layernorms to float32
-            if train_embedding and ("embed_tokens" in name or "embedding" in name):
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
-            if train_lm_head and ("lm_head" in name):
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
-            else:
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
+            # Full finetuning trains everything at compute dtype, but norms must be fp32
+            # for adam writeback precision (~60% of bf16 norm updates round to zero
+            # otherwise). A prior dangling else on `if train_lm_head:` had clobbered this.
+            requires_grad = True
+            upcast = False
+            if (train_layernorms
+                    and _is_norm
+                    and id(param) not in _externally_managed_param_ids
+                    and not _disable_float32_norm_upcast):
+                upcast = True
         pass
         # Set training or not
         if requires_grad:
@@ -217,33 +412,37 @@ def prepare_model_for_training(
         else:
             param.requires_grad_(False)
 
-        # Upcast to float32 if needed
-        if requires_grad:
-            name = name.replace("base_model", "model", 1)
-            while re.search(r'\.(\d+)\.', name) is not None:
-                name = re.sub(r'\.(\d+)\.', r'[\1].', name)
-            name = name.replace(".weight", "", 1)
+        # Cast storage in place via param.data.to(dtype) (like nn.Module._apply): keeps
+        # the Parameter identity so tied weights stay tied, and avoids the old exec()
+        # path. Skip externally-managed params so we don't undo their fp32 cast.
+        if requires_grad and id(param) not in _externally_managed_param_ids:
             dtype = torch.float32 if upcast else mixed_precision_dtype
-            try:
-                # Try original name
-                exec(f"{name}.to({str(dtype)})")
-            except:
-                # Maybe model.model
-                exec(f"model.{name}.to({str(dtype)})")
+            if param.dtype != dtype:
+                param.data = param.data.to(dtype)
         pass
 
-        if ('norm.' in name or '_layernorm' in name) and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1":
-            try:
-                name = name.replace("base_model", "model", 1)
-                while re.search(r'\.(\d+)\.', name) is not None:
-                    name = re.sub(r'\.(\d+)\.', r'[\1].', name)
-                name = name.replace(".weight", "", 1)
-                # Try original name
-                exec(f"{name}.to({str(torch.float32)})")
-            except:
-                # Maybe model.model
-                exec(f"model.{name}.to({str(torch.float32)})")
+        # Legacy UNSLOTH_UPCAST_LAYERNORM path: same union matcher + external-policy
+        # guard; any fp32 norms it creates are handled by the wrapper gate below.
+        if (_is_norm
+                and id(param) not in _externally_managed_param_ids
+                and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1"):
+            if param.dtype != torch.float32:
+                param.data = param.data.to(torch.float32)
     pass
+
+    # Install the autocast wrapper only if fp32 norms actually exist (our upcast, the
+    # legacy env, or an external policy). Gating on presence (not the upcast decision)
+    # avoids exposing external fp32 norms under rollback and never wraps a model without them.
+    _has_fp32_norms = any(
+        _is_norm_parameter(nm, p) and p.dtype == torch.float32
+        for nm, p in model.named_parameters()
+    )
+    if (full_finetuning
+            and mixed_precision_dtype == torch.bfloat16
+            and _has_fp32_norms):
+        _wrap_forward_in_bf16_autocast(model, torch.bfloat16)
+    else:
+        _unwrap_forward_in_bf16_autocast(model)
 
     # Vanilla GC (True/False) requires undoing any prior Unsloth patch.
     if use_gradient_checkpointing != "unsloth":
