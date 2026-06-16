@@ -167,6 +167,16 @@ def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, base_env = None, os
     return env
 
 
+def _canvas_maxtok(maxtok):
+    """Clamp the per-turn diffusion canvas (MAXTOK). The canvas is NON-CAUSAL, so the
+    compute buffer grows ~quadratically with its size (the full model context, e.g.
+    32768, reserves a ~77 GB buffer -> cudaMalloc OOM on a 24 GB GPU). Defer oversized
+    values to the server's MAXTOK=0 auto-size path (it probes the largest canvas that
+    fits VRAM); pass small explicit values through unchanged."""
+    maxtok = int(maxtok)
+    return maxtok if 0 < maxtok <= 8192 else 0
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
@@ -176,7 +186,7 @@ class VisualServer:
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=maxtok)
+        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok))
         self.p = None
         self._spawn()
 
