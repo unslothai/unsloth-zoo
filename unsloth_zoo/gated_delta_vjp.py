@@ -123,9 +123,10 @@ def gated_delta_ops_efficient(
         # current step (= input to step t+1). Starts at d_state_out, then
         # propagates through the recurrence + mask.
         # Per-step grads are collected in lists and stacked afterwards: each
-        # t is produced exactly once, and mx `.at[:, t].add` scatters read
-        # the update with a wrong batch stride (wrong grads for every batch
-        # row past the first; verified against plain autodiff on mlx 0.31).
+        # t is produced exactly once, and mx `.at[:, t].add` scatter-add
+        # reads the update tensor with a wrong batch stride (wrong grads for
+        # every batch row past the first; verified against plain autodiff on
+        # mlx 0.31).
         # Fixed upstream in ml-explore/mlx#3483, not yet in any release.
         d_q_steps = []
         d_k_steps = []
@@ -216,11 +217,13 @@ def gated_delta_ops_efficient(
             # d_state_prev = recurrence-derived gradient + mask passthrough.
             d_state = d_state_prev_via_recurrence + d_state_prev_passthrough
 
-        d_q = mx.stack(d_q_steps[::-1], axis=1)
-        d_k = mx.stack(d_k_steps[::-1], axis=1)
-        d_v = mx.stack(d_v_steps[::-1], axis=1)
-        d_g = mx.stack(d_g_steps[::-1], axis=1)
-        d_beta = mx.stack(d_beta_steps[::-1], axis=1)
+        for steps in (d_q_steps, d_k_steps, d_v_steps, d_g_steps, d_beta_steps):
+            steps.reverse()
+        d_q = mx.stack(d_q_steps, axis=1)
+        d_k = mx.stack(d_k_steps, axis=1)
+        d_v = mx.stack(d_v_steps, axis=1)
+        d_g = mx.stack(d_g_steps, axis=1)
+        d_beta = mx.stack(d_beta_steps, axis=1)
         d_mask = mx.zeros_like(mask_chunk) if mask_chunk is not None else None
         return d_q, d_k, d_v, d_g, d_beta, d_state, d_mask
 
