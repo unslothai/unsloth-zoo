@@ -1801,6 +1801,7 @@ class MLXTrainer:
                     # can restore Adam moments, step counter, and loss history.
                     # Adapter save was successful -- treat the extra writes as
                     # best-effort: log on failure but don't undo the adapter save.
+                    checkpoint_complete = False
                     try:
                         save_optimizer_state(optimizer, ckpt_dir)
                         save_trainer_state(
@@ -1810,10 +1811,12 @@ class MLXTrainer:
                             },
                             ckpt_dir,
                         )
+                        checkpoint_complete = True
                     except Exception as e:
                         print(f"  Unsloth: checkpoint saved without resume state ({e})")
                     print(f"  Saved checkpoint to {ckpt_dir}")
-                    _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
+                    if checkpoint_complete:
+                        _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
