@@ -335,7 +335,7 @@ if importlib.util.find_spec("vllm") is not None:
             import vllm.transformers_utils.tokenizer
             vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
             vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
-        except:
+        except ImportError:
             pass
 
         try:
