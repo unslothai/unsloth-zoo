@@ -33,8 +33,9 @@ recurrence) at B > 1, which is exactly the failure surface:
     reintroduced scatter-add also fails it.
 
 These run against a REAL `mlx` install (Apple Silicon Metal, or Linux CPU/CUDA
-if `mlx` is present); they are skipped where `mlx` cannot be imported, e.g. the
-torch-shim CI used by `test_mlx_gated_delta.py`. Target runtime is a few seconds.
+if `mlx` is present); they skip where a real `mlx` is unavailable, including
+under the torch shim that `test_mlx_gated_delta.py` registers into `sys.modules`
+(the shim is detected and rejected). Target runtime is a few seconds.
 """
 
 from __future__ import annotations
@@ -45,11 +46,19 @@ import pytest
 
 try:
     import mlx.core as mx
-    import mlx.nn as nn  # noqa: F401  (gated_delta_vjp imports it at module load)
-    from unsloth_zoo.gated_delta_vjp import gated_delta_ops_efficient, _gated_delta_step
-    _HAS_MLX = True
+    # Require a REAL mlx runtime: reject the torch shim (tests/mlx_simulation),
+    # which test_mlx_gated_delta.py registers into sys.modules. Under the shim
+    # these tests would exercise the custom-function/functorch path instead of
+    # the real Metal/CPU/CUDA backend (and are flaky there), so skip cleanly.
+    _HAS_MLX = "mlx_simulation" not in (getattr(mx, "__file__", "") or "")
 except Exception:
     _HAS_MLX = False
+
+# Import the module under test only when a real mlx is present, and OUTSIDE the
+# guard above: an import-time regression in gated_delta_vjp must fail loudly
+# here rather than be silently swallowed into a skip.
+if _HAS_MLX:
+    from unsloth_zoo.gated_delta_vjp import gated_delta_ops_efficient, _gated_delta_step
 
 _SKIP_REASON = (
     "Requires a real `mlx` install (Apple Silicon Metal, or Linux mlx[cpu]/"
@@ -139,9 +148,11 @@ def _efficient(q, k, v, g, beta, mask):
 
 
 def _rel_l2(a, b):
-    num = sum(mx.sum((x.astype(mx.float32) - y.astype(mx.float32)) ** 2).item() for x, y in zip(a, b)) ** 0.5
-    den = sum(mx.sum(y.astype(mx.float32) ** 2).item() for y in b) ** 0.5 + 1e-12
-    return num / den
+    # Keep the reduction in MLX and sync once: avoids a device-to-host transfer
+    # per gradient tensor.
+    num = sum(mx.sum((x.astype(mx.float32) - y.astype(mx.float32)) ** 2) for x, y in zip(a, b))
+    den = sum(mx.sum(y.astype(mx.float32) ** 2) for y in b)
+    return ((num ** 0.5) / (den ** 0.5 + 1e-12)).item()
 
 
 _NAMES = ("q", "k", "v", "g", "beta")
