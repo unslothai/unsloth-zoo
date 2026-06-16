@@ -25,7 +25,7 @@ import importlib
 import inspect
 import math
 import os
-import sys
+import tempfile
 import types
 import warnings
 from contextlib import contextmanager
@@ -112,7 +112,6 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
-    from ..model_lists import FORCE_FLOAT32
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
@@ -136,6 +135,42 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     model.update(tree_map_with_path(
         lambda k, v: v.astype(target_dtype)
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) else v,
+        model.parameters(),
+    ))
+    mx.eval(model.parameters())
+
+
+def _is_norm_parameter_path(path) -> bool:
+    """Return whether a parameter path belongs to a normalization module."""
+    parts = str(path).lower().split(".")
+    # "norm" matches RMSNorm/LayerNorm; ln_* covers GPT-2/GPT-OSS.
+    return any(
+        "norm" in part or part.startswith("ln_") or part == "ln_f"
+        for part in parts[:-1]
+    )
+
+
+def _keep_norm_parameters_float32(model) -> None:
+    """Keep LM/VLM normalization parameters in fp32 across FT/LoRA/QLoRA."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten, tree_map_with_path
+
+    needs_cast = False
+    for k, v in tree_flatten(model.parameters()):
+        if (
+            _is_norm_parameter_path(k)
+            and mx.issubdtype(v.dtype, mx.floating)
+            and v.dtype != mx.float32
+        ):
+            needs_cast = True
+            break
+    if not needs_cast:
+        return
+
+    model.update(tree_map_with_path(
+        lambda k, v: v.astype(mx.float32)
+        if _is_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
+        else v,
         model.parameters(),
     ))
     mx.eval(model.parameters())
@@ -239,6 +274,81 @@ def _message_matches_known_fallback(message, rule):
     return all(token in message for token in rule.get("message_tokens", ()))
 
 
+def _patch_deepseek_ocr_transformers_import_compat(model_type):
+    """Let DeepSeek-OCR remote config imports survive newer Transformers.
+
+    The MLX path does not instantiate the Torch Llama flash-attention class,
+    but DeepSeek-OCR's tokenizer/config import still imports that symbol from
+    Transformers. Recent Transformers releases removed it, so provide the
+    nearest eager-attention alias only for this import-time compatibility case.
+    """
+    if model_type not in {"deepseekocr", "deepseekocr_2", "deepseek_vl_v2"}:
+        return
+    try:
+        from transformers.models.llama import modeling_llama
+    except Exception:
+        return
+    if (
+        not hasattr(modeling_llama, "LlamaFlashAttention2")
+        and hasattr(modeling_llama, "LlamaAttention")
+    ):
+        modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+    try:
+        from transformers.utils import import_utils
+    except Exception:
+        return
+    if not hasattr(import_utils, "is_torch_fx_available"):
+        import_utils.is_torch_fx_available = lambda: False
+
+
+def _deepseek_ocr_config_model_type(config_data):
+    architectures = config_data.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    normalized = {str(arch).lower() for arch in architectures}
+    if "deepseekocrforcausallm" in normalized:
+        return "deepseekocr"
+    if "deepseekocr2forcausallm" in normalized:
+        return "deepseekocr_2"
+    return None
+
+
+def _materialize_mlx_vlm_config_override(local_path, config_data):
+    """Return a load path whose config routes known repos to the right mlx-vlm class."""
+    if not local_path:
+        return local_path, config_data
+    corrected_model_type = _deepseek_ocr_config_model_type(config_data)
+    if (
+        corrected_model_type is None
+        or config_data.get("model_type") == corrected_model_type
+    ):
+        return local_path, config_data
+
+    patched_config = dict(config_data)
+    patched_config["model_type"] = corrected_model_type
+    # mlx-vlm supplies the model/processor implementation locally. Keeping the
+    # Torch remote-code auto_map here makes AutoProcessor import incompatible
+    # DeepSeek OCR Torch modules during MLX loads.
+    patched_config.pop("auto_map", None)
+    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
+    for name in os.listdir(local_path):
+        src = os.path.join(local_path, name)
+        dst = os.path.join(override_dir, name)
+        if name == "config.json":
+            continue
+        try:
+            os.symlink(src, dst)
+        except FileExistsError:
+            pass
+    with open(os.path.join(override_dir, "config.json"), "w") as f:
+        json.dump(patched_config, f, indent=2)
+    print(
+        "Unsloth: Routing DeepSeek OCR checkpoint through "
+        f"mlx-vlm model_type={corrected_model_type!r}."
+    )
+    return override_dir, patched_config
+
+
 def _load_mlx_lm_with_strict_fallback(
     model_name,
     model_type,
@@ -307,6 +417,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
     load() lacks strict=False, retry with a temporary load_weights shim for
     registered mismatch signatures and exact allow-listed keys only.
     """
+    _patch_deepseek_ocr_transformers_import_compat(model_type)
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
@@ -691,6 +802,330 @@ def _fix_qwen35_attention_cache(model):
     print("Unsloth: Fixed Qwen3.5 attention for training (cache=None).")
 
 
+def _fix_gemma3_vision_post_layernorm_eps(model):
+    """Match HF Gemma3/SigLIP final vision LayerNorm epsilon.
+
+    mlx-vlm constructs ``post_layernorm`` with MLX's default eps=1e-5, while
+    the checkpoint config and Transformers path use vision_config.layer_norm_eps
+    (1e-6 for Gemma3). The mismatch only appears after the full vision tower,
+    so it is easy to misdiagnose as attention drift.
+    """
+
+    vision_tower = getattr(model, "vision_tower", None)
+    vision_model = getattr(vision_tower, "vision_model", None)
+    post_layernorm = getattr(vision_model, "post_layernorm", None)
+    if post_layernorm is None or not hasattr(post_layernorm, "eps"):
+        return False
+
+    config = getattr(model, "config", None)
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is None and isinstance(config, dict):
+        vision_config = config.get("vision_config")
+
+    eps = None
+    if isinstance(vision_config, dict):
+        eps = vision_config.get("layer_norm_eps")
+    elif vision_config is not None:
+        eps = getattr(vision_config, "layer_norm_eps", None)
+    if eps is None:
+        return False
+
+    eps = float(eps)
+    if float(getattr(post_layernorm, "eps")) == eps:
+        return False
+
+    post_layernorm.eps = eps
+    model._unsloth_gemma3_vision_post_layernorm_eps = eps
+    return True
+
+
+def _fix_gemma3_text_rmsnorm_fp32(model=None):
+    """Match HF Gemma3 text RMSNorm: fp32 math, then cast back to activation dtype."""
+
+    try:
+        import mlx.core as mx
+        language_module = importlib.import_module("mlx_vlm.models.gemma3.language")
+    except Exception:
+        return False
+
+    rmsnorm_cls = getattr(language_module, "RMSNorm", None)
+    if rmsnorm_cls is None:
+        return False
+    if getattr(rmsnorm_cls, "_unsloth_fp32_rmsnorm_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_text_rmsnorm_fp32 = True
+        return True
+
+    def patched_rmsnorm_call(self, x):
+        orig_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        y = x_f * mx.rsqrt(mx.mean(x_f * x_f, axis=-1, keepdims=True) + self.eps)
+        if "weight" in self:
+            y = y * (1.0 + self.weight.astype(mx.float32))
+        return y.astype(orig_dtype)
+
+    try:
+        rmsnorm_cls.__call__ = patched_rmsnorm_call
+        rmsnorm_cls._unsloth_fp32_rmsnorm_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_text_rmsnorm_fp32 = True
+    return True
+
+
+def _fix_gemma3_vision_attention_fp32_sdpa(model=None):
+    """Run Gemma3 vision SDPA in fp32, then cast back before the output proj."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    attention_cls = getattr(vision_module, "Attention", None)
+    if attention_cls is None:
+        return False
+    if getattr(attention_cls, "_unsloth_fp32_sdpa_patched", False):
+        return False
+
+    def patched_attention_call(self, x, mask=None):
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
+        orig_dtype = queries.dtype
+
+        num_heads = self.num_heads
+        batch_size, query_length, hidden_size = queries.shape
+        _, key_length, _ = keys.shape
+        queries = queries.reshape(
+            batch_size, query_length, num_heads, -1,
+        ).transpose(0, 2, 1, 3).astype(mx.float32)
+        keys = keys.reshape(
+            batch_size, key_length, num_heads, -1,
+        ).transpose(0, 2, 1, 3).astype(mx.float32)
+        values = values.reshape(
+            batch_size, key_length, num_heads, -1,
+        ).transpose(0, 2, 1, 3).astype(mx.float32)
+
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask,
+        )
+        output = output.astype(orig_dtype)
+        output = output.transpose(0, 2, 1, 3).reshape(
+            batch_size, query_length, hidden_size,
+        )
+        return self.out_proj(output)
+
+    try:
+        attention_cls.__call__ = patched_attention_call
+        attention_cls._unsloth_fp32_sdpa_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_attention_fp32_sdpa = True
+    return True
+
+
+def _fix_gemma3_vision_mlp_fp32_activation(model=None):
+    """Match CUDA SigLIP GELU: compute activation in fp32, then cast back."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    mlp_cls = getattr(vision_module, "MLP", None)
+    if mlp_cls is None:
+        return False
+    if getattr(mlp_cls, "_unsloth_fp32_activation_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_vision_mlp_fp32_activation = True
+        return True
+
+    def patched_mlp_call(self, x):
+        x = self.fc1(x)
+        orig_dtype = x.dtype
+        x = self.activation_fn(x.astype(mx.float32)).astype(orig_dtype)
+        x = self.fc2(x)
+        return x
+
+    try:
+        mlp_cls.__call__ = patched_mlp_call
+        mlp_cls._unsloth_fp32_activation_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_mlp_fp32_activation = True
+    return True
+
+
+def _fix_gemma3_vision_encoder_fp32_layernorm(model=None):
+    """Match CUDA SigLIP LayerNorm math in fp32 while preserving bf16 activations."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    encoder_layer_cls = getattr(vision_module, "EncoderLayer", None)
+    if encoder_layer_cls is None:
+        return False
+    if getattr(encoder_layer_cls, "_unsloth_fp32_layernorm_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_vision_encoder_fp32_layernorm = True
+        return True
+
+    def torch_like_layer_norm(norm, x):
+        orig_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        mean = mx.mean(x_f, axis=-1, keepdims=True)
+        centered = x_f - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        y = centered * mx.rsqrt(var + norm.eps)
+        if "weight" in norm:
+            y = y * norm.weight.astype(mx.float32)
+        if "bias" in norm:
+            y = y + norm.bias.astype(mx.float32)
+        return y.astype(orig_dtype)
+
+    def patched_encoder_layer_call(self, x, mask=None):
+        r = self.self_attn(torch_like_layer_norm(self.layer_norm1, x), mask)
+        h = x + r
+        r = self.mlp(torch_like_layer_norm(self.layer_norm2, h))
+        return h + r
+
+    try:
+        encoder_layer_cls.__call__ = patched_encoder_layer_call
+        encoder_layer_cls._unsloth_fp32_layernorm_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_encoder_fp32_layernorm = True
+    return True
+
+
+def _fix_gemma3_vision_post_layernorm_fp32(model=None):
+    """Run Gemma3 final SigLIP vision LayerNorm in fp32, then cast back."""
+
+    try:
+        import mlx.core as mx
+        vision_module = importlib.import_module("mlx_vlm.models.gemma3.vision")
+    except Exception:
+        return False
+
+    siglip_cls = getattr(vision_module, "SigLipVisionModel", None)
+    if siglip_cls is None:
+        return False
+    if getattr(siglip_cls, "_unsloth_fp32_post_layernorm_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_vision_post_layernorm_fp32 = True
+        return True
+
+    def torch_like_layer_norm(norm, x):
+        orig_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        mean = mx.mean(x_f, axis=-1, keepdims=True)
+        centered = x_f - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        y = centered * mx.rsqrt(var + norm.eps)
+        if "weight" in norm:
+            y = y * norm.weight.astype(mx.float32)
+        if "bias" in norm:
+            y = y + norm.bias.astype(mx.float32)
+        return y.astype(orig_dtype)
+
+    def patched_siglip_call(self, x, output_hidden_states=None):
+        x = self.embeddings(x)
+        encoder_outputs = self.encoder(
+            x=x, output_hidden_states=output_hidden_states, mask=None,
+        )
+        pooler_output = torch_like_layer_norm(self.post_layernorm, encoder_outputs[0])
+        return pooler_output, x, encoder_outputs[-1]
+
+    try:
+        siglip_cls.__call__ = patched_siglip_call
+        siglip_cls._unsloth_fp32_post_layernorm_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_vision_post_layernorm_fp32 = True
+    return True
+
+
+def _fix_gemma3_multimodal_image_feature_scale(model=None):
+    """Use text embedding width when compensating Gemma3 image feature scaling."""
+
+    try:
+        import mlx.core as mx
+        gemma3_module = importlib.import_module("mlx_vlm.models.gemma3.gemma3")
+    except Exception:
+        return False
+
+    model_cls = getattr(gemma3_module, "Model", None)
+    masked_scatter = getattr(gemma3_module, "masked_scatter", None)
+    if model_cls is None or masked_scatter is None:
+        return False
+    if getattr(model_cls, "_unsloth_image_feature_scale_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
+        return True
+
+    def prepare_inputs_for_multimodal(
+        hidden_size,
+        pad_token_id,
+        image_token_index,
+        image_features,
+        inputs_embeds,
+        input_ids,
+        attention_mask,
+    ):
+        del hidden_size
+        embed_dim = image_features.shape[-1]
+        batch_size, sequence_length = input_ids.shape
+        # Gemma3's language model scales all inputs_embeds by sqrt(text hidden
+        # size). Compensate image features with the actual embedding width, not
+        # the top-level multimodal config hidden_size.
+        scaled_image_features = image_features / (embed_dim**0.5)
+        final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
+
+        pad_token_id = pad_token_id if pad_token_id is not None else 0
+        text_mask = (input_ids != image_token_index) & (input_ids != pad_token_id)
+        image_mask = input_ids == image_token_index
+        pad_mask = input_ids == pad_token_id
+
+        text_mask_expanded = mx.repeat(mx.expand_dims(text_mask, -1), embed_dim, axis=-1)
+        pad_mask_expanded = mx.repeat(mx.expand_dims(pad_mask, -1), embed_dim, axis=-1)
+        image_mask_expanded = mx.repeat(mx.expand_dims(image_mask, -1), embed_dim, axis=-1)
+
+        final_embedding = mx.where(text_mask_expanded, inputs_embeds, final_embedding)
+        final_embedding = mx.where(
+            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding,
+        )
+        final_embedding = masked_scatter(
+            final_embedding, image_mask_expanded, scaled_image_features,
+        )
+
+        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
+        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
+        final_attention_mask_4d = mx.expand_dims(
+            attention_mask_expanded_1 * attention_mask_expanded_2,
+            1,
+        )
+        return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d
+
+    try:
+        model_cls.prepare_inputs_for_multimodal = staticmethod(
+            prepare_inputs_for_multimodal,
+        )
+        model_cls._unsloth_image_feature_scale_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
+    return True
 def _disable_fused_mrope(model):
     """Flip fused_apply off so MRoPE training uses the differentiable
     cos/sin fallback; the fused Metal kernel has no VJP."""
@@ -786,8 +1221,6 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     tree_flatten = getattr(module, "tree_flatten", None)
     if tree_unflatten is None or tree_flatten is None:
         return
-
-    original_sanitize = sanitize
 
     def patched_sanitize(self, weights):
         structured = tree_unflatten(list(weights.items()))
@@ -927,6 +1360,8 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
 
 _MLX_QUANT_MODE_DEFAULTS = {
     "affine": (64, 4),
+    # CUDA bnb NF4 parity (diagnostic): quantize then dequantize; not memory-saving.
+    "nf4_dense": (64, 4),
     "mxfp4": (32, 4),
     "nvfp4": (16, 4),
     "mxfp8": (32, 8),
@@ -2127,6 +2562,138 @@ def _dequantize_selected_mlx_modules(model, predicate):
     return len(replacements)
 
 
+def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
+    import mlx.core as mx
+
+    codebook = mx.array(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=mx.float32,
+    )
+
+    def _bnb_dynamic_codebook():
+        data = []
+        max_exponent_bits = 7
+        total_bits = 8
+        non_sign_bits = total_bits - 1
+        additional_items = 2 ** (non_sign_bits - max_exponent_bits) - 1
+        for i in range(max_exponent_bits):
+            fraction_items = int(2 ** (i + non_sign_bits - max_exponent_bits) + 1)
+            boundaries = mx.linspace(0.1, 1.0, fraction_items, dtype=mx.float32)
+            means = (boundaries[:-1] + boundaries[1:]) / 2.0
+            scale = 10 ** (-(max_exponent_bits - 1) + i)
+            data.extend((scale * means).tolist())
+            data.extend((-scale * means).tolist())
+        if additional_items > 0:
+            boundaries = mx.linspace(0.1, 1.0, additional_items + 1, dtype=mx.float32)
+            means = (boundaries[:-1] + boundaries[1:]) / 2.0
+            scale = 10 ** (-(max_exponent_bits - 1) + i)
+            data.extend((scale * means).tolist())
+            data.extend((-scale * means).tolist())
+        data.append(0.0)
+        data.append(1.0)
+        data.sort()
+        return mx.array(data, dtype=mx.float32)
+
+    def _bnb_nested_absmax(absmax):
+        dynamic_codebook = _bnb_dynamic_codebook()
+        original_size = (
+            absmax.numel()
+            if callable(getattr(absmax, "numel", None))
+            else (absmax.size() if callable(getattr(absmax, "size", None)) else absmax.size)
+        )
+        offset = mx.mean(absmax)
+        shifted = (absmax - offset).reshape((-1,))
+        pad = (-original_size) % 256
+        if pad:
+            shifted = mx.concatenate([shifted, mx.zeros((pad,), dtype=mx.float32)])
+        scale_groups = shifted.reshape((-1, 256))
+        scale_absmax = mx.max(mx.abs(scale_groups), axis=1, keepdims=True)
+        scale_denom = mx.where(scale_absmax > 0, scale_absmax, mx.ones_like(scale_absmax))
+        scaled = scale_groups / scale_denom
+        scale_indices = mx.argmin(mx.abs(scaled[..., None] - dynamic_codebook), axis=-1)
+        nested = (dynamic_codebook[scale_indices] * scale_absmax).reshape((-1,))[:original_size]
+        return nested + offset
+
+    original_shape = weight.shape
+    original_dtype = weight.dtype
+    flat = weight.astype(mx.float32).reshape((-1,))
+    original_size = (
+        flat.numel()
+        if callable(getattr(flat, "numel", None))
+        else (flat.size() if callable(getattr(flat, "size", None)) else flat.size)
+    )
+    pad = (-original_size) % group_size
+    if pad:
+        flat = mx.concatenate([flat, mx.zeros((pad,), dtype=mx.float32)])
+    groups = flat.reshape((-1, group_size))
+    absmax = mx.max(mx.abs(groups), axis=1, keepdims=True)
+    denom = mx.where(absmax > 0, absmax, mx.ones_like(absmax))
+    scaled = groups / denom
+    indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
+    # Only simulate the nested (double-quantized) absmax when double quant is
+    # requested. The accepted BitsAndBytesConfig path rejects
+    # bnb_4bit_use_double_quant=True, and CUDA bitsandbytes dequantizes plain
+    # NF4 with the raw absmax, so default NF4 must keep un-nested scales.
+    if use_double_quant:
+        absmax = _bnb_nested_absmax(absmax.reshape((-1,))).reshape((-1, 1))
+    dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
+    return dequantized.reshape(original_shape).astype(original_dtype)
+
+
+def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, predicate):
+    import mlx.core as mx
+
+    quantized = {}
+    for path, module in model.named_modules():
+        if not predicate(path, module):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or len(getattr(weight, "shape", ())) != 2:
+            continue
+        module.weight = _nf4_dense_dequantize_weight(weight, spec.group_size or 64)
+        quantized[path] = {
+            "bits": 4,
+            "group_size": spec.group_size or 64,
+            "mode": "nf4_dense",
+            "storage": "dense_dequantized",
+        }
+        mx.eval(module.weight)
+
+    updated_config = dict(config or {}) if isinstance(config, dict) else {}
+    updated_config["quantization"] = quantized
+    updated_config["quantization_config"] = quantized
+    model._config = updated_config
+    model._unsloth_quantization_config = quantized
+    model._unsloth_quantization_policy = {
+        **spec.to_metadata(),
+        "storage": "dense_dequantized",
+        "warning": (
+            "nf4_dense is a diagnostic CUDA bitsandbytes NF4 parity mode. "
+            "Weights are stored densely after quantize/dequantize and this "
+            "does not reduce memory like QLoRA."
+        ),
+    }
+    model._unsloth_quantized_source = "runtime_dense_nf4"
+    return model, updated_config
+
+
 def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     if not spec.enabled:
         model._unsloth_quantization_config = None
@@ -2163,6 +2730,8 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
     if is_vlm or spec.quantize_modules is not None or user_predicate is not None:
         config = dict(config or {})
         config.setdefault("quantization", {})
+    if spec.mode == "nf4_dense":
+        return _apply_dense_nf4_quantization(model, config, spec, predicate)
     model, updated_config = quantize_model(
         model,
         config,
@@ -2989,6 +3558,10 @@ class FastMLXModel:
                         config_data = json.load(f)
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
+            local_path, config_data = _materialize_mlx_vlm_config_override(
+                local_path,
+                config_data,
+            )
 
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
         # aren't trainable (our CCE backward zeros the quantized weight grad),
@@ -3299,6 +3872,7 @@ class FastMLXModel:
                         model._unsloth_quantized_source = adapter_cfg.get(
                             "base_quantized_source"
                         )
+                    _keep_norm_parameters_float32(model)
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
@@ -3394,14 +3968,16 @@ class FastMLXModel:
                 from mlx_vlm.utils import load_config as _vlm_load_config
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
+                _patch_deepseek_ocr_transformers_import_compat(model_type)
+                vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
                     model, processor = vlm_load(
-                        model_name,
+                        vlm_load_target,
                         lazy=True,
                         revision=revision,
                         **extra_kwargs,
                     )
-                    vlm_cfg = _vlm_load_config(local_path or model_name)
+                    vlm_cfg = _vlm_load_config(vlm_load_target)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
@@ -3416,7 +3992,7 @@ class FastMLXModel:
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
                 model, processor = _load_mlx_vlm_with_extra_weight_filter(
-                    model_name,
+                    local_path or model_name,
                     model_type,
                     vlm_load,
                     vlm_kwargs,
@@ -3436,6 +4012,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
+            _keep_norm_parameters_float32(model)
 
             from .utils import (
                 normalize_mlx_chat_template,
@@ -3458,6 +4035,13 @@ class FastMLXModel:
             model._is_vlm_model = True
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
+            _fix_gemma3_text_rmsnorm_fp32(model)
+            _fix_gemma3_vision_post_layernorm_eps(model)
+            _fix_gemma3_vision_attention_fp32_sdpa(model)
+            _fix_gemma3_vision_encoder_fp32_layernorm(model)
+            _fix_gemma3_vision_post_layernorm_fp32(model)
+            _fix_gemma3_vision_mlp_fp32_activation(model)
+            _fix_gemma3_multimodal_image_feature_scale(model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
@@ -3547,6 +4131,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
+            _keep_norm_parameters_float32(model)
             from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
@@ -3829,14 +4414,15 @@ class FastMLXModel:
             from .utils import apply_gradient_checkpointing
             apply_gradient_checkpointing(model)
 
-        import mlx.utils
-        trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
-        total = sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
-        pct = 100.0 * trainable / total if total > 0 else 0
-        print(
-            f"Unsloth: LoRA applied — {trainable:,} trainable params "
-            f"({pct:.2f}% of {total:,} total)"
-        )
+        if hasattr(model, "trainable_parameters") and hasattr(model, "parameters"):
+            import mlx.utils
+            trainable = sum(v.size for _, v in mlx.utils.tree_flatten(model.trainable_parameters()))
+            total = sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
+            pct = 100.0 * trainable / total if total > 0 else 0
+            print(
+                f"Unsloth: LoRA applied — {trainable:,} trainable params "
+                f"({pct:.2f}% of {total:,} total)"
+            )
         return model
 
 
