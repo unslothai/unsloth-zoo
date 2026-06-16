@@ -2575,30 +2575,13 @@ def merge_and_overwrite_lora(
     # tied lm_head -> embed_tokens). A looser re-derivation drifts from the merge
     # and raises false mismatches; len(lora_weights) over-counts unbacked targets
     # such as a vision tower absent from the base safetensors.
-    _converted_for_check = _convert_lora_keys_to_safetensor_format(
+    _base = find_lora_base_model(model)
+    effective_loras = _count_backed_lora_modules(
         lora_weights,
         safetensor_keys_seen,
-        model_class_name = find_lora_base_model(model).__class__.__name__,
+        _base.__class__.__name__,
+        bool(getattr(_base.config, "tie_word_embeddings", False)),
     )
-    _tie_word_embeddings = bool(getattr(find_lora_base_model(model).config, "tie_word_embeddings", False))
-
-    def _lora_is_backed(_key):
-        if not isinstance(_key, str):
-            return False
-        if (_key + ".weight") in safetensor_keys_seen:
-            return True
-        if (_key + ".linear.weight") in safetensor_keys_seen:   # Gemma4 ClippableLinear
-            return True
-        if ".experts" in _key or ".moe" in _key:                # fused / per-expert MoE
-            _p = _key[: -len(".base_layer")] if _key.endswith(".base_layer") else _key
-            if any(_s.startswith(_p + ".") and _s.endswith(".weight") for _s in safetensor_keys_seen):
-                return True
-        if _tie_word_embeddings and _key.endswith("lm_head"):   # tied: merged onto embed_tokens
-            if (_key[: -len("lm_head")] + "embed_tokens.weight") in safetensor_keys_seen:
-                return True
-        return False
-
-    effective_loras = sum(1 for _key in _converted_for_check if _lora_is_backed(_key))
 
     # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
     # though only one tensor exists on disk. If we see both logical modules but only one backing
@@ -3324,6 +3307,45 @@ def _convert_lora_keys_to_safetensor_format(
 
         converted_lora_weights_output[converted_key_for_lookup] = lora_stats
     return converted_lora_weights_output
+pass
+
+def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_name, tie_word_embeddings):
+    """Count LoRA modules backed by a saved tensor, mirroring the key resolution of
+    the merge loop in _merge_and_overwrite_lora (remap, Gemma4 .linear, fused MoE
+    experts, and the tied lm_head -> embed_tokens fallback with its model. add/strip).
+    Kept in sync with that loop so the save sanity check counts the same modules the
+    merge actually wrote; genuinely unbacked targets (e.g. a vision tower absent from
+    the base safetensors) are excluded.
+    """
+    converted = _convert_lora_keys_to_safetensor_format(
+        lora_weights, safetensor_keys_seen, model_class_name = model_class_name,
+    )
+
+    def _backed(key):
+        if not isinstance(key, str):
+            return False
+        if (key + ".weight") in safetensor_keys_seen:
+            return True
+        if (key + ".linear.weight") in safetensor_keys_seen:   # Gemma4 ClippableLinear
+            return True
+        if ".experts" in key or ".moe" in key:                 # fused / per-expert MoE
+            prefix = key[: -len(".base_layer")] if key.endswith(".base_layer") else key
+            if any(s.startswith(prefix + ".") and s.endswith(".weight") for s in safetensor_keys_seen):
+                return True
+        if tie_word_embeddings and key.endswith("lm_head"):    # tied: merged onto embed_tokens
+            # Mirror the merge loop's model. add/strip so a bare lm_head key resolves
+            # to model.embed_tokens.weight (and a model.-prefixed key to the bare one).
+            prefix = key[: -len("lm_head")]
+            candidates = [prefix + "embed_tokens.weight"]
+            if prefix.startswith("model."):
+                candidates.append(prefix[len("model."):] + "embed_tokens.weight")
+            else:
+                candidates.append("model." + prefix + "embed_tokens.weight")
+            if any(c in safetensor_keys_seen for c in candidates):
+                return True
+        return False
+
+    return sum(1 for key in converted if _backed(key))
 pass
 
 def find_lora_base_model(model_to_inspect):
