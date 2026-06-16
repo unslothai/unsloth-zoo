@@ -83,6 +83,90 @@ def _resolve_bin(server_bin=None):
     return os.path.abspath(cand)
 
 
+def _torch_cuda_lib_dir():
+    """Windows: torch's bundled ``torch/lib`` if it ships ``cudart64_*.dll``, else None.
+
+    On Windows ``LD_LIBRARY_PATH`` is ignored, so the child can only load ``ggml-cuda.dll`` when
+    torch/lib (cudart64_*/cublas64_*) is on ``PATH``; otherwise it errors 126 and falls back to CPU
+    (unsloth#6273; mirrors the llama-server fix unsloth#5491). Glob keeps it CUDA-major-agnostic."""
+    try:
+        import torch
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    except Exception:
+        return None
+    if not os.path.isdir(torch_lib):
+        return None
+    try:
+        has_cudart = any(
+            f.lower().startswith("cudart64_") and f.lower().endswith(".dll")
+            for f in os.listdir(torch_lib)
+        )
+    except OSError:
+        return None
+    return torch_lib if has_cudart else None
+
+
+def _bundled_cuda_lib_dirs():
+    """Linux/WSL: the venv's pip ``nvidia-*`` CUDA wheel lib dirs (``nvidia/cu13/lib``, ...).
+
+    The prebuilt visual-server links ``libcudart``/``libcublas`` from these wheels, not a system
+    ``/usr/local/cuda``. With only the binary dir on ``LD_LIBRARY_PATH`` the loader fell back to the
+    system CUDA: absent -> silent CPU, or on WSL a ``libcudart`` that crashes in the PTX JIT during
+    ``cudaGetDeviceCount`` (#6303). Prepended ahead of any system path, these make ``ggml-cuda.so``
+    resolve the bundled runtime (mirrors studio ``llama_cpp.py``; Linux analogue of #6273).
+    ``torch/lib`` is excluded: its bundled ``libgomp``/``libstdc++`` could shadow the C++ binary's
+    system libs, and the runtime is already in the ``nvidia-*`` wheels (Windows differs -- there
+    ``torch/lib`` ships the only ``cudart64_*.dll``, on ``PATH``). Returns ``[]`` if none found."""
+    import sysconfig
+
+    roots, dirs = [], []
+    # where unsloth_zoo is actually installed (<site-packages>/unsloth_zoo/diffusion_studio/..),
+    # then the env's purelib -- covers normal, non-standard-prefix and editable installs.
+    roots.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    try:
+        roots.append(sysconfig.get_paths()["purelib"])
+    except Exception:
+        pass
+    for root in roots:
+        nvidia = os.path.join(root, "nvidia")
+        if not os.path.isdir(nvidia):
+            continue
+        for name in sorted(os.listdir(nvidia)):  # cu13 sorts ahead of cudnn/nccl/...
+            lib = os.path.join(nvidia, name, "lib")
+            if os.path.isdir(lib) and lib not in dirs:
+                dirs.append(lib)
+    return dirs
+
+
+def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, base_env = None, os_name = None):
+    """Build the visual-server child env so it loads the CUDA backend, not CPU.
+
+    Binary dir first, then bundled CUDA runtime, then the inherited path. Windows: torch/lib
+    (``cudart64_*.dll``) is prepended to ``PATH`` (#6273). Linux/WSL: the bundled ``nvidia-*`` dirs
+    are prepended to ``LD_LIBRARY_PATH`` ahead of any inherited system CUDA (#6303). macOS / no GPU
+    wheels: only the binary dir is added (unchanged). Pure/injectable for cross-platform tests."""
+    name = os.name if os_name is None else os_name
+    env = dict(os.environ if base_env is None else base_env)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["NGL"] = "99"
+    env["MAXTOK"] = str(maxtok)
+
+    bin_dir = os.path.dirname(server_bin)
+    ld_dirs = [bin_dir]
+    if name != "nt":
+        ld_dirs += _bundled_cuda_lib_dirs()
+    existing_ld = env.get("LD_LIBRARY_PATH", "")
+    if existing_ld:
+        ld_dirs.append(existing_ld)
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(ld_dirs)
+
+    if name == "nt":
+        torch_lib = _torch_cuda_lib_dir()
+        if torch_lib:
+            env["PATH"] = torch_lib + os.pathsep + env.get("PATH", "")
+    return env
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
@@ -92,9 +176,7 @@ class VisualServer:
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), NGL="99", MAXTOK=str(maxtok))
-        env["LD_LIBRARY_PATH"] = os.path.dirname(self.server_bin) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-        self.env = env
+        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=maxtok)
         self.p = None
         self._spawn()
 
