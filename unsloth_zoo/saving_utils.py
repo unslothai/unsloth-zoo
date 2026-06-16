@@ -2570,11 +2570,35 @@ def merge_and_overwrite_lora(
 
 
     # Step 7: Check for errors
-    # The remap above already aligns LoRA keys to the saved tensors, so every
-    # mergeable module is counted by n_saved_modules. Re-deriving "backed" keys
-    # here only drifts from the merge's own resolution (.linear, tied embeds,
-    # fused MoE) and caused false mismatches, so count all LoRA modules.
-    effective_loras = len(lora_weights)
+    # Count only LoRA modules backed by a saved tensor, using the same key
+    # resolution as the merge loop above (remap, Gemma4 .linear, fused MoE experts,
+    # tied lm_head -> embed_tokens). A looser re-derivation drifts from the merge
+    # and raises false mismatches; len(lora_weights) over-counts unbacked targets
+    # such as a vision tower absent from the base safetensors.
+    _converted_for_check = _convert_lora_keys_to_safetensor_format(
+        lora_weights,
+        safetensor_keys_seen,
+        model_class_name = find_lora_base_model(model).__class__.__name__,
+    )
+    _tie_word_embeddings = bool(getattr(find_lora_base_model(model).config, "tie_word_embeddings", False))
+
+    def _lora_is_backed(_key):
+        if not isinstance(_key, str):
+            return False
+        if (_key + ".weight") in safetensor_keys_seen:
+            return True
+        if (_key + ".linear.weight") in safetensor_keys_seen:   # Gemma4 ClippableLinear
+            return True
+        if ".experts" in _key or ".moe" in _key:                # fused / per-expert MoE
+            _p = _key[: -len(".base_layer")] if _key.endswith(".base_layer") else _key
+            if any(_s.startswith(_p + ".") and _s.endswith(".weight") for _s in safetensor_keys_seen):
+                return True
+        if _tie_word_embeddings and _key.endswith("lm_head"):   # tied: merged onto embed_tokens
+            if (_key[: -len("lm_head")] + "embed_tokens.weight") in safetensor_keys_seen:
+                return True
+        return False
+
+    effective_loras = sum(1 for _key in _converted_for_check if _lora_is_backed(_key))
 
     # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
     # though only one tensor exists on disk. If we see both logical modules but only one backing
@@ -3201,20 +3225,25 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
                     if lora_prefix and sf_prefix and lora_prefix != sf_prefix:
                         substitution_votes[(lora_prefix, sf_prefix)] += 1
 
-        # Apply ALL valid prefix substitutions, not just the top vote.
-        # Multiple namespaces (e.g. language + vision) may each need a
-        # different remap, and most_common(1) would drop the non-dominant.
+        # Apply prefix substitutions, but only true reorderings of the same path
+        # components (e.g. model.language_model. <-> language_model.model.), never
+        # cross-namespace rewrites. Only claim a target that exists on disk and is
+        # not already taken, so an unmatched vision key cannot overwrite a real
+        # language tensor.
         if substitution_votes:
             remaining_unmatched = list(unmatched_keys)
             applied_prefixes = set()
             for (lora_prefix, sf_prefix), _ in substitution_votes.most_common():
                 if lora_prefix in applied_prefixes:
                     continue
+                if _Counter2(p for p in lora_prefix.split(".") if p) != \
+                   _Counter2(p for p in sf_prefix.split(".") if p):
+                    continue
                 applied_prefixes.add(lora_prefix)
                 still_unmatched = []
                 for k, v in remaining_unmatched:
-                    if k.startswith(lora_prefix):
-                        new_key = sf_prefix + k[len(lora_prefix):]
+                    new_key = sf_prefix + k[len(lora_prefix):] if k.startswith(lora_prefix) else None
+                    if new_key is not None and (new_key + ".weight") in sf_key_set and new_key not in remapped:
                         remapped[new_key] = v
                         inferred_prefixes.append(sf_prefix)
                         changed = True
