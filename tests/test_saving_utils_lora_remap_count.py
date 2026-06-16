@@ -132,11 +132,11 @@ def test_count_vision_tower_unbacked_excluded():
 
 def test_count_tied_embed_and_bare_lm_head():
     """Tied model, modules_to_save on model.embed_tokens and bare lm_head, only
-    embed_tokens.weight on disk. lm_head resolves to embed_tokens via the model.
-    add/strip, so both count; the Step-7 tied discount then makes it match the one
-    merged tensor."""
+    embed_tokens.weight on disk. The merge writes the embed delta and drops lm_head
+    (the tied bridge fires only when embed is not itself a target), so exactly one
+    tensor is merged and the merge-accurate count is 1, with no separate discount."""
     assert _count(["model.embed_tokens", "lm_head"], ["model.embed_tokens.weight"],
-                  model_class_name="LlamaForCausalLM", tie=True) == 2
+                  model_class_name="LlamaForCausalLM", tie=True) == 1
 
 
 def test_count_tied_bare_lm_head_with_layer():
@@ -151,3 +151,23 @@ def test_count_untied_lm_head_on_disk():
     assert _count(["lm_head", "model.layers.0.self_attn.q_proj"],
                   ["lm_head.weight", "model.layers.0.self_attn.q_proj.weight"],
                   model_class_name="LlamaForCausalLM", tie=False) == 2
+
+
+def test_count_composite_tied_embed_and_bare_lm_head():
+    """Composite VLM (deep model.language_model. prefix), tied, modules_to_save on the
+    deep embed_tokens and a bare lm_head, only the deep embed tensor on disk. The merge
+    writes the embed delta and cannot bridge the bare lm_head onto the deep-prefix embed,
+    so it merges one tensor and the count must mirror that as 1. The previous
+    discount-based scheme under-counted this to 0 and raised a false RuntimeError."""
+    assert _count(["model.language_model.embed_tokens", "lm_head"],
+                  ["model.language_model.embed_tokens.weight"],
+                  model_class_name="PreTrainedModel", tie=True) == 1
+
+
+def test_count_composite_tied_bare_lm_head_unbridgeable_dropped():
+    """Composite VLM, tied, a bare lm_head whose embed lives only at a deep prefix. The
+    merge cannot bridge a bare lm_head onto model.language_model.embed_tokens.weight, so
+    it is dropped and contributes 0 (the standard model.embed_tokens case still bridges
+    and counts, see test_count_tied_bare_lm_head_with_layer)."""
+    assert _count(["lm_head"], ["model.language_model.embed_tokens.weight"],
+                  model_class_name="PreTrainedModel", tie=True) == 0

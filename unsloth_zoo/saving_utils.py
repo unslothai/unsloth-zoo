@@ -2570,11 +2570,13 @@ def merge_and_overwrite_lora(
 
 
     # Step 7: Check for errors
-    # Count only LoRA modules backed by a saved tensor, using the same key
-    # resolution as the merge loop above (remap, Gemma4 .linear, fused MoE experts,
-    # tied lm_head -> embed_tokens). A looser re-derivation drifts from the merge
-    # and raises false mismatches; len(lora_weights) over-counts unbacked targets
-    # such as a vision tower absent from the base safetensors.
+    # Count only LoRA modules backed by a saved tensor, using the same key resolution
+    # as the merge loop above (remap, Gemma4 .linear, fused MoE experts, and the tied
+    # lm_head -> embed_tokens bridge with its embed-not-a-target guard). The count
+    # therefore equals the number of tensors the merge actually writes, so no separate
+    # tied discount is needed. A looser re-derivation drifts from the merge and raises
+    # false mismatches; len(lora_weights) over-counts unbacked targets such as a vision
+    # tower absent from the base safetensors.
     _base = find_lora_base_model(model)
     effective_loras = _count_backed_lora_modules(
         lora_weights,
@@ -2582,19 +2584,6 @@ def merge_and_overwrite_lora(
         _base.__class__.__name__,
         bool(getattr(_base.config, "tie_word_embeddings", False)),
     )
-
-    # For tied embeddings, PEFT can register both embed_tokens and lm_head as modules_to_save even
-    # though only one tensor exists on disk. If we see both logical modules but only one backing
-    # tensor key across shards, treat them as a single merged target to avoid an off-by-one on the
-    # sanity check while keeping the check meaningful for non-tied models.
-    has_embed = any(key.endswith("embed_tokens") for key in lora_weights)
-    has_head  = any(key.endswith("lm_head") for key in lora_weights)
-    if has_embed and has_head:
-        # Only count actual weight tensors; lm_head.bias alone should not mask tied-embedding cases.
-        has_embed_tensor = any(key.endswith("embed_tokens.weight") for key in safetensor_keys_seen)
-        has_head_tensor  = any(key.endswith("lm_head.weight")      for key in safetensor_keys_seen)
-        if has_embed_tensor ^ has_head_tensor:  # exactly one side present on disk
-            effective_loras -= 1
 
     if effective_loras != n_saved_modules:
         raise RuntimeError(
@@ -3312,10 +3301,12 @@ pass
 def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_name, tie_word_embeddings):
     """Count LoRA modules backed by a saved tensor, mirroring the key resolution of
     the merge loop in _merge_and_overwrite_lora (remap, Gemma4 .linear, fused MoE
-    experts, and the tied lm_head -> embed_tokens fallback with its model. add/strip).
-    Kept in sync with that loop so the save sanity check counts the same modules the
-    merge actually wrote; genuinely unbacked targets (e.g. a vision tower absent from
-    the base safetensors) are excluded.
+    experts, and the tied lm_head -> embed_tokens bridge). The tied bridge is keyed on
+    the DISK embed prefix and only fires when that embed is not itself a target, exactly
+    like the merge, so the count equals the number of tensors the merge writes and the
+    Step-7 sanity check needs no extra tied discount. Genuinely unbacked targets (e.g. a
+    vision tower absent from the base safetensors, or a bare lm_head whose composite-VLM
+    embed lives at a deep prefix the merge cannot bridge) are excluded.
     """
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, safetensor_keys_seen, model_class_name = model_class_name,
@@ -3333,16 +3324,23 @@ def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_n
             if any(s.startswith(prefix + ".") and s.endswith(".weight") for s in safetensor_keys_seen):
                 return True
         if tie_word_embeddings and key.endswith("lm_head"):    # tied: merged onto embed_tokens
-            # Mirror the merge loop's model. add/strip so a bare lm_head key resolves
-            # to model.embed_tokens.weight (and a model.-prefixed key to the bare one).
-            prefix = key[: -len("lm_head")]
-            candidates = [prefix + "embed_tokens.weight"]
-            if prefix.startswith("model."):
-                candidates.append(prefix[len("model."):] + "embed_tokens.weight")
-            else:
-                candidates.append("model." + prefix + "embed_tokens.weight")
-            if any(c in safetensor_keys_seen for c in candidates):
-                return True
+            # The merge folds an lm_head LoRA onto an on-disk embed_tokens.weight, but only
+            # when that embed module is not itself a LoRA target (else the merge writes the
+            # embed delta and drops lm_head). Mirror that exactly, keying off the DISK embed
+            # prefix with the same model. strip/add the merge uses, so a bare lm_head resolves
+            # onto model.embed_tokens.weight (standard) yet a deep composite-VLM prefix
+            # model.language_model.embed_tokens.weight does not claim a bare lm_head it can
+            # never reach.
+            for sf in safetensor_keys_seen:
+                if not (isinstance(sf, str) and sf.endswith("embed_tokens.weight")):
+                    continue
+                embed_key = sf[: -len(".weight")]
+                if embed_key in converted:           # embed is a target -> lm_head dropped
+                    continue
+                lm_head_key = embed_key[: -len("embed_tokens")] + "lm_head"
+                bridged = lm_head_key[len("model."):] if lm_head_key.startswith("model.") else "model." + lm_head_key
+                if key == lm_head_key or key == bridged:
+                    return True
         return False
 
     return sum(1 for key in converted if _backed(key))
