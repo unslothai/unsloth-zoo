@@ -3118,6 +3118,41 @@ def detect_keys_format(keys_to_check, forward_mapping):
     return "new" # Default to current HF format
 pass
 
+def _lora_key_has_backing(key, keys_set):
+    """True if a converted LoRA module path is backed by a tensor the merge loop would
+    actually consume, mirroring _merge_and_overwrite_lora / _merge_moe_experts_file:
+      - direct <key>.weight,
+      - Gemma4 ClippableLinear <key>.linear.weight,
+      - mxfp4 packed <key>_blocks + <key>_scales (dequantized to <key> on save),
+      - per-expert MoE descendants <prefix>.<e>.<proj>.weight (or packed _blocks/_scales),
+      - fused 3D MoE <prefix>.gate_up_proj / <prefix>.down_proj (no .weight, GPT-OSS/Gemma4),
+      including the .moe -> .experts alias the merge applies.
+    Shared by the save-count check and the remap fallback so both agree with what the
+    merge writes (and never invent a key with no backing).
+    """
+    if not isinstance(key, str):
+        return False
+    if (key + ".weight") in keys_set:
+        return True
+    if (key + ".linear.weight") in keys_set:                 # Gemma4 ClippableLinear
+        return True
+    if (key + "_blocks") in keys_set and (key + "_scales") in keys_set:  # mxfp4 packed
+        return True
+    if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
+        base = key.replace(".base_layer", "")
+        for cand in (base, base.replace(".moe", ".experts")):
+            if (cand + ".gate_up_proj") in keys_set or (cand + ".down_proj") in keys_set:
+                return True                                  # fused 3D (GPT-OSS / Gemma4)
+            for s in keys_set:
+                if not (isinstance(s, str) and s.startswith(cand + ".")):
+                    continue
+                if s.endswith(".weight"):                    # per-expert 2D
+                    return True
+                if s.endswith("_blocks") and (s[: -len("_blocks")] + "_scales") in keys_set:
+                    return True                              # per-expert packed mxfp4
+    return False
+pass
+
 def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     """Infer missing key prefixes by matching LoRA keys against safetensor keys.
 
@@ -3180,6 +3215,11 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
         # suffix and compare each unmatched key only against that bucket. This turns the
         # scan from O(unmatched * safetensors) into roughly O(unmatched + safetensors),
         # which matters when a whole namespace is unmatched on a large VLM.
+        # Known limitation: a reordered short module (e.g. model.language_model.embed_tokens)
+        # has no 3-component suffix to seed its own vote. In practice the per-layer targets
+        # trained alongside it seed the same reorder substitution, which is then applied to
+        # the short key below; only a degenerate run that trains the short module alone would
+        # miss it.
         sf_parts_by_suffix3 = defaultdict(list)
         for sf in safetensor_keys:
             if not sf.endswith(".weight"):
@@ -3265,14 +3305,16 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
         return None
 
     # Apply the most common inferred prefix to any remaining unmatched keys, but only
-    # when that lands on a real tensor; otherwise leave the key untouched so the merge
-    # skips a genuinely unbacked target (e.g. a vision adapter with no base tensor)
-    # instead of rewriting it onto a wrong or nonexistent key.
+    # when that lands on a real backing tensor; otherwise leave the key untouched so the
+    # merge skips a genuinely unbacked target (e.g. a vision adapter with no base tensor)
+    # instead of rewriting it onto a wrong or nonexistent key. Backing covers MoE experts
+    # (descendant / fused / packed) and Gemma4 .linear, not just a direct .weight, so a
+    # prefixed MoE LoRA key is not dropped.
     for k, v in unmatched_keys:
         if (
             common_prefix is not None and isinstance(k, str)
-            and (common_prefix + k + ".weight") in sf_key_set
             and (common_prefix + k) not in remapped
+            and _lora_key_has_backing(common_prefix + k, sf_key_set)
         ):
             remapped[common_prefix + k] = v
         else:
@@ -3359,19 +3401,10 @@ def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_n
     def _backed(key):
         if not isinstance(key, str):
             return False
-        if (key + ".weight") in safetensor_keys_seen:
+        # Direct, Gemma4 .linear, mxfp4 packed, and MoE (per-expert / fused 3D / .moe alias)
+        # backing all mirror the merge loop via the shared helper.
+        if _lora_key_has_backing(key, safetensor_keys_seen):
             return True
-        if (key + ".linear.weight") in safetensor_keys_seen:   # Gemma4 ClippableLinear
-            return True
-        # mxfp4 packed experts: the base shard stores <module>_blocks / _scales and the
-        # merge dequantizes them to <module> on save (_merge_and_overwrite_lora_mxfp4),
-        # so a LoRA on such a module has no .weight on disk.
-        if (key + "_blocks") in safetensor_keys_seen and (key + "_scales") in safetensor_keys_seen:
-            return True
-        if ".experts" in key or ".moe" in key:                 # fused / per-expert MoE
-            prefix = key[: -len(".base_layer")] if key.endswith(".base_layer") else key
-            if any(s.startswith(prefix + ".") and s.endswith(".weight") for s in safetensor_keys_seen):
-                return True
         if tie_word_embeddings and key.endswith("lm_head"):    # tied: merged onto embed_tokens
             # The merge folds an lm_head LoRA onto an on-disk embed_tokens.weight, but only
             # when that embed module is not itself a LoRA target (else the merge writes the

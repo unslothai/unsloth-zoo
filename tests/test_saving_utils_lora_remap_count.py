@@ -257,3 +257,51 @@ def test_remap_cross_namespace_union_resolves_both():
         "model.language_model.layers.0.self_attn.q_proj"
     assert out.get("vision_tower.transformer.layers.0.self_attn.q_proj") == \
         "model.vision_tower.transformer.layers.0.self_attn.q_proj"
+
+
+def test_remap_common_prefix_still_applies_to_moe_expert_backing():
+    """The common-prefix fallback must prefix MoE LoRA keys that are backed by descendant
+    expert tensors (model.layers.0.mlp.experts.0.*.weight), not only keys with a direct
+    <key>.weight. Otherwise the prefixed key is dropped and the MoE delta is skipped."""
+    disk = [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+    ]
+    out = _infer_prefix_and_remap(
+        _lw([
+            "layers.0.self_attn.q_proj",
+            "layers.0.mlp.experts.base_layer",
+            "layers.0.mlp.experts",
+        ]),
+        disk,
+    )
+    assert out is not None
+    assert out["model.layers.0.mlp.experts.base_layer"] == "layers.0.mlp.experts.base_layer"
+    assert out["model.layers.0.mlp.experts"] == "layers.0.mlp.experts"
+
+
+def test_count_fused_3d_experts_without_weight_suffix():
+    """Fused 3D MoE (GPT-OSS / Gemma4) stores experts as <prefix>.gate_up_proj /
+    <prefix>.down_proj with no .weight; _merge_moe_experts_file merges them, so they must
+    be counted as backed."""
+    keys = ["model.layers.0.experts.base_layer", "model.layers.0.experts"]
+    disk = ["model.layers.0.experts.gate_up_proj", "model.layers.0.experts.down_proj"]
+    assert _count(keys, disk) == 2
+
+
+def test_count_moe_alias_resolves_to_fused_experts():
+    """A LoRA key using .moe is aliased to .experts by the merge, so it must count against
+    the fused expert tensors stored under .experts."""
+    keys = ["model.layers.0.moe.base_layer", "model.layers.0.moe"]
+    disk = ["model.layers.0.experts.gate_up_proj", "model.layers.0.experts.down_proj"]
+    assert _count(keys, disk) == 2
+
+
+def test_count_mxfp4_per_expert_packed():
+    """Per-expert packed mxfp4 experts (descendant <prefix>.<e>.<proj>_blocks/_scales)
+    count as backed."""
+    keys = ["model.layers.0.mlp.experts.base_layer"]
+    disk = ["model.layers.0.mlp.experts.0.gate_proj_blocks", "model.layers.0.mlp.experts.0.gate_proj_scales"]
+    assert _count(keys, disk) == 1
