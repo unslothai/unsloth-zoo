@@ -517,6 +517,93 @@ def test_mixed_multi_turn_preserves_channels_and_branches(
     assert tool_message.content == "tool result"
 
 
+def test_assistant_thinking_with_tool_calls_keeps_both(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # An assistant turn carrying BOTH reasoning and a tool call must emit the analysis
+    # message AND the commentary tool call. The tool call must not be dropped.
+    messages = [
+        {
+            "role": "assistant",
+            "thinking": "decide to call the tool",
+            "tool_calls": [{"name": "lookup", "arguments": "{\"city\": \"Paris\"}"}],
+        },
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    channels = [m.channel for m in assistant_messages]
+    assert channels == ["analysis", "commentary"]
+    assert assistant_messages[0].content == "decide to call the tool"
+    tool_message = assistant_messages[1]
+    assert tool_message.recipient == "functions.lookup"
+    assert tool_message.content_type == "json"
+    assert tool_message.content == "{\"city\": \"Paris\"}"
+
+
+def test_assistant_thinking_none_falls_back_to_final(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # A nullable "thinking" column materialized as None must not be passed into Harmony.
+    # The turn should fall back to a single final-channel message from content.
+    messages = [
+        {"role": "assistant", "thinking": None, "content": "the answer"},
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0].channel == "final"
+    assert assistant_messages[0].content == "the answer"
+
+
+def test_assistant_thinking_empty_string_falls_back_to_final(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # Empty-string thinking is treated as absent (no empty analysis message); only the
+    # final-channel message from content is emitted.
+    messages = [
+        {"role": "assistant", "thinking": "", "content": "the answer"},
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0].channel == "final"
+    assert assistant_messages[0].content == "the answer"
+
+
+def test_assistant_thinking_tool_calls_and_content_keeps_analysis_and_tool_call(
+    monkeypatch,
+    gpt_oss_module,
+):
+    # When a turn has thinking, tool_calls and content, tool_calls and content stay
+    # mutually exclusive: the tool call wins (the final answer comes after the tool
+    # result), so we emit analysis + commentary and drop the content for this turn.
+    messages = [
+        {
+            "role": "assistant",
+            "thinking": "reason first",
+            "content": "should not be emitted in a tool-call turn",
+            "tool_calls": [{"name": "search", "arguments": "{\"q\": \"x\"}"}],
+        },
+    ]
+    assistant_messages = _encode_and_capture_messages(
+        monkeypatch, gpt_oss_module, messages
+    )
+
+    channels = [m.channel for m in assistant_messages]
+    assert channels == ["analysis", "commentary"]
+    assert "final" not in channels
+    assert assistant_messages[1].recipient == "functions.search"
+
+
 def test_encode_conversations_with_harmony_load_failure_retried_then_cached(
     monkeypatch,
     harmony_state,

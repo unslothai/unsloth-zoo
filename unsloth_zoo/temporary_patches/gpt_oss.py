@@ -2620,24 +2620,25 @@ def encode_conversations_with_harmony(
         if message["role"] == "user":
             convos.append(Message.from_role_and_content(Role.USER, message["content"]))
         elif message["role"] == "assistant":
-            if "thinking" in message:
+            # An assistant turn can independently carry reasoning, a tool call, and/or a
+            # final answer. Treat the parts separately so none silently suppresses another.
+            # Guard on truthiness (not key membership) so a nullable "thinking" column
+            # materialized as None or "" does not get passed into Harmony, which rejects it.
+            if message.get("thinking"):
                 x = Message.from_role_and_content(Role.ASSISTANT, message["thinking"])
                 x = x.with_channel("analysis")
                 convos.append(x)
-                # An assistant turn can carry both reasoning and a final answer; emit the
-                # final-channel response too so it is not dropped from the encoded conversation.
-                if message.get("content"):
-                    final = Message.from_role_and_content(Role.ASSISTANT, message["content"])
-                    final = final.with_channel("final")
-                    convos.append(final)
-                continue
-            elif "tool_calls" in message:
+            if message.get("tool_calls"):
                 x = Message.from_role_and_content(Role.ASSISTANT, message["tool_calls"][0]["arguments"])
                 x = x.with_channel("commentary").with_recipient(f"functions.{message['tool_calls'][0]['name']}").with_content_type("json")
-            else:
+                convos.append(x)
+            elif message.get("content"):
+                # A tool-call turn does not also emit a final answer (the answer comes
+                # after the tool result), so tool_calls and content stay mutually exclusive.
                 x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
                 x = x.with_channel("final")
-            convos.append(x)
+                convos.append(x)
+            continue
         elif message["role"] == "tool":
             x = Message.from_author_and_content(Author.new(Role.TOOL, f"functions.{message['name']}"), message["content"])
             x = x.with_recipient("assistant").with_channel("commentary")
