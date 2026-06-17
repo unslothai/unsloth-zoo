@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==80.9.0", "setuptools-scm==9.2.0"]
+requires = ["setuptools==82.0.1", "setuptools-scm==9.2.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -38,7 +38,7 @@ dependencies = [
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    "datasets>=4.0,<4.6",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
@@ -76,7 +76,7 @@ core = [
     "packaging>=24.1",
     "tyro",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    "datasets>=4.0,<4.6",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
