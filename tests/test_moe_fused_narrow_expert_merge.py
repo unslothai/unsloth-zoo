@@ -16,17 +16,12 @@
 
 """CPU regression for the fused-3D MoE merge on narrow-expert layouts.
 
-Gemma-4 26B-A4B is a narrow-expert MoE: per expert gate_up is
-(2*intermediate, hidden) with 2*intermediate < hidden, and down is
-(hidden, intermediate). _merge_moe_experts_file infers the fused layout
-from a tensor-shape magnitude check and passes it as is_transposed; that
-check assumes 2*intermediate > hidden, so it mislabels these tensors as
-transposed and the per-expert delta is added with the wrong orientation,
-falling back to the base weight and silently dropping the LoRA delta.
-
-These tests feed the fused mergers a narrow-expert standard layout, both
-with no hint and with the WRONG is_transposed=True hint, and require the
-delta to be applied correctly (the LoRA-dimension layout must win).
+In a narrow-expert MoE (Gemma-4 26B-A4B, Qwen3.5-35B-A3B) gate_up is
+(2*intermediate, hidden) with 2*intermediate < hidden. The shape-magnitude
+heuristic assumes 2*intermediate > hidden, so it mislabels these as transposed
+and drops the LoRA delta. These tests feed a narrow-expert standard layout (no
+hint, and the WRONG is_transposed=True hint) and require the delta to still be
+applied -- the LoRA-dimension layout must win.
 """
 
 from __future__ import annotations
@@ -45,7 +40,6 @@ from unsloth_zoo.saving_utils import (
 SEED = 5410
 NUM_EXPERTS, RANK, ALPHA = 4, 2, 8.0
 # Narrow-expert ratios (2*intermediate < hidden), scaled down from real models.
-# Both Gemma-4 26B-A4B and Qwen3.5-35B-A3B fall in this class.
 GEOMS = {"gemma4_26B_A4B": (16, 3), "qwen3_5_35B_A3B": (18, 4)}  # (hidden, intermediate)
 
 
