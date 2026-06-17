@@ -305,3 +305,42 @@ def test_count_mxfp4_per_expert_packed():
     keys = ["model.layers.0.mlp.experts.base_layer"]
     disk = ["model.layers.0.mlp.experts.0.gate_proj_blocks", "model.layers.0.mlp.experts.0.gate_proj_scales"]
     assert _count(keys, disk) == 1
+
+
+def test_remap_reordered_clippable_linear():
+    """A reordered composite VLM whose module is stored as Gemma4 ClippableLinear
+    (<module>.linear.weight) must still learn the prefix substitution (the vote normalizes
+    .linear.weight to its module key) and accept the .linear-backed target."""
+    disk = ["language_model.model.layers.0.mlp.gate_proj.linear.weight"]
+    out = _infer_prefix_and_remap(_lw(["model.language_model.layers.0.mlp.gate_proj"]), disk)
+    assert out is not None
+    assert out["language_model.model.layers.0.mlp.gate_proj"] == \
+        "model.language_model.layers.0.mlp.gate_proj"
+    assert _count(["model.language_model.layers.0.mlp.gate_proj"], disk) == 1
+
+
+def test_remap_reordered_linear_applied_via_seeded_vote():
+    """Vote seeded by a .weight attention key, then applied to a sibling .linear.weight
+    module: the application must accept the .linear backing, not only direct .weight."""
+    disk = ["language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.mlp.gate_proj.linear.weight"]
+    out = _infer_prefix_and_remap(
+        _lw(["model.language_model.layers.0.self_attn.q_proj",
+             "model.language_model.layers.0.mlp.gate_proj"]),
+        disk,
+    )
+    assert out is not None
+    assert out["language_model.model.layers.0.mlp.gate_proj"] == \
+        "model.language_model.layers.0.mlp.gate_proj"
+
+
+def test_count_native_mxfp4_does_not_count_packed():
+    """Native mxfp4 save (save_method='mxfp4') preserves _blocks/_scales without merging,
+    so a LoRA on a packed expert is not written and must not be counted (count_packed_mxfp4
+    =False). The dequantizing path (default True) does count it, since it merges."""
+    keys = ["model.layers.0.mlp.experts.gate_up_proj"]
+    disk = ["model.layers.0.mlp.experts.gate_up_proj_blocks", "model.layers.0.mlp.experts.gate_up_proj_scales"]
+    assert _count_backed_lora_modules(_lw(keys), set(disk), "PreTrainedModel", False,
+                                      count_packed_mxfp4=False) == 0
+    assert _count_backed_lora_modules(_lw(keys), set(disk), "PreTrainedModel", False,
+                                      count_packed_mxfp4=True) == 1
