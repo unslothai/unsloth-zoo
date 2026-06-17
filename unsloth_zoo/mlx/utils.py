@@ -2225,6 +2225,39 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
+def _flatten_vlm_content_for_text_template(messages):
+    """Render list-style VLM content as text for text-only chat templates."""
+    flattened = copy.deepcopy(messages)
+    for message in flattened:
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                texts.append(part)
+        message["content"] = "".join(texts)
+    return flattened
+
+
+def _flatten_vlm_messages_to_content_parts(messages):
+    """Flatten role messages for mlx-vlm processors with content-part templates."""
+    parts = []
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    parts.append({"type": "text", "text": part})
+                elif isinstance(part, dict):
+                    parts.append(_clean_vlm_none_keys(part))
+        elif content:
+            parts.append({"type": "text", "text": str(content)})
+    return parts
+
+
 def _count_vlm_image_parts(messages):
     if isinstance(messages, str):
         return 0
@@ -2302,6 +2335,10 @@ def _render_vlm_messages(
     if not _processor_accepts_assistant_list_content(processor):
         render_messages = _collapse_vlm_assistant_content(render_messages)
 
+    first_error = None
+    second_error = None
+    third_error = None
+
     try:
         text = processor.apply_chat_template(
             render_messages,
@@ -2312,12 +2349,39 @@ def _render_vlm_messages(
         if isinstance(text, str) and text.strip():
             return text
     except Exception as exc:
+        first_error = exc
+
+    try:
+        text = processor.apply_chat_template(
+            _flatten_vlm_messages_to_content_parts(messages),
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
+        if isinstance(text, str) and text.strip():
+            return text
+    except Exception as exc:
+        second_error = exc
+
+    try:
+        text = processor.apply_chat_template(
+            _flatten_vlm_content_for_text_template(render_messages),
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
+        if isinstance(text, str) and text.strip():
+            return text
+    except Exception as exc:
+        third_error = exc
+
+    if first_error is not None:
         raise RuntimeError(
             "Unsloth MLX VLM: failed to render chat messages with this "
             "processor chat_template. Check that the dataset roles/content "
             "schema matches the model family, or pass a formatting_func that "
             "returns pre-rendered text."
-        ) from exc
+        ) from (third_error or second_error or first_error)
 
     return ""
 
@@ -2512,7 +2576,7 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
         item,
         [],
         image_size,
-        suppress_process_errors=True,
+        suppress_process_errors=False,
     )
 
 
@@ -3090,7 +3154,6 @@ def _filter_trainable_vlm_indices(
         item = dataset[idx]
         if formatting_func is not None:
             item = formatting_func(item)
-            formatted_items[idx] = item
         batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
             [item],
             processor,
@@ -3105,12 +3168,16 @@ def _filter_trainable_vlm_indices(
         )
         if is_prompt_completion:
             kept_indices.append(idx)
+            if formatted_items is not None:
+                formatted_items[idx] = item
             continue
         valid_rows = _vlm_trainable_label_rows(batch_dict)
         if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
             removed += 1
             continue
         kept_indices.append(idx)
+        if formatted_items is not None:
+            formatted_items[idx] = item
     return kept_indices, removed, formatted_items
 
 

@@ -300,6 +300,37 @@ def test_vlm_response_mask_formats_each_filtered_row_once():
     assert len(batches) == 1
 
 
+def test_vlm_filter_caches_only_kept_formatted_rows():
+    from unsloth_zoo.mlx.utils import _filter_trainable_vlm_indices
+
+    def formatting_func(item):
+        return {"text": item["text"]}
+
+    def mask_fn(batch):
+        labels = []
+        for row in batch["input_ids"]:
+            if 10 in row:
+                labels.append([-100] * len(row))
+            else:
+                labels.append([-100, 12, 13, 0])
+        return {"labels": labels}
+
+    kept, removed, formatted_items = _filter_trainable_vlm_indices(
+        [{"text": "bad"}, {"text": "good"}],
+        [0, 1],
+        _ResponseMaskFilteringProcessor(),
+        {},
+        max_seq_length=8,
+        image_size=16,
+        response_mask_fn=mask_fn,
+        formatting_func=formatting_func,
+    )
+
+    assert kept == [1]
+    assert removed == 1
+    assert formatted_items == {1: {"text": "good"}}
+
+
 def test_vlm_prompt_completion_skips_response_mask_like_cuda():
     from unsloth_zoo.mlx.utils import create_vlm_batches
 
@@ -407,6 +438,66 @@ def test_vlm_image_extraction_raises_process_errors_like_cuda(monkeypatch):
             [{"role": "user", "content": [{"type": "image"}]}],
             image_size=16,
         )
+
+
+def test_vlm_prompt_completion_top_level_image_errors_are_not_suppressed(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    def fail_process_vision_info(*_args, **_kwargs):
+        raise ValueError("bad top-level image")
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fail_process_vision_info,
+    )
+
+    with pytest.raises(ValueError, match="bad top-level image"):
+        _extract_vlm_pc_images({}, [], [], image_size=16)
+
+
+def test_vlm_render_falls_back_to_content_part_templates():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class ContentPartProcessor:
+        chat_template = "parts"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            assert tokenize is False
+            if messages and all(isinstance(part, dict) and "type" in part for part in messages):
+                return "parts:" + ",".join(part["type"] for part in messages)
+            raise ValueError("expected content parts")
+
+    rendered = _render_vlm_messages(
+        ContentPartProcessor(),
+        [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Q"}]}],
+    )
+
+    assert rendered == "parts:image,text"
+
+
+def test_vlm_render_falls_back_to_text_templates():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class TextTemplateProcessor:
+        chat_template = "text"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            assert tokenize is False
+            if messages and all(isinstance(message.get("content"), str) for message in messages):
+                return "|".join(message["content"] for message in messages)
+            raise ValueError("expected text content")
+
+    rendered = _render_vlm_messages(
+        TextTemplateProcessor(),
+        [
+            {"role": "user", "content": [{"type": "text", "text": "Q"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "A"}]},
+        ],
+    )
+
+    assert rendered == "Q|A"
 
 
 def test_vlm_processor_inputs_flattens_qwen_style_images():

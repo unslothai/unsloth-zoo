@@ -112,28 +112,21 @@ def _resolve_response_mask_tokenizer(tokenizer):
         # mlx-lm TokenizerWrapper stores the HF tokenizer under _tokenizer.
         # HF fast tokenizers also expose _tokenizer, but that is the low-level
         # Rust tokenizer and is not callable like PreTrainedTokenizerBase.
-        if hasattr(tokenizer, "_tokenizer"):
-            wrapped = getattr(tokenizer, "_tokenizer", None)
-            if (
-                wrapped is not None
-                and wrapped is not tokenizer
-                and (
-                    not hasattr(tokenizer, "convert_tokens_to_ids")
-                    or callable(wrapped)
-                )
-            ):
-                tokenizer = wrapped
-                continue
+        wrapped = getattr(tokenizer, "_tokenizer", None)
+        if (
+            wrapped is not None
+            and wrapped is not tokenizer
+            and (
+                not hasattr(tokenizer, "convert_tokens_to_ids")
+                or callable(wrapped)
+            )
+        ):
+            tokenizer = wrapped
+            continue
 
         break
 
-    if not (
-        callable(tokenizer)
-        or (
-            hasattr(tokenizer, "encode")
-            and hasattr(tokenizer, "convert_tokens_to_ids")
-        )
-    ):
+    if not callable(tokenizer):
         raise TypeError(
             "Unsloth MLX: train_on_responses_only requires a callable "
             "Hugging Face tokenizer or a processor/tokenizer wrapper that "
@@ -1589,6 +1582,7 @@ class MLXTrainer:
 
         # Prepare eval batches
         eval_batches = None
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)

@@ -331,6 +331,31 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     assert received["last_response_only"] is True
 
 
+def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
+    from unsloth_zoo.mlx.trainer import _resolve_response_mask_tokenizer
+
+    class EncodeOnlyTokenizer:
+        def encode(self, text):
+            return [1, 2, 3]
+
+        def convert_tokens_to_ids(self, token):
+            return 1
+
+    with pytest.raises(TypeError, match="requires a callable"):
+        _resolve_response_mask_tokenizer(EncodeOnlyTokenizer())
+
+
+def test_vlm_eval_batches_define_completion_only_loss_before_use():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._train_inner)
+    definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
+    eval_use = source.index("completion_only_loss=text_completion_only_loss")
+    assert definition < eval_use
+
+
 def test_evaluate_dict_eval_datasets_records_split_metrics():
     import mlx.core as mx
 
