@@ -2571,13 +2571,25 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
         )
         if images:
             return images
+        return []
 
-    return _extract_vlm_images(
-        item,
-        [],
-        image_size,
-        suppress_process_errors=False,
-    )
+    if isinstance(item, dict) and "images" in item:
+        try:
+            from ..vision_utils import process_vision_info
+
+            raw_images = item["images"]
+            vision_infos = [{"image": raw_images[i]} for i in range(len(raw_images))]
+            extracted = process_vision_info(vision_infos, return_video_kwargs=True)
+            images = extracted[0] if isinstance(extracted, tuple) and extracted else None
+            if images is None:
+                images = []
+            elif not isinstance(images, list):
+                images = [images]
+        except Exception:
+            images = []
+        return _resize_vlm_images(images, image_size)
+
+    return []
 
 
 def _flatten_vlm_images(all_images):

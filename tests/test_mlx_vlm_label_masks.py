@@ -440,7 +440,7 @@ def test_vlm_image_extraction_raises_process_errors_like_cuda(monkeypatch):
         )
 
 
-def test_vlm_prompt_completion_top_level_image_errors_are_not_suppressed(monkeypatch):
+def test_vlm_prompt_completion_top_level_image_errors_are_suppressed_like_cuda(monkeypatch):
     import unsloth_zoo.vision_utils as vision_utils
     from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
 
@@ -453,8 +453,52 @@ def test_vlm_prompt_completion_top_level_image_errors_are_not_suppressed(monkeyp
         fail_process_vision_info,
     )
 
-    with pytest.raises(ValueError, match="bad top-level image"):
-        _extract_vlm_pc_images({}, [], [], image_size=16)
+    assert _extract_vlm_pc_images({"images": ["bad"]}, [], [], image_size=16) == []
+
+
+def test_vlm_prompt_completion_top_level_images_use_cuda_process_shape(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    seen = {}
+
+    def fake_process_vision_info(conversations, **kwargs):
+        seen["conversations"] = conversations
+        seen["kwargs"] = kwargs
+        return ["processed"], None, {"fps": []}
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fake_process_vision_info,
+    )
+
+    assert _extract_vlm_pc_images({"images": ["raw"]}, [], [], image_size=16) == ["processed"]
+    assert seen == {
+        "conversations": [{"image": "raw"}],
+        "kwargs": {"return_video_kwargs": True},
+    }
+
+
+def test_vlm_prompt_completion_message_rows_do_not_fallback_to_top_level_images(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    def fake_process_vision_info(_conversations, **_kwargs):
+        return None, None, {"fps": []}
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fake_process_vision_info,
+    )
+
+    assert _extract_vlm_pc_images(
+        {"images": ["top-level"]},
+        [{"role": "user", "content": [{"type": "text", "text": "Q"}]}],
+        [{"role": "assistant", "content": [{"type": "text", "text": "A"}]}],
+        image_size=16,
+    ) == []
 
 
 def test_vlm_render_falls_back_to_content_part_templates():

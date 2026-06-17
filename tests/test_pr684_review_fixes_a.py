@@ -54,6 +54,11 @@ class _SpaceTokenizer:
     eos_token_id = 99
     unk_token_id = -1
 
+    def __call__(self, texts, **_kwargs):
+        if isinstance(texts, str):
+            return {"input_ids": self.encode(texts)}
+        return {"input_ids": [self.encode(text) for text in texts]}
+
     def encode(self, text):
         return [int(part) for part in str(text).split()]
 
