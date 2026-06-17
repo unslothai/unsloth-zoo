@@ -3885,8 +3885,9 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
             return False
 
         # Zero-copy write into the mmap; avoids the bytes() copy that doubled peak
-        # RAM on large tensors (embed / lm_head).
-        tensor_view = tensor_formatted.detach().contiguous().view(torch.uint8)
+        # RAM on large tensors (embed / lm_head). Flatten first so the mmap slice
+        # gets a 1D buffer (multi-dim memoryview assignment errors on some Pythons).
+        tensor_view = tensor_formatted.detach().contiguous().reshape(-1).view(torch.uint8)
         mm[index_L:index_R] = memoryview(tensor_view.numpy())
 
         # Clear memory
