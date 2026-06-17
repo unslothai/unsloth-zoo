@@ -785,9 +785,8 @@ def _merge_and_overwrite_lora(
         mm.close()
         raw_pointer.close()
 
-        # Vocab grew: merged embed / lm_head no longer fit their byte slots, so the
-        # shard is re-laid-out. Stream-rewrite to a temp file (peak RAM ~ one tensor),
-        # then atomic os.replace (Windows mmap-release lag handled below).
+        # Vocab grew, so resized tensors no longer fit their byte slots: stream-rewrite
+        # the shard to a temp file (peak RAM ~ one tensor), then atomic os.replace.
         resized = getattr(_merge_and_overwrite_lora, "_resized", {})
         if resized:
             _merge_and_overwrite_lora._resized = {}
@@ -3797,9 +3796,8 @@ def split_safetensors_to_shards(file_path, max_shard_size_gb=2):
 pass
 
 def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized):
-    # Re-lay-out a shard after a vocab resize, streaming one tensor at a time so peak
-    # RAM ~= one tensor (not the whole shard). Resized tensors come from `resized`; the
-    # rest are byte-copied from src (already merged). Tensor-identical to dict+save_file.
+    # Stream one tensor at a time (peak RAM ~ one tensor): resized tensors from
+    # `resized`, the rest byte-copied from src. Tensor-identical to dict+save_file.
     import struct
     src_data_start = 8 + length_of_header
     meta = header_metadata.get("__metadata__", None)
