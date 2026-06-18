@@ -1545,12 +1545,16 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
             )
             return gate_up_W
 
-        if is_transposed is not None:
-            use_transpose = is_transposed
-        elif dim_A == dim1 and dim_B == dim2:
-            use_transpose = True
-        elif dim_A == dim2 and dim_B == dim1:
+        # LoRA dims fix the layout: standard (E,out,in) has dim_A==dim2, dim_B==dim1;
+        # transposed (E,in,out) the reverse. Hint only breaks the square (in==out) tie.
+        std = (dim_A == dim2 and dim_B == dim1)
+        trn = (dim_A == dim1 and dim_B == dim2)
+        if std and not trn:
             use_transpose = False
+        elif trn and not std:
+            use_transpose = True
+        elif is_transposed is not None:
+            use_transpose = is_transposed
         else:
             _record_moe_merge_fallback(
                 "fused_gate_up", -1,
@@ -1625,12 +1629,16 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
             )
             return down_W
 
-        if is_transposed is not None:
-            use_transpose = is_transposed
-        elif dim_A == dim1 and dim_B == dim2:
-            use_transpose = True
-        elif dim_A == dim2 and dim_B == dim1:
+        # LoRA dims fix the layout: standard (E,out,in) has dim_A==dim2, dim_B==dim1;
+        # transposed (E,in,out) the reverse. Hint only breaks the square (in==out) tie.
+        std = (dim_A == dim2 and dim_B == dim1)
+        trn = (dim_A == dim1 and dim_B == dim2)
+        if std and not trn:
             use_transpose = False
+        elif trn and not std:
+            use_transpose = True
+        elif is_transposed is not None:
+            use_transpose = is_transposed
         else:
             _record_moe_merge_fallback(
                 "fused_down", -1,
