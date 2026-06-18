@@ -190,22 +190,51 @@ def patch_Gemma3Processor():
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
-        # Fix double BOS tokens
+        # Fix double BOS tokens while preserving batch rectangularity.
+        # Tokenizers that already padded the batch return equal-length
+        # sequences; the previous `x[1:] if x[:2] == double_bos` pattern
+        # shortened only the rows whose first two tokens were BOS and
+        # left the rest, producing a jagged batch (315 vs 314 observed on
+        # Gemma3-(4B)-Vision-GRPO) that crashed BatchFeature.convert_to_tensors.
+        # If any row needed trimming, repad every trimmed row to the new
+        # max length so input_ids, attention_mask, and the downstream
+        # token_type_ids all stay rectangular.
         double_bos_token_id = [self.tokenizer.bos_token_id]*2
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
         input_ids = text_inputs["input_ids"]
-        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
+        attention_mask = text_inputs.get("attention_mask", None)
+        trim_flags = [x[:2] == double_bos_token_id for x in input_ids]
+        if any(trim_flags):
+            new_input_ids = [
+                (x[1:] if flag else x) for x, flag in zip(input_ids, trim_flags)
+            ]
+            if attention_mask is not None:
+                new_attention_mask = [
+                    (m[1:] if flag else m) for m, flag in zip(attention_mask, trim_flags)
+                ]
+            else:
+                new_attention_mask = None
+            new_max_len = max(len(x) for x in new_input_ids)
+            padding_side = getattr(self.tokenizer, "padding_side", "right")
+            def _pad_row(row, pad_value):
+                deficit = new_max_len - len(row)
+                if deficit <= 0:
+                    return row
+                pad = [pad_value] * deficit
+                return (row + pad) if padding_side == "right" else (pad + row)
+            text_inputs["input_ids"] = [_pad_row(x, pad_token_id) for x in new_input_ids]
+            if new_attention_mask is not None:
+                text_inputs["attention_mask"] = [_pad_row(m, 0) for m in new_attention_mask]
+        # else: no double-BOS rows -> leave text_inputs untouched.
 
         # Add token type ids manually, as tokenizer can't do arbitrary position token types
-        # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
         if return_mm_token_type_ids:
             input_ids = text_inputs["input_ids"]
             image_token_id = self.image_token_id
             mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
-            # array_ids = np.array(text_inputs["input_ids"])
-            # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
-            # mm_token_type_ids[array_ids == self.image_token_id] = 1
-            # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
-            text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
+            text_inputs["token_type_ids"] = mm_token_type_ids
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
 
@@ -838,3 +867,104 @@ def patch_Gemma3Attention_generic():
     patch_function_past_key_values(transformers.models.gemma3.modeling_gemma3.Gemma3Attention, "forward", functions, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3Attention_generic)
+
+
+def patch_Gemma3ForConditionalGeneration_logits_to_keep():
+    """Normalise tensor ``logits_to_keep`` and guard 4-D logits for Gemma3-VL.
+
+    Failure mode (`torch.multinomial: prob_dist must be 1 or 2 dim` at
+    ``transformers/generation/utils.py:_sample``) chain on transformers 5.x:
+
+    1. ``transformers/generation/utils.py`` auto-injects
+       ``model_kwargs["logits_to_keep"] = 1`` because
+       ``Gemma3ForConditionalGeneration.forward`` advertises that param.
+    2. ``prepare_inputs_for_generation`` for Gemma3-VL forwards it through
+       unchanged; for the prefill iteration combined with the
+       ``cache_implementation = "static"`` promotion that
+       ``unsloth_base_fast_generate`` performs for any model with a
+       ``vision_config``, ``logits_to_keep`` arrives as a
+       Tensor of indices, not a Python ``int``.
+    3. The unsloth-zoo compiled cache (``unsloth_compiled_module_gemma3``)
+       emits ``slice_indices = slice(-logits_to_keep, None) if
+       isinstance(logits_to_keep, int) else logits_to_keep`` and then
+       ``hidden_states[:, slice_indices, :]``. With a >=1-D index tensor
+       this fancy-indexes the middle axis and (when transformers chunks the
+       prefill into a 2-D index tensor) yields ``[B, K, S, V]`` logits.
+    4. ``_sample``'s ``outputs.logits[:, -1, :]`` then leaves a 3-D probs
+       tensor, which ``torch.multinomial`` rejects.
+
+    Fix: wrap ``Gemma3ForConditionalGeneration.forward`` to (a) coerce
+    ``logits_to_keep`` to ``int`` (0-D / 1-element Tensor) or a flat 1-D
+    index tensor BEFORE the compiled body sees it, so the compiler's
+    ``slice(-int, None)`` fast path is restored; and (b) on the generate
+    hot path (``labels is None``) defensively flatten any residual
+    ``dim() > 3`` ``outputs.logits`` to ``[B, S, V]``. Training paths emit
+    ``logits = EMPTY_LOGITS`` (1-D ``torch.empty(0)``) which we leave
+    untouched.
+
+    Compatibility:
+    - transformers 4.57.6 (always ``int``): coerce is identity, flatten
+      never fires. No-op.
+    - transformers 5.x (5.0 -> 5.9.0+ confirmed in unsloth-blackwell:test).
+    - TRL 0.22.2 / 0.27.1 / 1.x: all route through ``model.generate``.
+    - peft 0.13-0.19: forward delegation hits our wrapped ``cls.forward``.
+    - vLLM 0.11.2+: never enters ``_sample``; patch is unused.
+    - CUDA / ROCm / XPU / MPS / CPU / MLX: pure tensor ops, no kernels.
+    - ``UNSLOTH_COMPILE_DISABLE=1`` / ``UNSLOTH_COMPILE_OVERWRITE=0``:
+      we wrap the bound method, the closure-captured ``_orig_forward`` is
+      still what the unsloth-zoo compiler reads, so cache hits and SFT
+      training paths are byte-identical.
+
+    Idempotent via ``_unsloth_logits_to_keep_patched`` sentinel on the
+    wrapped forward; no-op if Gemma3 isn't present.
+    """
+    try:
+        import transformers.models.gemma3.modeling_gemma3 as _mg3
+    except Exception:
+        return
+    cls = getattr(_mg3, "Gemma3ForConditionalGeneration", None)
+    if cls is None:
+        return
+    orig_forward = getattr(cls, "forward", None)
+    if orig_forward is None or getattr(orig_forward, "_unsloth_logits_to_keep_patched", False):
+        return
+
+    def _coerce_logits_to_keep(lk):
+        if lk is None or isinstance(lk, int):
+            return lk
+        if isinstance(lk, torch.Tensor):
+            try:
+                if lk.numel() == 1:
+                    return int(lk.item())
+                if lk.dim() > 1:
+                    return lk.reshape(-1)
+            except Exception:
+                pass
+        return lk
+
+    import functools
+
+    @functools.wraps(orig_forward)
+    def forward(self, *args, **kwargs):
+        if "logits_to_keep" in kwargs:
+            kwargs["logits_to_keep"] = _coerce_logits_to_keep(kwargs["logits_to_keep"])
+        out = orig_forward(self, *args, **kwargs)
+        # Defensive 4-D -> 3-D flatten on the generate hot path only.
+        if kwargs.get("labels", None) is None:
+            lg = getattr(out, "logits", None)
+            if isinstance(lg, torch.Tensor) and lg.dim() > 3 and lg.numel() > 0:
+                new_shape = (-1, lg.shape[-2], lg.shape[-1])
+                try:
+                    flat = lg.reshape(new_shape)
+                except RuntimeError:
+                    flat = lg.contiguous().reshape(new_shape)
+                try:
+                    out.logits = flat
+                except Exception:
+                    pass
+        return out
+
+    forward._unsloth_logits_to_keep_patched = True
+    cls.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3ForConditionalGeneration_logits_to_keep)

@@ -1644,3 +1644,295 @@ def patch_qwen2vl_image_processor_pixel_attrs():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
+
+
+def patch_deepseek_v2_moe_alias():
+    """Alias DeepseekV2MoE -> DeepseekV2Moe in transformers' modeling_deepseek_v2.
+
+    Transformers 5.x renamed `DeepseekV2MoE` to `DeepseekV2Moe`, but several
+    HF trust_remote_code modeling files (notably deepseek-ai/deepseek-ocr's
+    `modeling_deepseekocr.py`) still import the old name and crash with
+    `ImportError: cannot import name 'DeepseekV2MoE' ... Did you mean:
+    'DeepseekV2Moe'?` before the model can be loaded. Restoring the old
+    spelling as an alias unblocks those notebooks without touching upstream.
+    """
+    try:
+        from transformers.models.deepseek_v2 import modeling_deepseek_v2 as ddv2
+    except Exception:
+        return  # transformers without deepseek_v2 -- nothing to patch.
+    if hasattr(ddv2, "DeepseekV2MoE"):
+        return
+    new_class = getattr(ddv2, "DeepseekV2Moe", None)
+    if new_class is None:
+        return
+    ddv2.DeepseekV2MoE = new_class
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
+
+
+def patch_transformers_legacy_import_utils():
+    """Restore ``is_torch_fx_available`` on ``transformers.utils.import_utils``.
+
+    Transformers 5.x dropped this helper. ``deepseek-ai/DeepSeek-OCR``'s
+    trust_remote_code modeling file imports it at module load time and
+    crashes with ``ImportError: cannot import name 'is_torch_fx_available'``
+    before any config can be parsed. The helper used to be a thin
+    ``importlib.util.find_spec("torch.fx") is not None`` check. Re-add it
+    with the same semantics so legacy modeling files import cleanly.
+
+    No-op when ``transformers`` is absent or when ``is_torch_fx_available``
+    already exists (older transformers).
+    """
+    try:
+        from transformers.utils import import_utils as iu
+    except Exception:
+        return
+    if hasattr(iu, "is_torch_fx_available"):
+        return
+
+    import importlib.util as _ilu
+
+    def is_torch_fx_available():
+        return _ilu.find_spec("torch.fx") is not None
+
+    iu.is_torch_fx_available = is_torch_fx_available
+    # transformers re-exports a bunch of helpers via the parent ``utils``
+    # package; mirror the symbol there too if it's already missing so
+    # ``from transformers.utils import is_torch_fx_available`` works.
+    try:
+        from transformers import utils as tu
+        if not hasattr(tu, "is_torch_fx_available"):
+            tu.is_torch_fx_available = is_torch_fx_available
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_transformers_legacy_import_utils)
+
+
+def patch_llama_attention_back_compat_aliases():
+    """Alias legacy ``Llama{Flash,Sdpa}Attention[2]`` symbols on
+    ``transformers.models.llama.modeling_llama``.
+
+    Transformers 5.x collapsed the per-backend attention subclasses into a
+    single ``LlamaAttention`` that selects flash/sdpa/eager via
+    ``config._attn_implementation``. Several HF trust_remote_code modeling
+    files (notably ``deepseek-ai/DeepSeek-OCR``'s ``modeling_deepseekv2.py``,
+    which lists ``LlamaFlashAttention2`` in a top-level ``from ... import``
+    plus an ``ATTENTION_CLASSES`` dict but only ever uses MLA in practice)
+    pre-date that refactor and crash with ``ImportError: cannot import name
+    'LlamaFlashAttention2'`` before the model can load.
+
+    Re-export the unified class under the old names so legacy import lines
+    succeed. The behaviour is identical: at construction time
+    ``LlamaAttention`` dispatches to the configured backend internally, so
+    callers that referenced the old subclasses still pick up the right
+    kernel path. Pre-5.0 transformers releases that still ship the
+    subclasses (4.57.6 etc.) keep their originals unchanged via the
+    ``hasattr`` guard.
+
+    Idempotent. No-op when ``transformers`` is absent (MLX-only path) or
+    when ``LlamaAttention`` itself is missing.
+    """
+    try:
+        from transformers.models.llama import modeling_llama as mllama
+    except Exception:
+        return
+    base = getattr(mllama, "LlamaAttention", None)
+    if base is None:
+        return
+    for legacy_name in (
+        "LlamaFlashAttention2",
+        "LlamaSdpaAttention",
+        "LlamaFlexAttention",
+    ):
+        if not hasattr(mllama, legacy_name):
+            setattr(mllama, legacy_name, base)
+pass
+TEMPORARY_PATCHES.append(patch_llama_attention_back_compat_aliases)
+
+
+def patch_deepseek_v2_config_default_ints():
+    """Coerce ``None`` values for required-int fields on Deepseek-V2 configs.
+
+    The official ``deepseek-ai/DeepSeek-OCR`` config.json has
+    ``kv_lora_rank: null`` and ``q_lora_rank: null`` because the OCR
+    head doesn't use MLA, but transformers 5.x ``StrictDataclass`` (and
+    legacy ``PretrainedConfig`` users that read these as ints later)
+    reject ``None`` for fields annotated ``int``. Walk the dict that
+    ``DeepseekV2Config.from_dict`` consumes and replace ``None`` with the
+    init default for known-required-int fields.
+
+    No-op on transformers builds without ``deepseek_v2`` or when the
+    fields are already non-None. Idempotent via the ``_unsloth_patched``
+    sentinel on the wrapped ``from_dict``.
+    """
+    try:
+        from transformers.models.deepseek_v2 import configuration_deepseek_v2 as cdv2
+    except Exception:
+        return
+    Config = getattr(cdv2, "DeepseekV2Config", None)
+    if Config is None:
+        return
+    orig_from_dict = getattr(Config, "from_dict", None)
+    if orig_from_dict is None or getattr(orig_from_dict, "_unsloth_patched", False):
+        return
+
+    import inspect
+    int_defaults = {}
+    try:
+        sig = inspect.signature(Config.__init__)
+        for name, p in sig.parameters.items():
+            if isinstance(p.default, int) and not isinstance(p.default, bool):
+                int_defaults[name] = p.default
+    except (TypeError, ValueError):
+        return
+
+    if not int_defaults:
+        return
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        if isinstance(config_dict, dict):
+            config_dict = dict(config_dict)
+            for key, default in int_defaults.items():
+                if key in config_dict and config_dict[key] is None:
+                    config_dict[key] = default
+        return orig_from_dict.__func__(cls, config_dict, **kwargs)
+
+    from_dict._unsloth_patched = True
+    Config.from_dict = from_dict
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_config_default_ints)
+
+
+def patch_deepseek_ocr_prepare_inputs_for_generation():
+    """Post-load patch for ``DeepseekOCRForCausalLM.prepare_inputs_for_generation``.
+
+    The trust_remote_code ``modeling_deepseekocr.py`` shipped with
+    ``deepseek-ai/DeepSeek-OCR`` predates the transformers Cache API
+    change: when ``past_key_values`` is a ``Cache`` instance,
+    ``past_length`` is taken from ``cache.seen_tokens`` which is a
+    ``torch.Tensor`` in transformers 5.x but used to be a Python int.
+    The next line then calls::
+
+        cache_position = torch.arange(
+            past_length, past_length + position_ids.shape[-1], device=...
+        )
+
+    and torch 2.10+ rejects Tensor positional args to ``torch.arange``:
+    ``TypeError: arange() received an invalid combination of arguments``.
+
+    Fix: wrap ``transformers.dynamic_module_utils.get_class_in_module`` so
+    that after the dynamic module loads, we look for the
+    ``DeepseekOCRForCausalLM`` (or the parent ``DeepseekV2ForCausalLM``)
+    on the module and replace its ``prepare_inputs_for_generation`` with
+    a thin wrapper that coerces tensor scalars to ``int`` before the
+    arange call. The wrapper is identical in behaviour for the
+    int-past_length case and the legacy 2D ``past_key_values`` tuple
+    case, so existing code paths are preserved.
+
+    Idempotent; sentinel both on the inner method and on the
+    ``get_class_in_module`` wrapper so re-runs don't stack.
+    """
+    try:
+        from transformers import dynamic_module_utils as dmu
+    except Exception:
+        return
+    gcim = getattr(dmu, "get_class_in_module", None)
+    if gcim is None or getattr(gcim, "_unsloth_arange_patched", False):
+        return
+    _orig = gcim
+
+    def _patch_cls(cls):
+        if cls is None or not isinstance(cls, type):
+            return
+        name = getattr(cls, "__name__", "")
+        if "Deepseek" not in name and "DeepSeek" not in name:
+            return
+        method = getattr(cls, "prepare_inputs_for_generation", None)
+        if method is None or getattr(method, "_unsloth_arange_patched", False):
+            return
+        import functools, torch as _torch
+
+        @functools.wraps(method)
+        def prepare_inputs_for_generation(self, *args, **kwargs):
+            # Replicate the original method but coerce a Tensor-shaped
+            # `past_length` to a Python int before torch.arange runs.
+            # Simplest: monkey-patch torch.arange transiently in the
+            # bound method's globals so we don't have to maintain a
+            # forked copy of the upstream method body.
+            mod_globals = getattr(method, "__globals__", None)
+            _orig_arange = _torch.arange
+
+            def _safe_arange(*aa, **kk):
+                aa2 = tuple(
+                    int(x.item()) if isinstance(x, _torch.Tensor) and x.numel() == 1 else x
+                    for x in aa
+                )
+                return _orig_arange(*aa2, **kk)
+
+            if mod_globals is not None and mod_globals.get("torch") is _torch:
+                mod_globals["torch"] = _ShimTorch(_torch, _safe_arange)
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    mod_globals["torch"] = _torch
+            else:
+                # Fallback: temporarily monkey-patch torch.arange itself.
+                _torch.arange = _safe_arange
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    _torch.arange = _orig_arange
+
+        prepare_inputs_for_generation._unsloth_arange_patched = True
+        cls.prepare_inputs_for_generation = prepare_inputs_for_generation
+
+    class _ShimTorch:
+        """Forward every attribute to ``torch`` except ``arange``."""
+        __slots__ = ("_torch", "_arange")
+        def __init__(self, t, arange):
+            object.__setattr__(self, "_torch", t)
+            object.__setattr__(self, "_arange", arange)
+        def __getattr__(self, name):
+            if name == "arange":
+                return object.__getattribute__(self, "_arange")
+            return getattr(object.__getattribute__(self, "_torch"), name)
+
+    import sys as _sys
+
+    def get_class_in_module(*args, **kwargs):
+        cls = _orig(*args, **kwargs)
+        try:
+            _patch_cls(cls)
+            # Also walk the SAME module the class lives in: trust_remote_code
+            # only returns the one class actually requested (AutoConfig vs
+            # AutoModel), but the module file declares siblings we also
+            # need to patch (DeepseekV2 / DeepseekV3 / DeepseekOCR
+            # ForCausalLM all live in the same dynamic module pair).
+            mod_name = getattr(cls, "__module__", None)
+            mod = _sys.modules.get(mod_name) if mod_name else None
+            if mod is not None:
+                for attr in dir(mod):
+                    sibling = getattr(mod, attr, None)
+                    if isinstance(sibling, type) and sibling is not cls:
+                        _patch_cls(sibling)
+        except Exception:
+            pass
+        return cls
+
+    get_class_in_module._unsloth_arange_patched = True
+    # Preserve any sentinels from the prior notebook_deps wrap.
+    for attr in ("_unsloth_patched",):
+        if getattr(_orig, attr, False):
+            setattr(get_class_in_module, attr, True)
+    dmu.get_class_in_module = get_class_in_module
+    if hasattr(dmu, "get_class_from_dynamic_module"):
+        try:
+            src_globals = getattr(dmu.get_class_from_dynamic_module, "__globals__", None)
+            if isinstance(src_globals, dict) and "get_class_in_module" in src_globals:
+                src_globals["get_class_in_module"] = get_class_in_module
+        except Exception:
+            pass
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_ocr_prepare_inputs_for_generation)

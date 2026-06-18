@@ -16,6 +16,7 @@
 
 
 from .common import *
+from .notebook_deps import *
 from .gemma import *
 from .misc import *
 from .gemma3n import *
@@ -35,3 +36,4 @@ from .bitsandbytes import *
 from .moe_utils_bnb4bit import *
 from .moe_utils_fp8 import *
 from .flex_attention_bwd import *
+from .synthetic_dataprep import *
