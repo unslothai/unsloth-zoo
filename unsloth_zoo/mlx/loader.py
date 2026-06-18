@@ -961,6 +961,50 @@ def _fix_gemma3_vision_mlp_fp32_activation(model=None):
     return True
 
 
+def _fix_gemma3_language_mlp_fp32_activation(model=None):
+    """Compute the language-tower GEGLU activation in fp32, then cast back.
+
+    Mirrors _fix_gemma3_vision_mlp_fp32_activation for the language tower.
+    Without this, the gelu_approx forward intermediates (x^3 term in the
+    tanh-form) overflow in bf16 / fp16 for some prompts and produce NaN
+    gradients in the backward pass — observed at language layers 0-11 of
+    gemma-3-4b-it during multimodal LoRA finetuning. The vision-side fix
+    above is not sufficient because the language MLP has its own activation
+    site that does not share that code path.
+    """
+
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        language_module = importlib.import_module("mlx_vlm.models.gemma3.language")
+    except Exception:
+        return False
+
+    mlp_cls = getattr(language_module, "MLP", None)
+    if mlp_cls is None:
+        return False
+    if getattr(mlp_cls, "_unsloth_fp32_activation_patched", False):
+        if model is not None:
+            model._unsloth_gemma3_language_mlp_fp32_activation = True
+        return True
+
+    def patched_mlp_call(self, x):
+        orig_dtype = x.dtype
+        gate_pre = self.gate_proj(x)
+        gate_post = nn.gelu_approx(gate_pre.astype(mx.float32)).astype(orig_dtype)
+        up = self.up_proj(x)
+        return self.down_proj(gate_post * up)
+
+    try:
+        mlp_cls.__call__ = patched_mlp_call
+        mlp_cls._unsloth_fp32_activation_patched = True
+    except Exception:
+        return False
+    if model is not None:
+        model._unsloth_gemma3_language_mlp_fp32_activation = True
+    return True
+
+
 def _fix_gemma3_vision_encoder_fp32_layernorm(model=None):
     """Match CUDA SigLIP LayerNorm math in fp32 while preserving bf16 activations."""
 
@@ -4041,6 +4085,7 @@ class FastMLXModel:
             _fix_gemma3_vision_encoder_fp32_layernorm(model)
             _fix_gemma3_vision_post_layernorm_fp32(model)
             _fix_gemma3_vision_mlp_fp32_activation(model)
+            _fix_gemma3_language_mlp_fp32_activation(model)
             _fix_gemma3_multimodal_image_feature_scale(model)
 
             model._config = getattr(model, "_config", config_data)
