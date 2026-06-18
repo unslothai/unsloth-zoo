@@ -1,4 +1,4 @@
-"""PR #768: patch_deepseek_v2_moe_alias.
+"""Tests for the DeepseekV2MoE compatibility alias (patch_deepseek_v2_moe_alias).
 
 transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code models
 (e.g. DeepSeek-OCR) still import the old name. The patch aliases it back when only

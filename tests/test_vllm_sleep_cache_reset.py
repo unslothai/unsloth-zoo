@@ -1,4 +1,4 @@
-"""PR #768: patch_vllm_reset_caches_on_sleep.
+"""Tests for the vLLM pre-sleep multimodal/encoder cache reset.
 
 Drives the real `unsloth_zoo.vllm_utils.patch_vllm_reset_caches_on_sleep`
 against a fake `vllm` module bound onto the module global (the function uses a
@@ -7,8 +7,8 @@ bare `vllm` global, so the test injects it). No GPU, no real vLLM needed.
 Asserts the contract:
   - pre-sleep cache resets fire BEFORE the original sleep, then gc.collect();
   - reset_mm_cache is called on the LLM, reset_encoder_cache on llm_engine;
-  - a missing method / missing llm_engine is a clean no-op (text models, and the
-    encoder-cache-absent reality of vLLM 0.15.1 where only reset_mm_cache exists);
+  - a missing method / missing llm_engine is a clean no-op (text models, and
+    vLLM builds that expose only reset_mm_cache);
   - a raising reset is swallowed and the original sleep still runs;
   - double-patching is idempotent (flag-guarded, no re-wrap).
 """

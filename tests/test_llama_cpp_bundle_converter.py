@@ -1,15 +1,14 @@
-"""PR #768: _resolve_bundle_convert_script (llama.cpp bundle converter fallback).
+"""Tests for the llama.cpp bundle converter resolver (_resolve_bundle_convert_script).
 
 A prebuilt llama.cpp bundle ships convert_hf_to_gguf.py co-versioned with its own
 conversion/ package. When UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is unset, the resolver
-prefers the bundle's converter *only when* the paired conversion/__init__.py is
-present; otherwise it returns None (monolith installs / hosts without a bundle
-fall through to the network).
+prefers the bundle's converter only when the paired conversion/ package (both
+__init__.py and base.py) is present; otherwise it returns None (monolith installs
+/ hosts without a paired package fall through to the network).
 
 Loads llama_cpp.py in isolation (spec_from_file_location), matching the idiom in
 tests/test_convert_hf_to_gguf_patcher.py, and monkeypatches LLAMA_CPP_DEFAULT_DIR
-to a tmp tree. No network, no GPU. Closes a coverage gap: no existing test names
-this function.
+to a tmp tree. No network, no GPU.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import pytest
 def _load_llama_cpp_module():
     repo_root = Path(__file__).resolve().parents[1]
     module_path = repo_root / "unsloth_zoo" / "llama_cpp.py"
-    spec = importlib.util.spec_from_file_location("llama_cpp_under_test_pr768", module_path)
+    spec = importlib.util.spec_from_file_location("llama_cpp_bundle_under_test", module_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -122,7 +121,7 @@ def test_underscore_wins_when_both_converters_present(mod, monkeypatch, tmp_path
 
 
 def test_source_or_new_layout_checkout_also_resolves(mod, monkeypatch, tmp_path):
-    # F6: the resolver keys purely on (conversion/__init__.py + converter), so a
+    # The resolver keys purely on (conversion/{__init__,base}.py + converter), so a
     # new-layout source checkout under LLAMA_CPP_DEFAULT_DIR also resolves locally
     # rather than hitting the network. This is intended (its converter is
     # genuinely co-versioned with its own conversion/) and documented here.
