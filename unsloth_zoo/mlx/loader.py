@@ -25,6 +25,7 @@ import importlib
 import inspect
 import math
 import os
+import re
 import tempfile
 import types
 import warnings
@@ -3605,6 +3606,37 @@ class FastMLXModel:
             local_path, config_data = _materialize_mlx_vlm_config_override(
                 local_path,
                 config_data,
+            )
+
+        # bitsandbytes-quantized models are not loadable on Apple Silicon:
+        # bnb's NF4 sidecar tensors (.absmax, .quant_state.bitsandbytes__nf4,
+        # etc.) require the bitsandbytes runtime for dequantization, and bnb
+        # has no Apple Silicon backend. Without an early check, downstream
+        # loaders either explode with a quantization-config conflict (when
+        # load_in_4bit=True) or with a cryptic "Received N parameters not in
+        # model" (when load_in_4bit=False). Detect the bnb metadata up front
+        # and surface a clear, actionable error instead.
+        _existing_quant = _get_existing_mlx_quantization(config_data)
+        if (
+            isinstance(_existing_quant, dict)
+            and _existing_quant.get("quant_method") == "bitsandbytes"
+        ):
+            _suggested = re.sub(
+                r"-(?:unsloth-)?bnb-\d+bit$", "", model_name,
+            ) or model_name
+            _suggestion_line = (
+                f"  - Try the non-bnb variant: '{_suggested}'\n"
+                if _suggested != model_name
+                else "  - Try the non-bnb variant of this model (drop the "
+                     "'-bnb-4bit' suffix)\n"
+            )
+            raise ValueError(
+                f"Unsloth: '{model_name}' is a bitsandbytes-quantized model. "
+                "bitsandbytes does not run on Apple Silicon (no Metal "
+                "backend), so MLX cannot dequantize the NF4 weights.\n"
+                f"{_suggestion_line}"
+                "  - Or load this exact repo on a CUDA machine, save a "
+                "dequantized copy, and load that on Mac"
             )
 
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
