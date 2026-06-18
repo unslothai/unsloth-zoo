@@ -3314,9 +3314,10 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
                     lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
                     sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
                     # Only a true reordering (same components, different order) seeds a vote.
+                    # sorted() equality is the multiset guard (cheaper than a Counter per pair).
                     if (lora_prefix and sf_prefix and lora_prefix != sf_prefix
-                            and _Counter2(p for p in lora_prefix.split(".") if p)
-                                == _Counter2(p for p in sf_prefix.split(".") if p)):
+                            and sorted(p for p in lora_prefix.split(".") if p)
+                                == sorted(p for p in sf_prefix.split(".") if p)):
                         substitution_votes[(lora_prefix, sf_prefix)] += 1
 
         # Apply prefix substitutions, but only true reorderings of the same path
@@ -3330,8 +3331,8 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
             for (lora_prefix, sf_prefix), _ in substitution_votes.most_common():
                 if lora_prefix in applied_prefixes:
                     continue
-                if _Counter2(p for p in lora_prefix.split(".") if p) != \
-                   _Counter2(p for p in sf_prefix.split(".") if p):
+                if sorted(p for p in lora_prefix.split(".") if p) != \
+                   sorted(p for p in sf_prefix.split(".") if p):
                     continue
                 applied_prefixes.add(lora_prefix)
                 still_unmatched = []
