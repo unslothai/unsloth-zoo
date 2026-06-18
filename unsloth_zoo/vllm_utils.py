@@ -325,12 +325,8 @@ if importlib.util.find_spec("vllm") is not None:
 
     def patch_vllm_lora_tokenizer():
         # All Unsloth Zoo code licensed under LGPLv3
-        # vLLM >= 0.22 removed `vllm.transformers_utils.tokenizer` (vLLM PR
-        # #35024, shipped in v0.21.1rc0 / v0.22.0; the `tokenizer_group` package
-        # and the per-LoRA tokenizers themselves went earlier in PR #24078).
-        # LoRA adapters now always reuse the base tokenizer, so there is nothing
-        # to patch and the import raises `No module named
-        # 'vllm.transformers_utils.tokenizer'` - guard it like the others below.
+        # vLLM >= 0.22 (PR #35024) removed this module; LoRA now reuses the base
+        # tokenizer, so guard the import like the tokenizer_group ones below.
         try:
             import vllm.transformers_utils.tokenizer
             vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
