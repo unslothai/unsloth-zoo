@@ -1036,13 +1036,8 @@ def _fix_gemma3_vision_encoder_fp32_layernorm(model=None):
         return y.astype(orig_dtype)
 
     def patched_encoder_layer_call(self, x, mask=None):
-        # [BISECT-B] Run attention in fp32. Attention softmax/QK^T is the
-        # classic overflow site for vision towers with large hidden dims.
-        residual_dtype = x.dtype
-        _n1 = torch_like_layer_norm(self.layer_norm1, x)
-        _n1_fp32 = _n1.astype(mx.float32)
-        attn_out = self.self_attn(_n1_fp32, mask).astype(residual_dtype)
-        h = x + attn_out
+        r = self.self_attn(torch_like_layer_norm(self.layer_norm1, x), mask)
+        h = x + r
         r = self.mlp(torch_like_layer_norm(self.layer_norm2, h))
         return h + r
 
