@@ -190,12 +190,16 @@ def _resolve_bundle_convert_script():
     the two are co-versioned. Downloading the latest entrypoint instead runs it
     against the bundle's older conversion/ModelBase and crashes (e.g. unexpected
     target_model_dir kwarg). Prefer the bundle's converter when, and only when,
-    that paired conversion/ package is present. Returns (path, mtime_ns, size)
-    or None (source builds / monolith installs fall through to the network)."""
+    that paired conversion/ package is present. We require both __init__.py and
+    base.py, the same signal _detect_converter_layout uses, so selection and
+    layout detection never disagree. Returns (path, mtime_ns, size) or None
+    (monolith installs / trees without a paired conversion/ fall through)."""
     bundle_dir = LLAMA_CPP_DEFAULT_DIR
     if not bundle_dir or not os.path.isdir(bundle_dir):
         return None
-    if not os.path.isfile(os.path.join(bundle_dir, "conversion", "__init__.py")):
+    conversion_dir = os.path.join(bundle_dir, "conversion")
+    if not (os.path.isfile(os.path.join(conversion_dir, "__init__.py")) and
+            os.path.isfile(os.path.join(conversion_dir, "base.py"))):
         return None
     for name in LLAMA_CPP_CONVERTER_FILENAMES:
         candidate = os.path.join(bundle_dir, name)

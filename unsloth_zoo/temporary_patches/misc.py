@@ -1649,9 +1649,13 @@ TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
 def patch_deepseek_v2_moe_alias():
     # transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code
     # models (e.g. DeepSeek-OCR) still import the old name. Alias it back when
-    # absent. No-op on transformers 4.x where the original name still exists.
+    # absent. Skip on 4.x (rename does not exist) to avoid eagerly importing the
+    # deepseek_v2 module on every startup.
     try:
-        import importlib
+        import importlib, transformers
+        from unsloth_zoo.utils import Version
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
         m = importlib.import_module(
             "transformers.models.deepseek_v2.modeling_deepseek_v2")
     except Exception:

@@ -673,28 +673,35 @@ def patch_vllm_reset_caches_on_sleep():
     # so the next access faults (cudaErrorIllegalAddress at empty_cache) or the
     # caches desync ("Expected a cached item for mm_hash=..."). Clear them before
     # each sleep, while their CUDA memory is still mapped, keeping P0/P1 in sync.
-    # No-op and cheap for text models (caches absent / null-guarded).
+    # No-op and cheap for text models (caches absent / null-guarded). Wrap every
+    # engine class load_vllm can return so use_async / use_engine don't bypass it.
     import functools
-    if getattr(vllm.LLM, "_unsloth_reset_caches_on_sleep", False): return
-    _orig_sleep = vllm.LLM.sleep
 
-    def _reset_caches(llm):
-        for owner, name in ((llm, "reset_mm_cache"),
-                            (getattr(llm, "llm_engine", None), "reset_encoder_cache")):
+    def _reset_caches(obj):
+        # reset_encoder_cache lives on llm_engine for LLM, on the engine itself otherwise.
+        for owner, name in ((obj, "reset_mm_cache"),
+                            (getattr(obj, "llm_engine", obj), "reset_encoder_cache")):
             fn = getattr(owner, name, None)
             if fn is None: continue
             try: fn()
             except Exception as e: logger.debug(f"Unsloth: {name} pre-sleep skipped: {e}")
 
-    @functools.wraps(_orig_sleep)
-    def new_sleep(self, *args, **kwargs):
-        _reset_caches(self)
-        gc.collect()
-        return _orig_sleep(self, *args, **kwargs)
+    def _wrap_sleep(cls):
+        if cls is None or getattr(cls, "_unsloth_reset_caches_on_sleep", False): return
+        _orig_sleep = getattr(cls, "sleep", None)
+        if _orig_sleep is None: return
+        @functools.wraps(_orig_sleep)
+        def new_sleep(self, *args, **kwargs):
+            _reset_caches(self)
+            gc.collect()
+            return _orig_sleep(self, *args, **kwargs)
+        cls.sleep = new_sleep
+        cls._unsloth_reset_caches_on_sleep = True
 
-    vllm.LLM.sleep = new_sleep
-    vllm.LLM._unsloth_reset_caches_on_sleep = True
-    logger.info("Unsloth: patched vLLM LLM.sleep to reset multimodal/encoder caches.")
+    for cls in (getattr(vllm, "LLM", None), getattr(vllm, "LLMEngine", None),
+                getattr(vllm, "AsyncLLMEngine", None)):
+        _wrap_sleep(cls)
+    logger.info("Unsloth: patched vLLM sleep to reset multimodal/encoder caches.")
 pass
 
 
@@ -786,7 +793,9 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
-    if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+    # Match load_vllm's standby check (!= "0") so any truthy value also installs
+    # the sleep + cache-reset patches, not just "1".
+    if os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0":
         if Version("0.10.0") <= Version(vllm_version) < Version("0.11.0"):
             raise RuntimeError(
                 "Unsloth: vLLM 0.10.x crashes with std::bad_alloc when standby mode is "
@@ -1842,6 +1851,8 @@ def load_vllm(
             "disabling it for this vision run. Set UNSLOTH_VLLM_STANDBY_VISION=1 to force."
         )
         unsloth_vllm_standby = False
+        # Propagate so env-keyed consumers (patch_vllm, the GRPO sleep-mode arg) agree.
+        os.environ["UNSLOTH_VLLM_STANDBY"] = "0"
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
 
