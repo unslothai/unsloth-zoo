@@ -232,6 +232,13 @@ class WorkerLoRAManager(AbstractWorkerManager):
                 self._cached_dummy_lora = dummy_lora
         return self._adapter_manager.add_adapter(dummy_lora)
 
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # vLLM >= 0.23 queries this before LoRA warmup profiling; older vLLM has
+        # no such method on the model manager, so fall back to the given rank.
+        manager = getattr(self, "_adapter_manager", None)
+        inner = getattr(manager, "get_dummy_lora_warmup_rank", None)
+        return inner(default_rank) if inner is not None else default_rank
+
     def pin_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.pin_adapter(adapter_id)
 
