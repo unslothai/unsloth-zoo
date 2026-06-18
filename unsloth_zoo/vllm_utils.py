@@ -324,9 +324,15 @@ if importlib.util.find_spec("vllm") is not None:
     pass
 
     def patch_vllm_lora_tokenizer():
-        import vllm.transformers_utils.tokenizer
-        vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
-        vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
+        # All Unsloth Zoo code licensed under LGPLv3
+        # vLLM >= 0.22 (PR #35024) removed this module; LoRA now reuses the base
+        # tokenizer, so guard the import like the tokenizer_group ones below.
+        try:
+            import vllm.transformers_utils.tokenizer
+            vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
+            vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
+        except ImportError:
+            pass
 
         try:
             import vllm.transformers_utils.tokenizer_group.tokenizer_group
