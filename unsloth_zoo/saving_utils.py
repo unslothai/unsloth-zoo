@@ -3158,7 +3158,16 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True):
         return True                                          # mxfp4 packed (dequantized on save)
     if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
         base = key.replace(".base_layer", "")
-        for cand in (base, base.replace(".moe", ".experts")):
+        cands = set()
+        for b in (base, base.replace(".moe", ".experts")):
+            cands.add(b)
+            # A fused-named LoRA key (<experts>.gate_up_proj / .down_proj) is also backed by
+            # the per-expert descendants under <experts>, since the merge maps disk
+            # <experts>.<e>.<proj>.weight onto <experts>.gate_up_proj (saving_utils ~L663).
+            for suf in (".gate_up_proj", ".down_proj"):
+                if b.endswith(suf):
+                    cands.add(b[: -len(suf)])
+        for cand in cands:
             if (cand + ".gate_up_proj") in keys_set or (cand + ".down_proj") in keys_set:
                 return True                                  # fused 3D (GPT-OSS / Gemma4)
             for s in keys_set:
@@ -3202,14 +3211,15 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
         if not isinstance(k, str):
             remapped[k] = v
             continue
-        # Already matches a safetensor key
-        if (k + ".weight") in sf_key_set:
+        # Already matches a safetensor key (direct, or Gemma4 ClippableLinear .linear.weight)
+        if (k + ".weight") in sf_key_set or (k + ".linear.weight") in sf_key_set:
             remapped[k] = v
             continue
-        # Unique non-empty prefix candidates for this key
-        suffix = k + ".weight"
+        # Unique non-empty prefix candidates for this key. Accept a .linear.weight shard
+        # (Gemma4 ClippableLinear) as well, so a prefix-add onto such a tensor is not dropped.
         candidates = list(dict.fromkeys(
             sf_key[: -len(suffix)]
+            for suffix in (k + ".weight", k + ".linear.weight")
             for sf_key in safetensor_keys
             if sf_key.endswith(suffix) and sf_key[: -len(suffix)]
         ))
@@ -3228,43 +3238,46 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     if unmatched_keys:
         from collections import Counter as _Counter2
         substitution_votes = _Counter2()
-        # A substitution is only recorded when the trailing 3 components match (the
-        # common_suffix_len >= 3 gate below), so group safetensor keys by their 3-component
-        # suffix and compare each unmatched key only against that bucket. This turns the
-        # scan from O(unmatched * safetensors) into roughly O(unmatched + safetensors),
-        # which matters when a whole namespace is unmatched on a large VLM.
-        # Known limitation: a reordered short module (e.g. model.language_model.embed_tokens)
-        # has no 3-component suffix to seed its own vote. In practice the per-layer targets
-        # trained alongside it seed the same reorder substitution, which is then applied to
-        # the short key below; only a degenerate run that trains the short module alone would
-        # miss it.
-        sf_parts_by_suffix3 = defaultdict(list)
+        # A vote is recorded only when the two prefixes are a true reordering of the same
+        # path components (the multiset guard below), so shorter trailing suffixes are safe
+        # to seed votes and cannot pull a key across namespaces. This lets a reordered short
+        # module (e.g. model.language_model.embed_tokens vs language_model.model.embed_tokens)
+        # learn its own reorder even on a shard that holds no longer layer keys to seed it.
+        # Group safetensor module keys by each trailing 1..3 component suffix so every
+        # unmatched key only scans plausible buckets (keeps this roughly O(n)).
+        sf_parts_by_suffix = defaultdict(list)
         for sf in safetensor_keys:
             module_key = _safetensor_module_key(sf)   # strips .weight and a trailing .linear
             if module_key is None:
                 continue
             sf_parts = module_key.split(".")
-            if len(sf_parts) >= 3:
-                sf_parts_by_suffix3[tuple(sf_parts[-3:])].append(sf_parts)
+            for sl in range(1, min(3, len(sf_parts)) + 1):
+                sf_parts_by_suffix[(sl, tuple(sf_parts[-sl:]))].append(sf_parts)
         for k, _ in unmatched_keys:
             if not isinstance(k, str):
                 continue
             k_parts = k.split(".")
-            if len(k_parts) < 3:
-                continue
-            for sf_parts in sf_parts_by_suffix3.get(tuple(k_parts[-3:]), ()):
-                # The trailing 3 already match; extend the common suffix as far as it goes.
-                common_suffix_len = 3
-                for i in range(4, min(len(k_parts), len(sf_parts)) + 1):
-                    if k_parts[-i] == sf_parts[-i]:
-                        common_suffix_len = i
-                    else:
-                        break
-                # Record the prefix substitution implied by this match
-                lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
-                sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
-                if lora_prefix and sf_prefix and lora_prefix != sf_prefix:
-                    substitution_votes[(lora_prefix, sf_prefix)] += 1
+            seen_sf = set()
+            for sl in range(min(3, len(k_parts)), 0, -1):
+                for sf_parts in sf_parts_by_suffix.get((sl, tuple(k_parts[-sl:])), ()):
+                    sf_id = tuple(sf_parts)
+                    if sf_id in seen_sf:        # process each sf once, at its longest match
+                        continue
+                    seen_sf.add(sf_id)
+                    # Extend the common suffix as far as it goes.
+                    common_suffix_len = sl
+                    for i in range(sl + 1, min(len(k_parts), len(sf_parts)) + 1):
+                        if k_parts[-i] == sf_parts[-i]:
+                            common_suffix_len = i
+                        else:
+                            break
+                    lora_prefix = ".".join(k_parts[: -common_suffix_len]) + "." if common_suffix_len < len(k_parts) else ""
+                    sf_prefix = ".".join(sf_parts[: -common_suffix_len]) + "." if common_suffix_len < len(sf_parts) else ""
+                    # Only a true reordering (same components, different order) seeds a vote.
+                    if (lora_prefix and sf_prefix and lora_prefix != sf_prefix
+                            and _Counter2(p for p in lora_prefix.split(".") if p)
+                                == _Counter2(p for p in sf_prefix.split(".") if p)):
+                        substitution_votes[(lora_prefix, sf_prefix)] += 1
 
         # Apply prefix substitutions, but only true reorderings of the same path
         # components (e.g. model.language_model. <-> language_model.model.), never

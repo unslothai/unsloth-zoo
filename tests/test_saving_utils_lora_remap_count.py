@@ -334,6 +334,56 @@ def test_remap_reordered_linear_applied_via_seeded_vote():
         "model.language_model.layers.0.mlp.gate_proj"
 
 
+def test_remap_short_reordered_embed_tokens_alone():
+    """A reordered short module (embed_tokens) on a shard that holds no longer layer keys
+    must still learn its own reorder via a short-suffix vote, guarded so it only fires for a
+    true component reordering. Otherwise the merge silently drops the embedding delta."""
+    out = _infer_prefix_and_remap(_lw(["model.language_model.embed_tokens"]),
+                                  ["language_model.model.embed_tokens.weight"])
+    assert out is not None
+    assert out["language_model.model.embed_tokens"] == "model.language_model.embed_tokens"
+
+
+def test_remap_short_reordered_lm_head_alone():
+    out = _infer_prefix_and_remap(_lw(["model.language_model.lm_head"]),
+                                  ["language_model.model.lm_head.weight"])
+    assert out is not None
+    assert out["language_model.model.lm_head"] == "model.language_model.lm_head"
+
+
+def test_remap_short_suffix_does_not_cross_namespaces():
+    """A short suffix match that is NOT a component reordering must not vote (no misroute).
+    model.embed_tokens vs language_model.model.embed_tokens is a prefix add, not a reorder;
+    it resolves by the unique-prefix path, never by a cross-namespace substitution."""
+    out = _infer_prefix_and_remap(
+        _lw(["model.vision_tower.embed_tokens", "model.language_model.layers.0.self_attn.q_proj"]),
+        ["language_model.model.layers.0.self_attn.q_proj.weight"])  # no vision embed tensor
+    # the vision embed has no backing tensor and must be left unmapped, never pulled onto
+    # the language tensor by a 1-component 'embed_tokens'/'q_proj' style vote.
+    assert out.get("language_model.model.layers.0.self_attn.q_proj") == \
+        "model.language_model.layers.0.self_attn.q_proj"
+    assert "model.vision_tower.embed_tokens" not in out or \
+        out["model.vision_tower.embed_tokens"] == "model.vision_tower.embed_tokens"
+
+
+def test_remap_prefix_add_onto_linear_weight():
+    """A prefix-add LoRA key whose only backing is a Gemma4 ClippableLinear .linear.weight
+    tensor must still remap via the unique-prefix path (not only direct .weight)."""
+    out = _infer_prefix_and_remap(_lw(["model.layers.0.mlp.gate_proj"]),
+                                  ["model.language_model.layers.0.mlp.gate_proj.linear.weight"])
+    assert out is not None
+    assert out["model.language_model.layers.0.mlp.gate_proj"] == "model.layers.0.mlp.gate_proj"
+
+
+def test_count_fused_named_gate_up_proj_backed_by_per_expert():
+    """A fused-named LoRA key ...experts.gate_up_proj is backed by per-expert descendants
+    ...experts.<e>.gate_proj.weight (the merge maps them onto it), so it must count."""
+    keys = ["model.layers.0.mlp.experts.gate_up_proj"]
+    disk = ["model.layers.0.mlp.experts.0.gate_proj.weight", "model.layers.0.mlp.experts.0.up_proj.weight",
+            "model.layers.0.mlp.experts.1.gate_proj.weight", "model.layers.0.mlp.experts.1.up_proj.weight"]
+    assert _count(keys, disk) == 1
+
+
 def test_count_native_mxfp4_does_not_count_packed():
     """Native mxfp4 save (save_method='mxfp4') preserves _blocks/_scales without merging,
     so a LoRA on a packed expert is not written and must not be counted (count_packed_mxfp4
