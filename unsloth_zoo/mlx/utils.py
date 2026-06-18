@@ -2905,6 +2905,10 @@ def _collate_vlm_prompt_completion_batch(
         completion_raw = item.get("completion", "")
         prompt = _normalize_vlm_messages(prompt_raw)
         completion = _normalize_vlm_messages(completion_raw)
+        # Coerce a raw prompt to a chat message when the completion is chat-style so
+        # both render through one template and split cleanly (avoids None + list).
+        if isinstance(completion, list) and isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
 
@@ -3108,7 +3112,8 @@ def _vlm_trainable_label_rows(batch_dict):
     labels_np = np.asarray(labels.tolist() if hasattr(labels, "tolist") else labels)
     if labels_np.ndim == 1:
         labels_np = labels_np.reshape(1, -1)
-    return [bool(np.any(row != -100)) for row in labels_np]
+    # Loss supervises labels[:, 1:] (causal shift), so the first column never trains.
+    return [bool(np.any(row[1:] != -100)) for row in labels_np]
 
 
 def _build_response_masked_vlm_batch(

@@ -2327,7 +2327,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
     def _has_valid_labels(labels):
         """Return whether a response-masked row still has trainable labels."""
-        return any(label != -100 for label in labels)
+        # Loss supervises labels[1:] (causal shift), so the first label never trains.
+        return any(label != -100 for label in labels[1:])
 
     max_workers = min(4, os.cpu_count() or 1)
     all_items = []
