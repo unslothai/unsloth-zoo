@@ -17,6 +17,7 @@ paths that only real Metal training can prove:
    label masking, CCE loss, and adapter save pipeline.
 """
 
+import gc
 import glob
 import json
 import os
@@ -304,13 +305,18 @@ def test_vlm_resume_from_checkpoint_matches_fresh_run(tmp_path):
     assert len(fresh_hist) == 6, f"fresh run logged {len(fresh_hist)} losses"
     _assert_finite(fresh_hist)
 
-    ckpt = str(fresh_dir / "checkpoint-3")
-    assert os.path.isfile(os.path.join(ckpt, "adapters.safetensors"))
-    assert os.path.isfile(os.path.join(ckpt, "optimizer_state.safetensors"))
-    assert os.path.isfile(os.path.join(ckpt, "trainer_state.json"))
-    with open(os.path.join(ckpt, "trainer_state.json")) as f:
+    ckpt_dir = fresh_dir / "checkpoint-3"
+    assert (ckpt_dir / "adapters.safetensors").is_file()
+    assert (ckpt_dir / "optimizer_state.safetensors").is_file()
+    assert (ckpt_dir / "trainer_state.json").is_file()
+    with open(ckpt_dir / "trainer_state.json") as f:
         saved_state = json.load(f)
     assert saved_state["global_step"] == 3
+    ckpt = str(ckpt_dir)
+
+    # Free the fresh trainer before loading the second 2B model (memory-tight runners).
+    del trainer
+    gc.collect()
 
     # Fresh process state: new base model, same seeds, resume from step 3.
     resumed = _make_vlm_trainer(
