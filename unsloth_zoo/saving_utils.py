@@ -802,14 +802,28 @@ def _merge_and_overwrite_lora(
                 free_bytes = None
             margin = 64 * 1024 * 1024
             if free_bytes is not None and free_bytes < est_bytes + margin:
-                # Not enough room for the atomic temp-file rewrite, so overwrite the
-                # shard in place. This is non-atomic: an interrupted save leaves the
-                # shard truncated. Warn unconditionally so the risk is visible.
+                # Not enough room for the atomic temp-file rewrite. The in-place
+                # fallback overwrites the shard directly, which is non-atomic: an
+                # interrupted or failed write leaves the only output shard truncated
+                # (and on Windows the mmap section can stay locked). Refuse by default
+                # so a tight-disk save never silently corrupts the shard; let callers
+                # who accept the risk opt back in explicitly.
+                if os.environ.get("UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE") != "1":
+                    raise RuntimeError(
+                        f"Unsloth: not enough free disk to rewrite resized shard "
+                        f"{filename_original} atomically (free={free_bytes}, "
+                        f"need~={est_bytes + margin}). The original shard was left "
+                        f"intact. Free disk space or point the save directory at a "
+                        f"larger volume, or set "
+                        f"UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE=1 to allow the "
+                        f"non-atomic in-place rewrite (which can corrupt the shard if "
+                        f"the write is interrupted)."
+                    )
                 logger.warning(
                     f"Unsloth: low disk to rewrite resized shard {filename_original} "
-                    f"(free={free_bytes}, need~={est_bytes}); rewriting in place. "
-                    f"This is non-atomic, so do not interrupt the save. Free "
-                    f"~{est_bytes + margin} bytes to get the safe atomic rewrite."
+                    f"(free={free_bytes}, need~={est_bytes}); rewriting in place via "
+                    f"UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE. This is non-atomic, so "
+                    f"do not interrupt the save."
                 )
                 _inplace_rewrite_resized_shard(filename_original, header_metadata, resized)
             else:

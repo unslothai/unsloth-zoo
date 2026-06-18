@@ -37,7 +37,7 @@ NEW_VOCAB = 80  # base vocab is 64 (H._VOCAB)
 
 
 def _build_resized_case(tmp_path, *, dtype=torch.float32, force_inplace=False,
-                        monkeypatch=None, calls=None):
+                        optin=True, monkeypatch=None, calls=None):
     from transformers import AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
@@ -88,6 +88,12 @@ def _build_resized_case(tmp_path, *, dtype=torch.float32, force_inplace=False,
         monkeypatch.setattr(SU, "_estimate_resized_shard_bytes", lambda *a, **k: 1 << 60)
         monkeypatch.setattr(SU, "_inplace_rewrite_resized_shard", _spy_inplace)
         monkeypatch.setattr(SU, "_stream_rewrite_resized_shard_and_replace", _spy_stream)
+        # The in-place rewrite is non-atomic, so it is refused by default; opt in
+        # explicitly to exercise it (the fail-closed default is covered separately).
+        if optin:
+            monkeypatch.setenv("UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE", "1")
+        else:
+            monkeypatch.delenv("UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE", raising=False)
 
     H.run_merge(pm, base_dir, out_dir, save_dtype=dtype)
     merged = H.read_safetensors_dir(out_dir)
@@ -123,13 +129,24 @@ def test_resized_vocab_grow_modules_to_save(tmp_path):
 
 
 def test_resized_vocab_grow_low_disk_inplace(tmp_path, monkeypatch):
-    """Force the disk-aware in-place rewrite branch (not the streaming default) and
-    prove it produces the same correct output. The branch is selected only when free
-    disk < estimated shard bytes, so the estimate is patched enormous to trigger it;
-    spies on both rewrite paths confirm the in-place branch actually ran."""
+    """With the non-atomic rewrite explicitly opted in, the in-place branch (not the
+    streaming default) runs and produces the same correct output. The branch is
+    selected only when free disk < estimated shard bytes, so the estimate is patched
+    enormous to trigger it; spies on both rewrite paths confirm which one ran."""
     calls = {"inplace": 0, "stream": 0}
-    res = _build_resized_case(tmp_path, force_inplace=True, monkeypatch=monkeypatch,
-                              calls=calls)
+    res = _build_resized_case(tmp_path, force_inplace=True, optin=True,
+                              monkeypatch=monkeypatch, calls=calls)
     assert calls["inplace"] >= 1, "in-place resized rewrite branch was not exercised"
     assert calls["stream"] == 0, "streaming branch ran despite forced low disk"
     _check(*res)
+
+
+def test_resized_vocab_grow_low_disk_fail_closed(tmp_path, monkeypatch):
+    """Without the opt-in, a low-disk resized rewrite must fail closed (raise, leaving
+    the shard untouched) rather than fall back to the non-atomic in-place rewrite."""
+    calls = {"inplace": 0, "stream": 0}
+    with pytest.raises(RuntimeError, match="not enough free disk"):
+        _build_resized_case(tmp_path, force_inplace=True, optin=False,
+                            monkeypatch=monkeypatch, calls=calls)
+    assert calls["inplace"] == 0, "non-atomic in-place rewrite ran despite fail-closed default"
+    assert calls["stream"] == 0, "streaming branch ran despite forced low disk"
