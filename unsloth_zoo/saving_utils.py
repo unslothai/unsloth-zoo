@@ -23,7 +23,7 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
-from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache, device_synchronize
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
@@ -150,6 +150,10 @@ from safetensors.torch import save_file
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
+
+# Flush the allocator only after a large-tensor merge (embed / lm_head / fused
+# experts); a per-key empty_cache/synchronize over every key is wasted GPU stall.
+_EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 
 
 @functools.lru_cache(maxsize = 1)
@@ -554,13 +558,7 @@ def _merge_and_overwrite_lora(
     if counted_lora_modules is None:
         counted_lora_modules = set()   # fused lora keys counted toward n_saved_modules
 
-    # Convert lora_weights to safetensor format
-    converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-        lora_weights,
-        [],
-        model_class_name = model_class_name,
-    )
-
+    # built once below, once the real safetensor keys are known.
     raw_pointer = None
     mm = None
     header_metadata = None
@@ -637,10 +635,6 @@ def _merge_and_overwrite_lora(
                     and len(processed_mxfp4_keys) == 0
                 ):
                     logger.info(f"[merge_debug] First shard key example: {key}")
-
-                # Free memory before each tensor
-                device_empty_cache()
-                device_synchronize()
 
                 # MoE stacked experts: gate_up_proj is fused in the model but
                 # sharded as per-expert gate_proj/up_proj on disk.
@@ -777,108 +771,61 @@ def _merge_and_overwrite_lora(
                         dtype=W_original_dtype, device="cpu"
                     )
 
+                nbytes = W.numel() * W.element_size()
                 del W
-                device_empty_cache()
+                # flush only after a large tensor; per-key flush was pure stall.
+                if nbytes >= _EMPTY_CACHE_BYTES_THRESHOLD:
+                    device_empty_cache()
             pass
         pass
         mm.flush()
         mm.close()
         raw_pointer.close()
 
-        # If any tensors were resized (vocab resize), rewrite the shard file
+        # Vocab grew -> resized tensors no longer fit their byte slots; rewrite the
+        # shard. Stream to a temp file when disk allows, else rewrite in place.
         resized = getattr(_merge_and_overwrite_lora, "_resized", {})
         if resized:
             _merge_and_overwrite_lora._resized = {}
-            # Reload shard, swap in resized tensors, save
-            tensors = {}
-            with safe_open(filename_original, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key in resized:
-                        tensors[key] = resized[key]
-                    else:
-                        tensors[key] = f.get_tensor(key)
+            gc.collect()
+            device_empty_cache()
 
-            # POSIX: direct save. Windows: temp-file + os.replace to
-            # avoid WinError 1224 (mmap section release can lag).
-            if os.name != "nt":
-                save_file(tensors, filename_original)
-                del tensors
+            temp_dir = os.path.dirname(os.path.abspath(filename_original))
+            est_bytes = _estimate_resized_shard_bytes(header_metadata, resized, length_of_header)
+            try:
+                free_bytes = shutil.disk_usage(temp_dir).free
+            except OSError:
+                free_bytes = None
+            margin = 64 * 1024 * 1024
+            if free_bytes is not None and free_bytes < est_bytes + margin:
+                # No room for the atomic temp+replace rewrite. The in-place fallback
+                # overwrites the shard non-atomically (a failed write truncates it,
+                # worse on Windows mmap), so refuse by default; opt in to allow it.
+                if os.environ.get("UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE") != "1":
+                    raise RuntimeError(
+                        f"Unsloth: not enough free disk to rewrite resized shard "
+                        f"{filename_original} atomically (free={free_bytes}, "
+                        f"need~={est_bytes + margin}). The original shard was left "
+                        f"intact. Free disk space or point the save directory at a "
+                        f"larger volume, or set "
+                        f"UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE=1 to allow the "
+                        f"non-atomic in-place rewrite (which can corrupt the shard if "
+                        f"the write is interrupted)."
+                    )
+                logger.warning(
+                    f"Unsloth: low disk to rewrite resized shard {filename_original} "
+                    f"(free={free_bytes}, need~={est_bytes}); rewriting in place via "
+                    f"UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE. This is non-atomic, so "
+                    f"do not interrupt the save."
+                )
+                _inplace_rewrite_resized_shard(filename_original, header_metadata, resized)
             else:
-                gc.collect()
-                device_empty_cache()
-
-                max_retries = 5
-                base_delay  = 0.2  # seconds
-                temp_dir    = os.path.dirname(os.path.abspath(filename_original))
-                try:
-                    original_mode = os.stat(filename_original).st_mode
-                except OSError:
-                    original_mode = None
-
-                fd, tmp_path = tempfile.mkstemp(dir=temp_dir, suffix=".safetensors.tmp")
-                os.close(fd)
-
-                try:
-                    save_file(tensors, tmp_path)
-                    if original_mode is not None:
-                        try:
-                            os.chmod(tmp_path, original_mode)
-                        except OSError:
-                            pass
-
-                    # Drop mmap refs before os.replace
-                    del tensors
-                    gc.collect()
-                    device_empty_cache()
-
-                    for attempt in range(max_retries):
-                        try:
-                            os.replace(tmp_path, filename_original)
-                            tmp_path = None
-                            break
-                        except OSError as e:
-                            winerror  = getattr(e, "winerror", None)
-                            error_msg = str(e).lower()
-                            is_lock_error = (
-                                winerror in {32, 1224}
-                                or (
-                                    winerror == 5 and (
-                                        "user-mapped" in error_msg
-                                        or "being used by another process" in error_msg
-                                        or "sharing violation" in error_msg
-                                    )
-                                )
-                                or "user-mapped" in error_msg
-                                or "being used by another process" in error_msg
-                            )
-                            if is_lock_error and attempt < max_retries - 1:
-                                delay = base_delay * (2 ** attempt)
-                                if UNSLOTH_ENABLE_LOGGING:
-                                    logger.warning(
-                                        f"[Retry {attempt + 1}/{max_retries}] Windows file lock "
-                                        f"detected for {filename_original}: {e}. "
-                                        f"Waiting {delay:.1f}s before retry..."
-                                    )
-                                gc.collect()
-                                time.sleep(delay)
-                                continue
-                            if is_lock_error:
-                                raise RuntimeError(
-                                    f"Failed to rewrite {filename_original} after {max_retries} "
-                                    f"attempts due to Windows file lock. Original shard is intact "
-                                    f"(atomic replace never committed). "
-                                    f"Solutions: 1) Restart Unsloth Studio 2) Disable antivirus "
-                                    f"3) Close File Explorer windows"
-                                ) from e
-                            raise RuntimeError(
-                                f"Model merge failed while rewriting {filename_original}: {e}"
-                            ) from e
-                finally:
-                    if tmp_path is not None and os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
+                _stream_rewrite_resized_shard_and_replace(
+                    filename_original, temp_dir, header_metadata, length_of_header, resized,
+                )
+            del resized
+            gc.collect()
+            device_empty_cache()
 
         device_empty_cache()
         return count, safetensor_keys_seen
@@ -1565,17 +1512,16 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 
         device = _active_merge_device()
         gate_up_merged = gate_up_W.to(device, dtype=torch.float32, non_blocking=True)
+        # Move lora_A/lora_B to device once, then slice per expert.
+        lora_A_dev = lora_stats.lora_A.to(device, dtype=torch.float32, non_blocking=True)
+        lora_B_dev = lora_stats.lora_B.to(device, dtype=torch.float32, non_blocking=True)
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
             # lora_B is contiguous-r per expert (see moe_utils.py
             # _canonical_lora_weights_for_grouped_mm); must match for the saved
             # checkpoint to reproduce the training-time forward.
-            a_slice = lora_stats.lora_A[start:end, :]
-            b_slice = lora_stats.lora_B[:, start:end]
-            delta = b_slice.to(
-                device, dtype=torch.float32, non_blocking=True
-            ) @ a_slice.to(device, dtype=torch.float32, non_blocking=True)
+            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
 
             gate_up_merged[expert_idx] = gate_up_merged[expert_idx].add(
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
@@ -1649,15 +1595,14 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
 
         device = _active_merge_device()
         down_merged = down_W.to(device, dtype=torch.float32, non_blocking=True)
+        # Move lora_A/lora_B to device once, then slice per expert.
+        lora_A_dev = lora_stats.lora_A.to(device, dtype=torch.float32, non_blocking=True)
+        lora_B_dev = lora_stats.lora_B.to(device, dtype=torch.float32, non_blocking=True)
 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
             # See _merge_moe_fused_gate_up_expert for the slicing rationale.
-            a_slice = lora_stats.lora_A[start:end, :]
-            b_slice = lora_stats.lora_B[:, start:end]
-            delta = b_slice.to(
-                device, dtype=torch.float32, non_blocking=True
-            ) @ a_slice.to(device, dtype=torch.float32, non_blocking=True)
+            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
 
             down_merged[expert_idx] = down_merged[expert_idx].add(
                 delta.T if use_transpose else delta, alpha=lora_stats.alpha
@@ -1710,10 +1655,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             if key in processed_mxfp4_keys:
                 continue
 
-            # FORCE memory cleanup before processing each tensor
-            device_empty_cache()
-            device_synchronize()
-
             W = None
             output_key = key
             action_logged = False
@@ -1732,7 +1673,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
                 blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
-                device_synchronize()
+                # Free the allocator before the large dequant alloc.
                 device_empty_cache()
 
                 # Pick device + chunk size for mxfp4 dequantization
@@ -1808,8 +1749,9 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
             tensors[output_key] = W
 
-            # Free up VRAM after each merge
-            device_empty_cache()
+            # Free VRAM only after a large dequant/merge, not every small tensor.
+            if W.numel() * W.element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
+                device_empty_cache()
 
     # CRITICAL: Force cleanup to release file handles on Windows
     if os.name == 'nt':
@@ -2523,18 +2465,25 @@ def merge_and_overwrite_lora(
     safetensor_keys_seen = set()
     counted_lora_modules_global = set()
 
+    # Per-shard-invariant: resolve the base model + tie flag once, not per shard.
+    _merge_base_model = find_lora_base_model(model)
+    _merge_model_class_name = _merge_base_model.__class__.__name__
+    _merge_tie_word_embeddings = bool(
+        getattr(_merge_base_model.config, "tie_word_embeddings", False)
+    )
+
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
             lora_weights = lora_weights,
             output_dtype = output_dtype,
-            model_class_name = find_lora_base_model(model).__class__.__name__,
+            model_class_name = _merge_model_class_name,
             base_model_is_quantized = base_model_is_quantized,
             quant_type = quant_type,
             save_method = save_method,
             counted_lora_modules = counted_lora_modules_global,
-            tie_word_embeddings = bool(getattr(find_lora_base_model(model).config, "tie_word_embeddings", False)),
+            tie_word_embeddings = _merge_tie_word_embeddings,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
@@ -3804,6 +3753,174 @@ def split_safetensors_to_shards(file_path, max_shard_size_gb=2):
     return shards
 pass
 
+def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized):
+    # Stream one tensor at a time (peak RAM ~ one tensor): resized tensors from
+    # `resized`, the rest byte-copied from src. Tensor-identical to dict+save_file.
+    import struct
+    src_data_start = 8 + length_of_header
+    meta = header_metadata.get("__metadata__", None)
+    tensor_keys = [k for k in header_metadata.keys() if k != "__metadata__"]
+    tensor_keys.sort(key = lambda k: header_metadata[k]["data_offsets"][0])
+
+    # Cast resized tensors to the header dtype so bytes match the label.
+    res_t = {}
+    for k in resized:
+        dt = SAFETENSORS_DTYPES[header_metadata[k]["dtype"]]
+        res_t[k] = resized[k].detach().to(dt).contiguous().cpu()
+
+    new_header = {}
+    if meta is not None:
+        new_header["__metadata__"] = meta
+    layout = []  # (key, src_off0, nbytes, is_resized)
+    cursor = 0
+    for k in tensor_keys:
+        entry = header_metadata[k]
+        if k in res_t:
+            t = res_t[k]
+            shape = list(t.shape)
+            nbytes = t.numel() * t.element_size()
+        else:
+            shape = list(entry["shape"])
+            o0, o1 = entry["data_offsets"]
+            nbytes = o1 - o0
+        # dtype is unchanged by a vocab resize
+        new_header[k] = {"dtype": entry["dtype"], "shape": shape,
+                         "data_offsets": [cursor, cursor + nbytes]}
+        layout.append((k, entry["data_offsets"][0], nbytes, k in res_t))
+        cursor += nbytes
+
+    header_bytes = json.dumps(new_header, separators = (",", ":")).encode("utf-8")
+    header_bytes += b" " * ((8 - (len(header_bytes) % 8)) % 8)  # 8-byte align data start
+
+    CHUNK = 64 * 1024 * 1024
+    with open(dst_path, "wb") as out, open(src_path, "rb") as src:
+        out.write(struct.pack("<Q", len(header_bytes)))
+        out.write(header_bytes)
+        for k, src_off0, nbytes, is_resized in layout:
+            if is_resized:
+                # reshape(-1) so 0-dim scalars (e.g. Gemma-4 audio min/max) view as bytes
+                out.write(memoryview(res_t[k].reshape(-1).view(torch.uint8).numpy()))
+            else:
+                src.seek(src_data_start + src_off0)
+                remaining = nbytes
+                while remaining > 0:
+                    chunk = src.read(min(CHUNK, remaining))
+                    if not chunk:
+                        raise RuntimeError(
+                            f"Unsloth: unexpected EOF reading {src_path} for tensor {k}")
+                    out.write(chunk)
+                    remaining -= len(chunk)
+    res_t.clear()
+pass
+
+
+def _estimate_resized_shard_bytes(header_metadata, resized, length_of_header):
+    # Rewritten-shard size: resized tensors at new byte count, rest at current slot, + header.
+    total = 0
+    for k, entry in header_metadata.items():
+        if k == "__metadata__":
+            continue
+        if k in resized:
+            t = resized[k]
+            total += t.numel() * t.element_size()
+        else:
+            o0, o1 = entry["data_offsets"]
+            total += o1 - o0
+    return total + 8 + length_of_header
+
+
+def _inplace_rewrite_resized_shard(filename_original, header_metadata, resized):
+    # Low-disk fallback: reload the shard, swap in resized tensors, save_file over
+    # the original (higher RAM, no transient 2x-shard disk; non-atomic).
+    meta = header_metadata.get("__metadata__", None)
+    tensors = {}
+    with safe_open(filename_original, framework = "pt", device = "cpu") as f:
+        for key in f.keys():
+            tensors[key] = resized[key] if key in resized else f.get_tensor(key)
+    save_file(tensors, filename_original, metadata = meta)
+    tensors.clear()
+
+
+def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, header_metadata, length_of_header, resized):
+    # Stream the resized shard to a temp file then atomically os.replace it in
+    # (peak RAM ~ one tensor). Used when disk has room for the transient copy.
+    max_retries = 5
+    base_delay  = 0.2  # seconds
+    try:
+        original_mode = os.stat(filename_original).st_mode
+    except OSError:
+        original_mode = None
+
+    fd, tmp_path = tempfile.mkstemp(dir=temp_dir, suffix=".safetensors.tmp")
+    os.close(fd)
+
+    try:
+        _stream_rewrite_resized_shard(
+            src_path = filename_original,
+            dst_path = tmp_path,
+            header_metadata = header_metadata,
+            length_of_header = length_of_header,
+            resized = resized,
+        )
+        if original_mode is not None:
+            try:
+                os.chmod(tmp_path, original_mode)
+            except OSError:
+                pass
+
+        gc.collect()
+        device_empty_cache()
+
+        for attempt in range(max_retries):
+            try:
+                os.replace(tmp_path, filename_original)
+                tmp_path = None
+                break
+            except OSError as e:
+                winerror  = getattr(e, "winerror", None)
+                error_msg = str(e).lower()
+                is_lock_error = (
+                    winerror in {32, 1224}
+                    or (
+                        winerror == 5 and (
+                            "user-mapped" in error_msg
+                            or "being used by another process" in error_msg
+                            or "sharing violation" in error_msg
+                        )
+                    )
+                    or "user-mapped" in error_msg
+                    or "being used by another process" in error_msg
+                )
+                if is_lock_error and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.warning(
+                            f"[Retry {attempt + 1}/{max_retries}] Windows file lock "
+                            f"detected for {filename_original}: {e}. "
+                            f"Waiting {delay:.1f}s before retry..."
+                        )
+                    gc.collect()
+                    time.sleep(delay)
+                    continue
+                if is_lock_error:
+                    raise RuntimeError(
+                        f"Failed to rewrite {filename_original} after {max_retries} "
+                        f"attempts due to Windows file lock. Original shard is intact "
+                        f"(atomic replace never committed). "
+                        f"Solutions: 1) Restart Unsloth Studio 2) Disable antivirus "
+                        f"3) Close File Explorer windows"
+                    ) from e
+                raise RuntimeError(
+                    f"Model merge failed while rewriting {filename_original}: {e}"
+                ) from e
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, tensor, output_dtype):
     """
     Write tensor directly to memory-mapped file using pure PyTorch operations
@@ -3832,20 +3949,13 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
                 logger.warning(f"Size mismatch for {output_key}: expected {expected_size}, got {tensor_bytes}")
             return False
 
-        # Use PyTorch's internal byte representation directly
-        # This avoids numpy conversion and preserves exact format
-        tensor_view = tensor_formatted.view(torch.uint8)
-
-        # Convert to bytes using PyTorch's .data_ptr() and ctypes
-        import ctypes
-        data_ptr = tensor_view.data_ptr()
-        byte_data = (ctypes.c_ubyte * tensor_view.numel()).from_address(data_ptr)
-
-        # Write directly to memory map
-        mm[index_L:index_R] = bytes(byte_data)
+        # Zero-copy write into the mmap; avoids the bytes() copy that doubled peak
+        # RAM on large tensors. tensor_formatted is already contiguous CPU; reshape(-1)
+        # gives the 1D buffer the mmap slice needs (multi-dim assignment errors on some Pythons).
+        tensor_view = tensor_formatted.detach().reshape(-1).view(torch.uint8)
+        mm[index_L:index_R] = memoryview(tensor_view.numpy())
 
         # Clear memory
-        del data_ptr
         del tensor_view
         del tensor_formatted
         del tensor
