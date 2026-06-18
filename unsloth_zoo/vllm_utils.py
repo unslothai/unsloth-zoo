@@ -2154,6 +2154,27 @@ def load_vllm(
     # Get device as well
     device = get_target_device()
 
+    # vLLM >= 0.19.0 ships a piecewise graph-partition pass (`_decompose_size_nodes`,
+    # vllm-project/vllm#36038) that crashes on Unsloth's LoRA graph under
+    # compilation_config=3: "Tried to erase Node size_N but it still had N users".
+    # Still unpatched as of vLLM 0.23. compilation_config=2 skips piecewise splitting and
+    # is unaffected, so step 3 -> 2 while the installed vLLM ships the broken pass. Detect
+    # by the pass itself (not a version number) so this self-heals once vLLM fixes it.
+    # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 regardless.
+    if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
+        try:
+            import vllm.compilation.backends as _vllm_backends
+            broken_piecewise = hasattr(_vllm_backends, "_decompose_size_nodes")
+        except Exception:
+            broken_piecewise = False
+        if broken_piecewise:
+            print(
+                "Unsloth: This vLLM's piecewise compile is incompatible with LoRA "
+                "(compilation_config=3); using compilation_config=2 instead. "
+                "Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to override."
+            )
+            compilation_config = 2
+
     if compilation_config == 3:
         try:
             from vllm.config import CompilationConfig
