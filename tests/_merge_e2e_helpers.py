@@ -16,19 +16,10 @@
 
 """Shared helpers for the end-to-end LoRA merge-to-16bit correctness suite.
 
-These helpers drive the real public merge path (`merge_and_overwrite_lora`) on
-tiny but architecturally-real models and check every saved tensor against an
-INDEPENDENT reference:
-
-    adapted module : merged == (base.float() + scale * (B @ A)).to(save_dtype)
-    pass-through   : merged is byte-identical to the base tensor
-
-The reference is built directly from the LoRA A/B/scaling read off the live PEFT
-model (not from the merge implementation), so it cannot mask a merge bug. Tiny
-configs use *distinct* hidden / intermediate sizes so fused-expert orientation is
-unambiguous and transpose bugs are visible.
-
-Not a `test_` module, so pytest does not collect it as tests.
+Drives the real merge path on tiny architecturally-real models and checks each
+saved tensor against a reference built independently from the live PEFT LoRA
+(adapted: base + scale*(B@A); pass-through: byte-identical). Distinct hidden /
+intermediate sizes keep fused-expert orientation unambiguous. Not a test_ module.
 """
 
 from __future__ import annotations
@@ -46,8 +37,7 @@ from unsloth_zoo.saving_utils import merge_and_overwrite_lora
 
 SEED = 1234
 
-# dtype-aware tolerances for adapted tensors (atol, rtol). Pass-through tensors
-# are always compared with exact byte-identity, never these tolerances.
+# (atol, rtol) for adapted tensors; pass-through is always byte-exact.
 _TOL = {
     torch.float32:  (1e-5, 1e-5),
     torch.bfloat16: (2e-2, 2e-2),
@@ -56,24 +46,20 @@ _TOL = {
 
 
 def set_offline_cpu_env():
-    """Make the merge run offline and tolerate CPU-only hosts (CI)."""
+    """Make the merge run offline and CPU-tolerant for CI."""
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
     os.environ.setdefault("UNSLOTH_DISABLE_AUTO_UPDATES", "1")
 
 
-# ---------------------------------------------------------------------------
-# Reference: one adapted target (a single saved tensor that LoRA modifies).
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _Adapted:
-    key: str            # safetensor key, e.g. model.layers.0.self_attn.q_proj.weight
+    key: str
     lora_A: torch.Tensor
     lora_B: torch.Tensor
     alpha: float
-    fused: bool         # True for grouped 3D expert tensors (gate_up_proj/down_proj)
+    fused: bool         # grouped 3D expert tensor (gate_up_proj/down_proj)
 
 
 def _strip_peft_prefix(name: str) -> str:
@@ -84,8 +70,7 @@ def _strip_peft_prefix(name: str) -> str:
 
 
 def _iter_lora_modules(peft_model):
-    """Yield (module_name, module) for every LoRA-bearing module (dense Linear
-    targets and target_parameters / fused expert wrappers)."""
+    """Yield (name, module) for every LoRA-bearing module."""
     for name, mod in peft_model.named_modules():
         la = getattr(mod, "lora_A", None)
         lb = getattr(mod, "lora_B", None)
@@ -97,9 +82,9 @@ def _iter_lora_modules(peft_model):
 
 
 def _module_to_key(name: str, param_name) -> str:
-    """Map a PEFT module name to the on-disk safetensor key it adapts."""
+    """Map a PEFT module name to the safetensor key it adapts."""
     base = _strip_peft_prefix(name)
-    if param_name:  # target_parameters (fused expert param)
+    if param_name:
         if base.endswith(".base_layer"):
             base = base[: -len(".base_layer")]
         return f"{base}.{param_name}"
@@ -107,33 +92,28 @@ def _module_to_key(name: str, param_name) -> str:
 
 
 def seed_lora(peft_model, seed: int = SEED):
-    """Fill lora_A and lora_B with deterministic, asymmetric, nonzero values.
+    """Fill lora_A/lora_B with deterministic asymmetric nonzero values.
 
-    PEFT inits lora_B to zero (no delta) and lora_A via kaiming; we overwrite
-    both with shaped values seeded by the *safetensor key* so the result is a
-    pure function of (key, seed) and independent of module-iteration order.
-    Shaped (not pure-randn) values make transpose / slice bugs visible on tiny
-    tensors.
+    Seeded by safetensor key (hashlib, since hash() is per-process random) so the
+    result is independent of module-iteration order; the shaped ramp makes
+    transpose/slice bugs visible on tiny tensors.
     """
     with torch.no_grad():
         for name, mod in _iter_lora_modules(peft_model):
             key = _module_to_key(name, getattr(mod, "parameter_name", None))
             for tag, bank in (("A", mod.lora_A), ("B", mod.lora_B)):
                 w = bank["default"].weight
-                # process-stable seed (Python's hash() is randomized per process)
                 h = hashlib.sha256(f"{key}|{tag}|{seed}".encode()).digest()
                 g = torch.Generator(device="cpu").manual_seed(
                     int.from_bytes(h[:7], "big")
                 )
                 vals = torch.randn(w.numel(), generator=g)
-                # add a shaped, position-dependent ramp so values are asymmetric
                 ramp = torch.arange(w.numel(), dtype=torch.float32) * 1.0e-3
                 w.copy_((vals * 0.02 + ramp).reshape(w.shape).to(w.dtype))
 
 
 def extract_adapted(peft_model) -> dict[str, _Adapted]:
-    """Build {safetensor_key: _Adapted} from the live PEFT model. Independent of
-    the merge implementation; reuses only the A/B/scaling tensors."""
+    """Build {safetensor_key: _Adapted} from the live PEFT model."""
     out: dict[str, _Adapted] = {}
     for name, mod in _iter_lora_modules(peft_model):
         param_name = getattr(mod, "parameter_name", None)
@@ -146,15 +126,8 @@ def extract_adapted(peft_model) -> dict[str, _Adapted]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Reference math.
-# ---------------------------------------------------------------------------
-
 def _ref_dense(base: torch.Tensor, a: _Adapted) -> torch.Tensor:
-    """2D Linear merge (also per-expert MoE, which is a plain Linear).
-
-    Handles the vocab-grow case where lora_B has more rows than base (zero-pad).
-    """
+    """2D Linear / per-expert merge, with vocab-grow zero-pad when B has more rows."""
     A = a.lora_A.to(torch.float64)
     B = a.lora_B.to(torch.float64)
     W = base.to(torch.float64)
@@ -166,8 +139,8 @@ def _ref_dense(base: torch.Tensor, a: _Adapted) -> torch.Tensor:
 
 
 def _ref_fused(base3d: torch.Tensor, a: _Adapted) -> torch.Tensor:
-    """Grouped 3D expert merge. Per expert e: delta = B_e @ A_e, applied in the
-    orientation that fits base[e] (auto-detected from distinct dims)."""
+    """Grouped 3D expert merge; per expert delta=B_e@A_e in the orientation that
+    fits base[e] (auto-detected from distinct dims)."""
     E = base3d.shape[0]
     r = a.lora_A.shape[0] // E
     d1, d2 = base3d.shape[1], base3d.shape[2]
@@ -188,10 +161,6 @@ def _ref_fused(base3d: torch.Tensor, a: _Adapted) -> torch.Tensor:
             )
     return out
 
-
-# ---------------------------------------------------------------------------
-# Build + save a tiny base, attach LoRA, run the real merge.
-# ---------------------------------------------------------------------------
 
 def read_safetensors_dir(d: str) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
@@ -227,28 +196,22 @@ def run_merge(peft_model, base_dir, out_dir, *, save_dtype, tokenizer=None,
     return res
 
 
-# ---------------------------------------------------------------------------
-# The assertion engine.
-# ---------------------------------------------------------------------------
-
 _LORA_REMNANT_MARKERS = (".lora_A", ".lora_B", ".lora_embedding",
                          ".base_layer", "modules_to_save", "original_module")
 
 
 class KeyResolutionError(AssertionError):
-    """The harness could not map an adapted module to a base safetensor key.
+    """Adapted module could not be mapped to a base safetensor key.
 
     Raised (not for value mismatches) when a tiny config's on-disk key layout
-    differs from the LoRA module path in a way this reference builder does not
-    model (e.g. composite text+vision prefixes, or fused-vs-per-expert expert
-    serialization that varies across transformers versions). Tests treat this as
-    a skip (the merge itself is validated elsewhere), never as a value failure.
+    differs from the LoRA module path (composite VLM prefixes, or fused-vs-per-
+    expert serialization that varies by transformers version). Tests skip on it.
     """
 
 
 def _resolve_key(adapted_key: str, base_keys: set[str]) -> str | None:
-    """Map an adapted key to an actual base safetensor key, tolerating an extra
-    prefix (VLM composite models, mirrors _infer_prefix_and_remap)."""
+    """Resolve an adapted key to a base key, tolerating an extra prefix (VLM
+    composite models; mirrors _infer_prefix_and_remap)."""
     if adapted_key in base_keys:
         return adapted_key
     cands = [k for k in base_keys if k.endswith("." + adapted_key) or k.endswith(adapted_key)]
@@ -260,7 +223,7 @@ def _resolve_key(adapted_key: str, base_keys: set[str]) -> str | None:
 
 def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
                          adapted: dict[str, _Adapted], allow_missing_adapted=False):
-    """Verify every merged tensor against the independent reference.
+    """Check every merged tensor against the independent reference.
 
     base_tensors : {key: tensor} snapshot of the base BEFORE merge.
     adapted      : {safetensor_key: _Adapted} from extract_adapted().
@@ -271,19 +234,18 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
     assert merged, f"[{family}] no safetensors written to {out_dir}"
     base_keys = set(base_tensors.keys())
 
-    # 1) no adapter remnants leaked into the merged checkpoint
+    # no adapter remnants leaked
     leaked = [k for k in merged if any(m in k for m in _LORA_REMNANT_MARKERS)]
     assert not leaked, f"[{family}] adapter remnants in merged output: {leaked[:5]}"
 
-    # 2) resolve adapted keys against the real base keys (VLM prefix tolerance)
+    # resolve adapted keys against real base keys (VLM prefix tolerance)
     resolved: dict[str, _Adapted] = {}
     for ak, a in adapted.items():
         rk = _resolve_key(ak, base_keys)
         if rk is None:
             if allow_missing_adapted:
-                # adapter targets a module absent from base safetensors (e.g. a
-                # vision-tower adapter). The merge must skip it without error;
-                # there is simply no merged tensor to check (mirrors PR #773).
+                # target absent from base (e.g. vision-tower adapter): merge skips
+                # it, nothing to check (mirrors PR #773).
                 continue
             raise KeyResolutionError(
                 f"[{family}] adapted key {ak!r} not found among base keys "
@@ -291,7 +253,6 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
             )
         resolved[rk] = a
 
-    # 3) per-tensor check
     atol, rtol = _TOL[save_dtype]
     n_adapted = n_passthru = 0
     for key, mt in merged.items():
@@ -308,18 +269,18 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
             _assert_equal(family, key, mt, base_tensors[key])
             n_passthru += 1
 
-    # 4) every adapted target actually appeared and was checked
+    # every adapted target appeared and was checked
     if not allow_missing_adapted:
         missing = [k for k in resolved if k not in merged]
         assert not missing, f"[{family}] adapted targets missing from merged output: {missing}"
     assert n_adapted >= 1, f"[{family}] no adapted tensors were checked (LoRA not attached?)"
 
-    # 5) MoE merge must not have fallen back
+    # MoE merge must not have fallen back
     assert _MOE_MERGE_STATE.get("fallback", 0) == 0, (
         f"[{family}] MoE merge fell back: {_MOE_MERGE_STATE}"
     )
 
-    # 6) index consistency
+    # index consistency
     idx = read_index(out_dir)
     if idx is not None:
         wm = idx.get("weight_map", {})
@@ -357,26 +318,22 @@ def _assert_equal(family, key, got, base):
                              _diag(family, key, got, base, adapted=False))
 
 
-# ---------------------------------------------------------------------------
-# Tiny-config factory + LoRA attach.
-# ---------------------------------------------------------------------------
-
 @dataclass
 class FamilySpec:
     family: str
-    kind: str                       # "dense" | "per_expert" | "fused"
+    kind: str                       # dense | per_expert | fused
     config: object
-    auto: str = "causal"            # "causal" | "image_text"
+    auto: str = "causal"            # causal | image_text
     attn_modules: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
-    mlp_modules: tuple = ("gate_proj", "up_proj", "down_proj")   # dense FFN
+    mlp_modules: tuple = ("gate_proj", "up_proj", "down_proj")
     expert_modules: tuple = ()      # per-expert MoE target_modules
-    fused_params: tuple = ()        # target_parameters for fused experts
+    fused_params: tuple = ()        # fused-expert target_parameters
 
 
 # distinct dims so fused-expert orientation is unambiguous (transpose bugs show)
-_H = 32          # hidden
-_I = 64          # dense intermediate
-_MOE_I = 48      # MoE intermediate (distinct from hidden and 2*MoE_I)
+_H = 32
+_I = 64
+_MOE_I = 48      # distinct from _H and 2*_MOE_I
 _HEADS = 4
 _KV = 2
 _VOCAB = 64
@@ -445,7 +402,6 @@ def make_spec(family: str) -> FamilySpec:
     # transformers 5.x only families
     if family == "qwen3_5_moe":
         cfg = T.AutoConfig.for_model("qwen3_5_moe")
-        # shrink whatever fields exist
         return _shrink_generic(family, "fused", cfg,
                                fused_params=("mlp.experts.gate_up_proj", "mlp.experts.down_proj"))
     if family == "gemma4":
@@ -475,8 +431,8 @@ def _shrink_generic(family, kind, cfg, **kw):
                           ("num_experts_per_tok", 2), ("decoder_sparse_step", 1)):
             if hasattr(obj, attr):
                 setattr(obj, attr, val)
-        # hybrid / strict-validated archs (lfm2_moe, qwen3_5_moe) require an explicit
-        # per-layer schedule matching num_hidden_layers, else instantiation raises.
+        # strict/hybrid archs (lfm2_moe, qwen3_5_moe) need an explicit per-layer
+        # schedule matching num_hidden_layers or instantiation raises.
         if hasattr(obj, "layer_types") and getattr(obj, "num_hidden_layers", None):
             try:
                 obj.layer_types = ["full_attention"] * obj.num_hidden_layers
@@ -500,11 +456,8 @@ def build_and_save_base(spec: FamilySpec, base_dir: str, *, dtype=torch.float32,
 
 def attach_lora(model, spec: FamilySpec, scenario: str, *, r=8, lora_alpha=16,
                 alpha_pattern=None, rank_pattern=None):
-    """Attach a PEFT LoRA adapter for the given scenario and seed it nonzero.
-
-    scenario in {full, attn_only, mlp_only, expert_only}.
-    Returns the PeftModel.
-    """
+    """Attach a PEFT LoRA adapter (scenario in {full, attn_only, mlp_only,
+    expert_only}) and seed it nonzero. Returns the PeftModel."""
     from peft import LoraConfig, get_peft_model
     tm: list[str] = []
     tp: list[str] = []
@@ -533,10 +486,8 @@ def attach_lora(model, spec: FamilySpec, scenario: str, *, r=8, lora_alpha=16,
 
 def run_case(family, scenario, work_dir, *, dtype=torch.float32, max_shard_size="5GB",
              allow_missing_adapted=False, **attach_kw):
-    """End-to-end: build tiny base -> attach LoRA -> real merge -> assert correct.
-
-    Returns (n_adapted_checked, n_passthrough_checked). Raises on any mismatch.
-    """
+    """Build base -> attach LoRA -> real merge -> assert. Returns
+    (n_adapted_checked, n_passthrough_checked); raises on any mismatch."""
     set_offline_cpu_env()
     spec = make_spec(family)
     base_dir = os.path.join(work_dir, "base")

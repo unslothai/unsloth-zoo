@@ -16,14 +16,12 @@
 
 """End-to-end LoRA merge correctness for vision / multimodal models.
 
-Language-side LoRA must merge correctly while every vision-tower / projector /
-audio tensor stays byte-identical to the base. These models also exercise the key
-remap that PR #773 hardens: the runtime LoRA path (``model.language_model.``)
-differs from the on-disk safetensor key (``language_model.model.``), so the
-reference keys are built with the production remapper
-``_convert_lora_keys_to_safetensor_format`` to match exactly what the merge does.
-A clean run also proves the key-count sanity check does not false-positive when
-adapters target the nested language model only.
+Language-side LoRA must merge while every vision-tower / projector / audio tensor
+stays byte-identical. Also exercises the #773 key remap (runtime
+`model.language_model.` vs on-disk `language_model.model.`): reference keys use the
+production remapper `_convert_lora_keys_to_safetensor_format`, and a clean run proves
+the key-count check does not false-positive when only the nested language model is
+adapted.
 """
 
 from __future__ import annotations
@@ -35,8 +33,7 @@ import torch
 
 import _merge_e2e_helpers as H
 
-# regex: target only the language model's q/v attention (NOT the vision encoder,
-# whose attention is also named q_proj/v_proj).
+# language model q/v only (the vision encoder also has q_proj/v_proj).
 _LANG_QV = r".*language_model.*\.(q_proj|v_proj)$"
 _VISION_MARKERS = ("vision", "visual", "multi_modal", "audio_tower", "vision_tower")
 
@@ -113,10 +110,8 @@ def test_vision_language_only_merge_preserves_vision(family, tmp_path):
             if sk in base:
                 ref[sk] = st
     if not ref:
-        # The production remapper could not line the language LoRA keys up with the
-        # on-disk keys on this transformers version (composite-model key layouts
-        # drift across versions). The vision-tower preservation below is the core
-        # check; exact language deltas are covered where keys resolve + real sweep.
+        # remapper could not line language LoRA keys to on-disk keys on this
+        # transformers version; vision preservation below is the core check.
         pytest.skip(f"{family}: language adapter keys did not resolve against base "
                     f"on this transformers version")
 

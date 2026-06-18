@@ -16,11 +16,9 @@
 
 """End-to-end LoRA merge-to-16bit correctness for dense decoder models.
 
-Drives the real `merge_and_overwrite_lora` path on tiny but architecturally-real
-configs (Llama / Qwen3 / Mistral / Gemma2) and checks every saved tensor against
-an independent reference: adapted modules == base + scale*(B@A); every untargeted
-tensor stays byte-identical to the base. Covers full / attention-only / MLP-only
-targeting, per-module alpha+rank patterns, bf16 output, and forced sharding.
+Llama / Qwen3 / Mistral / Gemma2 via the real merge: adapted == base + scale*(B@A),
+untargeted tensors byte-identical. Covers full / attn-only / mlp-only, per-module
+alpha+rank, bf16, and forced multi-shard.
 """
 
 from __future__ import annotations
@@ -55,8 +53,8 @@ def test_dense_merge_bf16(family, tmp_path):
 
 
 def test_dense_per_module_alpha_rank_pattern(tmp_path):
-    """Different alpha/rank per module: the merge must read scale per module, not
-    assume a single global lora_alpha/r."""
+    """Per-module alpha/rank: the merge must read scale per module, not a single
+    global lora_alpha/r."""
     _skip_if_missing("llama")
     H.run_case(
         "llama", "full", str(tmp_path),
@@ -67,6 +65,6 @@ def test_dense_per_module_alpha_rank_pattern(tmp_path):
 
 def test_dense_forced_multishard(tmp_path):
     """Tiny max_shard_size forces multiple shards + index, catching stale-shard /
-    index-mismatch bugs (one shard merged, another left as base)."""
+    index-mismatch bugs."""
     _skip_if_missing("llama")
     H.run_case("llama", "full", str(tmp_path), max_shard_size="40KB")

@@ -151,9 +151,8 @@ from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
 
-# Only flush the accelerator allocator after a merge that allocated a large tensor
-# (embed / lm_head / fused expert stacks). Per-tensor empty_cache()/synchronize()
-# over every key -- most of which never touch the GPU -- is a large wasted stall.
+# Flush the allocator only after a large-tensor merge (embed / lm_head / fused
+# experts); a per-key empty_cache/synchronize over every key is wasted GPU stall.
 _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 
 
@@ -559,8 +558,7 @@ def _merge_and_overwrite_lora(
     if counted_lora_modules is None:
         counted_lora_modules = set()   # fused lora keys counted toward n_saved_modules
 
-    # converted_lora_weights is built once below, after the real safetensor keys
-    # are known (the earlier empty-key conversion was discarded immediately).
+    # built once below, once the real safetensor keys are known.
     raw_pointer = None
     mm = None
     header_metadata = None
@@ -775,8 +773,7 @@ def _merge_and_overwrite_lora(
 
                 nbytes = W.numel() * W.element_size()
                 del W
-                # Only flush after a large tensor (embed / lm_head); the per-key
-                # flush over every small weight was pure GPU-driver stall.
+                # flush only after a large tensor; per-key flush was pure stall.
                 if nbytes >= _EMPTY_CACHE_BYTES_THRESHOLD:
                     device_empty_cache()
             pass
@@ -785,9 +782,8 @@ def _merge_and_overwrite_lora(
         mm.close()
         raw_pointer.close()
 
-        # Vocab grew, so resized tensors no longer fit their byte slots and the
-        # shard must be rewritten. Stream to a temp file (low RAM) when disk has
-        # room for the transient copy; otherwise rewrite in place (low disk).
+        # Vocab grew -> resized tensors no longer fit their byte slots; rewrite the
+        # shard. Stream to a temp file when disk allows, else rewrite in place.
         resized = getattr(_merge_and_overwrite_lora, "_resized", {})
         if resized:
             _merge_and_overwrite_lora._resized = {}
@@ -802,12 +798,9 @@ def _merge_and_overwrite_lora(
                 free_bytes = None
             margin = 64 * 1024 * 1024
             if free_bytes is not None and free_bytes < est_bytes + margin:
-                # Not enough room for the atomic temp-file rewrite. The in-place
-                # fallback overwrites the shard directly, which is non-atomic: an
-                # interrupted or failed write leaves the only output shard truncated
-                # (and on Windows the mmap section can stay locked). Refuse by default
-                # so a tight-disk save never silently corrupts the shard; let callers
-                # who accept the risk opt back in explicitly.
+                # No room for the atomic temp+replace rewrite. The in-place fallback
+                # overwrites the shard non-atomically (a failed write truncates it,
+                # worse on Windows mmap), so refuse by default; opt in to allow it.
                 if os.environ.get("UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE") != "1":
                     raise RuntimeError(
                         f"Unsloth: not enough free disk to rewrite resized shard "
@@ -3822,8 +3815,7 @@ pass
 
 
 def _estimate_resized_shard_bytes(header_metadata, resized, length_of_header):
-    # Size of the rewritten shard: resized tensors at their new byte count, the
-    # rest at their current slot, plus the header.
+    # Rewritten-shard size: resized tensors at new byte count, rest at current slot, + header.
     total = 0
     for k, entry in header_metadata.items():
         if k == "__metadata__":
@@ -3838,9 +3830,8 @@ def _estimate_resized_shard_bytes(header_metadata, resized, length_of_header):
 
 
 def _inplace_rewrite_resized_shard(filename_original, header_metadata, resized):
-    # Low-disk fallback for a resized shard: reload it, swap in the resized tensors,
-    # and save_file over the original (higher peak RAM, but no transient 2x-shard
-    # disk). Mirrors the pre-streaming behaviour for tight-disk / low-disk jobs.
+    # Low-disk fallback: reload the shard, swap in resized tensors, save_file over
+    # the original (higher RAM, no transient 2x-shard disk; non-atomic).
     meta = header_metadata.get("__metadata__", None)
     tensors = {}
     with safe_open(filename_original, framework = "pt", device = "cpu") as f:
@@ -3959,9 +3950,8 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
             return False
 
         # Zero-copy write into the mmap; avoids the bytes() copy that doubled peak
-        # RAM on large tensors (embed / lm_head). tensor_formatted is already
-        # contiguous CPU; reshape(-1) gives the 1D buffer the mmap slice needs
-        # (multi-dim memoryview assignment errors on some Pythons).
+        # RAM on large tensors. tensor_formatted is already contiguous CPU; reshape(-1)
+        # gives the 1D buffer the mmap slice needs (multi-dim assignment errors on some Pythons).
         tensor_view = tensor_formatted.detach().reshape(-1).view(torch.uint8)
         mm[index_L:index_R] = memoryview(tensor_view.numpy())
 

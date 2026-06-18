@@ -15,8 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """The resized-shard rewrite has two branches (streaming temp file vs low-disk
-in-place save_file). They must produce identical tensors, and both must preserve
-unchanged tensors byte-for-byte while swapping in the resized ones. CPU-only.
+in-place save_file): they must produce identical tensors and preserve unchanged
+tensors byte-for-byte while swapping in the resized ones. CPU-only.
 """
 
 from __future__ import annotations
@@ -84,9 +84,7 @@ def test_streaming_and_inplace_resized_rewrites_match(base_shard, tmp_path):
         assert sorted(a.keys()) == sorted(b.keys()) == sorted(original.keys())
         for key in original:
             ta, tb = a.get_tensor(key), b.get_tensor(key)
-            # Both branches agree with each other...
             assert torch.equal(ta, tb), f"branch mismatch for {key}"
-            # ...the resized tensor is the grown one, the rest are untouched.
             expected = grown if key == "model.embed_tokens.weight" else original[key]
             assert torch.equal(ta, expected), f"wrong content for {key}"
 

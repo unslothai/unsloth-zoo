@@ -16,21 +16,15 @@
 
 """End-to-end LoRA merge correctness for fused-3D MoE models.
 
-These models pack all experts into single 3D parameters (`experts.gate_up_proj`,
-`experts.down_proj`) and attach grouped LoRA via PEFT `target_parameters`. The
-merge must slice the grouped adapter per expert and apply the delta in the
-orientation that fits each expert weight (auto-detected from distinct dims, so a
-single shared transpose flag - the narrow-expert bug fixed in #779 - cannot pass
-by luck).
+These pack all experts into single 3D params (experts.gate_up_proj/down_proj) with
+grouped LoRA via PEFT target_parameters. The merge slices the adapter per expert and
+applies the delta in the orientation that fits each expert (auto-detected from
+distinct dims, so the #779 narrow-expert transpose bug cannot pass by luck).
 
-gpt_oss is the guaranteed fused representative: it runs on both transformers
-4.57.6 and 5.x, full and attention-only. The remaining worry-model fused arches
-(qwen3_5_moe = Qwen3.5-35B-A3B, gemma4 = gemma-4-26B-A4B, lfm2_moe = LFM2.5-8B-A1B)
-are transformers-5.x-only and have arch-specific tiny-instantiation quirks (strict
-per-layer validators, composite text+vision count semantics, MoE that only
-materialises at larger sizes). They are attempted here and SKIP cleanly when a
-tiny config cannot exercise the fused path; their full-scale fused merge is
-validated by the real-model sweep and the #779 real-geometry checks.
+gpt_oss runs on transformers 4.57.6 and 5.x. The 5.x-only worry arches (qwen3_5_moe
+= Qwen3.5-35B-A3B, gemma4 = gemma-4-26B-A4B, lfm2_moe = LFM2.5-8B-A1B) skip cleanly
+when a tiny config cannot exercise the fused path; their full-scale merge is covered
+by the real-model sweep + #779.
 """
 
 from __future__ import annotations
@@ -59,11 +53,11 @@ FUSED = [
     pytest.param("lfm2_moe", marks=_gated_mark("lfm2_moe")),
 ]
 
-# arch-specific tiny-config / orchestration issues we tolerate (skip) only for the
-# gated 5.x families; gpt_oss must never hit these.
+# tiny-config / orchestration errors tolerated (skip) only for gated 5.x families;
+# gpt_oss must never hit these.
 _TOLERATED = ("validate_layer_type", "does not match # of saved modules",
               "could not be instantiated", "is not supported",
-              "not found among base keys")  # composite/per-expert serialization at tiny scale
+              "not found among base keys")
 
 
 def _skip_or_raise(family, exc):

@@ -17,11 +17,9 @@
 """End-to-end LoRA merge correctness for the vocab-grow / resized rewrite path.
 
 Growing the tokenizer makes embed_tokens / lm_head larger than the base shard, so
-`_write_tensor_direct_torch` cannot overwrite in place and the merge falls back to
-the resized-shard rewrite (streaming on PR #777, or the disk-aware in-place
-variant). This test checks the rewritten embed/lm_head equal the model's resized
-weights, old rows are preserved, attention LoRA still merges, and everything else
-stays byte-identical.
+the merge falls back to the resized-shard rewrite (streaming, or the disk-aware
+in-place variant). Checks the rewritten embed/lm_head match the resized weights, old
+rows are preserved, attention LoRA still merges, everything else is byte-identical.
 """
 
 from __future__ import annotations
@@ -67,10 +65,8 @@ def _build_resized_case(tmp_path, *, dtype=torch.float32, force_inplace=False,
     adapted = H.extract_adapted(pm)  # q_proj / v_proj only
 
     if force_inplace:
-        # The streaming-vs-in-place choice is made purely from free disk vs the
-        # estimated shard size (low_disk_space_usage does NOT select it for a
-        # local-dir merge). Force the in-place branch by making the estimate
-        # enormous, and spy on both rewrite paths to prove which one ran.
+        # streaming-vs-in-place is chosen purely from free disk vs estimated shard
+        # size; force in-place via an enormous estimate and spy on both paths.
         import unsloth_zoo.saving_utils as SU
         real_inplace = SU._inplace_rewrite_resized_shard
         real_stream = SU._stream_rewrite_resized_shard_and_replace
@@ -88,8 +84,7 @@ def _build_resized_case(tmp_path, *, dtype=torch.float32, force_inplace=False,
         monkeypatch.setattr(SU, "_estimate_resized_shard_bytes", lambda *a, **k: 1 << 60)
         monkeypatch.setattr(SU, "_inplace_rewrite_resized_shard", _spy_inplace)
         monkeypatch.setattr(SU, "_stream_rewrite_resized_shard_and_replace", _spy_stream)
-        # The in-place rewrite is non-atomic, so it is refused by default; opt in
-        # explicitly to exercise it (the fail-closed default is covered separately).
+        # in-place is non-atomic -> refused by default; opt in to exercise it.
         if optin:
             monkeypatch.setenv("UNSLOTH_ALLOW_NON_ATOMIC_RESIZED_REWRITE", "1")
         else:
@@ -129,10 +124,8 @@ def test_resized_vocab_grow_modules_to_save(tmp_path):
 
 
 def test_resized_vocab_grow_low_disk_inplace(tmp_path, monkeypatch):
-    """With the non-atomic rewrite explicitly opted in, the in-place branch (not the
-    streaming default) runs and produces the same correct output. The branch is
-    selected only when free disk < estimated shard bytes, so the estimate is patched
-    enormous to trigger it; spies on both rewrite paths confirm which one ran."""
+    """In-place branch (opt-in) produces the same correct output as streaming.
+    Forced via an enormous shard-size estimate; spies confirm which path ran."""
     calls = {"inplace": 0, "stream": 0}
     res = _build_resized_case(tmp_path, force_inplace=True, optin=True,
                               monkeypatch=monkeypatch, calls=calls)
@@ -142,8 +135,8 @@ def test_resized_vocab_grow_low_disk_inplace(tmp_path, monkeypatch):
 
 
 def test_resized_vocab_grow_low_disk_fail_closed(tmp_path, monkeypatch):
-    """Without the opt-in, a low-disk resized rewrite must fail closed (raise, leaving
-    the shard untouched) rather than fall back to the non-atomic in-place rewrite."""
+    """Without the opt-in, a low-disk resized rewrite fails closed (raises, shard
+    untouched) instead of the non-atomic in-place rewrite."""
     calls = {"inplace": 0, "stream": 0}
     with pytest.raises(RuntimeError, match="not enough free disk"):
         _build_resized_case(tmp_path, force_inplace=True, optin=False,
