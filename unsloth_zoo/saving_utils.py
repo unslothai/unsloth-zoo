@@ -23,7 +23,7 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype
 from .hf_utils import dtype_from_config
-from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache, device_synchronize
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
@@ -802,11 +802,15 @@ def _merge_and_overwrite_lora(
                 free_bytes = None
             margin = 64 * 1024 * 1024
             if free_bytes is not None and free_bytes < est_bytes + margin:
-                if UNSLOTH_ENABLE_LOGGING:
-                    logger.info(
-                        f"Unsloth: low disk for resized rewrite of {filename_original}; "
-                        f"saving in place (free={free_bytes}, need~={est_bytes})"
-                    )
+                # Not enough room for the atomic temp-file rewrite, so overwrite the
+                # shard in place. This is non-atomic: an interrupted save leaves the
+                # shard truncated. Warn unconditionally so the risk is visible.
+                logger.warning(
+                    f"Unsloth: low disk to rewrite resized shard {filename_original} "
+                    f"(free={free_bytes}, need~={est_bytes}); rewriting in place. "
+                    f"This is non-atomic, so do not interrupt the save. Free "
+                    f"~{est_bytes + margin} bytes to get the safe atomic rewrite."
+                )
                 _inplace_rewrite_resized_shard(filename_original, header_metadata, resized)
             else:
                 _stream_rewrite_resized_shard_and_replace(

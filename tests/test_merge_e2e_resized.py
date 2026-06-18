@@ -36,7 +36,8 @@ import _merge_e2e_helpers as H
 NEW_VOCAB = 80  # base vocab is 64 (H._VOCAB)
 
 
-def _build_resized_case(tmp_path, *, dtype=torch.float32, low_disk=False):
+def _build_resized_case(tmp_path, *, dtype=torch.float32, force_inplace=False,
+                        monkeypatch=None, calls=None):
     from transformers import AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
@@ -65,7 +66,30 @@ def _build_resized_case(tmp_path, *, dtype=torch.float32, low_disk=False):
     ref_head = pm.get_output_embeddings().weight.detach().cpu().clone().to(dtype)
     adapted = H.extract_adapted(pm)  # q_proj / v_proj only
 
-    H.run_merge(pm, base_dir, out_dir, save_dtype=dtype, low_disk_space_usage=low_disk)
+    if force_inplace:
+        # The streaming-vs-in-place choice is made purely from free disk vs the
+        # estimated shard size (low_disk_space_usage does NOT select it for a
+        # local-dir merge). Force the in-place branch by making the estimate
+        # enormous, and spy on both rewrite paths to prove which one ran.
+        import unsloth_zoo.saving_utils as SU
+        real_inplace = SU._inplace_rewrite_resized_shard
+        real_stream = SU._stream_rewrite_resized_shard_and_replace
+
+        def _spy_inplace(*a, **k):
+            if calls is not None:
+                calls["inplace"] = calls.get("inplace", 0) + 1
+            return real_inplace(*a, **k)
+
+        def _spy_stream(*a, **k):
+            if calls is not None:
+                calls["stream"] = calls.get("stream", 0) + 1
+            return real_stream(*a, **k)
+
+        monkeypatch.setattr(SU, "_estimate_resized_shard_bytes", lambda *a, **k: 1 << 60)
+        monkeypatch.setattr(SU, "_inplace_rewrite_resized_shard", _spy_inplace)
+        monkeypatch.setattr(SU, "_stream_rewrite_resized_shard_and_replace", _spy_stream)
+
+    H.run_merge(pm, base_dir, out_dir, save_dtype=dtype)
     merged = H.read_safetensors_dir(out_dir)
     return base, merged, ref_embed, ref_head, adapted, dtype
 
@@ -98,6 +122,14 @@ def test_resized_vocab_grow_modules_to_save(tmp_path):
     _check(*_build_resized_case(tmp_path))
 
 
-def test_resized_vocab_grow_low_disk_fallback(tmp_path):
-    """Same correctness when the disk-aware in-place fallback is requested."""
-    _check(*_build_resized_case(tmp_path, low_disk=True))
+def test_resized_vocab_grow_low_disk_inplace(tmp_path, monkeypatch):
+    """Force the disk-aware in-place rewrite branch (not the streaming default) and
+    prove it produces the same correct output. The branch is selected only when free
+    disk < estimated shard bytes, so the estimate is patched enormous to trigger it;
+    spies on both rewrite paths confirm the in-place branch actually ran."""
+    calls = {"inplace": 0, "stream": 0}
+    res = _build_resized_case(tmp_path, force_inplace=True, monkeypatch=monkeypatch,
+                              calls=calls)
+    assert calls["inplace"] >= 1, "in-place resized rewrite branch was not exercised"
+    assert calls["stream"] == 0, "streaming branch ran despite forced low disk"
+    _check(*res)
