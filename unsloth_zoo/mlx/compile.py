@@ -44,10 +44,26 @@ _PATCHED_ARCHES: set[str] = set()
 _PATCHED_PATTERN_BUNDLES: set[str] = set()
 _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 
-# Architectures explicitly verified for mlx compile support. qwen2_5_vl is
-# real end-to-end; others are compiled synthetic forward+backward. SmolVLM is
-# kept patched but unqualified: real mlx-vlm training still hits MLX
-# primitive-less-array failures after a compiled call.
+# Controls whether the Qwen3-VL vision-block norm patch casts the fp32
+# norm output back to the activation dtype. Mirrors MLXTrainingConfig
+# `cast_norm_output_to_input_dtype`. Flipped by the trainer's
+# `_set_norm_output_cast_to_input_dtype` so the generic and Qwen3-VL
+# paths agree.
+_QWEN3_VISION_NORM_CAST_OUTPUT = True
+
+
+def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
+    global _QWEN3_VISION_NORM_CAST_OUTPUT
+    _QWEN3_VISION_NORM_CAST_OUTPUT = bool(enabled)
+
+# Architectures explicitly verified for mlx compile support.
+# Training verification currently covers:
+# - qwen2_5_vl: real end-to-end compiled training via train.py
+# - gemma3 / qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
+#   compiled synthetic forward+backward
+# SmolVLM has processor/template support, but real mlx-vlm training still hits
+# MLX primitive-less-array failures after a compiled call. Keep it patched but
+# unqualified until a real dataset compile run passes.
 _VERIFIED_TRAINING_ARCHES: set[str] = {
     "aya_vision",
     "deepseekocr",
@@ -88,6 +104,7 @@ _MODEL_REPO_TRAINING_COMPILE_BLOCKLIST: tuple[tuple[str, str], ...] = (
         "SmolVLM/Idefics3 real training currently leaves MLX primitive-less arrays after compiled execution",
     ),
 )
+
 
 _BACKEND_CONFIG_KEYS = (
     "text_config",
@@ -2021,7 +2038,6 @@ def _masked_scatter_no_numpy(final_embedding, image_mask_expanded, scaled_image_
     import mlx.core as mx
 
     final_shape = final_embedding.shape
-    hidden_dim = final_shape[-1]
     flat_mask = image_mask_expanded.reshape((-1,))
     flat_output = final_embedding.reshape((-1,))
     flat_features = scaled_image_features.reshape((-1,))
@@ -2355,7 +2371,6 @@ def _install_qwen2_5_compile_patches():
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -2489,7 +2504,6 @@ def _install_qwen2_compile_patches():
         return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
 
     def patched_qwen2_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.patch_embed(hidden_states)
@@ -2509,7 +2523,6 @@ def _install_qwen2_compile_patches():
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
-        mask = kwargs.get("mask", None)
         explicit_position_ids = kwargs.get("position_ids", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
@@ -2593,8 +2606,8 @@ def _install_qwen3_family_compile_patches():
         )
         q, k, v = mx.split(qkv, 3)
 
-        q = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
-        k = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q = _qwen3_vision_rotary_fp32(q, rotary_pos_emb)
+        k = _qwen3_vision_rotary_fp32(k, rotary_pos_emb)
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -2605,13 +2618,85 @@ def _install_qwen3_family_compile_patches():
 
         attn_outputs = []
         for q_chunk, k_chunk, v_chunk in zip(*splits):
+            # MLX fused SDPA mismatches value_and_grad for Qwen3-VL vision; use explicit.
+            scores = (
+                q_chunk.astype(mx.float32)
+                @ mx.swapaxes(k_chunk.astype(mx.float32), -1, -2)
+            ) * self.scale
+            probs = mx.softmax(scores, axis=-1).astype(q_chunk.dtype)
             attn_outputs.append(
-                vision_module.ensure_fused_sdpa(q_chunk, k_chunk, v_chunk, self.scale)
+                probs @ v_chunk
             )
 
         output = mx.concatenate(attn_outputs, axis=2)
         output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
         return self.proj(output)
+
+    def _qwen3_vision_rotary_fp32(tensor, freqs):
+        """Match Transformers Qwen3-VL rotary: fp32 math, cast back."""
+        import mlx.core as mx
+
+        orig_dtype = tensor.dtype
+        tensor_f = tensor.astype(mx.float32)
+        freqs_f = freqs.astype(mx.float32)
+        cos = mx.cos(freqs_f)
+        sin = mx.sin(freqs_f)
+
+        cos = mx.expand_dims(cos, axis=1)
+        cos = mx.tile(cos, (1, 1, 2))
+        sin = mx.expand_dims(sin, axis=1)
+        sin = mx.tile(sin, (1, 1, 2))
+
+        rotated = (tensor_f * cos) + (vision_module.rotate_half(tensor_f) * sin)
+        return rotated.astype(orig_dtype)
+
+    def _qwen3_torch_like_layer_norm(norm, x):
+        """Match PyTorch bf16 LayerNorm: fp32 stats/affine, cast result back.
+
+        Honors the module-level `_QWEN3_VISION_NORM_CAST_OUTPUT` flag (set
+        from MLXTrainingConfig.cast_norm_output_to_input_dtype); when
+        disabled the fp32 result is returned without recasting.
+        """
+        import mlx.core as mx
+
+        source_dtype = x.dtype
+        x_f = x.astype(mx.float32)
+        mean = mx.mean(x_f, axis=-1, keepdims=True)
+        centered = x_f - mean
+        var = mx.mean(centered * centered, axis=-1, keepdims=True)
+        y = centered * mx.rsqrt(var + norm.eps)
+        weight = getattr(norm, "weight", None)
+        if weight is not None:
+            y = y * weight.astype(mx.float32)
+        bias = getattr(norm, "bias", None)
+        if bias is not None:
+            y = y + bias.astype(mx.float32)
+        if _QWEN3_VISION_NORM_CAST_OUTPUT:
+            return y.astype(source_dtype)
+        return y
+
+    def patched_qwen3_vision_block_call(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        import mlx.core as mx
+        residual_dtype = hidden_states.dtype
+        attn_output = self.attn(
+            _qwen3_torch_like_layer_norm(self.norm1, hidden_states),
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        )
+        hidden_states = (hidden_states + attn_output.astype(residual_dtype)).astype(residual_dtype)
+        # Vision MLP linear_fc1 (up-projection) overflows fp16: its output magnitude
+        # exceeds 65504 for some inputs, so downcasting to fp16 saturates to inf and
+        # cascades to NaN in the backward. Keep the MLP path in fp32 when activation
+        # dtype is fp16; only cast back at the residual add. bf16/fp32 have enough
+        # range to avoid the saturation, so they keep the original (cheaper) path.
+        # This affects M1/M2 Macs (no native bf16 -> MLX defaults to fp16).
+        mlp_norm_out = _qwen3_torch_like_layer_norm(self.norm2, hidden_states)
+        if residual_dtype == mx.float16:
+            mlp_output = self.mlp(mlp_norm_out.astype(mx.float32))
+        else:
+            mlp_output = self.mlp(mlp_norm_out)
+        hidden_states = (hidden_states + mlp_output.astype(residual_dtype)).astype(residual_dtype)
+        return hidden_states
 
     def patched_qwen3_rot_pos_emb(self, grid_thw):
         import mlx.core as mx
@@ -2726,7 +2811,6 @@ def _install_qwen3_family_compile_patches():
         return mx.concatenate(patch_pos_embeds_permute)
 
     def patched_qwen3_vision_call(self, hidden_states, grid_thw, **kwargs):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.patch_embed(hidden_states)
@@ -2849,6 +2933,7 @@ def _install_qwen3_family_compile_patches():
     _patch_staticmethod(module.Model, "merge_input_ids_with_image_features", merge_qwen3)
     _patch_staticmethod(qwen35_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
     _patch_method(vision_module.Attention, "__call__", patched_qwen3_attention)
+    _patch_method(vision_module.Qwen3VLMoEVisionBlock, "__call__", patched_qwen3_vision_block_call)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
@@ -2859,6 +2944,7 @@ def _install_qwen3_family_compile_patches():
         qwen3moe_module.masked_scatter = _masked_scatter_no_numpy
         _patch_staticmethod(qwen3moe_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
         _patch_method(qwen3moe_vision_module.Attention, "__call__", patched_qwen3_attention)
+        _patch_method(qwen3moe_vision_module.Qwen3VLMoEVisionBlock, "__call__", patched_qwen3_vision_block_call)
         _patch_method(qwen3moe_vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
         _patch_method(qwen3moe_vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
         _patch_method(qwen3moe_vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
@@ -2951,7 +3037,6 @@ def _install_glm_ocr_compile_patches():
         return (mx.cos(emb), mx.sin(emb)), pos_ids
 
     def patched_glm_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.patch_embed(hidden_states)
@@ -3162,7 +3247,6 @@ def _install_paddleocr_vl_compile_patches():
         return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
 
     def patched_paddle_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
-        import mlx.core as mx
 
         grid_spec = _grid_to_tuple(grid_thw)
         hidden_states = self.embeddings(hidden_states, grid_spec)

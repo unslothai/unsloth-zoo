@@ -184,6 +184,40 @@ def _resolve_local_convert_script():
     )
 
 
+def _resolve_bundle_convert_script():
+    """Fallback when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is unset: a prebuilt llama.cpp
+    bundle ships convert_hf_to_gguf.py alongside its own conversion/ package, so
+    the two are co-versioned. Downloading the latest entrypoint instead runs it
+    against the bundle's older conversion/ModelBase and crashes (e.g. unexpected
+    target_model_dir kwarg). Prefer the bundle's converter when, and only when,
+    that paired conversion/ package is present. We require both __init__.py and
+    base.py, the same signal _detect_converter_layout uses, so selection and
+    layout detection never disagree. Returns (path, mtime_ns, size) or None
+    (monolith installs / trees without a paired conversion/ fall through)."""
+    bundle_dir = LLAMA_CPP_DEFAULT_DIR
+    if not bundle_dir or not os.path.isdir(bundle_dir):
+        return None
+    conversion_dir = os.path.join(bundle_dir, "conversion")
+    if not (os.path.isfile(os.path.join(conversion_dir, "__init__.py")) and
+            os.path.isfile(os.path.join(conversion_dir, "base.py"))):
+        return None
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
+        candidate = os.path.join(bundle_dir, name)
+        try:
+            if not os.path.isfile(candidate):
+                continue
+            stat = os.stat(candidate)
+        except OSError:
+            continue
+        logger.info(
+            f"Unsloth: Using bundle convert_hf_to_gguf.py from {candidate} "
+            f"(co-versioned with its conversion/ package)"
+        )
+        return (candidate, stat.st_mtime_ns, stat.st_size)
+    return None
+pass
+
+
 @contextlib.contextmanager
 def use_local_gguf():
     """Context manager to temporarily use llama.cpp's local gguf-py"""
@@ -1495,6 +1529,8 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # converter being patched (matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points
     # at a different checkout), not always LLAMA_CPP_DEFAULT_DIR.
     local_script_info = _resolve_local_convert_script()
+    if local_script_info is None:
+        local_script_info = _resolve_bundle_convert_script()
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
     _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))

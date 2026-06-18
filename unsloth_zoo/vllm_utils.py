@@ -324,9 +324,15 @@ if importlib.util.find_spec("vllm") is not None:
     pass
 
     def patch_vllm_lora_tokenizer():
-        import vllm.transformers_utils.tokenizer
-        vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
-        vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
+        # All Unsloth Zoo code licensed under LGPLv3
+        # vLLM >= 0.22 (PR #35024) removed this module; LoRA now reuses the base
+        # tokenizer, so guard the import like the tokenizer_group ones below.
+        try:
+            import vllm.transformers_utils.tokenizer
+            vllm.transformers_utils.tokenizer.get_lora_tokenizer = _return_nothing
+            vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = _return_nothing
+        except ImportError:
+            pass
 
         try:
             import vllm.transformers_utils.tokenizer_group.tokenizer_group
@@ -667,6 +673,49 @@ def patch_vllm_enable_sleep_mode():
 pass
 
 
+def patch_vllm_reset_caches_on_sleep():
+    # Vision GRPO + standby crashes: the multimodal (P0 sender / P1 receiver)
+    # and encoder caches hold GPU-backed tensors whose memory sleep() unmaps,
+    # so the next access faults (cudaErrorIllegalAddress at empty_cache) or the
+    # caches desync ("Expected a cached item for mm_hash=..."). Clear them before
+    # each sleep, while their CUDA memory is still mapped, keeping P0/P1 in sync.
+    # No-op and cheap for text models (caches absent / null-guarded). Wrap every
+    # engine class load_vllm can return so use_async / use_engine don't bypass it.
+    import functools
+    _warned = set()
+
+    def _reset_caches(obj):
+        # reset_encoder_cache lives on llm_engine for LLM, on the engine itself otherwise.
+        for owner, name in ((obj, "reset_mm_cache"),
+                            (getattr(obj, "llm_engine", obj), "reset_encoder_cache")):
+            fn = getattr(owner, name, None)
+            if fn is None: continue
+            try: fn()
+            except Exception as e:
+                # A reset that exists but throws can leave caches desynced; warn once.
+                if name not in _warned:
+                    _warned.add(name)
+                    logger.warning(f"Unsloth: {name} pre-sleep failed (continuing): {e}")
+
+    def _wrap_sleep(cls):
+        if cls is None or getattr(cls, "_unsloth_reset_caches_on_sleep", False): return
+        _orig_sleep = getattr(cls, "sleep", None)
+        if _orig_sleep is None: return
+        @functools.wraps(_orig_sleep)
+        def new_sleep(self, *args, **kwargs):
+            _reset_caches(self)
+            gc.collect()
+            return _orig_sleep(self, *args, **kwargs)
+        cls.sleep = new_sleep
+        cls._unsloth_reset_caches_on_sleep = True
+
+    for cls in (getattr(vllm, "LLM", None), getattr(vllm, "LLMEngine", None),
+                getattr(vllm, "AsyncLLMEngine", None)):
+        _wrap_sleep(cls)
+    logger.info("Unsloth: patched vLLM sleep to reset multimodal/encoder caches.")
+pass
+
+
 def patch_vllm_graph_capture():
     """Temporarily disable gc.collect to speed up CUDA graph capture with torch.compile."""
     from contextlib import contextmanager
@@ -755,7 +804,9 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
-    if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
+    # Match load_vllm's standby check (!= "0") so any truthy value also installs
+    # the sleep + cache-reset patches, not just "1".
+    if os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0":
         if Version("0.10.0") <= Version(vllm_version) < Version("0.11.0"):
             raise RuntimeError(
                 "Unsloth: vLLM 0.10.x crashes with std::bad_alloc when standby mode is "
@@ -770,6 +821,7 @@ def patch_vllm(debug = True):
             )
         logger.info(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
+        patch_vllm_reset_caches_on_sleep()
     patch_vllm_graph_capture()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
@@ -1799,6 +1851,21 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
+    # vLLM standby (sleep mode) corrupts the CuMemAllocator sleep/wake cycle for
+    # multimodal models (cudaErrorIllegalAddress at empty_cache on the first
+    # sleep), regardless of VRAM headroom. Text models are unaffected. Disable
+    # standby for vision models; override with UNSLOTH_VLLM_STANDBY_VISION=1.
+    # Fall back to the config so the gate still fires if the caller forgot is_vision_model.
+    _gate_vision = is_vision_model or hasattr(config, "vision_config")
+    if unsloth_vllm_standby and _gate_vision and \
+        os.getenv("UNSLOTH_VLLM_STANDBY_VISION", "0") == "0":
+        logger.warning(
+            "Unsloth: vLLM standby (sleep mode) is unstable for multimodal models; "
+            "disabling it for this vision run. Set UNSLOTH_VLLM_STANDBY_VISION=1 to force."
+        )
+        unsloth_vllm_standby = False
+        # Propagate so env-keyed consumers (patch_vllm, the GRPO sleep-mode arg) agree.
+        os.environ["UNSLOTH_VLLM_STANDBY"] = "0"
     # This would give the flexibility to override the util we set for standby mode. In some extreme cases, this can be helpful.
     standby_util_override = os.getenv("UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE", "0") != "0"
 
@@ -2147,6 +2214,27 @@ def load_vllm(
 
     # Get device as well
     device = get_target_device()
+
+    # vLLM >= 0.19.0 ships a piecewise graph-partition pass (`_decompose_size_nodes`,
+    # vllm-project/vllm#36038) that crashes on Unsloth's LoRA graph under
+    # compilation_config=3: "Tried to erase Node size_N but it still had N users".
+    # Still unpatched as of vLLM 0.23. compilation_config=2 skips piecewise splitting and
+    # is unaffected, so step 3 -> 2 while the installed vLLM ships the broken pass. Detect
+    # by the pass itself (not a version number) so this self-heals once vLLM fixes it.
+    # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 regardless.
+    if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
+        try:
+            import vllm.compilation.backends as _vllm_backends
+            broken_piecewise = hasattr(_vllm_backends, "_decompose_size_nodes")
+        except Exception:
+            broken_piecewise = False
+        if broken_piecewise:
+            print(
+                "Unsloth: This vLLM's piecewise compile is incompatible with LoRA "
+                "(compilation_config=3); using compilation_config=2 instead. "
+                "Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to override."
+            )
+            compilation_config = 2
 
     if compilation_config == 3:
         try:

@@ -442,3 +442,36 @@ def test_compiled_quantized_runtime_cce_preserves_aux_lse_for_gradients():
 
     assert compiled_loss.item() == pytest.approx(eager_loss.item(), rel=1e-5)
     assert compiled_norm.item() == pytest.approx(eager_norm.item(), rel=1e-4)
+
+
+def test_quantized_runtime_cce_rejects_missing_affine_biases():
+    _skip_torch_shim()
+    import mlx.nn as nn
+
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    linear = nn.Linear(32, 128, bias=False)
+    linear.weight = (
+        mx.arange(128 * 32, dtype=mx.float32).reshape(128, 32) / 113.0
+    ) - 1.0
+    qlinear = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=4)
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100,
+        chunk_size=32,
+        quantized=True,
+        group_size=qlinear.group_size,
+        bits=qlinear.bits,
+    )
+    hidden = (mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 97.0) - 1.0
+    targets = (mx.arange(64, dtype=mx.int32) * 7) % 128
+    ntoks = mx.maximum(
+        mx.sum((targets != -100).astype(mx.float32)),
+        mx.array(1.0, dtype=mx.float32),
+    )
+
+    def loss_fn(hh):
+        losses = runtime_cce(hh, qlinear.weight, qlinear.scales, None, targets)
+        return losses.astype(mx.float32).sum() / ntoks
+
+    with pytest.raises(ValueError, match="Biases must be provided for affine"):
+        mx.eval(loss_fn(hidden))

@@ -411,13 +411,13 @@ def test_sft_prepare_dataset_removes_original_columns_in_non_packing_path():
 
 
 def test_saving_utils_uses_atomic_replace_for_shard_rewrite():
-    """PR #595: _merge_and_overwrite_lora uses atomic os.replace
+    """PR #595: _stream_rewrite_resized_shard_and_replace uses atomic os.replace
     (not remove+move; Windows WinError 1224 on shard rewrite)."""
     src = _get_source(
-        "unsloth_zoo.saving_utils", "_merge_and_overwrite_lora",
+        "unsloth_zoo.saving_utils", "_stream_rewrite_resized_shard_and_replace",
     )
     assert "os.replace(" in src, (
-        "_merge_and_overwrite_lora no longer uses os.replace -- "
+        "_stream_rewrite_resized_shard_and_replace no longer uses os.replace -- "
         "regression of PR #595 (Windows WinError 1224 on shard rewrite)."
     )
     if "shutil.move(" in src and "os.remove(" in src:

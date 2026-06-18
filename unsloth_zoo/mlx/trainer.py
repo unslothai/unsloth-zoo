@@ -46,7 +46,7 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
@@ -58,11 +58,14 @@ from .utils import (
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
     create_batches,
+    create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
+    encode_mlx_text,
+    _get_vlm_ignore_token_ids,
     collect_mlx_texts,
     save_lora_adapters,
     save_trainable_adapters,
@@ -80,11 +83,66 @@ from .compile import (
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
-    get_model_architecture,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
 )
+
+
+def _is_hf_tokenizer(tokenizer):
+    """Check whether a wrapper has already resolved to an HF tokenizer."""
+    try:
+        from transformers import PreTrainedTokenizerBase
+    except Exception:
+        return False
+    return isinstance(tokenizer, PreTrainedTokenizerBase)
+
+
+def _resolve_response_mask_tokenizer(tokenizer):
+    """Return a callable HF tokenizer for the CUDA response-mask helper."""
+    for _ in range(3):
+        if _is_hf_tokenizer(tokenizer):
+            return tokenizer
+
+        processor_tokenizer = getattr(tokenizer, "tokenizer", None)
+        if processor_tokenizer is not None and processor_tokenizer is not tokenizer:
+            tokenizer = processor_tokenizer
+            continue
+
+        # mlx-lm TokenizerWrapper stores the HF tokenizer under _tokenizer.
+        # HF fast tokenizers also expose _tokenizer, but that is the low-level
+        # Rust tokenizer and is not callable like PreTrainedTokenizerBase.
+        wrapped = getattr(tokenizer, "_tokenizer", None)
+        if (
+            wrapped is not None
+            and wrapped is not tokenizer
+            and (
+                not hasattr(tokenizer, "convert_tokens_to_ids")
+                or callable(wrapped)
+            )
+        ):
+            tokenizer = wrapped
+            continue
+
+        break
+
+    if not callable(tokenizer):
+        raise TypeError(
+            "Unsloth MLX: train_on_responses_only requires a callable "
+            "Hugging Face tokenizer or a processor/tokenizer wrapper that "
+            "contains one."
+        )
+    return tokenizer
+
+
+def _text_completion_only_loss_arg(args):
+    """Resolve SFT-compatible completion-only loss defaults."""
+    value = getattr(args, "completion_only_loss", None)
+    if value is not None:
+        return value
+    if bool(getattr(args, "train_on_completions", False)):
+        return True
+    return None
 
 
 def _normalize_mlx_optimizer_name(name):
@@ -98,6 +156,186 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+_NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
+_NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
+
+
+def _part_is_norm(part: str) -> bool:
+    # "norm" matches RMSNorm/LayerNorm/input_layernorm; ln_* covers GPT-2/GPT-OSS.
+    return "norm" in part or part.startswith("ln_") or part == "ln_f"
+
+
+def _is_norm_parameter_path(path) -> bool:
+    parts = str(path).lower().split(".")
+    return any(_part_is_norm(part) for part in parts[:-1])
+
+
+def _is_norm_module_path(path) -> bool:
+    return any(_part_is_norm(part) for part in str(path).lower().split("."))
+
+
+def _has_norm_selected_floating_parameter(module_path, module) -> bool:
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    module_path_selected = _is_norm_module_path(module_path)
+    try:
+        for parameter_path, value in tree_flatten(parameters):
+            if (
+                hasattr(value, "dtype")
+                and mx.issubdtype(value.dtype, mx.floating)
+                and (
+                    module_path_selected
+                    or _is_norm_parameter_path(parameter_path)
+                )
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_floating_parameter(module) -> bool:
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    try:
+        for _, value in tree_flatten(parameters):
+            if hasattr(value, "dtype") and mx.issubdtype(value.dtype, mx.floating):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_parameterized_non_norm_children(module) -> bool:
+    try:
+        children = module.children()
+    except Exception:
+        return False
+
+    try:
+        for _, child in tree_flatten(children, is_leaf=nn.Module.is_module):
+            if (
+                isinstance(child, nn.Module)
+                and "norm" not in type(child).__name__.lower()
+                and _has_floating_parameter(child)
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _norm_output_cast_input_dtype(args, kwargs):
+    for value in args:
+        if hasattr(value, "dtype"):
+            return value.dtype
+    for value in kwargs.values():
+        if hasattr(value, "dtype"):
+            return value.dtype
+    return None
+
+
+def _is_norm_output_cast_candidate(module_path, module) -> bool:
+    """Return whether a custom module itself produces norm-like output."""
+    norm_cls = type(module)
+    if norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
+        return True
+    if "norm" not in norm_cls.__name__.lower():
+        return False
+    if _has_parameterized_non_norm_children(module):
+        return False
+    if not _has_norm_selected_floating_parameter(module_path, module):
+        return False
+    return True
+
+
+def _iter_norm_output_cast_classes(model=None):
+    norm_classes = []
+    seen = set()
+
+    for norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
+        norm_classes.append(norm_cls)
+        seen.add(norm_cls)
+
+    if model is not None:
+        try:
+            named_modules = model.named_modules()
+        except Exception:
+            named_modules = ()
+        for module_path, module in named_modules:
+            if _is_norm_output_cast_candidate(module_path, module):
+                norm_cls = type(module)
+                if norm_cls not in seen:
+                    norm_classes.append(norm_cls)
+                    seen.add(norm_cls)
+
+    return tuple(norm_classes)
+
+
+def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
+    """Control whether norm outputs are cast back to activation dtype.
+
+    Norm parameters can stay in fp32 for stability, but letting fp32 norm
+    outputs flow through the rest of the graph promotes downstream
+    intermediates and materially increases LoRA/QLoRA memory. Casting the
+    result back matches PyTorch autocast behavior more closely: fp32 norm math,
+    bf16/fp16 downstream activations.
+    """
+    # Sync Qwen3-VL vision-block patch with generic patcher (lazy import: cycle).
+    try:
+        from . import compile as _mlx_compile
+        _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
+    except Exception:
+        pass
+
+    norm_classes = list(_iter_norm_output_cast_classes(model))
+    if not enabled:
+        norm_classes.extend(
+            norm_cls for norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
+            if norm_cls not in norm_classes
+        )
+
+    for norm_cls in norm_classes:
+        patched = norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
+        if enabled:
+            original_call = norm_cls.__call__
+            if (
+                patched
+                or getattr(original_call, "_unsloth_norm_output_cast_wrapper", False)
+            ):
+                continue
+
+            def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):
+                input_dtype = _norm_output_cast_input_dtype(args, kwargs)
+                out = _original_call(self, *args, **kwargs)
+                if (
+                    input_dtype is not None
+                    and hasattr(out, "dtype")
+                    and out.dtype != input_dtype
+                ):
+                    return out.astype(input_dtype)
+                return out
+
+            norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
+            norm_cls._unsloth_original_call = original_call
+            norm_cls.__call__ = norm_call_cast_output
+            norm_cls._unsloth_cast_output_to_input_dtype = True
+            _NORM_OUTPUT_CAST_PATCHED_CLASSES.add(norm_cls)
+        elif patched:
+            original_call = getattr(norm_cls, "_unsloth_original_call", None)
+            if original_call is not None:
+                norm_cls.__call__ = original_call
+            norm_cls._unsloth_original_call = None
+            norm_cls._unsloth_cast_output_to_input_dtype = False
+            _NORM_OUTPUT_CAST_PATCHED_CLASSES.discard(norm_cls)
+
+
 def _normalize_mlx_scheduler_type(name):
     sched_type = str(name or "linear").strip().lower()
     if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
@@ -107,6 +345,114 @@ def _normalize_mlx_scheduler_type(name):
             f"Supported schedulers: {supported}."
         )
     return sched_type
+
+
+def _resolve_mlx_grad_clipping(args):
+    """Resolve mutually exclusive MLX clipping knobs.
+
+    Returns ``(max_grad_norm, max_grad_value, max_grad_leaf_norm, mode)``.
+    ``max_grad_value`` keeps elementwise clamp semantics. ``max_grad_leaf_norm``
+    is the cheap proportional alternative: cap each gradient leaf's L2 norm
+    without a cross-tree global reduction.
+    """
+    max_grad_norm = float(getattr(args, "max_grad_norm", 0.0) or 0.0)
+    raw_value = getattr(args, "max_grad_value", None)
+    raw_leaf = getattr(args, "max_grad_leaf_norm", None)
+    user_set_value = raw_value is not None
+    user_set_leaf = raw_leaf is not None
+
+    max_grad_value = float(raw_value or 0.0) if user_set_value else 0.0
+    max_grad_leaf_norm = float(raw_leaf or 0.0) if user_set_leaf else 0.0
+
+    if max_grad_value > 0:
+        # Preserve the public meaning of max_grad_value as elementwise clamp.
+        return 0.0, max_grad_value, 0.0, "value"
+
+    if max_grad_leaf_norm > 0:
+        return 0.0, 0.0, max_grad_leaf_norm, "leaf_norm"
+
+    if max_grad_norm > 0:
+        return max_grad_norm, 0.0, 0.0, "global_norm"
+
+    if user_set_value or user_set_leaf:
+        # Explicit 0.0 disables cheap clipping.
+        return 0.0, 0.0, 0.0, "none"
+
+    # MLX default: cheap proportional clipping without global norm memory cost.
+    return 0.0, 0.0, 1.0, "leaf_norm"
+
+
+def _clip_grad_by_value(grad, max_grad_value):
+    """Elementwise clamp; preserves the historical max_grad_value contract."""
+    return tree_map(lambda g: mx.clip(g, -max_grad_value, max_grad_value), grad)
+
+
+def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
+    """Scale each gradient leaf to a max L2 norm, preserving leaf direction."""
+    def _clip_leaf_norm(g):
+        g_f = g.astype(mx.float32)
+        norm = mx.sqrt(mx.sum(g_f * g_f))
+        scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), 1.0)
+        return g * scale.astype(g.dtype)
+
+    return tree_map(_clip_leaf_norm, grad)
+
+
+def _clip_grad_norm_fp32(grad, max_norm):
+    """Global norm clipping with a float32 norm reduction.
+
+    ``mlx.optimizers.clip_grad_norm`` reduces each leaf in its storage dtype.
+    For bf16/fp16 VLMs, that can move the global scale away from PyTorch/HF,
+    which computes the clipping norm in fp32. Keep clipped leaves in their
+    original dtype, but compute the single global scale in fp32.
+    """
+    norm_squared = tree_reduce(
+        lambda acc, g: acc + mx.sum(mx.square(g.astype(mx.float32))),
+        grad,
+        mx.array(0.0, dtype=mx.float32),
+    )
+    total_norm = mx.sqrt(norm_squared)
+    scale = mx.minimum(
+        mx.array(max_norm, dtype=mx.float32) / (
+            total_norm + mx.array(1e-6, dtype=mx.float32)
+        ),
+        mx.array(1.0, dtype=mx.float32),
+    )
+    return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
+
+
+def _prune_stale_checkpoints(output_dir, save_total_limit):
+    """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
+
+    ``-1`` / ``0`` / ``None`` preserve the existing "no limit" contract.
+    """
+    if not save_total_limit or save_total_limit < 1:
+        return
+    import shutil
+    from pathlib import Path
+
+    checkpoints = []
+    for child in Path(output_dir).glob("checkpoint-*"):
+        # Only prune real step-checkpoint dirs the trainer created; never
+        # follow symlinks or touch user paths that share the prefix.
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            step = int(child.name.removeprefix("checkpoint-"))
+        except ValueError:
+            continue
+        checkpoints.append((step, child))
+    if len(checkpoints) <= save_total_limit:
+        return
+    checkpoints.sort()
+    for _, stale in checkpoints[:-save_total_limit]:
+        try:
+            shutil.rmtree(stale)
+        except Exception as exc:
+            print(f"  Unsloth: failed to prune old checkpoint {stale}: {exc}")
+            continue
+        print(f"  Unsloth: pruned old checkpoint {stale} "
+              f"(save_total_limit={save_total_limit})")
 
 
 @dataclass
@@ -125,11 +471,24 @@ class MLXTrainingConfig:
     # Optimization
     optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.001
-    max_grad_norm: float = 0.0  # disabled by default on MLX to avoid clip-memory overhead
-    # Elementwise clip ([-max_grad_value, max_grad_value], per-leaf). None
-    # defaults to 1.0 unless max_grad_norm > 0 (global-norm wins); 0.0
-    # disables; a positive float opts in and overrides max_grad_norm.
+    adam_beta1: float | None = None
+    adam_beta2: float | None = None
+    # Global L2 norm clip (transformers/CUDA max_grad_norm). Disabled by
+    # default on MLX: the per-leaf cap below is the default instead, since
+    # global norm's cross-tree reduction costs more peak memory (measured
+    # ~1 GB more at 3B, scaling with size). Set this for CUDA-exact clipping;
+    # note per-leaf and global agree when no spike binds but diverge on
+    # gradient spikes (per-leaf cannot see an aggregate norm spread across
+    # many tensors).
+    max_grad_norm: float = 0.0
+    # Elementwise clip to `[-v, +v]`. None means "not requested";
+    # positive values override other clipping modes to preserve API meaning.
     max_grad_value: float | None = None
+    # Proportional per-leaf L2 norm cap and the MLX default (1.0 when no clip
+    # knob is set). Preserves each tensor's direction and avoids max_grad_norm's
+    # cross-tree memory overhead, but is not a drop-in for global max_grad_norm
+    # (see above). None uses the 1.0 default unless another clip knob is explicit.
+    max_grad_leaf_norm: float | None = None
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
     embedding_learning_rate: float = 0.0  # 0 = disabled, 5e-5 = recommended
@@ -162,13 +521,18 @@ class MLXTrainingConfig:
     compile_trace: bool = True
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
+    dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
+    preserve_dataset_order: bool = False  # Match Studio CUDA SequentialSampler order
     memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
     cache_limit_gb: float | None = None  # Optional MLX Metal cache cap in GB; <= 0 disables override
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
     disable_memory_limits: bool = False
+    cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
+    append_eos: bool = True  # True = mlx-lm parity; Studio sets False (template owns EOS)
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
+    completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
@@ -322,31 +686,38 @@ class MLXTrainer:
         if sched_type == "constant" and warmup == 0:
             return lr
 
-        decay_steps = max(total_steps - warmup, 1)
+        def warmup_multiplier(step):
+            if warmup <= 0:
+                return mx.array(1.0, dtype=mx.float32)
+            return step / mx.array(max(warmup, 1), dtype=mx.float32)
 
-        if sched_type == "cosine":
-            main_schedule = optim.cosine_decay(lr, decay_steps, end=0.0)
-        elif sched_type == "linear":
-            main_schedule = optim.linear_schedule(lr, 0.0, decay_steps)
-        else:  # constant
-            main_schedule = lr
+        def decay_progress(step):
+            return (
+                step - mx.array(warmup, dtype=mx.float32)
+            ) / mx.array(max(total_steps - warmup, 1), dtype=mx.float32)
 
-        if warmup > 0:
-            def warmup_fn(step):
-                step = mx.array(step)
-                step = mx.minimum(step + 1, mx.array(warmup))
-                return step * (lr / (warmup + 1))
-            if callable(main_schedule):
-                return optim.join_schedules(
-                    [warmup_fn, main_schedule], [warmup]
-                )
+        def schedule(step):
+            # HF Trainer LR parity; `step` is zero-based optimizer-step index.
+            step = mx.array(step).astype(mx.float32)
+            if warmup > 0:
+                warm = lr * warmup_multiplier(step)
             else:
-                const_fn = optim.linear_schedule(lr, lr, decay_steps)
-                return optim.join_schedules(
-                    [warmup_fn, const_fn], [warmup]
-                )
+                warm = mx.array(lr, dtype=mx.float32)
 
-        return main_schedule
+            progress = decay_progress(step)
+            if sched_type == "cosine":
+                decay = mx.array(0.5, dtype=mx.float32) * (
+                    mx.array(1.0, dtype=mx.float32) + mx.cos(mx.array(math.pi) * progress)
+                )
+            elif sched_type == "linear":
+                decay = mx.array(1.0, dtype=mx.float32) - progress
+            else:  # constant with warmup
+                decay = mx.array(1.0, dtype=mx.float32)
+            decay = mx.maximum(decay, mx.array(0.0, dtype=mx.float32))
+            main = mx.array(lr, dtype=mx.float32) * decay
+            return mx.where(step < warmup, warm, main)
+
+        return schedule
 
     @staticmethod
     def _schedule_value(schedule, step):
@@ -361,11 +732,27 @@ class MLXTrainer:
         optimizer.learning_rate = self._schedule_value(schedule, step)
 
     def _build_optimizer(self, total_steps):
-        """Create MLX optimizer with LR schedule from config."""
+        """Create MLX optimizer with LR schedule from config.
+
+        For AdamW, MLX applies weight decay inside the leaf update without a
+        parameter-group filter. Keep MLX AdamW's built-in decay disabled and
+        apply decoupled decay ourselves so bias and norm parameters match
+        HuggingFace Trainer behavior.
+        """
         schedule = self._build_schedule(total_steps)
         initial_lr = self._schedule_value(schedule, 0)
         self._lr_schedule = schedule if callable(schedule) else None
         wd = self.args.weight_decay
+        self._manual_weight_decay = 0.0
+        self._coupled_weight_decay = 0.0
+        adam_beta1 = getattr(self.args, "adam_beta1", None)
+        adam_beta2 = getattr(self.args, "adam_beta2", None)
+        adam_kwargs = {}
+        if adam_beta1 is not None or adam_beta2 is not None:
+            adam_kwargs["betas"] = (
+                float(0.9 if adam_beta1 is None else adam_beta1),
+                float(0.999 if adam_beta2 is None else adam_beta2),
+            )
 
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
@@ -390,26 +777,129 @@ class MLXTrainer:
                 scale_parameter=False,
             )
         elif opt_name == "adamw":
-            # Match HF/PyTorch AdamW: MLX defaults bias_correction to False,
-            # which makes early warmup updates much larger.
+            # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
+            # to False, which makes early warmup updates much larger.
+            self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.AdamW(
                 learning_rate=initial_lr,
-                weight_decay=wd,
+                weight_decay=0.0,
                 bias_correction=True,
+                **adam_kwargs,
             )
         elif opt_name == "adam":
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
                 bias_correction=True,
+                **adam_kwargs,
             )
         elif opt_name == "sgd":
-            optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=wd)
+            # HF/PyTorch SGD couples weight decay into the gradient (and thus
+            # momentum/Nesterov), unlike AdamW's decoupled shrink. Apply our
+            # own bias/norm-aware coupled decay so the exemption matches HF
+            # while keeping SGD's coupled dynamics.
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.SGD(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "muon":
-            optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=wd)
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "lion":
-            optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=wd)
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         self._resolved_optimizer_name = opt_name
         return optimizer
+
+    @staticmethod
+    def _should_apply_weight_decay(name, parameter=None):
+        """HF-style AdamW decay filter: decay weights, skip bias and norms."""
+        parts = [part.lower() for part in str(name).split(".") if part]
+        leaf = parts[-1] if parts else str(name).lower()
+        if leaf == "bias":
+            return False
+        # Cover RMSNorm/LayerNorm via "norm" + GPT-2 style ln_1/ln_2/ln_f.
+        if any(_part_is_norm(part) for part in parts):
+            return False
+        return True
+
+    @staticmethod
+    def _is_norm_parameter_name(name):
+        return any(
+            _part_is_norm(part.lower())
+            for part in str(name).split(".")
+            if part
+        )
+
+    @staticmethod
+    def _is_lora_parameter_name(name):
+        return any(
+            "lora" in part.lower()
+            for part in str(name).split(".")
+            if part
+        )
+
+    def _apply_manual_weight_decay(self, model, optimizer, grad):
+        """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
+
+        Active for AdamW, Muon, and Lion. The underlying MLX optimizer is
+        constructed with ``weight_decay=0.0`` so this helper owns the full
+        update for the weight-decay term and matches what HF Trainer does
+        via ``param_groups``. SGD uses coupled decay instead (see
+        ``_apply_coupled_weight_decay``).
+        """
+        wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
+        if wd <= 0:
+            return
+
+        flat_grad = dict(tree_flatten(grad))
+        decayed = []
+        for name, parameter in tree_flatten(model.trainable_parameters()):
+            if name not in flat_grad:
+                continue
+            if not self._should_apply_weight_decay(name, parameter):
+                continue
+            if not mx.issubdtype(parameter.dtype, mx.floating):
+                continue
+            lr_value = optimizer.learning_rate
+            if hasattr(lr_value, "astype"):
+                lr = lr_value.astype(mx.float32)
+            else:
+                lr = mx.array(lr_value, dtype=mx.float32)
+            scale = mx.array(1.0, dtype=mx.float32) - lr * mx.array(wd, dtype=mx.float32)
+            decayed.append((name, (parameter.astype(mx.float32) * scale).astype(parameter.dtype)))
+        if decayed:
+            model.update(tree_unflatten(decayed))
+
+    def _apply_coupled_weight_decay(self, model, grad):
+        """Fold HF/PyTorch-SGD coupled decay (wd * param) into the gradient.
+
+        SGD adds ``weight_decay * parameter`` to the gradient before the
+        momentum/Nesterov update, so it must be applied to ``grad`` rather
+        than as a post-update parameter shrink. Keeps HF's bias/norm
+        exemption. Returns a possibly-modified grad tree; the original is
+        returned unchanged when no decay applies.
+        """
+        wd = float(getattr(self, "_coupled_weight_decay", 0.0) or 0.0)
+        if wd <= 0:
+            return grad
+
+        params = dict(tree_flatten(model.trainable_parameters()))
+        wd_arr = mx.array(wd, dtype=mx.float32)
+        updated = []
+        changed = False
+        for name, value in tree_flatten(grad):
+            parameter = params.get(name)
+            if (
+                parameter is not None
+                and self._should_apply_weight_decay(name, parameter)
+                and mx.issubdtype(parameter.dtype, mx.floating)
+            ):
+                decayed = value + (parameter.astype(value.dtype) * wd_arr.astype(value.dtype))
+                updated.append((name, decayed))
+                changed = True
+            else:
+                updated.append((name, value))
+        if not changed:
+            return grad
+        return tree_unflatten(updated)
 
     @staticmethod
     def _adafactor_unsupported_parameters(model):
@@ -431,9 +921,8 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
-    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
-        """Run evaluation loop; returns (avg_loss, perplexity)."""
-        self.model.eval()
+    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+        """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
 
@@ -449,9 +938,47 @@ class MLXTrainer:
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
 
+        return all_losses, ntokens
+
+    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
+        """Run evaluation loop.
+
+        Returns:
+            (avg_loss, perplexity) tuple.
+        """
+        self.model.eval()
+        metrics = {}
+        if isinstance(eval_batches, dict):
+            all_losses = mx.array(0.0)
+            ntokens = mx.array(0)
+            for split_name, split_batches in eval_batches.items():
+                split_losses, split_tokens = self._evaluate_batch_totals(
+                    split_batches, loss_fn, is_vlm=is_vlm,
+                )
+                all_losses += split_losses
+                ntokens += split_tokens
+                mx.eval(all_losses, ntokens)
+                split_loss = (
+                    (split_losses / split_tokens).item()
+                    if split_tokens.item() > 0 else 0.0
+                )
+                split_ppl = math.exp(min(split_loss, 100))
+                split_prefix = f"eval_{split_name}"
+                metrics[f"{split_prefix}_loss"] = split_loss
+                metrics[f"{split_prefix}_perplexity"] = split_ppl
+                if self.stop_requested:
+                    break
+        else:
+            all_losses, ntokens = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm,
+            )
+
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
         perplexity = math.exp(min(avg_loss, 100))
+        metrics["eval_loss"] = avg_loss
+        metrics["eval_perplexity"] = perplexity
+        self._last_eval_metrics = metrics
         return avg_loss, perplexity
 
     @staticmethod
@@ -552,82 +1079,118 @@ class MLXTrainer:
         self._resume_from_checkpoint = resume_from_checkpoint
         args = self.args
         model = self.model
-        args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
-        model._unsloth_patch_mode = args.patch_mode
-
-        self._memory_limits_applied = self._configure_memory_limits()
-
-        self._compile_decision = None
-        self._compile_trace = None
-        self._compile_auto_tune_applied = []
-        if self._is_vlm and (args.compile or args.compile_trace):
-            compile_policy = build_compile_policy(args=args)
-            qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
-            if qual is not None:
-                model._unsloth_compile_qualification = qual
-            self._compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
-            model._unsloth_compile_decision = self._compile_decision
-            if args.compile_trace:
-                self._compile_trace = trace_compile_application(model, policy=compile_policy, args=args)
-                model._unsloth_compile_trace = self._compile_trace
-                model._unsloth_compile_explain = explain_compile_support(model, policy=compile_policy, args=args)
-            if args.compile_auto_tune:
-                self._compile_auto_tune_applied = self._apply_compile_recommendations(
-                    args, self._compile_decision
-                )
-                for setting, value, reason in self._compile_auto_tune_applied:
-                    print(
-                        f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
-                        f"({reason})"
-                    )
-
-        # (memory limits already applied above; just log what we configured)
-        if self._memory_limits_applied:
-            parts = []
-            if "memory_limit_gb" in self._memory_limits_applied:
-                parts.append(
-                    f"memory_limit={self._memory_limits_applied['memory_limit_gb']:.2f} GB"
-                )
-            if "cache_limit_gb" in self._memory_limits_applied:
-                parts.append(
-                    f"cache_limit={self._memory_limits_applied['cache_limit_gb']:.2f} GB"
-                )
-            if "wired_limit_gb" in self._memory_limits_applied:
-                parts.append(
-                    f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
-                )
-            print(
-                "Unsloth: MLX Metal memory guard enabled "
-                f"({', '.join(parts)})."
-            )
-
-        # Apply gradient checkpointing if requested
-        if args.gradient_checkpointing:
-            apply_gradient_checkpointing(model)
-            print("Unsloth: Using gradient checkpointing to reduce memory.")
-
-        # Qwen3.5-specific fixes
-        config = getattr(model, "_config", {})
-        model_type = config.get("model_type", "") if isinstance(config, dict) else ""
-        if "qwen3_5" in model_type:
-            from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
-            _fix_qwen35_attention_cache(model)
-            _disable_fused_mrope(model)
-            from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
-            patch_gated_delta()
-            patch_gated_delta_vlm()
-        # Qwen3-VL's language tower uses the same fused MRoPE kernel with no
-        # VJP; flip it off so training takes the differentiable fallback.
-        if "qwen3_vl" in model_type:
-            from .loader import _disable_fused_mrope
-            _disable_fused_mrope(model)
-
+        cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
+        # Save Qwen3-VL vision-block flag so finally restores it (not just False).
+        _prev_qwen3_vision_cast = True
         try:
+            from . import compile as _mlx_compile
+            _prev_qwen3_vision_cast = bool(
+                getattr(_mlx_compile, "_QWEN3_VISION_NORM_CAST_OUTPUT", True)
+            )
+        except Exception:
+            pass
+        # Patch INSIDE try/finally so any raise during setup still restores globals.
+        _norm_cast_applied = False
+        try:
+            _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
+            _norm_cast_applied = True
+            if cast_norm_output:
+                print("Unsloth: Casting MLX norm outputs back to activation dtype.")
+            args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
+            model._unsloth_patch_mode = args.patch_mode
+
+            self._memory_limits_applied = self._configure_memory_limits()
+
+            self._compile_decision = None
+            self._compile_trace = None
+            self._compile_auto_tune_applied = []
+            if self._is_vlm and (args.compile or args.compile_trace):
+                compile_policy = build_compile_policy(args=args)
+                qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
+                if qual is not None:
+                    model._unsloth_compile_qualification = qual
+                self._compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
+                model._unsloth_compile_decision = self._compile_decision
+                if args.compile_trace:
+                    self._compile_trace = trace_compile_application(model, policy=compile_policy, args=args)
+                    model._unsloth_compile_trace = self._compile_trace
+                    model._unsloth_compile_explain = explain_compile_support(model, policy=compile_policy, args=args)
+                if args.compile_auto_tune:
+                    self._compile_auto_tune_applied = self._apply_compile_recommendations(
+                        args, self._compile_decision
+                    )
+                    for setting, value, reason in self._compile_auto_tune_applied:
+                        print(
+                            f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
+                            f"({reason})"
+                        )
+
+            # (memory limits already applied above; just log what we configured)
+            if self._memory_limits_applied:
+                parts = []
+                if "memory_limit_gb" in self._memory_limits_applied:
+                    parts.append(
+                        f"memory_limit={self._memory_limits_applied['memory_limit_gb']:.2f} GB"
+                    )
+                if "cache_limit_gb" in self._memory_limits_applied:
+                    parts.append(
+                        f"cache_limit={self._memory_limits_applied['cache_limit_gb']:.2f} GB"
+                    )
+                if "wired_limit_gb" in self._memory_limits_applied:
+                    parts.append(
+                        f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
+                    )
+                print(
+                    "Unsloth: MLX Metal memory guard enabled "
+                    f"({', '.join(parts)})."
+                )
+
+            # Apply gradient checkpointing if requested
+            if args.gradient_checkpointing:
+                apply_gradient_checkpointing(model)
+                print("Unsloth: Using gradient checkpointing to reduce memory.")
+
+            # Qwen3.5-specific fixes
+            config = getattr(model, "_config", {})
+            model_type = config.get("model_type", "") if isinstance(config, dict) else ""
+            if "qwen3_5" in model_type:
+                from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
+                _fix_qwen35_attention_cache(model)
+                _disable_fused_mrope(model)
+                from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
+                patch_gated_delta()
+                patch_gated_delta_vlm()
+            # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
+            # no VJP; flip it off so training takes the differentiable fallback.
+            if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
+                from .loader import _disable_fused_mrope
+                _disable_fused_mrope(model)
+
             return self._train_inner()
         finally:
             if args.gradient_checkpointing:
-                remove_gradient_checkpointing(model)
-            self._restore_memory_limits()
+                try:
+                    remove_gradient_checkpointing(model)
+                except Exception:
+                    pass
+            try:
+                self._restore_memory_limits()
+            except Exception:
+                pass
+            if _norm_cast_applied and cast_norm_output:
+                # Undo the global norm-class patch; tolerate partial state.
+                try:
+                    _set_norm_output_cast_to_input_dtype(False, model)
+                except Exception:
+                    pass
+            # Restore Qwen3-VL vision-block flag to its pre-train value.
+            try:
+                from . import compile as _mlx_compile
+                _mlx_compile.set_qwen3_vision_norm_cast_output(
+                    _prev_qwen3_vision_cast
+                )
+            except Exception:
+                pass
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -637,15 +1200,30 @@ class MLXTrainer:
 
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
+        _vlm_ignore_token_ids = None
 
         if is_vlm:
+            processor = self._resolve_vlm_processor()
+            # Backstop only; VLM collation already owns label masking.
+            _vlm_ignore_token_ids = _get_vlm_ignore_token_ids(
+                processor=processor,
+                config=getattr(model, "_config", {}),
+            )
             _atid = args.assistant_token_id if args.train_on_completions else 0
             if use_cce:
-                loss_fn = make_vlm_cce_loss_fn(model, assistant_token_id=_atid)
+                loss_fn = make_vlm_cce_loss_fn(
+                    model,
+                    assistant_token_id=_atid,
+                    ignore_token_ids=_vlm_ignore_token_ids,
+                )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 print(f"Unsloth: Using VLM CCE loss ({cce_backend}) for memory-efficient training.")
             else:
-                loss_fn = make_vlm_baseline_loss_fn(model, assistant_token_id=_atid)
+                loss_fn = make_vlm_baseline_loss_fn(
+                    model,
+                    assistant_token_id=_atid,
+                    ignore_token_ids=_vlm_ignore_token_ids,
+                )
                 print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
@@ -656,7 +1234,11 @@ class MLXTrainer:
                 loss_fn = make_baseline_loss_fn()
                 print("Unsloth: Using standard cross-entropy loss.")
 
-        # Prepare data — determine total_steps first
+        # Prepare data, determine total_steps first. Keep any prebuilt flag
+        # from train_on_responses_only; _prepare_data returns self._batches
+        # early and never re-derives it for the completion-only text path.
+        if self._batches is None:
+            self._prepared_batches_include_epochs = False
         batches, batch_iter = self._prepare_data(is_vlm)
 
         if batches is not None and not batches:
@@ -669,7 +1251,9 @@ class MLXTrainer:
             total_steps = args.max_steps
         elif batches is not None:
             n_batches = len(batches)
-            if args.num_train_epochs > 0:
+            if getattr(self, "_prepared_batches_include_epochs", False):
+                total_steps = n_batches // grad_accum
+            elif args.num_train_epochs > 0:
                 # Epoch-based: total micro-batches = epochs * batches_per_epoch
                 total_steps = (n_batches * args.num_train_epochs) // grad_accum
             else:
@@ -744,37 +1328,75 @@ class MLXTrainer:
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
 
-        # Clip resolution: max_grad_value=None -> elementwise clip at 1.0
-        # unless max_grad_norm > 0 (then global-norm wins, HF/TRL parity);
-        # explicit max_grad_value is honored, and if both positive elementwise
-        # wins (warn). Elementwise is the default because MLX's clip_grad_norm
-        # materially increases peak memory on bf16 VLM runs.
-        max_grad_norm = float(args.max_grad_norm or 0.0)
-        _raw_mgv = getattr(args, "max_grad_value", None)  # TODO: expose MLX grad-clip in Studio UI for power users
-        _user_set_mgv = _raw_mgv is not None
-        if _user_set_mgv:
-            max_grad_value = float(_raw_mgv or 0.0)
-            if max_grad_norm > 0 and max_grad_value > 0:
+        # Build step functions following mlx-lm's pattern. `max_grad_value`
+        # remains an elementwise clamp. MLX's cheap default is now the clearer
+        # `max_grad_leaf_norm`, a proportional per-leaf norm cap that avoids
+        # global norm clipping's cross-tree memory overhead.
+        (
+            max_grad_norm,
+            max_grad_value,
+            max_grad_leaf_norm,
+            _grad_clip_mode,
+        ) = _resolve_mlx_grad_clipping(args)
+        _raw_mgln = getattr(args, "max_grad_leaf_norm", None)
+        if max_grad_value > 0:
+            conflicts = []
+            if float(getattr(args, "max_grad_norm", 0.0) or 0.0) > 0:
+                conflicts.append("max_grad_norm")
+            if _raw_mgln is not None and float(_raw_mgln or 0.0) > 0:
+                conflicts.append("max_grad_leaf_norm")
+            if conflicts:
                 print(
-                    "Unsloth: max_grad_norm and max_grad_value are both enabled; "
-                    "ignoring max_grad_norm in favor of max_grad_value."
+                    "Unsloth: max_grad_value is elementwise and overrides "
+                    f"{', '.join(conflicts)}."
                 )
-                max_grad_norm = 0.0
-        elif max_grad_norm > 0:
-            # User opted into global-norm clipping; suppress the default elementwise.
-            max_grad_value = 0.0
-        else:
-            # Neither requested -> cheap MLX default.
-            max_grad_value = 1.0
+        elif (
+            max_grad_leaf_norm > 0
+            and float(getattr(args, "max_grad_norm", 0.0) or 0.0) > 0
+        ):
+            print(
+                "Unsloth: max_grad_leaf_norm is enabled; ignoring "
+                "max_grad_norm to avoid double clipping."
+            )
         _clip_grad_value = max_grad_value > 0
+        _clip_grad_leaf_norm = max_grad_leaf_norm > 0
         state = [model.state, optimizer.state, mx.random.state]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
             grad_accum == 1 and
             not _needs_grad_scaling and
-            max_grad_norm <= 0
+            max_grad_norm <= 0 and
+            not _clip_grad_value and
+            not _clip_grad_leaf_norm
         )
+
+        _restore_storage_after_norm_clip = max_grad_norm > 0
+        _trainable_storage_dtypes = (
+            {
+                name: value.dtype
+                for name, value in tree_flatten(model.trainable_parameters())
+                if not self._is_norm_parameter_name(name)
+                and not self._is_lora_parameter_name(name)
+            }
+            if _restore_storage_after_norm_clip
+            else {}
+        )
+
+        def _restore_trainable_storage_dtypes():
+            """Keep norm-clipped MLX updates from promoting base params."""
+            if not _restore_storage_after_norm_clip:
+                return
+            recast = []
+            needs_update = False
+            for name, value in tree_flatten(model.trainable_parameters()):
+                dtype = _trainable_storage_dtypes.get(name)
+                if dtype is not None and value.dtype != dtype:
+                    value = value.astype(dtype)
+                    needs_update = True
+                recast.append((name, value))
+            if needs_update:
+                model.update(tree_unflatten(recast))
 
         def _grad_leaf_scale(name, safe_toks_f, clip_scale=None, dtype=None):
             """Return the scalar applied to one grad leaf before update.
@@ -867,16 +1489,19 @@ class MLXTrainer:
                 final_items.append((name, scaled))
             final_grad = tree_unflatten(final_items)
             if max_grad_norm > 0:
-                final_grad, grad_norm = optim.clip_grad_norm(
+                final_grad, grad_norm = _clip_grad_norm_fp32(
                     final_grad, max_norm=max_grad_norm
                 )
             if _clip_grad_value:
-                # Elementwise clip after norm-scaling, before optimizer step.
-                final_grad = tree_map(
-                    lambda g: mx.clip(g, -max_grad_value, max_grad_value),
-                    final_grad,
-                )
+                final_grad = _clip_grad_by_value(final_grad, max_grad_value)
+            if _clip_grad_leaf_norm:
+                final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
+            # Coupled (SGD) decay folds into the post-clip grad so it feeds
+            # momentum; decoupled (AdamW-family) decay shrinks params directly.
+            final_grad = self._apply_coupled_weight_decay(model, final_grad)
+            self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
+            _restore_trainable_storage_dtypes()
             return grad_norm
 
         def _apply_update_direct(grad):
@@ -888,14 +1513,15 @@ class MLXTrainer:
             """
             grad_norm = None
             if max_grad_norm > 0:
-                grad, grad_norm = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+                grad, grad_norm = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
             if _clip_grad_value:
-                # Elementwise clip per leaf — no cross-leaf reduction.
-                grad = tree_map(
-                    lambda g: mx.clip(g, -max_grad_value, max_grad_value),
-                    grad,
-                )
+                grad = _clip_grad_by_value(grad, max_grad_value)
+            if _clip_grad_leaf_norm:
+                grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
+            grad = self._apply_coupled_weight_decay(model, grad)
+            self._apply_manual_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
+            _restore_trainable_storage_dtypes()
             return grad_norm
 
         # Unified step for VLM (dict batch) and text (tuple batch) training.
@@ -991,45 +1617,62 @@ class MLXTrainer:
 
         # Prepare eval batches
         eval_batches = None
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
-            elif is_vlm:
-                processor = self.processor or getattr(self.model, "_processor", None)
-                config = getattr(self.model, "_config", {})
-                _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-                eval_batches = create_vlm_batches(
-                    dataset=self.eval_dataset,
-                    processor=processor,
-                    config=config,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    seed=args.seed,
-                    response_mask_fn=_vlm_mask_fn,
-                    formatting_func=self.formatting_func,
-                )
             else:
-                eval_batches = create_batches(
-                    dataset=self.eval_dataset,
-                    tokenizer=self.tokenizer,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    seed=args.seed,
-                    dataset_text_field=args.dataset_text_field,
-                    formatting_func=self.formatting_func,
-                    chat_template=getattr(args, "chat_template", None),
-                    model_name=getattr(self.model, "_hf_repo", None),
-                    model_type=(
-                        getattr(self.model, "_config", {}).get("model_type")
-                        if isinstance(getattr(self.model, "_config", {}), dict)
-                        else None
-                    ),
-                )
+                def _create_eval_batches(eval_dataset):
+                    """Materialize eval batches for one dataset split."""
+                    if is_vlm:
+                        processor = self._resolve_vlm_processor()
+                        config = getattr(self.model, "_config", {})
+                        _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
+                        return create_vlm_batches(
+                            dataset=eval_dataset,
+                            processor=processor,
+                            config=config,
+                            batch_size=args.per_device_train_batch_size,
+                            max_seq_length=args.max_seq_length,
+                            seed=args.seed,
+                            response_mask_fn=_vlm_mask_fn,
+                            formatting_func=self.formatting_func,
+                            completion_only_loss=text_completion_only_loss,
+                        )
+                    return create_batches(
+                        dataset=eval_dataset,
+                        tokenizer=self.tokenizer,
+                        batch_size=args.per_device_train_batch_size,
+                        max_seq_length=args.max_seq_length,
+                        seed=args.seed,
+                        dataset_text_field=args.dataset_text_field,
+                        formatting_func=self.formatting_func,
+                        chat_template=getattr(args, "chat_template", None),
+                        model_name=getattr(self.model, "_hf_repo", None),
+                        model_type=(
+                            getattr(self.model, "_config", {}).get("model_type")
+                            if isinstance(getattr(self.model, "_config", {}), dict)
+                            else None
+                        ),
+                        append_eos=bool(getattr(args, "append_eos", True)),
+                    )
+
+                if isinstance(self.eval_dataset, dict):
+                    eval_batches = {
+                        key: _create_eval_batches(value)
+                        for key, value in self.eval_dataset.items()
+                    }
+                else:
+                    eval_batches = _create_eval_batches(self.eval_dataset)
             if eval_batches:
+                eval_batch_count = (
+                    sum(len(value) for value in eval_batches.values())
+                    if isinstance(eval_batches, dict) else len(eval_batches)
+                )
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                      f"({len(eval_batches)} eval batches).")
+                      f"({eval_batch_count} eval batches).")
 
         features = []
         if is_vlm:
@@ -1269,6 +1912,7 @@ class MLXTrainer:
                     # can restore Adam moments, step counter, and loss history.
                     # Adapter save was successful -- treat the extra writes as
                     # best-effort: log on failure but don't undo the adapter save.
+                    checkpoint_complete = False
                     try:
                         save_optimizer_state(optimizer, ckpt_dir)
                         save_trainer_state(
@@ -1278,9 +1922,12 @@ class MLXTrainer:
                             },
                             ckpt_dir,
                         )
+                        checkpoint_complete = True
                     except Exception as e:
                         print(f"  Unsloth: checkpoint saved without resume state ({e})")
                     print(f"  Saved checkpoint to {ckpt_dir}")
+                    if checkpoint_complete:
+                        _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
@@ -1293,6 +1940,14 @@ class MLXTrainer:
               f"Total time: {total_time:.1f}s | "
               f"Steps: {total_steps} | "
               f"Tokens: {trained_tokens}")
+
+        # Honor the documented save_steps=0 contract: save at end of training.
+        try:
+            self.save_model()
+        except ValueError as e:
+            print(f"Unsloth: skipped final save ({e})")
+        else:
+            print(f"Unsloth: Saved final adapters to {args.output_dir}")
 
         return {
             "train_loss": avg_loss,
@@ -1320,7 +1975,50 @@ class MLXTrainer:
             ),
             "compile_auto_tune_applied": list(getattr(self, "_compile_auto_tune_applied", [])),
             "memory_limits_applied": dict(getattr(self, "_memory_limits_applied", {})),
+            "base_quantization_config": getattr(
+                self.model, "_unsloth_quantization_config", None,
+            ),
+            "base_quantization_policy": getattr(
+                self.model, "_unsloth_quantization_policy", None,
+            ),
+            "base_quantized_source": getattr(
+                self.model, "_unsloth_quantized_source", None,
+            ),
         }
+
+    def _resolve_vlm_processor(self):
+        """Resolve the processor used for VLM collation without mutating model."""
+        args = self.args
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        model_name = getattr(self.model, "_hf_repo", None)
+
+        processor = self.processor
+        if processor is None and (
+            hasattr(self.tokenizer, "image_processor")
+            or (
+                hasattr(self.tokenizer, "tokenizer")
+                and hasattr(self.tokenizer, "apply_chat_template")
+            )
+        ):
+            processor = self.tokenizer
+        if processor is None:
+            processor = getattr(self.model, "_processor", None)
+        if processor is None:
+            raise ValueError(
+                "VLM training requires a processor. Pass processor= to MLXTrainer "
+                "or load the model with FastLanguageModel.from_pretrained()."
+            )
+
+        processor = normalize_vlm_processor_chat_template(
+            processor,
+            chat_template=getattr(args, "vlm_chat_template", None),
+            model_name=model_name,
+            model_type=model_type,
+            strict=False,
+        )
+        self.processor = processor
+        return processor
 
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
@@ -1330,21 +2028,7 @@ class MLXTrainer:
         model_name = getattr(self.model, "_hf_repo", None)
 
         if is_vlm:
-            processor = self.processor or getattr(self.model, "_processor", None)
-            if processor is None:
-                raise ValueError(
-                    "VLM training requires a processor. Pass processor= to MLXTrainer "
-                    "or load the model with FastLanguageModel.from_pretrained()."
-                )
-            processor = normalize_vlm_processor_chat_template(
-                processor,
-                chat_template=getattr(args, "vlm_chat_template", None),
-                model_name=model_name,
-                model_type=model_type,
-                strict=False,
-            )
-            self.processor = processor
-            self.model._processor = processor
+            processor = self._resolve_vlm_processor()
         else:
             self.tokenizer = normalize_mlx_chat_template(
                 self.tokenizer,
@@ -1362,9 +2046,24 @@ class MLXTrainer:
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
+            vlm_dataset_order = (
+                "sequential"
+                if getattr(args, "preserve_dataset_order", False)
+                else getattr(args, "dataset_order", "default")
+            )
+            vlm_num_epochs = (
+                args.num_train_epochs
+                if (
+                    args.max_steps <= 0
+                    and args.num_train_epochs > 0
+                    and vlm_dataset_order == "torch_randperm"
+                )
+                else None
+            )
             if args.streaming:
                 return None, iterate_vlm_training_batches(
                     dataset=self.train_dataset,
@@ -1375,8 +2074,11 @@ class MLXTrainer:
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
+                    dataset_order=vlm_dataset_order,
+                    completion_only_loss=text_completion_only_loss,
                 )
             else:
+                self._prepared_batches_include_epochs = vlm_num_epochs is not None
                 batches = create_vlm_batches(
                     dataset=self.train_dataset,
                     processor=processor,
@@ -1387,6 +2089,9 @@ class MLXTrainer:
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
+                    dataset_order=vlm_dataset_order,
+                    num_epochs=vlm_num_epochs,
+                    completion_only_loss=text_completion_only_loss,
                 )
                 if _vlm_mask_fn is not None and batches:
                     _check_vlm_all_masked(batches)
@@ -1394,6 +2099,16 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
+                # Streaming has no index space; refuse explicit order requests.
+                if (
+                    getattr(args, "preserve_dataset_order", False)
+                    or getattr(args, "dataset_order", "default") != "default"
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: preserve_dataset_order / dataset_order is not "
+                        "supported with streaming=True for text training. Disable "
+                        "streaming or materialize batches."
+                    )
                 return None, iterate_training_batches(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,
@@ -1405,9 +2120,10 @@ class MLXTrainer:
                     chat_template=chat_tmpl,
                     model_name=model_name,
                     model_type=model_type,
+                    append_eos=bool(getattr(args, "append_eos", True)),
                 )
             else:
-                batches = create_batches(
+                batch_kwargs = dict(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,
                     batch_size=args.per_device_train_batch_size,
@@ -1419,7 +2135,28 @@ class MLXTrainer:
                     chat_template=chat_tmpl,
                     model_name=model_name,
                     model_type=model_type,
+                    append_eos=bool(getattr(args, "append_eos", True)),
                 )
+                if (
+                    getattr(args, "preserve_dataset_order", False)
+                    or getattr(args, "dataset_order", "default") != "default"
+                ):
+                    text_dataset_order = (
+                        "sequential"
+                        if getattr(args, "preserve_dataset_order", False)
+                        else getattr(args, "dataset_order", "default")
+                    )
+                    batch_kwargs["dataset_order"] = text_dataset_order
+                    if (
+                        args.max_steps <= 0
+                        and args.num_train_epochs > 0
+                        and text_dataset_order == "torch_randperm"
+                    ):
+                        batch_kwargs["num_epochs"] = args.num_train_epochs
+                        self._prepared_batches_include_epochs = True
+                    batches = create_ordered_batches(**batch_kwargs)
+                else:
+                    batches = create_batches(**batch_kwargs)
                 return batches, None
 
     def save_model(self, output_dir=None):
@@ -1559,13 +2296,23 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
                             dataset_text_field="text", num_batches=None,
                             seed=42, chat_template=None,
-                            model_name=None, model_type=None):
+                            model_name=None, model_type=None,
+                            append_eos=True, dataset_order="default",
+                            preserve_dataset_order=False,
+                            num_epochs=None):
     """Create padded batches with label masks for train_on_responses_only.
 
-    Tokenizes, masks, sorts by length, and right-pads into 3-tuples:
-    - batch: mx.array (BS, padded_len) — input_ids padded with 0
-    - lengths: mx.array (BS, 2) — [1, actual_len - 1] per sequence
-    - labels: mx.array (BS, padded_len) — labels padded with -100
+    Tokenizes each dataset item, applies the masking closure to get labels,
+    sorts by length, and produces right-padded 3-tuple batches.
+
+    Returns:
+        List of (batch, lengths, labels) tuples where:
+        - batch: mx.array (BS, padded_len) — input_ids padded with 0
+        - lengths: mx.array of shape (BS, 2) holding [1, actual_len]
+          per sequence. Right-half-open `[start, end)` matching the
+          exclusive-end loss masks in `utils.py:360`, `:393`, `:429`,
+          `:439`.
+        - labels: mx.array (BS, padded_len) — labels padded with -100
     """
     eos_id = tokenizer.eos_token_id
     tokenizer = normalize_mlx_chat_template(
@@ -1598,8 +2345,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe).
     def _process_text(text):
-        encoded = tokenizer.encode(text)
-        if eos_id is not None and (not encoded or encoded[-1] != eos_id):
+        encoded = encode_mlx_text(tokenizer, text)
+        # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
+        if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
             encoded.append(eos_id)
         if len(encoded) > max_seq_length:
             encoded = encoded[:max_seq_length]
@@ -1611,12 +2359,35 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             labels = labels.tolist()
         return (encoded, labels[0])
 
+    # Filter out samples where all labels are -100 (no valid training signal).
+    # This can happen when truncation cuts off the response_part entirely,
+    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
+    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    def _has_valid_labels(labels):
+        """Return whether a response-masked row still has trainable labels."""
+        # Loss supervises labels[1:] (causal shift), so the first label never trains.
+        return any(label != -100 for label in labels[1:])
+
     max_workers = min(4, os.cpu_count() or 1)
     all_items = []
+    n_before_filter = 0
+    n_removed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for result in executor.map(_process_text, all_texts):
             if result is not None:
-                all_items.append(result)
+                n_before_filter += 1
+                if _has_valid_labels(result[1]):
+                    all_items.append(result)
+                else:
+                    n_removed += 1
+
+    if n_removed > 0:
+        print(
+            f"Unsloth: Removed {n_removed} out of {n_before_filter} samples "
+            f"from train_dataset where all labels were -100 "
+            f"(no response found after truncation). "
+            f"This prevents NaN loss during training."
+        )
 
     if not all_items:
         raise ValueError(
@@ -1624,40 +2395,71 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "Check your dataset and formatting_func."
         )
 
-    # 2. Sort by length for efficient padding
-    all_items.sort(key=lambda x: len(x[0]))
+    # 2. Sample order; must agree with unlabeled `create_ordered_batches`
+    # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
+    _order_requested = preserve_dataset_order or (
+        dataset_order not in (None, "default")
+    )
+    if dataset_order not in (None, "default", "sequential", "torch_randperm"):
+        raise ValueError(
+            f"Unsloth MLX: unsupported dataset_order={dataset_order!r}. "
+            "Expected one of: None, 'default', 'sequential', "
+            "'torch_randperm'."
+        )
 
-    # 3. Create padded batches
+    def _order_samples_for_epoch(items, epoch_idx):
+        if preserve_dataset_order or dataset_order == "sequential":
+            return list(items)
+        if dataset_order == "torch_randperm":
+            from .utils import _torch_randperm_order, _normalize_seed
+            # Reseed per epoch (matches `create_ordered_batches`). Normalize a
+            # None seed first so seed=None does not raise on the int add.
+            order = _torch_randperm_order(
+                len(items), _normalize_seed(seed) + epoch_idx
+            )
+            return [items[i] for i in order]
+        # legacy default: length-sort once
+        return sorted(items, key=lambda x: len(x[0]))
+
+    # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
+    _n_epochs_materialize = (
+        max(1, int(num_epochs)) if num_epochs is not None else 1
+    )
     rng = random.Random(seed)
     batches = []
-    for start in range(0, len(all_items), batch_size):
-        batch_items = all_items[start:start + batch_size]
-        if not batch_items:
-            continue
-        max_len = max(len(ids) for ids, _ in batch_items)
-        # +1 (like mlx-lm iterate_batches) gives autoregressive shift headroom
-        # so post-shift length is a clean _PAD_MULTIPLE.
-        padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
-        padded_len = min(padded_len, max_seq_length)
+    for epoch_idx in range(_n_epochs_materialize):
+        epoch_items = _order_samples_for_epoch(all_items, epoch_idx)
+        epoch_batches = []
+        for start in range(0, len(epoch_items), batch_size):
+            batch_items = epoch_items[start:start + batch_size]
+            if not batch_items:
+                continue
+            max_len = max(len(ids) for ids, _ in batch_items)
+            # +1 for autoregressive shift (mlx-lm iterate_batches parity).
+            padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
+            padded_len = min(padded_len, max_seq_length)
 
-        batch_ids = []
-        batch_labels = []
-        batch_lengths = []
-        for ids, lbls in batch_items:
-            L = min(len(ids), padded_len)
-            pad_len = padded_len - L
-            batch_ids.append(ids[:L] + [0] * pad_len)
-            batch_labels.append(lbls[:L] + [-100] * pad_len)
-            batch_lengths.append([1, L - 1])
+            batch_ids = []
+            batch_labels = []
+            batch_lengths = []
+            for ids, lbls in batch_items:
+                L = min(len(ids), padded_len)
+                pad_len = padded_len - L
+                batch_ids.append(ids[:L] + [0] * pad_len)
+                batch_labels.append(lbls[:L] + [-100] * pad_len)
+                # [start, end) matches loss masks in utils.py:360/:393/:429/:439.
+                batch_lengths.append([1, L])
 
-        batches.append((
-            mx.array(batch_ids),
-            mx.array(batch_lengths),
-            mx.array(batch_labels),
-        ))
+            epoch_batches.append((
+                mx.array(batch_ids),
+                mx.array(batch_lengths),
+                mx.array(batch_labels),
+            ))
 
-    # 4. Shuffle batches
-    rng.shuffle(batches)
+        # 4. Legacy length-sort: shuffle batches so adjacent steps differ.
+        if not _order_requested:
+            rng.shuffle(epoch_batches)
+        batches.extend(epoch_batches)
 
     # Limit if needed
     if num_batches is not None and len(batches) > num_batches:
@@ -1665,8 +2467,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # Evaluate all tensors
     all_tensors = []
-    for b, l, lb in batches:
-        all_tensors.extend([b, l, lb])
+    for batch_arr, lengths_arr, labels_arr in batches:
+        all_tensors.extend([batch_arr, lengths_arr, labels_arr])
     mx.eval(all_tensors)
 
     return batches
@@ -1764,6 +2566,7 @@ def train_on_responses_only(
     tokenizer=None,
     return_function=False,
     num_proc=None,
+    last_response_only=False,
 ):
     """Mask instruction tokens from loss — train only on assistant responses.
 
@@ -1779,6 +2582,8 @@ def train_on_responses_only(
         tokenizer: Optional override; defaults to trainer.tokenizer.
         return_function: If True, return the masking closure only.
         num_proc: Accepted for HF API compat, unused on MLX.
+        last_response_only: If True, only the final assistant response is
+            unmasked, matching the CUDA helper.
 
     Returns:
         The trainer (for chaining), or the closure if return_function=True.
@@ -1797,12 +2602,7 @@ def train_on_responses_only(
             "kwarg or via trainer.tokenizer."
         )
 
-    # Unwrap to a callable HF tokenizer (mlx-lm TokenizerWrapper._tokenizer,
-    # or VLM processor.tokenizer).
-    if hasattr(_tokenizer, "_tokenizer"):
-        _tokenizer = _tokenizer._tokenizer
-    elif hasattr(_tokenizer, "tokenizer"):
-        _tokenizer = _tokenizer.tokenizer
+    _tokenizer = _resolve_response_mask_tokenizer(_tokenizer)
 
     # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
@@ -1812,6 +2612,7 @@ def train_on_responses_only(
         force_match=force_match,
         tokenizer=_tokenizer,
         return_function=True,
+        last_response_only=last_response_only,
     )
 
     if return_function:
@@ -1835,6 +2636,14 @@ def train_on_responses_only(
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
+        # Only materialize all epoch blocks for true epoch-based runs. Step-based
+        # runs (max_steps>0) truncate to num_batches, so pre-building every epoch
+        # just wastes tokenization/memory. Mirrors the unlabeled path's gate.
+        labeled_num_epochs = (
+            int(args.num_train_epochs)
+            if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
+            else None
+        )
         batches = _create_labeled_batches(
             dataset=trainer.train_dataset,
             tokenizer=_tokenizer,
@@ -1852,32 +2661,51 @@ def train_on_responses_only(
                 if isinstance(getattr(trainer.model, "_config", {}), dict)
                 else None
             ),
+            append_eos=bool(getattr(args, "append_eos", True)),
+            dataset_order=getattr(args, "dataset_order", "default"),
+            preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+            num_epochs=labeled_num_epochs,
         )
 
         # Safety check: detect all-masked labels early
         _check_all_masked(batches)
-
+        trainer._prepared_batches_include_epochs = (
+            labeled_num_epochs is not None
+        )
         trainer._batches = batches
 
         # Process eval dataset too
         if trainer.eval_dataset is not None:
-            eval_batches = _create_labeled_batches(
-                dataset=trainer.eval_dataset,
-                tokenizer=_tokenizer,
-                mask_fn=mask_fn,
-                batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
-                formatting_func=trainer.formatting_func,
-                dataset_text_field=args.dataset_text_field,
-                seed=args.seed,
-                chat_template=getattr(args, "chat_template", None),
-                model_name=getattr(trainer.model, "_hf_repo", None),
-                model_type=(
-                    getattr(trainer.model, "_config", {}).get("model_type")
-                    if isinstance(getattr(trainer.model, "_config", {}), dict)
-                    else None
-                ),
-            )
+            def _create_labeled_eval_batches(eval_dataset):
+                """Build response-masked eval batches for one dataset split."""
+                return _create_labeled_batches(
+                    dataset=eval_dataset,
+                    tokenizer=_tokenizer,
+                    mask_fn=mask_fn,
+                    batch_size=args.per_device_train_batch_size,
+                    max_seq_length=args.max_seq_length,
+                    formatting_func=trainer.formatting_func,
+                    dataset_text_field=args.dataset_text_field,
+                    seed=args.seed,
+                    chat_template=getattr(args, "chat_template", None),
+                    model_name=getattr(trainer.model, "_hf_repo", None),
+                    model_type=(
+                        getattr(trainer.model, "_config", {}).get("model_type")
+                        if isinstance(getattr(trainer.model, "_config", {}), dict)
+                        else None
+                    ),
+                    append_eos=bool(getattr(args, "append_eos", True)),
+                    dataset_order=getattr(args, "dataset_order", "default"),
+                    preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                )
+
+            if isinstance(trainer.eval_dataset, dict):
+                eval_batches = {
+                    key: _create_labeled_eval_batches(value)
+                    for key, value in trainer.eval_dataset.items()
+                }
+            else:
+                eval_batches = _create_labeled_eval_batches(trainer.eval_dataset)
             trainer._eval_batches_labeled = eval_batches
 
         print(f"Unsloth: train_on_responses_only enabled "
