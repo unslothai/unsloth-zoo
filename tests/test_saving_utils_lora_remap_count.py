@@ -27,8 +27,17 @@ CPU-only, no disk or model download.
 from __future__ import annotations
 
 import collections
+import importlib.util
+import sys
+import types
 
-from unsloth_zoo.saving_utils import (
+# These are pure key-string / count helpers and never use bitsandbytes, but importing
+# saving_utils pulls bitsandbytes at module scope. Inject a tiny stub when it is absent so
+# collection works in a CPU-only environment without the optional dependency.
+if importlib.util.find_spec("bitsandbytes") is None:
+    sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
+
+from unsloth_zoo.saving_utils import (  # noqa: E402
     LoraStats,
     _infer_prefix_and_remap,
     _count_backed_lora_modules,
@@ -373,6 +382,31 @@ def test_remap_prefix_add_onto_linear_weight():
                                   ["model.language_model.layers.0.mlp.gate_proj.linear.weight"])
     assert out is not None
     assert out["model.language_model.layers.0.mlp.gate_proj"] == "model.layers.0.mlp.gate_proj"
+
+
+def test_remap_strip_does_not_drop_semantic_namespace_to_bare_layers():
+    """The wrapper-strip fallback must remove only generic wrapper components (model/
+    base_model/module), never a semantic namespace. An unbacked vision adapter sharing a
+    suffix with a bare language tensor must not be merged onto it."""
+    out = _infer_prefix_and_remap(
+        _lw(["model.vision_tower.layers.0.self_attn.q_proj"]),
+        ["layers.0.self_attn.q_proj.weight"],
+    )
+    assert out is None or out.get("model.vision_tower.layers.0.self_attn.q_proj") == \
+        "model.vision_tower.layers.0.self_attn.q_proj"
+    assert not (out and out.get("layers.0.self_attn.q_proj") ==
+                "model.vision_tower.layers.0.self_attn.q_proj")
+
+
+def test_remap_strip_still_drops_leading_model_wrapper():
+    """The legitimate case still works: model.vision_tower.* strips the leading model.
+    onto the real vision_tower.* base tensor."""
+    out = _infer_prefix_and_remap(
+        _lw(["model.vision_tower.transformer.layers.0.attention.q_proj"]),
+        ["vision_tower.transformer.layers.0.attention.q_proj.weight"])
+    assert out is not None
+    assert out["vision_tower.transformer.layers.0.attention.q_proj"] == \
+        "model.vision_tower.transformer.layers.0.attention.q_proj"
 
 
 def test_count_fused_named_gate_up_proj_backed_by_per_expert():
