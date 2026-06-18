@@ -676,6 +676,7 @@ def patch_vllm_reset_caches_on_sleep():
     # No-op and cheap for text models (caches absent / null-guarded). Wrap every
     # engine class load_vllm can return so use_async / use_engine don't bypass it.
     import functools
+    _warned = set()
 
     def _reset_caches(obj):
         # reset_encoder_cache lives on llm_engine for LLM, on the engine itself otherwise.
@@ -684,7 +685,11 @@ def patch_vllm_reset_caches_on_sleep():
             fn = getattr(owner, name, None)
             if fn is None: continue
             try: fn()
-            except Exception as e: logger.debug(f"Unsloth: {name} pre-sleep skipped: {e}")
+            except Exception as e:
+                # A reset that exists but throws can leave caches desynced; warn once.
+                if name not in _warned:
+                    _warned.add(name)
+                    logger.warning(f"Unsloth: {name} pre-sleep failed (continuing): {e}")
 
     def _wrap_sleep(cls):
         if cls is None or getattr(cls, "_unsloth_reset_caches_on_sleep", False): return
@@ -1844,7 +1849,9 @@ def load_vllm(
     # multimodal models (cudaErrorIllegalAddress at empty_cache on the first
     # sleep), regardless of VRAM headroom. Text models are unaffected. Disable
     # standby for vision models; override with UNSLOTH_VLLM_STANDBY_VISION=1.
-    if unsloth_vllm_standby and is_vision_model and \
+    # Fall back to the config so the gate still fires if the caller forgot is_vision_model.
+    _gate_vision = is_vision_model or hasattr(config, "vision_config")
+    if unsloth_vllm_standby and _gate_vision and \
         os.getenv("UNSLOTH_VLLM_STANDBY_VISION", "0") == "0":
         logger.warning(
             "Unsloth: vLLM standby (sleep mode) is unstable for multimodal models; "
