@@ -498,6 +498,7 @@ class MLXTrainingConfig:
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
+    completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 

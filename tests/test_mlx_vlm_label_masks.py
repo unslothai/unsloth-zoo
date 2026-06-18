@@ -273,6 +273,36 @@ def test_vlm_response_mask_filters_before_batching_like_cuda():
     ]
 
 
+def test_vlm_streaming_response_mask_skips_fully_masked_rows():
+    from unsloth_zoo.mlx.utils import iterate_vlm_training_batches
+
+    class StreamingDataset:
+        def __iter__(self):
+            return iter([{"text": "bad"}, {"text": "good"}])
+
+    def mask_fn(batch):
+        labels = []
+        for row in batch["input_ids"]:
+            if 10 in row:
+                labels.append([-100] * len(row))
+            else:
+                labels.append([-100, 12, 13, 0])
+        return {"labels": labels}
+
+    batches = iterate_vlm_training_batches(
+        dataset=StreamingDataset(),
+        processor=_ResponseMaskFilteringProcessor(),
+        config={},
+        batch_size=2,
+        max_seq_length=8,
+        response_mask_fn=mask_fn,
+    )
+    batch = next(batches)
+
+    assert batch["input_ids"].tolist() == [[101, 12, 13, 0]]
+    assert batch["labels"].tolist() == [[-100, 12, 13, -100]]
+
+
 def test_vlm_response_mask_formats_each_filtered_row_once():
     from unsloth_zoo.mlx.utils import create_vlm_batches
 

@@ -2074,10 +2074,7 @@ def encode_mlx_text(tokenizer, text):
     """Tokenize text while mirroring Unsloth's double-BOS guard."""
     add_special_tokens = True
     bos_token = getattr(tokenizer, "bos_token", None)
-    chat_template = getattr(tokenizer, "chat_template", "") or ""
-    if bos_token is not None and (
-        text.startswith(bos_token) or bos_token in chat_template
-    ):
+    if bos_token is not None and text.startswith(bos_token):
         add_special_tokens = False
 
     try:
@@ -3411,18 +3408,47 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 "via `dataset.to_iterable_dataset()` -> list) or drop "
                 "the order request."
             )
+        def _filter_stream_item(item):
+            """Return a formatted trainable streaming row, or None to skip it."""
+            if response_mask_fn is None:
+                return item
+            if formatting_func is not None:
+                item = formatting_func(item)
+            batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+                [item],
+                processor,
+                config,
+                max_seq_length,
+                image_size,
+                response_mask_fn=response_mask_fn,
+                formatting_func=None,
+                ignore_token_ids=ignore_token_ids,
+                completion_only_loss=completion_only_loss,
+                return_prompt_completion=True,
+            )
+            if is_prompt_completion:
+                return item
+            valid_rows = _vlm_trainable_label_rows(batch_dict)
+            if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+                return None
+            return item
+
+        batch_formatting_func = None if response_mask_fn is not None else formatting_func
         while True:
             pending = []
             yielded = False
             for item in dataset:
+                item = _filter_stream_item(item)
+                if item is None:
+                    continue
                 pending.append(item)
                 if len(pending) >= batch_size:
                     yielded = True
-                    yield _build_batch(pending, formatting_func)
+                    yield _build_batch(pending, batch_formatting_func)
                     pending = []
             if pending:
                 yielded = True
-                yield _build_batch(pending, formatting_func)
+                yield _build_batch(pending, batch_formatting_func)
             if not yielded:
                 raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
 
