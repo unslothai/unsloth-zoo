@@ -14,14 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unit tests for the LoRA-save key remap and the Step-7 backed-module count in
-unsloth_zoo/saving_utils.py.
+"""Tests for the LoRA-save key remap and backed-module count in saving_utils.py.
 
-Covers the VLM prefix reorder fix, its guards against misrouting a vision LoRA
-onto a language tensor, and the backed-module count across model families
-(normal, reordered VLM, Gemma4 ClippableLinear, fused/per-expert MoE, tied
-embeddings, and a vision tower absent from the base safetensors). Pure-function,
-CPU-only, no disk or model download.
+Covers the VLM prefix reorder fix, vision-onto-language misroute guards, and the
+backed-module count across model families (VLM, Gemma4 ClippableLinear, MoE, tied
+embeddings, absent vision tower). Pure-function, CPU-only, no disk/download.
 """
 
 from __future__ import annotations
@@ -31,9 +28,7 @@ import importlib.util
 import sys
 import types
 
-# These are pure key-string / count helpers and never use bitsandbytes, but importing
-# saving_utils pulls bitsandbytes at module scope. Inject a tiny stub when it is absent so
-# collection works in a CPU-only environment without the optional dependency.
+# saving_utils imports bitsandbytes at module scope; stub it so CPU-only collection works.
 if importlib.util.find_spec("bitsandbytes") is None:
     sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
 
@@ -45,16 +40,12 @@ from unsloth_zoo.saving_utils import (  # noqa: E402
 
 
 def _lw(keys):
-    """Build a lora_weights defaultdict; value is the key so we can trace remaps."""
+    """Build a lora_weights defaultdict whose value is the key, to trace remaps."""
     d = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
     for k in keys:
         d[k] = k
     return d
 
-
-# ---------------------------------------------------------------------------
-# _infer_prefix_and_remap: reorder fix + misroute guards
-# ---------------------------------------------------------------------------
 
 def test_remap_reorders_ministral_language_keys():
     """model.language_model.* LoRA keys remap onto language_model.model.* tensors."""
@@ -75,8 +66,7 @@ def test_remap_returns_none_when_already_aligned():
 
 
 def test_remap_does_not_misroute_vision_onto_language_tensor():
-    """A vision LoRA sharing a trailing path with a language tensor must not be
-    rewritten onto that language tensor when only the language tensor exists."""
+    """Vision LoRA sharing a trailing path with a language tensor isn't rewritten onto it."""
     disk = ["language_model.model.layers.0.self_attn.q_proj.weight"]
     out = _infer_prefix_and_remap(
         _lw([
@@ -98,8 +88,7 @@ def test_remap_qwen35_extra_prefix_still_works():
 
 
 def test_remap_strips_extra_wrapper_prefix_onto_base_tensor():
-    """A LoRA carrying an extra leading wrapper (model.vision_tower.*) strips onto the
-    base tensor (vision_tower.*) when that tensor exists on disk."""
+    """An extra leading wrapper (model.vision_tower.*) strips onto the base vision_tower.* tensor."""
     disk = ["vision_tower.transformer.layers.0.attention.q_proj.weight"]
     out = _infer_prefix_and_remap(
         _lw(["model.vision_tower.transformer.layers.0.attention.q_proj"]), disk)
@@ -109,9 +98,7 @@ def test_remap_strips_extra_wrapper_prefix_onto_base_tensor():
 
 
 def test_remap_mixed_language_reorder_and_vision_strip():
-    """Composite VLM where the language half reorders (model.language_model.* ->
-    language_model.model.*) and the vision half only drops the leading model.. Both
-    namespaces resolve onto their own base tensors, neither onto a nonexistent key."""
+    """Composite VLM: language half reorders, vision half strips leading model.; each resolves onto its own tensor."""
     disk = (
         [f"language_model.model.layers.0.self_attn.{p}.weight" for p in ("q_proj", "k_proj")]
         + [f"vision_tower.transformer.layers.0.attention.{p}.weight" for p in ("q_proj", "k_proj")]
@@ -127,15 +114,13 @@ def test_remap_mixed_language_reorder_and_vision_strip():
             f"model.language_model.layers.0.self_attn.{p}"
         assert out.get(f"vision_tower.transformer.layers.0.attention.{p}") == \
             f"model.vision_tower.transformer.layers.0.attention.{p}"
-    # No invented keys: every remapped target backs a real on-disk tensor.
+    # Every remapped target backs a real on-disk tensor; no invented keys.
     for tgt in out:
         if isinstance(tgt, str):
             assert (tgt + ".weight") in set(disk)
 
 
-# ---------------------------------------------------------------------------
-# _count_backed_lora_modules: count matches what the merge loop would write
-# ---------------------------------------------------------------------------
+# _count_backed_lora_modules: count must match what the merge loop would write.
 
 def _count(keys, disk_keys, model_class_name="PreTrainedModel", tie=False):
     return _count_backed_lora_modules(_lw(keys), set(disk_keys), model_class_name, tie)
@@ -176,10 +161,7 @@ def test_count_vision_tower_unbacked_excluded():
 
 
 def test_count_tied_embed_and_bare_lm_head():
-    """Tied model, modules_to_save on model.embed_tokens and bare lm_head, only
-    embed_tokens.weight on disk. The merge writes the embed delta and drops lm_head
-    (the tied bridge fires only when embed is not itself a target), so exactly one
-    tensor is merged and the merge-accurate count is 1, with no separate discount."""
+    """Tied embed + bare lm_head, only embed on disk: merge writes embed, drops lm_head, count 1."""
     assert _count(["model.embed_tokens", "lm_head"], ["model.embed_tokens.weight"],
                   model_class_name="LlamaForCausalLM", tie=True) == 1
 
@@ -199,29 +181,20 @@ def test_count_untied_lm_head_on_disk():
 
 
 def test_count_composite_tied_embed_and_bare_lm_head():
-    """Composite VLM (deep model.language_model. prefix), tied, modules_to_save on the
-    deep embed_tokens and a bare lm_head, only the deep embed tensor on disk. The merge
-    writes the embed delta and cannot bridge the bare lm_head onto the deep-prefix embed,
-    so it merges one tensor and the count must mirror that as 1. The previous
-    discount-based scheme under-counted this to 0 and raised a false RuntimeError."""
+    """Composite VLM, tied, deep embed + bare lm_head: lm_head can't bridge the deep embed, count 1."""
     assert _count(["model.language_model.embed_tokens", "lm_head"],
                   ["model.language_model.embed_tokens.weight"],
                   model_class_name="PreTrainedModel", tie=True) == 1
 
 
 def test_count_composite_tied_bare_lm_head_unbridgeable_dropped():
-    """Composite VLM, tied, a bare lm_head whose embed lives only at a deep prefix. The
-    merge cannot bridge a bare lm_head onto model.language_model.embed_tokens.weight, so
-    it is dropped and contributes 0 (the standard model.embed_tokens case still bridges
-    and counts, see test_count_tied_bare_lm_head_with_layer)."""
+    """Composite VLM, tied: a bare lm_head can't bridge a deep-prefix embed, so it's dropped (count 0)."""
     assert _count(["lm_head"], ["model.language_model.embed_tokens.weight"],
                   model_class_name="PreTrainedModel", tie=True) == 0
 
 
 def test_count_mxfp4_packed_experts():
-    """MXFP4 base: fused experts are stored packed as <module>_blocks / _scales and the
-    merge dequantizes them to <module> on save, so a LoRA on such a module has no .weight
-    on disk. It must still be counted as backed (the merge writes and counts it)."""
+    """MXFP4 fused experts (packed _blocks/_scales, no .weight) are dequantized on save, so counted."""
     keys = ["model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.mlp.experts.down_proj",
             "model.layers.0.self_attn.q_proj"]
     disk = ["model.layers.0.mlp.experts.gate_up_proj_blocks", "model.layers.0.mlp.experts.gate_up_proj_scales",
@@ -231,8 +204,7 @@ def test_count_mxfp4_packed_experts():
 
 
 def test_count_mxfp4_blocks_without_scales_not_counted():
-    """A packed module missing its _scales tensor is skipped by the merge (it cannot be
-    dequantized), so it must not be counted as backed."""
+    """A packed module missing its _scales can't be dequantized, so it's not counted."""
     keys = ["model.layers.0.mlp.experts.gate_up_proj", "model.layers.0.self_attn.q_proj"]
     disk = ["model.layers.0.mlp.experts.gate_up_proj_blocks",  # no matching _scales
             "model.layers.0.self_attn.q_proj.weight"]
@@ -240,10 +212,7 @@ def test_count_mxfp4_blocks_without_scales_not_counted():
 
 
 def test_count_cross_namespace_same_trailing_path_union():
-    """Sharded composite checkpoint where two namespaces (language reorder + vision strip)
-    share the same trailing module path but live in different shards. Counting against the
-    union of all shard keys must still resolve each LoRA onto its own tensor (count 2), not
-    collapse them into an ambiguous unbacked pair."""
+    """Sharded VLM: two namespaces share a trailing path; against the key union each resolves (count 2)."""
     keys = ["model.language_model.layers.0.self_attn.q_proj",
             "model.vision_tower.transformer.layers.0.self_attn.q_proj"]
     union = ["language_model.model.layers.0.self_attn.q_proj.weight",
@@ -252,8 +221,7 @@ def test_count_cross_namespace_same_trailing_path_union():
 
 
 def test_remap_cross_namespace_union_resolves_both():
-    """The remap, given the union of both shards' keys, routes the language key to its
-    reordered tensor and the vision key to its stripped tensor, never crossing namespaces."""
+    """Given both shards' key union, the remap routes language and vision keys without crossing namespaces."""
     union = ["language_model.model.layers.0.self_attn.q_proj.weight",
              "vision_tower.transformer.layers.0.self_attn.q_proj.weight"]
     out = _infer_prefix_and_remap(
@@ -269,9 +237,7 @@ def test_remap_cross_namespace_union_resolves_both():
 
 
 def test_remap_common_prefix_still_applies_to_moe_expert_backing():
-    """The common-prefix fallback must prefix MoE LoRA keys that are backed by descendant
-    expert tensors (model.layers.0.mlp.experts.0.*.weight), not only keys with a direct
-    <key>.weight. Otherwise the prefixed key is dropped and the MoE delta is skipped."""
+    """Common-prefix fallback must prefix MoE keys backed by descendant expert tensors, not only direct .weight."""
     disk = [
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.mlp.experts.0.gate_proj.weight",
@@ -292,34 +258,28 @@ def test_remap_common_prefix_still_applies_to_moe_expert_backing():
 
 
 def test_count_fused_3d_experts_without_weight_suffix():
-    """Fused 3D MoE (GPT-OSS / Gemma4) stores experts as <prefix>.gate_up_proj /
-    <prefix>.down_proj with no .weight; _merge_moe_experts_file merges them, so they must
-    be counted as backed."""
+    """Fused 3D MoE (GPT-OSS/Gemma4) stores experts with no .weight; the merge handles them, so counted."""
     keys = ["model.layers.0.experts.base_layer", "model.layers.0.experts"]
     disk = ["model.layers.0.experts.gate_up_proj", "model.layers.0.experts.down_proj"]
     assert _count(keys, disk) == 2
 
 
 def test_count_moe_alias_resolves_to_fused_experts():
-    """A LoRA key using .moe is aliased to .experts by the merge, so it must count against
-    the fused expert tensors stored under .experts."""
+    """A .moe LoRA key is aliased to .experts by the merge, so it counts against the fused .experts tensors."""
     keys = ["model.layers.0.moe.base_layer", "model.layers.0.moe"]
     disk = ["model.layers.0.experts.gate_up_proj", "model.layers.0.experts.down_proj"]
     assert _count(keys, disk) == 2
 
 
 def test_count_mxfp4_per_expert_packed():
-    """Per-expert packed mxfp4 experts (descendant <prefix>.<e>.<proj>_blocks/_scales)
-    count as backed."""
+    """Per-expert packed mxfp4 experts (descendant <prefix>.<e>.<proj>_blocks/_scales) count as backed."""
     keys = ["model.layers.0.mlp.experts.base_layer"]
     disk = ["model.layers.0.mlp.experts.0.gate_proj_blocks", "model.layers.0.mlp.experts.0.gate_proj_scales"]
     assert _count(keys, disk) == 1
 
 
 def test_remap_reordered_clippable_linear():
-    """A reordered composite VLM whose module is stored as Gemma4 ClippableLinear
-    (<module>.linear.weight) must still learn the prefix substitution (the vote normalizes
-    .linear.weight to its module key) and accept the .linear-backed target."""
+    """Reordered VLM stored as Gemma4 ClippableLinear (<module>.linear.weight) still learns the prefix and is backed."""
     disk = ["language_model.model.layers.0.mlp.gate_proj.linear.weight"]
     out = _infer_prefix_and_remap(_lw(["model.language_model.layers.0.mlp.gate_proj"]), disk)
     assert out is not None
@@ -329,8 +289,7 @@ def test_remap_reordered_clippable_linear():
 
 
 def test_remap_reordered_linear_applied_via_seeded_vote():
-    """Vote seeded by a .weight attention key, then applied to a sibling .linear.weight
-    module: the application must accept the .linear backing, not only direct .weight."""
+    """A vote seeded by a .weight key, applied to a sibling .linear.weight module, accepts the .linear backing."""
     disk = ["language_model.model.layers.0.self_attn.q_proj.weight",
             "language_model.model.layers.0.mlp.gate_proj.linear.weight"]
     out = _infer_prefix_and_remap(
@@ -344,9 +303,7 @@ def test_remap_reordered_linear_applied_via_seeded_vote():
 
 
 def test_remap_short_reordered_embed_tokens_alone():
-    """A reordered short module (embed_tokens) on a shard that holds no longer layer keys
-    must still learn its own reorder via a short-suffix vote, guarded so it only fires for a
-    true component reordering. Otherwise the merge silently drops the embedding delta."""
+    """A reordered short module (embed_tokens) alone still learns its reorder via a guarded short-suffix vote."""
     out = _infer_prefix_and_remap(_lw(["model.language_model.embed_tokens"]),
                                   ["language_model.model.embed_tokens.weight"])
     assert out is not None
@@ -361,14 +318,11 @@ def test_remap_short_reordered_lm_head_alone():
 
 
 def test_remap_short_suffix_does_not_cross_namespaces():
-    """A short suffix match that is NOT a component reordering must not vote (no misroute).
-    model.embed_tokens vs language_model.model.embed_tokens is a prefix add, not a reorder;
-    it resolves by the unique-prefix path, never by a cross-namespace substitution."""
+    """A short-suffix match that is a prefix add, not a reorder, must not vote (no cross-namespace misroute)."""
     out = _infer_prefix_and_remap(
         _lw(["model.vision_tower.embed_tokens", "model.language_model.layers.0.self_attn.q_proj"]),
         ["language_model.model.layers.0.self_attn.q_proj.weight"])  # no vision embed tensor
-    # the vision embed has no backing tensor and must be left unmapped, never pulled onto
-    # the language tensor by a 1-component 'embed_tokens'/'q_proj' style vote.
+    # The vision embed has no backing tensor; it must stay unmapped, not be pulled onto the language tensor.
     assert out.get("language_model.model.layers.0.self_attn.q_proj") == \
         "model.language_model.layers.0.self_attn.q_proj"
     assert "model.vision_tower.embed_tokens" not in out or \
@@ -376,8 +330,7 @@ def test_remap_short_suffix_does_not_cross_namespaces():
 
 
 def test_remap_prefix_add_onto_linear_weight():
-    """A prefix-add LoRA key whose only backing is a Gemma4 ClippableLinear .linear.weight
-    tensor must still remap via the unique-prefix path (not only direct .weight)."""
+    """A prefix-add key backed only by a ClippableLinear .linear.weight still remaps via the unique-prefix path."""
     out = _infer_prefix_and_remap(_lw(["model.layers.0.mlp.gate_proj"]),
                                   ["model.language_model.layers.0.mlp.gate_proj.linear.weight"])
     assert out is not None
@@ -385,9 +338,7 @@ def test_remap_prefix_add_onto_linear_weight():
 
 
 def test_remap_strip_does_not_drop_semantic_namespace_to_bare_layers():
-    """The wrapper-strip fallback must remove only generic wrapper components (model/
-    base_model/module), never a semantic namespace. An unbacked vision adapter sharing a
-    suffix with a bare language tensor must not be merged onto it."""
+    """Wrapper-strip removes only generic wrappers, never a semantic namespace onto a bare language tensor."""
     out = _infer_prefix_and_remap(
         _lw(["model.vision_tower.layers.0.self_attn.q_proj"]),
         ["layers.0.self_attn.q_proj.weight"],
@@ -399,8 +350,7 @@ def test_remap_strip_does_not_drop_semantic_namespace_to_bare_layers():
 
 
 def test_remap_strip_still_drops_leading_model_wrapper():
-    """The legitimate case still works: model.vision_tower.* strips the leading model.
-    onto the real vision_tower.* base tensor."""
+    """The legitimate case still works: model.vision_tower.* strips onto the real vision_tower.* tensor."""
     out = _infer_prefix_and_remap(
         _lw(["model.vision_tower.transformer.layers.0.attention.q_proj"]),
         ["vision_tower.transformer.layers.0.attention.q_proj.weight"])
@@ -410,8 +360,7 @@ def test_remap_strip_still_drops_leading_model_wrapper():
 
 
 def test_count_fused_named_gate_up_proj_backed_by_per_expert():
-    """A fused-named LoRA key ...experts.gate_up_proj is backed by per-expert descendants
-    ...experts.<e>.gate_proj.weight (the merge maps them onto it), so it must count."""
+    """A fused-named key ...experts.gate_up_proj is backed by per-expert descendants, so it counts."""
     keys = ["model.layers.0.mlp.experts.gate_up_proj"]
     disk = ["model.layers.0.mlp.experts.0.gate_proj.weight", "model.layers.0.mlp.experts.0.up_proj.weight",
             "model.layers.0.mlp.experts.1.gate_proj.weight", "model.layers.0.mlp.experts.1.up_proj.weight"]
@@ -419,9 +368,7 @@ def test_count_fused_named_gate_up_proj_backed_by_per_expert():
 
 
 def test_count_native_mxfp4_does_not_count_packed():
-    """Native mxfp4 save (save_method='mxfp4') preserves _blocks/_scales without merging,
-    so a LoRA on a packed expert is not written and must not be counted (count_packed_mxfp4
-    =False). The dequantizing path (default True) does count it, since it merges."""
+    """Native mxfp4 save preserves packed experts without merging, so count_packed_mxfp4=False -> 0, True -> 1."""
     keys = ["model.layers.0.mlp.experts.gate_up_proj"]
     disk = ["model.layers.0.mlp.experts.gate_up_proj_blocks", "model.layers.0.mlp.experts.gate_up_proj_scales"]
     assert _count_backed_lora_modules(_lw(keys), set(disk), "PreTrainedModel", False,
