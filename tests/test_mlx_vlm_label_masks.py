@@ -49,6 +49,101 @@ class _FakeProcessor:
         }
 
 
+class _ResponseMaskFilteringProcessor:
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    chat_template = "{{ messages }}"
+
+    def __call__(self, text, **_kwargs):
+        rows = []
+        masks = []
+        for value in text:
+            if "bad" in value:
+                row = [101, 10, 0, 0]
+                mask = [1, 1, 0, 0]
+            else:
+                row = [101, 12, 13, 0]
+                mask = [1, 1, 1, 0]
+            rows.append(row)
+            masks.append(mask)
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+        }
+
+
+class _PromptCompletionProcessor:
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    chat_template = "{{ messages }}"
+
+    def __call__(self, text, **_kwargs):
+        rows = []
+        masks = []
+        for value in text:
+            if value == "prompt":
+                row = [101, 0, 0, 0]
+                mask = [1, 0, 0, 0]
+            else:
+                row = [101, 102, 103, 0]
+                mask = [1, 1, 1, 0]
+            rows.append(row)
+            masks.append(mask)
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+        }
+
+
+class _ConversationalPromptCompletionProcessor:
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.images_seen = []
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        assert tokenize is False
+        parts = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            if message.get("role") == "user":
+                parts.append(f"USER:{content}")
+            elif message.get("role") == "assistant":
+                parts.append(f"ASSISTANT:{content}")
+        if add_generation_prompt:
+            parts.append("ASSISTANT:")
+        return "\n".join(parts)
+
+    def __call__(self, text, images=None, **_kwargs):
+        self.images_seen.append(images)
+        rows = []
+        masks = []
+        for value in text:
+            if value == "USER:Q\nASSISTANT:":
+                row = [101, 102, 0]
+                mask = [1, 1, 0]
+            elif value == "A":
+                row = [103, 0, 0]
+                mask = [1, 0, 0]
+            else:
+                row = [999, 0, 0]
+                mask = [1, 0, 0]
+            rows.append(row)
+            masks.append(mask)
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+        }
+
+
 def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
     from unsloth_zoo.mlx.utils import (
         _collate_vlm_batch,
@@ -98,6 +193,385 @@ def test_vlm_response_mask_reapplies_special_token_masks():
     )
 
     assert out["labels"].tolist() == [[-100, -100, 13, -100]]
+
+
+def test_vlm_response_mask_preserves_existing_labels_like_cuda():
+    from unsloth_zoo.mlx.utils import _apply_response_mask_to_vlm_batch
+
+    batch = {
+        "input_ids": mx.array([[101, 12, 13, 0]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1, 0]], dtype=mx.int32),
+        "labels": mx.array([[-100, 777, -100, -100]], dtype=mx.int64),
+    }
+
+    def mask_fn(mask_batch):
+        old_labels = mask_batch["labels"].tolist()
+        return {"labels": [[-100, old_labels[0][1], old_labels[0][2], -100]]}
+
+    out = _apply_response_mask_to_vlm_batch(batch, mask_fn, ignore_token_ids=[0])
+
+    assert out["labels"].tolist() == [[-100, 777, -100, -100]]
+
+
+def test_vlm_response_mask_drops_fully_masked_rows():
+    from unsloth_zoo.mlx.utils import create_vlm_batches
+
+    def mask_fn(batch):
+        labels = []
+        for row in batch["input_ids"]:
+            if 10 in row:
+                labels.append([-100] * len(row))
+            else:
+                labels.append([-100, 12, 13, 0])
+        return {"labels": labels}
+
+    batches = create_vlm_batches(
+        dataset=[{"text": "bad"}, {"text": "good"}],
+        processor=_ResponseMaskFilteringProcessor(),
+        config={},
+        batch_size=2,
+        max_seq_length=8,
+        response_mask_fn=mask_fn,
+        dataset_order="sequential",
+    )
+
+    assert len(batches) == 1
+    assert batches[0]["input_ids"].tolist() == [[101, 12, 13, 0]]
+    assert batches[0]["labels"].tolist() == [[-100, 12, 13, -100]]
+
+
+def test_vlm_response_mask_filters_before_batching_like_cuda():
+    from unsloth_zoo.mlx.utils import create_vlm_batches
+
+    def mask_fn(batch):
+        labels = []
+        for row in batch["input_ids"]:
+            if 10 in row:
+                labels.append([-100] * len(row))
+            else:
+                labels.append([-100, 12, 13, 0])
+        return {"labels": labels}
+
+    batches = create_vlm_batches(
+        dataset=[{"text": "good-1"}, {"text": "bad"}, {"text": "good-2"}],
+        processor=_ResponseMaskFilteringProcessor(),
+        config={},
+        batch_size=2,
+        max_seq_length=8,
+        response_mask_fn=mask_fn,
+        dataset_order="sequential",
+    )
+
+    assert len(batches) == 1
+    assert batches[0]["input_ids"].tolist() == [
+        [101, 12, 13, 0],
+        [101, 12, 13, 0],
+    ]
+    assert batches[0]["labels"].tolist() == [
+        [-100, 12, 13, -100],
+        [-100, 12, 13, -100],
+    ]
+
+
+def test_vlm_streaming_response_mask_skips_fully_masked_rows():
+    from unsloth_zoo.mlx.utils import iterate_vlm_training_batches
+
+    class StreamingDataset:
+        def __iter__(self):
+            return iter([{"text": "bad"}, {"text": "good"}])
+
+    def mask_fn(batch):
+        labels = []
+        for row in batch["input_ids"]:
+            if 10 in row:
+                labels.append([-100] * len(row))
+            else:
+                labels.append([-100, 12, 13, 0])
+        return {"labels": labels}
+
+    batches = iterate_vlm_training_batches(
+        dataset=StreamingDataset(),
+        processor=_ResponseMaskFilteringProcessor(),
+        config={},
+        batch_size=2,
+        max_seq_length=8,
+        response_mask_fn=mask_fn,
+    )
+    batch = next(batches)
+
+    assert batch["input_ids"].tolist() == [[101, 12, 13, 0]]
+    assert batch["labels"].tolist() == [[-100, 12, 13, -100]]
+
+
+def test_vlm_response_mask_formats_each_filtered_row_once():
+    from unsloth_zoo.mlx.utils import create_vlm_batches
+
+    calls = []
+
+    def formatting_func(item):
+        calls.append(item["text"])
+        return {"text": item["text"]}
+
+    def mask_fn(batch):
+        return {"labels": [[-100, 12, 13, 0] for _ in batch["input_ids"]]}
+
+    batches = create_vlm_batches(
+        dataset=[{"text": "good-1"}, {"text": "good-2"}],
+        processor=_ResponseMaskFilteringProcessor(),
+        config={},
+        batch_size=2,
+        max_seq_length=8,
+        response_mask_fn=mask_fn,
+        formatting_func=formatting_func,
+        dataset_order="sequential",
+    )
+
+    assert calls == ["good-1", "good-2"]
+    assert len(batches) == 1
+
+
+def test_vlm_filter_caches_only_kept_formatted_rows():
+    from unsloth_zoo.mlx.utils import _filter_trainable_vlm_indices
+
+    def formatting_func(item):
+        return {"text": item["text"]}
+
+    def mask_fn(batch):
+        labels = []
+        for row in batch["input_ids"]:
+            if 10 in row:
+                labels.append([-100] * len(row))
+            else:
+                labels.append([-100, 12, 13, 0])
+        return {"labels": labels}
+
+    kept, removed, formatted_items = _filter_trainable_vlm_indices(
+        [{"text": "bad"}, {"text": "good"}],
+        [0, 1],
+        _ResponseMaskFilteringProcessor(),
+        {},
+        max_seq_length=8,
+        image_size=16,
+        response_mask_fn=mask_fn,
+        formatting_func=formatting_func,
+    )
+
+    assert kept == [1]
+    assert removed == 1
+    assert formatted_items == {1: {"text": "good"}}
+
+
+def test_vlm_prompt_completion_skips_response_mask_like_cuda():
+    from unsloth_zoo.mlx.utils import create_vlm_batches
+
+    def mask_fn(_batch):
+        raise AssertionError("CUDA VLM prompt/completion returns before response masking")
+
+    batches = create_vlm_batches(
+        dataset=[{"prompt": "prompt", "completion": "completion"}],
+        processor=_PromptCompletionProcessor(),
+        config={},
+        batch_size=1,
+        max_seq_length=8,
+        response_mask_fn=mask_fn,
+        dataset_order="sequential",
+    )
+
+    assert batches[0]["labels"].tolist() == [[-100, 101, 102, 103]]
+
+
+def test_vlm_prompt_completion_honors_completion_only_loss_false():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    default_batch = _collate_vlm_batch(
+        [{"prompt": "prompt", "completion": "completion"}],
+        _PromptCompletionProcessor(),
+        max_seq_length=8,
+        image_size=16,
+    )
+    batch = _collate_vlm_batch(
+        [{"prompt": "prompt", "completion": "completion"}],
+        _PromptCompletionProcessor(),
+        max_seq_length=8,
+        image_size=16,
+        completion_only_loss=False,
+    )
+
+    assert default_batch["labels"].tolist() == [[-100, 101, 102, 103]]
+    assert batch["labels"].tolist() == [[101, 101, 102, 103]]
+
+
+def test_vlm_prompt_completion_conversational_uses_cuda_prompt_split():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    processor = _ConversationalPromptCompletionProcessor()
+    batch = _collate_vlm_batch(
+        [{
+            "prompt": [{"role": "user", "content": [{"type": "text", "text": "Q"}]}],
+            "completion": [{"role": "assistant", "content": [{"type": "text", "text": "A"}]}],
+        }],
+        processor,
+        max_seq_length=8,
+        image_size=16,
+    )
+
+    assert batch["input_ids"].tolist() == [[101, 102, 103]]
+    assert batch["labels"].tolist() == [[-100, -100, 103]]
+
+
+def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    processor = _ConversationalPromptCompletionProcessor()
+    _collate_vlm_batch(
+        [{
+            "image": "top-level",
+            "prompt": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "embedded"},
+                    {"type": "text", "text": "Q"},
+                ],
+            }],
+            "completion": [{"role": "assistant", "content": [{"type": "text", "text": "A"}]}],
+        }],
+        processor,
+        max_seq_length=8,
+        image_size=16,
+    )
+
+    assert processor.images_seen[0] == ["embedded"]
+
+
+def test_vlm_top_level_image_key_is_not_cuda_images_alias():
+    from unsloth_zoo.mlx.utils import _extract_vlm_images
+
+    assert _extract_vlm_images({"image": "top-level"}, [], image_size=16) == []
+
+
+def test_vlm_image_extraction_raises_process_errors_like_cuda(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_images
+
+    def fail_process_vision_info(*_args, **_kwargs):
+        raise ValueError("bad image")
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fail_process_vision_info,
+    )
+
+    with pytest.raises(ValueError, match="bad image"):
+        _extract_vlm_images(
+            [{"role": "user", "content": [{"type": "image"}]}],
+            [{"role": "user", "content": [{"type": "image"}]}],
+            image_size=16,
+        )
+
+
+def test_vlm_prompt_completion_top_level_image_errors_are_suppressed_like_cuda(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    def fail_process_vision_info(*_args, **_kwargs):
+        raise ValueError("bad top-level image")
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fail_process_vision_info,
+    )
+
+    assert _extract_vlm_pc_images({"images": ["bad"]}, [], [], image_size=16) == []
+
+
+def test_vlm_prompt_completion_top_level_images_use_cuda_process_shape(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    seen = {}
+
+    def fake_process_vision_info(conversations, **kwargs):
+        seen["conversations"] = conversations
+        seen["kwargs"] = kwargs
+        return ["processed"], None, {"fps": []}
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fake_process_vision_info,
+    )
+
+    assert _extract_vlm_pc_images({"images": ["raw"]}, [], [], image_size=16) == ["processed"]
+    assert seen == {
+        "conversations": [{"image": "raw"}],
+        "kwargs": {"return_video_kwargs": True},
+    }
+
+
+def test_vlm_prompt_completion_message_rows_do_not_fallback_to_top_level_images(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    def fake_process_vision_info(_conversations, **_kwargs):
+        return None, None, {"fps": []}
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fake_process_vision_info,
+    )
+
+    assert _extract_vlm_pc_images(
+        {"images": ["top-level"]},
+        [{"role": "user", "content": [{"type": "text", "text": "Q"}]}],
+        [{"role": "assistant", "content": [{"type": "text", "text": "A"}]}],
+        image_size=16,
+    ) == []
+
+
+def test_vlm_render_falls_back_to_content_part_templates():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class ContentPartProcessor:
+        chat_template = "parts"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            assert tokenize is False
+            if messages and all(isinstance(part, dict) and "type" in part for part in messages):
+                return "parts:" + ",".join(part["type"] for part in messages)
+            raise ValueError("expected content parts")
+
+    rendered = _render_vlm_messages(
+        ContentPartProcessor(),
+        [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Q"}]}],
+    )
+
+    assert rendered == "parts:image,text"
+
+
+def test_vlm_render_falls_back_to_text_templates():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class TextTemplateProcessor:
+        chat_template = "text"
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+            assert tokenize is False
+            if messages and all(isinstance(message.get("content"), str) for message in messages):
+                return "|".join(message["content"] for message in messages)
+            raise ValueError("expected text content")
+
+    rendered = _render_vlm_messages(
+        TextTemplateProcessor(),
+        [
+            {"role": "user", "content": [{"type": "text", "text": "Q"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "A"}]},
+        ],
+    )
+
+    assert rendered == "Q|A"
 
 
 def test_vlm_processor_inputs_flattens_qwen_style_images():

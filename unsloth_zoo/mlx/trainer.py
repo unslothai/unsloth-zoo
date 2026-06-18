@@ -64,6 +64,7 @@ from .utils import (
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
+    encode_mlx_text,
     _get_vlm_ignore_token_ids,
     collect_mlx_texts,
     save_lora_adapters,
@@ -86,6 +87,62 @@ from .compile import (
     resolve_training_compile,
     trace_compile_application,
 )
+
+
+def _is_hf_tokenizer(tokenizer):
+    """Check whether a wrapper has already resolved to an HF tokenizer."""
+    try:
+        from transformers import PreTrainedTokenizerBase
+    except Exception:
+        return False
+    return isinstance(tokenizer, PreTrainedTokenizerBase)
+
+
+def _resolve_response_mask_tokenizer(tokenizer):
+    """Return a callable HF tokenizer for the CUDA response-mask helper."""
+    for _ in range(3):
+        if _is_hf_tokenizer(tokenizer):
+            return tokenizer
+
+        processor_tokenizer = getattr(tokenizer, "tokenizer", None)
+        if processor_tokenizer is not None and processor_tokenizer is not tokenizer:
+            tokenizer = processor_tokenizer
+            continue
+
+        # mlx-lm TokenizerWrapper stores the HF tokenizer under _tokenizer.
+        # HF fast tokenizers also expose _tokenizer, but that is the low-level
+        # Rust tokenizer and is not callable like PreTrainedTokenizerBase.
+        wrapped = getattr(tokenizer, "_tokenizer", None)
+        if (
+            wrapped is not None
+            and wrapped is not tokenizer
+            and (
+                not hasattr(tokenizer, "convert_tokens_to_ids")
+                or callable(wrapped)
+            )
+        ):
+            tokenizer = wrapped
+            continue
+
+        break
+
+    if not callable(tokenizer):
+        raise TypeError(
+            "Unsloth MLX: train_on_responses_only requires a callable "
+            "Hugging Face tokenizer or a processor/tokenizer wrapper that "
+            "contains one."
+        )
+    return tokenizer
+
+
+def _text_completion_only_loss_arg(args):
+    """Resolve SFT-compatible completion-only loss defaults."""
+    value = getattr(args, "completion_only_loss", None)
+    if value is not None:
+        return value
+    if bool(getattr(args, "train_on_completions", False)):
+        return True
+    return None
 
 
 def _normalize_mlx_optimizer_name(name):
@@ -475,6 +532,7 @@ class MLXTrainingConfig:
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
+    completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
@@ -863,9 +921,8 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
-    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
-        """Run evaluation loop; returns (avg_loss, perplexity)."""
-        self.model.eval()
+    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+        """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
 
@@ -881,9 +938,47 @@ class MLXTrainer:
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
 
+        return all_losses, ntokens
+
+    def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
+        """Run evaluation loop.
+
+        Returns:
+            (avg_loss, perplexity) tuple.
+        """
+        self.model.eval()
+        metrics = {}
+        if isinstance(eval_batches, dict):
+            all_losses = mx.array(0.0)
+            ntokens = mx.array(0)
+            for split_name, split_batches in eval_batches.items():
+                split_losses, split_tokens = self._evaluate_batch_totals(
+                    split_batches, loss_fn, is_vlm=is_vlm,
+                )
+                all_losses += split_losses
+                ntokens += split_tokens
+                mx.eval(all_losses, ntokens)
+                split_loss = (
+                    (split_losses / split_tokens).item()
+                    if split_tokens.item() > 0 else 0.0
+                )
+                split_ppl = math.exp(min(split_loss, 100))
+                split_prefix = f"eval_{split_name}"
+                metrics[f"{split_prefix}_loss"] = split_loss
+                metrics[f"{split_prefix}_perplexity"] = split_ppl
+                if self.stop_requested:
+                    break
+        else:
+            all_losses, ntokens = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm,
+            )
+
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
         perplexity = math.exp(min(avg_loss, 100))
+        metrics["eval_loss"] = avg_loss
+        metrics["eval_perplexity"] = perplexity
+        self._last_eval_metrics = metrics
         return avg_loss, perplexity
 
     @staticmethod
@@ -1522,46 +1617,62 @@ class MLXTrainer:
 
         # Prepare eval batches
         eval_batches = None
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
-            elif is_vlm:
-                processor = self._resolve_vlm_processor()
-                config = getattr(self.model, "_config", {})
-                _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-                eval_batches = create_vlm_batches(
-                    dataset=self.eval_dataset,
-                    processor=processor,
-                    config=config,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    seed=args.seed,
-                    response_mask_fn=_vlm_mask_fn,
-                    formatting_func=self.formatting_func,
-                )
             else:
-                eval_batches = create_batches(
-                    dataset=self.eval_dataset,
-                    tokenizer=self.tokenizer,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    seed=args.seed,
-                    dataset_text_field=args.dataset_text_field,
-                    formatting_func=self.formatting_func,
-                    chat_template=getattr(args, "chat_template", None),
-                    model_name=getattr(self.model, "_hf_repo", None),
-                    model_type=(
-                        getattr(self.model, "_config", {}).get("model_type")
-                        if isinstance(getattr(self.model, "_config", {}), dict)
-                        else None
-                    ),
-                    append_eos=bool(getattr(args, "append_eos", True)),
-                )
+                def _create_eval_batches(eval_dataset):
+                    """Materialize eval batches for one dataset split."""
+                    if is_vlm:
+                        processor = self._resolve_vlm_processor()
+                        config = getattr(self.model, "_config", {})
+                        _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
+                        return create_vlm_batches(
+                            dataset=eval_dataset,
+                            processor=processor,
+                            config=config,
+                            batch_size=args.per_device_train_batch_size,
+                            max_seq_length=args.max_seq_length,
+                            seed=args.seed,
+                            response_mask_fn=_vlm_mask_fn,
+                            formatting_func=self.formatting_func,
+                            completion_only_loss=text_completion_only_loss,
+                        )
+                    return create_batches(
+                        dataset=eval_dataset,
+                        tokenizer=self.tokenizer,
+                        batch_size=args.per_device_train_batch_size,
+                        max_seq_length=args.max_seq_length,
+                        seed=args.seed,
+                        dataset_text_field=args.dataset_text_field,
+                        formatting_func=self.formatting_func,
+                        chat_template=getattr(args, "chat_template", None),
+                        model_name=getattr(self.model, "_hf_repo", None),
+                        model_type=(
+                            getattr(self.model, "_config", {}).get("model_type")
+                            if isinstance(getattr(self.model, "_config", {}), dict)
+                            else None
+                        ),
+                        append_eos=bool(getattr(args, "append_eos", True)),
+                    )
+
+                if isinstance(self.eval_dataset, dict):
+                    eval_batches = {
+                        key: _create_eval_batches(value)
+                        for key, value in self.eval_dataset.items()
+                    }
+                else:
+                    eval_batches = _create_eval_batches(self.eval_dataset)
             if eval_batches:
+                eval_batch_count = (
+                    sum(len(value) for value in eval_batches.values())
+                    if isinstance(eval_batches, dict) else len(eval_batches)
+                )
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                      f"({len(eval_batches)} eval batches).")
+                      f"({eval_batch_count} eval batches).")
 
         features = []
         if is_vlm:
@@ -1935,6 +2046,7 @@ class MLXTrainer:
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
+        text_completion_only_loss = _text_completion_only_loss_arg(args)
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -1963,6 +2075,7 @@ class MLXTrainer:
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
+                    completion_only_loss=text_completion_only_loss,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -1978,6 +2091,7 @@ class MLXTrainer:
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
                     num_epochs=vlm_num_epochs,
+                    completion_only_loss=text_completion_only_loss,
                 )
                 if _vlm_mask_fn is not None and batches:
                     _check_vlm_all_masked(batches)
@@ -2231,7 +2345,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 2. Tokenize + mask in parallel (HF fast tokenizers are thread-safe).
     def _process_text(text):
-        encoded = tokenizer.encode(text)
+        encoded = encode_mlx_text(tokenizer, text)
         # Mirror `_prepare_dataset`'s EOS contract; mismatch desyncs labeled vs unlabeled.
         if append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
             encoded.append(eos_id)
@@ -2245,12 +2359,35 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             labels = labels.tolist()
         return (encoded, labels[0])
 
+    # Filter out samples where all labels are -100 (no valid training signal).
+    # This can happen when truncation cuts off the response_part entirely,
+    # e.g. long reasoning/analysis channels in GPT-OSS that exceed max_seq_length.
+    # Such samples cause NaN loss since cross_entropy(mean) computes 0/0.
+    def _has_valid_labels(labels):
+        """Return whether a response-masked row still has trainable labels."""
+        # Loss supervises labels[1:] (causal shift), so the first label never trains.
+        return any(label != -100 for label in labels[1:])
+
     max_workers = min(4, os.cpu_count() or 1)
     all_items = []
+    n_before_filter = 0
+    n_removed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for result in executor.map(_process_text, all_texts):
             if result is not None:
-                all_items.append(result)
+                n_before_filter += 1
+                if _has_valid_labels(result[1]):
+                    all_items.append(result)
+                else:
+                    n_removed += 1
+
+    if n_removed > 0:
+        print(
+            f"Unsloth: Removed {n_removed} out of {n_before_filter} samples "
+            f"from train_dataset where all labels were -100 "
+            f"(no response found after truncation). "
+            f"This prevents NaN loss during training."
+        )
 
     if not all_items:
         raise ValueError(
@@ -2429,6 +2566,7 @@ def train_on_responses_only(
     tokenizer=None,
     return_function=False,
     num_proc=None,
+    last_response_only=False,
 ):
     """Mask instruction tokens from loss — train only on assistant responses.
 
@@ -2444,6 +2582,8 @@ def train_on_responses_only(
         tokenizer: Optional override; defaults to trainer.tokenizer.
         return_function: If True, return the masking closure only.
         num_proc: Accepted for HF API compat, unused on MLX.
+        last_response_only: If True, only the final assistant response is
+            unmasked, matching the CUDA helper.
 
     Returns:
         The trainer (for chaining), or the closure if return_function=True.
@@ -2462,16 +2602,7 @@ def train_on_responses_only(
             "kwarg or via trainer.tokenizer."
         )
 
-    # Unwrap to a callable HF tokenizer (mlx-lm TokenizerWrapper._tokenizer,
-    # or VLM processor.tokenizer). The HF masking impl calls tokenizer(...),
-    # and mlx-lm's TokenizerWrapper proxies attributes but is not callable,
-    # so require both. HF fast tokenizers already speak the API and their
-    # _tokenizer is the Rust backend, so leave those as-is.
-    if not (callable(_tokenizer) and hasattr(_tokenizer, "convert_tokens_to_ids")):
-        if hasattr(_tokenizer, "_tokenizer"):
-            _tokenizer = _tokenizer._tokenizer
-        elif hasattr(_tokenizer, "tokenizer"):
-            _tokenizer = _tokenizer.tokenizer
+    _tokenizer = _resolve_response_mask_tokenizer(_tokenizer)
 
     # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
@@ -2481,6 +2612,7 @@ def train_on_responses_only(
         force_match=force_match,
         tokenizer=_tokenizer,
         return_function=True,
+        last_response_only=last_response_only,
     )
 
     if return_function:
@@ -2544,26 +2676,36 @@ def train_on_responses_only(
 
         # Process eval dataset too
         if trainer.eval_dataset is not None:
-            eval_batches = _create_labeled_batches(
-                dataset=trainer.eval_dataset,
-                tokenizer=_tokenizer,
-                mask_fn=mask_fn,
-                batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
-                formatting_func=trainer.formatting_func,
-                dataset_text_field=args.dataset_text_field,
-                seed=args.seed,
-                chat_template=getattr(args, "chat_template", None),
-                model_name=getattr(trainer.model, "_hf_repo", None),
-                model_type=(
-                    getattr(trainer.model, "_config", {}).get("model_type")
-                    if isinstance(getattr(trainer.model, "_config", {}), dict)
-                    else None
-                ),
-                append_eos=bool(getattr(args, "append_eos", True)),
-                dataset_order=getattr(args, "dataset_order", "default"),
-                preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
-            )
+            def _create_labeled_eval_batches(eval_dataset):
+                """Build response-masked eval batches for one dataset split."""
+                return _create_labeled_batches(
+                    dataset=eval_dataset,
+                    tokenizer=_tokenizer,
+                    mask_fn=mask_fn,
+                    batch_size=args.per_device_train_batch_size,
+                    max_seq_length=args.max_seq_length,
+                    formatting_func=trainer.formatting_func,
+                    dataset_text_field=args.dataset_text_field,
+                    seed=args.seed,
+                    chat_template=getattr(args, "chat_template", None),
+                    model_name=getattr(trainer.model, "_hf_repo", None),
+                    model_type=(
+                        getattr(trainer.model, "_config", {}).get("model_type")
+                        if isinstance(getattr(trainer.model, "_config", {}), dict)
+                        else None
+                    ),
+                    append_eos=bool(getattr(args, "append_eos", True)),
+                    dataset_order=getattr(args, "dataset_order", "default"),
+                    preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                )
+
+            if isinstance(trainer.eval_dataset, dict):
+                eval_batches = {
+                    key: _create_labeled_eval_batches(value)
+                    for key, value in trainer.eval_dataset.items()
+                }
+            else:
+                eval_batches = _create_labeled_eval_batches(trainer.eval_dataset)
             trainer._eval_batches_labeled = eval_batches
 
         print(f"Unsloth: train_on_responses_only enabled "

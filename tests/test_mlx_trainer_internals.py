@@ -62,8 +62,26 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "gradient_checkpointing",
         "dataset_order",
         "preserve_dataset_order",
+        "completion_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
+
+
+def test_mlx_training_config_exposes_completion_only_loss():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _text_completion_only_loss_arg,
+    )
+
+    assert _text_completion_only_loss_arg(
+        MLXTrainingConfig(completion_only_loss=False)
+    ) is False
+    assert _text_completion_only_loss_arg(
+        MLXTrainingConfig(completion_only_loss=True)
+    ) is True
+    assert _text_completion_only_loss_arg(
+        MLXTrainingConfig(train_on_completions=True)
+    ) is True
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
@@ -294,12 +312,126 @@ def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
     assert dataset_default[0] == ([1, 2, 3, 99], 0)
 
 
+def test_encode_mlx_text_keeps_raw_text_bos_when_template_has_bos():
+    from unsloth_zoo.mlx.utils import encode_mlx_text
+
+    class Tokenizer:
+        bos_token = "<s>"
+        chat_template = "{{ bos_token }}{{ messages }}"
+
+        def __init__(self):
+            self.add_special_tokens_seen = []
+
+        def encode(self, text, add_special_tokens=True):
+            self.add_special_tokens_seen.append(add_special_tokens)
+            return [1, 2, 3]
+
+    tokenizer = Tokenizer()
+
+    encode_mlx_text(tokenizer, "raw text")
+    encode_mlx_text(tokenizer, "<s>rendered text")
+
+    assert tokenizer.add_special_tokens_seen == [True, False]
+
+
 def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
     source = inspect.getsource(mlx_utils.make_baseline_loss_fn)
     assert "steps < lengths[:, 1:]" in source
+
+
+def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    class CallableTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+    received = {}
+
+    def fake_hf(trainer, *, instruction_part=None, response_part=None,
+                force_match=True, tokenizer=None, return_function=False,
+                num_proc=None, last_response_only=False):
+        received["last_response_only"] = last_response_only
+        return lambda batch: batch
+
+    monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    train_on_responses_only(
+        None,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        tokenizer=CallableTokenizer(),
+        return_function=True,
+        last_response_only=True,
+    )
+
+    assert received["last_response_only"] is True
+
+
+def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
+    from unsloth_zoo.mlx.trainer import _resolve_response_mask_tokenizer
+
+    class EncodeOnlyTokenizer:
+        def encode(self, text):
+            return [1, 2, 3]
+
+        def convert_tokens_to_ids(self, token):
+            return 1
+
+    with pytest.raises(TypeError, match="requires a callable"):
+        _resolve_response_mask_tokenizer(EncodeOnlyTokenizer())
+
+
+def test_vlm_eval_batches_define_completion_only_loss_before_use():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._train_inner)
+    definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
+    eval_use = source.index("completion_only_loss=text_completion_only_loss")
+    assert definition < eval_use
+
+
+def test_evaluate_dict_eval_datasets_records_split_metrics():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def __init__(self):
+            self.modes = []
+
+        def eval(self):
+            self.modes.append("eval")
+
+        def train(self):
+            self.modes.append("train")
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+
+    def loss_fn(_model, name, _lengths, _labels):
+        if name == "small":
+            return mx.array(1.0), mx.array(2)
+        return mx.array(3.0), mx.array(6)
+
+    loss, ppl = trainer._evaluate(
+        {"small": [("small", None, None)], "large": [("large", None, None)]},
+        loss_fn,
+        is_vlm=False,
+    )
+
+    assert loss == pytest.approx(2.5)
+    assert ppl == pytest.approx(__import__("math").exp(2.5))
+    assert trainer._last_eval_metrics["eval_small_loss"] == pytest.approx(1.0)
+    assert trainer._last_eval_metrics["eval_large_loss"] == pytest.approx(3.0)
+    assert trainer._last_eval_metrics["eval_loss"] == pytest.approx(2.5)
+    assert trainer.model.modes == ["eval", "train"]
 
 
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():

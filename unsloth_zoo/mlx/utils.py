@@ -2070,6 +2070,19 @@ def normalize_vlm_processor_chat_template(
     )
 
 
+def encode_mlx_text(tokenizer, text):
+    """Tokenize text while mirroring Unsloth's double-BOS guard."""
+    add_special_tokens = True
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if bos_token is not None and text.startswith(bos_token):
+        add_special_tokens = False
+
+    try:
+        return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    except TypeError:
+        return tokenizer.encode(text)
+
+
 def _raise_mlx_chat_template_error(target, *, is_vlm=False):
     if is_vlm:
         _raise_vlm_chat_template_error(target)
@@ -2210,28 +2223,24 @@ def _collapse_vlm_assistant_content(messages):
 
 
 def _flatten_vlm_content_for_text_template(messages):
+    """Render list-style VLM content as text for text-only chat templates."""
     flattened = copy.deepcopy(messages)
     for message in flattened:
         content = message.get("content", "")
-        if isinstance(content, list):
-            texts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(str(part.get("text", "")))
-                elif isinstance(part, str):
-                    texts.append(part)
-            message["content"] = "".join(texts)
+        if not isinstance(content, list):
+            continue
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                texts.append(part)
+        message["content"] = "".join(texts)
     return flattened
 
 
 def _flatten_vlm_messages_to_content_parts(messages):
-    """Flatten role messages for processors whose template expects content parts.
-
-    Some mlx-vlm base processors ship a VLM token template, not a chat template.
-    For example Qwen2-VL base templates iterate directly over content parts like
-    {"type": "image"} / {"type": "text"}, and render an empty string when given
-    role-wrapped messages.
-    """
+    """Flatten role messages for mlx-vlm processors with content-part templates."""
     parts = []
     for message in messages:
         content = message.get("content", "")
@@ -2309,7 +2318,12 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
-def _render_vlm_messages(processor, messages):
+def _render_vlm_messages(
+    processor,
+    messages,
+    *,
+    add_generation_prompt=False,
+):
     normalize_vlm_processor_chat_template(processor, strict=True)
     if isinstance(messages, str):
         return messages
@@ -2318,47 +2332,45 @@ def _render_vlm_messages(processor, messages):
     if not _processor_accepts_assistant_list_content(processor):
         render_messages = _collapse_vlm_assistant_content(render_messages)
 
+    first_error = None
+    second_error = None
+    third_error = None
+
     try:
         text = processor.apply_chat_template(
             render_messages,
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
         text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
-    except Exception as first_exc:
-        first_error = first_exc
-    else:
-        first_error = None
+    except Exception as exc:
+        first_error = exc
 
     try:
         text = processor.apply_chat_template(
             _flatten_vlm_messages_to_content_parts(messages),
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
         text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
-    except Exception as second_exc:
-        second_error = second_exc
-    else:
-        second_error = None
+    except Exception as exc:
+        second_error = exc
 
     try:
         text = processor.apply_chat_template(
             _flatten_vlm_content_for_text_template(render_messages),
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
         text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
-    except Exception as third_exc:
-        third_error = third_exc
-    else:
-        third_error = None
+    except Exception as exc:
+        third_error = exc
 
     if first_error is not None:
         raise RuntimeError(
@@ -2504,10 +2516,16 @@ def _resize_vlm_images(images, image_size):
     return resized
 
 
-def _extract_vlm_images(item, messages, image_size):
+def _extract_vlm_images(
+    item,
+    messages,
+    image_size,
+    *,
+    suppress_process_errors=False,
+):
     images = []
     if isinstance(item, dict):
-        image = item.get("image", item.get("images"))
+        image = item.get("images")
         if image is not None:
             images = image if isinstance(image, list) else [image]
 
@@ -2532,9 +2550,43 @@ def _extract_vlm_images(item, messages, image_size):
                 if maybe_images is not None:
                     images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
         except Exception:
-            pass
+            if not suppress_process_errors:
+                raise
 
     return _resize_vlm_images(images, image_size)
+
+
+def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_size):
+    """Extract VLM PC images with CUDA's embedded-then-top-level preference."""
+    messages = (prompt_messages or []) + (completion_messages or [])
+    if messages:
+        images = _extract_vlm_images(
+            {},
+            messages,
+            image_size,
+            suppress_process_errors=True,
+        )
+        if images:
+            return images
+        return []
+
+    if isinstance(item, dict) and "images" in item:
+        try:
+            from ..vision_utils import process_vision_info
+
+            raw_images = item["images"]
+            vision_infos = [{"image": raw_images[i]} for i in range(len(raw_images))]
+            extracted = process_vision_info(vision_infos, return_video_kwargs=True)
+            images = extracted[0] if isinstance(extracted, tuple) and extracted else None
+            if images is None:
+                images = []
+            elif not isinstance(images, list):
+                images = [images]
+        except Exception:
+            images = []
+        return _resize_vlm_images(images, image_size)
+
+    return []
 
 
 def _flatten_vlm_images(all_images):
@@ -2643,15 +2695,27 @@ def _to_mx_vlm_batch(inputs):
     return batch
 
 
-def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes=None):
+def _processor_vlm_inputs(
+    processor,
+    texts,
+    all_images,
+    max_seq_length,
+    suffixes=None,
+    truncation=True,
+    padding_side=None,
+):
     base_kwargs = dict(
         text=texts,
         padding=True,
-        truncation=True,
-        max_length=max_seq_length,
         return_tensors="np",
         add_special_tokens=False,
     )
+    if truncation:
+        base_kwargs["truncation"] = True
+        if max_seq_length is not None:
+            base_kwargs["max_length"] = max_seq_length
+    if padding_side is not None:
+        base_kwargs["padding_side"] = padding_side
     images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
         image_layouts = (
@@ -2698,6 +2762,16 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
                     if len(image_layouts) == 1:
                         raise
                     continue
+            if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
+                proc_kwargs.pop("padding_side", None)
+                try:
+                    return processor(**proc_kwargs)
+                except Exception as retry_exc:
+                    if first_error is None:
+                        first_error = retry_exc
+                    if len(image_layouts) == 1:
+                        raise
+                    continue
             if first_error is None:
                 first_error = exc
             if len(image_layouts) == 1:
@@ -2710,77 +2784,227 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
     raise first_error
 
 
-def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image_size,
-                                         ignore_token_ids=None):
+def _as_numpy_vlm_field(inputs, key):
+    """Return a processor output field as a 2-D numpy array."""
+    value = inputs[key]
+    arr = np.asarray(value)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    return arr
+
+
+def _common_text_prefix(left, right):
+    """Return CUDA's shared rendered prompt prefix for VLM PC rows."""
+    end = 0
+    for lhs, rhs in zip(left, right):
+        if lhs != rhs:
+            break
+        end += 1
+    return left[:end]
+
+
+def _vlm_tokenizer_padding_side(processor):
+    """Resolve the tokenizer padding side used by CUDA's VLM collator."""
+    tokenizer = _get_processor_tokenizer(processor)
+    side = getattr(tokenizer, "padding_side", "right")
+    return "left" if side == "left" else "right"
+
+
+def _vlm_pad_token_id(processor):
+    """Return the processor tokenizer pad id required for PC collation."""
+    tokenizer = _get_processor_tokenizer(processor)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        raise ValueError(
+            "Tokenizer must define `pad_token_id` for prompt-completion collation."
+        )
+    return int(pad_id)
+
+
+def _concat_vlm_token_type_ids(prompt_inputs, completion_inputs, p_ids, c_ids):
+    """Concatenate token-type metadata the same way CUDA's collator does."""
+    for key in ("token_type_ids", "mm_token_type_ids"):
+        if key not in prompt_inputs and key not in completion_inputs:
+            continue
+        p_tt = (
+            _as_numpy_vlm_field(prompt_inputs, key)
+            if key in prompt_inputs else np.zeros_like(p_ids)
+        )
+        c_tt = (
+            _as_numpy_vlm_field(completion_inputs, key)
+            if key in completion_inputs else np.zeros_like(c_ids)
+        )
+        return key, np.concatenate((p_tt, c_tt), axis=1)
+    return None, None
+
+
+def _flush_vlm_arrays_to_side(input_ids, attention_mask, side, pad_id, extras):
+    """Move non-pad VLM PC tokens to the tokenizer padding side."""
+    keep = attention_mask.astype(bool)
+    if keep.all():
+        return input_ids, attention_mask, extras
+
+    batch, seq_len = input_ids.shape
+    counts = keep.sum(axis=1)
+    ranks = np.cumsum(keep, axis=1) - 1
+    if side == "left":
+        dst = (seq_len - counts)[:, None] + ranks
+    else:
+        dst = ranks
+
+    row_idx, col_src = np.nonzero(keep)
+    col_dst = dst[row_idx, col_src].astype(np.int64)
+
+    new_ids = np.full(input_ids.shape, pad_id, dtype=input_ids.dtype)
+    new_mask = np.zeros(attention_mask.shape, dtype=attention_mask.dtype)
+    new_ids[row_idx, col_dst] = input_ids[row_idx, col_src]
+    new_mask[row_idx, col_dst] = 1
+
+    new_extras = {}
+    for key, values in extras.items():
+        out = np.zeros(values.shape, dtype=values.dtype)
+        out[row_idx, col_dst] = values[row_idx, col_src]
+        new_extras[key] = out
+
+    max_count = int(counts.max()) if counts.size else 0
+    if 0 < max_count < seq_len:
+        sl = slice(seq_len - max_count, seq_len) if side == "left" else slice(0, max_count)
+        new_ids = new_ids[:, sl]
+        new_mask = new_mask[:, sl]
+        new_extras = {key: value[:, sl] for key, value in new_extras.items()}
+
+    return new_ids, new_mask, new_extras
+
+
+def _truncate_vlm_arrays_by_side(input_ids, attention_mask, side, max_seq_length, extras):
+    """Truncate VLM PC arrays from the same side as CUDA."""
+    if max_seq_length is None or max_seq_length <= 0 or input_ids.shape[1] <= max_seq_length:
+        return input_ids, attention_mask, extras
+    sl = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
+    return (
+        input_ids[:, sl],
+        attention_mask[:, sl],
+        {key: value[:, sl] for key, value in extras.items()},
+    )
+
+
+def _collate_vlm_prompt_completion_batch(
+    items,
+    processor,
+    max_seq_length,
+    image_size,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+):
     prompt_texts = []
-    combined_texts = []
+    completion_texts = []
     all_images = []
 
     for item in items:
-        prompt = _normalize_vlm_messages(item.get("prompt", ""))
-        completion = _normalize_vlm_messages(item.get("completion", ""))
+        prompt_raw = item.get("prompt", "")
+        completion_raw = item.get("completion", "")
+        prompt = _normalize_vlm_messages(prompt_raw)
+        completion = _normalize_vlm_messages(completion_raw)
+        # Coerce a raw prompt to a chat message when the completion is chat-style so
+        # both render through one template and split cleanly (avoids None + list).
+        if isinstance(completion, list) and isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
 
-        if prompt_messages is not None and completion_messages is not None:
-            combined = prompt_messages + completion_messages
-            images = _extract_vlm_images(item, combined, image_size)
-            prompt_text = _render_vlm_messages(processor, prompt_messages)
-            combined_text = _render_vlm_messages(processor, combined)
+        if prompt_messages is not None:
+            prompt_text = _render_vlm_messages(
+                processor,
+                prompt_messages,
+                add_generation_prompt=True,
+            )
         else:
-            images = _extract_vlm_images(item, prompt_messages or [], image_size)
-            prompt_text = _render_vlm_messages(processor, prompt)
-            completion_text = _render_vlm_messages(processor, completion)
-            combined_text = prompt_text + completion_text
+            prompt_text = str(prompt)
+
+        if completion_messages is not None:
+            combined = prompt_messages + completion_messages
+            prompt_completion_text = _render_vlm_messages(processor, combined)
+            images = _extract_vlm_pc_images(
+                item, prompt_messages, completion_messages, image_size,
+            )
+            prompt_text = _common_text_prefix(
+                prompt_text, prompt_completion_text,
+            )
+            completion_text = prompt_completion_text[len(prompt_text):]
+        else:
+            images = _extract_vlm_pc_images(
+                item, prompt_messages, completion_messages, image_size,
+            )
+            completion_text = str(completion)
 
         prompt_texts.append(prompt_text)
-        combined_texts.append(combined_text)
+        completion_texts.append(completion_text)
         all_images.append(images)
 
-    combined_inputs = _processor_vlm_inputs(
-        processor, combined_texts, all_images, max_seq_length
-    )
     prompt_inputs = _processor_vlm_inputs(
-        processor, prompt_texts, all_images, max_seq_length
+        processor,
+        prompt_texts,
+        all_images,
+        max_seq_length,
+        truncation=False,
+        padding_side="left",
+    )
+    completion_inputs = _processor_vlm_inputs(
+        processor,
+        completion_texts,
+        [[] for _ in completion_texts],
+        max_seq_length,
+        truncation=False,
+        padding_side="right",
     )
 
-    # Build labels BEFORE _to_mx_vlm_batch narrows to int32 so wide invalid
-    # ids (e.g. uint32 wrap) reach the runtime CCE validity check intact.
-    # A direct int64 cast of uint64 would wrap 2**64-100 onto -100; saturate
-    # those rows to a positive out-of-vocab sentinel instead.
-    _raw_input_ids = np.asarray(combined_inputs["input_ids"])
-    if _raw_input_ids.dtype == np.uint64:
-        labels_np = np.where(
-            _raw_input_ids > np.uint64((1 << 63) - 1),
-            np.int64(1 << 62),
-            _raw_input_ids.astype(np.int64),
-        ).copy()
-    else:
-        labels_np = _raw_input_ids.astype(np.int64, copy=True)
+    p_ids = _as_numpy_vlm_field(prompt_inputs, "input_ids")
+    c_ids = _as_numpy_vlm_field(completion_inputs, "input_ids")
+    p_mask = _as_numpy_vlm_field(prompt_inputs, "attention_mask")
+    c_mask = _as_numpy_vlm_field(completion_inputs, "attention_mask")
+    input_ids = np.concatenate((p_ids, c_ids), axis=1)
+    attention_mask = np.concatenate((p_mask, c_mask), axis=1)
+    completion_mask = np.concatenate((np.zeros_like(p_mask), c_mask), axis=1)
+    token_type_key, token_type_ids = _concat_vlm_token_type_ids(
+        prompt_inputs, completion_inputs, p_ids, c_ids,
+    )
+
+    extras = {"completion_mask": completion_mask}
+    if token_type_key is not None:
+        extras[token_type_key] = token_type_ids
+
+    flush_side = _vlm_tokenizer_padding_side(processor)
+    pad_id = _vlm_pad_token_id(processor)
+    input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
+        input_ids, attention_mask, flush_side, pad_id, extras,
+    )
+    input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
+        input_ids, attention_mask, flush_side, max_seq_length, extras,
+    )
+
+    combined_inputs = dict(prompt_inputs)
+    combined_inputs["input_ids"] = input_ids
+    combined_inputs["attention_mask"] = attention_mask
+    if token_type_key is not None:
+        combined_inputs[token_type_key] = extras[token_type_key]
     batch = _to_mx_vlm_batch(combined_inputs)
     batch["labels"] = _apply_vlm_label_masks(
         batch,
         ignore_token_ids=ignore_token_ids,
     )
 
-    # Read masked labels back (image + attention already applied by
-    # _apply_vlm_label_masks); int64 preserves wide invalid ids for CCE.
-    labels_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
-    prompt_batch = _to_mx_vlm_batch(prompt_inputs)
-    prompt_mask = prompt_batch.get("attention_mask")
-    prompt_ids = prompt_batch["input_ids"]
-    for row in range(labels_np.shape[0]):
-        if prompt_mask is not None:
-            prompt_len = int(mx.sum(prompt_mask[row]).item())
-        else:
-            prompt_len = int(mx.sum(prompt_ids[row] != 0).item())
-        labels_np[row, :prompt_len] = -100
-    batch["labels"] = mx.array(labels_np)
+    completion_only_loss_enabled = True if completion_only_loss is None else bool(completion_only_loss)
+    if completion_only_loss_enabled:
+        labels_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
+        labels_np[np.asarray(extras["completion_mask"]) == 0] = -100
+        batch["labels"] = mx.array(labels_np)
     return batch
 
 
 def _collate_vlm_batch(items, processor, max_seq_length, image_size,
-                       formatting_func=None, ignore_token_ids=None):
+                       formatting_func=None, ignore_token_ids=None,
+                       completion_only_loss=None,
+                       return_prompt_completion=False):
     """Collate a batch of VLM samples using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator: extract images, resize
@@ -2800,10 +3024,12 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         and "prompt" in formatted_items[0]
         and "completion" in formatted_items[0]
     ):
-        return _collate_vlm_prompt_completion_batch(
+        batch = _collate_vlm_prompt_completion_batch(
             formatted_items, processor, max_seq_length, image_size,
             ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
         )
+        return (batch, True) if return_prompt_completion else batch
 
     all_texts = []
     all_images = []
@@ -2836,15 +3062,15 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         batch,
         ignore_token_ids=ignore_token_ids,
     )
-    return batch
+    return (batch, False) if return_prompt_completion else batch
 
 
 def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None):
     """Apply response masking to a VLM batch dict, adding 'labels' key.
 
     Converts input_ids to plain lists, runs the masking closure from
-    dataset_utils.train_on_responses_only, and stores the result as
-    an mx.array in batch_dict["labels"].
+    dataset_utils.train_on_responses_only with the current VLM labels, and
+    stores the result as an mx.array in batch_dict["labels"].
     """
     # Prefer the raw (pre-int32-narrowing) input_ids so the masking closure
     # sees original processor ids; wide invalid ids like uint32(2**32-100)
@@ -2852,7 +3078,15 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
     raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
     input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
     ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
-    result = mask_fn({"input_ids": ids_list})
+    mask_batch = {"input_ids": ids_list}
+    existing_labels = batch_dict.get("labels")
+    if existing_labels is not None:
+        labels_list = (
+            existing_labels.tolist()
+            if hasattr(existing_labels, "tolist") else existing_labels
+        )
+        mask_batch["labels"] = _normalize_numpy_cce_labels(labels_list)
+    result = mask_fn(mask_batch)
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
@@ -2870,10 +3104,101 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
     return batch_dict
 
 
+def _vlm_trainable_label_rows(batch_dict):
+    """Return per-row trainability from VLM labels after response masking."""
+    labels = batch_dict.get("labels")
+    if labels is None:
+        return None
+    labels_np = np.asarray(labels.tolist() if hasattr(labels, "tolist") else labels)
+    if labels_np.ndim == 1:
+        labels_np = labels_np.reshape(1, -1)
+    # Loss supervises labels[:, 1:] (causal shift), so the first column never trains.
+    return [bool(np.any(row[1:] != -100)) for row in labels_np]
+
+
+def _build_response_masked_vlm_batch(
+    items,
+    processor,
+    config,
+    max_seq_length,
+    image_size,
+    response_mask_fn=None,
+    formatting_func=None,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+    return_prompt_completion=False,
+):
+    """Collate VLM rows and apply the CUDA response-mask closure."""
+    batch_dict, is_prompt_completion = _collate_vlm_batch(
+        items, processor, max_seq_length, image_size,
+        formatting_func=formatting_func,
+        ignore_token_ids=ignore_token_ids,
+        completion_only_loss=completion_only_loss,
+        return_prompt_completion=True,
+    )
+    batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
+    if response_mask_fn is not None and not is_prompt_completion:
+        batch_dict = _apply_response_mask_to_vlm_batch(
+            batch_dict,
+            response_mask_fn,
+            ignore_token_ids=ignore_token_ids,
+        )
+    if return_prompt_completion:
+        return batch_dict, is_prompt_completion
+    return batch_dict
+
+
+def _filter_trainable_vlm_indices(
+    dataset,
+    indices,
+    processor,
+    config,
+    max_seq_length,
+    image_size,
+    response_mask_fn,
+    formatting_func=None,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+):
+    """Filter VLM rows before batching, matching CUDA dataset.filter order."""
+    kept_indices = []
+    formatted_items = {} if formatting_func is not None else None
+    removed = 0
+    for idx in indices:
+        item = dataset[idx]
+        if formatting_func is not None:
+            item = formatting_func(item)
+        batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+            [item],
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=None,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+            return_prompt_completion=True,
+        )
+        if is_prompt_completion:
+            kept_indices.append(idx)
+            if formatted_items is not None:
+                formatted_items[idx] = item
+            continue
+        valid_rows = _vlm_trainable_label_rows(batch_dict)
+        if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+            removed += 1
+            continue
+        kept_indices.append(idx)
+        if formatted_items is not None:
+            formatted_items[idx] = item
+    return kept_indices, removed, formatted_items
+
+
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
-                       num_epochs=None):
+                       num_epochs=None, completion_only_loss=None):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -2889,15 +3214,52 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     epoch = 0
     base_seed = _normalize_seed(seed)
     target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
-    indices = list(range(len(dataset)))
-    if dataset_order == "torch_randperm":
-        indices = _torch_randperm_order(len(dataset), base_seed)
-    elif dataset_order in (None, "default"):
-        if num_batches is not None:
-            np.random.seed(base_seed)
-            np.random.shuffle(indices)
-    elif dataset_order != "sequential":
+    base_indices = list(range(len(dataset)))
+    total_removed = 0
+    formatted_items = None
+    if response_mask_fn is not None:
+        base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+            dataset,
+            base_indices,
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn,
+            formatting_func=formatting_func,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+        )
+        if not base_indices and total_removed > 0:
+            raise ValueError(
+                "Unsloth MLX VLM: no trainable rows remain after "
+                "train_on_responses_only masking. Check instruction_part / "
+                "response_part and max_seq_length."
+            )
+    batch_formatting_func = None if formatted_items is not None else formatting_func
+
+    def _item(idx):
+        return formatted_items[idx] if formatted_items is not None else dataset[idx]
+
+    if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+    if not base_indices:
+        return []
+
+    def _epoch_indices(epoch_idx):
+        """Return CUDA-style sampler order over the filtered VLM dataset."""
+        if dataset_order == "torch_randperm":
+            order = _torch_randperm_order(len(base_indices), base_seed + epoch_idx)
+            return [base_indices[i] for i in order]
+        indices = list(base_indices)
+        if dataset_order in (None, "default") and (
+            num_batches is not None or epoch_idx > 0
+        ):
+            np.random.seed(base_seed + epoch_idx)
+            np.random.shuffle(indices)
+        return indices
+
+    indices = _epoch_indices(epoch)
 
     while num_batches is None or len(batch_list) < num_batches:
         if seen >= len(indices):
@@ -2905,31 +3267,30 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                 break
             epoch += 1
             seen = 0
-            indices = list(range(len(dataset)))
-            if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
-            elif dataset_order in (None, "default"):
-                np.random.seed(base_seed + epoch)
-                np.random.shuffle(indices)
+            indices = _epoch_indices(epoch)
 
         bi = indices[seen : seen + batch_size]
         seen += len(bi)
         if not bi:
             break
-        items = [dataset[idx] for idx in bi]
-        batch_dict = _collate_vlm_batch(
-            items, processor, max_seq_length, image_size,
-            formatting_func=formatting_func,
+        batch_dict = _build_response_masked_vlm_batch(
+            [_item(idx) for idx in bi],
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
         )
-        batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
-        if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(
-                batch_dict,
-                response_mask_fn,
-                ignore_token_ids=ignore_token_ids,
-            )
         batch_list.append(batch_dict)
+
+    if total_removed > 0:
+        print(
+            f"Unsloth: Removed {total_removed} VLM samples where all labels "
+            f"were -100 after train_on_responses_only masking."
+        )
 
     # Evaluate all tensors
     all_tensors = []
@@ -2947,7 +3308,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   max_seq_length, seed=42,
                                   response_mask_fn=None,
                                   formatting_func=None,
-                                  dataset_order="default"):
+                                  dataset_order="default",
+                                  completion_only_loss=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -2959,32 +3321,66 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
     base_seed = _normalize_seed(seed)
 
-    def _emit(items):
-        batch_dict = _collate_vlm_batch(
-            items, processor, max_seq_length, image_size,
-            formatting_func=formatting_func,
+    def _build_batch(items, batch_formatting_func):
+        """Build one VLM batch with the selected formatting function."""
+        return _build_response_masked_vlm_batch(
+            items,
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
         )
-        batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
-        if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(
-                batch_dict,
-                response_mask_fn,
-                ignore_token_ids=ignore_token_ids,
-            )
-        return batch_dict
 
     if hasattr(dataset, "__len__"):
         if len(dataset) <= 0:
             raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+        base_indices = list(range(len(dataset)))
+        total_removed = 0
+        formatted_items = None
+        if response_mask_fn is not None:
+            base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+                dataset,
+                base_indices,
+                processor,
+                config,
+                max_seq_length,
+                image_size,
+                response_mask_fn,
+                formatting_func=formatting_func,
+                ignore_token_ids=ignore_token_ids,
+                completion_only_loss=completion_only_loss,
+            )
+            if not base_indices and total_removed > 0:
+                raise ValueError(
+                    "Unsloth MLX VLM: no trainable rows remain after "
+                    "train_on_responses_only masking. Check instruction_part / "
+                    "response_part and max_seq_length."
+                )
+            if total_removed > 0:
+                print(
+                    f"Unsloth: Removed {total_removed} VLM samples where all "
+                    f"labels were -100 after train_on_responses_only masking."
+                )
+        if not base_indices:
+            raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+
+        def _item(idx):
+            return formatted_items[idx] if formatted_items is not None else dataset[idx]
+
+        batch_formatting_func = None if formatted_items is not None else formatting_func
         epoch = 0
         while True:
             if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
+                order = _torch_randperm_order(len(base_indices), base_seed + epoch)
+                indices = [base_indices[i] for i in order]
             elif dataset_order == "sequential":
-                indices = list(range(len(dataset)))
+                indices = list(base_indices)
             elif dataset_order in (None, "default"):
-                indices = list(range(len(dataset)))
+                indices = list(base_indices)
                 batch_indices = [
                     indices[i : i + batch_size]
                     for i in range(0, len(indices), batch_size)
@@ -2993,15 +3389,19 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 rng = np.random.default_rng(base_seed + epoch)
                 order = rng.permutation(len(batch_indices))
                 for b in order:
-                    items = [dataset[idx] for idx in batch_indices[b]]
-                    yield _emit(items)
+                    yield _build_batch(
+                        [_item(idx) for idx in batch_indices[b]],
+                        batch_formatting_func,
+                    )
                 epoch += 1
                 continue
             else:
                 raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
             for start in range(0, len(indices), batch_size):
-                items = [dataset[idx] for idx in indices[start : start + batch_size]]
-                yield _emit(items)
+                yield _build_batch(
+                    [_item(idx) for idx in indices[start : start + batch_size]],
+                    batch_formatting_func,
+                )
             epoch += 1
     else:
         # Streaming has no index space; refuse rather than silently misorder.
@@ -3013,18 +3413,47 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 "via `dataset.to_iterable_dataset()` -> list) or drop "
                 "the order request."
             )
+        def _filter_stream_item(item):
+            """Return a formatted trainable streaming row, or None to skip it."""
+            if response_mask_fn is None:
+                return item
+            if formatting_func is not None:
+                item = formatting_func(item)
+            batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+                [item],
+                processor,
+                config,
+                max_seq_length,
+                image_size,
+                response_mask_fn=response_mask_fn,
+                formatting_func=None,
+                ignore_token_ids=ignore_token_ids,
+                completion_only_loss=completion_only_loss,
+                return_prompt_completion=True,
+            )
+            if is_prompt_completion:
+                return item
+            valid_rows = _vlm_trainable_label_rows(batch_dict)
+            if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+                return None
+            return item
+
+        batch_formatting_func = None if response_mask_fn is not None else formatting_func
         while True:
             pending = []
             yielded = False
             for item in dataset:
+                item = _filter_stream_item(item)
+                if item is None:
+                    continue
                 pending.append(item)
                 if len(pending) >= batch_size:
                     yielded = True
-                    yield _emit(pending)
+                    yield _build_batch(pending, batch_formatting_func)
                     pending = []
             if pending:
                 yielded = True
-                yield _emit(pending)
+                yield _build_batch(pending, batch_formatting_func)
             if not yielded:
                 raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
 
@@ -3100,7 +3529,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
             self._eos_id = eos_id
 
         def process(self, item):
-            encoded = self.tokenizer.encode(item[self.text_key])
+            encoded = encode_mlx_text(self.tokenizer, item[self.text_key])
             if (
                 self._eos_id is not None
                 and (not encoded or encoded[-1] != self._eos_id)
