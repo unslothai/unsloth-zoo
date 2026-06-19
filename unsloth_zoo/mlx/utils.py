@@ -5478,6 +5478,7 @@ def save_pretrained_gguf(
         convert_to_gguf,
         quantize_gguf,
         check_llama_cpp,
+        install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
