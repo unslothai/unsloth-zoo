@@ -5536,7 +5536,16 @@ def save_pretrained_gguf(
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
-            quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+            if sys.platform == "darwin":
+                # install_llama_cpp resolves missing system build-deps through
+                # apt-get, which does not exist on macOS (it raises "apt-get
+                # does not exist? Is this NOT a Linux / Mac based computer?").
+                # Build from source with cmake + Metal instead, then re-probe
+                # for the freshly built binaries.
+                _install_llama_cpp_macos(llama_cpp_folder)
+                quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
+            else:
+                quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
 
         # Ensure gguf is installed (may be missing if llama.cpp was built
