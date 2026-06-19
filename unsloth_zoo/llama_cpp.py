@@ -868,19 +868,40 @@ def _download_archive(url, dest_path):
 def _extract_archive(archive_path, extract_dir):
     """Extract a release .zip / .tar.gz, refusing path-escaping members."""
     real_root = os.path.realpath(extract_dir)
+    def _escapes(target):
+        return target != real_root and not target.startswith(real_root + os.sep)
     def _check(name):
         target = os.path.realpath(os.path.join(extract_dir, name))
-        if target != real_root and not target.startswith(real_root + os.sep):
+        if _escapes(target):
             raise RuntimeError(f"Unsloth: Archive member escapes extraction dir: {name}")
+        return target
+    def _check_tar_member(member):
+        member_target = _check(member.name)
+        if member.issym() or member.islnk():
+            # Hardlink targets are archive-relative (resolve from the root);
+            # symlink targets resolve from the link's own directory.
+            link_base = real_root if member.islnk() else os.path.dirname(member_target)
+            link_target = member.linkname if os.path.isabs(member.linkname) else os.path.join(link_base, member.linkname)
+            if _escapes(os.path.realpath(link_target)):
+                raise RuntimeError(f"Unsloth: Archive link escapes extraction dir: {member.name} -> {member.linkname}")
+        elif not (member.isfile() or member.isdir()):
+            raise RuntimeError(f"Unsloth: Unsupported archive member type: {member.name}")
     if archive_path.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.namelist(): _check(member)
+            for member in archive.infolist():
+                _check(member.filename)
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise RuntimeError(f"Unsloth: Archive contains an unsupported symlink: {member.filename}")
             archive.extractall(extract_dir)
     else:
         tar_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
         with tarfile.open(archive_path, "r:gz") as archive:
-            for member in archive.getmembers(): _check(member.name)
-            archive.extractall(extract_dir, **tar_kwargs)
+            for member in archive.getmembers():
+                # Validate immediately before extraction so previously-created
+                # symlinks cannot redirect later members outside extract_dir
+                # on Python versions without tarfile's data extraction filter.
+                _check_tar_member(member)
+                archive.extract(member, extract_dir, **tar_kwargs)
 
 
 def _single_extracted_root(extract_dir):
