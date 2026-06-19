@@ -146,7 +146,24 @@ def _text_completion_only_loss_arg(args):
 
 
 def _normalize_mlx_optimizer_name(name):
+    if hasattr(name, "value"):
+        name = name.value
     opt_name = str(name or "adamw").strip().lower()
+    opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
+    if opt_name in (
+        "adamw_8bit",
+        "paged_adamw_8bit",
+        "adamw_bnb_8bit",
+        "paged_adamw_32bit",
+        "adamw_torch",
+        "adamw_torch_fused",
+        "paged_adamw",
+        "adamw_32bit",
+        "adamw_hf",
+        "adamw_anyprecision",
+        "adamw_apex_fused",
+    ):
+        opt_name = "adamw"
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
         supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
         raise ValueError(
