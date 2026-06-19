@@ -525,6 +525,33 @@ def test_pretokenized_text_streaming_yields_labeled_batches():
     assert batch.shape[0] == 1
     assert lengths.shape == (1, 2)
     assert labels.shape == batch.shape
+    _second_batch = next(stream)
+    third_batch, _third_lengths, _third_labels = next(stream)
+    assert third_batch.tolist() == [[1, 2, 3]]
+
+
+def test_pretokenized_text_streaming_does_not_eagerly_materialize():
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    def rows():
+        yield {"input_ids": [1, 2, 3]}
+        raise AssertionError("streaming path eagerly consumed another row")
+
+    stream = iterate_training_batches(
+        rows(),
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        seed=3,
+    )
+
+    batch, lengths, labels = next(stream)
+    assert batch.tolist() == [[1, 2, 3]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[1, 2, 3]]
 
 
 def test_pretokenized_prompt_completion_defaults_to_completion_only_loss():
@@ -551,6 +578,29 @@ def test_pretokenized_prompt_completion_defaults_to_completion_only_loss():
 
     _batch, _lengths, labels = batches[0]
     assert labels.tolist() == [[-100, 2, 3]]
+
+
+def test_prompt_completion_nullable_input_ids_routes_to_text_tokenization():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [int(part) for part in text.split()]
+
+    batches = create_batches(
+        [{"prompt": "10 ", "completion": "11", "input_ids": None}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        completion_only_loss=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[10, 11]]
+    assert lengths.tolist() == [[0, 2]]
+    assert labels.tolist() == [[-100, 11]]
 
 
 @pytest.mark.parametrize(
@@ -588,6 +638,34 @@ def test_prompt_completion_text_batches_mask_prompt_tokens_like_cuda(
     assert batch.tolist() == [[10, 11, 12, 13], [20, 21, 0, 0]]
     assert lengths.tolist() == [[0, 4], [0, 2]]
     assert labels.tolist() == expected
+
+
+def test_prompt_completion_drops_rows_with_fully_truncated_completion():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [int(part) for part in text.split()]
+
+    batches = create_ordered_batches(
+        [
+            {"prompt": "10 11 ", "completion": "12"},
+            {"prompt": "20 ", "completion": "21"},
+        ],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=2,
+        dataset_order="sequential",
+        completion_only_loss=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert len(batches) == 1
+    assert batch.tolist() == [[20, 21]]
+    assert lengths.tolist() == [[0, 2]]
+    assert labels.tolist() == [[-100, 21]]
 
 
 def test_conversational_prompt_completion_uses_chat_template_split_like_cuda():

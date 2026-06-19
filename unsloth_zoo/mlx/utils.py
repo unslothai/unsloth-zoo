@@ -3579,29 +3579,38 @@ def _aligned_text_field(item, field, length):
     return values[:length]
 
 
+def _prepare_pretokenized_text_row(item, max_seq_length, completion_only_loss=False):
+    """Normalize one pre-tokenized text row, or return None when unusable."""
+    if not isinstance(item, dict) or item.get("input_ids") is None:
+        return None
+    input_ids = _to_int_list(item["input_ids"])[:max_seq_length]
+    if len(input_ids) < 2:
+        return None
+
+    row = {"input_ids": input_ids}
+    labels = _aligned_text_field(item, "labels", len(input_ids))
+    if labels is not None:
+        row["labels"] = labels
+    if completion_only_loss and "completion_mask" in item:
+        completion_mask = _aligned_text_field(item, "completion_mask", len(input_ids))
+        if completion_mask is not None:
+            row["completion_mask"] = completion_mask
+    if "assistant_masks" in item:
+        assistant_masks = _aligned_text_field(item, "assistant_masks", len(input_ids))
+        if assistant_masks is not None:
+            row["assistant_masks"] = assistant_masks
+    return row
+
+
 def _prepare_pretokenized_text_rows(dataset, max_seq_length, completion_only_loss=False):
     """Normalize pre-tokenized text rows to TRL collator-compatible fields."""
     rows = []
     for item in dataset:
-        if not isinstance(item, dict) or item.get("input_ids") is None:
-            continue
-        input_ids = _to_int_list(item["input_ids"])[:max_seq_length]
-        if len(input_ids) < 2:
-            continue
-
-        row = {"input_ids": input_ids}
-        labels = _aligned_text_field(item, "labels", len(input_ids))
-        if labels is not None:
-            row["labels"] = labels
-        if completion_only_loss and "completion_mask" in item:
-            completion_mask = _aligned_text_field(item, "completion_mask", len(input_ids))
-            if completion_mask is not None:
-                row["completion_mask"] = completion_mask
-        if "assistant_masks" in item:
-            assistant_masks = _aligned_text_field(item, "assistant_masks", len(input_ids))
-            if assistant_masks is not None:
-                row["assistant_masks"] = assistant_masks
-        rows.append(row)
+        row = _prepare_pretokenized_text_row(
+            item, max_seq_length, completion_only_loss=completion_only_loss
+        )
+        if row is not None:
+            rows.append(row)
 
     if not rows:
         raise ValueError(
@@ -3725,30 +3734,16 @@ def _prepare_prompt_completion_text_rows(
     mask_completions = True if completion_only_loss is None else bool(completion_only_loss)
     eos_token = getattr(tokenizer, "eos_token", None) if append_eos else None
     for item in dataset:
-        if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
-            continue
-
-        if _is_trl_chat_messages(item.get("prompt")):
-            prompt_ids, input_ids = _tokenize_conversational_prompt_completion(
-                tokenizer, item
-            )
-        else:
-            prompt_text, completion_text = _prompt_completion_text_parts(
-                tokenizer, item, dataset_text_field
-            )
-            if eos_token and not completion_text.endswith(eos_token):
-                completion_text += eos_token
-            input_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text + completion_text))
-            prompt_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text))
-        input_ids = input_ids[:max_seq_length]
-        if len(input_ids) < 2:
-            continue
-
-        row = {"input_ids": input_ids}
-        if mask_completions:
-            prompt_len = min(len(prompt_ids), len(input_ids))
-            row["completion_mask"] = [0] * prompt_len + [1] * (len(input_ids) - prompt_len)
-        rows.append(row)
+        row = _prepare_prompt_completion_text_row(
+            item,
+            tokenizer,
+            max_seq_length,
+            dataset_text_field=dataset_text_field,
+            mask_completions=mask_completions,
+            eos_token=eos_token,
+        )
+        if row is not None:
+            rows.append(row)
 
     if not rows:
         raise ValueError(
@@ -3756,6 +3751,43 @@ def _prepare_prompt_completion_text_rows(
             "sequences (need at least two input_ids after truncation)."
         )
     return rows
+
+
+def _prepare_prompt_completion_text_row(
+    item,
+    tokenizer,
+    max_seq_length,
+    dataset_text_field="text",
+    mask_completions=True,
+    eos_token=None,
+):
+    """Tokenize one prompt/completion row and mask prompt tokens."""
+    if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
+        return None
+
+    if _is_trl_chat_messages(item.get("prompt")):
+        prompt_ids, input_ids = _tokenize_conversational_prompt_completion(
+            tokenizer, item
+        )
+    else:
+        prompt_text, completion_text = _prompt_completion_text_parts(
+            tokenizer, item, dataset_text_field
+        )
+        if eos_token and not completion_text.endswith(eos_token):
+            completion_text += eos_token
+        input_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text + completion_text))
+        prompt_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text))
+    input_ids = input_ids[:max_seq_length]
+    if len(input_ids) < 2:
+        return None
+
+    row = {"input_ids": input_ids}
+    if mask_completions:
+        prompt_len = min(len(prompt_ids), len(input_ids))
+        if prompt_len >= len(input_ids):
+            return None
+        row["completion_mask"] = [0] * prompt_len + [1] * (len(input_ids) - prompt_len)
+    return row
 
 
 def _make_labeled_text_batch_tuple(batch_rows, max_seq_length, pad_id=0):
@@ -3916,23 +3948,49 @@ def _make_labeled_text_batches(
     return batch_pairs
 
 
-def _iterate_labeled_text_batches(
-    rows,
+def _iterate_labeled_text_batches_from_dataset(
+    dataset,
     tokenizer,
     batch_size,
     max_seq_length,
-    seed=None,
-    dataset_order="default",
+    prepare_row,
+    repeat_dataset=None,
 ):
-    """Yield labeled text batches without materializing each epoch."""
+    """Yield labeled text batches from rows as they are read."""
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    for chunk in _iter_text_index_chunks(rows, batch_size, seed, dataset_order):
-        batch = _make_labeled_text_batch_tuple(
-            [rows[i] for i in chunk], max_seq_length, pad_id=pad_id
-        )
-        mx.eval([batch[0], batch[1], batch[2]])
-        yield batch
+    source = dataset
+    while True:
+        pending = []
+        yielded = False
+        for item in source:
+            row = prepare_row(item)
+            if row is None:
+                continue
+            pending.append(row)
+            if len(pending) >= batch_size:
+                batch = _make_labeled_text_batch_tuple(
+                    pending, max_seq_length, pad_id=pad_id
+                )
+                mx.eval([batch[0], batch[1], batch[2]])
+                yield batch
+                yielded = True
+                pending = []
+        if pending:
+            batch = _make_labeled_text_batch_tuple(
+                pending, max_seq_length, pad_id=pad_id
+            )
+            mx.eval([batch[0], batch[1], batch[2]])
+            yield batch
+            yielded = True
+        if not yielded:
+            raise ValueError(
+                "Unsloth MLX: streaming labeled dataset produced no trainable "
+                "token sequences."
+            )
+        if repeat_dataset is None:
+            return
+        source = repeat_dataset
 
 
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
@@ -3961,7 +4019,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     _raise_if_completion_formatter_conflict(
         formatting_func, completion_only_loss, first_item
     )
-    if isinstance(first_item, dict) and "input_ids" in first_item:
+    if isinstance(first_item, dict) and first_item.get("input_ids") is not None:
         rows = _prepare_pretokenized_text_rows(
             replay_dataset,
             max_seq_length,
@@ -4069,7 +4127,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     _raise_if_completion_formatter_conflict(
         formatting_func, completion_only_loss, first_item
     )
-    if isinstance(first_item, dict) and "input_ids" in first_item:
+    if isinstance(first_item, dict) and first_item.get("input_ids") is not None:
         rows = _prepare_pretokenized_text_rows(
             replay_dataset,
             max_seq_length,
@@ -4223,22 +4281,24 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     _raise_if_completion_formatter_conflict(
         formatting_func, completion_only_loss, first_item
     )
-    if isinstance(first_item, dict) and "input_ids" in first_item:
-        rows = _prepare_pretokenized_text_rows(
-            replay_dataset,
-            max_seq_length,
-            completion_only_loss=_pretokenized_completion_only_loss(
-                completion_only_loss, first_item
-            ),
+    if isinstance(first_item, dict) and first_item.get("input_ids") is not None:
+        pretokenized_completion_only = _pretokenized_completion_only_loss(
+            completion_only_loss, first_item
         )
-        yield from _iterate_labeled_text_batches(
-            rows,
+        repeat_dataset = dataset if iter(dataset) is not dataset else None
+        yield from _iterate_labeled_text_batches_from_dataset(
+            replay_dataset,
             tokenizer,
             batch_size,
             max_seq_length,
-            seed=seed,
-            dataset_order="default",
+            lambda item: _prepare_pretokenized_text_row(
+                item,
+                max_seq_length,
+                completion_only_loss=pretokenized_completion_only,
+            ),
+            repeat_dataset=repeat_dataset,
         )
+        return
 
     if (
         formatting_func is None
@@ -4254,22 +4314,25 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             is_vlm=False,
             strict=False,
         )
-        rows = _prepare_prompt_completion_text_rows(
+        mask_completions = True if completion_only_loss is None else bool(completion_only_loss)
+        eos_token = getattr(tokenizer, "eos_token", None) if append_eos else None
+        repeat_dataset = dataset if iter(dataset) is not dataset else None
+        yield from _iterate_labeled_text_batches_from_dataset(
             replay_dataset,
-            tokenizer,
-            max_seq_length,
-            dataset_text_field=dataset_text_field,
-            completion_only_loss=completion_only_loss,
-            append_eos=append_eos,
-        )
-        yield from _iterate_labeled_text_batches(
-            rows,
             tokenizer,
             batch_size,
             max_seq_length,
-            seed=seed,
-            dataset_order="default",
+            lambda item: _prepare_prompt_completion_text_row(
+                item,
+                tokenizer,
+                max_seq_length,
+                dataset_text_field=dataset_text_field,
+                mask_completions=mask_completions,
+                eos_token=eos_token,
+            ),
+            repeat_dataset=repeat_dataset,
         )
+        return
 
     ds = _prepare_dataset(
         replay_dataset, tokenizer, dataset_text_field, formatting_func,
