@@ -355,7 +355,7 @@ def main():
                     help="per-turn context budget; 0 = auto-size the largest that fits VRAM")
     args = ap.parse_args()
 
-    _STATE["player"] = open(_PLAYER_TEMPLATE).read()
+    _STATE["player"] = open(_PLAYER_TEMPLATE, encoding="utf-8").read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok)
     print(f"DiffusionGemma OpenAI shim ready on http://{args.host}:{args.port}  (model={MODEL_ID})",
