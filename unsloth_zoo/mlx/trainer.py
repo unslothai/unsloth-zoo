@@ -36,7 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 import concurrent.futures
 import math
 import os
@@ -554,6 +554,43 @@ class MLXTrainingConfig:
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
+    def __init__(self, *args, **kwargs):
+        """Initialize config fields while remembering explicit warmup_steps."""
+        config_fields = [field for field in fields(type(self)) if field.init]
+        if len(args) > len(config_fields):
+            raise TypeError(
+                f"MLXTrainingConfig expected at most {len(config_fields)} "
+                f"positional arguments, got {len(args)}"
+            )
+        for field, value in zip(config_fields, args):
+            if field.name in kwargs:
+                raise TypeError(
+                    f"MLXTrainingConfig got multiple values for argument "
+                    f"{field.name!r}"
+                )
+            kwargs[field.name] = value
+
+        provided = set(kwargs)
+        unknown = provided - {field.name for field in config_fields}
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise TypeError(f"MLXTrainingConfig got unexpected arguments: {names}")
+
+        for field in config_fields:
+            if field.name in kwargs:
+                value = kwargs[field.name]
+            elif field.default is not MISSING:
+                value = field.default
+            elif field.default_factory is not MISSING:
+                value = field.default_factory()
+            else:
+                raise TypeError(
+                    f"MLXTrainingConfig missing required argument: {field.name!r}"
+                )
+            setattr(self, field.name, value)
+
+        self._unsloth_mlx_warmup_steps_explicit = "warmup_steps" in provided
+
 
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
@@ -721,7 +758,8 @@ class MLXTrainer:
         if steps_explicit:
             return max(0, warmup_steps)
 
-        return max(0, math.ceil(total_steps * warmup_ratio))
+        resolved = math.ceil(max(0.0, warmup_ratio) * max(0, int(total_steps)))
+        return min(max(0, int(total_steps)), max(0, resolved))
 
     def _build_schedule(self, total_steps):
         """Build LR schedule from config. Returns a callable or float."""

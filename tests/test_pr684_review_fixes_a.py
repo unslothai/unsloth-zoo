@@ -33,8 +33,6 @@ Runs on Linux via the mlx_simulation torch shim.
 
 from __future__ import annotations
 
-import types
-
 import pytest
 import torch
 
@@ -563,9 +561,14 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     import unsloth_zoo.mlx.trainer as trainer_mod
 
+    class _TokenizerOutput(dict):
+        @property
+        def input_ids(self):
+            return self["input_ids"]
+
     class _CallableTokenizer(_SpaceTokenizer):
         def __call__(self, text, **kwargs):
-            return types.SimpleNamespace(input_ids=self.encode(text))
+            return _TokenizerOutput(input_ids=self.encode(text))
 
     inner = _CallableTokenizer()
 
