@@ -483,6 +483,7 @@ class MLXTrainingConfig:
     max_steps: int = 60
     num_train_epochs: int = -1  # -1 means use max_steps instead
     warmup_steps: int = 5
+    warmup_ratio: float = 0.0
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "linear"  # "cosine", "linear", "constant"
 
@@ -695,10 +696,34 @@ class MLXTrainer:
             f"parameters to prevent optimizer NaN."
         )
 
+    def _resolve_warmup_steps(self, total_steps):
+        """Return warmup steps, resolving warmup_ratio after total_steps exists."""
+        warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
+        warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
+        if warmup_ratio is None:
+            return max(0, warmup_steps)
+        try:
+            warmup_ratio = float(warmup_ratio)
+        except (TypeError, ValueError):
+            return max(0, warmup_steps)
+        if warmup_ratio == 0.0:
+            return max(0, warmup_steps)
+
+        default_warmup_steps = getattr(MLXTrainingConfig, "warmup_steps", 5)
+        steps_explicit = getattr(
+            self.args,
+            "_unsloth_mlx_warmup_steps_explicit",
+            warmup_steps != default_warmup_steps,
+        )
+        if steps_explicit:
+            return max(0, warmup_steps)
+
+        return max(0, int(total_steps * warmup_ratio))
+
     def _build_schedule(self, total_steps):
         """Build LR schedule from config. Returns a callable or float."""
         lr = self.args.learning_rate
-        warmup = self.args.warmup_steps
+        warmup = self._resolve_warmup_steps(total_steps)
         sched_type = _normalize_mlx_scheduler_type(self.args.lr_scheduler_type)
 
         if sched_type == "constant" and warmup == 0:

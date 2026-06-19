@@ -47,6 +47,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "per_device_train_batch_size",
         "gradient_accumulation_steps",
         "max_steps",
+        "warmup_ratio",
         "learning_rate",
         "lr_scheduler_type",
         "optim",
@@ -121,6 +122,18 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     trainer._set_optimizer_lr_for_step(optimizer, 1)
     second_lr = float(optimizer.learning_rate)
     assert second_lr > first_lr
+
+    ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    ratio_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_ratio=0.25,
+    )
+    ratio_schedule = ratio_trainer._build_schedule(total_steps=8)
+    assert ratio_schedule(1).item() < ratio_trainer.args.learning_rate
+    assert ratio_schedule(2).item() == pytest.approx(
+        ratio_trainer.args.learning_rate,
+    )
 
 
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
