@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 import pytest
 import torch
 
@@ -397,6 +398,36 @@ def test_pretokenized_text_batches_apply_explicit_labels_and_masks():
     assert labels.tolist() == [[-100, -100, -100], [-100, 5, -100]]
 
 
+def test_pretokenized_text_batches_handle_mixed_optional_fields():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": None,
+                "completion_mask": None,
+                "assistant_masks": None,
+            },
+            {"input_ids": [4, 5], "completion_mask": [0, 1]},
+            {"input_ids": None, "labels": [9, 9]},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 0]]
+    assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert labels.tolist() == [[1, 2, 3], [-100, 5, -100]]
+
+
 @pytest.mark.parametrize(
     ("completion_only_loss", "expected"),
     [
@@ -446,6 +477,54 @@ def test_pretokenized_text_create_batches_path_uses_labeled_collator():
     assert batch.tolist() == [[1, 2, 3]]
     assert lengths.tolist() == [[0, 3]]
     assert labels.tolist() == [[-100, 2, 3]]
+
+
+def test_pretokenized_text_create_batches_preserves_mlx_lm_default_order():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    rows = [
+        {"input_ids": [length] * length}
+        for length in [7, 2, 6, 3, 5, 4]
+    ]
+    batches = create_batches(
+        rows,
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=16,
+        seed=7,
+    )
+
+    sorted_lengths = [2, 3, 4, 5, 6, 7]
+    groups = [sorted_lengths[i:i + 2] for i in range(0, len(sorted_lengths), 2)]
+    expected = [groups[i] for i in np.random.RandomState(7).permutation(len(groups))]
+    observed = [
+        [int(length.item()) for length in lengths[:, 1]]
+        for _batch, lengths, _labels in batches
+    ]
+    assert observed == expected
+
+
+def test_pretokenized_text_streaming_yields_labeled_batches():
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    stream = iterate_training_batches(
+        [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5]}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        seed=3,
+    )
+
+    batch, lengths, labels = next(stream)
+    assert batch.shape[0] == 1
+    assert lengths.shape == (1, 2)
+    assert labels.shape == batch.shape
 
 
 def test_pretokenized_prompt_completion_defaults_to_completion_only_loss():
@@ -554,6 +633,49 @@ def test_conversational_prompt_completion_uses_chat_template_split_like_cuda():
     assert batch.tolist() == [[10, 1, 20, 2]]
     assert lengths.tolist() == [[0, 4]]
     assert labels.tolist() == [[-100, -100, -100, 2]]
+
+
+def test_prompt_completion_batches_apply_explicit_chat_template():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=False,
+            **_kwargs,
+        ):
+            assert self.chat_template == "{{ messages[0]['content'] }}"
+            ids = []
+            for message in messages:
+                if message["role"] == "assistant":
+                    ids.append(20)
+                ids.append(int(message["content"]))
+            if add_generation_prompt:
+                ids.append(20)
+            return {"input_ids": ids} if return_dict else ids
+
+    batches = create_ordered_batches(
+        [
+            {
+                "prompt": [{"role": "user", "content": "1"}],
+                "completion": [{"role": "assistant", "content": "2"}],
+            }
+        ],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        chat_template="{{ messages[0]['content'] }}",
+        completion_only_loss=True,
+    )
+
+    _batch, _lengths, labels = batches[0]
+    assert labels.tolist() == [[-100, -100, 2]]
 
 
 def test_prompt_completion_text_batches_append_eos_to_completion():
