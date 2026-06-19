@@ -33,6 +33,8 @@ Runs on Linux via the mlx_simulation torch shim.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
 
@@ -563,7 +565,7 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
 
     class _CallableTokenizer(_SpaceTokenizer):
         def __call__(self, text, **kwargs):
-            return {"input_ids": self.encode(text)}
+            return types.SimpleNamespace(input_ids=self.encode(text))
 
     inner = _CallableTokenizer()
 
@@ -604,3 +606,14 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
         return_function=True,
     )
     assert received["tokenizer"] is inner
+
+    monkeypatch.undo()
+    trainer = object.__new__(trainer_mod.MLXTrainer)
+    trainer.tokenizer = _ProxyWrapper(inner)
+    mask_fn = dataset_utils.train_on_responses_only(
+        trainer,
+        instruction_part="1",
+        response_part="2",
+        return_function=True,
+    )
+    assert mask_fn({"input_ids": [[1, 2, 3]]}) == {"labels": [[-100, -100, 3]]}

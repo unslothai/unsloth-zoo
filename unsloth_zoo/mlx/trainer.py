@@ -51,6 +51,20 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
+_MLX_OPTIMIZER_NAME_MAP = {
+    **{name: name for name in SUPPORTED_MLX_OPTIMIZERS},
+    "adamw_8bit": "adamw",
+    "paged_adamw_8bit": "adamw",
+    "adamw_bnb_8bit": "adamw",
+    "paged_adamw_32bit": "adamw",
+    "adamw_torch": "adamw",
+    "adamw_torch_fused": "adamw",
+    "paged_adamw": "adamw",
+    "adamw_32bit": "adamw",
+    "adamw_hf": "adamw",
+    "adamw_anyprecision": "adamw",
+    "adamw_apex_fused": "adamw",
+}
 
 from .utils import (
     make_cce_loss_fn,
@@ -146,14 +160,18 @@ def _text_completion_only_loss_arg(args):
 
 
 def _normalize_mlx_optimizer_name(name):
+    if hasattr(name, "value"):
+        name = name.value
     opt_name = str(name or "adamw").strip().lower()
-    if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
-        supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
+    opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
+    try:
+        return _MLX_OPTIMIZER_NAME_MAP[opt_name]
+    except KeyError:
+        supported = ", ".join(sorted(_MLX_OPTIMIZER_NAME_MAP))
         raise ValueError(
             f"Unsloth: Unsupported MLX optimizer {name!r}. "
             f"Supported optimizers: {supported}."
-        )
-    return opt_name
+        ) from None
 
 
 _NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
