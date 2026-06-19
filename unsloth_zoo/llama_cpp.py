@@ -869,7 +869,10 @@ def _extract_archive(archive_path, extract_dir):
     """Extract a release .zip / .tar.gz, refusing path-escaping members."""
     real_root = os.path.realpath(extract_dir)
     def _escapes(target):
-        return target != real_root and not target.startswith(real_root + os.sep)
+        try:
+            return os.path.commonpath([real_root, target]) != real_root
+        except ValueError:
+            return True
     def _check(name):
         target = os.path.realpath(os.path.join(extract_dir, name))
         if _escapes(target):
@@ -896,12 +899,13 @@ def _extract_archive(archive_path, extract_dir):
     else:
         tar_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
         with tarfile.open(archive_path, "r:gz") as archive:
-            for member in archive.getmembers():
-                # Validate immediately before extraction so previously-created
-                # symlinks cannot redirect later members outside extract_dir
-                # on Python versions without tarfile's data extraction filter.
-                _check_tar_member(member)
-                archive.extract(member, extract_dir, **tar_kwargs)
+            # Validate every member (rejecting links whose targets escape) before
+            # extracting anything, so no escaping symlink is ever written for a
+            # later member to traverse through. extractall defers directory attrs
+            # until contents are written, which per-member extract would break.
+            members = archive.getmembers()
+            for member in members: _check_tar_member(member)
+            archive.extractall(extract_dir, members = members, **tar_kwargs)
 
 
 def _single_extracted_root(extract_dir):

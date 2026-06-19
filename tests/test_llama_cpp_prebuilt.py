@@ -328,6 +328,24 @@ def test_extract_rejects_zip_symlink(tmp_path):
         llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
 
 
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0, reason = "read-only dir perms (non-root POSIX)")
+def test_extract_allows_readonly_dir_before_contents(tmp_path):
+    # A read-only dir entry preceding its files must not trip extraction:
+    # extractall defers directory perms until contents are written.
+    archive = tmp_path / "ro.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        d = tarfile.TarInfo("ro")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o555
+        tar.addfile(d)
+        _add_file(tar, "ro/file.txt", "ok")
+    out = tmp_path / "out"
+    llama_cpp._extract_archive(str(archive), str(out))
+    content = (out / "ro" / "file.txt").read_text()
+    os.chmod(out / "ro", 0o755)  # restore write bit so tmp_path cleanup can unlink
+    assert content == "ok"
+
+
 @pytest.mark.skipif(not IS_POSIX, reason = "symlink semantics")
 def test_extract_allows_in_tree_symlink(tmp_path):
     # Real release tarballs ship relative .so symlinks that stay in-tree.
