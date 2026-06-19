@@ -401,6 +401,7 @@ def test_pretokenized_text_batches_apply_explicit_labels_and_masks():
     ("completion_only_loss", "expected"),
     [
         (False, [[1, 2, 3], [4, 5, -100]]),
+        (None, [[1, 2, 3], [4, 5, -100]]),
         (True, [[-100, 2, 3], [-100, 5, -100]]),
     ],
 )
@@ -426,6 +427,51 @@ def test_pretokenized_text_batches_apply_completion_mask_when_requested(
 
     _batch, _lengths, labels = batches[0]
     assert labels.tolist() == expected
+
+
+def test_pretokenized_text_create_batches_path_uses_labeled_collator():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_batches(
+        [{"input_ids": [1, 2, 3], "assistant_masks": [0, 1, 1]}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[1, 2, 3]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[-100, 2, 3]]
+
+
+def test_pretokenized_prompt_completion_defaults_to_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "prompt": "ignored",
+                "completion": "ignored",
+                "input_ids": [1, 2, 3],
+                "completion_mask": [0, 1, 1],
+            },
+        ],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=None,
+    )
+
+    _batch, _lengths, labels = batches[0]
+    assert labels.tolist() == [[-100, 2, 3]]
 
 
 @pytest.mark.parametrize(
@@ -463,6 +509,124 @@ def test_prompt_completion_text_batches_mask_prompt_tokens_like_cuda(
     assert batch.tolist() == [[10, 11, 12, 13], [20, 21, 0, 0]]
     assert lengths.tolist() == [[0, 4], [0, 2]]
     assert labels.tolist() == expected
+
+
+def test_conversational_prompt_completion_uses_chat_template_split_like_cuda():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=False,
+            **_kwargs,
+        ):
+            ids = []
+            for message in messages:
+                if message["role"] == "user":
+                    ids.extend([10, int(message["content"])])
+                elif message["role"] == "assistant":
+                    ids.extend([20, int(message["content"])])
+            if add_generation_prompt:
+                ids.append(20)
+            return {"input_ids": ids} if return_dict else ids
+
+    batches = create_ordered_batches(
+        [
+            {
+                "prompt": [{"role": "user", "content": "1"}],
+                "completion": [{"role": "assistant", "content": "2"}],
+                "chat_template_kwargs": None,
+            }
+        ],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[10, 1, 20, 2]]
+    assert lengths.tolist() == [[0, 4]]
+    assert labels.tolist() == [[-100, -100, -100, 2]]
+
+
+def test_prompt_completion_text_batches_append_eos_to_completion():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = " 99"
+
+        def encode(self, text, **_kwargs):
+            return [int(part) for part in text.split()]
+
+    batches = create_ordered_batches(
+        [{"prompt": "10 ", "completion": "11"}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        append_eos=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[10, 11, 99]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[-100, 11, 99]]
+
+
+def test_prompt_completion_text_batches_append_eos_to_empty_completion():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token = "99"
+
+        def encode(self, text, **_kwargs):
+            return [int(part) for part in text.split()]
+
+    batches = create_ordered_batches(
+        [{"prompt": "10 ", "completion": ""}],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+        append_eos=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[10, 99]]
+    assert lengths.tolist() == [[0, 2]]
+    assert labels.tolist() == [[-100, 99]]
+
+
+def test_prompt_completion_formatter_conflicts_with_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [int(part) for part in text.split()]
+
+    with pytest.raises(ValueError, match="formatting_func is incompatible"):
+        create_ordered_batches(
+            [{"prompt": "10 ", "completion": "11"}],
+            Tokenizer(),
+            batch_size=1,
+            max_seq_length=8,
+            dataset_order="sequential",
+            formatting_func=lambda _row: "10 11",
+            completion_only_loss=None,
+        )
 
 
 def test_train_on_responses_only_forwards_last_response_only(monkeypatch):

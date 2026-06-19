@@ -3627,25 +3627,118 @@ def _prompt_completion_text_parts(tokenizer, item, dataset_text_field):
     return prompt or "", completion or ""
 
 
+def _is_trl_chat_messages(value):
+    """Return whether a value is TRL-style role/content chat messages."""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and isinstance(value[0], dict)
+        and "role" in value[0]
+        and "content" in value[0]
+    )
+
+
+def _unwrap_chat_template_ids(value):
+    """Return flat input_ids from tokenizer chat-template outputs."""
+    if isinstance(value, dict):
+        value = value["input_ids"]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], list):
+        value = value[0]
+    return _to_int_list(value)
+
+
+def _tokenize_conversational_prompt_completion(tokenizer, item):
+    """Tokenize conversational prompt/completion rows with TRL's split point."""
+    prompt = _normalize_mlx_messages(item["prompt"], is_vlm=False)
+    completion = _normalize_mlx_messages(item["completion"], is_vlm=False)
+    tools = item.get("tools")
+    chat_kwargs = item.get("chat_template_kwargs") or {}
+
+    prompt_ids = tokenizer.apply_chat_template(
+        prompt,
+        tokenize=True,
+        add_generation_prompt=True,
+        tools=tools,
+        **chat_kwargs,
+    )
+    prompt_completion = tokenizer.apply_chat_template(
+        prompt + completion,
+        return_dict=True,
+        tokenize=True,
+        tools=tools,
+        **chat_kwargs,
+    )
+    return (
+        _unwrap_chat_template_ids(prompt_ids),
+        _unwrap_chat_template_ids(prompt_completion),
+    )
+
+
+def _raise_if_completion_formatter_conflict(
+    formatting_func,
+    completion_only_loss,
+    first_item,
+):
+    """Mirror TRL's rejection of formatters with completion-only loss."""
+    if formatting_func is None:
+        return
+    if completion_only_loss is None:
+        completion_only = (
+            isinstance(first_item, dict)
+            and "prompt" in first_item
+            and "completion" in first_item
+        )
+    else:
+        completion_only = bool(completion_only_loss)
+    if completion_only:
+        raise ValueError(
+            "Unsloth MLX: formatting_func is incompatible with "
+            "completion_only_loss=True. Apply formatting before passing the "
+            "dataset, or disable completion_only_loss."
+        )
+
+
+def _pretokenized_completion_only_loss(completion_only_loss, first_item):
+    """Resolve TRL's completion-only default for pre-tokenized rows."""
+    if completion_only_loss is not None:
+        return bool(completion_only_loss)
+    return (
+        isinstance(first_item, dict)
+        and "prompt" in first_item
+        and "completion" in first_item
+    )
+
+
 def _prepare_prompt_completion_text_rows(
     dataset,
     tokenizer,
     max_seq_length,
     dataset_text_field="text",
     completion_only_loss=None,
+    append_eos=True,
 ):
     """Tokenize prompt/completion rows and build CUDA-style completion masks."""
     rows = []
     mask_completions = True if completion_only_loss is None else bool(completion_only_loss)
+    eos_token = getattr(tokenizer, "eos_token", None) if append_eos else None
     for item in dataset:
         if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
             continue
 
-        prompt_text, completion_text = _prompt_completion_text_parts(
-            tokenizer, item, dataset_text_field
-        )
-        input_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text + completion_text))
-        prompt_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text))
+        if _is_trl_chat_messages(item.get("prompt")):
+            prompt_ids, input_ids = _tokenize_conversational_prompt_completion(
+                tokenizer, item
+            )
+        else:
+            prompt_text, completion_text = _prompt_completion_text_parts(
+                tokenizer, item, dataset_text_field
+            )
+            if eos_token and not completion_text.endswith(eos_token):
+                completion_text += eos_token
+            input_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text + completion_text))
+            prompt_ids = _to_int_list(encode_mlx_text(tokenizer, prompt_text))
         input_ids = input_ids[:max_seq_length]
         if len(input_ids) < 2:
             continue
@@ -3819,11 +3912,16 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     from mlx_lm.tuner.trainer import iterate_batches
 
     first_item, replay_dataset = _peek_dataset(dataset)
+    _raise_if_completion_formatter_conflict(
+        formatting_func, completion_only_loss, first_item
+    )
     if isinstance(first_item, dict) and "input_ids" in first_item:
         rows = _prepare_pretokenized_text_rows(
             replay_dataset,
             max_seq_length,
-            completion_only_loss=bool(completion_only_loss),
+            completion_only_loss=_pretokenized_completion_only_loss(
+                completion_only_loss, first_item
+            ),
         )
         return _make_labeled_text_batches(
             rows,
@@ -3847,6 +3945,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             max_seq_length,
             dataset_text_field=dataset_text_field,
             completion_only_loss=completion_only_loss,
+            append_eos=append_eos,
         )
         return _make_labeled_text_batches(
             rows,
@@ -3912,11 +4011,16 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
 
     first_item, replay_dataset = _peek_dataset(dataset)
+    _raise_if_completion_formatter_conflict(
+        formatting_func, completion_only_loss, first_item
+    )
     if isinstance(first_item, dict) and "input_ids" in first_item:
         rows = _prepare_pretokenized_text_rows(
             replay_dataset,
             max_seq_length,
-            completion_only_loss=bool(completion_only_loss),
+            completion_only_loss=_pretokenized_completion_only_loss(
+                completion_only_loss, first_item
+            ),
         )
         return _make_labeled_text_batches(
             rows,
@@ -3945,6 +4049,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             max_seq_length,
             dataset_text_field=dataset_text_field,
             completion_only_loss=completion_only_loss,
+            append_eos=append_eos,
         )
         return _make_labeled_text_batches(
             rows,
@@ -4051,11 +4156,16 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     from mlx_lm.tuner.trainer import iterate_batches
 
     first_item, replay_dataset = _peek_dataset(dataset)
+    _raise_if_completion_formatter_conflict(
+        formatting_func, completion_only_loss, first_item
+    )
     if isinstance(first_item, dict) and "input_ids" in first_item:
         rows = _prepare_pretokenized_text_rows(
             replay_dataset,
             max_seq_length,
-            completion_only_loss=bool(completion_only_loss),
+            completion_only_loss=_pretokenized_completion_only_loss(
+                completion_only_loss, first_item
+            ),
         )
         while True:
             for batch in _make_labeled_text_batches(
@@ -4080,6 +4190,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             max_seq_length,
             dataset_text_field=dataset_text_field,
             completion_only_loss=completion_only_loss,
+            append_eos=append_eos,
         )
         while True:
             for batch in _make_labeled_text_batches(
