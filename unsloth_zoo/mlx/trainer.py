@@ -1657,6 +1657,7 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
+                        completion_only_loss=text_completion_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2121,6 +2122,7 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=text_completion_only_loss,
                 )
             else:
                 batch_kwargs = dict(
@@ -2136,6 +2138,7 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=text_completion_only_loss,
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)

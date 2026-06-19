@@ -342,6 +342,129 @@ def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     assert "steps < lengths[:, 1:]" in source
 
 
+def test_pretokenized_text_batches_ignore_attention_mask_like_trl():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {"input_ids": [1, 2, 0, 3], "attention_mask": [1, 1, 0, 1]},
+            {"input_ids": [4, 5], "attention_mask": [1, 1]},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[1, 2, 0, 3], [4, 5, 0, 0]]
+    assert lengths.tolist() == [[0, 4], [0, 2]]
+    assert labels.tolist() == [[1, 2, 0, 3], [4, 5, -100, -100]]
+
+
+def test_pretokenized_text_batches_apply_explicit_labels_and_masks():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "labels": [1, -100, 3],
+                "completion_mask": [0, 1, 1],
+                "assistant_masks": [1, 1, 0],
+            },
+            {
+                "input_ids": [4, 5],
+                "labels": [4, 5],
+                "completion_mask": [0, 1],
+                "assistant_masks": [0, 1],
+            },
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+    )
+
+    _batch, _lengths, labels = batches[0]
+    assert labels.tolist() == [[-100, -100, -100], [-100, 5, -100]]
+
+
+@pytest.mark.parametrize(
+    ("completion_only_loss", "expected"),
+    [
+        (False, [[1, 2, 3], [4, 5, -100]]),
+        (True, [[-100, 2, 3], [-100, 5, -100]]),
+    ],
+)
+def test_pretokenized_text_batches_apply_completion_mask_when_requested(
+    completion_only_loss, expected,
+):
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {"input_ids": [1, 2, 3], "completion_mask": [0, 1, 1]},
+            {"input_ids": [4, 5], "completion_mask": [0, 1]},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=completion_only_loss,
+    )
+
+    _batch, _lengths, labels = batches[0]
+    assert labels.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    ("completion_only_loss", "expected"),
+    [
+        (False, [[10, 11, 12, 13], [20, 21, -100, -100]]),
+        (True, [[-100, -100, 12, 13], [-100, 21, -100, -100]]),
+        (None, [[-100, -100, 12, 13], [-100, 21, -100, -100]]),
+    ],
+)
+def test_prompt_completion_text_batches_mask_prompt_tokens_like_cuda(
+    completion_only_loss, expected,
+):
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [int(part) for part in text.split()]
+
+    batches = create_ordered_batches(
+        [
+            {"prompt": "10 11 ", "completion": "12 13"},
+            {"prompt": "20 ", "completion": "21"},
+        ],
+        Tokenizer(),
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=completion_only_loss,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert batch.tolist() == [[10, 11, 12, 13], [20, 21, 0, 0]]
+    assert lengths.tolist() == [[0, 4], [0, 2]]
+    assert labels.tolist() == expected
+
+
 def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     from unsloth_zoo.mlx.trainer import train_on_responses_only
