@@ -378,6 +378,14 @@ def prepare_model_for_training(
             if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
                 upcast = True
                 requires_grad = True
+            elif name.endswith(".bias"):
+                # Respect PEFT's bias decision. LoraConfig(bias="all"/"lora_only")
+                # marks the relevant biases trainable; blindly freezing every
+                # non-LoRA param here silently disabled bias training (#2343).
+                # bias="none" (the default) leaves biases frozen, so this keeps
+                # requires_grad = False and is a no-op for the common path.
+                requires_grad = param.requires_grad
+                upcast = requires_grad
             else:
                 requires_grad = False
         else:
