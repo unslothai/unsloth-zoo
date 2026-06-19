@@ -5416,6 +5416,10 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     print("Unsloth: Building llama.cpp with cmake...")
     subprocess.run(
         ["cmake", llama_cpp_folder, "-B", build_dir,
+         # macOS uses a single-config generator, so the build type must be set
+         # at configure time; --config Release on the build step is ignored and
+         # the binaries would otherwise be built unoptimized (very slow).
+         "-DCMAKE_BUILD_TYPE=Release",
          "-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"],
         check=True, capture_output=True,
     )
