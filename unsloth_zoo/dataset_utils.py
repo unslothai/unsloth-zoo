@@ -180,11 +180,13 @@ def train_on_responses_only(
     # All Unsloth Zoo code licensed under LGPLv3
     if trainer is not None:
         try:
-            from .mlx.trainer import MLXTrainer
+            from .mlx.trainer import (
+                MLXTrainer,
+                train_on_responses_only as _mlx_train_on_responses_only,
+            )
         except ImportError:
             MLXTrainer = None
         if MLXTrainer is not None and isinstance(trainer, MLXTrainer):
-            from .mlx.trainer import train_on_responses_only as _mlx_train_on_responses_only
             return _mlx_train_on_responses_only(
                 trainer,
                 instruction_part=instruction_part,

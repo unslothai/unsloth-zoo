@@ -712,7 +712,7 @@ class MLXTrainer:
         if warmup_ratio == 0.0:
             return max(0, warmup_steps)
 
-        default_warmup_steps = getattr(MLXTrainingConfig, "warmup_steps", 5)
+        default_warmup_steps = getattr(type(self.args), "warmup_steps", 5)
         steps_explicit = getattr(
             self.args,
             "_unsloth_mlx_warmup_steps_explicit",
