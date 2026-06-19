@@ -127,11 +127,12 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     ratio_trainer.args = MLXTrainingConfig(
         learning_rate=5e-5,
         lr_scheduler_type="linear",
-        warmup_ratio=0.25,
+        warmup_ratio=0.1,
     )
     ratio_schedule = ratio_trainer._build_schedule(total_steps=8)
-    assert ratio_schedule(1).item() < ratio_trainer.args.learning_rate
-    assert ratio_schedule(2).item() == pytest.approx(
+    assert ratio_trainer._resolve_warmup_steps(total_steps=8) == 1
+    assert ratio_schedule(0).item() < ratio_trainer.args.learning_rate
+    assert ratio_schedule(1).item() == pytest.approx(
         ratio_trainer.args.learning_rate,
     )
 

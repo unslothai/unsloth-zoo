@@ -51,20 +51,6 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
-_MLX_OPTIMIZER_NAME_MAP = {
-    **{name: name for name in SUPPORTED_MLX_OPTIMIZERS},
-    "adamw_8bit": "adamw",
-    "paged_adamw_8bit": "adamw",
-    "adamw_bnb_8bit": "adamw",
-    "paged_adamw_32bit": "adamw",
-    "adamw_torch": "adamw",
-    "adamw_torch_fused": "adamw",
-    "paged_adamw": "adamw",
-    "adamw_32bit": "adamw",
-    "adamw_hf": "adamw",
-    "adamw_anyprecision": "adamw",
-    "adamw_apex_fused": "adamw",
-}
 
 from .utils import (
     make_cce_loss_fn,
@@ -160,18 +146,14 @@ def _text_completion_only_loss_arg(args):
 
 
 def _normalize_mlx_optimizer_name(name):
-    if hasattr(name, "value"):
-        name = name.value
     opt_name = str(name or "adamw").strip().lower()
-    opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
-    try:
-        return _MLX_OPTIMIZER_NAME_MAP[opt_name]
-    except KeyError:
-        supported = ", ".join(sorted(_MLX_OPTIMIZER_NAME_MAP))
+    if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
+        supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
         raise ValueError(
             f"Unsloth: Unsupported MLX optimizer {name!r}. "
             f"Supported optimizers: {supported}."
-        ) from None
+        )
+    return opt_name
 
 
 _NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
@@ -698,6 +680,10 @@ class MLXTrainer:
 
     def _resolve_warmup_steps(self, total_steps):
         """Return warmup steps, resolving warmup_ratio after total_steps exists."""
+        get_warmup_steps = getattr(self.args, "get_warmup_steps", None)
+        if callable(get_warmup_steps):
+            return max(0, int(get_warmup_steps(total_steps)))
+
         warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
         if warmup_ratio is None:
@@ -718,7 +704,7 @@ class MLXTrainer:
         if steps_explicit:
             return max(0, warmup_steps)
 
-        return max(0, int(total_steps * warmup_ratio))
+        return max(0, math.ceil(total_steps * warmup_ratio))
 
     def _build_schedule(self, total_steps):
         """Build LR schedule from config. Returns a callable or float."""
