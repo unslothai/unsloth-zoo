@@ -473,3 +473,79 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
         "the original ImportError must be chained (raise ... from e) so an "
         "installed-but-broken peft stays debuggable"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: gpt-oss bnb-4bit <-> 16bit compiled-cache mode switch.
+#
+# The compiled `unsloth_compiled_module_gpt_oss.py` is a single per-model-type
+# file that hardcodes EITHER the BnB layout (router.linear.weight + ModuleList
+# experts) OR the stock layout (router.weight + fused 3D experts), depending on
+# which classes were active when it was generated. A bnb-4bit load swaps the
+# transformers GptOssTopKRouter/GptOssExperts globals and writes a BnB-flavoured
+# compiled module. Reusing that stale module when later loading a stock 16bit
+# checkpoint (e.g. a merged_16bit export of a 4bit-trained model) re-installs the
+# BnB router, so the checkpoint's router.weight/.bias are "not used" and
+# transformers raises "Unsloth: Critical error since some weights are not
+# initialized". `patch_gpt_oss_bnb4bit_auto` must (a) restore the stock classes
+# and invalidate the compiled module when the current load is NOT bnb-4bit, and
+# (b) invalidate a stale stock-built module the first time it switches INTO bnb.
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path, monkeypatch):
+    """`_invalidate_gpt_oss_compiled_module` must remove both the in-memory
+    `unsloth_compiled_module_gpt_oss` entry and the on-disk cached .py so the
+    next compile regenerates against the currently-active classes."""
+    import sys
+    import types
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    # fake an already-imported compiled module + its on-disk cache file
+    sys.modules["unsloth_compiled_module_gpt_oss"] = types.ModuleType(
+        "unsloth_compiled_module_gpt_oss"
+    )
+    cache_dir = tmp_path / "unsloth_compiled_cache"
+    cache_dir.mkdir()
+    cache_file = cache_dir / "unsloth_compiled_module_gpt_oss.py"
+    cache_file.write_text("# stale compiled module\n")
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(cache_dir))
+
+    try:
+        _M._invalidate_gpt_oss_compiled_module()
+        assert "unsloth_compiled_module_gpt_oss" not in sys.modules, (
+            "stale compiled module must be evicted from sys.modules"
+        )
+        assert not cache_file.exists(), (
+            "stale on-disk compiled module .py must be deleted"
+        )
+        # idempotent: a second call with nothing to clean must not raise
+        _M._invalidate_gpt_oss_compiled_module()
+    finally:
+        sys.modules.pop("unsloth_compiled_module_gpt_oss", None)
+
+
+def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
+    """The static contract: `patch_gpt_oss_bnb4bit_auto`'s non-bnb branch must
+    restore the stock classes, clear UNSLOTH_GPT_OSS_BNB4BIT_PATCHED, and
+    invalidate the compiled module; the bnb branch must invalidate the stale
+    stock-built module on the first switch into bnb. Asserted on the AST so the
+    mode-switch teardown can't be silently dropped."""
+    import ast
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    src = inspect.getsource(_M.patch_gpt_oss_bnb4bit_auto)
+    body = ast.unparse(ast.parse(src))
+
+    assert "restore_gpt_oss_original" in body, (
+        "non-bnb load must call restore_gpt_oss_original() so a stale BnB router "
+        "swap from an earlier 4bit load does not break a later 16bit reload"
+    )
+    assert "_invalidate_gpt_oss_compiled_module" in body, (
+        "must invalidate the stale compiled gpt_oss module on a bnb<->16bit "
+        "mode switch (otherwise the wrong router/experts layout is re-installed)"
+    )
+    assert "UNSLOTH_GPT_OSS_BNB4BIT_PATCHED" in body, (
+        "must track/clear the BNB4BIT_PATCHED flag to detect the mode switch"
+    )

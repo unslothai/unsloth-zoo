@@ -1082,15 +1082,53 @@ def _is_transformers_v5() -> bool:
     return transformers_version >= Version("5.0.0.dev0")
 
 
+def _invalidate_gpt_oss_compiled_module():
+    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py) so it is
+    regenerated against the CURRENT router/experts classes. The compiled module is a
+    single per-model-type file that hardcodes either the BnB (router.linear) or stock
+    (router.weight / 3D experts) layout; reusing a stale one across a 4bit<->16bit mode
+    switch in the same process re-installs the wrong classes."""
+    try:
+        import sys as _sys
+        for _name in ("unsloth_compiled_module_gpt_oss",):
+            _sys.modules.pop(_name, None)
+        loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+        _f = os.path.join(loc, "unsloth_compiled_module_gpt_oss.py")
+        if os.path.isfile(_f):
+            try:
+                os.remove(_f)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def patch_gpt_oss_bnb4bit_auto():
     """
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
     """
     if not _should_use_gpt_oss_bnb4bit():
+        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally (router.linear.weight
+        # + ModuleList experts). UNSLOTH_MODEL_NAME is set per-load but persists in-process and
+        # is inherited across processes (a save->reload subprocess), so a stale "_load_in_4bit_"
+        # from an earlier bnb-4bit load would leave the BnB classes installed when later loading
+        # a 16bit (e.g. merged_16bit) checkpoint, whose router.weight + 3D experts then mismatch
+        # -> "Unsloth: Critical error since some weights are not initialized". This runs every
+        # phase (init/pre_compile/post_compile), so restore the stock classes when the current
+        # load is NOT BnB-4bit.
+        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+            restore_gpt_oss_original()
+            os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
+            _invalidate_gpt_oss_compiled_module()
         return
+    already_bnb = os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1"
     # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols.
     patch_gpt_oss_bnb4bit()
+    if not already_bnb:
+        # First time switching INTO BnB mode this process: a stale 16bit-built compiled
+        # gpt_oss module would otherwise re-install the stock router/experts. Invalidate it.
+        _invalidate_gpt_oss_compiled_module()
     # Inference path avoids torch.compile for 4-bit
     try:
         global moe_forward_inference
