@@ -369,23 +369,33 @@ def prepare_model_for_training(
             or "norm2." in nm
         )
 
+    # Only honor an incoming bias requires_grad as a PEFT decision on an actual
+    # PEFT model. On a freshly-loaded non-PEFT model every nn.Linear bias defaults
+    # to requires_grad=True, so without this gate the bias branch below would keep
+    # all biases trainable for a LoRA-style (not full_finetuning) call (#2343 review).
+    _is_peft_model = hasattr(model, "peft_config")
+
     for name, param in model.named_parameters():
         original_name = name
         upcast = False
         requires_grad = False
+        _keep_param_dtype = False
         _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
             if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
                 upcast = True
                 requires_grad = True
-            elif name.endswith(".bias"):
+            elif _is_peft_model and "bias" in name and param.requires_grad:
                 # Respect PEFT's bias decision. LoraConfig(bias="all"/"lora_only")
-                # marks the relevant biases trainable; blindly freezing every
-                # non-LoRA param here silently disabled bias training (#2343).
-                # bias="none" (the default) leaves biases frozen, so this keeps
-                # requires_grad = False and is a no-op for the common path.
-                requires_grad = param.requires_grad
-                upcast = requires_grad
+                # marks bias params trainable (PEFT itself tests `"bias" in name`);
+                # blindly freezing every non-LoRA param here silently disabled bias
+                # training (#2343). bias="none" (the default) leaves biases frozen,
+                # so they fall through to the else and stay frozen. Keep a trainable
+                # bias at its loaded dtype: upcasting it to fp32 while the Linear's
+                # weight stays bf16/fp16 breaks the matmul ("self and mat2 must have
+                # the same dtype").
+                requires_grad = True
+                _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
@@ -406,8 +416,12 @@ def prepare_model_for_training(
             param.requires_grad_(False)
 
         # Cast storage in place (keeps Parameter identity so tied weights stay tied);
-        # skip externally-managed params so we don't undo their fp32 cast.
-        if requires_grad and id(param) not in _externally_managed_param_ids:
+        # skip externally-managed params so we don't undo their fp32 cast, and skip
+        # params we must leave at their loaded dtype (trainable biases, which have to
+        # match their Linear's weight dtype).
+        if (requires_grad
+                and not _keep_param_dtype
+                and id(param) not in _externally_managed_param_ids):
             dtype = torch.float32 if upcast else mixed_precision_dtype
             if param.dtype != dtype:
                 param.data = param.data.to(dtype)

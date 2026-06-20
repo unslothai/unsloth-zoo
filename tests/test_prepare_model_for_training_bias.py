@@ -1,24 +1,22 @@
 """Regression tests for unsloth#2343: bias training was silently disabled.
 
 Pre-fix bug: `prepare_model_for_training`'s LoRA branch froze every parameter
-that was not a LoRA adapter weight:
+that was not a LoRA adapter weight, so `LoraConfig(bias="all")` / `bias="lora_only"`
+had no effect (PEFT enabled the biases, then this loop re-froze them).
 
-    if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
-        requires_grad = True
-    else:
-        requires_grad = False   # <- also froze biases PEFT had marked trainable
+The fix preserves PEFT's bias decision. Important properties (each guarded below):
+  * bias="all"/"lora_only": the biases PEFT marked trainable stay trainable.
+  * bias="none" (default): biases stay frozen (byte-identical common path).
+  * a trainable bias keeps its loaded dtype, NOT fp32: upcasting a bias while its
+    Linear's weight stays bf16/fp16 breaks the matmul ("self and mat2 must have
+    the same dtype") -- the dtype-mismatch the fix must avoid.
+  * the preservation is gated to PEFT models: a freshly-loaded non-PEFT model
+    (whose nn.Linear biases default to requires_grad=True) is left frozen on the
+    LoRA (not full_finetuning) path.
 
-So `LoraConfig(bias="all")` / `bias="lora_only"` had no effect: PEFT enabled the
-biases, then this loop re-froze them. The fix keeps the PEFT decision for params
-whose name ends in `.bias` (preserve their incoming requires_grad and upcast the
-trainable ones to fp32 like LoRA adapters). `bias="none"` (the default) leaves
-biases frozen, so the common path is byte-identical.
-
-Pure CPU, tiny random Llama. The PEFT end-to-end test is gated on peft being
-importable (peft is excluded on darwin/arm64).
+Pure CPU, tiny random Llama. PEFT is required for the bias-preservation tests
+(peft is excluded on darwin/arm64), so those import-or-skip.
 """
-import os
-
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -47,154 +45,121 @@ def _bias_names(model):
     return [n for n, _ in model.named_parameters() if n.endswith(".bias")]
 
 
-# ---------------- core fix (no peft): PEFT's bias decision is respected -------
+def _lora(model, bias):
+    from peft import LoraConfig, get_peft_model
 
-def test_marked_biases_stay_trainable_after_prepare():
-    """Simulate PEFT bias='all' (every bias requires_grad=True). After prepare
-    the biases must remain trainable and the non-bias base weights frozen."""
+    return get_peft_model(
+        model,
+        LoraConfig(
+            r=8, lora_alpha=8, bias=bias,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+        ),
+    )
+
+
+def _trainable_bias_count(model):
+    return sum(
+        p.requires_grad for n, p in model.named_parameters() if n.endswith(".bias"))
+
+
+# ---------------- PEFT bias decision is preserved ----------------------------
+
+def test_peft_bias_all_stays_trainable():
+    """bias='all': every bias PEFT enabled stays trainable after prepare."""
+    pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    model = _tiny_llama()
-    biases = _bias_names(model)
-    assert biases, "fixture must have bias params"
-    for n, p in model.named_parameters():
-        p.requires_grad_(n.endswith(".bias"))  # PEFT bias='all' shape
+    model = _lora(_tiny_llama(), bias="all")
+    before = _trainable_bias_count(model)
+    assert before > 0, "PEFT should enable biases for bias='all'"
 
     prepare_model_for_training(
         model, use_gradient_checkpointing=False, use_reentrant=False,
         full_finetuning=False,
     )
-
+    after = _trainable_bias_count(model)
+    assert after == before, f"bias='all' lost trainable biases: {before} -> {after}"
+    # The non-bias base weights must remain frozen.
     params = dict(model.named_parameters())
-    for n in biases:
-        assert params[n].requires_grad, f"{n} should stay trainable (bias='all')"
-    # A representative non-bias base weight must be frozen.
-    assert not params["model.layers.0.self_attn.q_proj.weight"].requires_grad
+    base_w = next(n for n in params
+                  if n.endswith("q_proj.base_layer.weight"))
+    assert not params[base_w].requires_grad
 
 
-def test_default_biases_stay_frozen():
-    """bias='none' shape: nothing marked trainable -> biases stay frozen, i.e.
-    byte-identical to pre-fix behaviour on the common path."""
+def test_peft_bias_none_stays_frozen():
+    """bias='none' (default): no biases trainable before or after -> unchanged."""
+    pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    model = _tiny_llama()
-    for _, p in model.named_parameters():
-        p.requires_grad_(False)
-
+    model = _lora(_tiny_llama(), bias="none")
     prepare_model_for_training(
         model, use_gradient_checkpointing=False, use_reentrant=False,
         full_finetuning=False,
     )
-
-    params = dict(model.named_parameters())
-    for n in _bias_names(model):
-        assert not params[n].requires_grad, f"{n} should stay frozen (bias='none')"
+    assert _trainable_bias_count(model) == 0
 
 
-def test_trainable_bias_is_upcast_to_fp32():
-    """A trainable bias is upcast to fp32 (like LoRA adapters); a frozen one
-    keeps its loaded (bf16) dtype."""
+def test_peft_trainable_bias_keeps_module_dtype():
+    """A trainable bias must keep its Linear's (bf16) dtype, NOT be upcast to
+    fp32 -- otherwise the bf16 weight @ fp32 bias matmul raises
+    'self and mat2 must have the same dtype'. Regression guard for the review fix.
+    """
+    pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    model = _tiny_llama(dtype=torch.bfloat16)
-    names = _bias_names(model)
-    trainable_bias = names[0]
-    # Mark exactly one bias trainable (mimics bias='lora_only' picking a subset).
-    for n, p in model.named_parameters():
-        p.requires_grad_(n == trainable_bias)
-
+    model = _lora(_tiny_llama(dtype=torch.bfloat16), bias="all")
     prepare_model_for_training(
         model, use_gradient_checkpointing=False, use_reentrant=False,
         full_finetuning=False, float32_mixed_precision=True,
     )
-
     params = dict(model.named_parameters())
-    assert params[trainable_bias].dtype == torch.float32
-    assert params[trainable_bias].requires_grad
-    # An untouched, frozen bias is not recast.
-    frozen_bias = names[1]
-    assert params[frozen_bias].dtype == torch.bfloat16
-    assert not params[frozen_bias].requires_grad
+    bias_name = next(n for n in params
+                     if n.endswith(".bias") and params[n].requires_grad)
+    weight_name = bias_name[:-len("bias")] + "weight"
+    assert params[bias_name].dtype == torch.bfloat16, params[bias_name].dtype
+    assert params[bias_name].dtype == params[weight_name].dtype
 
 
-def test_bias_gradient_flows_after_backward():
-    """End-to-end on CPU: with biases trainable, a backward pass populates
-    their .grad; a frozen base weight gets no grad."""
+def test_peft_bias_gradient_flows_after_backward():
+    """End-to-end on CPU: with bias='all', a backward pass populates a finite
+    gradient on a trainable bias; a frozen base weight gets none."""
+    pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    model = _tiny_llama()
-    for n, p in model.named_parameters():
-        p.requires_grad_(n.endswith(".bias"))
-
+    model = _lora(_tiny_llama(), bias="all")
     prepare_model_for_training(
         model, use_gradient_checkpointing=False, use_reentrant=False,
         full_finetuning=False,
     )
 
     input_ids = torch.randint(0, 64, (1, 8))
-    out = model(input_ids=input_ids, labels=input_ids)
-    out.loss.backward()
+    model(input_ids=input_ids, labels=input_ids).loss.backward()
 
     params = dict(model.named_parameters())
-    a_bias = _bias_names(model)[0]
+    a_bias = next(n for n in params
+                  if n.endswith(".bias") and params[n].requires_grad)
     assert params[a_bias].grad is not None, "trainable bias must receive a grad"
-    assert params[a_bias].grad.abs().sum() >= 0  # finite, allocated
-    # A frozen base weight must not accumulate a grad.
-    assert params["model.layers.0.self_attn.q_proj.weight"].grad is None
+    assert torch.isfinite(params[a_bias].grad).all(), "bias grad must be finite"
+    base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
+    assert params[base_w].grad is None, "frozen base weight must not accumulate grad"
 
 
-# ---------------- PEFT end-to-end (gated on peft) ----------------------------
+# ---------------- non-PEFT models are left frozen ----------------------------
 
-def test_peft_bias_all_end_to_end():
-    """Through real PEFT: LoraConfig(bias='all') biases stay trainable after
-    prepare_model_for_training (the exact path from the issue repro)."""
-    peft = pytest.importorskip("peft")
-    from peft import LoraConfig, get_peft_model
+def test_non_peft_model_biases_stay_frozen():
+    """A non-PEFT model's nn.Linear biases default to requires_grad=True. On the
+    LoRA (not full_finetuning) path they must still be frozen -- the bias
+    preservation is only a PEFT decision, so a raw model is unaffected."""
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    model = _tiny_llama()
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=8, lora_alpha=8, bias="all",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-        ),
-    )
-    trainable_before = sum(
-        p.requires_grad for n, p in model.named_parameters() if n.endswith(".bias"))
-    assert trainable_before > 0  # PEFT enabled the biases
+    model = _tiny_llama()  # plain LlamaForCausalLM, no PEFT
+    assert any(p.requires_grad for n, p in model.named_parameters()
+               if n.endswith(".bias")), "fresh nn.Linear biases default to trainable"
 
     prepare_model_for_training(
         model, use_gradient_checkpointing=False, use_reentrant=False,
         full_finetuning=False,
     )
-
-    trainable_after = sum(
-        p.requires_grad for n, p in model.named_parameters() if n.endswith(".bias"))
-    assert trainable_after == trainable_before, (
-        f"bias='all' lost trainable biases: {trainable_before} -> {trainable_after}")
-
-
-def test_peft_bias_none_end_to_end():
-    """bias='none' (default): no biases trainable before or after -> unchanged."""
-    pytest.importorskip("peft")
-    from peft import LoraConfig, get_peft_model
-    from unsloth_zoo.training_utils import prepare_model_for_training
-
-    model = _tiny_llama()
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=8, lora_alpha=8, bias="none",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-        ),
-    )
-    prepare_model_for_training(
-        model, use_gradient_checkpointing=False, use_reentrant=False,
-        full_finetuning=False,
-    )
-    trainable_after = sum(
-        p.requires_grad for n, p in model.named_parameters() if n.endswith(".bias"))
-    assert trainable_after == 0
+    assert _trainable_bias_count(model) == 0, \
+        "non-PEFT biases must be frozen on the LoRA path"
