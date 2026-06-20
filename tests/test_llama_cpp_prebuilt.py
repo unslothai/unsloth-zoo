@@ -290,6 +290,75 @@ def test_extract_rejects_path_traversal(tmp_path):
         llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
 
 
+def _add_link(tar, name, linkname, link_type = tarfile.SYMTYPE):
+    info = tarfile.TarInfo(name)
+    info.type = link_type
+    info.linkname = linkname
+    tar.addfile(info)
+
+
+def test_extract_rejects_symlink_escape(tmp_path):
+    evil = tmp_path / "evil-symlink.tar.gz"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "link", str(outside))
+        _add_file(tar, "link/pwned.txt", "pwned")
+    with pytest.raises(RuntimeError, match = "escapes extraction dir"):
+        llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
+    assert not (outside / "pwned.txt").exists()
+
+
+def test_extract_rejects_hardlink_escape(tmp_path):
+    evil = tmp_path / "evil-hardlink.tar.gz"
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "link", "../../../../etc/passwd", link_type = tarfile.LNKTYPE)
+    with pytest.raises(RuntimeError, match = "escapes extraction dir"):
+        llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
+
+
+def test_extract_rejects_zip_symlink(tmp_path):
+    import zipfile
+    evil = tmp_path / "evil.zip"
+    with zipfile.ZipFile(evil, "w") as archive:
+        info = zipfile.ZipInfo("link")
+        info.external_attr = 0o120777 << 16  # S_IFLNK
+        archive.writestr(info, str(tmp_path / "outside"))
+    with pytest.raises(RuntimeError, match = "symlink"):
+        llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
+
+
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0, reason = "read-only dir perms (non-root POSIX)")
+def test_extract_allows_readonly_dir_before_contents(tmp_path):
+    # A read-only dir entry preceding its files must not trip extraction:
+    # extractall defers directory perms until contents are written.
+    archive = tmp_path / "ro.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        d = tarfile.TarInfo("ro")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o555
+        tar.addfile(d)
+        _add_file(tar, "ro/file.txt", "ok")
+    out = tmp_path / "out"
+    llama_cpp._extract_archive(str(archive), str(out))
+    content = (out / "ro" / "file.txt").read_text()
+    os.chmod(out / "ro", 0o755)  # restore write bit so tmp_path cleanup can unlink
+    assert content == "ok"
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink semantics")
+def test_extract_allows_in_tree_symlink(tmp_path):
+    # Real release tarballs ship relative .so symlinks that stay in-tree.
+    archive = tmp_path / "libs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        _add_file(tar, "libllama.so.0", "not really elf")
+        _add_link(tar, "libllama.so", "libllama.so.0")
+    out = tmp_path / "out"
+    llama_cpp._extract_archive(str(archive), str(out))
+    assert (out / "libllama.so").is_symlink()
+    assert (out / "libllama.so").resolve() == (out / "libllama.so.0").resolve()
+
+
 @pytest.mark.skipif(not IS_POSIX, reason = "shell-script fake binaries")
 def test_extract_and_place_linux(tmp_path):
     archive = tmp_path / "llama-b9000-bin-ubuntu-x64.tar.gz"
