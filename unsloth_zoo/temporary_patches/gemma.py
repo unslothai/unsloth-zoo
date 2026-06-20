@@ -70,6 +70,18 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
     return padding_mask & causal_mask[None, None, :, :]
 
 
+def _gemma3_rms_norm(x, weight, eps, out_dtype):
+    # Inline Gemma3RMSNorm math. q_norm/k_norm are applied here instead of calling
+    # the module so the already-compiled prepare() never inlines another compiled
+    # (and accelerate-hooked) forward, which broke Dynamo with
+    # "missing a required argument: 'x'" on older torch. See unsloth#3535.
+    x_fp32 = x.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim=True)
+    hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    output_fp32 = hidden_states_fp32 * (1.0 + weight.to(torch.float32))
+    return output_fp32.to(out_dtype)
+
+
 def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     """Build the past_key_value / past_key_values forward variants."""
     functions = []
@@ -422,9 +434,13 @@ def patch_Gemma3Attention():
         key_states_fp32   = key_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2)
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
 
-        # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
-        key_norm_out_fp16   = k_norm(key_states_fp32) # self.q_norm doesn't use auto compiler
+        # 3. Normalization (q_norm, k_norm are RMSNorms) applied inline; see _gemma3_rms_norm.
+        # Float32 path clamps to fp16 range and emits fp16 to match patch_Gemma3RMSNorm.
+        fp16_max = torch.finfo(torch.float16).max
+        query_norm_out_fp16 = _gemma3_rms_norm(query_states_fp32, q_norm.weight, q_norm.eps, torch.float32)
+        key_norm_out_fp16   = _gemma3_rms_norm(key_states_fp32,   k_norm.weight, k_norm.eps, torch.float32)
+        query_norm_out_fp16 = torch.clamp(query_norm_out_fp16, min=-fp16_max, max=fp16_max).to(torch.float16)
+        key_norm_out_fp16   = torch.clamp(key_norm_out_fp16,   min=-fp16_max, max=fp16_max).to(torch.float16)
 
         query_states_fp32 = query_norm_out_fp16.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16.to(torch.float32)
@@ -656,9 +672,10 @@ def patch_Gemma3Attention_generic():
         key_states_fp32   = key_states_fp16.view(kv_hidden_shape).transpose(1, 2)
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).transpose(1, 2) # V for attention also fp32
 
-        # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
-        key_norm_out_fp16   = k_norm(key_states_fp32) # self.k_norm doesn't use auto compiler
+        # 3. Normalization (q_norm, k_norm are RMSNorms) applied inline; see _gemma3_rms_norm.
+        # Output dtype mirrors the input dtype, matching patch_Gemma3RMSNorm_generic.
+        query_norm_out_fp16 = _gemma3_rms_norm(query_states_fp32, q_norm.weight, q_norm.eps, query_states_fp32.dtype)
+        key_norm_out_fp16   = _gemma3_rms_norm(key_states_fp32,   k_norm.weight, k_norm.eps, key_states_fp32.dtype)
 
         query_states_fp32 = query_norm_out_fp16#.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16#.to(torch.float32)
