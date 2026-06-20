@@ -549,6 +549,17 @@ def _merge_and_overwrite_lora(
         )
     pass
 
+    # FP8 weights grow to 16bit and shed their companion scales on a 16bit merge,
+    # so they need the same full-rewrite path as mxfp4 (in-place mmap can't resize).
+    if base_model_is_quantized and quant_type == "fp8":
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("FP8 quantized model detected. Dequantizing to 16bit via full rewrite.")
+        return _merge_and_overwrite_lora_fp8(
+            save_directory, filename, lora_weights, output_dtype,
+            model_class_name, tie_word_embeddings = tie_word_embeddings,
+        )
+    pass
+
     filename_original = os.path.join(save_directory, filename)  # Original file path
     count = 0
     # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
@@ -1799,6 +1810,136 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     return count, safetensor_keys_seen
 pass
 
+# Companion-scale suffixes that an FP8 dense checkpoint stores next to each
+# float8 weight. On a 16bit merge the weight is dequantized, so these are dropped.
+_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
+
+def _fp8_dequantize_weight(file, header_metadata, weight_key):
+    """Dequantize one FP8 dense weight to its companion scale's dtype.
+
+    Returns (W_real, [scale_keys]) where scale_keys are the companion tensors to
+    drop from the merged shard. Raises if the weight is FP8 but no usable
+    weight_scale / weight_scale_inv is found (loud failure, never silent FP8).
+    """
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
+    W = file.get_tensor(weight_key)
+    if W.dtype != torch.float8_e4m3fn:
+        return W, []
+    base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
+    scale_inv = None
+    for suffix in (".weight_scale_inv", ".weight_scale"):
+        cand = base + suffix
+        if cand in header_metadata:
+            scale_inv = file.get_tensor(cand)
+            break
+    if scale_inv is None:
+        raise RuntimeError(
+            f"Unsloth: FP8 weight '{weight_key}' has no companion weight_scale / "
+            "weight_scale_inv; cannot dequantize to 16bit. The merged model would be "
+            "corrupted. Please file a bug at https://github.com/unslothai/unsloth/issues."
+        )
+    if scale_inv.ndim != 2 or W.ndim != 2 or W.shape[0] % scale_inv.shape[0] or W.shape[1] % scale_inv.shape[1]:
+        raise RuntimeError(
+            f"Unsloth: FP8 weight '{weight_key}' shape {tuple(W.shape)} is not tiled by "
+            f"its scale {tuple(scale_inv.shape)}; cannot dequantize safely."
+        )
+    W_real = _fp8_dequant_blockwise(W, scale_inv)
+    # Drop every companion scale for this weight (input_scale too on static FP8).
+    scale_keys = [base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata]
+    return W_real, scale_keys
+
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Dequantizes FP8 dense weights to 16bit, merges LoRA, drops companion scales,
+    # and atomically rewrites the shard (mirrors the mxfp4 full-rewrite strategy).
+    filename_original = os.path.join(save_directory, filename)
+    tensors = OrderedDict()
+    count = 0
+    safetensor_keys_seen = set()
+
+    with safe_open(filename_original, framework = "pt", device = "cpu") as file:
+        safetensor_keys = list(file.keys())
+        safetensor_keys_seen.update(safetensor_keys)
+
+        # Read header dtypes so we skip scale companions without a tensor read.
+        raw_pointer = open(filename_original, "r+b")
+        try:
+            length_of_header = int.from_bytes(raw_pointer.read(8), "little")
+            header_metadata = json.loads(raw_pointer.read(length_of_header))
+        finally:
+            raw_pointer.close()
+
+        converted_lora_weights = _convert_lora_keys_to_safetensor_format(
+            lora_weights, safetensor_keys, model_class_name = model_class_name,
+        )
+
+        # Collect companion scale keys to drop (their FP8 weights are dequantized).
+        scale_keys_to_drop = set()
+        for key in safetensor_keys:
+            if key in scale_keys_to_drop:
+                continue
+            if any(key.endswith(s) for s in _FP8_SCALE_SUFFIXES):
+                continue
+
+            W, scale_keys = _fp8_dequantize_weight(file, header_metadata, key)
+            scale_keys_to_drop.update(scale_keys)
+
+            output_key = key
+            lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
+            lora_stats = converted_lora_weights.get(lora_key, None)
+            if lora_stats is None and lora_key.endswith(".linear"):
+                lora_stats = converted_lora_weights.get(lora_key[: -len(".linear")], None)
+            # Tied embeddings: fold an lm_head LoRA onto embed_tokens (shared base tensor).
+            if lora_stats is None and tie_word_embeddings and lora_key.endswith("embed_tokens"):
+                lm_head_key = lora_key[: -len("embed_tokens")] + "lm_head"
+                lora_stats = converted_lora_weights.get(lm_head_key, None)
+                if lora_stats is None and lm_head_key.startswith("model."):
+                    lora_stats = converted_lora_weights.get(lm_head_key[len("model."):], None)
+                if lora_stats is None and not lm_head_key.startswith("model."):
+                    lora_stats = converted_lora_weights.get("model." + lm_head_key, None)
+            if lora_stats is not None:
+                if getattr(lora_stats, "lora_A", None) is None and getattr(lora_stats, "module", None) is not None:
+                    # modules_to_save (e.g. resized embed/lm_head): take the saved weight.
+                    saved_weight = _get_modules_to_save_weight(lora_stats.module)
+                    if saved_weight is None and hasattr(lora_stats.module, "weight"):
+                        saved_weight = lora_stats.module.weight
+                    if saved_weight is not None:
+                        W = saved_weight.to(W.device, dtype = torch.float32)
+                        count += 1
+                elif getattr(lora_stats, "lora_A", None) is not None:
+                    W = _merge_lora(W, lora_stats, output_key)
+                    count += 1
+
+            tensors[output_key] = W.to(output_dtype).contiguous()
+            del W
+            if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
+                device_empty_cache()
+
+        # Remove the dropped scale companions from the rewritten shard.
+        for sk in scale_keys_to_drop:
+            tensors.pop(sk, None)
+        for k in list(safetensor_keys):
+            if k in scale_keys_to_drop:
+                safetensor_keys_seen.discard(k)
+
+    if os.name == 'nt':
+        gc.collect()
+        time.sleep(0.1)
+
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
+        temp_filename_safetensors = tmpfile.name
+    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
+    try:
+        os.replace(temp_filename_safetensors, filename_original)
+    except OSError as e:
+        print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
+        shutil.copy2(temp_filename_safetensors, filename_original)
+        try: os.remove(temp_filename_safetensors)
+        except: pass
+
+    return count, safetensor_keys_seen
+pass
+
 from huggingface_hub import (
     split_state_dict_into_shards_factory,
     get_torch_storage_size,
@@ -2332,8 +2473,13 @@ def merge_and_overwrite_lora(
     is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
 
-    # ONLY download/copy the original index if we are NOT dequantizing an MXFP4 model
-    if (not (base_model_is_quantized and quant_type == "mxfp4") or (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")) and not needs_splitting:
+    # The original index references companion scale keys, so it goes stale once we
+    # dequantize. Skip copying it for MXFP4 dequant and FP8 dequant (regenerated below).
+    _is_quant_dequant = (
+        base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
+    ) or (base_model_is_quantized and quant_type == "fp8")
+    # ONLY download/copy the original index if we are NOT dequantizing a quantized model
+    if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok = True)
             # Copy from local
@@ -2460,7 +2606,9 @@ def merge_and_overwrite_lora(
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)
 
     is_final_safetensors_list_sharded = is_hf_sharded_safetensors(final_safetensors_list)
-    regenerate_index = ((base_model_is_quantized and quant_type == "mxfp4") or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
+    # FP8 dequant drops companion scale keys, so a sharded index must be rebuilt too.
+    _quant_dequant_index = base_model_is_quantized and quant_type in ("mxfp4", "fp8")
+    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
     weight_map = {}
 
     # Collect all tensor keys encountered across shards so we can reason about tied embeddings
@@ -3541,6 +3689,29 @@ def check_local_model_exists(model_path):
     return None
 pass
 
+def _is_fp8_quant_config(quant_config):
+    """True if a quantization_config dict describes an FP8 dense scheme.
+
+    Covers compressed-tensors `float-quantized`, transformers `finegrained_fp8`,
+    and `fbgemm_fp8`. These store float8 weights with companion weight_scale /
+    weight_scale_inv and must be dequantized (not written raw) on a 16bit merge.
+    """
+    if not isinstance(quant_config, dict):
+        return False
+    method = str(quant_config.get("quant_method", "")).lower()
+    if "fp8" in method or method == "fbgemm_fp8":
+        return True
+    # compressed-tensors: quant_method "compressed-tensors" + float weights.
+    if method == "compressed-tensors":
+        if str(quant_config.get("format", "")).lower() == "float-quantized":
+            return True
+        for group in (quant_config.get("config_groups") or {}).values():
+            weights = group.get("weights") if isinstance(group, dict) else None
+            if isinstance(weights, dict) and str(weights.get("type", "")).lower() == "float":
+                return True
+    return False
+pass
+
 def check_model_quantization_status(model_name_or_path, token=None):
     """Check if a model is quantized (works for both HF and local)"""
     config = None
@@ -3575,6 +3746,11 @@ def check_model_quantization_status(model_name_or_path, token=None):
         # We assume the Mxfp4Config serializes with a "quant_method": "mxfp4" key.
         if isinstance(quant_config, dict) and quant_config.get("quant_method") == "mxfp4":
             return (True, "mxfp4")
+
+        # Case 3: FP8 (compressed-tensors float-quantized / finegrained_fp8 / fbgemm_fp8).
+        # Detected here so the merged-16bit path dequantizes instead of writing raw FP8.
+        elif isinstance(quant_config, dict) and _is_fp8_quant_config(quant_config):
+            return (True, "fp8")
 
         # Case 1: Fallback to existing logic for bitsandbytes
         elif isinstance(quant_config, dict):
