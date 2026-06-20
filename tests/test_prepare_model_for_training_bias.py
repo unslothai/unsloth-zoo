@@ -139,8 +139,12 @@ def test_peft_bias_gradient_flows_after_backward():
     params = dict(model.named_parameters())
     a_bias = next(n for n in params
                   if n.endswith(".bias") and params[n].requires_grad)
-    assert params[a_bias].grad is not None, "trainable bias must receive a grad"
-    assert torch.isfinite(params[a_bias].grad).all(), "bias grad must be finite"
+    a_grad = params[a_bias].grad
+    assert a_grad is not None, "trainable bias must receive a grad"
+    assert torch.isfinite(a_grad).all(), "bias grad must be finite"
+    # Strictly > 0 (not just >= 0, which holds for any tensor): proves a gradient
+    # actually flowed into the bias rather than the param merely being allocated.
+    assert a_grad.abs().sum() > 0, "bias grad must be non-zero (gradient flowed)"
     base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
     assert params[base_w].grad is None, "frozen base weight must not accumulate grad"
 
@@ -163,3 +167,43 @@ def test_non_peft_model_biases_stay_frozen():
     )
     assert _trainable_bias_count(model) == 0, \
         "non-PEFT biases must be frozen on the LoRA path"
+
+
+# ---------------- modules_to_save biases are not a bias decision -------------
+
+def test_modules_to_save_bias_not_preserved_on_bias_none():
+    """bias='none' + modules_to_save: PEFT marks the saved module's bias trainable
+    because the whole module is saved, NOT because of a LoRA bias decision. With the
+    default patch_modules_to_save=False the saved module's weight stays frozen here,
+    so its bias must stay frozen too -- otherwise we partially train a saved head and
+    silently change the bias='none' path (#2343 review). The saved bias and weight
+    must end up with the same requires_grad state."""
+    pytest.importorskip("peft")
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    # gate_proj is an nn.Linear with a bias (mlp_bias=True) and is NOT a LoRA target
+    # here, so PEFT wraps it as a saved module: gate_proj.modules_to_save.default.*.
+    model = get_peft_model(
+        _tiny_llama(),
+        LoraConfig(
+            r=8, lora_alpha=8, bias="none",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            modules_to_save=["gate_proj"],
+        ),
+    )
+    saved = [n for n, _ in model.named_parameters() if ".modules_to_save." in n]
+    saved_bias = next(n for n in saved if n.endswith(".bias"))
+    saved_weight = next(n for n in saved if n.endswith(".weight"))
+    params = dict(model.named_parameters())
+    assert params[saved_bias].requires_grad, "PEFT should mark the saved module trainable"
+
+    prepare_model_for_training(
+        model, use_gradient_checkpointing=False, use_reentrant=False,
+        full_finetuning=False, patch_modules_to_save=False,
+    )
+    params = dict(model.named_parameters())
+    # No bias leaks trainable on the bias='none' path...
+    assert _trainable_bias_count(model) == 0, "bias='none' must leave all biases frozen"
+    # ...and the saved bias matches its weight (both frozen, not partially trained).
+    assert params[saved_bias].requires_grad == params[saved_weight].requires_grad

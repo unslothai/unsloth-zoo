@@ -385,7 +385,8 @@ def prepare_model_for_training(
             if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
                 upcast = True
                 requires_grad = True
-            elif _is_peft_model and "bias" in name and param.requires_grad:
+            elif (_is_peft_model and "bias" in name and param.requires_grad
+                    and ".modules_to_save." not in name):
                 # Respect PEFT's bias decision. LoraConfig(bias="all"/"lora_only")
                 # marks bias params trainable (PEFT itself tests `"bias" in name`);
                 # blindly freezing every non-LoRA param here silently disabled bias
@@ -394,6 +395,12 @@ def prepare_model_for_training(
                 # bias at its loaded dtype: upcasting it to fp32 while the Linear's
                 # weight stays bf16/fp16 breaks the matmul ("self and mat2 must have
                 # the same dtype").
+                # Exclude modules_to_save: PEFT marks a saved module's bias trainable
+                # because the whole module is saved, not as a LoRA bias decision. With
+                # the default patch_modules_to_save=False the saved weight stays frozen
+                # here, so preserving its bias would partially train a saved head and
+                # change the bias="none" path (#2343 review). When the caller opts into
+                # patch_modules_to_save the block below re-enables the whole module.
                 requires_grad = True
                 _keep_param_dtype = True
             else:
