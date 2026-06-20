@@ -1963,10 +1963,28 @@ def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
     with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
-    if "quantization_config" in config:
-        # Remove the quantization_config field
-        del config["quantization_config"]
-    else:
+    # Strip quantization_config from the top level AND every nested sub-config.
+    # VLMs keep the LLM's quantization_config under config["text_config"] (and some
+    # under vision_config), so a merged_16bit export of a 4bit-loaded model would
+    # otherwise ship dequantized bf16 weights still labelled load_in_4bit in a
+    # nested sub-config. On reload transformers then builds the bnb 4bit quantizer
+    # for full-precision weights -> "Cannot copy out of meta tensor". Recurse so the
+    # marker is removed wherever it lives. No-op when none is present.
+    def _strip_quantization_config(obj):
+        removed = False
+        if isinstance(obj, dict):
+            if "quantization_config" in obj:
+                del obj["quantization_config"]
+                removed = True
+            for value in obj.values():
+                if _strip_quantization_config(value):
+                    removed = True
+        elif isinstance(obj, list):
+            for value in obj:
+                if _strip_quantization_config(value):
+                    removed = True
+        return removed
+    if not _strip_quantization_config(config):
         return
     # Overwrite the config file
     with open(config_path, "w", encoding = "utf-8") as f:
@@ -2177,6 +2195,38 @@ def merge_and_overwrite_lora(
                 safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+
+            # Drop stale/duplicate shard sets the index does not reference. Some
+            # repos (e.g. granite-3.2-8b-instruct) ship a leftover second shard set
+            # (e.g. model-0000N-of-0000M) next to the real one, while
+            # model.safetensors.index.json references only the real set. Merging the
+            # LoRA into a stale shard whose tensor shapes differ raises
+            # "Bad in-place call: input tensor size ... should match". Only filter
+            # when the index exists AND there are genuinely extra (non-indexed)
+            # shards, so single-shard / well-formed repos are untouched (no-op).
+            try:
+                from huggingface_hub import hf_hub_download as _hf_hub_download
+                _idx_path = _hf_hub_download(
+                    repo_id  = model_name,
+                    filename = "model.safetensors.index.json",
+                    token    = token,
+                )
+                with open(_idx_path, "r", encoding = "utf-8") as f:
+                    _weight_map = json.load(f).get("weight_map", {})
+                _indexed = {os.path.split(v)[-1] for v in _weight_map.values()}
+                if _indexed and not set(safetensors_list).issubset(_indexed):
+                    _kept = [s for s in safetensors_list if s in _indexed]
+                    if _kept and len(_kept) != len(safetensors_list):
+                        _sizes = {os.path.split(x["name"])[-1] : x["size"] for x in _hf_entries}
+                        safetensors_list      = _kept
+                        max_size_in_bytes     = 0
+                        total_size_in_bytes   = 0
+                        for _s in safetensors_list:
+                            _sz = _sizes.get(_s, 0)
+                            max_size_in_bytes   = max(max_size_in_bytes, _sz)
+                            total_size_in_bytes += _sz
+            except Exception:
+                pass
 
         if not safetensors_list:
              raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
