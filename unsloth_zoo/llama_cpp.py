@@ -1287,9 +1287,14 @@ def install_llama_cpp(
                 # Clean up any partial build
                 try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
-                # Build cmake configure command with library detection
+                # Build cmake configure command with library detection.
+                # Set CMAKE_BUILD_TYPE=Release at configure time: on single-config
+                # generators (Unix Makefiles / Ninja on Linux/macOS) the build
+                # step's `--config Release` is ignored, so without this the
+                # binaries are built unoptimized.
                 cmake_configure = (
                     f"cmake . -B build "
+                    f"-DCMAKE_BUILD_TYPE=Release "
                     f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
                 )
 

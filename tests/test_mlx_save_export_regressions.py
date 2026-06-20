@@ -818,6 +818,134 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == old_scripts_dir
 
 
+@pytest.mark.parametrize(
+    "platform_name, install_behavior, expect_macos_helper",
+    [
+        ("darwin", "prebuilt_ok", False),    # prebuilt-first: no clone/compile
+        ("darwin", "apt_get_error", True),   # prebuilt unavailable -> macOS cmake+Metal helper
+        ("linux", "prebuilt_ok", False),     # unchanged Linux path
+    ],
+)
+def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
+    monkeypatch, tmp_path, platform_name, install_behavior, expect_macos_helper
+):
+    """When llama.cpp is missing, the install fallback must try the shared
+    install_llama_cpp() (prebuilt-first) on every platform, and only drop to the
+    macOS cmake+Metal source helper when that prebuilt path hit the apt-get
+    failure that is macOS-specific."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setitem(sys.modules, "gguf", types.ModuleType("gguf"))
+    monkeypatch.setattr(mutils.sys, "platform", platform_name)
+
+    llama_root = tmp_path / "llama.cpp"
+    llama_root.mkdir()
+    converter = llama_root / "convert_hf_to_gguf.py"
+    converter.write_text("# converter", encoding="utf-8")
+    quantizer = llama_root / "llama-quantize"
+    quantizer.write_text("# quantizer", encoding="utf-8")
+    (llama_root / "unsloth_convert_hf_to_gguf.py").write_text("# patched", encoding="utf-8")
+
+    calls = []
+    check_state = {"n": 0}
+
+    def fake_check(folder):
+        # First probe fails (forces the install fallback); the re-probe after the
+        # macOS helper succeeds.
+        check_state["n"] += 1
+        calls.append("check")
+        if check_state["n"] == 1:
+            raise RuntimeError("llama.cpp not found")
+        return (str(quantizer), str(converter))
+
+    def fake_install(folder):
+        calls.append("install_llama_cpp")
+        if install_behavior == "prebuilt_ok":
+            return (str(quantizer), str(converter))
+        # Mirror the real macOS-only source-build failure (no apt-get).
+        raise RuntimeError(
+            "[FAIL] Unsloth: apt-get does not exist? Is this NOT a Linux / Mac based computer?"
+        )
+
+    def fake_macos(folder):
+        calls.append("_install_llama_cpp_macos")
+
+    monkeypatch.setattr(
+        mutils, "save_merged_model",
+        lambda model, tokenizer, path, dequantize=False: Path(path).mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(mutils, "_install_llama_cpp_macos", fake_macos)
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(llama_root))
+    monkeypatch.setattr(llama_cpp, "check_llama_cpp", fake_check)
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", fake_install)
+    monkeypatch.setattr(
+        llama_cpp, "_download_convert_hf_to_gguf",
+        lambda: (str(llama_root / "unsloth_convert_hf_to_gguf.py"), {"Qwen3ForCausalLM"}, set()),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "convert_to_gguf",
+        lambda **kw: Path(
+            f"{kw['model_name']}.{kw['quantization_type'].upper()}.gguf"
+        ).write_bytes(b"GGUF"),
+    )
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", lambda **kw: None)
+
+    model = types.SimpleNamespace(_hf_repo="org/TestModel")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=tmp_path / "out",
+        quantization_method="not_quantized",
+        first_conversion="f16",
+    )
+
+    # Prebuilt-first is attempted on every platform.
+    assert "install_llama_cpp" in calls
+    # The macOS source helper is reached only on the darwin apt-get path.
+    assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
+
+
+def test_gguf_install_fallback_reraises_non_aptget_runtimeerror(monkeypatch, tmp_path):
+    """A non-apt-get RuntimeError from install_llama_cpp must propagate, not get
+    silently swallowed into the macOS source build."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setitem(sys.modules, "gguf", types.ModuleType("gguf"))
+    monkeypatch.setattr(mutils.sys, "platform", "darwin")
+
+    monkeypatch.setattr(
+        mutils, "save_merged_model",
+        lambda model, tokenizer, path, dequantize=False: Path(path).mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(
+        mutils, "_install_llama_cpp_macos",
+        lambda folder: pytest.fail("_install_llama_cpp_macos must not run for an unrelated error"),
+    )
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "llama.cpp"))
+    monkeypatch.setattr(
+        llama_cpp, "check_llama_cpp",
+        lambda folder: (_ for _ in ()).throw(RuntimeError("not found")),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "install_llama_cpp",
+        lambda folder: (_ for _ in ()).throw(RuntimeError("disk full while downloading prebuilt")),
+    )
+
+    model = types.SimpleNamespace(_hf_repo="org/TestModel")
+    with pytest.raises(RuntimeError, match="disk full"):
+        mutils.save_pretrained_gguf(
+            model,
+            tokenizer=object(),
+            save_directory=tmp_path / "out",
+            quantization_method="not_quantized",
+            first_conversion="f16",
+        )
+
+
 def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 

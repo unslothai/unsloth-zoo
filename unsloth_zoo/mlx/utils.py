@@ -5540,16 +5540,28 @@ def save_pretrained_gguf(
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
-            if sys.platform == "darwin":
-                # install_llama_cpp resolves missing system build-deps through
-                # apt-get, which does not exist on macOS (it raises "apt-get
-                # does not exist? Is this NOT a Linux / Mac based computer?").
-                # Build from source with cmake + Metal instead, then re-probe
-                # for the freshly built binaries.
+            try:
+                # Prefer the shared installer on every platform: it tries the
+                # prebuilt llama.cpp archive first (on macOS the Darwin bundle, so
+                # no clone + ~10 min compile) and only then falls back to a source
+                # build. For GGUF export this is sufficient -- llama-quantize is
+                # CPU-only and the converter is pure Python. install_llama_cpp also
+                # creates ~/.unsloth before cloning, so a fresh machine is fine.
+                quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+            except RuntimeError as exc:
+                # The source-build fallback resolves missing system build-deps via
+                # apt-get, which does not exist on macOS (it raises "... does not
+                # exist? Is this NOT a Linux / Mac based computer?"). Only when the
+                # prebuilt was unavailable AND we hit that macOS-only failure do we
+                # build from source with cmake + Metal via the macOS helper, then
+                # re-probe for the freshly built binaries.
+                if (
+                    sys.platform != "darwin"
+                    or "does not exist? Is this NOT a Linux" not in str(exc)
+                ):
+                    raise
                 _install_llama_cpp_macos(llama_cpp_folder)
                 quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
-            else:
-                quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
 
         # Ensure gguf is installed (may be missing if llama.cpp was built
