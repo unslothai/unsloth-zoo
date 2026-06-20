@@ -118,10 +118,17 @@ def get_peft_regex(
     regex_components  = "|".join(regex_components)
 
     match_linear_modules = r"(?:" + "|".join(re.escape(x) for x in only_linear_modules) + r")"
+    # Do not append a trailing ".*?" after the linear-module group. PEFT matches
+    # target_modules with re.fullmatch, so a trailing ".*?" lets a key like
+    # "...attn.proj_drop" (a Dropout) fullmatch -- "proj" matches the linear group
+    # and ".*?" eats "_drop" -- raising "Target module Dropout is not supported".
+    # LoRA targets are leaf Linear modules whose names ARE the group entries, so
+    # ending the regex at the linear-module group keeps every real target and only
+    # stops matching non-linear modules that merely share a name prefix.
     regex_matcher = \
         r".*?(?:"  + regex_model_parts + \
         r").*?(?:" + regex_components + \
-        r").*?"    + match_linear_modules + ".*?"
+        r").*?"    + match_linear_modules
 
     # Also account for model.layers.0.self_attn/mlp type modules like Qwen
     if finetune_language_layers:
@@ -135,7 +142,7 @@ def get_peft_regex(
     if not check:
         regex_matcher = \
             r".*?(?:" + regex_components + \
-            r").*?"   + match_linear_modules + ".*?"
+            r").*?"   + match_linear_modules
     pass
 
     # Final check to confirm if matches exist
