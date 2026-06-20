@@ -425,37 +425,22 @@ def _patch_forward_for_kv_shared_no_cache(cls):
     cls.forward = _make_kv_shared_use_cache_false_safe_forward(cls.forward)
 
 
+# NOTE: On the Gemma-4 E-series (E2B / E4B, num_kv_shared_layers > 0) in
+# transformers 5.5.0 the cache-free forward (use_cache=False) is the CORRECT
+# path: teacher-forced loss goes to 0 and greedy decode reproduces the target,
+# while the KV-cache path (use_cache=True) is the broken one
+# (huggingface/transformers#45242). Wrapping the forward to build an internal
+# cache for use_cache=False therefore INVERTS correctness - it forces the broken
+# cached computation onto the path that was already right, so a memorised model
+# generates garbage and teacher-forced loss explodes to ~12. We keep the wrapper
+# defined above for reference, but do NOT register it. Generation safety is
+# handled in unsloth by defaulting Gemma-4 shared-KV generate() to use_cache=False.
 def patch_Gemma4TextModel_forward_kv_shared_no_cache():
-    """Patch Gemma4TextModel.forward (the language decoder that drives attention)."""
-    try:
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
-    except ImportError:
-        return
-    except Exception as e:
-        return raise_error("Gemma4TextModel.forward use_cache=False fix", e)
-    try:
-        _patch_forward_for_kv_shared_no_cache(Gemma4TextModel)
-    except Exception as e:
-        return raise_error("Gemma4TextModel.forward use_cache=False fix", e)
-pass
-TEMPORARY_PATCHES.append(patch_Gemma4TextModel_forward_kv_shared_no_cache)
+    return
 
 
 def patch_Gemma4Model_forward_kv_shared_no_cache():
-    """Patch Gemma4Model.forward (multimodal parent) as a safety net in case a
-    refactor moves cache auto-creation above Gemma4TextModel."""
-    try:
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4Model
-    except ImportError:
-        return
-    except Exception as e:
-        return raise_error("Gemma4Model.forward use_cache=False fix", e)
-    try:
-        _patch_forward_for_kv_shared_no_cache(Gemma4Model)
-    except Exception as e:
-        return raise_error("Gemma4Model.forward use_cache=False fix", e)
-pass
-TEMPORARY_PATCHES.append(patch_Gemma4Model_forward_kv_shared_no_cache)
+    return
 
 
 # Gemma4 AudioAttention: config attention_invalid_logits_value (-1e9) overflows
