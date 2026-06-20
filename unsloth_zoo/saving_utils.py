@@ -586,6 +586,13 @@ def _merge_and_overwrite_lora(
                     prefix, idx, _ = m.groups()
                     idx = int(idx)
                     moe_num_experts[prefix] = max(moe_num_experts.get(prefix, -1), idx + 1)
+                # Legacy Mixtral on disk: block_sparse_moe.experts.N.w1/w2/w3.weight.
+                # LoRA lives under the renamed mlp.experts prefix, so count under that.
+                m = re.match(r"^(.*)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$", _k)
+                if m:
+                    prefix = m.group(1) + ".mlp.experts"
+                    idx = int(m.group(2))
+                    moe_num_experts[prefix] = max(moe_num_experts.get(prefix, -1), idx + 1)
 
             # Update converted_lora_weights with actual safetensor keys
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -635,6 +642,38 @@ def _merge_and_overwrite_lora(
                     and len(processed_mxfp4_keys) == 0
                 ):
                     logger.info(f"[merge_debug] First shard key example: {key}")
+
+                # Legacy Mixtral on disk: block_sparse_moe.experts.N.w1/w2/w3.weight.
+                # transformers v5 fuses w1+w3 -> gate_up_proj and renames w2 -> down_proj
+                # in-memory, so the LoRA (and its merge) live under mlp.experts. Map the
+                # disk key back so w1->gate, w3->up, w2->down get merged.
+                m_legacy = re.match(
+                    r"^(.*)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$", key
+                )
+                if m_legacy:
+                    layer_prefix, expert_idx, w_name = m_legacy.groups()
+                    expert_idx = int(expert_idx)
+                    base_prefix = layer_prefix + ".mlp.experts"
+                    available_experts = moe_num_experts.get(base_prefix, None)
+                    if available_experts is not None and expert_idx >= available_experts:
+                        continue
+                    num_experts = available_experts
+                    if w_name == "w2":
+                        fused_key = base_prefix  # down_proj LoRA stored on experts module
+                        merge_fn = _merge_moe_down_proj_expert
+                    else:
+                        fused_key = base_prefix + ".base_layer"  # gate_up_proj LoRA
+                        merge_fn = _merge_moe_gate_expert if w_name == "w1" else _merge_moe_up_expert
+                    lora_stats = converted_lora_weights.get(fused_key)
+                    if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
+                        W = file.get_tensor(key)
+                        merged_W = merge_fn(W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype)
+                        _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged_W, W.dtype)
+                        processed_mxfp4_keys.add(key)
+                        if fused_key not in counted_lora_modules:
+                            count += 1
+                            counted_lora_modules.add(fused_key)
+                        continue
 
                 # MoE stacked experts: gate_up_proj is fused in the model but
                 # sharded as per-expert gate_proj/up_proj on disk.
@@ -3128,7 +3167,13 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
         base = key.replace(".base_layer", "")
         cands = set()
-        for b in (base, base.replace(".moe", ".experts")):
+        # .moe -> .experts (Gemma4); .mlp.experts -> .block_sparse_moe.experts (legacy Mixtral
+        # w1/w2/w3 on disk, renamed to mlp.experts in-memory by transformers v5).
+        for b in (
+            base,
+            base.replace(".moe", ".experts"),
+            base.replace(".mlp.experts", ".block_sparse_moe.experts"),
+        ):
             cands.add(b)
             # fused-named key (.gate_up_proj/.down_proj) is also backed by its per-expert
             # descendants, since the merge maps <experts>.<e>.<proj>.weight onto it.
