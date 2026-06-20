@@ -1260,6 +1260,35 @@ def _resolve_moe_num_experts(prefix, lora_stats, moe_num_experts):
 
 
 
+# Per-expert disk-tensor naming schemes for the per-expert (2D) MoE layout.
+# Default scheme is the standard gate_proj/up_proj/down_proj (DeepSeek/Qwen3 on
+# old transformers). LFM2 (lfm2_moe) and some ERNIE variants instead store the
+# experts on disk as w1 (gate) / w3 (up) / w2 (down) while the runtime module is
+# the fused Lfm2MoeExperts/Ernie4_5_MoeExperts (LoRA on gate_up_proj/down_proj).
+# (Lfm2MoeMLP.forward = w2(silu(w1(x)) * w3(x))  ->  w1=gate, w3=up, w2=down.)
+_MOE_PEREXPERT_SCHEMES = (
+    ("gate_proj", "up_proj", "down_proj"),
+    ("w1", "w3", "w2"),
+)
+
+
+def _detect_moe_perexpert_scheme(prefix, header_metadata):
+    """Return the (gate, up, down) per-expert disk-tensor name scheme used by the
+    shard for ``prefix``, or None if no per-expert scheme is present.
+
+    Detected from the actual shard header (expert 0's tensors), not by model
+    name, so any future arch using the same on-disk layout is handled and every
+    other layout is left to the default ``gate_proj/up_proj/down_proj`` path.
+    """
+    for gate_name, up_name, down_name in _MOE_PEREXPERT_SCHEMES:
+        if (
+            f"{prefix}.0.{gate_name}.weight" in header_metadata
+            or f"{prefix}.0.{down_name}.weight" in header_metadata
+        ):
+            return gate_name, up_name, down_name
+    return None
+
+
 def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys):
     count = 0
     debug_logged = 0
@@ -1307,12 +1336,20 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         if ".experts" in lora_key or ".moe" in lora_key:
             base = lora_key.replace(".base_layer", "")
             # Try direct match first (standard models)
-            if f"{base}.gate_up_proj" in header_metadata or f"{base}.down_proj" in header_metadata:
+            if (
+                f"{base}.gate_up_proj" in header_metadata
+                or f"{base}.down_proj" in header_metadata
+                or _detect_moe_perexpert_scheme(base, header_metadata) is not None
+            ):
                 _moe_lora_to_shard_prefix[lora_key] = base
             else:
                 # Try remapping moe -> experts (Gemma4)
                 remapped = base.replace(".moe", ".experts")
-                if f"{remapped}.gate_up_proj" in header_metadata or f"{remapped}.down_proj" in header_metadata:
+                if (
+                    f"{remapped}.gate_up_proj" in header_metadata
+                    or f"{remapped}.down_proj" in header_metadata
+                    or _detect_moe_perexpert_scheme(remapped, header_metadata) is not None
+                ):
                     _moe_lora_to_shard_prefix[lora_key] = remapped
 
     for lora_key, lora_stats in converted_lora_weights.items():
@@ -1387,7 +1424,14 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 counted_lora_modules.add(lora_key)
             continue
 
-        # Standard per-expert format (DeepSeek, Qwen3, GLM4, etc.)
+        # Standard per-expert format (DeepSeek, Qwen3, GLM4, etc.).
+        # Resolve the per-expert disk-tensor names: default gate_proj/up_proj/
+        # down_proj, or w1/w3/w2 when the shard uses that layout (LFM2, some
+        # ERNIE variants whose runtime experts module is the fused
+        # Lfm2MoeExperts/Ernie4_5_MoeExperts but whose checkpoint stores experts
+        # per-expert as w1=gate / w3=up / w2=down).
+        _scheme = _detect_moe_perexpert_scheme(prefix, header_metadata)
+        gate_name, up_name, down_name = _scheme or ("gate_proj", "up_proj", "down_proj")
         resolution_stats = lora_stats
         if getattr(resolution_stats, "module", None) is None:
             base_stats = converted_lora_weights.get(prefix + ".base_layer")
@@ -1426,8 +1470,8 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 pass
         for expert_idx in range(num_experts):
             if is_gate:
-                gate_key = f"{prefix}.{expert_idx}.gate_proj.weight"
-                up_key   = f"{prefix}.{expert_idx}.up_proj.weight"
+                gate_key = f"{prefix}.{expert_idx}.{gate_name}.weight"
+                up_key   = f"{prefix}.{expert_idx}.{up_name}.weight"
                 if _merge_moe_expert_quant_aware(
                     "gate", gate_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
@@ -1441,7 +1485,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 ):
                     module_updated = True
             else:
-                down_key = f"{prefix}.{expert_idx}.down_proj.weight"
+                down_key = f"{prefix}.{expert_idx}.{down_name}.weight"
                 if _merge_moe_expert_quant_aware(
                     "down", down_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
