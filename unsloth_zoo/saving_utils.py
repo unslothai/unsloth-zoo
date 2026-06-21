@@ -231,6 +231,8 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
             if tuple(W_dq.shape) == tuple(W.shape):
                 W = W_dq
         except Exception:
+            # Best-effort: any dequant/shape issue falls back to the W16 base so a
+            # merge that previously worked cannot regress (see comment above).
             pass
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
