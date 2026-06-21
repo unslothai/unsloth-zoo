@@ -134,7 +134,15 @@ def test_peft_bias_gradient_flows_after_backward():
     )
 
     input_ids = torch.randint(0, 64, (1, 8))
-    model(input_ids=input_ids, labels=input_ids).loss.backward()
+    # Build the loss from logits on the CPU side rather than passing `labels=`:
+    # with unsloth installed the labelled forward routes through the fused CUDA
+    # cross-entropy (unsloth_fused_lm_head_loss), which calls torch.cuda
+    # mem_get_info and aborts on a CPU-only build. A plain logits-based scalar
+    # keeps this test genuinely CPU-only while still driving a real backward.
+    logits = model(input_ids=input_ids).logits.float()
+    loss = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)), input_ids.view(-1))
+    loss.backward()
 
     params = dict(model.named_parameters())
     a_bias = next(n for n in params
