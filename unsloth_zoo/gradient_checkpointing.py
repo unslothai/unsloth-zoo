@@ -67,7 +67,7 @@ def _no_inference_mode():
     # no_grad avoids the "view created in no_grad modified in grad mode" error.
     try:
         leave_inference = torch.inference_mode(False)
-    except TypeError:
+    except (TypeError, AttributeError):
         # Older torch without inference_mode(bool); no_grad alone is enough.
         leave_inference = nullcontext()
     with leave_inference, torch.no_grad():
