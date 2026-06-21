@@ -659,18 +659,33 @@ def _merge_and_overwrite_lora(
                         continue
                     num_experts = available_experts
                     if w_name == "w2":
-                        fused_key = base_prefix  # down_proj LoRA stored on experts module
+                        # down_proj LoRA stored on the experts module.
+                        fused_key = base_prefix
+                        lora_stats = converted_lora_weights.get(fused_key)
+                        merge_role = "down"
                         merge_fn = _merge_moe_down_proj_expert
                     else:
-                        fused_key = base_prefix + ".base_layer"  # gate_up_proj LoRA
+                        # gate_up_proj LoRA: PEFT stores it on experts.base_layer, but
+                        # the fused .gate_up_proj key is used when there is no base_layer
+                        # wrapper (mirror the per-expert gate/up branch below).
+                        fused_key = base_prefix + ".base_layer"
+                        lora_stats = converted_lora_weights.get(fused_key)
+                        if lora_stats is None:
+                            fused_key = base_prefix + ".gate_up_proj"
+                            lora_stats = converted_lora_weights.get(fused_key)
+                        merge_role = "gate" if w_name == "w1" else "up"
                         merge_fn = _merge_moe_gate_expert if w_name == "w1" else _merge_moe_up_expert
-                    lora_stats = converted_lora_weights.get(fused_key)
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
-                        W = file.get_tensor(key)
-                        merged_W = merge_fn(W, lora_stats, expert_idx, num_experts, output_dtype or W.dtype)
-                        _write_tensor_direct_torch(mm, header_metadata, length_of_header, key, merged_W, W.dtype)
-                        processed_mxfp4_keys.add(key)
-                        if fused_key not in counted_lora_modules:
+                        # Route through the quant-aware helper so FP8/compressed legacy
+                        # shards dequantise -> merge -> requantise and rewrite their
+                        # companion scales; for plain 16-bit weights it is a straight
+                        # read/merge/write (apply_moe_quant_load returns the tensor as-is).
+                        merged = _merge_moe_expert_quant_aware(
+                            merge_role, key, file, header_metadata, lora_stats,
+                            expert_idx, num_experts, output_dtype, mm, length_of_header,
+                            processed_mxfp4_keys, merge_fn,
+                        )
+                        if merged and fused_key not in counted_lora_modules:
                             count += 1
                             counted_lora_modules.add(fused_key)
                         continue
