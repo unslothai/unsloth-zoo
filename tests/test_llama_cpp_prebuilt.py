@@ -752,8 +752,9 @@ def test_cpu_fork_full_install_happy_path(monkeypatch, tmp_path):
     assert marker["repo"] == "unslothai/llama.cpp"
     assert marker["asset"] == asset
     # Converter hydrated from the fork's own source asset, not ggml-org codeload.
+    from urllib.parse import urlparse
     assert f"https://example.invalid/{fork_source}" in downloaded
-    assert not any("codeload.github.com" in u for u in downloaded)
+    assert all(urlparse(u).netloc != "codeload.github.com" for u in downloaded)
 
 
 def test_force_compile_skips_prebuilt_gpu(monkeypatch, tmp_path):
