@@ -2161,6 +2161,29 @@ def merge_and_overwrite_lora(
                                         file_size = os.path.getsize(file_path)
                                         max_size_in_bytes = max(max_size_in_bytes, file_size)
                                         total_size_in_bytes += file_size
+                            else:
+                                # Drop stale/duplicate shards the index does not
+                                # reference, mirroring the HF-repo branch below. A
+                                # local snapshot of an indexed repo can carry a
+                                # leftover non-indexed shard set (e.g. granite-3.2-8b)
+                                # whose tensor shapes differ; merging the LoRA into it
+                                # raises "Bad in-place call: input tensor size ...".
+                                # Only filter when the index exists AND there are
+                                # genuinely extra (non-indexed) shards, so single-shard
+                                # / well-formed dirs are untouched (no-op).
+                                _indexed = {os.path.split(v)[-1] for v in index_data["weight_map"].values()}
+                                if _indexed and not set(safetensors_list).issubset(_indexed):
+                                    _kept = [s for s in safetensors_list if s in _indexed]
+                                    if _kept and len(_kept) != len(safetensors_list):
+                                        safetensors_list    = _kept
+                                        max_size_in_bytes   = 0
+                                        total_size_in_bytes = 0
+                                        for _s in safetensors_list:
+                                            _sp = os.path.join(model_name, _s)
+                                            if os.path.exists(_sp):
+                                                _sz = os.path.getsize(_sp)
+                                                max_size_in_bytes   = max(max_size_in_bytes, _sz)
+                                                total_size_in_bytes += _sz
                 except Exception as e:
                     print(f"Warning: Could not process index file: {e}")
             tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
@@ -2226,6 +2249,8 @@ def merge_and_overwrite_lora(
                             max_size_in_bytes   = max(max_size_in_bytes, _sz)
                             total_size_in_bytes += _sz
             except Exception:
+                # Index-based filtering is best-effort: if the index cannot be
+                # fetched/parsed, fall back to the full shard list found above.
                 pass
 
         if not safetensors_list:
