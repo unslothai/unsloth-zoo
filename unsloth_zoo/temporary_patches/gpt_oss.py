@@ -1082,22 +1082,108 @@ def _is_transformers_v5() -> bool:
     return transformers_version >= Version("5.0.0.dev0")
 
 
+_GPT_OSS_COMPILED_MODULE = "unsloth_compiled_module_gpt_oss"
+_GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
+
+
+def _gpt_oss_cache_locations():
+    """Candidate dirs that may hold the compiled gpt_oss module: the configured
+    location and the temp-fallback the compiler switches to when that dir is not
+    writable (see compiler._get_compile_folder). Resolved without calling the
+    compiler so this never triggers distributed coordination at patch time."""
+    locs = []
+    loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+    if loc:
+        locs.append(loc)
+        try:
+            import tempfile
+            locs.append(os.path.join(tempfile.gettempdir(), os.path.basename(loc)))
+        except Exception:
+            pass
+    # De-dup, preserve order (configured first = primary).
+    seen, out = set(), []
+    for _l in locs:
+        if _l and _l not in seen:
+            seen.add(_l); out.append(_l)
+    return out
+
+
 def _invalidate_gpt_oss_compiled_module():
-    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py) so it is
-    regenerated against the CURRENT router/experts classes. The compiled module is a
-    single per-model-type file that hardcodes either the BnB (router.linear) or stock
+    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it
+    is regenerated against the CURRENT router/experts classes. The compiled module is
+    a single per-model-type file that hardcodes either the BnB (router.linear) or stock
     (router.weight / 3D experts) layout; reusing a stale one across a 4bit<->16bit mode
-    switch in the same process re-installs the wrong classes."""
+    switch re-installs the wrong classes. Cleans every candidate cache location."""
     try:
         import sys as _sys
-        for _name in ("unsloth_compiled_module_gpt_oss",):
-            _sys.modules.pop(_name, None)
-        loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
-        _f = os.path.join(loc, "unsloth_compiled_module_gpt_oss.py")
-        if os.path.isfile(_f):
+        import importlib, importlib.util
+        _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
+        for loc in _gpt_oss_cache_locations():
+            _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if os.path.isfile(_f):
+                try:
+                    os.remove(_f)
+                except OSError:
+                    # Best-effort cleanup; ignore deletion failures.
+                    pass
+                # Also drop the byte-compiled .pyc so a stale module is not
+                # re-imported from __pycache__ after the .py is gone.
+                try:
+                    _pyc = importlib.util.cache_from_source(_f)
+                    if os.path.isfile(_pyc):
+                        os.remove(_pyc)
+                except Exception:
+                    pass
+        # Make Python forget any cached finder/directory state for these paths.
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+    except Exception:
+        # Best-effort cache invalidation; failures here must never break loading.
+        pass
+
+
+def _sync_gpt_oss_compiled_flavor(desired_flavor):
+    """Invalidate the on-disk compiled gpt_oss module when it was built for a
+    DIFFERENT flavor ("bnb4bit" vs "stock") than this load needs, independently of
+    the in-process UNSLOTH_GPT_OSS_BNB4BIT_PATCHED flag.
+
+    That flag is unset in a fresh process, so a fresh 16bit load after a 4bit load
+    (sharing the same compiled-cache dir) would otherwise import the stale BnB
+    router/experts and hit "Critical error since some weights are not initialized".
+    A small marker file next to the compiled module records the flavor it was built
+    for; on a mismatch (or when the marker is missing, i.e. an unknown older build)
+    the stale module is dropped so the compiler regenerates it for this load."""
+    try:
+        locations = _gpt_oss_cache_locations()
+        mismatch = False
+        for loc in locations:
+            module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if not os.path.isfile(module_path):
+                continue
+            on_disk = None
+            marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+            if os.path.isfile(marker_path):
+                try:
+                    with open(marker_path, "r", encoding = "utf-8") as f:
+                        on_disk = f.read().strip()
+                except Exception:
+                    on_disk = None
+            if on_disk != desired_flavor:
+                mismatch = True
+        if mismatch:
+            _invalidate_gpt_oss_compiled_module()
+        # Record this load's flavor where the module will be (re)built. Always write
+        # to the primary location; write to the temp fallback only if it is in use.
+        for idx, loc in enumerate(locations):
+            if idx != 0 and not os.path.isdir(loc):
+                continue
             try:
-                os.remove(_f)
-            except OSError:
+                os.makedirs(loc, exist_ok = True)
+                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
+                    f.write(desired_flavor)
+            except Exception:
                 pass
     except Exception:
         pass
@@ -1108,6 +1194,11 @@ def patch_gpt_oss_bnb4bit_auto():
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
     """
+    # Cross-process safety: invalidate a stale on-disk compiled module built for the
+    # other flavor BEFORE the flag-gated branches below (the flag is unset in a fresh
+    # process, so those branches alone cannot detect cross-process staleness).
+    _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
+
     if not _should_use_gpt_oss_bnb4bit():
         # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally (router.linear.weight
         # + ModuleList experts). UNSLOTH_MODEL_NAME is set per-load but persists in-process and

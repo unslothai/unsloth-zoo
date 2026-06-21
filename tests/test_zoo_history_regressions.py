@@ -549,3 +549,38 @@ def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
     assert "UNSLOTH_GPT_OSS_BNB4BIT_PATCHED" in body, (
         "must track/clear the BNB4BIT_PATCHED flag to detect the mode switch"
     )
+
+
+def test_sync_gpt_oss_compiled_flavor_drops_cross_process_stale_module(tmp_path, monkeypatch):
+    """A fresh process has UNSLOTH_GPT_OSS_BNB4BIT_PATCHED unset, so the flag-gated
+    teardown cannot see that the on-disk compiled module was built for the other
+    flavor. `_sync_gpt_oss_compiled_flavor` must invalidate a stale module via the
+    on-disk flavor marker, and be a no-op when the flavor already matches."""
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    cache_dir = tmp_path / "unsloth_compiled_cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(cache_dir))
+    module = cache_dir / "unsloth_compiled_module_gpt_oss.py"
+    marker = cache_dir / ".unsloth_gpt_oss_compiled_flavor"
+
+    # Prior 4bit process left a BnB-built module; a fresh 16bit (stock) load must drop it.
+    module.write_text("# bnb-built\n")
+    marker.write_text("bnb4bit")
+    _M._sync_gpt_oss_compiled_flavor("stock")
+    assert not module.exists(), "stale BnB module not invalidated for a fresh stock load"
+    assert marker.read_text().strip() == "stock"
+
+    # Matching flavor is a strict no-op (no needless recompile).
+    module.write_text("# stock-built\n")
+    marker.write_text("stock")
+    before = module.read_text()
+    _M._sync_gpt_oss_compiled_flavor("stock")
+    assert module.exists() and module.read_text() == before, "matching flavor wrongly invalidated"
+
+    # An older build with no marker is treated as unknown -> conservatively rebuilt.
+    module.write_text("# unknown\n")
+    if marker.exists():
+        marker.unlink()
+    _M._sync_gpt_oss_compiled_flavor("stock")
+    assert not module.exists(), "unmarked module not conservatively invalidated"
