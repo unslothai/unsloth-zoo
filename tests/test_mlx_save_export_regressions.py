@@ -849,6 +849,7 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
 
     calls = []
     check_state = {"n": 0}
+    gpu_support_seen = {"value": None}
 
     def fake_check(folder):
         # First probe fails (forces the install fallback); the re-probe after the
@@ -859,8 +860,9 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
             raise RuntimeError("llama.cpp not found")
         return (str(quantizer), str(converter))
 
-    def fake_install(folder):
+    def fake_install(folder, gpu_support=False):
         calls.append("install_llama_cpp")
+        gpu_support_seen["value"] = gpu_support
         if install_behavior == "prebuilt_ok":
             return (str(quantizer), str(converter))
         # Mirror the real macOS-only source-build failure (no apt-get).
@@ -903,6 +905,9 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
 
     # Prebuilt-first is attempted on every platform.
     assert "install_llama_cpp" in calls
+    # macOS routes export to the unslothai/llama.cpp fork bundle (gpu_support=True,
+    # Metal/minos 14); Linux/Windows keep the lighter ggml-org CPU build.
+    assert gpu_support_seen["value"] == (platform_name == "darwin")
     # The macOS source helper is reached only on the darwin apt-get path.
     assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
 
@@ -932,7 +937,7 @@ def test_gguf_install_fallback_reraises_non_aptget_runtimeerror(monkeypatch, tmp
     )
     monkeypatch.setattr(
         llama_cpp, "install_llama_cpp",
-        lambda folder: (_ for _ in ()).throw(RuntimeError("disk full while downloading prebuilt")),
+        lambda folder, gpu_support=False: (_ for _ in ()).throw(RuntimeError("disk full while downloading prebuilt")),
     )
 
     model = types.SimpleNamespace(_hf_repo="org/TestModel")

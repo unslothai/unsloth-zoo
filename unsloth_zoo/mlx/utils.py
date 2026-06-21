@@ -5541,13 +5541,18 @@ def save_pretrained_gguf(
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
             try:
-                # Prefer the shared installer on every platform: it tries the
-                # prebuilt llama.cpp archive first (on macOS the Darwin bundle, so
-                # no clone + ~10 min compile) and only then falls back to a source
-                # build. For GGUF export this is sufficient -- llama-quantize is
-                # CPU-only and the converter is pure Python. install_llama_cpp also
-                # creates ~/.unsloth before cloning, so a fresh machine is fine.
-                quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+                # Prefer the shared installer on every platform: it tries a
+                # prebuilt llama.cpp archive first and only then compiles. On macOS
+                # pass gpu_support=True so it pulls the unslothai/llama.cpp bundle
+                # (Metal, built for macOS 14) rather than ggml-org's CPU build,
+                # which is compiled for a newer macOS and fails to load on macOS
+                # 14/15. llama-quantize is CPU-only so the bundle exports the same;
+                # Linux/Windows keep the lighter ggml-org CPU build. install_llama_cpp
+                # also creates ~/.unsloth before cloning, so a fresh machine is fine.
+                quantizer_location, converter_location = install_llama_cpp(
+                    llama_cpp_folder,
+                    gpu_support = (sys.platform == "darwin"),
+                )
             except RuntimeError as exc:
                 # The source-build fallback resolves missing system build-deps via
                 # apt-get, which does not exist on macOS (it raises "... does not
