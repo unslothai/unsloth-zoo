@@ -378,7 +378,7 @@ def test_pretokenized_text_batches_apply_explicit_labels_and_masks():
                 "input_ids": [1, 2, 3],
                 "labels": [1, -100, 3],
                 "completion_mask": [0, 1, 1],
-                "assistant_masks": [1, 1, 0],
+                "assistant_masks": [1, 1, 1],
             },
             {
                 "input_ids": [4, 5],
@@ -395,7 +395,7 @@ def test_pretokenized_text_batches_apply_explicit_labels_and_masks():
     )
 
     _batch, _lengths, labels = batches[0]
-    assert labels.tolist() == [[-100, -100, -100], [-100, 5, -100]]
+    assert labels.tolist() == [[-100, -100, 3], [-100, 5, -100]]
 
 
 def test_pretokenized_text_batches_handle_mixed_optional_fields():
@@ -479,7 +479,8 @@ def test_pretokenized_text_create_batches_path_uses_labeled_collator():
     assert labels.tolist() == [[-100, 2, 3]]
 
 
-def test_pretokenized_text_create_batches_preserves_mlx_lm_default_order():
+@pytest.mark.parametrize("seed", [0, 7])
+def test_pretokenized_text_create_batches_preserves_mlx_lm_default_order(seed):
     from unsloth_zoo.mlx.utils import create_batches
 
     class Tokenizer:
@@ -494,17 +495,43 @@ def test_pretokenized_text_create_batches_preserves_mlx_lm_default_order():
         Tokenizer(),
         batch_size=2,
         max_seq_length=16,
-        seed=7,
+        seed=seed,
     )
 
     sorted_lengths = [2, 3, 4, 5, 6, 7]
     groups = [sorted_lengths[i:i + 2] for i in range(0, len(sorted_lengths), 2)]
-    expected = [groups[i] for i in np.random.RandomState(7).permutation(len(groups))]
+    expected = [groups[i] for i in np.random.RandomState(seed).permutation(len(groups))]
     observed = [
         [int(length.item()) for length in lengths[:, 1]]
         for _batch, lengths, _labels in batches
     ]
     assert observed == expected
+
+
+def test_pretokenized_text_drops_rows_without_supervised_targets():
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    class Tokenizer:
+        pad_token_id = 0
+
+    batches = create_ordered_batches(
+        [
+            {"input_ids": [1, 2, 3], "labels": [-100, -100, -100]},
+            {"input_ids": [4, 5, 6], "completion_mask": [1, 0, 0]},
+            {"input_ids": [7, 8, 9], "assistant_masks": [0, 1, 1]},
+        ],
+        Tokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        completion_only_loss=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert len(batches) == 1
+    assert batch.tolist() == [[7, 8, 9]]
+    assert lengths.tolist() == [[0, 3]]
+    assert labels.tolist() == [[-100, 8, 9]]
 
 
 def test_pretokenized_text_streaming_yields_labeled_batches():

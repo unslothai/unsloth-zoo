@@ -3579,6 +3579,24 @@ def _aligned_text_field(item, field, length):
     return values[:length]
 
 
+def _labeled_text_row_has_supervised_targets(row):
+    """Return whether effective labels train at least one causal target."""
+    input_ids = row["input_ids"]
+    row_labels = row.get("labels")
+    labels = row_labels[:len(input_ids)] if row_labels is not None else [
+        int(token) for token in input_ids
+    ]
+    for mask_name in ("completion_mask", "assistant_masks"):
+        mask = row.get(mask_name)
+        if mask is None:
+            continue
+        labels = [
+            int(label) if int(mask_value) != 0 else -100
+            for label, mask_value in zip(labels, mask[:len(labels)])
+        ]
+    return any(label != -100 for label in labels[1:])
+
+
 def _prepare_pretokenized_text_row(item, max_seq_length, completion_only_loss=False):
     """Normalize one pre-tokenized text row, or return None when unusable."""
     if not isinstance(item, dict) or item.get("input_ids") is None:
@@ -3599,6 +3617,8 @@ def _prepare_pretokenized_text_row(item, max_seq_length, completion_only_loss=Fa
         assistant_masks = _aligned_text_field(item, "assistant_masks", len(input_ids))
         if assistant_masks is not None:
             row["assistant_masks"] = assistant_masks
+    if not _labeled_text_row_has_supervised_targets(row):
+        return None
     return row
 
 
@@ -3858,7 +3878,7 @@ def _iter_text_index_chunks(items, batch_size, seed, dataset_order, num_epochs=N
         return
 
     epoch = 0
-    rng = np.random.RandomState(int(seed)) if seed else np.random.RandomState()
+    rng = np.random.RandomState(int(seed)) if seed is not None else np.random.RandomState()
     while num_epochs is None or epoch < int(num_epochs):
         if dataset_order in (None, "default"):
             ordered = sorted(range(length), key=lambda idx: _text_item_length(items[idx]))
