@@ -341,12 +341,16 @@ pass
 def _get_lora_scaling(module):
     # All Unsloth Zoo code licensed under LGPLv3
     # Resolve a LoRA layer's scaling regardless of peft version. peft exposes
-    # `active_adapters` (plural); older builds only `active_adapter` (singular).
-    # Returns 0.0 if it cannot be resolved so the count still aligns. (#2966)
-    if hasattr(module, "active_adapters") and module.active_adapters:
-        active_adapter = module.active_adapters[0]
+    # `active_adapters` (plural); older builds only `active_adapter` (singular, which
+    # may also hold a list after set_adapter). Returns 0.0 if it cannot be resolved
+    # so the count still aligns. (#2966)
+    active_adapters = getattr(module, "active_adapters", None)
+    if active_adapters:
+        active_adapter = active_adapters[0]
     else:
         active_adapter = getattr(module, "active_adapter", "default")
+        if isinstance(active_adapter, (list, tuple)):
+            active_adapter = active_adapter[0] if active_adapter else "default"
     try:
         return module.scaling[active_adapter]
     except Exception:
