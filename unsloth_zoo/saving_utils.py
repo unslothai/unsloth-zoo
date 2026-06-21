@@ -536,6 +536,7 @@ def _merge_and_overwrite_lora(
     save_method = "merged_16bit",
     counted_lora_modules = None,
     tie_word_embeddings = False,
+    weight_block_size = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -557,6 +558,7 @@ def _merge_and_overwrite_lora(
         return _merge_and_overwrite_lora_fp8(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, tie_word_embeddings = tie_word_embeddings,
+            weight_block_size = weight_block_size,
         )
     pass
 
@@ -1814,17 +1816,27 @@ pass
 # float8 weight. On a 16bit merge the weight is dequantized, so these are dropped.
 _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
 
-def _fp8_dequantize_weight(file, header_metadata, weight_key):
+def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
     """Dequantize one FP8 dense weight to its companion scale's dtype.
 
     Returns (W_real, [scale_keys]) where scale_keys are the companion tensors to
     drop from the merged shard. Raises if the weight is FP8 but no usable
     weight_scale / weight_scale_inv is found (loud failure, never silent FP8).
+
+    Accepts every dense FP8 scale layout vllm_utils loads: 1-D per-row/per-column
+    (fbgemm / static / channel quant), 2-D per-channel, and 2-D block scales.
+    weight_block_size (the configured (bm, bn)) keeps block dequant correct when a
+    weight dimension is not an exact multiple of the block (partial final block).
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
     if W.dtype != torch.float8_e4m3fn:
         return W, []
+    if W.ndim != 2:
+        raise RuntimeError(
+            f"Unsloth: FP8 weight '{weight_key}' is {W.ndim}-D; only 2-D dense FP8 "
+            "weights are supported on a 16bit merge."
+        )
     base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
     scale_inv = None
     for suffix in (".weight_scale_inv", ".weight_scale"):
@@ -1838,17 +1850,24 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key):
             "weight_scale_inv; cannot dequantize to 16bit. The merged model would be "
             "corrupted. Please file a bug at https://github.com/unslothai/unsloth/issues."
         )
-    if scale_inv.ndim != 2 or W.ndim != 2 or W.shape[0] % scale_inv.shape[0] or W.shape[1] % scale_inv.shape[1]:
+    rows, cols = W.shape
+    _scale_ok = (
+        scale_inv.numel() == 1
+        or (scale_inv.ndim == 1 and scale_inv.shape[0] in (rows, cols))
+        or (scale_inv.ndim == 2 and rows % scale_inv.shape[0] == 0 and cols % scale_inv.shape[1] == 0)
+        or (scale_inv.ndim == 2 and weight_block_size is not None and len(weight_block_size) == 2)
+    )
+    if not _scale_ok:
         raise RuntimeError(
             f"Unsloth: FP8 weight '{weight_key}' shape {tuple(W.shape)} is not tiled by "
             f"its scale {tuple(scale_inv.shape)}; cannot dequantize safely."
         )
-    W_real = _fp8_dequant_blockwise(W, scale_inv)
+    W_real = _fp8_dequant_blockwise(W, scale_inv, block_size = weight_block_size)
     # Drop every companion scale for this weight (input_scale too on static FP8).
     scale_keys = [base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata]
     return W_real, scale_keys
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantizes FP8 dense weights to 16bit, merges LoRA, drops companion scales,
     # and atomically rewrites the shard (mirrors the mxfp4 full-rewrite strategy).
@@ -1873,6 +1892,17 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             lora_weights, safetensor_keys, model_class_name = model_class_name,
         )
 
+        # This dense path merges each weight independently; it has no per-expert
+        # MoE fusion (that lives in the standard mmap path). Refuse a LoRA that
+        # targets fused experts so we never silently drop the adapter or fail the
+        # later count check with a confusing message.
+        if any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in converted_lora_weights):
+            raise RuntimeError(
+                "Unsloth: FP8 dequant-on-merge does not yet support LoRA adapters on "
+                "MoE experts. Please open an issue at "
+                "https://github.com/unslothai/unsloth/issues."
+            )
+
         # Collect companion scale keys to drop (their FP8 weights are dequantized).
         scale_keys_to_drop = set()
         for key in safetensor_keys:
@@ -1881,7 +1911,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             if any(key.endswith(s) for s in _FP8_SCALE_SUFFIXES):
                 continue
 
-            W, scale_keys = _fp8_dequantize_weight(file, header_metadata, key)
+            W, scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size)
             scale_keys_to_drop.update(scale_keys)
 
             output_key = key
@@ -1910,7 +1940,10 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                     W = _merge_lora(W, lora_stats, output_key)
                     count += 1
 
-            tensors[output_key] = W.to(output_dtype).contiguous()
+            # Land merged weights on CPU so the whole dequantized model does not
+            # pile up in VRAM (the merge math runs on the accelerator). Mirrors the
+            # CPU-backed tensors the mxfp4 path stores.
+            tensors[output_key] = W.to(device = "cpu", dtype = output_dtype).contiguous()
             del W
             if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
                 device_empty_cache()
@@ -2622,6 +2655,16 @@ def merge_and_overwrite_lora(
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
+    # Block-quantized FP8 (finegrained_fp8 / DeepSeek-style) needs the configured
+    # weight_block_size to dequantize correctly when a weight dim is not an exact
+    # multiple of the block. Capture it before the merge16bit path strips the config.
+    _merge_weight_block_size = None
+    if base_model_is_quantized and quant_type == "fp8":
+        _qc = getattr(_merge_base_model.config, "quantization_config", None)
+        if _qc is not None:
+            _wbs = _qc.get("weight_block_size", None) if isinstance(_qc, dict) else getattr(_qc, "weight_block_size", None)
+            if _wbs is not None and len(_wbs) == 2:
+                _merge_weight_block_size = tuple(int(x) for x in _wbs)
 
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
@@ -2635,6 +2678,7 @@ def merge_and_overwrite_lora(
             save_method = save_method,
             counted_lora_modules = counted_lora_modules_global,
             tie_word_embeddings = _merge_tie_word_embeddings,
+            weight_block_size = _merge_weight_block_size,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)

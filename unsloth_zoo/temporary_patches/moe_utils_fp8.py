@@ -809,22 +809,51 @@ _FP8_E4M3_MAX = 448.0
 _MOE_QUANT_UNSAFE = object()
 
 
-def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
-    """Block-wise dequant of float8_e4m3fn weight via per-block weight_scale_inv.
+def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_size = None) -> torch.Tensor:
+    """Dequant of a 2-D float8_e4m3fn weight via its companion weight_scale(_inv).
 
     Inverse of compressed-tensors / DeepSeek-style FP8 quantization:
-        W_real = decode_fp8(W) * scale_inv_broadcast(block_size)
-    where scale_inv has shape (rows/bm, cols/bn) and each scalar tiles its
-    bm x bn block of the dequantized weight.
+        W_real = decode_fp8(W) * scale_broadcast
+    Handles every dense FP8 scale layout the loader (vllm_utils) accepts:
+      - per-tensor scalar (numel == 1),
+      - 1-D per-row (len == rows) or per-column (len == cols) scales (fbgemm /
+        static / compressed-tensors channel quant),
+      - 2-D per-channel (rows, 1) / (1, cols),
+      - 2-D block scales (ceil(rows/bm), ceil(cols/bn)).
+    block_size (bm, bn) is the configured weight_block_size; without it the block
+    size is inferred from the scale grid, which is only exact when rows/cols are
+    multiples of the block (so a partial final block needs the explicit value).
+    Scales are tiled with repeat_interleave + trim, which is byte-identical to a
+    plain reshape when the scale evenly divides the weight.
     """
     rows, cols = W_fp8.shape
+    out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
+    W = W_fp8.to(out_dtype)
+    # Per-tensor scalar scale.
+    if scale_inv.numel() == 1:
+        return W * scale_inv.reshape(()).to(out_dtype)
+    # 1-D per-row / per-column scale (broadcast along the matching axis).
+    if scale_inv.ndim == 1:
+        if scale_inv.shape[0] == rows:
+            return W * scale_inv.view(-1, 1).to(out_dtype)
+        if scale_inv.shape[0] == cols:
+            return W * scale_inv.view(1, -1).to(out_dtype)
+        raise RuntimeError(
+            f"Unsloth: FP8 1-D scale length {scale_inv.shape[0]} matches neither "
+            f"rows ({rows}) nor cols ({cols}); cannot dequantize."
+        )
     srows, scols = scale_inv.shape
-    bm, bn = rows // srows, cols // scols
-    W_bf16 = W_fp8.to(scale_inv.dtype)
-    return (
-        W_bf16.reshape(srows, bm, scols, bn)
-        * scale_inv.unsqueeze(-1).unsqueeze(1)
-    ).reshape(rows, cols)
+    if block_size is not None and len(block_size) == 2:
+        bm, bn = block_size
+    else:
+        bm = -(-rows // srows)  # ceil(rows / srows)
+        bn = -(-cols // scols)  # ceil(cols / scols)
+    scale = scale_inv.to(out_dtype)
+    if bm > 1:
+        scale = scale.repeat_interleave(bm, dim = 0)[:rows]
+    if bn > 1:
+        scale = scale.repeat_interleave(bn, dim = 1)[:, :cols]
+    return W * scale
 
 
 def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: torch.dtype):

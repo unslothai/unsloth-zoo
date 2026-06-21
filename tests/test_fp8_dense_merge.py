@@ -55,6 +55,30 @@ def _fp8_quant_channel(W):
     return q, scale.to(torch.bfloat16)
 
 
+def _fp8_quant_row_1d(W):
+    """Per-row 1-D scale (fbgemm_fp8 / static channel quant; loader builds
+    FbgemmFp8Linear for ndim==1)."""
+    max_fp8 = 448.0
+    amax = W.abs().amax(dim=1).clamp_min(1e-12)  # 1-D, len == out_features
+    scale = amax / max_fp8
+    q = (W / scale.unsqueeze(1)).clamp(-max_fp8, max_fp8).to(torch.float8_e4m3fn)
+    return q, scale.to(torch.bfloat16)
+
+
+def _fp8_quant_block(W, bs=128):
+    """DeepSeek-style (ceil(rows/bs), ceil(cols/bs)) block scale (weight_scale_inv)."""
+    max_fp8 = 448.0
+    rows, cols = W.shape
+    srows, scols = -(-rows // bs), -(-cols // bs)
+    Wpad = torch.zeros(srows * bs, scols * bs, dtype=torch.float32)
+    Wpad[:rows, :cols] = W
+    blocks = Wpad.reshape(srows, bs, scols, bs)
+    scale = (blocks.abs().amax(dim=(1, 3)) / max_fp8).clamp_min(1e-12)
+    q = (blocks / scale.unsqueeze(-1).unsqueeze(1)).clamp(-max_fp8, max_fp8)
+    q = q.reshape(srows * bs, scols * bs)[:rows, :cols].to(torch.float8_e4m3fn)
+    return q, scale.to(torch.float32)
+
+
 def _write_shard(path, weights):
     save_file(weights, str(path), metadata={"format": "pt"})
 
@@ -166,3 +190,94 @@ def test_fp8_quant_config_detection():
         "quant_method": "compressed-tensors",
         "config_groups": {"group_0": {"weights": {"type": "int", "num_bits": 8}}},
     })
+
+
+def test_fp8_dense_one_d_row_scale_dequantizes(tmp_path):
+    """fbgemm / static FP8 store a 1-D per-row weight_scale (loader builds
+    FbgemmFp8Linear for ndim==1). It must dequantize, not raise."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(2)
+    W_real = torch.randn(64, 128, dtype=torch.float32) * 0.1
+    W_fp8, scale = _fp8_quant_row_1d(W_real)
+    assert scale.ndim == 1
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.down_proj.weight": W_fp8,
+        "model.layers.0.mlp.down_proj.weight_scale": scale,
+    })
+
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path),
+        filename="model.safetensors",
+        lora_weights=defaultdict(_FakeLoraStats),
+        output_dtype=torch.bfloat16,
+        model_class_name="Qwen2ForCausalLM",
+        base_model_is_quantized=True,
+        quant_type="fp8",
+    )
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        assert all(f.get_tensor(k).dtype != torch.float8_e4m3fn for k in keys)
+        assert not any(k.endswith(("weight_scale", "weight_scale_inv")) for k in keys)
+        merged = f.get_tensor("model.layers.0.mlp.down_proj.weight").float()
+        assert torch.allclose(merged, W_real, atol=0.05)
+
+
+def test_fp8_dense_block_scale_partial_block(tmp_path):
+    """Block-quant where a dim is not a multiple of the block size: the configured
+    weight_block_size must dequantize correctly (inferring rows//srows is wrong)."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(3)
+    W_real = torch.randn(130, 256, dtype=torch.float32) * 0.1  # 130 not a multiple of 128
+    W_fp8, scale_inv = _fp8_quant_block(W_real, bs=128)
+    assert scale_inv.shape == (2, 2)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.down_proj.weight": W_fp8,
+        "model.layers.0.mlp.down_proj.weight_scale_inv": scale_inv,
+    })
+
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path),
+        filename="model.safetensors",
+        lora_weights=defaultdict(_FakeLoraStats),
+        output_dtype=torch.float32,
+        model_class_name="Qwen2ForCausalLM",
+        base_model_is_quantized=True,
+        quant_type="fp8",
+        weight_block_size=(128, 128),
+    )
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        merged = f.get_tensor("model.layers.0.mlp.down_proj.weight").float()
+    assert torch.allclose(merged, W_real, atol=0.05)
+
+
+def test_fp8_dense_moe_expert_lora_raises(tmp_path):
+    """Dense FP8 path has no per-expert MoE fusion; a LoRA on fused experts must
+    raise loudly instead of silently dropping the adapter."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    W_fp8, scale = _fp8_quant_channel(torch.randn(32, 48) * 0.1)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": W_fp8,
+        "model.layers.0.mlp.experts.0.gate_proj.weight_scale": scale,
+    })
+    lora = defaultdict(_FakeLoraStats)
+    lora["model.layers.0.mlp.experts"] = _FakeLoraStats(
+        lora_A=torch.randn(4, 48) * 0.02, lora_B=torch.randn(32, 4) * 0.02, alpha=1.0,
+    )
+    with pytest.raises(RuntimeError, match="MoE experts"):
+        _merge_and_overwrite_lora(
+            save_directory=str(tmp_path),
+            filename="model.safetensors",
+            lora_weights=lora,
+            output_dtype=torch.bfloat16,
+            model_class_name="Qwen3MoeForCausalLM",
+            base_model_is_quantized=True,
+            quant_type="fp8",
+        )
