@@ -5555,14 +5555,16 @@ def save_pretrained_gguf(
                 )
             except RuntimeError as exc:
                 # The source-build fallback resolves missing system build-deps via
-                # apt-get, which does not exist on macOS (it raises "... does not
-                # exist? Is this NOT a Linux / Mac based computer?"). Only when the
-                # prebuilt was unavailable AND we hit that macOS-only failure do we
-                # build from source with cmake + Metal via the macOS helper, then
-                # re-probe for the freshly built binaries.
+                # apt-get, which does not exist on macOS. Both raise sites for that
+                # (do_we_need_sudo and install_package) end with the same phrase
+                # "Is this NOT a Linux / Mac based computer?", so match on that shared
+                # suffix rather than one variant. Only when the prebuilt was
+                # unavailable AND we hit that macOS-only failure do we build from
+                # source with cmake + Metal via the macOS helper, then re-probe for
+                # the freshly built binaries.
                 if (
                     sys.platform != "darwin"
-                    or "does not exist? Is this NOT a Linux" not in str(exc)
+                    or "Is this NOT a Linux / Mac based computer?" not in str(exc)
                 ):
                     raise
                 _install_llama_cpp_macos(llama_cpp_folder)

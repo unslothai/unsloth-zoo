@@ -380,6 +380,39 @@ def test_extract_and_place_linux(tmp_path):
     assert (install / "libggml-base.so").is_file()
 
 
+def _make_binary_zip(path, tag):
+    import zipfile
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(f"llama-{tag}/llama-quantize.exe", b"MZ fake exe")
+        z.writestr(f"llama-{tag}/llama-cli.exe", b"MZ fake exe")
+        z.writestr(f"llama-{tag}/ggml.dll", b"fake dll")
+        z.writestr(f"llama-{tag}/llama.dll", b"fake dll")
+        z.writestr(f"llama-{tag}/LICENSE", b"MIT-ish")
+
+
+def test_extract_and_place_windows_zip(monkeypatch, tmp_path):
+    # The fork/ggml Windows bundle is a .zip; _place_prebuilt_binaries must land
+    # the executables + DLLs under build/bin/Release (where check_llama_cpp looks
+    # on Windows). Exercise the Windows placement on any host by patching
+    # IS_WINDOWS -- nothing is executed, only copied, so no POSIX skip is needed.
+    archive = tmp_path / "llama-b9000-bin-win-cpu-x64.zip"
+    _make_binary_zip(str(archive), "b9000")
+    extract_dir = tmp_path / "extracted"
+    os.makedirs(extract_dir)
+    llama_cpp._extract_archive(str(archive), str(extract_dir))
+    root = llama_cpp._single_extracted_root(str(extract_dir))
+    assert os.path.basename(root) == "llama-b9000"
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
+    install = tmp_path / "install"
+    llama_cpp._place_prebuilt_binaries(root, str(install))
+    release = install / "build" / "bin" / "Release"
+    assert (release / "llama-quantize.exe").is_file()
+    assert (release / "llama-cli.exe").is_file()
+    assert (release / "ggml.dll").is_file()
+    # On Windows nothing is placed at the flat install root.
+    assert not (install / "llama-quantize.exe").exists()
+
+
 # --- full install orchestration ----------------------------------------------
 
 def _wire_fake_downloads(monkeypatch, tmp_path, tag, quantize_script = FAKE_QUANTIZE):

@@ -759,11 +759,13 @@ def _rocm_gfx_family(gfx):
     return None
 
 
-def _select_gpu_assets(tag, assets, manifest):
+def _select_gpu_assets(tag, assets, manifest, target = None):
     """Ordered download attempts [(asset_name, url), ...] of unslothai/llama.cpp
     GPU bundles for this host: narrowest CUDA coverage for the torch runtime
     line first, that line's portable build next, then the other line; ROCm by
-    gfx family; macOS by the fork's Metal bundles. Empty list = compile."""
+    gfx family; macOS by the fork's Metal bundles. Empty list = compile.
+    target is the _detect_gpu_target() result; pass it to reuse an already-probed
+    value (the caller's gate probes it once), else it is detected here."""
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64"): arch = "x64"
     elif machine in ("aarch64", "arm64"): arch = "arm64"
@@ -774,7 +776,8 @@ def _select_gpu_assets(tag, assets, manifest):
         name = f"llama-{tag}-bin-macos-{arch}.tar.gz"
         return [(name, assets[name])] if name in assets else []
 
-    target = _detect_gpu_target()
+    if target is None:
+        target = _detect_gpu_target()
     if target is None:
         return []
     artifacts = (manifest or {}).get("artifacts", [])
@@ -1103,9 +1106,11 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
             fork_checksums = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
             fork_checksums = fork_checksums.get("artifacts", {})
             # 1: GPU bundle, only with a usable GPU target (or macOS Metal).
-            if gpu_support and (is_darwin or _detect_gpu_target() is not None):
+            # Probe the GPU target once and reuse it inside _select_gpu_assets.
+            gpu_target = _detect_gpu_target() if (gpu_support and not is_darwin) else None
+            if gpu_support and (is_darwin or gpu_target is not None):
                 _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
-                        _select_gpu_assets(fork_tag, fork_assets, manifest))
+                        _select_gpu_assets(fork_tag, fork_assets, manifest, target = gpu_target))
             # 2: CPU bundle -- always the final prebuilt fallback.
             _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
                     _select_cpu_assets(fork_tag, fork_assets, manifest))
