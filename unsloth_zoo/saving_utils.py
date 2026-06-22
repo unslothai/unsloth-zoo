@@ -340,10 +340,8 @@ pass
 
 def _get_lora_scaling(module):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Resolve a LoRA layer's scaling regardless of peft version. peft exposes
-    # `active_adapters` (plural); older builds only `active_adapter` (singular, which
-    # may also hold a list after set_adapter). Returns 0.0 if it cannot be resolved
-    # so the count still aligns. (#2966)
+    # Resolve scaling across peft versions: active_adapters (plural) or older
+    # active_adapter (singular, may hold a list). 0.0 if unresolved so counts align. (#2966)
     active_adapters = getattr(module, "active_adapters", None)
     if active_adapters:
         active_adapter = active_adapters[0]
@@ -391,11 +389,9 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
-        # Fallback: some LoRA wrappers (MoE experts, custom quant backends, older
-        # peft) are not Linear_LoRA_Layers subclasses but still carry a `scaling`
-        # dict. Match on `scaling` plus either active-adapter attr (peft uses
-        # `active_adapters` (plural) and older builds `active_adapter`) so counts
-        # align and the delta is not merged with the default alpha = 0. (#2966)
+        # Fallback for wrappers (MoE experts, quant backends, older peft) that aren't
+        # Linear_LoRA_Layers but carry `scaling`: match on either active-adapter attr so
+        # counts align and the delta is not merged with the default alpha = 0. (#2966)
         elif hasattr(module, "scaling") and \
             (hasattr(module, "active_adapters") or hasattr(module, "active_adapter")):
             lora_weights[name].alpha = _get_lora_scaling(module)
