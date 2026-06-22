@@ -2268,19 +2268,31 @@ def convert_to_gguf(
     if not os.path.exists(input_folder):
         raise RuntimeError(f"Unsloth: `{input_folder}` does not exist?")
 
-    config_file = os.path.join(input_folder, "config.json")
-    if not os.path.exists(config_file):
+    config_path = os.path.join(input_folder, "config.json")
+    if not os.path.exists(config_path):
         raise RuntimeError(f"Unsloth: `config.json` does not exist inside `{input_folder}`.")
 
     # Load config.json
-    with open(config_file, "r", encoding = "utf-8") as config_file:
-        config_file = json.load(config_file)
+    with open(config_path, "r", encoding = "utf-8") as f:
+        config_file = json.load(f)
+
+    # Strip MTP / nextn config keys so the downstream convert_hf_to_gguf.py
+    # doesn't inflate block_count / inject nextn_predict_layers.
+    _changed = False
+    for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
+        if config_file.pop(_key, None) is not None:
+            _changed = True
+        _tc = config_file.get("text_config")
+        if _tc and _tc.pop(_key, None) is not None:
+            _changed = True
+    if _changed:
+        with open(config_path, "w", encoding = "utf-8") as f:
+            json.dump(config_file, f, indent = 2)
     pass
 
     # Check if arch is supported
     supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
-    if supported_types:
-        assert("architectures" in config_file)
+    if supported_types and "architectures" in config_file:
         arch = config_file["architectures"][0]
         if arch not in supported_types:
             raise NotImplementedError(
@@ -2290,8 +2302,11 @@ def convert_to_gguf(
     pass
 
     if is_vlm and supported_vision_archs is not None:
-        arch = config_file["architectures"][0]
-        if arch not in supported_vision_archs:
+        if "architectures" in config_file:
+            arch = config_file["architectures"][0]
+        else:
+            arch = None  # MLX-style config; skip mmproj arch check
+        if arch is not None and arch not in supported_vision_archs:
                 is_vlm = False
                 print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
 
