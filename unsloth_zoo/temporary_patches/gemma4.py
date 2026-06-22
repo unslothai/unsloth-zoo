@@ -388,11 +388,78 @@ def _patch_gemma4_attention_carrier():
     Gemma4TextAttention.forward = _make_gemma4_attention_carrier_forward(Gemma4TextAttention.forward)
 
 
+def _gemma4_force_nonreentrant_checkpointing(model):
+    """Force gemma-4 text decoder layers to use NON-reentrant gradient checkpointing
+    while the carrier is active, so the cross-layer shared K/V stays grad-connected.
+
+    The shared K/V is produced by an earlier ("producer") layer and reused by the ~20
+    later ("consumer") layers via the carrier. Under REENTRANT checkpointing -- which
+    includes Unsloth's offloaded checkpointer (it forces use_reentrant=True) and torch's
+    use_reentrant=True -- each layer is recomputed independently during backward in
+    REVERSE order, so a consumer is recomputed before its producer and reads the detached
+    no-grad K/V from the first forward; gradients from the shared layers then never reach
+    the producer's k_proj/v_proj (the logits/loss look correct, only the gradient is
+    wrong). Un-checkpointing the producer instead triggers "backward through the graph a
+    second time" because its activation feeds many reentrant-checkpointed consumers.
+    Non-reentrant recomputation keeps the whole region's autograd graph connected, so the
+    producer K/V gradient is exact (verified: producer k/v_proj grads match the
+    use_cache=True reference to cosine 1.0). Scoped to gemma-4 E-series on the legacy
+    transformers window (5.5.0-5.5.1) where the carrier runs; trades Unsloth's CPU
+    activation offload (a memory optimisation) for correct gradients on these ~1-2B
+    models. No-op when gradient checkpointing is off (e.g. plain use_cache=False), and
+    moot from transformers 5.5.2 where the native shared_kv_states path makes the whole
+    patch a no-op."""
+    import functools
+    try:
+        import torch.utils.checkpoint as _ckpt
+    except Exception:
+        return
+    func = getattr(model, "_unsloth_gemma4_nonreentrant_func", None)
+    if func is None:
+        # Resolve the PRISTINE torch checkpoint. Unsloth's smart GC globally swaps
+        # torch.utils.checkpoint.checkpoint for `unsloth_checkpoint`, which hard-forces
+        # use_reentrant=True (for its CPU-offload CheckpointFunction) and would ignore the
+        # use_reentrant=False below. Unsloth saves the original at `_old_checkpoint`, so
+        # use that when the current one is an Unsloth shim.
+        base = getattr(_ckpt, "checkpoint", None)
+        if getattr(base, "__name__", "") in (
+            "unsloth_checkpoint", "unsloth_gradient_checkpoint",
+            "unsloth_offloaded_gradient_checkpoint",
+        ):
+            base = getattr(_ckpt, "_old_checkpoint", base)
+        if base is None:
+            return
+        func = functools.partial(base, use_reentrant = False)
+        try:
+            model._unsloth_gemma4_nonreentrant_func = func
+        except Exception:
+            pass
+    layers = getattr(model, "_unsloth_gemma4_decoder_layers", None)
+    if layers is None:
+        layers = [
+            m for m in model.modules()
+            if hasattr(m, "gradient_checkpointing")
+            and type(getattr(m, "self_attn", None)).__name__ == "Gemma4TextAttention"
+        ]
+        try:
+            model._unsloth_gemma4_decoder_layers = layers
+        except Exception:
+            pass
+    for layer in layers:
+        try:
+            # Only override when this layer is actually being checkpointed.
+            if getattr(layer, "gradient_checkpointing", False):
+                layer._gradient_checkpointing_func = func
+        except Exception:
+            pass
+
+
 def _gemma4_attach_shared_kv_carrier(model):
     """Create a fresh carrier and attach it to every Gemma4TextAttention under ``model``
     so shared layers can reach it even after gradient checkpointing nulls their
-    past_key_values kwarg. The attention list is cached on the model; called once per
-    forward. No-op without KV sharing."""
+    past_key_values kwarg, and force non-reentrant checkpointing so the shared K/V stays
+    grad-connected. The attention list is cached on the model; called once per forward.
+    No-op without KV sharing."""
     attns = getattr(model, "_unsloth_gemma4_attns", None)
     if attns is None:
         attns = [m for m in model.modules() if m.__class__.__name__ == "Gemma4TextAttention"]
@@ -412,6 +479,7 @@ def _gemma4_attach_shared_kv_carrier(model):
             attn._unsloth_shared_kv_carrier = carrier
         except Exception:
             pass
+    _gemma4_force_nonreentrant_checkpointing(model)
 
 
 def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):

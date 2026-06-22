@@ -569,3 +569,51 @@ def test_gemma4_attention_carrier_substitution():
     m2 = M()  # no carrier attached
     wrapped(m2, "h", "pe", "am", past_key_values=None)
     assert seen["pkv"] is None, "without a carrier, pass through unchanged"
+
+
+def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
+    """The GC fix overrides _gradient_checkpointing_func on gemma-4 text decoder layers
+    that are being checkpointed with a NON-reentrant torch checkpoint, resolving the
+    PRISTINE checkpoint when Unsloth's smart GC has globally swapped in its
+    reentrant-forcing shim (`unsloth_checkpoint`). Layers not being checkpointed, and
+    non-gemma-4 layers, are left untouched. This guards the gradient-correctness fix for
+    cross-layer KV sharing under reentrant/offloaded gradient checkpointing."""
+    import functools
+    import torch.utils.checkpoint as _ckpt
+    from unsloth_zoo.temporary_patches.gemma4 import _gemma4_force_nonreentrant_checkpointing
+
+    def _pristine(function, *args, use_reentrant=None, **kw):
+        return ("pristine", use_reentrant)
+    def unsloth_checkpoint(function, *args, **kw):
+        return "shim"
+    unsloth_checkpoint.__name__ = "unsloth_checkpoint"  # the reentrant-forcing shim
+    # Simulate Unsloth smart GC having globally patched torch's checkpoint.
+    monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", _pristine, raising=False)
+
+    Gemma4TextAttention = type("Gemma4TextAttention", (), {})
+    OtherAttention = type("OtherAttention", (), {})
+
+    class _Layer:
+        def __init__(self, attn_cls, gc):
+            self.self_attn = attn_cls()
+            self.gradient_checkpointing = gc
+            self._gradient_checkpointing_func = "ORIG"
+
+    on = _Layer(Gemma4TextAttention, True)    # checkpointed gemma-4 layer -> overridden
+    off = _Layer(Gemma4TextAttention, False)  # not checkpointed -> untouched
+    other = _Layer(OtherAttention, True)      # non-gemma-4 -> untouched
+
+    class _Model:
+        def modules(self):
+            return [self, on, off, other]
+    m = _Model()
+
+    _gemma4_force_nonreentrant_checkpointing(m)
+
+    f = on._gradient_checkpointing_func
+    assert isinstance(f, functools.partial), "checkpointed gemma-4 layer must be overridden"
+    assert f.func is _pristine, "must resolve the PRISTINE checkpoint, not the unsloth shim"
+    assert f.keywords.get("use_reentrant") is False, "must force non-reentrant"
+    assert off._gradient_checkpointing_func == "ORIG", "non-checkpointed layer left alone"
+    assert other._gradient_checkpointing_func == "ORIG", "non-gemma-4 layer left alone"
