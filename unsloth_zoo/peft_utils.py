@@ -57,8 +57,8 @@ def get_peft_regex(
     finetune_language_layers   : bool = True,
     finetune_attention_modules : bool = True,
     finetune_mlp_modules       : bool = True,
-    finetune_audio_layers      : bool = False,
     target_modules             : List[str] = None,
+    finetune_audio_layers      : bool = False,
     vision_tags                : List[str] = ["vision", "image", "visual", "patch",],
     language_tags              : List[str] = ["language", "text",],
     attention_tags             : List[str] = ["self_attn", "attention", "attn", "mixer",],
@@ -141,53 +141,68 @@ def get_peft_regex(
             r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
             r")\.(?:" + match_linear_modules + r"))"
         pass
-
-        # Check if regex is wrong since model does not have vision parts
-        check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
-        if not check:
-            regex_matcher = \
-                r".*?(?:" + regex_components + \
-                r").*?"   + match_linear_modules
-        pass
     pass
 
     # Gemma 4 / Gemma 3N keep the visual/audio path in flat embedder Linears
     # (embed_vision.embedding_projection, embed_audio.embedding_projection,
     # vision_embedder.patch_dense, vision_tower.patch_embedder.input_proj) and a
     # conformer audio_tower whose ffw_layer_* / lconv1d.linear_* / attention.post
-    # leaves carry no attn/mlp component token. The standard matcher above can
-    # never select them, so add dedicated name-anchored branches. Each branch is
-    # only appended if it actually matches a Linear in THIS model, so for every
-    # other architecture the regex is byte-identical (the branches are anchored to
-    # audio_tower / embed_vision / embed_audio / vision_embedder name segments that
-    # exist only on Gemma 4 / Gemma 3N). Leading ".*?" for PEFT's re.fullmatch; no
-    # trailing ".*?" (a real Linear leaf must terminate the match); "(?:\.linear)?"
-    # also covers Gemma4ClippableLinear ".linear" children.
+    # leaves carry no attn/mlp component token, so the standard matcher above can
+    # never select them. Add dedicated name-anchored branches, gated on the
+    # vision/audio flags, scoped to the attention/mlp flags, and -- when an explicit
+    # target_modules list is given -- intersected with it. The branches are anchored
+    # to audio_tower / embed_vision / embed_audio / vision_embedder name segments
+    # that exist only on Gemma 4 / Gemma 3N, and each is appended only if it
+    # re.fullmatch-es a Linear in THIS model (matching PEFT's own matcher), so for
+    # every other architecture the regex is byte-identical. Leading ".*?"; no
+    # trailing ".*?" (a real Linear leaf terminates the match); "(?:\.linear)?" also
+    # covers Gemma4ClippableLinear ".linear" children.
+    def _scoped(leaves):
+        # Honour an explicit target_modules list when one was provided.
+        if target_modules is not None:
+            return [x for x in leaves if x in only_linear_modules]
+        return leaves
+
     candidate_branches = []
     if finetune_audio_layers:
-        # Exact Linear leaf names of the Gemma 4 / Gemma 3N audio conformer
-        # (verified from the checkpoint tensor names). conv / *norm leaves are not
-        # nn.Linear so they are never candidates and need no exclusion here.
-        audio_leaf_names = [
-            "q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj",
-            "post", "output_proj", "ffw_layer_1", "ffw_layer_2",
-            "linear_start", "linear_end", "input_proj_linear",
-        ]
-        audio_leaf_re = r"(?:" + "|".join(re.escape(x) for x in audio_leaf_names) + r")"
-        candidate_branches.append(r"(?:.*?\baudio_tower\..*?" + audio_leaf_re + r"(?:\.linear)?)")
-        candidate_branches.append(r"(?:.*?\bembed_audio\.embedding_projection(?:\.linear)?)")
+        # conv / *norm leaves are not nn.Linear so they are never candidates.
+        audio_leaves = ["linear_start", "linear_end", "input_proj_linear", "output_proj"]
+        if finetune_attention_modules:
+            audio_leaves += ["q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj", "post"]
+        if finetune_mlp_modules:
+            audio_leaves += ["ffw_layer_1", "ffw_layer_2"]
+        audio_leaves = _scoped(audio_leaves)
+        if audio_leaves:
+            audio_leaf_re = r"(?:" + "|".join(re.escape(x) for x in audio_leaves) + r")"
+            candidate_branches.append(r"(?:.*?\baudio_tower\..*?" + audio_leaf_re + r"(?:\.linear)?)")
+        if _scoped(["embedding_projection"]):
+            candidate_branches.append(r"(?:.*?\bembed_audio\.embedding_projection(?:\.linear)?)")
     if finetune_vision_layers:
-        candidate_branches.append(
-            r"(?:.*?\b(?:embed_vision\.embedding_projection"
-            r"|vision_embedder\.patch_dense"
-            r"|vision_tower\.patch_embedder\.input_proj)(?:\.linear)?)"
-        )
+        vision_embed = []
+        if _scoped(["embedding_projection"]): vision_embed.append(r"embed_vision\.embedding_projection")
+        if _scoped(["patch_dense"]):          vision_embed.append(r"vision_embedder\.patch_dense")
+        if _scoped(["input_proj"]):           vision_embed.append(r"vision_tower\.patch_embedder\.input_proj")
+        if vision_embed:
+            candidate_branches.append(r"(?:.*?\b(?:" + "|".join(vision_embed) + r")(?:\.linear)?)")
     extra_branches = [
         branch for branch in candidate_branches
-        if any(re.search(branch, name, flags = re.DOTALL) for name in linear_modules)
+        if any(re.fullmatch(branch, name, flags = re.DOTALL) for name in linear_modules)
     ]
     if extra_branches:
         regex_matcher = r"(?:" + regex_matcher + r")|" + "|".join(extra_branches)
+    pass
+
+    # Fallback only when a vision/language model-part was requested but neither the
+    # base matcher nor the branches above matched anything (e.g. a VLM whose vision
+    # modules are not tagged with vision keywords): drop the model-part requirement.
+    # Never broaden for audio-only (regex_model_parts == ""), which would otherwise
+    # pull in the whole language stack.
+    if regex_model_parts != "":
+        check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
+        if not check:
+            regex_matcher = \
+                r".*?(?:" + regex_components + \
+                r").*?"   + match_linear_modules
     pass
 
     # Final check to confirm if matches exist

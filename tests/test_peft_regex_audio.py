@@ -35,7 +35,6 @@ trees for determinism / no downloads; get_peft_regex only inspects named_modules
 """
 import re
 import pytest
-import torch
 import torch.nn as nn
 
 from unsloth_zoo.peft_utils import get_peft_regex
@@ -298,6 +297,68 @@ def test_audio_only_does_not_match_language():
                                 finetune_audio_layers=True), ns)
     assert on, "audio-only should still match audio modules"
     assert not any(".language_model." in n for n in on), "audio-only leaked into language stack"
+
+
+def test_vision_only_no_language_does_not_touch_language():
+    # finetune_vision_layers=True, language=False on Gemma 3N: the only vision
+    # Linear is the flat embed_vision.embedding_projection. The component-only
+    # fallback must NOT fire before the embedder branch and broaden into the
+    # language stack.
+    model = _gemma3n()
+    ns = linear_names(model)
+    on = matched(get_peft_regex(model, finetune_vision_layers=True,
+                                finetune_language_layers=False,
+                                finetune_audio_layers=False), ns)
+    assert any(n.endswith("embed_vision.embedding_projection") for n in on)
+    assert not any(".language_model." in n for n in on), \
+        f"vision-only leaked into the language stack: {[n for n in on if '.language_model.' in n]}"
+
+
+def test_audio_respects_explicit_target_modules():
+    # With an explicit target_modules list, the audio branch must intersect with it
+    # rather than attach every Gemma audio leaf.
+    model = _gemma3n()
+    ns = linear_names(model)
+    on = matched(get_peft_regex(model, finetune_vision_layers=False,
+                                finetune_language_layers=True,
+                                finetune_audio_layers=True,
+                                target_modules=["q_proj", "v_proj"]), ns)
+    at = {leaf(n) for n in on if ".audio_tower." in n}
+    assert {"q_proj", "v_proj"} <= at
+    assert "k_proj" not in at and "ffw_layer_1" not in at and "post" not in at, \
+        f"explicit target_modules not respected by audio branch: {at}"
+    # embedding_projection was not in the list -> the projector is not attached
+    assert not any(n.endswith("embed_audio.embedding_projection") for n in on)
+
+
+def test_audio_respects_attn_mlp_flags():
+    # attention off, mlp on: the conformer attention leaves (q/k/v/post) must not
+    # attach, but the feed-forward leaves must.
+    model = _gemma3n()
+    ns = linear_names(model)
+    on = matched(get_peft_regex(model, finetune_vision_layers=False,
+                                finetune_language_layers=True,
+                                finetune_attention_modules=False,
+                                finetune_mlp_modules=True,
+                                finetune_audio_layers=True), ns)
+    at = {leaf(n) for n in on if ".audio_tower." in n}
+    assert {"ffw_layer_1", "ffw_layer_2"} <= at
+    assert "q_proj" not in at and "k_proj" not in at and "post" not in at, \
+        f"attn-off should drop audio attention leaves: {at}"
+
+
+def test_positional_target_modules_not_shadowed():
+    # finetune_audio_layers must come AFTER target_modules so positional callers
+    # that pass an explicit list as the 6th argument are unaffected.
+    model = FakeModel(LLAMA)
+    ns = linear_names(model)
+    kw = get_peft_regex(model, True, True, True, True, ["q_proj", "v_proj"])  # 6th positional = target_modules
+    pos = get_peft_regex(model, finetune_vision_layers=True, finetune_language_layers=True,
+                         finetune_attention_modules=True, finetune_mlp_modules=True,
+                         target_modules=["q_proj", "v_proj"])
+    assert kw == pos
+    m = matched(kw, ns)
+    assert m and all(leaf(n) in ("q_proj", "v_proj") for n in m)
 
 
 def test_guard_allows_audio_only_and_blocks_nothing_selected():
