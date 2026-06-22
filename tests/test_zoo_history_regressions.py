@@ -571,6 +571,41 @@ def test_gemma4_attention_carrier_substitution():
     assert seen["pkv"] is None, "without a carrier, pass through unchanged"
 
 
+def test_gemma4_clear_shared_kv_carrier_releases_kv():
+    """_gemma4_clear_shared_kv_carrier drops the producer K/V the carrier pinned and
+    removes the module attribute, so a no_grad/eval forward does not hold the carrier
+    (and its K/V) alive until the next forward. No-op when there is no carrier."""
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _Gemma4SharedKVCarrier, _gemma4_clear_shared_kv_carrier,
+    )
+
+    class _Attn:
+        pass
+
+    a0, a1 = _Attn(), _Attn()
+    carrier = _Gemma4SharedKVCarrier()
+    carrier.shared_layers[0] = ("k", "v")
+    a0._unsloth_shared_kv_carrier = carrier
+    a1._unsloth_shared_kv_carrier = carrier
+
+    class _Model:
+        pass
+
+    model = _Model()
+    model._unsloth_gemma4_attns = [a0, a1]
+
+    _gemma4_clear_shared_kv_carrier(model)
+    assert carrier.shared_layers == {}, "producer K/V must be released"
+    assert not hasattr(a0, "_unsloth_shared_kv_carrier"), "carrier attr must be removed"
+    assert not hasattr(a1, "_unsloth_shared_kv_carrier")
+
+    # Idempotent / no-op when nothing is attached.
+    model2 = _Model()
+    _gemma4_clear_shared_kv_carrier(model2)  # no _unsloth_gemma4_attns -> no error
+    model3 = _Model(); model3._unsloth_gemma4_attns = []
+    _gemma4_clear_shared_kv_carrier(model3)  # empty list -> no error
+
+
 def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
     """The GC fix overrides _gradient_checkpointing_func on gemma-4 text decoder layers
     that are being checkpointed with a NON-reentrant torch checkpoint, resolving the

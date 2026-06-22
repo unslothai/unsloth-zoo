@@ -538,13 +538,46 @@ def _gemma4_attach_shared_kv_carrier(model):
             pass
 
 
+def _gemma4_clear_shared_kv_carrier(model):
+    """Drop the producer K/V the per-forward carrier pinned. Only safe to call when no
+    checkpointed backward will read the carrier (i.e. ``not torch.is_grad_enabled()``):
+    under gradient checkpointing the carrier must survive until backward recompute. The
+    cached attention list is reused; no-op without KV sharing / without a carrier."""
+    attns = getattr(model, "_unsloth_gemma4_attns", None)
+    if not attns:
+        return
+    for attn in attns:
+        carrier = getattr(attn, "_unsloth_shared_kv_carrier", None)
+        if carrier is not None:
+            try:
+                carrier.shared_layers.clear()
+            except Exception:
+                pass
+            try:
+                del attn._unsloth_shared_kv_carrier
+            except Exception:
+                pass
+
+
 def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
     """Wrap a Gemma-4 model forward to (1) force non-reentrant gradient checkpointing so
     the cross-layer shared K/V stays grad-connected under reentrant/offloaded GC -- needed
     on EVERY version with E-series KV sharing -- and (2), only on builds that need the
     carrier (transformers 5.5.0-5.5.1, ``attach_carrier=True``), attach a fresh per-forward
     shared-KV carrier so the cache-free forward also works. On 5.5.2+ the native
-    shared_kv_states handles the forward, so only the gradient fix runs."""
+    shared_kv_states handles the forward, so only the gradient fix runs.
+
+    Carrier scope note (transformers 5.5.0-5.5.1 only): the carrier is stored as a module
+    attribute because that is the only channel that survives into gradient-checkpoint
+    backward recompute (recompute re-runs the decoder layers, NOT this model-forward
+    wrapper, so a forward-scoped contextvar/stack would already be gone). Consequently, if
+    a training loop keeps more than one checkpointed forward graph alive before calling
+    backward (e.g. summing two microbatch losses, or multi-view/contrastive losses), the
+    second forward overwrites the single carrier and the first graph's recompute reads the
+    later batch's K/V. This affects ONLY the 5.5.0-5.5.1 carrier bridge; on transformers
+    >= 5.5.2 the native ``shared_kv_states`` is passed per forward (function-scoped) and is
+    immune, so the supported fix for that pattern is to upgrade transformers. Standard
+    single-forward / gradient-accumulation training (one backward per forward) is unaffected."""
     def forward(self, *args, **kwargs):
         try:
             _gemma4_force_nonreentrant_checkpointing(self)
@@ -555,6 +588,18 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
                 _gemma4_attach_shared_kv_carrier(self)
             except Exception:
                 pass
+            # In eval / inference / no_grad there is no backward to read the carrier, so
+            # release the producer K/V it pinned as soon as the forward returns instead of
+            # holding it until the next forward or model deletion. In training the carrier
+            # must survive until backward, and the next forward replaces it.
+            if not torch.is_grad_enabled():
+                try:
+                    return _orig_forward(self, *args, **kwargs)
+                finally:
+                    try:
+                        _gemma4_clear_shared_kv_carrier(self)
+                    except Exception:
+                        pass
         return _orig_forward(self, *args, **kwargs)
 
     forward._unsloth_kv_shared_use_cache_false_patched = True
