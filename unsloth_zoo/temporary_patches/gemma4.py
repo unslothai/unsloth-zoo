@@ -304,6 +304,12 @@ TEMPORARY_PATCHES.append(patch_StaticCache_kv_shared_zero)
 # teacher-forced loss ~16 vs ~6.8 (use_cache=True); under gradient checkpointing
 # all 20 shared layers fall back to recomputing their own KV.
 #
+# Version window: gemma-4 first ships in transformers 5.5.0, and the buggy
+# cache-dependent path exists only in 5.5.0 and 5.5.1. From 5.5.2 onward (the
+# native `shared_kv_states` arg was backported into the 5.5.x line, then 5.6.0+)
+# the cache-free path is fixed upstream. The gate below detects this by signature,
+# not version, so it stays correct across the mid-patch-release backport.
+#
 # Fix: decouple the within-forward shared KV from past_key_values. The model
 # forward attaches a fresh tiny carrier (a shared_layers dict + no-op update) to
 # every Gemma4TextAttention, and the attention uses it whenever the real
@@ -316,10 +322,11 @@ TEMPORARY_PATCHES.append(patch_StaticCache_kv_shared_zero)
 
 def _gemma4_kv_sharing_needs_cache():
     """True iff this transformers build plumbs Gemma-4 cross-layer KV sharing through
-    ``past_key_values`` (the buggy, cache-dependent mechanism, transformers 5.5.0).
-    Newer builds pass it via a dedicated ``shared_kv_states`` argument to the attention
-    forward, which fixes the cache-free path and makes this patch unnecessary, so we
-    no-op there (forwards-compat with transformers >= 5.5.0 and 5.x latest)."""
+    ``past_key_values`` (the buggy, cache-dependent mechanism: transformers 5.5.0-5.5.1).
+    Newer builds (5.5.2+, where the native ``shared_kv_states`` attention argument was
+    backported, through 5.x latest) pass the shared KV cache-independently, fixing the
+    cache-free path and making this patch unnecessary, so we no-op there. Detection is by
+    signature, not version, so it tracks the backport correctly (forwards-compatible)."""
     try:
         import inspect
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
