@@ -85,7 +85,10 @@ def _delta(A, B, alpha, expert_idx, num_experts):
 
 def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     num_layers, num_experts, rank_per = 2, 4, 4
-    hidden, intermediate = 16, 8
+    # 2*intermediate != hidden keeps the fused gate_up_proj layout shape-distinct,
+    # so the merge resolves it without relying on the PEFT-version-dependent
+    # ambiguous-layout default (swapped on peft < 0.19, standard on >= 0.19).
+    hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
 
@@ -143,7 +146,10 @@ def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
     branch's .base_layer -> .gate_up_proj fallback. Down stays on the module.
     """
     num_layers, num_experts, rank_per = 2, 4, 4
-    hidden, intermediate = 16, 8
+    # 2*intermediate != hidden keeps the fused gate_up_proj layout shape-distinct,
+    # so the merge resolves it without relying on the PEFT-version-dependent
+    # ambiguous-layout default (swapped on peft < 0.19, standard on >= 0.19).
+    hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
 
@@ -214,7 +220,10 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
     )
 
     num_layers, num_experts, rank_per = 1, 2, 4
-    hidden, intermediate = 16, 8
+    # 2*intermediate != hidden keeps the fused gate_up_proj layout shape-distinct,
+    # so the merge resolves it without relying on the PEFT-version-dependent
+    # ambiguous-layout default (swapped on peft < 0.19, standard on >= 0.19).
+    hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
 
