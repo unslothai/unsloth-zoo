@@ -3013,6 +3013,7 @@ def patch_gpt_oss_init_weights_modulelist_fix():
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel
     )
     GptOssExperts = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    GptOssTopKRouter = transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
     if getattr(GptOssPreTrainedModel, "_unsloth_init_weights_fixed", False):
         return
     _original_init_weights = GptOssPreTrainedModel._init_weights
@@ -3028,6 +3029,22 @@ def patch_gpt_oss_init_weights_modulelist_fix():
                 init.normal_(down.weight, mean=0.0, std=std)
                 if down.bias is not None:
                     init.zeros_(down.bias)
+            return
+        if isinstance(module, GptOssTopKRouter):
+            # Router weight/bias live under .weight (stock) or .linear (Unsloth BnB-4bit).
+            # Resolve whichever exists so stock _init_weights' module.weight access can't
+            # raise "GptOssTopKRouter object has no attribute 'weight'" (#3119).
+            std = self.config.initializer_range
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                weight = getattr(getattr(module, "linear", None), "weight", None)
+            bias = getattr(module, "bias", None)
+            if bias is None:
+                bias = getattr(getattr(module, "linear", None), "bias", None)
+            if weight is not None:
+                init.normal_(weight, mean=0.0, std=std)
+            if bias is not None:
+                init.normal_(bias, mean=0.0, std=std)
             return
         _original_init_weights(self, module)
 
