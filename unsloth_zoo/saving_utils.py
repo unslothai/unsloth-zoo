@@ -1963,13 +1963,10 @@ def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
     with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
-    # Strip quantization_config from the top level AND every nested sub-config.
-    # VLMs keep the LLM's quantization_config under config["text_config"] (and some
-    # under vision_config), so a merged_16bit export of a 4bit-loaded model would
-    # otherwise ship dequantized bf16 weights still labelled load_in_4bit in a
-    # nested sub-config. On reload transformers then builds the bnb 4bit quantizer
-    # for full-precision weights -> "Cannot copy out of meta tensor". Recurse so the
-    # marker is removed wherever it lives. No-op when none is present.
+    # Strip quantization_config from the top level AND nested sub-configs. VLMs keep it under
+    # text_config/vision_config, so a merged_16bit export would ship bf16 weights still labelled
+    # load_in_4bit there -> on reload transformers builds the bnb quantizer for full-precision
+    # weights ("Cannot copy out of meta tensor"). Recurse to remove it wherever it lives.
     def _strip_quantization_config(obj):
         removed = False
         if isinstance(obj, dict):
@@ -2162,15 +2159,11 @@ def merge_and_overwrite_lora(
                                         max_size_in_bytes = max(max_size_in_bytes, file_size)
                                         total_size_in_bytes += file_size
                             else:
-                                # Drop stale/duplicate shards the index does not
-                                # reference, mirroring the HF-repo branch below. A
-                                # local snapshot of an indexed repo can carry a
-                                # leftover non-indexed shard set (e.g. granite-3.2-8b)
-                                # whose tensor shapes differ; merging the LoRA into it
-                                # raises "Bad in-place call: input tensor size ...".
-                                # Only filter when the index exists AND there are
-                                # genuinely extra (non-indexed) shards, so single-shard
-                                # / well-formed dirs are untouched (no-op).
+                                # Drop stale/duplicate shards the index doesn't reference
+                                # (mirrors the HF-repo branch below): a local snapshot can carry a
+                                # leftover non-indexed shard set (e.g. granite-3.2-8b) whose shapes
+                                # differ -> "Bad in-place call". Filter only when extra shards
+                                # exist, so well-formed dirs are untouched.
                                 _indexed = {os.path.split(v)[-1] for v in index_data["weight_map"].values()}
                                 if _indexed and not set(safetensors_list).issubset(_indexed):
                                     _kept = [s for s in safetensors_list if s in _indexed]
@@ -2219,14 +2212,10 @@ def merge_and_overwrite_lora(
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
 
-            # Drop stale/duplicate shard sets the index does not reference. Some
-            # repos (e.g. granite-3.2-8b-instruct) ship a leftover second shard set
-            # (e.g. model-0000N-of-0000M) next to the real one, while
-            # model.safetensors.index.json references only the real set. Merging the
-            # LoRA into a stale shard whose tensor shapes differ raises
-            # "Bad in-place call: input tensor size ... should match". Only filter
-            # when the index exists AND there are genuinely extra (non-indexed)
-            # shards, so single-shard / well-formed repos are untouched (no-op).
+            # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
+            # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
+            # the index references only the real set; merging into a stale shard whose shapes
+            # differ raises "Bad in-place call". Filter only when extra shards exist.
             try:
                 from huggingface_hub import hf_hub_download as _hf_hub_download
                 _idx_path = _hf_hub_download(
