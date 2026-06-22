@@ -1310,6 +1310,31 @@ def _count_moe_experts_in_header(prefix, header_metadata, scheme):
     return (max_idx + 1) if max_idx >= 0 else None
 
 
+def _resolve_moe_num_experts_with_header(prefix, resolution_stats, moe_num_experts, header_metadata, scheme):
+    """Expert count for ``prefix``, preferring the authoritative source.
+
+    Resolution order:
+      1. The live experts module's ``num_experts`` attr, then the fused-LoRA shape
+         (``_resolve_moe_num_experts``). Both are shard-independent -> the true N.
+      2. The shard header's (max per-expert index + 1) for per-expert schemes the
+         pre-scan does not count (w1/w3/w2). Needed only when (1) cannot resolve a
+         count (e.g. a down_proj-only w1/w3/w2 adapter that derives 1, which would
+         otherwise leave experts 1..N-1 unmerged).
+
+    The header count may only RAISE a missing/too-low count, never lower an
+    authoritative one: a shard holding only a low-index subset (experts 0..15 of
+    64) under-counts, and that count drives the per-expert LoRA slicing stride, so
+    lowering it would corrupt every merged expert. Records a raised count in
+    ``moe_num_experts`` and returns the resolved count (possibly None).
+    """
+    num_experts = _resolve_moe_num_experts(prefix, resolution_stats, moe_num_experts)
+    hdr_ne = _count_moe_experts_in_header(prefix, header_metadata, scheme)
+    if hdr_ne and hdr_ne > (num_experts or 0):
+        num_experts = hdr_ne
+        moe_num_experts[prefix] = hdr_ne
+    return num_experts
+
+
 def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys):
     count = 0
     debug_logged = 0
@@ -1453,17 +1478,6 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         # per-expert as w1=gate / w3=up / w2=down).
         _scheme = _detect_moe_perexpert_scheme(prefix, header_metadata)
         gate_name, up_name, down_name = _scheme or ("gate_proj", "up_proj", "down_proj")
-        # Seed the expert count from the shard header for schemes the pre-scan
-        # does not count (w1/w3/w2). Without this, a down_proj-only adapter has no
-        # fused gate LoRA to borrow num_experts from and _resolve_moe_num_experts
-        # would derive 1, leaving experts 1..N-1 unmerged. No-op when already known
-        # or when the header has no per-expert tensors for this prefix.
-        if moe_num_experts.get(prefix, 0) <= 0:
-            _hdr_ne = _count_moe_experts_in_header(
-                prefix, header_metadata, (gate_name, up_name, down_name)
-            )
-            if _hdr_ne:
-                moe_num_experts[prefix] = _hdr_ne
         resolution_stats = lora_stats
         if getattr(resolution_stats, "module", None) is None:
             base_stats = converted_lora_weights.get(prefix + ".base_layer")
@@ -1472,8 +1486,12 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 and getattr(base_stats, "module", None) is not None
             ):
                 resolution_stats = base_stats
-        num_experts = _resolve_moe_num_experts(
-            prefix, resolution_stats, moe_num_experts
+        # Prefer the authoritative (module/fused-LoRA) count; the shard header may
+        # only raise a missing/too-low count, never lower it (a low-index shard
+        # subset under-counts and would corrupt the per-expert slicing stride).
+        num_experts = _resolve_moe_num_experts_with_header(
+            prefix, resolution_stats, moe_num_experts,
+            header_metadata, (gate_name, up_name, down_name),
         )
         if UNSLOTH_ENABLE_LOGGING and num_experts is not None and debug_logged < 2:
             try:
