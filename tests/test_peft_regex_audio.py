@@ -219,13 +219,19 @@ def test_audio_flag_additive_for_non_audio_archs(arch_name, flags):
     assert r_off == r_on
 
 
-def test_qwen2audio_no_leak_off_but_capability_on():
+def test_qwen2audio_off_no_leak_and_no_qwen_specific_leaves():
+    # finetune_audio_layers is scoped to the models we ship notebooks for
+    # (Gemma 4 / Gemma 3N). On a non-notebook audio_tower (Qwen2-Audio) the flag is
+    # a no-op when off, and even when on it must NOT target Qwen-specific leaves
+    # (out_proj / fc1 / fc2) -- we deliberately do not generalize to it here.
     model = FakeModel(QWEN2_AUDIO)
     ns = linear_names(model)
     off = matched(get_peft_regex(model, finetune_audio_layers=False), ns)
     assert not any("audio_tower" in n for n in off)
-    on = matched(get_peft_regex(model, finetune_audio_layers=True), ns)
-    assert any("audio_tower" in n for n in on), "flag on should reach audio_tower (forward-looking)"
+    on_leaves = {leaf(n) for n in matched(get_peft_regex(model, finetune_audio_layers=True), ns)
+                 if "audio_tower" in n}
+    assert not ({"out_proj", "fc1", "fc2"} & on_leaves), \
+        f"unexpectedly targeted Qwen-specific audio leaves: {on_leaves}"
 
 
 def test_audio_branch_keys_on_audio_tower_anchor():
@@ -329,6 +335,21 @@ def test_audio_respects_explicit_target_modules():
         f"explicit target_modules not respected by audio branch: {at}"
     # embedding_projection was not in the list -> the projector is not attached
     assert not any(n.endswith("embed_audio.embedding_projection") for n in on)
+
+
+def test_explicit_leaf_matches_full_segment_not_prefix():
+    # target_modules=["k_proj"] must match audio_tower ...attn.k_proj but NOT
+    # ...attn.relative_k_proj (the ".*?" before the leaf must stop at a "." boundary).
+    model = _gemma4("E2B")  # Gemma 4 audio_tower has relative_k_proj (+ .linear children)
+    ns = linear_names(model)
+    on = matched(get_peft_regex(model, finetune_vision_layers=False,
+                                finetune_language_layers=True,
+                                finetune_audio_layers=True,
+                                target_modules=["k_proj"]), ns)
+    at = [n for n in on if ".audio_tower." in n]
+    assert any(leaf(n) == "k_proj" for n in at), "k_proj should match in audio_tower"
+    assert not any(leaf(n) == "relative_k_proj" for n in at), \
+        f"k_proj wrongly matched relative_k_proj: {at}"
 
 
 def test_audio_respects_attn_mlp_flags():

@@ -165,16 +165,22 @@ def get_peft_regex(
 
     candidate_branches = []
     if finetune_audio_layers:
-        # conv / *norm leaves are not nn.Linear so they are never candidates.
-        audio_leaves = ["linear_start", "linear_end", "input_proj_linear", "output_proj"]
+        # conv / *norm leaves are not nn.Linear so they are never candidates. The
+        # conformer attention leaves are gated by finetune_attention_modules; the
+        # feed-forward / lightweight-conv / subsample / output projections are gated
+        # by finetune_mlp_modules.
+        audio_leaves = []
         if finetune_attention_modules:
             audio_leaves += ["q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj", "post"]
         if finetune_mlp_modules:
-            audio_leaves += ["ffw_layer_1", "ffw_layer_2"]
+            audio_leaves += ["ffw_layer_1", "ffw_layer_2", "linear_start", "linear_end",
+                             "input_proj_linear", "output_proj"]
         audio_leaves = _scoped(audio_leaves)
         if audio_leaves:
             audio_leaf_re = r"(?:" + "|".join(re.escape(x) for x in audio_leaves) + r")"
-            candidate_branches.append(r"(?:.*?\baudio_tower\..*?" + audio_leaf_re + r"(?:\.linear)?)")
+            # Require a "." before the leaf so the leaf is a complete path segment --
+            # e.g. target_modules=["k_proj"] must not also match "...relative_k_proj".
+            candidate_branches.append(r"(?:.*?\baudio_tower\.(?:.*\.)?" + audio_leaf_re + r"(?:\.linear)?)")
         if _scoped(["embedding_projection"]):
             candidate_branches.append(r"(?:.*?\bembed_audio\.embedding_projection(?:\.linear)?)")
     if finetune_vision_layers:
