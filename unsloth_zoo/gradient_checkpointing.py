@@ -224,10 +224,32 @@ def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs)
 pass
 
 
+# Names of the checkpoint shims below; none is the pristine torch fn.
+_UNSLOTH_CKPT_SHIM_NAMES = frozenset({
+    "unsloth_checkpoint",
+    "unsloth_gradient_checkpoint",
+    "unsloth_offloaded_gradient_checkpoint",
+})
+
+
+def _capture_pristine_checkpoint_once():
+    # Stash the genuine torch.utils.checkpoint.checkpoint the first time we patch, before any
+    # shim stacks. The per-patch _old_checkpoint is module-level, so a second patch overwrites
+    # it with the first shim and the pristine fn becomes unreachable. Consumers that must force
+    # use_reentrant=False (e.g. the Gemma-4 KV-sharing fix) read this set-once ref instead.
+    ck = torch.utils.checkpoint
+    if getattr(ck, "_unsloth_pristine_checkpoint", None) is not None:
+        return
+    current = getattr(ck, "checkpoint", None)
+    if current is not None and getattr(current, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES:
+        ck._unsloth_pristine_checkpoint = current
+
+
 def patch_unsloth_gradient_checkpointing():
     print("Unsloth: Patched gradient checkpointing for long context finetuning.")
     import torch.utils
     if torch.utils.checkpoint.checkpoint.__name__ == "unsloth_offloaded_gradient_checkpoint": return
+    _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_offloaded_gradient_checkpoint
     import transformers.modeling_utils
@@ -240,6 +262,7 @@ def patch_gradient_checkpointing():
     print("Unsloth: Patched gradient checkpointing.")
     import torch.utils
     if torch.utils.checkpoint.checkpoint.__name__ == "unsloth_gradient_checkpoint": return
+    _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_gradient_checkpoint
     import transformers.modeling_utils
@@ -810,6 +833,7 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
         torch.utils.checkpoint.CheckpointFunction = UnslothCheckpointFunction
 
     if torch.utils.checkpoint.checkpoint.__name__ != "unsloth_checkpoint":
+        _capture_pristine_checkpoint_once()
         torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
 

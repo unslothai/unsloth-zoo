@@ -476,6 +476,313 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Gemma-4 E-series KV sharing under use_cache=False / gradient checkpointing
+# (transformers#45242). These lock the zoo fix in and check its invariants on CPU.
+# ---------------------------------------------------------------------------
+def test_gemma4_kv_shared_patches_registered():
+    """Both patch functions stay registered AND wire the carrier (not bare return stubs)."""
+    import inspect
+    from unsloth_zoo.temporary_patches import gemma4 as _M
+    from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+
+    names = {getattr(p, "__name__", "") for p in TEMPORARY_PATCHES}
+    assert "patch_Gemma4TextModel_forward_kv_shared_no_cache" in names
+    assert "patch_Gemma4Model_forward_kv_shared_no_cache" in names
+    for fn in (_M.patch_Gemma4TextModel_forward_kv_shared_no_cache,
+               _M.patch_Gemma4Model_forward_kv_shared_no_cache):
+        src = inspect.getsource(fn)
+        assert "_patch_forward_for_kv_shared_no_cache" in src and "_patch_gemma4_attention_carrier" in src, (
+            "the shared-KV fix must install both the model carrier-attacher and the "
+            "attention carrier patch; do not reduce it to a no-op"
+        )
+
+
+def test_gemma4_shared_kv_carrier_semantics():
+    """Carrier exposes only shared_layers + a no-op update, so non-shared layers stay cache-free."""
+    from unsloth_zoo.temporary_patches.gemma4 import _Gemma4SharedKVCarrier
+    c = _Gemma4SharedKVCarrier()
+    assert c.shared_layers == {}
+    k, v = object(), object()
+    assert c.update(k, v, 0) == (k, v)
+    assert c.get_seq_length() == 0
+    c.shared_layers[3] = (k, v)
+    assert c.shared_layers[3] == (k, v)
+
+
+def test_gemma4_capability_gate(monkeypatch):
+    """needs_cache() is True when the attention forward lacks shared_kv_states, False once it
+    has it. Uses a synthetic module, independent of the installed transformers."""
+    import sys, types, inspect
+    from unsloth_zoo.temporary_patches import gemma4 as _M
+
+    class _Buggy:
+        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kw):
+            return None
+    class _Fixed:
+        def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states, past_key_values=None, **kw):
+            return None
+    # The discriminator is the `shared_kv_states` parameter on the attention forward.
+    assert "shared_kv_states" not in inspect.signature(_Buggy.forward).parameters
+    assert "shared_kv_states" in inspect.signature(_Fixed.forward).parameters
+
+    import transformers.models as tm
+    pkg = types.ModuleType("transformers.models.gemma4")
+    leaf = types.ModuleType("transformers.models.gemma4.modeling_gemma4")
+    pkg.modeling_gemma4 = leaf
+    monkeypatch.setitem(sys.modules, "transformers.models.gemma4", pkg)
+    monkeypatch.setitem(sys.modules, "transformers.models.gemma4.modeling_gemma4", leaf)
+    monkeypatch.setattr(tm, "gemma4", pkg, raising=False)
+
+    leaf.Gemma4TextAttention = _Buggy
+    assert _M._gemma4_kv_sharing_needs_cache() is True
+    leaf.Gemma4TextAttention = _Fixed
+    assert _M._gemma4_kv_sharing_needs_cache() is False
+
+
+def test_gemma4_attention_carrier_substitution():
+    """The wrapper supplies the carrier only when past_key_values is None; a real cache and
+    the no-carrier case pass through unchanged."""
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _make_gemma4_attention_carrier_forward, _Gemma4SharedKVCarrier,
+    )
+    seen = {}
+    def orig(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kw):
+        seen["pkv"] = past_key_values
+        return "ok"
+    wrapped = _make_gemma4_attention_carrier_forward(orig)
+
+    class M:
+        pass
+    m = M(); carrier = _Gemma4SharedKVCarrier(); m._unsloth_shared_kv_carrier = carrier
+    wrapped(m, "h", "pe", "am", past_key_values=None)
+    assert seen["pkv"] is carrier, "None past_key_values must be replaced by the carrier"
+    real = object()
+    wrapped(m, "h", "pe", "am", past_key_values=real)
+    assert seen["pkv"] is real, "a real cache must NOT be replaced"
+    m2 = M()  # no carrier attached
+    wrapped(m2, "h", "pe", "am", past_key_values=None)
+    assert seen["pkv"] is None, "without a carrier, pass through unchanged"
+
+
+def test_gemma4_clear_shared_kv_carrier_releases_kv():
+    """clear drops the pinned K/V and removes the module attr, so a no_grad/eval forward does
+    not hold the carrier alive until the next forward. No-op when there is no carrier."""
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _Gemma4SharedKVCarrier, _gemma4_clear_shared_kv_carrier,
+    )
+
+    class _Attn:
+        pass
+
+    a0, a1 = _Attn(), _Attn()
+    carrier = _Gemma4SharedKVCarrier()
+    carrier.shared_layers[0] = ("k", "v")
+    a0._unsloth_shared_kv_carrier = carrier
+    a1._unsloth_shared_kv_carrier = carrier
+
+    class _Model:
+        pass
+
+    model = _Model()
+    model._unsloth_gemma4_attns = [a0, a1]
+
+    _gemma4_clear_shared_kv_carrier(model)
+    assert carrier.shared_layers == {}, "producer K/V must be released"
+    assert not hasattr(a0, "_unsloth_shared_kv_carrier"), "carrier attr must be removed"
+    assert not hasattr(a1, "_unsloth_shared_kv_carrier")
+
+    # Idempotent / no-op when nothing is attached.
+    model2 = _Model()
+    _gemma4_clear_shared_kv_carrier(model2)  # no _unsloth_gemma4_attns -> no error
+    model3 = _Model(); model3._unsloth_gemma4_attns = []
+    _gemma4_clear_shared_kv_carrier(model3)  # empty list -> no error
+
+
+def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
+    """Overrides _gradient_checkpointing_func on checkpointed gemma-4 layers with a NON-reentrant
+    checkpoint, resolving the pristine one past Unsloth's smart-GC shim. Non-checkpointed and
+    non-gemma-4 layers are left untouched."""
+    import functools
+    import torch.utils.checkpoint as _ckpt
+    from unsloth_zoo.temporary_patches import gemma4 as g4
+    from unsloth_zoo.temporary_patches.gemma4 import _gemma4_force_nonreentrant_checkpointing
+
+    def _pristine(function, *args, use_reentrant=None, **kw):
+        return ("pristine", use_reentrant)
+    def unsloth_checkpoint(function, *args, **kw):
+        return "shim"
+    unsloth_checkpoint.__name__ = "unsloth_checkpoint"  # reentrant-forcing shim
+    def unsloth_offloaded_gradient_checkpoint(function, *args, **kw):
+        return "shim2"
+    unsloth_offloaded_gradient_checkpoint.__name__ = "unsloth_offloaded_gradient_checkpoint"
+    # Simulate STACKED Unsloth shims: checkpoint and _old_checkpoint are BOTH shims, so
+    # the import-captured pristine is what must be used.
+    monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", unsloth_offloaded_gradient_checkpoint, raising=False)
+    monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", _pristine, raising=False)
+    # Real GC patching may have stashed a set-once pristine on the live module; clear it so the
+    # import-captured and _old_checkpoint-unwrap paths below are what gets exercised.
+    monkeypatch.delattr(_ckpt, "_unsloth_pristine_checkpoint", raising=False)
+
+    Gemma4TextAttention = type("Gemma4TextAttention", (), {})
+    OtherAttention = type("OtherAttention", (), {})
+
+    class _Layer:
+        def __init__(self, attn_cls, gc, is_shared=False, existing="ORIG"):
+            self.self_attn = attn_cls()
+            self.self_attn.is_kv_shared_layer = is_shared
+            self.gradient_checkpointing = gc
+            self._gradient_checkpointing_func = existing
+
+    # `on` carries a user checkpoint kwarg (preserve_rng_state=False) that must survive.
+    on = _Layer(Gemma4TextAttention, True, is_shared=True,
+                existing=functools.partial(unsloth_checkpoint, use_reentrant=True, preserve_rng_state=False))
+    off = _Layer(Gemma4TextAttention, False)  # not checkpointed -> untouched
+    other = _Layer(OtherAttention, True)      # non-gemma-4 -> untouched
+
+    class _Model:
+        # modules() must expose the attentions so the fix can detect KV sharing.
+        def modules(self):
+            return [self, on, on.self_attn, off, off.self_attn, other, other.self_attn]
+    m = _Model()
+
+    _gemma4_force_nonreentrant_checkpointing(m)
+
+    # Non-E-series gemma-4 (no shared layer) must be a strict no-op.
+    plain = _Layer(Gemma4TextAttention, True)  # gemma-4 but NOT a shared layer
+    class _ModelNoShare:
+        def modules(self):
+            return [self, plain, plain.self_attn]
+    mns = _ModelNoShare()
+    _gemma4_force_nonreentrant_checkpointing(mns)
+    assert plain._gradient_checkpointing_func == "ORIG", "no-KV-sharing model must be untouched"
+
+    f = on._gradient_checkpointing_func
+    assert isinstance(f, functools.partial), "checkpointed gemma-4 layer must be overridden"
+    assert f.func is _pristine, "must resolve the PRISTINE checkpoint past stacked shims"
+    assert f.keywords.get("use_reentrant") is False, "must force non-reentrant"
+    assert f.keywords.get("preserve_rng_state") is False, "must preserve user checkpoint kwargs"
+    assert off._gradient_checkpointing_func == "ORIG", "non-checkpointed layer left alone"
+    assert other._gradient_checkpointing_func == "ORIG", "non-gemma-4 layer left alone"
+
+    # Fallback: when no import-captured pristine, unwrap _old_checkpoint past the shim.
+    monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", None, raising=False)
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", _pristine, raising=False)
+    on2 = _Layer(Gemma4TextAttention, True, is_shared=True)
+    class _Model2:
+        def modules(self):
+            return [self, on2, on2.self_attn]
+    _gemma4_force_nonreentrant_checkpointing(_Model2())
+    assert on2._gradient_checkpointing_func.func is _pristine, "fallback must unwrap _old_checkpoint"
+
+
+def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
+    """When gemma4 imports after smart GC stacked on an offloaded shim, neither shim carries a
+    function-level _old_checkpoint and the module-level one points at the first shim. The set-once
+    capture the GC patcher stashes before any shim must still recover the pristine fn."""
+    import torch.utils.checkpoint as _ckpt
+    from unsloth_zoo import gradient_checkpointing as gc
+    from unsloth_zoo.temporary_patches import gemma4 as g4
+
+    real = _ckpt.checkpoint  # genuine torch fn in the test process (no shim installed)
+
+    # Force the "late import" path: no import-captured pristine available.
+    monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", None, raising=False)
+    monkeypatch.delattr(_ckpt, "_unsloth_pristine_checkpoint", raising=False)
+
+    # First GC patch captures the pristine before any shim stacks.
+    gc._capture_pristine_checkpoint_once()
+    assert getattr(_ckpt, "_unsloth_pristine_checkpoint", None) is real
+
+    # Now stack two shims: module-level _old_checkpoint ends up at the first shim, so unwrapping
+    # it alone would only ever reach a shim.
+    def unsloth_offloaded_gradient_checkpoint(*a, **k):
+        raise AssertionError("a shim must never be returned as the pristine checkpoint")
+    unsloth_offloaded_gradient_checkpoint.__name__ = "unsloth_offloaded_gradient_checkpoint"
+    def unsloth_checkpoint(*a, **k):
+        raise AssertionError("a shim must never be returned as the pristine checkpoint")
+    unsloth_checkpoint.__name__ = "unsloth_checkpoint"
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", unsloth_offloaded_gradient_checkpoint, raising=False)
+    monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
+
+    assert g4._resolve_pristine_checkpoint(_ckpt) is real, (
+        "set-once capture must recover the pristine checkpoint despite stacked shims"
+    )
+    # cleanup the attr we created (monkeypatch.delattr above only records absence)
+    if hasattr(_ckpt, "_unsloth_pristine_checkpoint"):
+        del _ckpt._unsloth_pristine_checkpoint
+
+
+def _make_gemma4_fake_model(torch, *, kv_shared, checkpointed):
+    """A stand-in Gemma-4 model: one decoder layer whose self_attn class is named
+    Gemma4TextAttention, with configurable KV sharing and gradient checkpointing flags."""
+    Gemma4TextAttention = type("Gemma4TextAttention", (), {})
+
+    class _Layer:
+        def __init__(self):
+            self.self_attn = Gemma4TextAttention()
+            self.self_attn.is_kv_shared_layer = kv_shared
+            self.gradient_checkpointing = checkpointed
+
+    layer = _Layer()
+
+    class _Model:
+        def modules(self):
+            return [self, layer, layer.self_attn]
+
+    return _Model()
+
+
+def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
+    """The module-scoped 5.5.0/5.5.1 carrier cannot serve two live checkpointed graphs, so a
+    second grad-enabled forward before the first's backward must raise -- but ONLY when KV sharing
+    AND gradient checkpointing are both active (else no carrier is re-read in backward). Models
+    without sharing (31B/26B-A4B) or with checkpointing off must keep working with DPO/contrastive."""
+    import torch
+    import pytest
+    from unsloth_zoo.temporary_patches.gemma4 import _make_kv_shared_use_cache_false_safe_forward
+
+    w = torch.nn.Parameter(torch.randn(4, 4))
+
+    def _orig(self, x):
+        return x @ w  # stands in for last_hidden_state; requires grad
+
+    wrapped = _make_kv_shared_use_cache_false_safe_forward(_orig, attach_carrier=True)
+    x = torch.randn(2, 4, requires_grad=True)
+
+    # Unsafe: KV sharing + checkpointing -> arm + reject the overlapping forward.
+    m = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=True)
+    out1 = wrapped(m, x)
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
+    with pytest.raises(RuntimeError, match="two forward passes before a single backward"):
+        wrapped(m, x)
+    # after the first graph's backward the marker clears and a new forward is allowed
+    out1.sum().backward()
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is False
+    wrapped(m, x)
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
+
+    # Safe (no KV sharing, e.g. 31B/26B-A4B): two forwards before one backward must NOT raise.
+    m_noshare = _make_gemma4_fake_model(torch, kv_shared=False, checkpointed=True)
+    wrapped(m_noshare, x)
+    wrapped(m_noshare, x)  # would raise if the marker were armed
+    assert getattr(m_noshare, "_unsloth_gemma4_carrier_outstanding", False) is False
+
+    # Safe (KV sharing but checkpointing off): backward uses saved activations, never re-reads
+    # the carrier, so overlapping forwards must NOT raise.
+    m_nockpt = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=False)
+    wrapped(m_nockpt, x)
+    wrapped(m_nockpt, x)
+    assert getattr(m_nockpt, "_unsloth_gemma4_carrier_outstanding", False) is False
+
+    # eval / no_grad never arms the marker (no backward to guard)
+    m_eval = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=True)
+    with torch.no_grad():
+        wrapped(m_eval, x)
+    assert getattr(m_eval, "_unsloth_gemma4_carrier_outstanding", False) is False
+
+
+# ---------------------------------------------------------------------------
 # Regression: gpt-oss bnb-4bit <-> 16bit compiled-cache mode switch.
 # The compiled gpt_oss module hardcodes the BnB or stock router/experts layout. Reusing a
 # stale BnB-built module for a later 16bit load re-installs the BnB router -> "weights not
