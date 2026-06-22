@@ -586,8 +586,7 @@ def _merge_and_overwrite_lora(
                     prefix, idx, _ = m.groups()
                     idx = int(idx)
                     moe_num_experts[prefix] = max(moe_num_experts.get(prefix, -1), idx + 1)
-                # Legacy Mixtral on disk: block_sparse_moe.experts.N.w1/w2/w3.weight.
-                # LoRA lives under the renamed mlp.experts prefix, so count under that.
+                # Legacy Mixtral disk keys; LoRA lives under the renamed mlp.experts, count there.
                 m = re.match(r"^(.*)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$", _k)
                 if m:
                     prefix = m.group(1) + ".mlp.experts"
@@ -643,10 +642,9 @@ def _merge_and_overwrite_lora(
                 ):
                     logger.info(f"[merge_debug] First shard key example: {key}")
 
-                # Legacy Mixtral on disk: block_sparse_moe.experts.N.w1/w2/w3.weight.
-                # transformers v5 fuses w1+w3 -> gate_up_proj and renames w2 -> down_proj
-                # in-memory, so the LoRA (and its merge) live under mlp.experts. Map the
-                # disk key back so w1->gate, w3->up, w2->down get merged.
+                # Legacy Mixtral disk keys (block_sparse_moe.experts.N.w1/w2/w3): transformers
+                # v5 fuses w1+w3 -> gate_up_proj, w2 -> down_proj under mlp.experts in-memory,
+                # where the LoRA lives. Map disk back: w1->gate, w3->up, w2->down.
                 m_legacy = re.match(
                     r"^(.*)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$", key
                 )
@@ -659,15 +657,14 @@ def _merge_and_overwrite_lora(
                         continue
                     num_experts = available_experts
                     if w_name == "w2":
-                        # down_proj LoRA stored on the experts module.
+                        # down_proj LoRA on the experts module.
                         fused_key = base_prefix
                         lora_stats = converted_lora_weights.get(fused_key)
                         merge_role = "down"
                         merge_fn = _merge_moe_down_proj_expert
                     else:
-                        # gate_up_proj LoRA: PEFT stores it on experts.base_layer, but
-                        # the fused .gate_up_proj key is used when there is no base_layer
-                        # wrapper (mirror the per-expert gate/up branch below).
+                        # gate_up_proj LoRA: on experts.base_layer, else the fused
+                        # .gate_up_proj key when unwrapped (mirrors the gate/up branch below).
                         fused_key = base_prefix + ".base_layer"
                         lora_stats = converted_lora_weights.get(fused_key)
                         if lora_stats is None:
@@ -676,10 +673,8 @@ def _merge_and_overwrite_lora(
                         merge_role = "gate" if w_name == "w1" else "up"
                         merge_fn = _merge_moe_gate_expert if w_name == "w1" else _merge_moe_up_expert
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
-                        # Route through the quant-aware helper so FP8/compressed legacy
-                        # shards dequantise -> merge -> requantise and rewrite their
-                        # companion scales; for plain 16-bit weights it is a straight
-                        # read/merge/write (apply_moe_quant_load returns the tensor as-is).
+                        # Quant-aware helper: FP8/compressed shards dequant -> merge ->
+                        # requant (+ rewrite scales); 16-bit weights pass straight through.
                         merged = _merge_moe_expert_quant_aware(
                             merge_role, key, file, header_metadata, lora_stats,
                             expert_idx, num_experts, output_dtype, mm, length_of_header,
@@ -3182,8 +3177,8 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
         base = key.replace(".base_layer", "")
         cands = set()
-        # .moe -> .experts (Gemma4); .mlp.experts -> .block_sparse_moe.experts (legacy Mixtral
-        # w1/w2/w3 on disk, renamed to mlp.experts in-memory by transformers v5).
+        # Disk aliases: .moe -> .experts (Gemma4); .mlp.experts -> .block_sparse_moe.experts
+        # (legacy Mixtral w1/w2/w3, renamed to mlp.experts in-memory by transformers v5).
         for b in (
             base,
             base.replace(".moe", ".experts"),
