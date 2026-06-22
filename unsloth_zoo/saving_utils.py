@@ -211,14 +211,26 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     # +q the adapter never saw. For most models ||q|| is negligible (and W16 is the better 16bit
     # weight), but for huge base-weight norms over tiny MuP multipliers (Falcon-H1) +q compounds
     # and swamps the fine-tune. The caller sets use_dequant_base only for gated archs -> strict
-    # no-op elsewhere. try/except falls back to W16 so a working merge can't regress.
+    # no-op elsewhere. Assumes a live 4bit base means the adapter trained against dequant(W4)
+    # (the standard QLoRA flow); an adapter trained on the 16bit base and only reloaded in 4bit
+    # for export has no merge-time provenance signal, so it would also fold onto dequant(W4).
     if use_dequant_base and _is_bnb_4bit_base(getattr(lora_stats, "module", None)):
         try:
             W_dq = dequantize_module_weight(lora_stats.module)
-            if tuple(W_dq.shape) == tuple(W.shape):
-                W = W_dq
-        except Exception:
-            pass  # fall back to the W16 base; a previously-working merge cannot regress
+        except Exception as e:
+            # For a gated arch the 16bit base is the known-wrong base (the +q error this path
+            # exists to remove), so silently folding onto it would emit a corrupt merged_16bit.
+            # Surface the failure instead of degrading just this layer to the wrong base.
+            raise RuntimeError(
+                f"Unsloth: could not dequantize the 4bit base for `{name}` during merged_16bit "
+                "export of a model that requires dequant(W4) as the merge base. Falling back to "
+                "the 16bit base would corrupt this checkpoint, so the merge was aborted. Free GPU "
+                "memory (or merge on CPU) and retry."
+            ) from e
+        if tuple(W_dq.shape) == tuple(W.shape):
+            W = W_dq
+        # else: a shape mismatch is structural (e.g. vocab resize handled below), not a dequant
+        # failure, so keep the 16bit W here and let the resize path reconcile it.
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
