@@ -1,21 +1,16 @@
 """Regression tests for unsloth#2343: bias training was silently disabled.
 
-Pre-fix bug: `prepare_model_for_training`'s LoRA branch froze every parameter
-that was not a LoRA adapter weight, so `LoraConfig(bias="all")` / `bias="lora_only"`
-had no effect (PEFT enabled the biases, then this loop re-froze them).
+The LoRA branch of prepare_model_for_training froze every non-adapter param, so
+LoraConfig(bias="all"/"lora_only") had no effect. The fix preserves PEFT's bias
+decision; properties guarded below:
+  * bias="all"/"lora_only": PEFT-enabled biases stay trainable.
+  * bias="none" (default): biases stay frozen.
+  * a trainable bias keeps its loaded dtype, not fp32 (an fp32 bias on a bf16/fp16
+    Linear breaks the matmul with a dtype mismatch).
+  * gated to PEFT models, so a non-PEFT model's biases stay frozen on the LoRA path.
 
-The fix preserves PEFT's bias decision. Important properties (each guarded below):
-  * bias="all"/"lora_only": the biases PEFT marked trainable stay trainable.
-  * bias="none" (default): biases stay frozen (byte-identical common path).
-  * a trainable bias keeps its loaded dtype, NOT fp32: upcasting a bias while its
-    Linear's weight stays bf16/fp16 breaks the matmul ("self and mat2 must have
-    the same dtype") -- the dtype-mismatch the fix must avoid.
-  * the preservation is gated to PEFT models: a freshly-loaded non-PEFT model
-    (whose nn.Linear biases default to requires_grad=True) is left frozen on the
-    LoRA (not full_finetuning) path.
-
-Pure CPU, tiny random Llama. PEFT is required for the bias-preservation tests
-(peft is excluded on darwin/arm64), so those import-or-skip.
+Pure CPU, tiny random Llama. PEFT tests import-or-skip (peft is excluded on
+darwin/arm64).
 """
 import pytest
 import torch
@@ -101,10 +96,8 @@ def test_peft_bias_none_stays_frozen():
 
 
 def test_peft_trainable_bias_keeps_module_dtype():
-    """A trainable bias must keep its Linear's (bf16) dtype, NOT be upcast to
-    fp32 -- otherwise the bf16 weight @ fp32 bias matmul raises
-    'self and mat2 must have the same dtype'. Regression guard for the review fix.
-    """
+    """A trainable bias keeps its Linear's bf16 dtype, not fp32; an fp32 bias on a
+    bf16 weight raises 'self and mat2 must have the same dtype'."""
     pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
@@ -134,11 +127,9 @@ def test_peft_bias_gradient_flows_after_backward():
     )
 
     input_ids = torch.randint(0, 64, (1, 8))
-    # Build the loss from logits on the CPU side rather than passing `labels=`:
-    # with unsloth installed the labelled forward routes through the fused CUDA
-    # cross-entropy (unsloth_fused_lm_head_loss), which calls torch.cuda
-    # mem_get_info and aborts on a CPU-only build. A plain logits-based scalar
-    # keeps this test genuinely CPU-only while still driving a real backward.
+    # Loss from logits, not labels=: with unsloth the labelled forward uses the
+    # fused CUDA cross-entropy, which aborts on a CPU-only build. A logits scalar
+    # stays CPU-only while still driving a real backward.
     logits = model(input_ids=input_ids).logits.float()
     loss = torch.nn.functional.cross_entropy(
         logits.view(-1, logits.size(-1)), input_ids.view(-1))
@@ -150,8 +141,7 @@ def test_peft_bias_gradient_flows_after_backward():
     a_grad = params[a_bias].grad
     assert a_grad is not None, "trainable bias must receive a grad"
     assert torch.isfinite(a_grad).all(), "bias grad must be finite"
-    # Strictly > 0 (not just >= 0, which holds for any tensor): proves a gradient
-    # actually flowed into the bias rather than the param merely being allocated.
+    # Strictly > 0 proves a gradient actually flowed, not just that grad exists.
     assert a_grad.abs().sum() > 0, "bias grad must be non-zero (gradient flowed)"
     base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
     assert params[base_w].grad is None, "frozen base weight must not accumulate grad"
@@ -160,9 +150,8 @@ def test_peft_bias_gradient_flows_after_backward():
 # ---------------- non-PEFT models are left frozen ----------------------------
 
 def test_non_peft_model_biases_stay_frozen():
-    """A non-PEFT model's nn.Linear biases default to requires_grad=True. On the
-    LoRA (not full_finetuning) path they must still be frozen -- the bias
-    preservation is only a PEFT decision, so a raw model is unaffected."""
+    """A non-PEFT model's biases default to requires_grad=True but must still be
+    frozen on the LoRA path; bias preservation is a PEFT-only decision."""
     from unsloth_zoo.training_utils import prepare_model_for_training
 
     model = _tiny_llama()  # plain LlamaForCausalLM, no PEFT
@@ -180,18 +169,17 @@ def test_non_peft_model_biases_stay_frozen():
 # ---------------- modules_to_save biases are not a bias decision -------------
 
 def test_modules_to_save_bias_not_preserved_on_bias_none():
-    """bias='none' + modules_to_save: PEFT marks the saved module's bias trainable
-    because the whole module is saved, NOT because of a LoRA bias decision. With the
-    default patch_modules_to_save=False the saved module's weight stays frozen here,
-    so its bias must stay frozen too -- otherwise we partially train a saved head and
-    silently change the bias='none' path (#2343 review). The saved bias and weight
-    must end up with the same requires_grad state."""
+    """bias='none' + modules_to_save: PEFT marks the saved module trainable because
+    the whole module is saved, not as a bias decision. With patch_modules_to_save=False
+    the saved weight stays frozen, so its bias must too (else a saved head is partially
+    trained, changing the bias='none' path, #2343 review). Bias and weight must share
+    requires_grad."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    # gate_proj is an nn.Linear with a bias (mlp_bias=True) and is NOT a LoRA target
-    # here, so PEFT wraps it as a saved module: gate_proj.modules_to_save.default.*.
+    # gate_proj has a bias (mlp_bias=True) and is not a LoRA target, so PEFT wraps
+    # it as a saved module: gate_proj.modules_to_save.default.*.
     model = get_peft_model(
         _tiny_llama(),
         LoraConfig(
