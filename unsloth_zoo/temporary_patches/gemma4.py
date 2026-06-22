@@ -388,27 +388,48 @@ def _patch_gemma4_attention_carrier():
     Gemma4TextAttention.forward = _make_gemma4_attention_carrier_forward(Gemma4TextAttention.forward)
 
 
+def _gemma4_model_has_kv_sharing(model):
+    """True iff ``model`` has any Gemma-4 E-series cross-layer KV sharing (E2B/E4B).
+    Cached on the model; a strict no-op signal for 31B / 26B-A4B / non-shared models."""
+    flag = getattr(model, "_unsloth_gemma4_has_kv_sharing", None)
+    if flag is None:
+        flag = any(
+            getattr(m, "is_kv_shared_layer", False)
+            for m in model.modules() if m.__class__.__name__ == "Gemma4TextAttention"
+        )
+        try:
+            model._unsloth_gemma4_has_kv_sharing = flag
+        except Exception:
+            pass
+    return flag
+
+
 def _gemma4_force_nonreentrant_checkpointing(model):
-    """Force gemma-4 text decoder layers to use NON-reentrant gradient checkpointing
-    while the carrier is active, so the cross-layer shared K/V stays grad-connected.
+    """Force gemma-4 text decoder layers to use NON-reentrant gradient checkpointing so
+    the cross-layer shared K/V stays grad-connected. Required on EVERY transformers
+    version with E-series KV sharing, not just the carrier window.
 
     The shared K/V is produced by an earlier ("producer") layer and reused by the ~20
-    later ("consumer") layers via the carrier. Under REENTRANT checkpointing -- which
-    includes Unsloth's offloaded checkpointer (it forces use_reentrant=True) and torch's
-    use_reentrant=True -- each layer is recomputed independently during backward in
-    REVERSE order, so a consumer is recomputed before its producer and reads the detached
-    no-grad K/V from the first forward; gradients from the shared layers then never reach
-    the producer's k_proj/v_proj (the logits/loss look correct, only the gradient is
-    wrong). Un-checkpointing the producer instead triggers "backward through the graph a
-    second time" because its activation feeds many reentrant-checkpointed consumers.
-    Non-reentrant recomputation keeps the whole region's autograd graph connected, so the
-    producer K/V gradient is exact (verified: producer k/v_proj grads match the
-    use_cache=True reference to cosine 1.0). Scoped to gemma-4 E-series on the legacy
-    transformers window (5.5.0-5.5.1) where the carrier runs; trades Unsloth's CPU
-    activation offload (a memory optimisation) for correct gradients on these ~1-2B
-    models. No-op when gradient checkpointing is off (e.g. plain use_cache=False), and
-    moot from transformers 5.5.2 where the native shared_kv_states path makes the whole
-    patch a no-op."""
+    later ("consumer") layers -- via the carrier on transformers 5.5.0-5.5.1, and via the
+    native ``shared_kv_states`` dict on 5.5.2+. BOTH are a Python dict reached through a
+    module attribute / a kwarg baked into GradientCheckpointingLayer's partial, NOT a
+    checkpoint input. So under REENTRANT checkpointing -- which includes Unsloth's
+    offloaded checkpointer (it forces use_reentrant=True) and torch's use_reentrant=True --
+    each layer is recomputed independently during backward in REVERSE order: a consumer is
+    recomputed before its producer and reads the detached no-grad K/V from the first
+    forward, so gradients from the shared layers never reach the producer's k_proj/v_proj
+    (the logits/loss look correct, only the gradient is wrong). Confirmed on transformers
+    5.5.0 AND native 5.12.1: producer k/v_proj grads diverge from the use_cache=True
+    reference (cosine ~0.14-0.55) under reentrant GC. Un-checkpointing the producer instead
+    triggers "backward through the graph a second time" because its activation feeds many
+    reentrant-checkpointed consumers. Non-reentrant recomputation keeps the region's
+    autograd graph connected, so the producer K/V gradient is exact (verified: grads match
+    the reference to cosine 1.0 under reentrant, non-reentrant, and Unsloth offloaded, on
+    both 5.5.0 and 5.12.1). Trades Unsloth's CPU activation offload (a memory optimisation)
+    for correct gradients on these ~1-2B E-series models. No-op when gradient checkpointing
+    is off, and a strict no-op for non-E-series gemma-4 (no shared layers)."""
+    if not _gemma4_model_has_kv_sharing(model):
+        return
     import functools
     try:
         import torch.utils.checkpoint as _ckpt
@@ -479,20 +500,25 @@ def _gemma4_attach_shared_kv_carrier(model):
             attn._unsloth_shared_kv_carrier = carrier
         except Exception:
             pass
-    _gemma4_force_nonreentrant_checkpointing(model)
 
 
-def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
-    """Wrap a Gemma-4 model forward to attach a fresh per-forward shared-KV carrier to
-    every Gemma4TextAttention, so cross-layer KV sharing works under use_cache=False
-    AND gradient checkpointing. The carrier (consumed by the attention patch) replaces
-    the older approach of injecting a DynamicCache + forcing use_cache=True, which the
-    GradientCheckpointingLayer defeated by nulling past_key_values at the attention."""
+def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
+    """Wrap a Gemma-4 model forward to (1) force non-reentrant gradient checkpointing so
+    the cross-layer shared K/V stays grad-connected under reentrant/offloaded GC -- needed
+    on EVERY version with E-series KV sharing -- and (2), only on builds that need the
+    carrier (transformers 5.5.0-5.5.1, ``attach_carrier=True``), attach a fresh per-forward
+    shared-KV carrier so the cache-free forward also works. On 5.5.2+ the native
+    shared_kv_states handles the forward, so only the gradient fix runs."""
     def forward(self, *args, **kwargs):
         try:
-            _gemma4_attach_shared_kv_carrier(self)
+            _gemma4_force_nonreentrant_checkpointing(self)
         except Exception:
             pass
+        if attach_carrier:
+            try:
+                _gemma4_attach_shared_kv_carrier(self)
+            except Exception:
+                pass
         return _orig_forward(self, *args, **kwargs)
 
     forward._unsloth_kv_shared_use_cache_false_patched = True
@@ -501,51 +527,51 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
     return forward
 
 
-def _patch_forward_for_kv_shared_no_cache(cls):
+def _patch_forward_for_kv_shared_no_cache(cls, attach_carrier):
     """Install the wrapper on `cls.forward`. Idempotent."""
     if getattr(cls.forward, "_unsloth_kv_shared_use_cache_false_patched", False):
         return
-    cls.forward = _make_kv_shared_use_cache_false_safe_forward(cls.forward)
+    cls.forward = _make_kv_shared_use_cache_false_safe_forward(cls.forward, attach_carrier)
 
 
 def patch_Gemma4TextModel_forward_kv_shared_no_cache():
-    """Patch Gemma4TextModel.forward + Gemma4TextAttention.forward so cross-layer KV
-    sharing works under use_cache=False and gradient checkpointing."""
-    if not _gemma4_kv_sharing_needs_cache():
-        # transformers passes the shared KV via `shared_kv_states` (cache-independent),
-        # so the cache-free path already works; this patch would be needless.
-        return
+    """Patch Gemma4TextModel.forward so cross-layer KV sharing is gradient-correct under
+    reentrant/offloaded gradient checkpointing (all versions), and -- only on the
+    transformers 5.5.0-5.5.1 window where the cache-free forward is broken -- also
+    carrier-patch Gemma4TextAttention.forward so use_cache=False works."""
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
     except ImportError:
         return
     except Exception as e:
-        return raise_error("Gemma4TextModel.forward use_cache=False fix", e)
+        return raise_error("Gemma4TextModel.forward kv-shared GC fix", e)
     try:
-        _patch_gemma4_attention_carrier()
-        _patch_forward_for_kv_shared_no_cache(Gemma4TextModel)
+        needs_carrier = _gemma4_kv_sharing_needs_cache()
+        if needs_carrier:
+            _patch_gemma4_attention_carrier()
+        _patch_forward_for_kv_shared_no_cache(Gemma4TextModel, attach_carrier = needs_carrier)
     except Exception as e:
-        return raise_error("Gemma4TextModel.forward use_cache=False fix", e)
+        return raise_error("Gemma4TextModel.forward kv-shared GC fix", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextModel_forward_kv_shared_no_cache)
 
 
 def patch_Gemma4Model_forward_kv_shared_no_cache():
-    """Patch Gemma4Model.forward (multimodal parent) to attach the carrier too, in
-    case a refactor moves cache auto-creation above Gemma4TextModel."""
-    if not _gemma4_kv_sharing_needs_cache():
-        return
+    """Patch Gemma4Model.forward (multimodal parent) for the same gradient fix (and the
+    carrier on 5.5.0-5.5.1), in case a refactor routes the forward through it."""
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4Model
     except ImportError:
         return
     except Exception as e:
-        return raise_error("Gemma4Model.forward use_cache=False fix", e)
+        return raise_error("Gemma4Model.forward kv-shared GC fix", e)
     try:
-        _patch_gemma4_attention_carrier()
-        _patch_forward_for_kv_shared_no_cache(Gemma4Model)
+        needs_carrier = _gemma4_kv_sharing_needs_cache()
+        if needs_carrier:
+            _patch_gemma4_attention_carrier()
+        _patch_forward_for_kv_shared_no_cache(Gemma4Model, attach_carrier = needs_carrier)
     except Exception as e:
-        return raise_error("Gemma4Model.forward use_cache=False fix", e)
+        return raise_error("Gemma4Model.forward kv-shared GC fix", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4Model_forward_kv_shared_no_cache)
 

@@ -595,21 +595,32 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
     OtherAttention = type("OtherAttention", (), {})
 
     class _Layer:
-        def __init__(self, attn_cls, gc):
+        def __init__(self, attn_cls, gc, is_shared=False):
             self.self_attn = attn_cls()
+            self.self_attn.is_kv_shared_layer = is_shared
             self.gradient_checkpointing = gc
             self._gradient_checkpointing_func = "ORIG"
 
-    on = _Layer(Gemma4TextAttention, True)    # checkpointed gemma-4 layer -> overridden
+    on = _Layer(Gemma4TextAttention, True, is_shared=True)  # checkpointed shared layer -> overridden
     off = _Layer(Gemma4TextAttention, False)  # not checkpointed -> untouched
     other = _Layer(OtherAttention, True)      # non-gemma-4 -> untouched
 
     class _Model:
+        # modules() must expose the attentions so the fix can detect KV sharing.
         def modules(self):
-            return [self, on, off, other]
+            return [self, on, on.self_attn, off, off.self_attn, other, other.self_attn]
     m = _Model()
 
     _gemma4_force_nonreentrant_checkpointing(m)
+
+    # Non-E-series gemma-4 (no shared layer) must be a strict no-op.
+    plain = _Layer(Gemma4TextAttention, True)  # gemma-4 but NOT a shared layer
+    class _ModelNoShare:
+        def modules(self):
+            return [self, plain, plain.self_attn]
+    mns = _ModelNoShare()
+    _gemma4_force_nonreentrant_checkpointing(mns)
+    assert plain._gradient_checkpointing_func == "ORIG", "no-KV-sharing model must be untouched"
 
     f = on._gradient_checkpointing_func
     assert isinstance(f, functools.partial), "checkpointed gemma-4 layer must be overridden"
