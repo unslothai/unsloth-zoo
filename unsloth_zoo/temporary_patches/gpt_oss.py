@@ -1082,14 +1082,125 @@ def _is_transformers_v5() -> bool:
     return transformers_version >= Version("5.0.0.dev0")
 
 
+_GPT_OSS_COMPILED_MODULE = "unsloth_compiled_module_gpt_oss"
+_GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
+
+
+def _gpt_oss_cache_locations():
+    """Dirs that may hold the compiled gpt_oss module: the configured location and the
+    temp-fallback used when it is not writable. Resolved without the compiler so it never
+    triggers distributed coordination at patch time."""
+    locs = []
+    loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+    if loc:
+        locs.append(loc)
+        try:
+            import tempfile
+            locs.append(os.path.join(tempfile.gettempdir(), os.path.basename(loc)))
+        except Exception:
+            pass
+    # De-dup, preserve order (configured first = primary).
+    seen, out = set(), []
+    for _l in locs:
+        if _l and _l not in seen:
+            seen.add(_l); out.append(_l)
+    return out
+
+
+def _invalidate_gpt_oss_compiled_module():
+    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
+    rebuilt against the CURRENT router/experts classes. The single per-model-type file
+    hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
+    wrong classes. Cleans every candidate location."""
+    try:
+        import sys as _sys
+        import importlib, importlib.util
+        _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
+        for loc in _gpt_oss_cache_locations():
+            _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if os.path.isfile(_f):
+                try:
+                    os.remove(_f)
+                except OSError:
+                    pass
+                # Drop the .pyc too so a stale module isn't re-imported from __pycache__.
+                try:
+                    _pyc = importlib.util.cache_from_source(_f)
+                    if os.path.isfile(_pyc):
+                        os.remove(_pyc)
+                except Exception:
+                    pass
+        # Forget any cached finder/directory state for these paths.
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+    except Exception:
+        pass  # best-effort: cache invalidation must never break loading
+
+
+def _sync_gpt_oss_compiled_flavor(desired_flavor):
+    """Invalidate the on-disk compiled gpt_oss module when it was built for a DIFFERENT flavor
+    ("bnb4bit" vs "stock") than this load needs, independently of the in-process flag (unset in
+    a fresh process, so a fresh 16bit load after a 4bit one would import the stale BnB classes
+    and hit "weights not initialized"). A marker file records the built flavor; on a mismatch or
+    missing marker the stale module is dropped for the compiler to regenerate."""
+    try:
+        locations = _gpt_oss_cache_locations()
+        mismatch = False
+        for loc in locations:
+            module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if not os.path.isfile(module_path):
+                continue
+            on_disk = None
+            marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+            if os.path.isfile(marker_path):
+                try:
+                    with open(marker_path, "r", encoding = "utf-8") as f:
+                        on_disk = f.read().strip()
+                except Exception:
+                    on_disk = None
+            if on_disk != desired_flavor:
+                mismatch = True
+        if mismatch:
+            _invalidate_gpt_oss_compiled_module()
+        # Record this load's flavor; always at the primary location, the temp fallback only if used.
+        for idx, loc in enumerate(locations):
+            if idx != 0 and not os.path.isdir(loc):
+                continue
+            try:
+                os.makedirs(loc, exist_ok = True)
+                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
+                    f.write(desired_flavor)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def patch_gpt_oss_bnb4bit_auto():
     """
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
     """
+    # Cross-process safety: invalidate a stale on-disk module built for the other flavor (the
+    # in-process flag is unset in a fresh process). Sole cache invalidator: drops the file only
+    # on a real mismatch, so a matching cache is reused. Gated to gpt-oss loads.
+    if "gpt_oss" in _normalized_unsloth_model_name():
+        _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
+
     if not _should_use_gpt_oss_bnb4bit():
+        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
+        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
+        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
+        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
+        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
+        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+            restore_gpt_oss_original()
+            os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
         return
-    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols.
+    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols. A stale
+    # stock module is handled by _sync above; a matching bnb module is reused, not recompiled.
     patch_gpt_oss_bnb4bit()
     # Inference path avoids torch.compile for 4-bit
     try:
@@ -2902,6 +3013,7 @@ def patch_gpt_oss_init_weights_modulelist_fix():
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel
     )
     GptOssExperts = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    GptOssTopKRouter = transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
     if getattr(GptOssPreTrainedModel, "_unsloth_init_weights_fixed", False):
         return
     _original_init_weights = GptOssPreTrainedModel._init_weights
@@ -2917,6 +3029,22 @@ def patch_gpt_oss_init_weights_modulelist_fix():
                 init.normal_(down.weight, mean=0.0, std=std)
                 if down.bias is not None:
                     init.zeros_(down.bias)
+            return
+        if isinstance(module, GptOssTopKRouter):
+            # Router weight/bias live under .weight (stock) or .linear (Unsloth BnB-4bit).
+            # Resolve whichever exists so stock _init_weights' module.weight access can't
+            # raise "GptOssTopKRouter object has no attribute 'weight'" (#3119).
+            std = self.config.initializer_range
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                weight = getattr(getattr(module, "linear", None), "weight", None)
+            bias = getattr(module, "bias", None)
+            if bias is None:
+                bias = getattr(getattr(module, "linear", None), "bias", None)
+            if weight is not None:
+                init.normal_(weight, mean=0.0, std=std)
+            if bias is not None:
+                init.normal_(bias, mean=0.0, std=std)
             return
         _original_init_weights(self, module)
 

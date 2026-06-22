@@ -1963,10 +1963,25 @@ def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
     with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
-    if "quantization_config" in config:
-        # Remove the quantization_config field
-        del config["quantization_config"]
-    else:
+    # Strip quantization_config from the top level AND nested sub-configs. VLMs keep it under
+    # text_config/vision_config, so a merged_16bit export would ship bf16 weights still labelled
+    # load_in_4bit there -> on reload transformers builds the bnb quantizer for full-precision
+    # weights ("Cannot copy out of meta tensor"). Recurse to remove it wherever it lives.
+    def _strip_quantization_config(obj):
+        removed = False
+        if isinstance(obj, dict):
+            if "quantization_config" in obj:
+                del obj["quantization_config"]
+                removed = True
+            for value in obj.values():
+                if _strip_quantization_config(value):
+                    removed = True
+        elif isinstance(obj, list):
+            for value in obj:
+                if _strip_quantization_config(value):
+                    removed = True
+        return removed
+    if not _strip_quantization_config(config):
         return
     # Overwrite the config file
     with open(config_path, "w", encoding = "utf-8") as f:
@@ -2143,6 +2158,25 @@ def merge_and_overwrite_lora(
                                         file_size = os.path.getsize(file_path)
                                         max_size_in_bytes = max(max_size_in_bytes, file_size)
                                         total_size_in_bytes += file_size
+                            else:
+                                # Drop stale/duplicate shards the index doesn't reference
+                                # (mirrors the HF-repo branch below): a local snapshot can carry a
+                                # leftover non-indexed shard set (e.g. granite-3.2-8b) whose shapes
+                                # differ -> "Bad in-place call". Filter only when extra shards
+                                # exist, so well-formed dirs are untouched.
+                                _indexed = {os.path.split(v)[-1] for v in index_data["weight_map"].values()}
+                                if _indexed and not set(safetensors_list).issubset(_indexed):
+                                    _kept = [s for s in safetensors_list if s in _indexed]
+                                    if _kept and len(_kept) != len(safetensors_list):
+                                        safetensors_list    = _kept
+                                        max_size_in_bytes   = 0
+                                        total_size_in_bytes = 0
+                                        for _s in safetensors_list:
+                                            _sp = os.path.join(model_name, _s)
+                                            if os.path.exists(_sp):
+                                                _sz = os.path.getsize(_sp)
+                                                max_size_in_bytes   = max(max_size_in_bytes, _sz)
+                                                total_size_in_bytes += _sz
                 except Exception as e:
                     print(f"Warning: Could not process index file: {e}")
             tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
@@ -2177,6 +2211,36 @@ def merge_and_overwrite_lora(
                 safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+
+            # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
+            # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
+            # the index references only the real set; merging into a stale shard whose shapes
+            # differ raises "Bad in-place call". Filter only when extra shards exist.
+            try:
+                from huggingface_hub import hf_hub_download as _hf_hub_download
+                _idx_path = _hf_hub_download(
+                    repo_id  = model_name,
+                    filename = "model.safetensors.index.json",
+                    token    = token,
+                )
+                with open(_idx_path, "r", encoding = "utf-8") as f:
+                    _weight_map = json.load(f).get("weight_map", {})
+                _indexed = {os.path.split(v)[-1] for v in _weight_map.values()}
+                if _indexed and not set(safetensors_list).issubset(_indexed):
+                    _kept = [s for s in safetensors_list if s in _indexed]
+                    if _kept and len(_kept) != len(safetensors_list):
+                        _sizes = {os.path.split(x["name"])[-1] : x["size"] for x in _hf_entries}
+                        safetensors_list      = _kept
+                        max_size_in_bytes     = 0
+                        total_size_in_bytes   = 0
+                        for _s in safetensors_list:
+                            _sz = _sizes.get(_s, 0)
+                            max_size_in_bytes   = max(max_size_in_bytes, _sz)
+                            total_size_in_bytes += _sz
+            except Exception:
+                # Index-based filtering is best-effort: if the index cannot be
+                # fetched/parsed, fall back to the full shard list found above.
+                pass
 
         if not safetensors_list:
              raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
