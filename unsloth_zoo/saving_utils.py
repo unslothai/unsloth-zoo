@@ -2834,14 +2834,22 @@ def merge_and_overwrite_lora(
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
-    # Block-quantized FP8 (finegrained_fp8 / DeepSeek) needs weight_block_size to
-    # dequantize partial final blocks; capture it before merge16bit strips the config.
+    # FP8 block dequant needs the block size for partial final blocks; capture it
+    # before merge16bit strips the config. finegrained_fp8/fbgemm keep it top-level;
+    # compressed-tensors nests it under config_groups[*].weights.block_structure.
     _merge_weight_block_size = None
     if base_model_is_quantized and quant_type == "fp8":
         _qc = getattr(_merge_base_model.config, "quantization_config", None)
-        if _qc is not None:
-            _wbs = _qc.get("weight_block_size", None) if isinstance(_qc, dict) else getattr(_qc, "weight_block_size", None)
-            if _wbs is not None and len(_wbs) == 2:
+        _qc_get = (_qc.get if isinstance(_qc, dict) else (lambda k, d = None: getattr(_qc, k, d))) if _qc is not None else None
+        if _qc_get is not None:
+            _wbs = _qc_get("weight_block_size", None)
+            if _wbs is None:
+                for _grp in (_qc_get("config_groups", None) or {}).values():
+                    _w = _grp.get("weights") if isinstance(_grp, dict) else None
+                    if isinstance(_w, dict) and isinstance(_w.get("block_structure"), (list, tuple)):
+                        _wbs = _w["block_structure"]
+                        break
+            if isinstance(_wbs, (list, tuple)) and len(_wbs) == 2:
                 _merge_weight_block_size = tuple(int(x) for x in _wbs)
     # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
     # (see _merge_lora). Strict no-op for every other model/merge.
@@ -3926,21 +3934,26 @@ def check_local_model_exists(model_path):
 pass
 
 def _is_fp8_quant_config(quant_config):
-    """True if quant_config is an FP8 dense scheme (compressed-tensors
-    float-quantized, finegrained_fp8, or fbgemm_fp8), which must be dequantized
-    rather than written raw on a 16bit merge."""
+    """True if quant_config is a dense 8-bit FP8 scheme (finegrained_fp8,
+    fbgemm_fp8, or compressed-tensors float-quantized) to dequantize on a 16bit
+    merge. Excludes microscaling (mxfp8/mxfp4) and sub-8-bit floats (e.g. NVFP4),
+    which carry their own scales and need a different path."""
     if not isinstance(quant_config, dict):
         return False
     method = str(quant_config.get("quant_method", "")).lower()
-    if "fp8" in method or method == "fbgemm_fp8":
+    # Dense FP8 method, but not microscaling (mx* keep their own block scales).
+    if "fp8" in method and not method.startswith("mx"):
         return True
-    # compressed-tensors: quant_method "compressed-tensors" + float weights.
+    # compressed-tensors: only 8-bit float-quantized groups are dense FP8. 4-bit
+    # formats (e.g. NVFP4) also use type "float", so require num_bits == 8.
     if method == "compressed-tensors":
         if str(quant_config.get("format", "")).lower() == "float-quantized":
             return True
         for group in (quant_config.get("config_groups") or {}).values():
             weights = group.get("weights") if isinstance(group, dict) else None
-            if isinstance(weights, dict) and str(weights.get("type", "")).lower() == "float":
+            if (isinstance(weights, dict)
+                    and str(weights.get("type", "")).lower() == "float"
+                    and int(weights.get("num_bits", 8)) == 8):
                 return True
     return False
 pass

@@ -184,10 +184,18 @@ def test_fp8_quant_config_detection():
     # Non-FP8 schemes must NOT be reclassified.
     assert not _is_fp8_quant_config({"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"})
     assert not _is_fp8_quant_config({"quant_method": "mxfp4"})
+    # Microscaling FP8 (mxfp8) carries its own block scales, not dense FP8.
+    assert not _is_fp8_quant_config({"quant_method": "mxfp8"})
     assert not _is_fp8_quant_config({"quant_method": "gptq", "bits": 4})
     assert not _is_fp8_quant_config({
         "quant_method": "compressed-tensors",
         "config_groups": {"group_0": {"weights": {"type": "int", "num_bits": 8}}},
+    })
+    # 4-bit float formats (e.g. NVFP4) also use type "float"; not dense FP8.
+    assert not _is_fp8_quant_config({
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 4}}},
     })
 
 
