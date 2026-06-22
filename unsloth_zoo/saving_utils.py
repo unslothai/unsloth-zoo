@@ -172,9 +172,65 @@ def _active_merge_device():
     return "cpu"
 pass
 
-def _merge_lora(W, lora_stats, name):
+# Architectures whose bnb-4bit merged_16bit export must fold the adapter onto the DEQUANTIZED
+# 4bit base dequant(W4), not the downloaded 16bit base W16 (see `_merge_lora`). Deliberately
+# narrow: the dequant base bakes quant noise into the checkpoint and regresses ordinary models
+# (Qwen2.5 perplexity +~20%), so only models where the quant error swamps the fine-tune delta
+# (huge base-weight norms from small MuP multipliers over a deep hybrid stack) belong here.
+_DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})
+
+
+def _model_type_needs_dequant_merge_base(model) -> bool:
+    """True iff `model`'s architecture is one whose on-the-fly bnb-4bit merged_16bit
+    export must use dequant(W4) as the LoRA merge base instead of the downloaded W16."""
+    try:
+        cfg = getattr(model, "config", None)
+        mt = (getattr(cfg, "model_type", "") or "").lower()
+    except Exception:
+        return False
+    return mt in _DEQUANT_MERGE_BASE_MODEL_TYPES
+
+
+def _is_bnb_4bit_base(module):
+    # True iff `module` is a live bitsandbytes 4bit linear whose weight still
+    # carries a quant_state (i.e. an on-the-fly / pre-quantized bnb-4bit base).
+    if module is None: return False
+    weight = getattr(module, "weight", None)
+    if weight is None: return False
+    if weight.__class__.__name__ != "Params4bit": return False
+    return getattr(weight, "quant_state", None) is not None
+pass
+
+
+def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
     device = _active_merge_device()
+    # QLoRA merge-base correctness (gated, see _DEQUANT_MERGE_BASE_MODEL_TYPES). A bnb-4bit
+    # adapter is trained against dequant(W4), not the 16bit base W16 that merged_16bit downloads;
+    # they differ by quant error q = W16 - dequant(W4). Merging the delta into W16 leaves a stray
+    # +q the adapter never saw. For most models ||q|| is negligible (and W16 is the better 16bit
+    # weight), but for huge base-weight norms over tiny MuP multipliers (Falcon-H1) +q compounds
+    # and swamps the fine-tune. The caller sets use_dequant_base only for gated archs -> strict
+    # no-op elsewhere. Assumes a live 4bit base means the adapter trained against dequant(W4)
+    # (the standard QLoRA flow); an adapter trained on the 16bit base and only reloaded in 4bit
+    # for export has no merge-time provenance signal, so it would also fold onto dequant(W4).
+    if use_dequant_base and _is_bnb_4bit_base(getattr(lora_stats, "module", None)):
+        try:
+            W_dq = dequantize_module_weight(lora_stats.module)
+        except Exception as e:
+            # For a gated arch the 16bit base is the known-wrong base (the +q error this path
+            # exists to remove), so silently folding onto it would emit a corrupt merged_16bit.
+            # Surface the failure instead of degrading just this layer to the wrong base.
+            raise RuntimeError(
+                f"Unsloth: could not dequantize the 4bit base for `{name}` during merged_16bit "
+                "export of a model that requires dequant(W4) as the merge base. Falling back to "
+                "the 16bit base would corrupt this checkpoint, so the merge was aborted. Free GPU "
+                "memory (or merge on CPU) and retry."
+            ) from e
+        if tuple(W_dq.shape) == tuple(W.shape):
+            W = W_dq
+        # else: a shape mismatch is structural (e.g. vocab resize handled below), not a dequant
+        # failure, so keep the 16bit W here and let the resize path reconcile it.
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
@@ -536,6 +592,7 @@ def _merge_and_overwrite_lora(
     save_method = "merged_16bit",
     counted_lora_modules = None,
     tie_word_embeddings = False,
+    use_dequant_base = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -758,7 +815,7 @@ def _merge_and_overwrite_lora(
                             W = saved_weight.to(W.device, dtype = target_dtype, non_blocking = True)
                             count += 1
                     elif hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                        W = _merge_lora(W, lora_stats, output_key)
+                        W = _merge_lora(W, lora_stats, output_key, use_dequant_base = use_dequant_base)
                         count += 1
 
                 success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
@@ -2604,6 +2661,19 @@ def merge_and_overwrite_lora(
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
+    # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
+    # (see _merge_lora). Strict no-op for every other model/merge.
+    _use_dequant_base = (
+        save_method == "merged_16bit"
+        and _model_type_needs_dequant_merge_base(_merge_base_model)
+    )
+    if _use_dequant_base:
+        warnings.warn(
+            "Unsloth: merging each LoRA delta onto the dequantized 4bit base "
+            "dequant(W4) (the weights the QLoRA adapter trained against) instead of "
+            "the downloaded 16bit base, to keep the merged_16bit checkpoint faithful "
+            f"for model_type={getattr(getattr(_merge_base_model, 'config', None), 'model_type', '?')}."
+        )
 
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
@@ -2617,6 +2687,7 @@ def merge_and_overwrite_lora(
             save_method = save_method,
             counted_lora_modules = counted_lora_modules_global,
             tie_word_embeddings = _merge_tie_word_embeddings,
+            use_dequant_base = _use_dequant_base,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
