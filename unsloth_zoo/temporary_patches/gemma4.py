@@ -383,17 +383,26 @@ except Exception:
 
 def _resolve_pristine_checkpoint(_ckpt):
     """Genuine non-reentrant-capable torch checkpoint: prefer the import-captured ref, else
-    unwrap _old_checkpoint past stacked Unsloth shims (a shim base would bypass the override)."""
+    unwrap _old_checkpoint past stacked Unsloth shims (a shim base would bypass the override).
+    Returns None if every candidate is a shim, so the caller skips rather than wrap a shim."""
     if _PRISTINE_TORCH_CHECKPOINT is not None:
         return _PRISTINE_TORCH_CHECKPOINT
     cand = getattr(_ckpt, "checkpoint", None)
     seen = set()
     while getattr(cand, "__name__", "") in _UNSLOTH_CKPT_SHIM_NAMES:
-        nxt = getattr(_ckpt, "_old_checkpoint", None)
+        # Prefer the shim's own _old_checkpoint (survives stacking, where a single module-level
+        # attr is overwritten), then fall back to the module-level one.
+        nxt = getattr(cand, "_old_checkpoint", None)
+        if nxt is None:
+            nxt = getattr(_ckpt, "_old_checkpoint", None)
         if nxt is None or id(nxt) in seen or nxt is cand:
             break
         seen.add(id(nxt))
         cand = nxt
+    # Never hand back a shim: forcing use_reentrant=False onto it would wrap the very offloaded
+    # checkpointer we are trying to bypass, silently dropping the gradient fix. Signal "none".
+    if getattr(cand, "__name__", "") in _UNSLOTH_CKPT_SHIM_NAMES:
+        return None
     return cand
 
 
@@ -527,7 +536,11 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
             except Exception:
                 pass
             # No backward to read the carrier under eval/no_grad: release its pinned K/V now
-            # instead of holding it until the next forward. Training keeps it until backward.
+            # instead of holding it until the next forward. Under training the carrier must stay
+            # live through the whole backward (GC recompute reads it in reverse order), so it is
+            # only released when the next forward swaps in a fresh carrier; this lingers one
+            # producer layer's K/V across optimizer.step() (small for E2B/E4B), the cost of the
+            # module-scoped carrier on this 5.5.0-5.5.1 window (5.5.2+ frees it function-scoped).
             if not torch.is_grad_enabled():
                 try:
                     return _orig_forward(self, *args, **kwargs)
