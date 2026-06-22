@@ -1111,16 +1111,23 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
             if gpu_support and (is_darwin or gpu_target is not None):
                 _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
                         _select_gpu_assets(fork_tag, fork_assets, manifest, target = gpu_target))
-            # 2: CPU bundle -- always the final prebuilt fallback.
-            _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
-                    _select_cpu_assets(fork_tag, fork_assets, manifest))
+            # 2: CPU bundle -- the final prebuilt fallback for CPU-oriented
+            # installs. Skipped for an explicit GPU request so a failed GPU
+            # prebuilt compiles a GPU-enabled build (the pre-prebuilt behavior)
+            # rather than silently landing on a CPU-only prebuilt. macOS export
+            # passes gpu_support=False and still gets the right archive: on Darwin
+            # the CPU selector returns the same universal macOS/Metal bundle.
+            if not gpu_support:
+                _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
+                        _select_cpu_assets(fork_tag, fork_assets, manifest))
         else:
             logger.warning("Unsloth: Could not resolve a unslothai/llama.cpp release - "
                            "trying upstream ggml-org instead.")
 
-        # 3: ggml-org upstream CPU, non-Darwin only (its Darwin CPU build is
-        # unusable on macOS 14/15, so we never let it shadow the fork Metal bundle).
-        if not is_darwin:
+        # 3: ggml-org upstream CPU, non-Darwin CPU installs only (its Darwin CPU
+        # build is unusable on macOS 14/15, and a GPU request must not be shadowed
+        # by a CPU-only prebuilt -- it falls through to a source GPU build).
+        if not is_darwin and not gpu_support:
             ggml_repo = "ggml-org/llama.cpp"
             resolved = _resolve_llama_cpp_release()
             if resolved is not None:

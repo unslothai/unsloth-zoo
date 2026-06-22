@@ -139,9 +139,9 @@ def test_force_compile_skips_prebuilt(monkeypatch, tmp_path):
 
 
 def test_gpu_without_detectable_target_falls_back(monkeypatch, tmp_path):
-    # gpu_support=True with no detectable GPU no longer bails early: it falls
-    # through to the fork CPU prebuilt (then ggml-org). With no prebuilt release
-    # reachable at all, it returns None so the caller compiles.
+    # gpu_support=True with no detectable GPU target does not substitute a CPU
+    # prebuilt: it returns None so the caller compiles a GPU build. (Here no
+    # prebuilt release resolves either, so None is returned regardless.)
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
@@ -639,32 +639,32 @@ def test_attempt_order_cpu_only_linux(monkeypatch, tmp_path):
 
 
 def test_attempt_order_gpu_cuda_host(monkeypatch, tmp_path):
-    # gpu_support=True with a CUDA target: fork GPU bundles first, then fork CPU,
-    # then ggml-org CPU last.
+    # gpu_support=True with a CUDA target: ONLY fork GPU bundles are attempted --
+    # no CPU prebuilt and no ggml-org -- so if every GPU prebuilt fails the caller
+    # compiles a GPU build rather than silently landing on a CPU-only prebuilt.
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 100, "cuda13"))
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
     calls = _wire_attempt_recorder(monkeypatch, fork_release = ("b9585", FORK_ASSETS), ggml_release = ggml)
     assert llama_cpp._install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp"), gpu_support = True) is None
-    cpu_idx = calls.index(("unslothai/llama.cpp", "app-b9585-linux-x64-cpu.tar.gz"))
-    assert cpu_idx >= 1  # at least one fork GPU attempt precedes the CPU fallback
-    assert all(r == "unslothai/llama.cpp" and "cuda" in a for r, a in calls[:cpu_idx])
-    assert calls[-1] == ("ggml-org/llama.cpp", "llama-b9000-bin-ubuntu-x64.tar.gz")
+    assert calls, "expected at least one fork GPU attempt"
+    assert all(r == "unslothai/llama.cpp" and "cuda" in a for r, a in calls)
+    assert not any(a == "app-b9585-linux-x64-cpu.tar.gz" for _, a in calls)
+    assert not any(r == "ggml-org/llama.cpp" for r, _ in calls)
 
 
-def test_attempt_order_gpu_no_target_falls_to_cpu(monkeypatch, tmp_path):
-    # gpu_support=True but NO GPU target: no GPU bundle attempted; falls through to
-    # fork CPU then ggml (the old early-None bail is gone).
+def test_attempt_order_gpu_no_target_compiles(monkeypatch, tmp_path):
+    # gpu_support=True but NO GPU target: no GPU bundle matches and CPU prebuilts
+    # are never substituted for a GPU request, so nothing is attempted and the
+    # caller compiles a GPU build (instead of the old silent CPU fallback).
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
     calls = _wire_attempt_recorder(monkeypatch, fork_release = ("b9585", FORK_ASSETS), ggml_release = ggml)
     assert llama_cpp._install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp"), gpu_support = True) is None
-    assert all("cuda" not in a and "rocm" not in a for _, a in calls)
-    assert calls[0] == ("unslothai/llama.cpp", "app-b9585-linux-x64-cpu.tar.gz")
-    assert calls[-1] == ("ggml-org/llama.cpp", "llama-b9000-bin-ubuntu-x64.tar.gz")
+    assert calls == []
 
 
 def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):

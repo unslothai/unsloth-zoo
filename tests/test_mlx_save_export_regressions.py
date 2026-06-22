@@ -905,9 +905,11 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
 
     # Prebuilt-first is attempted on every platform.
     assert "install_llama_cpp" in calls
-    # macOS routes export to the unslothai/llama.cpp fork bundle (gpu_support=True,
-    # Metal/minos 14); Linux/Windows keep the lighter ggml-org CPU build.
-    assert gpu_support_seen["value"] == (platform_name == "darwin")
+    # Export only needs the CPU-only llama-quantize, so gpu_support=False on every
+    # platform. On macOS this still resolves the universal unslothai/llama.cpp
+    # Metal bundle (same archive from the CPU selector), and the Metal source build
+    # is handled by the macOS helper below, not by this flag.
+    assert gpu_support_seen["value"] is False
     # The macOS source helper is reached only on the darwin apt-get path.
     assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
 
