@@ -580,28 +580,36 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
     cross-layer KV sharing under reentrant/offloaded gradient checkpointing."""
     import functools
     import torch.utils.checkpoint as _ckpt
+    from unsloth_zoo.temporary_patches import gemma4 as g4
     from unsloth_zoo.temporary_patches.gemma4 import _gemma4_force_nonreentrant_checkpointing
 
     def _pristine(function, *args, use_reentrant=None, **kw):
         return ("pristine", use_reentrant)
     def unsloth_checkpoint(function, *args, **kw):
         return "shim"
-    unsloth_checkpoint.__name__ = "unsloth_checkpoint"  # the reentrant-forcing shim
-    # Simulate Unsloth smart GC having globally patched torch's checkpoint.
+    unsloth_checkpoint.__name__ = "unsloth_checkpoint"  # reentrant-forcing shim
+    def unsloth_offloaded_gradient_checkpoint(function, *args, **kw):
+        return "shim2"
+    unsloth_offloaded_gradient_checkpoint.__name__ = "unsloth_offloaded_gradient_checkpoint"
+    # Simulate STACKED Unsloth shims: checkpoint and _old_checkpoint are BOTH shims, so
+    # the import-captured pristine is what must be used.
     monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
-    monkeypatch.setattr(_ckpt, "_old_checkpoint", _pristine, raising=False)
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", unsloth_offloaded_gradient_checkpoint, raising=False)
+    monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", _pristine, raising=False)
 
     Gemma4TextAttention = type("Gemma4TextAttention", (), {})
     OtherAttention = type("OtherAttention", (), {})
 
     class _Layer:
-        def __init__(self, attn_cls, gc, is_shared=False):
+        def __init__(self, attn_cls, gc, is_shared=False, existing="ORIG"):
             self.self_attn = attn_cls()
             self.self_attn.is_kv_shared_layer = is_shared
             self.gradient_checkpointing = gc
-            self._gradient_checkpointing_func = "ORIG"
+            self._gradient_checkpointing_func = existing
 
-    on = _Layer(Gemma4TextAttention, True, is_shared=True)  # checkpointed shared layer -> overridden
+    # `on` carries a user checkpoint kwarg (preserve_rng_state=False) that must survive.
+    on = _Layer(Gemma4TextAttention, True, is_shared=True,
+                existing=functools.partial(unsloth_checkpoint, use_reentrant=True, preserve_rng_state=False))
     off = _Layer(Gemma4TextAttention, False)  # not checkpointed -> untouched
     other = _Layer(OtherAttention, True)      # non-gemma-4 -> untouched
 
@@ -624,7 +632,18 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
 
     f = on._gradient_checkpointing_func
     assert isinstance(f, functools.partial), "checkpointed gemma-4 layer must be overridden"
-    assert f.func is _pristine, "must resolve the PRISTINE checkpoint, not the unsloth shim"
+    assert f.func is _pristine, "must resolve the PRISTINE checkpoint past stacked shims"
     assert f.keywords.get("use_reentrant") is False, "must force non-reentrant"
+    assert f.keywords.get("preserve_rng_state") is False, "must preserve user checkpoint kwargs"
     assert off._gradient_checkpointing_func == "ORIG", "non-checkpointed layer left alone"
     assert other._gradient_checkpointing_func == "ORIG", "non-gemma-4 layer left alone"
+
+    # Fallback: when no import-captured pristine, unwrap _old_checkpoint past the shim.
+    monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", None, raising=False)
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", _pristine, raising=False)
+    on2 = _Layer(Gemma4TextAttention, True, is_shared=True)
+    class _Model2:
+        def modules(self):
+            return [self, on2, on2.self_attn]
+    _gemma4_force_nonreentrant_checkpointing(_Model2())
+    assert on2._gradient_checkpointing_func.func is _pristine, "fallback must unwrap _old_checkpoint"

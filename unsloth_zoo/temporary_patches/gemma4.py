@@ -388,6 +388,44 @@ def _patch_gemma4_attention_carrier():
     Gemma4TextAttention.forward = _make_gemma4_attention_carrier_forward(Gemma4TextAttention.forward)
 
 
+# Names of Unsloth's checkpoint shims (all force/route reentrant), so we can recognise
+# and unwrap them to find the pristine torch checkpoint.
+_UNSLOTH_CKPT_SHIM_NAMES = frozenset({
+    "unsloth_checkpoint", "unsloth_gradient_checkpoint",
+    "unsloth_offloaded_gradient_checkpoint",
+})
+# Capture the pristine torch checkpoint at import (before any Unsloth GC patch swaps
+# torch.utils.checkpoint.checkpoint), so forcing non-reentrant cannot be defeated even
+# when Unsloth's shims are stacked and _old_checkpoint no longer holds the original.
+try:
+    import torch.utils.checkpoint as _ckpt_at_import
+    _PRISTINE_TORCH_CHECKPOINT = (
+        _ckpt_at_import.checkpoint
+        if getattr(_ckpt_at_import.checkpoint, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES
+        else None
+    )
+except Exception:
+    _PRISTINE_TORCH_CHECKPOINT = None
+
+
+def _resolve_pristine_checkpoint(_ckpt):
+    """Return the genuine non-reentrant-capable torch checkpoint. Prefer the reference
+    captured at import; otherwise unwrap _old_checkpoint repeatedly past any stacked
+    Unsloth shims (each shim forces/routes reentrant, so a shim base would silently
+    bypass the non-reentrant override)."""
+    if _PRISTINE_TORCH_CHECKPOINT is not None:
+        return _PRISTINE_TORCH_CHECKPOINT
+    cand = getattr(_ckpt, "checkpoint", None)
+    seen = set()
+    while getattr(cand, "__name__", "") in _UNSLOTH_CKPT_SHIM_NAMES:
+        nxt = getattr(_ckpt, "_old_checkpoint", None)
+        if nxt is None or id(nxt) in seen or nxt is cand:
+            break
+        seen.add(id(nxt))
+        cand = nxt
+    return cand
+
+
 def _gemma4_model_has_kv_sharing(model):
     """True iff ``model`` has any Gemma-4 E-series cross-layer KV sharing (E2B/E4B).
     Cached on the model; a strict no-op signal for 31B / 26B-A4B / non-shared models."""
@@ -435,26 +473,13 @@ def _gemma4_force_nonreentrant_checkpointing(model):
         import torch.utils.checkpoint as _ckpt
     except Exception:
         return
-    func = getattr(model, "_unsloth_gemma4_nonreentrant_func", None)
-    if func is None:
-        # Resolve the PRISTINE torch checkpoint. Unsloth's smart GC globally swaps
-        # torch.utils.checkpoint.checkpoint for `unsloth_checkpoint`, which hard-forces
-        # use_reentrant=True (for its CPU-offload CheckpointFunction) and would ignore the
-        # use_reentrant=False below. Unsloth saves the original at `_old_checkpoint`, so
-        # use that when the current one is an Unsloth shim.
-        base = getattr(_ckpt, "checkpoint", None)
-        if getattr(base, "__name__", "") in (
-            "unsloth_checkpoint", "unsloth_gradient_checkpoint",
-            "unsloth_offloaded_gradient_checkpoint",
-        ):
-            base = getattr(_ckpt, "_old_checkpoint", base)
-        if base is None:
-            return
-        func = functools.partial(base, use_reentrant = False)
-        try:
-            model._unsloth_gemma4_nonreentrant_func = func
-        except Exception:
-            pass
+    # The PRISTINE torch checkpoint: Unsloth's smart GC globally swaps
+    # torch.utils.checkpoint.checkpoint for a shim that hard-forces use_reentrant=True
+    # (for its CPU-offload CheckpointFunction) and would ignore the use_reentrant=False
+    # below, so resolve past any (possibly stacked) shims.
+    base = _resolve_pristine_checkpoint(_ckpt)
+    if base is None:
+        return
     layers = getattr(model, "_unsloth_gemma4_decoder_layers", None)
     if layers is None:
         layers = [
@@ -469,8 +494,19 @@ def _gemma4_force_nonreentrant_checkpointing(model):
     for layer in layers:
         try:
             # Only override when this layer is actually being checkpointed.
-            if getattr(layer, "gradient_checkpointing", False):
-                layer._gradient_checkpointing_func = func
+            if not getattr(layer, "gradient_checkpointing", False):
+                continue
+            # Preserve any user-supplied checkpoint kwargs (preserve_rng_state, context_fn,
+            # determinism_check, ...) that transformers baked into the layer's existing
+            # _gradient_checkpointing_func; only override use_reentrant.
+            existing = getattr(layer, "_gradient_checkpointing_func", None)
+            extra = {}
+            if isinstance(existing, functools.partial):
+                extra = {k: v for k, v in (existing.keywords or {}).items()
+                         if k != "use_reentrant"}
+            layer._gradient_checkpointing_func = functools.partial(
+                base, use_reentrant = False, **extra
+            )
         except Exception:
             pass
 
