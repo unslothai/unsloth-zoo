@@ -527,10 +527,10 @@ def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path,
 
 def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
     """The static contract: `patch_gpt_oss_bnb4bit_auto`'s non-bnb branch must
-    restore the stock classes, clear UNSLOTH_GPT_OSS_BNB4BIT_PATCHED, and
-    invalidate the compiled module; the bnb branch must invalidate the stale
-    stock-built module on the first switch into bnb. Asserted on the AST so the
-    mode-switch teardown can't be silently dropped."""
+    restore the stock classes and clear UNSLOTH_GPT_OSS_BNB4BIT_PATCHED, and the
+    function must sync the on-disk compiled module to the current flavor (the sole
+    cache invalidator, which drops a stale module on a bnb<->16bit mode switch).
+    Asserted on the AST so the mode-switch teardown can't be silently dropped."""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -542,9 +542,10 @@ def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
         "non-bnb load must call restore_gpt_oss_original() so a stale BnB router "
         "swap from an earlier 4bit load does not break a later 16bit reload"
     )
-    assert "_invalidate_gpt_oss_compiled_module" in body, (
-        "must invalidate the stale compiled gpt_oss module on a bnb<->16bit "
-        "mode switch (otherwise the wrong router/experts layout is re-installed)"
+    assert "_sync_gpt_oss_compiled_flavor" in body, (
+        "must sync the compiled gpt_oss module to the current flavor on a "
+        "bnb<->16bit mode switch (otherwise the wrong router/experts layout is "
+        "re-installed); this is the sole compiled-module invalidator"
     )
     assert "UNSLOTH_GPT_OSS_BNB4BIT_PATCHED" in body, (
         "must track/clear the BNB4BIT_PATCHED flag to detect the mode switch"
@@ -584,3 +585,28 @@ def test_sync_gpt_oss_compiled_flavor_drops_cross_process_stale_module(tmp_path,
         marker.unlink()
     _M._sync_gpt_oss_compiled_flavor("stock")
     assert not module.exists(), "unmarked module not conservatively invalidated"
+
+
+def test_patch_gpt_oss_auto_does_not_touch_cache_for_non_gpt_loads(tmp_path, monkeypatch):
+    """patch_gpt_oss_bnb4bit_auto runs for EVERY model load (it is a global
+    temporary patch). Loading an unrelated model must not delete a valid GPT-OSS
+    compiled cache: the flavor sync is gated on the model actually being GPT-OSS,
+    and there is no unconditional invalidate that would wipe a matching cache."""
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    cache_dir = tmp_path / "unsloth_compiled_cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(cache_dir))
+    module = cache_dir / "unsloth_compiled_module_gpt_oss.py"
+    marker = cache_dir / ".unsloth_gpt_oss_compiled_flavor"
+    module.write_text("# valid bnb4bit gpt-oss compiled module\n")
+    marker.write_text("bnb4bit")
+    before = module.read_text()
+
+    # Loading some other model (name has no "gpt_oss") must leave the cache intact.
+    monkeypatch.setenv("UNSLOTH_MODEL_NAME", "meta-llama/Llama-3.2-1B")
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0")
+    _M.patch_gpt_oss_bnb4bit_auto()
+    assert module.exists() and module.read_text() == before, (
+        "loading a non-GPT model deleted the GPT-OSS compiled cache"
+    )

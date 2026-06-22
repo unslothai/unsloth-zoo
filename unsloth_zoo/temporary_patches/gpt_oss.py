@@ -1195,9 +1195,13 @@ def patch_gpt_oss_bnb4bit_auto():
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
     """
     # Cross-process safety: invalidate a stale on-disk compiled module built for the
-    # other flavor BEFORE the flag-gated branches below (the flag is unset in a fresh
-    # process, so those branches alone cannot detect cross-process staleness).
-    _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
+    # other flavor (the in-process flag is unset in a fresh process, so the flag-gated
+    # branches below cannot detect cross-process staleness). This is the SOLE cache
+    # invalidator: it only drops the file on an actual flavor mismatch, so a matching
+    # cache is preserved (no needless recompile every session). Gate to GPT-OSS loads
+    # so merely loading an unrelated model never touches a valid GPT-OSS cache.
+    if "gpt_oss" in _normalized_unsloth_model_name():
+        _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
 
     if not _should_use_gpt_oss_bnb4bit():
         # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally (router.linear.weight
@@ -1207,19 +1211,15 @@ def patch_gpt_oss_bnb4bit_auto():
         # a 16bit (e.g. merged_16bit) checkpoint, whose router.weight + 3D experts then mismatch
         # -> "Unsloth: Critical error since some weights are not initialized". This runs every
         # phase (init/pre_compile/post_compile), so restore the stock classes when the current
-        # load is NOT BnB-4bit.
+        # load is NOT BnB-4bit. The compiled-module file is handled by _sync above.
         if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
             restore_gpt_oss_original()
             os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
-            _invalidate_gpt_oss_compiled_module()
         return
-    already_bnb = os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1"
     # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols.
+    # The stale-stock-module case is handled by _sync above (mismatch -> invalidate);
+    # a matching bnb module is left intact so it is reused, not recompiled each session.
     patch_gpt_oss_bnb4bit()
-    if not already_bnb:
-        # First time switching INTO BnB mode this process: a stale 16bit-built compiled
-        # gpt_oss module would otherwise re-install the stock router/experts. Invalidate it.
-        _invalidate_gpt_oss_compiled_module()
     # Inference path avoids torch.compile for 4-bit
     try:
         global moe_forward_inference
