@@ -118,13 +118,10 @@ def get_peft_regex(
     regex_components  = "|".join(regex_components)
 
     match_linear_modules = r"(?:" + "|".join(re.escape(x) for x in only_linear_modules) + r")"
-    # Do not append a trailing ".*?" after the linear-module group. PEFT matches
-    # target_modules with re.fullmatch, so a trailing ".*?" lets a key like
-    # "...attn.proj_drop" (a Dropout) fullmatch -- "proj" matches the linear group
-    # and ".*?" eats "_drop" -- raising "Target module Dropout is not supported".
-    # LoRA targets are leaf Linear modules whose names ARE the group entries, so
-    # ending the regex at the linear-module group keeps every real target and only
-    # stops matching non-linear modules that merely share a name prefix.
+    # No trailing ".*?" after the linear-module group: PEFT uses re.fullmatch, so ".*?" would let
+    # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
+    # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
+    # so ending at the group keeps every real target and drops same-prefix non-linear modules.
     regex_matcher = \
         r".*?(?:"  + regex_model_parts + \
         r").*?(?:" + regex_components + \
