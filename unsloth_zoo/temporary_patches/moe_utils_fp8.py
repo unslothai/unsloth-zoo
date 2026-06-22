@@ -810,21 +810,14 @@ _MOE_QUANT_UNSAFE = object()
 
 
 def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_size = None) -> torch.Tensor:
-    """Dequant of a 2-D float8_e4m3fn weight via its companion weight_scale(_inv).
+    """Dequant a 2-D float8_e4m3fn weight: W_real = decode_fp8(W) * scale_broadcast.
 
-    Inverse of compressed-tensors / DeepSeek-style FP8 quantization:
-        W_real = decode_fp8(W) * scale_broadcast
-    Handles every dense FP8 scale layout the loader (vllm_utils) accepts:
-      - per-tensor scalar (numel == 1),
-      - 1-D per-row (len == rows) or per-column (len == cols) scales (fbgemm /
-        static / compressed-tensors channel quant),
-      - 2-D per-channel (rows, 1) / (1, cols),
-      - 2-D block scales (ceil(rows/bm), ceil(cols/bn)).
-    block_size (bm, bn) is the configured weight_block_size; without it the block
-    size is inferred from the scale grid, which is only exact when rows/cols are
-    multiples of the block (so a partial final block needs the explicit value).
-    Scales are tiled with repeat_interleave + trim, which is byte-identical to a
-    plain reshape when the scale evenly divides the weight.
+    Inverse of compressed-tensors / DeepSeek FP8. Handles every dense scale layout
+    the loader accepts: per-tensor scalar, 1-D per-row/col, 2-D per-channel, and 2-D
+    block (ceil(rows/bm), ceil(cols/bn)). block_size (bm, bn) is the configured
+    weight_block_size; without it bm/bn are inferred from the scale grid, which is
+    only exact when rows/cols are block multiples (partial final block needs it).
+    repeat_interleave + trim matches a plain reshape when the scale divides evenly.
     """
     rows, cols = W_fp8.shape
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32

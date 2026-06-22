@@ -1812,21 +1812,16 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     return count, safetensor_keys_seen
 pass
 
-# Companion-scale suffixes that an FP8 dense checkpoint stores next to each
-# float8 weight. On a 16bit merge the weight is dequantized, so these are dropped.
+# Companion scales an FP8 dense checkpoint stores per float8 weight; dropped on merge.
 _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
 
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
-    """Dequantize one FP8 dense weight to its companion scale's dtype.
+    """Dequantize one FP8 dense weight; return (W_real, [scale_keys to drop]).
 
-    Returns (W_real, [scale_keys]) where scale_keys are the companion tensors to
-    drop from the merged shard. Raises if the weight is FP8 but no usable
-    weight_scale / weight_scale_inv is found (loud failure, never silent FP8).
-
-    Accepts every dense FP8 scale layout vllm_utils loads: 1-D per-row/per-column
-    (fbgemm / static / channel quant), 2-D per-channel, and 2-D block scales.
-    weight_block_size (the configured (bm, bn)) keeps block dequant correct when a
-    weight dimension is not an exact multiple of the block (partial final block).
+    Raises if FP8 but no usable weight_scale / weight_scale_inv (never silent FP8).
+    Accepts every dense scale layout vllm_utils loads: 1-D per-row/col, 2-D
+    per-channel, and 2-D block. weight_block_size (bm, bn) keeps block dequant
+    correct when a weight dim is not an exact multiple of the block.
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
@@ -1869,8 +1864,8 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
 
 def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Dequantizes FP8 dense weights to 16bit, merges LoRA, drops companion scales,
-    # and atomically rewrites the shard (mirrors the mxfp4 full-rewrite strategy).
+    # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard
+    # (mirrors the mxfp4 full-rewrite path).
     filename_original = os.path.join(save_directory, filename)
     tensors = OrderedDict()
     count = 0
@@ -1880,7 +1875,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
 
-        # Read header dtypes so we skip scale companions without a tensor read.
+        # Read the header so we skip scale companions without a tensor read.
         raw_pointer = open(filename_original, "r+b")
         try:
             length_of_header = int.from_bytes(raw_pointer.read(8), "little")
@@ -1892,10 +1887,8 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             lora_weights, safetensor_keys, model_class_name = model_class_name,
         )
 
-        # This dense path merges each weight independently; it has no per-expert
-        # MoE fusion (that lives in the standard mmap path). Refuse a LoRA that
-        # targets fused experts so we never silently drop the adapter or fail the
-        # later count check with a confusing message.
+        # Dense path: merges each weight independently, no per-expert MoE fusion.
+        # Refuse a fused-expert LoRA so we never silently drop the adapter.
         if any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in converted_lora_weights):
             raise RuntimeError(
                 "Unsloth: FP8 dequant-on-merge does not yet support LoRA adapters on "
@@ -1940,9 +1933,8 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                     W = _merge_lora(W, lora_stats, output_key)
                     count += 1
 
-            # Land merged weights on CPU so the whole dequantized model does not
-            # pile up in VRAM (the merge math runs on the accelerator). Mirrors the
-            # CPU-backed tensors the mxfp4 path stores.
+            # Keep merged weights on CPU so the dequantized model does not pile up
+            # in VRAM (merge math runs on the accelerator); mirrors the mxfp4 path.
             tensors[output_key] = W.to(device = "cpu", dtype = output_dtype).contiguous()
             del W
             if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
@@ -2506,8 +2498,8 @@ def merge_and_overwrite_lora(
     is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
 
-    # The original index references companion scale keys, so it goes stale once we
-    # dequantize. Skip copying it for MXFP4 dequant and FP8 dequant (regenerated below).
+    # The original index lists companion scale keys, so it goes stale on dequant.
+    # Skip copying it for MXFP4/FP8 dequant (regenerated below).
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8")
@@ -2655,9 +2647,8 @@ def merge_and_overwrite_lora(
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
-    # Block-quantized FP8 (finegrained_fp8 / DeepSeek-style) needs the configured
-    # weight_block_size to dequantize correctly when a weight dim is not an exact
-    # multiple of the block. Capture it before the merge16bit path strips the config.
+    # Block-quantized FP8 (finegrained_fp8 / DeepSeek) needs weight_block_size to
+    # dequantize partial final blocks; capture it before merge16bit strips the config.
     _merge_weight_block_size = None
     if base_model_is_quantized and quant_type == "fp8":
         _qc = getattr(_merge_base_model.config, "quantization_config", None)
@@ -3734,12 +3725,9 @@ def check_local_model_exists(model_path):
 pass
 
 def _is_fp8_quant_config(quant_config):
-    """True if a quantization_config dict describes an FP8 dense scheme.
-
-    Covers compressed-tensors `float-quantized`, transformers `finegrained_fp8`,
-    and `fbgemm_fp8`. These store float8 weights with companion weight_scale /
-    weight_scale_inv and must be dequantized (not written raw) on a 16bit merge.
-    """
+    """True if quant_config is an FP8 dense scheme (compressed-tensors
+    float-quantized, finegrained_fp8, or fbgemm_fp8), which must be dequantized
+    rather than written raw on a 16bit merge."""
     if not isinstance(quant_config, dict):
         return False
     method = str(quant_config.get("quant_method", "")).lower()
@@ -3791,8 +3779,7 @@ def check_model_quantization_status(model_name_or_path, token=None):
         if isinstance(quant_config, dict) and quant_config.get("quant_method") == "mxfp4":
             return (True, "mxfp4")
 
-        # Case 3: FP8 (compressed-tensors float-quantized / finegrained_fp8 / fbgemm_fp8).
-        # Detected here so the merged-16bit path dequantizes instead of writing raw FP8.
+        # Case 3: FP8, so the merged-16bit path dequantizes instead of writing raw FP8.
         elif isinstance(quant_config, dict) and _is_fp8_quant_config(quant_config):
             return (True, "fp8")
 

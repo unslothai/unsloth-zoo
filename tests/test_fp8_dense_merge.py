@@ -16,11 +16,10 @@
 
 """FP8 dense merge-to-16bit (unslothai/unsloth#4919).
 
-Before the fix `_merge_and_overwrite_lora` wrote FP8 weights straight back for
-dense compressed-tensors / finegrained_fp8 models: weight_scale was never
-applied, companion scales were left dangling, and no error was raised. These
-tests pin the rewrite path: FP8 weights dequantize to 16bit, companion scale
-keys are dropped, and a missing scale raises instead of corrupting silently.
+Before the fix, dense FP8 weights were written straight back: weight_scale was
+never applied and companion scales were left dangling with no error. These tests
+pin the rewrite path: FP8 dequantizes to 16bit, scale keys drop, and a missing
+scale raises instead of corrupting silently.
 """
 
 from __future__ import annotations
