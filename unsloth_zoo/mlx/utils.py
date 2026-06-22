@@ -5389,12 +5389,23 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
 
-    if not os.path.exists(llama_cpp_folder):
+    def _clone():
         print("Unsloth: Cloning llama.cpp...")
         subprocess.run(
             ["git", "clone", "https://github.com/ggml-org/llama.cpp", llama_cpp_folder],
             check=True,
         )
+
+    if not os.path.exists(llama_cpp_folder):
+        _clone()
+    elif not os.path.isfile(os.path.join(llama_cpp_folder, "CMakeLists.txt")):
+        # The folder exists but is not a llama.cpp source tree -- e.g. a prior
+        # prebuilt install left binaries + a marker (and no CMakeLists.txt). cmake
+        # would fail against it, so replace it with a fresh source checkout before
+        # building. A real source tree (CMakeLists.txt present) is kept and rebuilt.
+        print("Unsloth: Existing llama.cpp folder is not a source tree; re-cloning for the source build...")
+        shutil.rmtree(llama_cpp_folder, ignore_errors=True)
+        _clone()
 
     # Install deps; prefer gguf from the cloned repo to stay in sync
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")

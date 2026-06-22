@@ -1021,3 +1021,60 @@ def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
         "private": True,
     }
     assert calls["upload"]["path_in_repo"] == "model.F16.gguf"
+
+
+def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
+    # A stale prebuilt install (binaries + marker, no CMakeLists.txt) left in the
+    # llama.cpp folder must be replaced before the macOS source build, or cmake runs
+    # against a directory with no CMakeLists.txt and the source fallback fails. The
+    # prebuilt-first export path reaches this helper exactly that way on macOS.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    (folder / "llama-quantize").write_text("broken prebuilt binary")
+    (folder / "UNSLOTH_PREBUILT_INFO.json").write_text("{}")
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        if list(cmd[:2]) == ["git", "clone"]:
+            dest = Path(cmd[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "CMakeLists.txt").write_text("# source tree")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    assert any(list(c[:2]) == ["git", "clone"] for c in cmds), "expected a re-clone of the non-source dir"
+    assert (folder / "CMakeLists.txt").is_file(), "folder should be a source tree after the re-clone"
+
+
+def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
+    # A real source checkout (CMakeLists.txt present) is kept and rebuilt, never
+    # re-cloned -- only non-source dirs are replaced.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    (folder / "CMakeLists.txt").write_text("# existing source tree")
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), "must not re-clone an existing source tree"
+    assert (folder / "CMakeLists.txt").is_file()
