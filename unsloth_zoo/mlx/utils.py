@@ -5414,14 +5414,31 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     # Build with cmake (Metal support on macOS)
     build_dir = os.path.join(llama_cpp_folder, "build")
     print("Unsloth: Building llama.cpp with cmake...")
-    subprocess.run(
+
+    def _run_build_step(cmd, description):
+        # capture_output keeps a successful build quiet, but on failure cmake's
+        # stdout/stderr would be swallowed inside CalledProcessError and the user
+        # would see a bare non-zero exit with no build log. Surface the captured
+        # output in the RuntimeError so macOS build failures are debuggable (this
+        # mirrors how the Linux source-build path in llama_cpp.py reports errors).
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            details = ""
+            if exc.stdout: details += f"\n--- stdout ---\n{exc.stdout}"
+            if exc.stderr: details += f"\n--- stderr ---\n{exc.stderr}"
+            raise RuntimeError(
+                f"Unsloth: {description} failed (exit {exc.returncode}).{details}"
+            ) from exc
+
+    _run_build_step(
         ["cmake", llama_cpp_folder, "-B", build_dir,
          # macOS uses a single-config generator, so the build type must be set
          # at configure time; --config Release on the build step is ignored and
          # the binaries would otherwise be built unoptimized (very slow).
          "-DCMAKE_BUILD_TYPE=Release",
          "-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"],
-        check=True, capture_output=True,
+        "llama.cpp cmake configure",
     )
 
     import psutil
@@ -5431,10 +5448,10 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     for t in targets:
         target_args += ["--target", t]
 
-    subprocess.run(
+    _run_build_step(
         ["cmake", "--build", build_dir, "--config", "Release",
          f"-j{n_jobs}", "--clean-first"] + target_args,
-        check=True, capture_output=True,
+        "llama.cpp cmake build",
     )
 
     # Copy binaries to llama.cpp root
