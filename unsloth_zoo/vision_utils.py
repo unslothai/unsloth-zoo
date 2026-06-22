@@ -702,7 +702,9 @@ def _raise_chat_template_error(error, processor, model = None):
     checkpoint whose processor has no chat template)."""
     name = _resolve_processor_model_name(processor, model)
     msg = str(error)
-    if "chat template" in msg.lower():
+    lowered = msg.lower()
+    # newer Transformers says "chat template"; older says "apply_chat_template()/chat_template"
+    if "chat template" in lowered or "chat_template" in lowered:
         raise RuntimeError(
             f"Unsloth: The processor for `{name}` has no chat template, so vision "
             "conversations cannot be formatted.\n"
