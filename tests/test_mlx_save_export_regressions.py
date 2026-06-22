@@ -1031,6 +1031,12 @@ def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
     import subprocess
     import unsloth_zoo.mlx.utils as mutils
 
+    import unsloth_zoo.llama_cpp as lcpp
+
+    # The helper only deletes a recognised managed prebuilt install (marker present)
+    # that lives in a safe-to-delete location, so anchor UNSLOTH_HOME at tmp_path.
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path), raising=False)
+
     folder = tmp_path / "llama.cpp"
     folder.mkdir()
     (folder / "llama-quantize").write_text("broken prebuilt binary")
@@ -1053,6 +1059,38 @@ def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
 
     assert any(list(c[:2]) == ["git", "clone"] for c in cmds), "expected a re-clone of the non-source dir"
     assert (folder / "CMakeLists.txt").is_file(), "folder should be a source tree after the re-clone"
+
+
+def test_macos_helper_refuses_unmanaged_non_source_dir(monkeypatch, tmp_path):
+    # A non-source directory that is NOT a recognised Unsloth prebuilt install
+    # (no UNSLOTH_PREBUILT_INFO.json marker) must never be deleted -- a caller may
+    # point UNSLOTH_LLAMA_CPP_PATH at a directory full of their own files. The
+    # helper must raise instead of wiping it, mirroring the generic installer's
+    # _is_safe_to_delete / prebuilt-marker guard.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path), raising=False)
+
+    folder = tmp_path / "user_data"
+    folder.mkdir()
+    (folder / "important.txt").write_text("precious user file")  # no marker, no CMakeLists
+
+    def fake_run(cmd, *a, **k):
+        if list(cmd[:2]) == ["git", "clone"]:
+            pytest.fail("must not re-clone (and therefore delete) an unmanaged directory")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    with pytest.raises(RuntimeError, match="will not be removed"):
+        mutils._install_llama_cpp_macos(str(folder))
+
+    # The user's directory and its contents must be left fully intact.
+    assert folder.is_dir()
+    assert (folder / "important.txt").read_text() == "precious user file"
 
 
 def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):

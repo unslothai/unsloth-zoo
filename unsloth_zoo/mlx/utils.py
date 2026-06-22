@@ -5403,7 +5403,25 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         # prebuilt install left binaries + a marker (and no CMakeLists.txt). cmake
         # would fail against it, so replace it with a fresh source checkout before
         # building. A real source tree (CMakeLists.txt present) is kept and rebuilt.
-        print("Unsloth: Existing llama.cpp folder is not a source tree; re-cloning for the source build...")
+        #
+        # Only ever delete a directory we recognise as our own managed prebuilt
+        # install (carries UNSLOTH_PREBUILT_INFO.json) AND that lives in a
+        # safe-to-delete location (under ~/.unsloth or the legacy ./llama.cpp).
+        # Reuse the same guards the generic installer uses so a user-pointed
+        # UNSLOTH_LLAMA_CPP_PATH that happens to be a non-source directory is
+        # never wiped out from under the caller.
+        from ..llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
+        is_prebuilt_install = os.path.isfile(
+            os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
+        )
+        if not (is_prebuilt_install and _is_safe_to_delete(llama_cpp_folder)):
+            raise RuntimeError(
+                f"Unsloth: '{llama_cpp_folder}' exists but is not a llama.cpp source "
+                f"tree, and is not a recognised Unsloth prebuilt install in a managed "
+                f"location, so it will not be removed.\n"
+                f"Please point the build at a fresh directory or manually remove it."
+            )
+        print("Unsloth: Existing prebuilt llama.cpp install is not a source tree; re-cloning for the source build...")
         shutil.rmtree(llama_cpp_folder, ignore_errors=True)
         _clone()
 
