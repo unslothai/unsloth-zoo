@@ -681,7 +681,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             device_autocast_ctx = torch.amp.autocast(
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
-            ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
+            ) if torch.amp.is_autocast_available(ctx.device_type) else nullcontext()
 
             # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
