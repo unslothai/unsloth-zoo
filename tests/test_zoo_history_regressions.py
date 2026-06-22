@@ -476,15 +476,11 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Gemma-4 E-series cross-layer KV sharing with use_cache=False / gradient
-# checkpointing (transformers#45242). use_cache=False is the BROKEN path: the
-# shared layers recompute their own KV and the logits become garbage. A prior PR
-# tried to make the zoo fix a no-op (which would regress E-series training); these
-# tests lock the fix in and check its key invariants without a GPU/model.
+# Gemma-4 E-series KV sharing under use_cache=False / gradient checkpointing
+# (transformers#45242). These lock the zoo fix in and check its invariants on CPU.
 # ---------------------------------------------------------------------------
 def test_gemma4_kv_shared_patches_registered():
-    """Both shared-KV patch functions must stay registered AND actually wire the
-    carrier (not be reduced to bare `return` stubs)."""
+    """Both patch functions stay registered AND wire the carrier (not bare return stubs)."""
     import inspect
     from unsloth_zoo.temporary_patches import gemma4 as _M
     from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
@@ -502,8 +498,7 @@ def test_gemma4_kv_shared_patches_registered():
 
 
 def test_gemma4_shared_kv_carrier_semantics():
-    """The carrier exposes only shared_layers + a no-op update (no autoregressive
-    cache accumulation), so non-shared layers stay cache-free under use_cache=False."""
+    """Carrier exposes only shared_layers + a no-op update, so non-shared layers stay cache-free."""
     from unsloth_zoo.temporary_patches.gemma4 import _Gemma4SharedKVCarrier
     c = _Gemma4SharedKVCarrier()
     assert c.shared_layers == {}
@@ -515,9 +510,8 @@ def test_gemma4_shared_kv_carrier_semantics():
 
 
 def test_gemma4_capability_gate(monkeypatch):
-    """needs_cache() is True on the buggy build (attention forward lacks
-    shared_kv_states) and False once transformers passes it explicitly (fixed).
-    Uses a synthetic module so it is independent of the installed transformers."""
+    """needs_cache() is True when the attention forward lacks shared_kv_states, False once it
+    has it. Uses a synthetic module, independent of the installed transformers."""
     import sys, types, inspect
     from unsloth_zoo.temporary_patches import gemma4 as _M
 
@@ -546,8 +540,7 @@ def test_gemma4_capability_gate(monkeypatch):
 
 
 def test_gemma4_attention_carrier_substitution():
-    """The attention wrapper supplies the carrier only when the real past_key_values
-    is None (use_cache=False or nulled by gradient checkpointing); a real cache and
+    """The wrapper supplies the carrier only when past_key_values is None; a real cache and
     the no-carrier case pass through unchanged."""
     from unsloth_zoo.temporary_patches.gemma4 import (
         _make_gemma4_attention_carrier_forward, _Gemma4SharedKVCarrier,
@@ -572,9 +565,8 @@ def test_gemma4_attention_carrier_substitution():
 
 
 def test_gemma4_clear_shared_kv_carrier_releases_kv():
-    """_gemma4_clear_shared_kv_carrier drops the producer K/V the carrier pinned and
-    removes the module attribute, so a no_grad/eval forward does not hold the carrier
-    (and its K/V) alive until the next forward. No-op when there is no carrier."""
+    """clear drops the pinned K/V and removes the module attr, so a no_grad/eval forward does
+    not hold the carrier alive until the next forward. No-op when there is no carrier."""
     from unsloth_zoo.temporary_patches.gemma4 import (
         _Gemma4SharedKVCarrier, _gemma4_clear_shared_kv_carrier,
     )
@@ -607,12 +599,9 @@ def test_gemma4_clear_shared_kv_carrier_releases_kv():
 
 
 def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
-    """The GC fix overrides _gradient_checkpointing_func on gemma-4 text decoder layers
-    that are being checkpointed with a NON-reentrant torch checkpoint, resolving the
-    PRISTINE checkpoint when Unsloth's smart GC has globally swapped in its
-    reentrant-forcing shim (`unsloth_checkpoint`). Layers not being checkpointed, and
-    non-gemma-4 layers, are left untouched. This guards the gradient-correctness fix for
-    cross-layer KV sharing under reentrant/offloaded gradient checkpointing."""
+    """Overrides _gradient_checkpointing_func on checkpointed gemma-4 layers with a NON-reentrant
+    checkpoint, resolving the pristine one past Unsloth's smart-GC shim. Non-checkpointed and
+    non-gemma-4 layers are left untouched."""
     import functools
     import torch.utils.checkpoint as _ckpt
     from unsloth_zoo.temporary_patches import gemma4 as g4
