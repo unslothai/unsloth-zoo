@@ -711,8 +711,10 @@ def _raise_chat_template_error(error, processor, model = None):
             "conversations cannot be formatted.\n"
             "Use an instruction-tuned checkpoint (e.g. the `-Instruct` / `-it` "
             "variant of this model), or set a chat template before training via "
-            "`tokenizer.chat_template = ...` (or pass `chat_template=` to the "
-            "processor / `apply_chat_template`).\n"
+            "`processor.chat_template = ...` -- the collator calls "
+            "`processor.apply_chat_template`, so setting it on a separate tokenizer "
+            "has no effect (you may also pass `chat_template=` to "
+            "`apply_chat_template`).\n"
             f"(original error: {msg})"
         ) from error
     raise RuntimeError(error) from error
