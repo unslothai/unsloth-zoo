@@ -620,6 +620,9 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
     monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
     monkeypatch.setattr(_ckpt, "_old_checkpoint", unsloth_offloaded_gradient_checkpoint, raising=False)
     monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", _pristine, raising=False)
+    # Real GC patching may have stashed a set-once pristine on the live module; clear it so the
+    # import-captured and _old_checkpoint-unwrap paths below are what gets exercised.
+    monkeypatch.delattr(_ckpt, "_unsloth_pristine_checkpoint", raising=False)
 
     Gemma4TextAttention = type("Gemma4TextAttention", (), {})
     OtherAttention = type("OtherAttention", (), {})
@@ -671,6 +674,86 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
             return [self, on2, on2.self_attn]
     _gemma4_force_nonreentrant_checkpointing(_Model2())
     assert on2._gradient_checkpointing_func.func is _pristine, "fallback must unwrap _old_checkpoint"
+
+
+def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
+    """When gemma4 imports after smart GC stacked on an offloaded shim, neither shim carries a
+    function-level _old_checkpoint and the module-level one points at the first shim. The set-once
+    capture the GC patcher stashes before any shim must still recover the pristine fn."""
+    import torch.utils.checkpoint as _ckpt
+    from unsloth_zoo import gradient_checkpointing as gc
+    from unsloth_zoo.temporary_patches import gemma4 as g4
+
+    real = _ckpt.checkpoint  # genuine torch fn in the test process (no shim installed)
+
+    # Force the "late import" path: no import-captured pristine available.
+    monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", None, raising=False)
+    monkeypatch.delattr(_ckpt, "_unsloth_pristine_checkpoint", raising=False)
+
+    # First GC patch captures the pristine before any shim stacks.
+    gc._capture_pristine_checkpoint_once()
+    assert getattr(_ckpt, "_unsloth_pristine_checkpoint", None) is real
+
+    # Now stack two shims: module-level _old_checkpoint ends up at the first shim, so unwrapping
+    # it alone would only ever reach a shim.
+    def unsloth_offloaded_gradient_checkpoint(*a, **k):
+        raise AssertionError("a shim must never be returned as the pristine checkpoint")
+    unsloth_offloaded_gradient_checkpoint.__name__ = "unsloth_offloaded_gradient_checkpoint"
+    def unsloth_checkpoint(*a, **k):
+        raise AssertionError("a shim must never be returned as the pristine checkpoint")
+    unsloth_checkpoint.__name__ = "unsloth_checkpoint"
+    monkeypatch.setattr(_ckpt, "_old_checkpoint", unsloth_offloaded_gradient_checkpoint, raising=False)
+    monkeypatch.setattr(_ckpt, "checkpoint", unsloth_checkpoint, raising=False)
+
+    assert g4._resolve_pristine_checkpoint(_ckpt) is real, (
+        "set-once capture must recover the pristine checkpoint despite stacked shims"
+    )
+    # cleanup the attr we created (monkeypatch.delattr above only records absence)
+    if hasattr(_ckpt, "_unsloth_pristine_checkpoint"):
+        del _ckpt._unsloth_pristine_checkpoint
+
+
+def test_gemma4_carrier_rejects_two_forwards_before_one_backward():
+    """The module-scoped 5.5.0/5.5.1 carrier cannot serve two live checkpointed graphs, so a
+    second grad-enabled forward before the first's backward (DPO/contrastive) must raise rather
+    than silently corrupt gradients. Single-forward + backward, then re-forward, stays allowed."""
+    import torch
+    import pytest
+    from unsloth_zoo.temporary_patches.gemma4 import _make_kv_shared_use_cache_false_safe_forward
+
+    w = torch.nn.Parameter(torch.randn(4, 4))
+
+    class _Model:
+        # no Gemma4TextAttention -> force/attach helpers are strict no-ops; only the
+        # outstanding-forward marker logic is under test here.
+        def modules(self):
+            return []
+
+    def _orig(self, x):
+        return x @ w  # stands in for last_hidden_state; requires grad
+
+    wrapped = _make_kv_shared_use_cache_false_safe_forward(_orig, attach_carrier=True)
+    m = _Model()
+    x = torch.randn(2, 4, requires_grad=True)
+
+    out1 = wrapped(m, x)
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
+
+    # second forward before any backward -> reject
+    with pytest.raises(RuntimeError, match="two forward passes before a single backward"):
+        wrapped(m, x)
+
+    # after the first graph's backward, the marker clears and a new forward is allowed
+    out1.sum().backward()
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is False
+    wrapped(m, x)
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
+
+    # eval / no_grad never arms the marker (no backward to guard)
+    delattr(m, "_unsloth_gemma4_carrier_outstanding")
+    with torch.no_grad():
+        wrapped(m, x)
+    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is False
 
 
 # ---------------------------------------------------------------------------

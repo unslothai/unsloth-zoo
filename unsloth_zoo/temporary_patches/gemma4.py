@@ -382,11 +382,16 @@ except Exception:
 
 
 def _resolve_pristine_checkpoint(_ckpt):
-    """Genuine non-reentrant-capable torch checkpoint: prefer the import-captured ref, else
-    unwrap _old_checkpoint past stacked Unsloth shims (a shim base would bypass the override).
-    Returns None if every candidate is a shim, so the caller skips rather than wrap a shim."""
+    """Genuine non-reentrant-capable torch checkpoint: prefer the import-captured ref, then the
+    set-once ref the GC patcher stashes before any shim stacks, else unwrap _old_checkpoint past
+    stacked Unsloth shims. Returns None if every candidate is a shim."""
     if _PRISTINE_TORCH_CHECKPOINT is not None:
         return _PRISTINE_TORCH_CHECKPOINT
+    # patch_unsloth_*_gradient_checkpointing stash the real fn here on the first patch, so it
+    # survives stacked shims and a late gemma4 import (when module-level _old_checkpoint is a shim).
+    captured = getattr(_ckpt, "_unsloth_pristine_checkpoint", None)
+    if captured is not None and getattr(captured, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES:
+        return captured
     cand = getattr(_ckpt, "checkpoint", None)
     seen = set()
     while getattr(cand, "__name__", "") in _UNSLOTH_CKPT_SHIM_NAMES:
@@ -515,6 +520,37 @@ def _gemma4_clear_shared_kv_carrier(model):
                 pass
 
 
+def _arm_carrier_outstanding_marker(model, output):
+    """Mark the carrier outstanding until this forward's backward starts. A grad hook on the
+    output clears it at the start of this graph's backward, so a later forward can tell whether
+    a prior checkpointed graph is still pending (DPO/contrastive) vs already consumed (grad
+    accumulation). No-op if nothing in the output carries grad (no backward graph to guard)."""
+    tensor = getattr(output, "last_hidden_state", None)
+    if not isinstance(tensor, torch.Tensor):
+        if isinstance(output, torch.Tensor):
+            tensor = output
+        elif isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
+            tensor = output[0]
+        else:
+            tensor = None
+    if tensor is None or not tensor.requires_grad or tensor.grad_fn is None:
+        return
+    try:
+        model._unsloth_gemma4_carrier_outstanding = True
+    except Exception:
+        return
+    def _clear(_grad):
+        try: model._unsloth_gemma4_carrier_outstanding = False
+        except Exception: pass
+        return None
+    try:
+        tensor.register_hook(_clear)
+    except Exception:
+        # could not arm the auto-clear -> do not leave a sticky marker that false-positives later
+        try: model._unsloth_gemma4_carrier_outstanding = False
+        except Exception: pass
+
+
 def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
     """Wrap a Gemma-4 model forward: always force non-reentrant GC (the gradient fix, all
     versions), and on the 5.5.0-5.5.1 carrier window (attach_carrier=True) also attach a fresh
@@ -522,26 +558,24 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
 
     Carrier scope (5.5.0-5.5.1 only): the carrier lives on the module because that is the only
     channel surviving GC backward recompute (recompute re-runs the layers, not this wrapper).
-    So keeping two checkpointed forward graphs alive before one backward (DPO/contrastive,
-    summed microbatch losses) lets the second overwrite the carrier; upgrade to >= 5.5.2 (its
-    function-scoped shared_kv_states is immune). Single-forward / grad-accumulation is fine."""
+    Two checkpointed forward graphs alive before one backward (DPO/contrastive, summed microbatch
+    losses) would have the second overwrite a carrier the first graph still needs -> we detect
+    that and raise instead of silently corrupting grads (upgrade to >= 5.5.2 for function-scoped
+    shared_kv_states). Single-forward / grad-accumulation is fine (the prior graph's backward
+    clears the marker before the next forward)."""
     def forward(self, *args, **kwargs):
         try:
             _gemma4_force_nonreentrant_checkpointing(self)
         except Exception:
             pass
         if attach_carrier:
-            try:
-                _gemma4_attach_shared_kv_carrier(self)
-            except Exception:
-                pass
             # No backward to read the carrier under eval/no_grad: release its pinned K/V now
-            # instead of holding it until the next forward. Under training the carrier must stay
-            # live through the whole backward (GC recompute reads it in reverse order), so it is
-            # only released when the next forward swaps in a fresh carrier; this lingers one
-            # producer layer's K/V across optimizer.step() (small for E2B/E4B), the cost of the
-            # module-scoped carrier on this 5.5.0-5.5.1 window (5.5.2+ frees it function-scoped).
+            # instead of holding it until the next forward.
             if not torch.is_grad_enabled():
+                try:
+                    _gemma4_attach_shared_kv_carrier(self)
+                except Exception:
+                    pass
                 try:
                     return _orig_forward(self, *args, **kwargs)
                 finally:
@@ -549,6 +583,23 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
                         _gemma4_clear_shared_kv_carrier(self)
                     except Exception:
                         pass
+            # Training: refuse a second outstanding checkpointed forward (its carrier would
+            # clobber the first graph's K/V during recompute).
+            if getattr(self, "_unsloth_gemma4_carrier_outstanding", False):
+                raise RuntimeError(
+                    "Unsloth: Gemma-4 E-series KV sharing on transformers 5.5.0/5.5.1 cannot run "
+                    "two forward passes before a single backward (e.g. DPO/contrastive or summed "
+                    "microbatch losses): the shared-KV carrier is module-scoped, so the second "
+                    "forward would corrupt the first graph's gradients. Upgrade to transformers "
+                    ">= 5.5.2, whose function-scoped shared K/V supports these objectives."
+                )
+            try:
+                _gemma4_attach_shared_kv_carrier(self)
+            except Exception:
+                pass
+            out = _orig_forward(self, *args, **kwargs)
+            _arm_carrier_outstanding_marker(self, out)
+            return out
         return _orig_forward(self, *args, **kwargs)
 
     forward._unsloth_kv_shared_use_cache_false_patched = True
