@@ -520,6 +520,24 @@ def _gemma4_clear_shared_kv_carrier(model):
                 pass
 
 
+def _gemma4_carrier_overlap_unsafe(model):
+    """Overlapping checkpointed forwards corrupt grads through the module-scoped carrier ONLY when
+    the model truly shares K/V (so a carrier is attached) AND gradient checkpointing is active on a
+    Gemma-4 layer (so backward recompute re-enters attention and re-reads the carrier). Without
+    sharing no carrier exists (31B/26B-A4B cache an empty attn list); without checkpointing backward
+    uses saved activations and never re-reads it, so two forwards before one backward are safe."""
+    if not _gemma4_model_has_kv_sharing(model):
+        return False
+    layers = getattr(model, "_unsloth_gemma4_decoder_layers", None)
+    if layers is None:
+        layers = [
+            m for m in model.modules()
+            if hasattr(m, "gradient_checkpointing")
+            and type(getattr(m, "self_attn", None)).__name__ == "Gemma4TextAttention"
+        ]
+    return any(getattr(layer, "gradient_checkpointing", False) for layer in layers)
+
+
 def _arm_carrier_outstanding_marker(model, output):
     """Mark the carrier outstanding until this forward's backward starts. A grad hook on the
     output clears it at the start of this graph's backward, so a later forward can tell whether
@@ -583,22 +601,27 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
                         _gemma4_clear_shared_kv_carrier(self)
                     except Exception:
                         pass
-            # Training: refuse a second outstanding checkpointed forward (its carrier would
-            # clobber the first graph's K/V during recompute).
-            if getattr(self, "_unsloth_gemma4_carrier_outstanding", False):
+            # Training: a second outstanding checkpointed forward would clobber the first graph's
+            # carrier during recompute -- but only when KV sharing AND gradient checkpointing are
+            # both active (otherwise no carrier is re-read in backward). Only then track/reject, so
+            # 31B/26B-A4B and checkpointing-off runs keep working with DPO/contrastive/summed loss.
+            overlap_unsafe = _gemma4_carrier_overlap_unsafe(self)
+            if overlap_unsafe and getattr(self, "_unsloth_gemma4_carrier_outstanding", False):
                 raise RuntimeError(
                     "Unsloth: Gemma-4 E-series KV sharing on transformers 5.5.0/5.5.1 cannot run "
                     "two forward passes before a single backward (e.g. DPO/contrastive or summed "
-                    "microbatch losses): the shared-KV carrier is module-scoped, so the second "
-                    "forward would corrupt the first graph's gradients. Upgrade to transformers "
-                    ">= 5.5.2, whose function-scoped shared K/V supports these objectives."
+                    "microbatch losses) while gradient checkpointing is on: the shared-KV carrier "
+                    "is module-scoped, so the second forward would corrupt the first graph's "
+                    "gradients. Upgrade to transformers >= 5.5.2 (function-scoped shared K/V), or "
+                    "disable gradient checkpointing for these objectives."
                 )
             try:
                 _gemma4_attach_shared_kv_carrier(self)
             except Exception:
                 pass
             out = _orig_forward(self, *args, **kwargs)
-            _arm_carrier_outstanding_marker(self, out)
+            if overlap_unsafe:
+                _arm_carrier_outstanding_marker(self, out)
             return out
         return _orig_forward(self, *args, **kwargs)
 

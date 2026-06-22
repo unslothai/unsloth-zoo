@@ -713,47 +713,73 @@ def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
         del _ckpt._unsloth_pristine_checkpoint
 
 
-def test_gemma4_carrier_rejects_two_forwards_before_one_backward():
+def _make_gemma4_fake_model(torch, *, kv_shared, checkpointed):
+    """A stand-in Gemma-4 model: one decoder layer whose self_attn class is named
+    Gemma4TextAttention, with configurable KV sharing and gradient checkpointing flags."""
+    Gemma4TextAttention = type("Gemma4TextAttention", (), {})
+
+    class _Layer:
+        def __init__(self):
+            self.self_attn = Gemma4TextAttention()
+            self.self_attn.is_kv_shared_layer = kv_shared
+            self.gradient_checkpointing = checkpointed
+
+    layer = _Layer()
+
+    class _Model:
+        def modules(self):
+            return [self, layer, layer.self_attn]
+
+    return _Model()
+
+
+def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
     """The module-scoped 5.5.0/5.5.1 carrier cannot serve two live checkpointed graphs, so a
-    second grad-enabled forward before the first's backward (DPO/contrastive) must raise rather
-    than silently corrupt gradients. Single-forward + backward, then re-forward, stays allowed."""
+    second grad-enabled forward before the first's backward must raise -- but ONLY when KV sharing
+    AND gradient checkpointing are both active (else no carrier is re-read in backward). Models
+    without sharing (31B/26B-A4B) or with checkpointing off must keep working with DPO/contrastive."""
     import torch
     import pytest
     from unsloth_zoo.temporary_patches.gemma4 import _make_kv_shared_use_cache_false_safe_forward
 
     w = torch.nn.Parameter(torch.randn(4, 4))
 
-    class _Model:
-        # no Gemma4TextAttention -> force/attach helpers are strict no-ops; only the
-        # outstanding-forward marker logic is under test here.
-        def modules(self):
-            return []
-
     def _orig(self, x):
         return x @ w  # stands in for last_hidden_state; requires grad
 
     wrapped = _make_kv_shared_use_cache_false_safe_forward(_orig, attach_carrier=True)
-    m = _Model()
     x = torch.randn(2, 4, requires_grad=True)
 
+    # Unsafe: KV sharing + checkpointing -> arm + reject the overlapping forward.
+    m = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=True)
     out1 = wrapped(m, x)
     assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
-
-    # second forward before any backward -> reject
     with pytest.raises(RuntimeError, match="two forward passes before a single backward"):
         wrapped(m, x)
-
-    # after the first graph's backward, the marker clears and a new forward is allowed
+    # after the first graph's backward the marker clears and a new forward is allowed
     out1.sum().backward()
     assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is False
     wrapped(m, x)
     assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
 
+    # Safe (no KV sharing, e.g. 31B/26B-A4B): two forwards before one backward must NOT raise.
+    m_noshare = _make_gemma4_fake_model(torch, kv_shared=False, checkpointed=True)
+    wrapped(m_noshare, x)
+    wrapped(m_noshare, x)  # would raise if the marker were armed
+    assert getattr(m_noshare, "_unsloth_gemma4_carrier_outstanding", False) is False
+
+    # Safe (KV sharing but checkpointing off): backward uses saved activations, never re-reads
+    # the carrier, so overlapping forwards must NOT raise.
+    m_nockpt = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=False)
+    wrapped(m_nockpt, x)
+    wrapped(m_nockpt, x)
+    assert getattr(m_nockpt, "_unsloth_gemma4_carrier_outstanding", False) is False
+
     # eval / no_grad never arms the marker (no backward to guard)
-    delattr(m, "_unsloth_gemma4_carrier_outstanding")
+    m_eval = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=True)
     with torch.no_grad():
-        wrapped(m, x)
-    assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is False
+        wrapped(m_eval, x)
+    assert getattr(m_eval, "_unsloth_gemma4_carrier_outstanding", False) is False
 
 
 # ---------------------------------------------------------------------------
