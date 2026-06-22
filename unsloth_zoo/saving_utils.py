@@ -1273,16 +1273,9 @@ _MOE_PEREXPERT_SCHEMES = (
 
 
 def _detect_moe_perexpert_scheme(prefix, header_metadata):
-    """Return the (gate, up, down) per-expert disk-tensor name scheme used by the
-    shard for ``prefix``, or None if no per-expert scheme is present.
-
-    Detected from the actual shard header (any expert index, any of the three
-    projections), not by model name, so any future arch using the same on-disk
-    layout is handled and every other layout is left to the default
-    ``gate_proj/up_proj/down_proj`` path. Probing every expert index (not just
-    expert 0) means a multi-shard checkpoint whose shard holds only later
-    experts (e.g. ``prefix.7.w3.weight``) is still detected and merged.
-    """
+    """The (gate, up, down) per-expert disk-tensor name scheme for ``prefix`` in the shard
+    header, or None. Detected from the header (any expert index, any projection), not by model
+    name, so a shard holding only later experts (e.g. prefix.7.w3.weight) is still matched."""
     esc = re.escape(prefix)
     for gate_name, up_name, down_name in _MOE_PEREXPERT_SCHEMES:
         names = "|".join(re.escape(n) for n in (gate_name, up_name, down_name))
@@ -1293,13 +1286,9 @@ def _detect_moe_perexpert_scheme(prefix, header_metadata):
 
 
 def _count_moe_experts_in_header(prefix, header_metadata, scheme):
-    """Number of experts (max per-expert index + 1) for ``prefix`` under the
-    given (gate, up, down) name ``scheme`` in the shard header, or None.
-
-    Used to seed ``moe_num_experts`` for per-expert schemes the pre-scan does not
-    count (e.g. w1/w3/w2), so an adapter that targets only ``down_proj`` still
-    merges every expert instead of falling back to a derived count of 1.
-    """
+    """Expert count (max per-expert index + 1) for ``prefix`` under ``scheme`` in the shard
+    header, or None. Seeds moe_num_experts for schemes the pre-scan misses (w1/w3/w2), so a
+    down_proj-only adapter still merges every expert instead of deriving 1."""
     names = "|".join(re.escape(n) for n in scheme)
     pat = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.(?:{names})\.weight$")
     max_idx = -1
@@ -1311,22 +1300,12 @@ def _count_moe_experts_in_header(prefix, header_metadata, scheme):
 
 
 def _resolve_moe_num_experts_with_header(prefix, resolution_stats, moe_num_experts, header_metadata, scheme):
-    """Expert count for ``prefix``, preferring the authoritative source.
-
-    Resolution order:
-      1. The live experts module's ``num_experts`` attr, then the fused-LoRA shape
-         (``_resolve_moe_num_experts``). Both are shard-independent -> the true N.
-      2. The shard header's (max per-expert index + 1) for per-expert schemes the
-         pre-scan does not count (w1/w3/w2). Needed only when (1) cannot resolve a
-         count (e.g. a down_proj-only w1/w3/w2 adapter that derives 1, which would
-         otherwise leave experts 1..N-1 unmerged).
-
-    The header count may only RAISE a missing/too-low count, never lower an
-    authoritative one: a shard holding only a low-index subset (experts 0..15 of
-    64) under-counts, and that count drives the per-expert LoRA slicing stride, so
-    lowering it would corrupt every merged expert. Records a raised count in
-    ``moe_num_experts`` and returns the resolved count (possibly None).
-    """
+    """Expert count for ``prefix``, preferring the authoritative source: the live module's
+    num_experts then the fused-LoRA shape (both shard-independent), else the shard header's
+    (max index + 1) only when neither resolves (e.g. a down_proj-only w1/w3/w2 adapter that
+    derives 1). The header may only RAISE a missing/too-low count, never lower an authoritative
+    one -- a low-index shard subset under-counts and would corrupt the per-expert slicing
+    stride. Records a raised count and returns it (possibly None)."""
     num_experts = _resolve_moe_num_experts(prefix, resolution_stats, moe_num_experts)
     hdr_ne = _count_moe_experts_in_header(prefix, header_metadata, scheme)
     if hdr_ne and hdr_ne > (num_experts or 0):
@@ -1470,12 +1449,8 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 counted_lora_modules.add(lora_key)
             continue
 
-        # Standard per-expert format (DeepSeek, Qwen3, GLM4, etc.).
-        # Resolve the per-expert disk-tensor names: default gate_proj/up_proj/
-        # down_proj, or w1/w3/w2 when the shard uses that layout (LFM2, some
-        # ERNIE variants whose runtime experts module is the fused
-        # Lfm2MoeExperts/Ernie4_5_MoeExperts but whose checkpoint stores experts
-        # per-expert as w1=gate / w3=up / w2=down).
+        # Standard per-expert format (DeepSeek, Qwen3, GLM4, etc.): default
+        # gate_proj/up_proj/down_proj, or w1/w3/w2 (LFM2 / some ERNIE) per the shard layout.
         _scheme = _detect_moe_perexpert_scheme(prefix, header_metadata)
         gate_name, up_name, down_name = _scheme or ("gate_proj", "up_proj", "down_proj")
         resolution_stats = lora_stats
@@ -1486,9 +1461,6 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 and getattr(base_stats, "module", None) is not None
             ):
                 resolution_stats = base_stats
-        # Prefer the authoritative (module/fused-LoRA) count; the shard header may
-        # only raise a missing/too-low count, never lower it (a low-index shard
-        # subset under-counts and would corrupt the per-expert slicing stride).
         num_experts = _resolve_moe_num_experts_with_header(
             prefix, resolution_stats, moe_num_experts,
             header_metadata, (gate_name, up_name, down_name),

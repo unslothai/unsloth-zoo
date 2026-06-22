@@ -16,15 +16,10 @@
 
 """Expert-count resolution precedence for per-expert MoE merges.
 
-A w1/w3/w2 (or gate/up/down) checkpoint can split one MoE layer's experts across
-several shards. A shard holding only a low-index subset (experts 0..15 of 64)
-reports 16 from its header. That count drives the per-expert LoRA slicing stride,
-so if it were allowed to override the authoritative module/fused-LoRA count it
-would slice every expert with the wrong stride and write corrupt weights.
-
-These tests pin the precedence: the live module / fused-LoRA count always wins;
-the shard header may only RAISE a missing or too-low count (so a down_proj-only
-adapter that derives 1 still merges all experts), never lower an authoritative one.
+A w1/w3/w2 checkpoint can split one layer's experts across shards; a low-index shard
+(experts 0..15 of 64) reports 16, which drives the per-expert LoRA slicing stride. These
+tests pin that the authoritative module/fused-LoRA count always wins and the shard header
+may only RAISE a missing/too-low count, never lower it.
 """
 
 from __future__ import annotations

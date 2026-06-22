@@ -32,15 +32,9 @@ from .moe_utils import (
 
 
 def _make_ernie4_5_moe_lora_extractor():
-    """LoRA extractor for the fused ERNIE 4.5 MoE experts modules.
-
-    Ernie4_5_MoeExperts / Ernie4_5_VLMoeMoeExperts store their experts as 3D
-    parameters identical in layout to Qwen3MoeExperts:
-        gate_up_proj : (num_experts, 2 * intermediate_dim, hidden_dim)
-        down_proj    : (num_experts, hidden_dim,           intermediate_dim)
-    and expose ``hidden_dim`` / ``intermediate_dim`` attributes, so the io-dims
-    of each separated LoRA can be read straight off the module.
-    """
+    """LoRA extractor for the fused ERNIE 4.5 MoE experts (Ernie4_5_MoeExperts /
+    Ernie4_5_VLMoeMoeExperts). Same 3D layout as Qwen3MoeExperts (gate_up_proj
+    (E, 2*I, H), down_proj (E, H, I)); io-dims read off hidden_dim / intermediate_dim."""
     def _get_ernie4_5_moe_lora_dims(wrapper):
         if wrapper is None or not hasattr(wrapper, "get_base_layer"):
             return None, None
@@ -83,33 +77,22 @@ _ERNIE4_5_MOE_EXPERTS = (
 
 
 def patch_ernie4_5_moe():
-    """Patch ERNIE 4.5 MoE (ernie4_5_moe / ernie4_5_vl_moe) experts for Split
-    LoRA via grouped GEMM.
-
-    Transformers >= 5 loads the fused Ernie4_5_MoeExperts (and, for the VL model,
-    Ernie4_5_VLMoeMoeExperts). Their native grouped-mm experts ``forward`` cannot
-    consume a packed 2D bitsandbytes Params4bit ``gate_up_proj`` under 4bit QLoRA
-    and raises ``IndexError: Dimension out of range`` on the first backward.
-    Replacing the experts ``forward`` with Unsloth's MoE backend dispatcher routes
-    bnb-4bit experts through dequantize + grouped_mm, exactly as for
-    qwen3_moe / glm4_moe / deepseek_v3_moe / gemma4_moe.
-
-    The sparse MoE block (including ERNIE's shared experts and custom top-k
-    router) keeps its native forward and still calls
-    ``self.experts(hidden_states, top_k_index, top_k_weights)``, whose signature
-    matches the backend dispatcher, so only the experts forward is replaced.
+    """Patch ERNIE 4.5 MoE (ernie4_5_moe / ernie4_5_vl_moe) fused experts for Split LoRA via
+    grouped GEMM. The native experts.forward can't consume a packed 2D bnb Params4bit
+    gate_up_proj under 4bit QLoRA (IndexError on backward); routing it through Unsloth's MoE
+    backend (dequantize + grouped_mm) fixes it, as for qwen3_moe / glm4_moe / etc. The MoE
+    block (shared experts + router) keeps its native forward, calling self.experts(...) whose
+    signature matches the dispatcher, so only the experts forward is replaced.
     """
     import importlib
 
-    # Install the ParamWrapper MoE forward patch (separated LoRA on the fused
-    # experts parameters). Idempotent; qwen3_moe already installs it at import.
+    # Separated LoRA on the fused experts params. Idempotent (qwen3_moe installs it too).
     patch_param_wrapper_for_moe()
 
     _ernie_lora_extractor = _make_ernie4_5_moe_lora_extractor()
     patched_any = False
     for module_path, experts_name in _ERNIE4_5_MOE_EXPERTS:
-        # Transformers < 5 has no ERNIE 4.5 MoE experts classes (they only ship
-        # on 5.x), so the import/getattr fails there and this is a strict no-op.
+        # Transformers < 5 has no ERNIE 4.5 MoE experts classes -> strict no-op there.
         try:
             module = importlib.import_module(module_path)
         except Exception:
@@ -122,8 +105,7 @@ def patch_ernie4_5_moe():
             continue
 
         experts_cls._unsloth_lora_extractor_fn = staticmethod(_ernie_lora_extractor)
-        # Pass the shared backend dispatcher FUNCTION OBJECT directly (no closure)
-        # so patch_function can serialize its SOURCE into the compiled cache.
+        # Pass the function object directly (no closure) so patch_function can serialize its source.
         patch_function(experts_cls, "forward", get_forward_moe_backend())
         experts_cls._unsloth_already_patched = True
         patched_any = True

@@ -32,15 +32,8 @@ from .moe_utils import (
 
 
 def _make_lfm2_moe_lora_extractor():
-    """LoRA extractor for the fused Lfm2MoeExperts module.
-
-    Lfm2MoeExperts stores its experts as 3D parameters identical in layout to
-    Qwen3MoeExperts:
-        gate_up_proj : (num_experts, 2 * intermediate_dim, hidden_dim)
-        down_proj    : (num_experts, hidden_dim,           intermediate_dim)
-    and exposes ``hidden_dim`` / ``intermediate_dim`` attributes, so the io-dims
-    of each separated LoRA can be read straight off the module.
-    """
+    """LoRA extractor for the fused Lfm2MoeExperts. Same 3D layout as Qwen3MoeExperts
+    (gate_up_proj (E, 2*I, H), down_proj (E, H, I)); io-dims read off hidden_dim / intermediate_dim."""
     def _get_lfm2_moe_lora_dims(wrapper):
         if wrapper is None or not hasattr(wrapper, "get_base_layer"):
             return None, None
@@ -75,29 +68,17 @@ def _make_lfm2_moe_lora_extractor():
 
 
 def patch_lfm2_moe():
-    """Patch LFM2 MoE (lfm2_moe) experts for Split LoRA via grouped GEMM.
-
-    Transformers >= 5 loads Lfm2MoeExperts, whose ``forward`` runs the native
-    grouped-mm experts path. Under 4bit QLoRA the fused ``gate_up_proj`` becomes
-    a packed 2D bitsandbytes Params4bit, which the native grouped-mm kernel
-    cannot consume (it expects a 3D ``(E, in, out)`` weight) and raises
-    ``IndexError: Dimension out of range`` on the first backward. Replacing the
-    experts ``forward`` with Unsloth's MoE backend dispatcher routes the bnb-4bit
-    experts through dequantize + grouped_mm, exactly as is already done for
-    qwen3_moe / glm4_moe / deepseek_v3_moe / gemma4_moe.
-
-    The Lfm2MoeSparseMoeBlock keeps its native routing (sigmoid + optional
-    expert bias + norm_topk_prob + routed scaling) and still calls
-    ``self.experts(hidden_states, top_k_index, top_k_weights)``, whose signature
-    matches the backend dispatcher, so only the experts forward is replaced.
+    """Patch LFM2 MoE (lfm2_moe) fused experts for Split LoRA via grouped GEMM. The native
+    grouped-mm experts.forward can't consume a packed 2D bnb Params4bit gate_up_proj under
+    4bit QLoRA (it expects 3D (E, in, out); IndexError on backward); routing it through
+    Unsloth's MoE backend (dequantize + grouped_mm) fixes it, as for qwen3_moe / glm4_moe /
+    etc. The Lfm2MoeSparseMoeBlock keeps its native routing, calling self.experts(...) whose
+    signature matches the dispatcher, so only the experts forward is replaced.
     """
-    # Install the ParamWrapper MoE forward patch (separated LoRA on the fused
-    # experts parameters). qwen3_moe already installs it at import; calling it
-    # again is idempotent and keeps this file self-contained.
+    # Separated LoRA on the fused experts params. Idempotent (qwen3_moe installs it too).
     patch_param_wrapper_for_moe()
 
-    # Transformers < 5 has no Lfm2MoeExperts (lfm2_moe only ships on 5.x), so the
-    # import fails there and this patch is a strict no-op.
+    # Transformers < 5 has no Lfm2MoeExperts -> strict no-op there.
     try:
         from transformers.models.lfm2_moe.modeling_lfm2_moe import Lfm2MoeExperts
     except Exception:
@@ -109,10 +90,8 @@ def patch_lfm2_moe():
     _lfm2_lora_extractor = _make_lfm2_moe_lora_extractor()
     Lfm2MoeExperts._unsloth_lora_extractor_fn = staticmethod(_lfm2_lora_extractor)
 
-    # IMPORTANT: pass the shared backend dispatcher FUNCTION OBJECT directly (no
-    # closure). patch_function serializes the function SOURCE into the compiled
-    # cache module, so a closure variable would be unresolved (NameError) there.
-    # This mirrors qwen3_moe.py exactly.
+    # Pass the function object directly (no closure): patch_function serializes the source into
+    # the compiled cache, so a closure var would be a NameError there. Mirrors qwen3_moe.py.
     patch_function(Lfm2MoeExperts, "forward", get_forward_moe_backend())
     Lfm2MoeExperts._unsloth_already_patched = True
 
