@@ -58,18 +58,13 @@ DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable doub
 
 @contextmanager
 def _no_inference_mode():
-    # Persistent GC buffers must never be inference tensors: GRPO computes
-    # ref/old log-probs under torch.inference_mode (rl_replacements.py). A buffer
-    # allocated or copied into while that context is active becomes an inference
-    # tensor, so the next training/eval offload x.copy_(arg) raises "Inplace
-    # update to inference tensor". See unslothai/unsloth#3828. Exit inference mode
-    # but stay in no_grad: buffer offload copies never track gradients, and
-    # no_grad avoids the "view created in no_grad modified in grad mode" error.
+    # GC buffers must not be inference tensors, else a later offload copy_ raises
+    # "Inplace update to inference tensor" (GRPO log-probs run under inference_mode,
+    # unsloth#3828). Leave inference_mode but stay in no_grad for the copies.
     try:
         leave_inference = torch.inference_mode(False)
     except (TypeError, AttributeError):
-        # Older torch without inference_mode(bool); no_grad alone is enough.
-        leave_inference = nullcontext()
+        leave_inference = nullcontext()  # older torch lacks inference_mode(bool)
     with leave_inference, torch.no_grad():
         yield
 
@@ -369,7 +364,6 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
-    # Keep persistent buffers out of inference mode (see _no_inference_mode).
     with _no_inference_mode():
         for i in range(200):
             x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
@@ -380,7 +374,6 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
-        # Keep persistent buffers out of inference mode (see _no_inference_mode).
         with _no_inference_mode():
             GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
         # Double buffering: try to allocate buffer B (can be disabled via env var)
@@ -527,7 +520,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                         pass
 
-                        # Extend buffer size (keep new buffer out of inference mode)
+                        # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
                                 x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
@@ -572,7 +565,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
-                        # _no_inference_mode: never inplace-update an inference tensor (unsloth#3828)
+                        # copy_ must not hit an inference tensor (unsloth#3828)
                         with _no_inference_mode(), torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
@@ -652,7 +645,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
-            # _no_inference_mode: never inplace-update an inference tensor (unsloth#3828)
+            # copy_ must not hit an inference tensor (unsloth#3828)
             with _no_inference_mode(), torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
