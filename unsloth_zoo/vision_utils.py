@@ -698,11 +698,8 @@ def _resolve_processor_model_name(processor, model = None):
 
 
 def _raise_chat_template_error(error, processor, model = None):
-    """Turn an apply_chat_template failure into an actionable Unsloth error.
-
-    The most common cause is a base (non instruction tuned) checkpoint whose
-    processor has no chat template, so vision conversations cannot be formatted.
-    """
+    """Turn an apply_chat_template failure into an actionable Unsloth error (usually a base
+    checkpoint whose processor has no chat template)."""
     name = _resolve_processor_model_name(processor, model)
     msg = str(error)
     if "chat template" in msg.lower():
