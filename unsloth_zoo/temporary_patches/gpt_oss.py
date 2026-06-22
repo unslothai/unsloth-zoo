@@ -1087,10 +1087,9 @@ _GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
 
 
 def _gpt_oss_cache_locations():
-    """Candidate dirs that may hold the compiled gpt_oss module: the configured
-    location and the temp-fallback the compiler switches to when that dir is not
-    writable (see compiler._get_compile_folder). Resolved without calling the
-    compiler so this never triggers distributed coordination at patch time."""
+    """Dirs that may hold the compiled gpt_oss module: the configured location and the
+    temp-fallback used when it is not writable. Resolved without the compiler so it never
+    triggers distributed coordination at patch time."""
     locs = []
     loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
     if loc:
@@ -1109,11 +1108,10 @@ def _gpt_oss_cache_locations():
 
 
 def _invalidate_gpt_oss_compiled_module():
-    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it
-    is regenerated against the CURRENT router/experts classes. The compiled module is
-    a single per-model-type file that hardcodes either the BnB (router.linear) or stock
-    (router.weight / 3D experts) layout; reusing a stale one across a 4bit<->16bit mode
-    switch re-installs the wrong classes. Cleans every candidate cache location."""
+    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
+    rebuilt against the CURRENT router/experts classes. The single per-model-type file
+    hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
+    wrong classes. Cleans every candidate location."""
     try:
         import sys as _sys
         import importlib, importlib.util
@@ -1124,37 +1122,29 @@ def _invalidate_gpt_oss_compiled_module():
                 try:
                     os.remove(_f)
                 except OSError:
-                    # Best-effort cleanup; ignore deletion failures.
                     pass
-                # Also drop the byte-compiled .pyc so a stale module is not
-                # re-imported from __pycache__ after the .py is gone.
+                # Drop the .pyc too so a stale module isn't re-imported from __pycache__.
                 try:
                     _pyc = importlib.util.cache_from_source(_f)
                     if os.path.isfile(_pyc):
                         os.remove(_pyc)
                 except Exception:
                     pass
-        # Make Python forget any cached finder/directory state for these paths.
+        # Forget any cached finder/directory state for these paths.
         try:
             importlib.invalidate_caches()
         except Exception:
             pass
     except Exception:
-        # Best-effort cache invalidation; failures here must never break loading.
-        pass
+        pass  # best-effort: cache invalidation must never break loading
 
 
 def _sync_gpt_oss_compiled_flavor(desired_flavor):
-    """Invalidate the on-disk compiled gpt_oss module when it was built for a
-    DIFFERENT flavor ("bnb4bit" vs "stock") than this load needs, independently of
-    the in-process UNSLOTH_GPT_OSS_BNB4BIT_PATCHED flag.
-
-    That flag is unset in a fresh process, so a fresh 16bit load after a 4bit load
-    (sharing the same compiled-cache dir) would otherwise import the stale BnB
-    router/experts and hit "Critical error since some weights are not initialized".
-    A small marker file next to the compiled module records the flavor it was built
-    for; on a mismatch (or when the marker is missing, i.e. an unknown older build)
-    the stale module is dropped so the compiler regenerates it for this load."""
+    """Invalidate the on-disk compiled gpt_oss module when it was built for a DIFFERENT flavor
+    ("bnb4bit" vs "stock") than this load needs, independently of the in-process flag (unset in
+    a fresh process, so a fresh 16bit load after a 4bit one would import the stale BnB classes
+    and hit "weights not initialized"). A marker file records the built flavor; on a mismatch or
+    missing marker the stale module is dropped for the compiler to regenerate."""
     try:
         locations = _gpt_oss_cache_locations()
         mismatch = False
@@ -1174,8 +1164,7 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
                 mismatch = True
         if mismatch:
             _invalidate_gpt_oss_compiled_module()
-        # Record this load's flavor where the module will be (re)built. Always write
-        # to the primary location; write to the temp fallback only if it is in use.
+        # Record this load's flavor; always at the primary location, the temp fallback only if used.
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):
                 continue
@@ -1194,31 +1183,24 @@ def patch_gpt_oss_bnb4bit_auto():
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
     """
-    # Cross-process safety: invalidate a stale on-disk compiled module built for the
-    # other flavor (the in-process flag is unset in a fresh process, so the flag-gated
-    # branches below cannot detect cross-process staleness). This is the SOLE cache
-    # invalidator: it only drops the file on an actual flavor mismatch, so a matching
-    # cache is preserved (no needless recompile every session). Gate to GPT-OSS loads
-    # so merely loading an unrelated model never touches a valid GPT-OSS cache.
+    # Cross-process safety: invalidate a stale on-disk module built for the other flavor (the
+    # in-process flag is unset in a fresh process). Sole cache invalidator: drops the file only
+    # on a real mismatch, so a matching cache is reused. Gated to gpt-oss loads.
     if "gpt_oss" in _normalized_unsloth_model_name():
         _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
 
     if not _should_use_gpt_oss_bnb4bit():
-        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally (router.linear.weight
-        # + ModuleList experts). UNSLOTH_MODEL_NAME is set per-load but persists in-process and
-        # is inherited across processes (a save->reload subprocess), so a stale "_load_in_4bit_"
-        # from an earlier bnb-4bit load would leave the BnB classes installed when later loading
-        # a 16bit (e.g. merged_16bit) checkpoint, whose router.weight + 3D experts then mismatch
-        # -> "Unsloth: Critical error since some weights are not initialized". This runs every
-        # phase (init/pre_compile/post_compile), so restore the stock classes when the current
-        # load is NOT BnB-4bit. The compiled-module file is handled by _sync above.
+        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
+        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
+        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
+        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
+        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
         if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
             restore_gpt_oss_original()
             os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
         return
-    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols.
-    # The stale-stock-module case is handled by _sync above (mismatch -> invalidate);
-    # a matching bnb module is left intact so it is reused, not recompiled each session.
+    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols. A stale
+    # stock module is handled by _sync above; a matching bnb module is reused, not recompiled.
     patch_gpt_oss_bnb4bit()
     # Inference path avoids torch.compile for 4-bit
     try:
