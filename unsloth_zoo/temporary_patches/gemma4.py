@@ -300,117 +300,125 @@ TEMPORARY_PATCHES.append(patch_StaticCache_kv_shared_zero)
 # See huggingface/transformers#45242.
 #
 # Affects num_kv_shared_layers > 0 (E2B=20, E4B=18); 31B / 26B-A4B (=0) are
-# unaffected.
+# unaffected. Confirmed on transformers 5.5.0 + gemma-4-E2B-it: use_cache=False
+# teacher-forced loss ~16 vs ~6.8 (use_cache=True); under gradient checkpointing
+# all 20 shared layers fall back to recomputing their own KV.
 #
-# Fix: wrap Gemma4TextModel.forward (and Gemma4Model.forward) so that when KV
-# sharing is active and the caller passes past_key_values=None with use_cache
-# falsy, we build a DynamicCache, run the original forward, then drop it from
-# the output to preserve use_cache=False semantics. Pass-through otherwise.
+# Fix: decouple the within-forward shared KV from past_key_values. The model
+# forward attaches a fresh tiny carrier (a shared_layers dict + no-op update) to
+# every Gemma4TextAttention, and the attention uses it whenever the real
+# past_key_values is None. The store/retrieve then works under use_cache=False
+# AND gradient checkpointing (where GradientCheckpointingLayer nulls the
+# past_key_values kwarg before the attention, defeating any injected cache).
+# Mirrors transformers' own later `shared_kv_states` fix; capability-gated to a
+# no-op on builds that already pass `shared_kv_states` (forwards-compatibility).
 # ============================================================================
 
-def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
-    """Wrap a Gemma-4 forward to build an internal DynamicCache when KV sharing
-    is active but the caller passed use_cache=False, nulling it from the output.
-
-    Uses inspect.signature.bind_partial so past_key_values / use_cache resolve
-    whether passed positionally or by keyword, and calls the inner forward via
-    bound.args/bound.kwargs to avoid duplicate-argument TypeErrors.
-    """
-    import inspect
-
+def _gemma4_kv_sharing_needs_cache():
+    """True iff this transformers build plumbs Gemma-4 cross-layer KV sharing through
+    ``past_key_values`` (the buggy, cache-dependent mechanism, transformers 5.5.0).
+    Newer builds pass it via a dedicated ``shared_kv_states`` argument to the attention
+    forward, which fixes the cache-free path and makes this patch unnecessary, so we
+    no-op there (forwards-compat with transformers >= 5.5.0 and 5.x latest)."""
     try:
-        _sig = inspect.signature(_orig_forward)
-    except (TypeError, ValueError):
-        _sig = None
+        import inspect
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
+        return "shared_kv_states" not in inspect.signature(Gemma4TextAttention.forward).parameters
+    except Exception:
+        # Default to applying: no-op for models without KV sharing, safe where needed.
+        return True
 
+
+class _Gemma4SharedKVCarrier:
+    """Carries Gemma-4 cross-layer shared K/V WITHIN a single forward, decoupled from
+    ``past_key_values`` so the store/retrieve survives both use_cache=False and
+    gradient checkpointing (GradientCheckpointingLayer nulls the past_key_values kwarg
+    before the attention runs, see transformers/modeling_layers.py). Only
+    ``shared_layers`` is used; update() is a no-op so non-shared layers never build an
+    autoregressive cache. Mirrors transformers' own later ``shared_kv_states`` fix."""
+    __slots__ = ("shared_layers",)
+    def __init__(self):
+        self.shared_layers = {}
+    def update(self, key_states, value_states, layer_idx, cache_kwargs = None):
+        return key_states, value_states
+    def get_seq_length(self, layer_idx = 0):
+        return 0
+
+
+def _make_gemma4_attention_carrier_forward(_orig_attn_forward):
+    """Feed the per-forward carrier to Gemma4TextAttention whenever the real
+    ``past_key_values`` is None (use_cache=False, or nulled by gradient
+    checkpointing), so the cross-layer KV store/retrieve still works. The carrier is
+    attached to the module by the model-forward patch below. Pass-through otherwise
+    (e.g. generation with a real cache), so this is a strict no-op when not needed."""
     def forward(self, *args, **kwargs):
-        num_kv_shared = getattr(
-            getattr(self, "config", None), "num_kv_shared_layers", 0
-        )
-        # No-op without KV sharing (31B, 26B-A4B, non-Gemma-4).
-        if not num_kv_shared or num_kv_shared <= 0:
-            return _orig_forward(self, *args, **kwargs)
-
-        # Resolve past_key_values / use_cache from args or kwargs.
-        if _sig is None:
-            # Fallback if signature introspection failed: kwargs-only path.
-            past_key_values = kwargs.get("past_key_values", None)
-            use_cache_kw = kwargs.get("use_cache", None)
-            arguments = None
-        else:
-            try:
-                bound = _sig.bind_partial(self, *args, **kwargs)
-            except TypeError:
-                # Caller passed something the original forward will reject;
-                # let the original forward raise the canonical error.
-                return _orig_forward(self, *args, **kwargs)
-            arguments = bound.arguments
-            past_key_values = arguments.get("past_key_values", None)
-            use_cache_kw = arguments.get("use_cache", None)
-
-        use_cache_resolved = (
-            use_cache_kw
-            if use_cache_kw is not None
-            else getattr(self.config, "use_cache", True)
-        )
-
-        # Only intervene when the original forward would leave past_key_values
-        # as None (use_cache falsy and no cache passed in).
-        if past_key_values is not None or use_cache_resolved:
-            return _orig_forward(self, *args, **kwargs)
-
-        # Local cache for cross-layer KV sharing only; not leaked to the caller.
-        try:
-            from transformers.cache_utils import DynamicCache
-        except Exception:
-            return _orig_forward(self, *args, **kwargs)
-
-        # Inject the cache and force use_cache=True so the inner forward takes
-        # the same mask/position path; the result is cleaned up below.
-        if arguments is not None:
-            arguments["past_key_values"] = DynamicCache(config=self.config)
-            arguments["use_cache"] = True
-            # bound.args/kwargs derive from `arguments`, so the injected values
-            # land in the correct slot without duplicate-keyword TypeErrors.
-            inner_args = bound.args
-            inner_kwargs = bound.kwargs
-            result = _orig_forward(*inner_args, **inner_kwargs)
-        else:
-            kwargs["past_key_values"] = DynamicCache(config=self.config)
-            kwargs["use_cache"] = True
-            result = _orig_forward(self, *args, **kwargs)
-
-        # Null the cache from every result shape (ModelOutput, dict, tuple) to
-        # preserve the caller's use_cache=False contract.
-        try:
-            if isinstance(result, tuple):
-                # to_tuple() drops None entries, so the cache index isn't fixed;
-                # scan for the injected DynamicCache and drop it.
-                injected = (
-                    arguments["past_key_values"]
-                    if arguments is not None
-                    else kwargs["past_key_values"]
-                )
-                new_items = tuple(None if x is injected else x for x in result)
-                result = new_items
+        carrier = getattr(self, "_unsloth_shared_kv_carrier", None)
+        if carrier is not None:
+            # past_key_values is the 4th positional arg (after self) or a kwarg.
+            if "past_key_values" in kwargs:
+                if kwargs["past_key_values"] is None:
+                    kwargs["past_key_values"] = carrier
+            elif len(args) >= 4:
+                if args[3] is None:
+                    args = args[:3] + (carrier,) + args[4:]
             else:
-                # ModelOutput acts dict-like; __setitem__ keeps the attribute
-                # slot and OrderedDict in sync. Fall back to attribute assignment.
-                set_via_item = False
-                try:
-                    if hasattr(result, "__setitem__") and "past_key_values" in result:
-                        result["past_key_values"] = None
-                        set_via_item = True
-                except (TypeError, KeyError):
-                    set_via_item = False
-                if not set_via_item and hasattr(result, "past_key_values"):
-                    try:
-                        result.past_key_values = None
-                    except (AttributeError, TypeError):
-                        pass
+                kwargs["past_key_values"] = carrier
+        return _orig_attn_forward(self, *args, **kwargs)
+    forward._unsloth_gemma4_carrier_patched = True
+    forward.__qualname__ = getattr(_orig_attn_forward, "__qualname__", "forward")
+    forward.__doc__ = getattr(_orig_attn_forward, "__doc__", None)
+    return forward
+
+
+def _patch_gemma4_attention_carrier():
+    """Patch Gemma4TextAttention.forward to accept the shared-KV carrier. Idempotent."""
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
+    except Exception:
+        return
+    if getattr(Gemma4TextAttention.forward, "_unsloth_gemma4_carrier_patched", False):
+        return
+    Gemma4TextAttention.forward = _make_gemma4_attention_carrier_forward(Gemma4TextAttention.forward)
+
+
+def _gemma4_attach_shared_kv_carrier(model):
+    """Create a fresh carrier and attach it to every Gemma4TextAttention under ``model``
+    so shared layers can reach it even after gradient checkpointing nulls their
+    past_key_values kwarg. The attention list is cached on the model; called once per
+    forward. No-op without KV sharing."""
+    attns = getattr(model, "_unsloth_gemma4_attns", None)
+    if attns is None:
+        attns = [m for m in model.modules() if m.__class__.__name__ == "Gemma4TextAttention"]
+        # Only relevant when some layer actually shares KV (E2B/E4B); cache an empty
+        # list for 31B / 26B-A4B / non-shared models so later forwards are a no-op.
+        if not any(getattr(m, "is_kv_shared_layer", False) for m in attns):
+            attns = []
+        try:
+            model._unsloth_gemma4_attns = attns
         except Exception:
             pass
-        return result
+    if not attns:
+        return
+    carrier = _Gemma4SharedKVCarrier()
+    for attn in attns:
+        try:
+            attn._unsloth_shared_kv_carrier = carrier
+        except Exception:
+            pass
+
+
+def _make_kv_shared_use_cache_false_safe_forward(_orig_forward):
+    """Wrap a Gemma-4 model forward to attach a fresh per-forward shared-KV carrier to
+    every Gemma4TextAttention, so cross-layer KV sharing works under use_cache=False
+    AND gradient checkpointing. The carrier (consumed by the attention patch) replaces
+    the older approach of injecting a DynamicCache + forcing use_cache=True, which the
+    GradientCheckpointingLayer defeated by nulling past_key_values at the attention."""
+    def forward(self, *args, **kwargs):
+        try:
+            _gemma4_attach_shared_kv_carrier(self)
+        except Exception:
+            pass
+        return _orig_forward(self, *args, **kwargs)
 
     forward._unsloth_kv_shared_use_cache_false_patched = True
     forward.__qualname__ = getattr(_orig_forward, "__qualname__", "forward")
@@ -426,7 +434,12 @@ def _patch_forward_for_kv_shared_no_cache(cls):
 
 
 def patch_Gemma4TextModel_forward_kv_shared_no_cache():
-    """Patch Gemma4TextModel.forward (the language decoder that drives attention)."""
+    """Patch Gemma4TextModel.forward + Gemma4TextAttention.forward so cross-layer KV
+    sharing works under use_cache=False and gradient checkpointing."""
+    if not _gemma4_kv_sharing_needs_cache():
+        # transformers passes the shared KV via `shared_kv_states` (cache-independent),
+        # so the cache-free path already works; this patch would be needless.
+        return
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
     except ImportError:
@@ -434,6 +447,7 @@ def patch_Gemma4TextModel_forward_kv_shared_no_cache():
     except Exception as e:
         return raise_error("Gemma4TextModel.forward use_cache=False fix", e)
     try:
+        _patch_gemma4_attention_carrier()
         _patch_forward_for_kv_shared_no_cache(Gemma4TextModel)
     except Exception as e:
         return raise_error("Gemma4TextModel.forward use_cache=False fix", e)
@@ -442,8 +456,10 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextModel_forward_kv_shared_no_cache)
 
 
 def patch_Gemma4Model_forward_kv_shared_no_cache():
-    """Patch Gemma4Model.forward (multimodal parent) as a safety net in case a
-    refactor moves cache auto-creation above Gemma4TextModel."""
+    """Patch Gemma4Model.forward (multimodal parent) to attach the carrier too, in
+    case a refactor moves cache auto-creation above Gemma4TextModel."""
+    if not _gemma4_kv_sharing_needs_cache():
+        return
     try:
         from transformers.models.gemma4.modeling_gemma4 import Gemma4Model
     except ImportError:
@@ -451,6 +467,7 @@ def patch_Gemma4Model_forward_kv_shared_no_cache():
     except Exception as e:
         return raise_error("Gemma4Model.forward use_cache=False fix", e)
     try:
+        _patch_gemma4_attention_carrier()
         _patch_forward_for_kv_shared_no_cache(Gemma4Model)
     except Exception as e:
         return raise_error("Gemma4Model.forward use_cache=False fix", e)

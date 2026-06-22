@@ -473,3 +473,99 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
         "the original ImportError must be chained (raise ... from e) so an "
         "installed-but-broken peft stays debuggable"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gemma-4 E-series cross-layer KV sharing with use_cache=False / gradient
+# checkpointing (transformers#45242). use_cache=False is the BROKEN path: the
+# shared layers recompute their own KV and the logits become garbage. A prior PR
+# tried to make the zoo fix a no-op (which would regress E-series training); these
+# tests lock the fix in and check its key invariants without a GPU/model.
+# ---------------------------------------------------------------------------
+def test_gemma4_kv_shared_patches_registered():
+    """Both shared-KV patch functions must stay registered AND actually wire the
+    carrier (not be reduced to bare `return` stubs)."""
+    import inspect
+    from unsloth_zoo.temporary_patches import gemma4 as _M
+    from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
+
+    names = {getattr(p, "__name__", "") for p in TEMPORARY_PATCHES}
+    assert "patch_Gemma4TextModel_forward_kv_shared_no_cache" in names
+    assert "patch_Gemma4Model_forward_kv_shared_no_cache" in names
+    for fn in (_M.patch_Gemma4TextModel_forward_kv_shared_no_cache,
+               _M.patch_Gemma4Model_forward_kv_shared_no_cache):
+        src = inspect.getsource(fn)
+        assert "_patch_forward_for_kv_shared_no_cache" in src and "_patch_gemma4_attention_carrier" in src, (
+            "the shared-KV fix must install both the model carrier-attacher and the "
+            "attention carrier patch; do not reduce it to a no-op"
+        )
+
+
+def test_gemma4_shared_kv_carrier_semantics():
+    """The carrier exposes only shared_layers + a no-op update (no autoregressive
+    cache accumulation), so non-shared layers stay cache-free under use_cache=False."""
+    from unsloth_zoo.temporary_patches.gemma4 import _Gemma4SharedKVCarrier
+    c = _Gemma4SharedKVCarrier()
+    assert c.shared_layers == {}
+    k, v = object(), object()
+    assert c.update(k, v, 0) == (k, v)
+    assert c.get_seq_length() == 0
+    c.shared_layers[3] = (k, v)
+    assert c.shared_layers[3] == (k, v)
+
+
+def test_gemma4_capability_gate(monkeypatch):
+    """needs_cache() is True on the buggy build (attention forward lacks
+    shared_kv_states) and False once transformers passes it explicitly (fixed).
+    Uses a synthetic module so it is independent of the installed transformers."""
+    import sys, types, inspect
+    from unsloth_zoo.temporary_patches import gemma4 as _M
+
+    class _Buggy:
+        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kw):
+            return None
+    class _Fixed:
+        def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states, past_key_values=None, **kw):
+            return None
+    # The discriminator is the `shared_kv_states` parameter on the attention forward.
+    assert "shared_kv_states" not in inspect.signature(_Buggy.forward).parameters
+    assert "shared_kv_states" in inspect.signature(_Fixed.forward).parameters
+
+    import transformers.models as tm
+    pkg = types.ModuleType("transformers.models.gemma4")
+    leaf = types.ModuleType("transformers.models.gemma4.modeling_gemma4")
+    pkg.modeling_gemma4 = leaf
+    monkeypatch.setitem(sys.modules, "transformers.models.gemma4", pkg)
+    monkeypatch.setitem(sys.modules, "transformers.models.gemma4.modeling_gemma4", leaf)
+    monkeypatch.setattr(tm, "gemma4", pkg, raising=False)
+
+    leaf.Gemma4TextAttention = _Buggy
+    assert _M._gemma4_kv_sharing_needs_cache() is True
+    leaf.Gemma4TextAttention = _Fixed
+    assert _M._gemma4_kv_sharing_needs_cache() is False
+
+
+def test_gemma4_attention_carrier_substitution():
+    """The attention wrapper supplies the carrier only when the real past_key_values
+    is None (use_cache=False or nulled by gradient checkpointing); a real cache and
+    the no-carrier case pass through unchanged."""
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _make_gemma4_attention_carrier_forward, _Gemma4SharedKVCarrier,
+    )
+    seen = {}
+    def orig(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kw):
+        seen["pkv"] = past_key_values
+        return "ok"
+    wrapped = _make_gemma4_attention_carrier_forward(orig)
+
+    class M:
+        pass
+    m = M(); carrier = _Gemma4SharedKVCarrier(); m._unsloth_shared_kv_carrier = carrier
+    wrapped(m, "h", "pe", "am", past_key_values=None)
+    assert seen["pkv"] is carrier, "None past_key_values must be replaced by the carrier"
+    real = object()
+    wrapped(m, "h", "pe", "am", past_key_values=real)
+    assert seen["pkv"] is real, "a real cache must NOT be replaced"
+    m2 = M()  # no carrier attached
+    wrapped(m2, "h", "pe", "am", past_key_values=None)
+    assert seen["pkv"] is None, "without a carrier, pass through unchanged"
