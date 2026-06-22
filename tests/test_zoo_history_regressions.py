@@ -473,3 +473,124 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
         "the original ImportError must be chained (raise ... from e) so an "
         "installed-but-broken peft stays debuggable"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: gpt-oss bnb-4bit <-> 16bit compiled-cache mode switch.
+# The compiled gpt_oss module hardcodes the BnB or stock router/experts layout. Reusing a
+# stale BnB-built module for a later 16bit load re-installs the BnB router -> "weights not
+# initialized". patch_gpt_oss_bnb4bit_auto must restore stock classes + invalidate the module
+# when the load is not bnb-4bit, and drop a stale stock module when switching into bnb.
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path, monkeypatch):
+    """_invalidate_gpt_oss_compiled_module removes the sys.modules entry and the on-disk .py so
+    the next compile regenerates against the active classes."""
+    import sys
+    import types
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    # fake an already-imported compiled module + its on-disk cache file
+    sys.modules["unsloth_compiled_module_gpt_oss"] = types.ModuleType(
+        "unsloth_compiled_module_gpt_oss"
+    )
+    cache_dir = tmp_path / "unsloth_compiled_cache"
+    cache_dir.mkdir()
+    cache_file = cache_dir / "unsloth_compiled_module_gpt_oss.py"
+    cache_file.write_text("# stale compiled module\n")
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(cache_dir))
+
+    try:
+        _M._invalidate_gpt_oss_compiled_module()
+        assert "unsloth_compiled_module_gpt_oss" not in sys.modules, (
+            "stale compiled module must be evicted from sys.modules"
+        )
+        assert not cache_file.exists(), (
+            "stale on-disk compiled module .py must be deleted"
+        )
+        # idempotent: a second call with nothing to clean must not raise
+        _M._invalidate_gpt_oss_compiled_module()
+    finally:
+        sys.modules.pop("unsloth_compiled_module_gpt_oss", None)
+
+
+def test_gpt_oss_bnb4bit_auto_restores_and_invalidates_on_non_4bit_load():
+    """AST contract: patch_gpt_oss_bnb4bit_auto's non-bnb branch restores stock classes and
+    clears UNSLOTH_GPT_OSS_BNB4BIT_PATCHED, and the function syncs the on-disk module to the
+    current flavor (the sole cache invalidator). Asserted on the AST so it can't be dropped."""
+    import ast
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    src = inspect.getsource(_M.patch_gpt_oss_bnb4bit_auto)
+    body = ast.unparse(ast.parse(src))
+
+    assert "restore_gpt_oss_original" in body, (
+        "non-bnb load must call restore_gpt_oss_original() so a stale BnB router "
+        "swap from an earlier 4bit load does not break a later 16bit reload"
+    )
+    assert "_sync_gpt_oss_compiled_flavor" in body, (
+        "must sync the compiled gpt_oss module to the current flavor on a "
+        "bnb<->16bit mode switch (otherwise the wrong router/experts layout is "
+        "re-installed); this is the sole compiled-module invalidator"
+    )
+    assert "UNSLOTH_GPT_OSS_BNB4BIT_PATCHED" in body, (
+        "must track/clear the BNB4BIT_PATCHED flag to detect the mode switch"
+    )
+
+
+def test_sync_gpt_oss_compiled_flavor_drops_cross_process_stale_module(tmp_path, monkeypatch):
+    """In a fresh process the in-process flag is unset, so _sync_gpt_oss_compiled_flavor must
+    invalidate a stale module via the on-disk marker, and be a no-op when the flavor matches."""
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    cache_dir = tmp_path / "unsloth_compiled_cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(cache_dir))
+    module = cache_dir / "unsloth_compiled_module_gpt_oss.py"
+    marker = cache_dir / ".unsloth_gpt_oss_compiled_flavor"
+
+    # Prior 4bit process left a BnB-built module; a fresh 16bit (stock) load must drop it.
+    module.write_text("# bnb-built\n")
+    marker.write_text("bnb4bit")
+    _M._sync_gpt_oss_compiled_flavor("stock")
+    assert not module.exists(), "stale BnB module not invalidated for a fresh stock load"
+    assert marker.read_text().strip() == "stock"
+
+    # Matching flavor is a strict no-op (no needless recompile).
+    module.write_text("# stock-built\n")
+    marker.write_text("stock")
+    before = module.read_text()
+    _M._sync_gpt_oss_compiled_flavor("stock")
+    assert module.exists() and module.read_text() == before, "matching flavor wrongly invalidated"
+
+    # An older build with no marker is treated as unknown -> conservatively rebuilt.
+    module.write_text("# unknown\n")
+    if marker.exists():
+        marker.unlink()
+    _M._sync_gpt_oss_compiled_flavor("stock")
+    assert not module.exists(), "unmarked module not conservatively invalidated"
+
+
+def test_patch_gpt_oss_auto_does_not_touch_cache_for_non_gpt_loads(tmp_path, monkeypatch):
+    """patch_gpt_oss_bnb4bit_auto runs for every load; loading an unrelated model must not delete
+    a valid gpt-oss cache (the flavor sync is gated on the model being gpt-oss)."""
+    from unsloth_zoo.temporary_patches import gpt_oss as _M
+
+    cache_dir = tmp_path / "unsloth_compiled_cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(cache_dir))
+    module = cache_dir / "unsloth_compiled_module_gpt_oss.py"
+    marker = cache_dir / ".unsloth_gpt_oss_compiled_flavor"
+    module.write_text("# valid bnb4bit gpt-oss compiled module\n")
+    marker.write_text("bnb4bit")
+    before = module.read_text()
+
+    # Loading some other model (name has no "gpt_oss") must leave the cache intact.
+    monkeypatch.setenv("UNSLOTH_MODEL_NAME", "meta-llama/Llama-3.2-1B")
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0")
+    _M.patch_gpt_oss_bnb4bit_auto()
+    assert module.exists() and module.read_text() == before, (
+        "loading a non-GPT model deleted the GPT-OSS compiled cache"
+    )
