@@ -172,9 +172,65 @@ def _active_merge_device():
     return "cpu"
 pass
 
-def _merge_lora(W, lora_stats, name):
+# Architectures whose bnb-4bit merged_16bit export must fold the adapter onto the DEQUANTIZED
+# 4bit base dequant(W4), not the downloaded 16bit base W16 (see `_merge_lora`). Deliberately
+# narrow: the dequant base bakes quant noise into the checkpoint and regresses ordinary models
+# (Qwen2.5 perplexity +~20%), so only models where the quant error swamps the fine-tune delta
+# (huge base-weight norms from small MuP multipliers over a deep hybrid stack) belong here.
+_DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})
+
+
+def _model_type_needs_dequant_merge_base(model) -> bool:
+    """True iff `model`'s architecture is one whose on-the-fly bnb-4bit merged_16bit
+    export must use dequant(W4) as the LoRA merge base instead of the downloaded W16."""
+    try:
+        cfg = getattr(model, "config", None)
+        mt = (getattr(cfg, "model_type", "") or "").lower()
+    except Exception:
+        return False
+    return mt in _DEQUANT_MERGE_BASE_MODEL_TYPES
+
+
+def _is_bnb_4bit_base(module):
+    # True iff `module` is a live bitsandbytes 4bit linear whose weight still
+    # carries a quant_state (i.e. an on-the-fly / pre-quantized bnb-4bit base).
+    if module is None: return False
+    weight = getattr(module, "weight", None)
+    if weight is None: return False
+    if weight.__class__.__name__ != "Params4bit": return False
+    return getattr(weight, "quant_state", None) is not None
+pass
+
+
+def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
     device = _active_merge_device()
+    # QLoRA merge-base correctness (gated, see _DEQUANT_MERGE_BASE_MODEL_TYPES). A bnb-4bit
+    # adapter is trained against dequant(W4), not the 16bit base W16 that merged_16bit downloads;
+    # they differ by quant error q = W16 - dequant(W4). Merging the delta into W16 leaves a stray
+    # +q the adapter never saw. For most models ||q|| is negligible (and W16 is the better 16bit
+    # weight), but for huge base-weight norms over tiny MuP multipliers (Falcon-H1) +q compounds
+    # and swamps the fine-tune. The caller sets use_dequant_base only for gated archs -> strict
+    # no-op elsewhere. Assumes a live 4bit base means the adapter trained against dequant(W4)
+    # (the standard QLoRA flow); an adapter trained on the 16bit base and only reloaded in 4bit
+    # for export has no merge-time provenance signal, so it would also fold onto dequant(W4).
+    if use_dequant_base and _is_bnb_4bit_base(getattr(lora_stats, "module", None)):
+        try:
+            W_dq = dequantize_module_weight(lora_stats.module)
+        except Exception as e:
+            # For a gated arch the 16bit base is the known-wrong base (the +q error this path
+            # exists to remove), so silently folding onto it would emit a corrupt merged_16bit.
+            # Surface the failure instead of degrading just this layer to the wrong base.
+            raise RuntimeError(
+                f"Unsloth: could not dequantize the 4bit base for `{name}` during merged_16bit "
+                "export of a model that requires dequant(W4) as the merge base. Falling back to "
+                "the 16bit base would corrupt this checkpoint, so the merge was aborted. Free GPU "
+                "memory (or merge on CPU) and retry."
+            ) from e
+        if tuple(W_dq.shape) == tuple(W.shape):
+            W = W_dq
+        # else: a shape mismatch is structural (e.g. vocab resize handled below), not a dequant
+        # failure, so keep the 16bit W here and let the resize path reconcile it.
     W = W.to(device, dtype = torch.float32, non_blocking = True)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
@@ -536,6 +592,7 @@ def _merge_and_overwrite_lora(
     save_method = "merged_16bit",
     counted_lora_modules = None,
     tie_word_embeddings = False,
+    use_dequant_base = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -758,7 +815,7 @@ def _merge_and_overwrite_lora(
                             W = saved_weight.to(W.device, dtype = target_dtype, non_blocking = True)
                             count += 1
                     elif hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
-                        W = _merge_lora(W, lora_stats, output_key)
+                        W = _merge_lora(W, lora_stats, output_key, use_dequant_base = use_dequant_base)
                         count += 1
 
                 success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
@@ -1260,6 +1317,60 @@ def _resolve_moe_num_experts(prefix, lora_stats, moe_num_experts):
 
 
 
+# Per-expert disk-tensor naming schemes for the per-expert (2D) MoE layout.
+# Default scheme is the standard gate_proj/up_proj/down_proj (DeepSeek/Qwen3 on
+# old transformers). LFM2 (lfm2_moe) and some ERNIE variants instead store the
+# experts on disk as w1 (gate) / w3 (up) / w2 (down) while the runtime module is
+# the fused Lfm2MoeExperts/Ernie4_5_MoeExperts (LoRA on gate_up_proj/down_proj).
+# (Lfm2MoeMLP.forward = w2(silu(w1(x)) * w3(x))  ->  w1=gate, w3=up, w2=down.)
+_MOE_PEREXPERT_SCHEMES = (
+    ("gate_proj", "up_proj", "down_proj"),
+    ("w1", "w3", "w2"),
+)
+
+
+def _detect_moe_perexpert_scheme(prefix, header_metadata):
+    """The (gate, up, down) per-expert disk-tensor name scheme for ``prefix`` in the shard
+    header, or None. Detected from the header (any expert index, any projection), not by model
+    name, so a shard holding only later experts (e.g. prefix.7.w3.weight) is still matched."""
+    esc = re.escape(prefix)
+    for gate_name, up_name, down_name in _MOE_PEREXPERT_SCHEMES:
+        names = "|".join(re.escape(n) for n in (gate_name, up_name, down_name))
+        pat = re.compile(rf"^{esc}\.\d+\.(?:{names})\.weight$")
+        if any(pat.match(k) for k in header_metadata):
+            return gate_name, up_name, down_name
+    return None
+
+
+def _count_moe_experts_in_header(prefix, header_metadata, scheme):
+    """Expert count (max per-expert index + 1) for ``prefix`` under ``scheme`` in the shard
+    header, or None. Seeds moe_num_experts for schemes the pre-scan misses (w1/w3/w2), so a
+    down_proj-only adapter still merges every expert instead of deriving 1."""
+    names = "|".join(re.escape(n) for n in scheme)
+    pat = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.(?:{names})\.weight$")
+    max_idx = -1
+    for k in header_metadata:
+        m = pat.match(k)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return (max_idx + 1) if max_idx >= 0 else None
+
+
+def _resolve_moe_num_experts_with_header(prefix, resolution_stats, moe_num_experts, header_metadata, scheme):
+    """Expert count for ``prefix``, preferring the authoritative source: the live module's
+    num_experts then the fused-LoRA shape (both shard-independent), else the shard header's
+    (max index + 1) only when neither resolves (e.g. a down_proj-only w1/w3/w2 adapter that
+    derives 1). The header may only RAISE a missing/too-low count, never lower an authoritative
+    one -- a low-index shard subset under-counts and would corrupt the per-expert slicing
+    stride. Records a raised count and returns it (possibly None)."""
+    num_experts = _resolve_moe_num_experts(prefix, resolution_stats, moe_num_experts)
+    hdr_ne = _count_moe_experts_in_header(prefix, header_metadata, scheme)
+    if hdr_ne and hdr_ne > (num_experts or 0):
+        num_experts = hdr_ne
+        moe_num_experts[prefix] = hdr_ne
+    return num_experts
+
+
 def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys):
     count = 0
     debug_logged = 0
@@ -1307,12 +1418,20 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         if ".experts" in lora_key or ".moe" in lora_key:
             base = lora_key.replace(".base_layer", "")
             # Try direct match first (standard models)
-            if f"{base}.gate_up_proj" in header_metadata or f"{base}.down_proj" in header_metadata:
+            if (
+                f"{base}.gate_up_proj" in header_metadata
+                or f"{base}.down_proj" in header_metadata
+                or _detect_moe_perexpert_scheme(base, header_metadata) is not None
+            ):
                 _moe_lora_to_shard_prefix[lora_key] = base
             else:
                 # Try remapping moe -> experts (Gemma4)
                 remapped = base.replace(".moe", ".experts")
-                if f"{remapped}.gate_up_proj" in header_metadata or f"{remapped}.down_proj" in header_metadata:
+                if (
+                    f"{remapped}.gate_up_proj" in header_metadata
+                    or f"{remapped}.down_proj" in header_metadata
+                    or _detect_moe_perexpert_scheme(remapped, header_metadata) is not None
+                ):
                     _moe_lora_to_shard_prefix[lora_key] = remapped
 
     for lora_key, lora_stats in converted_lora_weights.items():
@@ -1387,7 +1506,10 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 counted_lora_modules.add(lora_key)
             continue
 
-        # Standard per-expert format (DeepSeek, Qwen3, GLM4, etc.)
+        # Standard per-expert format (DeepSeek, Qwen3, GLM4, etc.): default
+        # gate_proj/up_proj/down_proj, or w1/w3/w2 (LFM2 / some ERNIE) per the shard layout.
+        _scheme = _detect_moe_perexpert_scheme(prefix, header_metadata)
+        gate_name, up_name, down_name = _scheme or ("gate_proj", "up_proj", "down_proj")
         resolution_stats = lora_stats
         if getattr(resolution_stats, "module", None) is None:
             base_stats = converted_lora_weights.get(prefix + ".base_layer")
@@ -1396,8 +1518,9 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 and getattr(base_stats, "module", None) is not None
             ):
                 resolution_stats = base_stats
-        num_experts = _resolve_moe_num_experts(
-            prefix, resolution_stats, moe_num_experts
+        num_experts = _resolve_moe_num_experts_with_header(
+            prefix, resolution_stats, moe_num_experts,
+            header_metadata, (gate_name, up_name, down_name),
         )
         if UNSLOTH_ENABLE_LOGGING and num_experts is not None and debug_logged < 2:
             try:
@@ -1426,8 +1549,8 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 pass
         for expert_idx in range(num_experts):
             if is_gate:
-                gate_key = f"{prefix}.{expert_idx}.gate_proj.weight"
-                up_key   = f"{prefix}.{expert_idx}.up_proj.weight"
+                gate_key = f"{prefix}.{expert_idx}.{gate_name}.weight"
+                up_key   = f"{prefix}.{expert_idx}.{up_name}.weight"
                 if _merge_moe_expert_quant_aware(
                     "gate", gate_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
@@ -1441,7 +1564,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 ):
                     module_updated = True
             else:
-                down_key = f"{prefix}.{expert_idx}.down_proj.weight"
+                down_key = f"{prefix}.{expert_idx}.{down_name}.weight"
                 if _merge_moe_expert_quant_aware(
                     "down", down_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
@@ -1963,10 +2086,25 @@ def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
     with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
-    if "quantization_config" in config:
-        # Remove the quantization_config field
-        del config["quantization_config"]
-    else:
+    # Strip quantization_config from the top level AND nested sub-configs. VLMs keep it under
+    # text_config/vision_config, so a merged_16bit export would ship bf16 weights still labelled
+    # load_in_4bit there -> on reload transformers builds the bnb quantizer for full-precision
+    # weights ("Cannot copy out of meta tensor"). Recurse to remove it wherever it lives.
+    def _strip_quantization_config(obj):
+        removed = False
+        if isinstance(obj, dict):
+            if "quantization_config" in obj:
+                del obj["quantization_config"]
+                removed = True
+            for value in obj.values():
+                if _strip_quantization_config(value):
+                    removed = True
+        elif isinstance(obj, list):
+            for value in obj:
+                if _strip_quantization_config(value):
+                    removed = True
+        return removed
+    if not _strip_quantization_config(config):
         return
     # Overwrite the config file
     with open(config_path, "w", encoding = "utf-8") as f:
@@ -2143,6 +2281,25 @@ def merge_and_overwrite_lora(
                                         file_size = os.path.getsize(file_path)
                                         max_size_in_bytes = max(max_size_in_bytes, file_size)
                                         total_size_in_bytes += file_size
+                            else:
+                                # Drop stale/duplicate shards the index doesn't reference
+                                # (mirrors the HF-repo branch below): a local snapshot can carry a
+                                # leftover non-indexed shard set (e.g. granite-3.2-8b) whose shapes
+                                # differ -> "Bad in-place call". Filter only when extra shards
+                                # exist, so well-formed dirs are untouched.
+                                _indexed = {os.path.split(v)[-1] for v in index_data["weight_map"].values()}
+                                if _indexed and not set(safetensors_list).issubset(_indexed):
+                                    _kept = [s for s in safetensors_list if s in _indexed]
+                                    if _kept and len(_kept) != len(safetensors_list):
+                                        safetensors_list    = _kept
+                                        max_size_in_bytes   = 0
+                                        total_size_in_bytes = 0
+                                        for _s in safetensors_list:
+                                            _sp = os.path.join(model_name, _s)
+                                            if os.path.exists(_sp):
+                                                _sz = os.path.getsize(_sp)
+                                                max_size_in_bytes   = max(max_size_in_bytes, _sz)
+                                                total_size_in_bytes += _sz
                 except Exception as e:
                     print(f"Warning: Could not process index file: {e}")
             tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
@@ -2177,6 +2334,36 @@ def merge_and_overwrite_lora(
                 safetensors_list.append(fname)
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+
+            # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
+            # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
+            # the index references only the real set; merging into a stale shard whose shapes
+            # differ raises "Bad in-place call". Filter only when extra shards exist.
+            try:
+                from huggingface_hub import hf_hub_download as _hf_hub_download
+                _idx_path = _hf_hub_download(
+                    repo_id  = model_name,
+                    filename = "model.safetensors.index.json",
+                    token    = token,
+                )
+                with open(_idx_path, "r", encoding = "utf-8") as f:
+                    _weight_map = json.load(f).get("weight_map", {})
+                _indexed = {os.path.split(v)[-1] for v in _weight_map.values()}
+                if _indexed and not set(safetensors_list).issubset(_indexed):
+                    _kept = [s for s in safetensors_list if s in _indexed]
+                    if _kept and len(_kept) != len(safetensors_list):
+                        _sizes = {os.path.split(x["name"])[-1] : x["size"] for x in _hf_entries}
+                        safetensors_list      = _kept
+                        max_size_in_bytes     = 0
+                        total_size_in_bytes   = 0
+                        for _s in safetensors_list:
+                            _sz = _sizes.get(_s, 0)
+                            max_size_in_bytes   = max(max_size_in_bytes, _sz)
+                            total_size_in_bytes += _sz
+            except Exception:
+                # Index-based filtering is best-effort: if the index cannot be
+                # fetched/parsed, fall back to the full shard list found above.
+                pass
 
         if not safetensors_list:
              raise RuntimeError(f"No '.safetensors' files found for the base model: {model_name}")
@@ -2474,6 +2661,19 @@ def merge_and_overwrite_lora(
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
+    # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
+    # (see _merge_lora). Strict no-op for every other model/merge.
+    _use_dequant_base = (
+        save_method == "merged_16bit"
+        and _model_type_needs_dequant_merge_base(_merge_base_model)
+    )
+    if _use_dequant_base:
+        warnings.warn(
+            "Unsloth: merging each LoRA delta onto the dequantized 4bit base "
+            "dequant(W4) (the weights the QLoRA adapter trained against) instead of "
+            "the downloaded 16bit base, to keep the merged_16bit checkpoint faithful "
+            f"for model_type={getattr(getattr(_merge_base_model, 'config', None), 'model_type', '?')}."
+        )
 
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
@@ -2487,6 +2687,7 @@ def merge_and_overwrite_lora(
             save_method = save_method,
             counted_lora_modules = counted_lora_modules_global,
             tie_word_embeddings = _merge_tie_word_embeddings,
+            use_dequant_base = _use_dequant_base,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)

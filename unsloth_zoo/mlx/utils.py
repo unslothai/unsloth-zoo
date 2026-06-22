@@ -5389,12 +5389,41 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
 
-    if not os.path.exists(llama_cpp_folder):
+    def _clone():
         print("Unsloth: Cloning llama.cpp...")
         subprocess.run(
             ["git", "clone", "https://github.com/ggml-org/llama.cpp", llama_cpp_folder],
             check=True,
         )
+
+    if not os.path.exists(llama_cpp_folder):
+        _clone()
+    elif not os.path.isfile(os.path.join(llama_cpp_folder, "CMakeLists.txt")):
+        # The folder exists but is not a llama.cpp source tree -- e.g. a prior
+        # prebuilt install left binaries + a marker (and no CMakeLists.txt). cmake
+        # would fail against it, so replace it with a fresh source checkout before
+        # building. A real source tree (CMakeLists.txt present) is kept and rebuilt.
+        #
+        # Only ever delete a directory we recognise as our own managed prebuilt
+        # install (carries UNSLOTH_PREBUILT_INFO.json) AND that lives in a
+        # safe-to-delete location (under ~/.unsloth or the legacy ./llama.cpp).
+        # Reuse the same guards the generic installer uses so a user-pointed
+        # UNSLOTH_LLAMA_CPP_PATH that happens to be a non-source directory is
+        # never wiped out from under the caller.
+        from ..llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
+        is_prebuilt_install = os.path.isfile(
+            os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
+        )
+        if not (is_prebuilt_install and _is_safe_to_delete(llama_cpp_folder)):
+            raise RuntimeError(
+                f"Unsloth: '{llama_cpp_folder}' exists but is not a llama.cpp source "
+                f"tree, and is not a recognised Unsloth prebuilt install in a managed "
+                f"location, so it will not be removed.\n"
+                f"Please point the build at a fresh directory or manually remove it."
+            )
+        print("Unsloth: Existing prebuilt llama.cpp install is not a source tree; re-cloning for the source build...")
+        shutil.rmtree(llama_cpp_folder, ignore_errors=True)
+        _clone()
 
     # Install deps; prefer gguf from the cloned repo to stay in sync
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
@@ -5414,10 +5443,31 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     # Build with cmake (Metal support on macOS)
     build_dir = os.path.join(llama_cpp_folder, "build")
     print("Unsloth: Building llama.cpp with cmake...")
-    subprocess.run(
+
+    def _run_build_step(cmd, description):
+        # capture_output keeps a successful build quiet, but on failure cmake's
+        # stdout/stderr would be swallowed inside CalledProcessError and the user
+        # would see a bare non-zero exit with no build log. Surface the captured
+        # output in the RuntimeError so macOS build failures are debuggable (this
+        # mirrors how the Linux source-build path in llama_cpp.py reports errors).
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            details = ""
+            if exc.stdout: details += f"\n--- stdout ---\n{exc.stdout}"
+            if exc.stderr: details += f"\n--- stderr ---\n{exc.stderr}"
+            raise RuntimeError(
+                f"Unsloth: {description} failed (exit {exc.returncode}).{details}"
+            ) from exc
+
+    _run_build_step(
         ["cmake", llama_cpp_folder, "-B", build_dir,
+         # macOS uses a single-config generator, so the build type must be set
+         # at configure time; --config Release on the build step is ignored and
+         # the binaries would otherwise be built unoptimized (very slow).
+         "-DCMAKE_BUILD_TYPE=Release",
          "-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"],
-        check=True, capture_output=True,
+        "llama.cpp cmake configure",
     )
 
     import psutil
@@ -5427,10 +5477,10 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     for t in targets:
         target_args += ["--target", t]
 
-    subprocess.run(
+    _run_build_step(
         ["cmake", "--build", build_dir, "--config", "Release",
          f"-j{n_jobs}", "--clean-first"] + target_args,
-        check=True, capture_output=True,
+        "llama.cpp cmake build",
     )
 
     # Copy binaries to llama.cpp root
@@ -5478,6 +5528,7 @@ def save_pretrained_gguf(
         convert_to_gguf,
         quantize_gguf,
         check_llama_cpp,
+        install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
@@ -5529,13 +5580,69 @@ def save_pretrained_gguf(
                     f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
                 )
 
+        # Strip MTP/nextn config keys so llama.cpp converter
+        # doesn't inflate block_count / inject nextn_predict_layers.
+        # Also restore architectures from the original HF config since
+        # mlx-vlm's save_config strips that key.
+        _config_path = tmp_path / "config.json"
+        if _config_path.exists():
+            _cfg = json.loads(_config_path.read_text())
+            _changed = False
+            for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
+                if _cfg.pop(_key, None) is not None:
+                    _changed = True
+                _tc = _cfg.get("text_config")
+                if _tc and _tc.pop(_key, None) is not None:
+                    _changed = True
+            # Restore architectures from the original HF config
+            if "architectures" not in _cfg:
+                _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
+                if _orig_cfg_path:
+                    _orig_cfg_file = os.path.join(_orig_cfg_path, "config.json")
+                    if os.path.exists(_orig_cfg_file):
+                        _orig_cfg = json.load(open(_orig_cfg_file))
+                        if "architectures" in _orig_cfg:
+                            _cfg["architectures"] = _orig_cfg["architectures"]
+                            _changed = True
+            if _changed:
+                _config_path.write_text(json.dumps(_cfg, indent=2))
+
         # Step 2: Ensure llama.cpp is installed and gguf package is available
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
-            quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+            try:
+                # Prefer the shared installer on every platform: it tries a
+                # prebuilt llama.cpp archive first and only then compiles.
+                # gpu_support=False everywhere: GGUF export only needs the CPU-only
+                # llama-quantize, so no GPU/CUDA build is required. On macOS the
+                # flag is moot anyway -- the installer returns the same universal
+                # unslothai/llama.cpp macOS/Metal bundle regardless, and the macOS
+                # source-build fallback below compiles with Metal on its own.
+                # install_llama_cpp also creates ~/.unsloth before cloning, so a
+                # fresh machine is fine.
+                quantizer_location, converter_location = install_llama_cpp(
+                    llama_cpp_folder,
+                    gpu_support = False,
+                )
+            except RuntimeError as exc:
+                # The source-build fallback resolves missing system build-deps via
+                # apt-get, which does not exist on macOS. Both raise sites for that
+                # (do_we_need_sudo and install_package) end with the same phrase
+                # "Is this NOT a Linux / Mac based computer?", so match on that shared
+                # suffix rather than one variant. Only when the prebuilt was
+                # unavailable AND we hit that macOS-only failure do we build from
+                # source with cmake + Metal via the macOS helper, then re-probe for
+                # the freshly built binaries.
+                if (
+                    sys.platform != "darwin"
+                    or "Is this NOT a Linux / Mac based computer?" not in str(exc)
+                ):
+                    raise
+                _install_llama_cpp_macos(llama_cpp_folder)
+                quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
 
         # Ensure gguf is installed (may be missing if llama.cpp was built
