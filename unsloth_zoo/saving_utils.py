@@ -389,9 +389,12 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
-        # Wrappers with `scaling` but not Linear_LoRA_Layers (MoE/quant/older peft):
-        # capture alpha so counts align and the delta isn't merged with alpha = 0. (#2966)
+        # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers but
+        # carrying adapter tensors + `scaling`: capture alpha so counts align and the
+        # delta isn't merged with alpha = 0. Require lora_A/lora_B so a non-LoRA module
+        # with its own `scaling` + `active_adapter` is not misclassified. (#2966)
         elif hasattr(module, "scaling") and \
+            (hasattr(module, "lora_A") or hasattr(module, "lora_B")) and \
             (hasattr(module, "active_adapters") or hasattr(module, "active_adapter")):
             lora_weights[name].alpha = _get_lora_scaling(module)
             scaling_count += 1
