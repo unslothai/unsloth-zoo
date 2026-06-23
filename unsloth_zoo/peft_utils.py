@@ -163,8 +163,8 @@ def get_lora_layer_modules():
     for file in files:
         if file == "__init__.py" or not file.endswith(".py"): continue
         item = f"peft.tuners.lora.{file[:-len('.py')]}"
-        # Skip a submodule whose optional backend (bnb/eetq/awq/...) is absent or
-        # partially installed, rather than crashing the whole LoRA-layer discovery.
+        # Skip submodules whose optional backend (bnb/eetq/awq/...) is missing
+        # instead of crashing LoRA-layer discovery.
         try:
             exec(f"import {item}", locals(), globals())
         except (ImportError, OSError, ValueError, AttributeError, TypeError) as exception:

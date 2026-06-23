@@ -28,10 +28,9 @@ import importlib.util
 import sys
 import types
 
-# saving_utils imports bitsandbytes at module scope. When absent (CPU-only) install a
-# lightweight stub with a real __spec__ so find_spec() probes in peft / transformers
-# don't raise on a bare ModuleType whose __spec__ is None. Built inline (no unsloth_zoo
-# import) so package init can't pull the very deps the stub is meant to avoid.
+# Stub bitsandbytes (imported at module scope) for CPU-only runs. Needs a real __spec__
+# so find_spec() probes don't raise; built inline so package init can't pull the deps
+# the stub avoids.
 if importlib.util.find_spec("bitsandbytes") is None:
     from importlib.machinery import ModuleSpec
     _bnb = types.ModuleType("bitsandbytes")
@@ -39,8 +38,7 @@ if importlib.util.find_spec("bitsandbytes") is None:
     _bnb.__path__ = []
     _bnb_nn = types.ModuleType("bitsandbytes.nn")
     _bnb_nn.__spec__ = ModuleSpec("bitsandbytes.nn", loader=None)
-    # Subclassable placeholders so older peft `class X(bnb.nn.Y)` import-time subclassing
-    # works; modern peft subclasses torch.nn.Module and touches bnb.nn only in methods.
+    # Subclassable placeholders for older peft `class X(bnb.nn.Y)` import-time subclassing.
     for _cls in ("Linear8bitLt", "Linear4bit", "Int8Params", "Params4bit"):
         setattr(_bnb_nn, _cls, type(_cls, (object,), {}))
     _bnb.nn = _bnb_nn
@@ -417,7 +415,7 @@ def test_get_lora_scaling_unresolved_returns_zero():
 
 
 class _FakeLoRALinear(nn.Module):
-    """LoRA wrapper not surfaced by get_lora_layer_modules(), exposing only the singular active_adapter (#2966)."""
+    """LoRA wrapper not surfaced by get_lora_layer_modules(); singular active_adapter only (#2966)."""
     def __init__(self, n=8, r=4, alpha=8):
         super().__init__()
         self.base_layer = nn.Linear(n, n, bias=False)
@@ -440,7 +438,7 @@ class _PeftLike(nn.Module):
         self.base_model = _BM(inner)
 
 def test_create_lora_statistics_counts_align_for_unmatched_class():
-    """Class-mismatched LoRA layers (#2966) must have scaling captured so the delta isn't merged with alpha = 0."""
+    """Class-mismatched LoRA layers must capture scaling so the delta isn't merged with alpha = 0 (#2966)."""
     model = _PeftLike(_Inner(3))
     lora_weights, _ = create_lora_statistics(model, merge_into_original=True, return_state_dict=False)
     alphas = [v.alpha for v in lora_weights.values() if v.lora_A is not None]
@@ -449,9 +447,8 @@ def test_create_lora_statistics_counts_align_for_unmatched_class():
 
 
 def test_non_lora_scaled_module_not_misclassified():
-    """A module exposing `scaling` + singular active_adapter but no LoRA tensors
-    (e.g. an attention scale) must not be captured as a LoRA wrapper and have its
-    weights scheduled for removal (#806)."""
+    """A module with `scaling` + singular active_adapter but no LoRA tensors
+    (e.g. an attention scale) must not be captured as a LoRA wrapper (#806)."""
     inner = _Inner(2)  # two real LoRA layers (have lora_A/lora_B)
     non_lora = nn.Linear(8, 8, bias=False)
     non_lora.scaling = 0.125
@@ -460,7 +457,6 @@ def test_non_lora_scaled_module_not_misclassified():
     model = _PeftLike(inner)
 
     lora_weights, _ = create_lora_statistics(model, merge_into_original=True, return_state_dict=False)
-    # The real LoRA layers are still captured...
+    # Real LoRA layers captured; non-LoRA scaled module not (its weight is not dropped).
     assert sum(1 for v in lora_weights.values() if v.lora_A is not None) == 2
-    # ...but the non-LoRA scaled module is not (no key, so its weight is not dropped).
     assert not any(k.endswith("attn_like") for k in lora_weights)

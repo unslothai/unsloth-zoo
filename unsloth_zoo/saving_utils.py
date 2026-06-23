@@ -340,7 +340,7 @@ pass
 
 def _get_lora_scaling(module):
     # All Unsloth Zoo code licensed under LGPLv3
-    # active_adapters (plural) or older singular active_adapter (may be a list);
+    # Resolve plural active_adapters or older singular active_adapter (may be a list);
     # 0.0 if unresolved so counts align. (#2966)
     active_adapters = getattr(module, "active_adapters", None)
     if active_adapters:
@@ -389,10 +389,9 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
-        # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers but
-        # carrying adapter tensors + `scaling`: capture alpha so counts align and the
-        # delta isn't merged with alpha = 0. Require lora_A/lora_B so a non-LoRA module
-        # with its own `scaling` + `active_adapter` is not misclassified. (#2966)
+        # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers:
+        # capture alpha so counts align. Require lora_A/lora_B so a non-LoRA module
+        # with its own `scaling` + `active_adapter` isn't misclassified. (#2966)
         elif hasattr(module, "scaling") and \
             (hasattr(module, "lora_A") or hasattr(module, "lora_B")) and \
             (hasattr(module, "active_adapters") or hasattr(module, "active_adapter")):
