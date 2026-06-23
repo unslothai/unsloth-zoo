@@ -2,9 +2,23 @@
 # Copyright 2023-present the Unsloth team. All rights reserved.
 """Offline tests for unsloth_zoo.pad_token.fix_pad_token (no network, no torch)."""
 
+import importlib.util
+import os
+
 import pytest
 
-from unsloth_zoo.pad_token import fix_pad_token, VISION_RESERVED_TOKENS
+# Load pad_token.py directly from its file so the test stays truly offline: it
+# does not run unsloth_zoo/__init__.py (which pulls the full stack and can fail
+# without the companion unsloth package installed).
+_PAD_TOKEN_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "unsloth_zoo", "pad_token.py",
+)
+_spec = importlib.util.spec_from_file_location("_unsloth_pad_token_offline", _PAD_TOKEN_PATH)
+_pad_token = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_pad_token)
+fix_pad_token = _pad_token.fix_pad_token
+VISION_RESERVED_TOKENS = _pad_token.VISION_RESERVED_TOKENS
 
 
 class FakeTokenizer:
@@ -159,3 +173,32 @@ def test_vision_model_keeps_its_vision_pad():
     res = fix_pad_token(tok, model_config = cfg)
     assert res["changed"] is False
     assert tok.pad_token == "<|vision_pad|>"
+
+
+def test_unk_token_fallback_when_no_reserved():
+    # Llama-2 style: no pad and no reserved-token family, but <unk> exists, so
+    # reuse it rather than hard-failing (matches the original patch_tokenizer).
+    tok = FakeTokenizer({"<s>": 1, "</s>": 2, "<unk>": 0},
+                        pad_token = None, eos_token = "</s>")
+    tok.unk_token = "<unk>"
+    res = fix_pad_token(tok, allow_add = False)
+    assert res["changed"] and tok.pad_token == "<unk>"
+
+
+def test_vision_model_reuses_vision_pad_when_only_option():
+    # Vision model with pad == eos and only a modality pad available -> reuse it
+    # instead of adding/raising.
+    tok = FakeTokenizer({"<|im_end|>": 1, "<|vision_pad|>": 2},
+                        pad_token = "<|im_end|>", eos_token = "<|im_end|>")
+    cfg = type("Cfg", (), {"model_type": "qwen2_vl"})()
+    res = fix_pad_token(tok, model_config = cfg)
+    assert res["changed"] and tok.pad_token == "<|vision_pad|>"
+
+
+def test_audio_pad_not_denylisted_for_audio_model():
+    # <|audio_pad|> is not a denied token (we cannot detect audio-only models),
+    # so an audio tokenizer keeping it as pad is a no-op.
+    tok = FakeTokenizer({"<|im_end|>": 1, "<|audio_pad|>": 2},
+                        pad_token = "<|audio_pad|>", eos_token = "<|im_end|>")
+    assert fix_pad_token(tok)["changed"] is False
+    assert "<|audio_pad|>" not in VISION_RESERVED_TOKENS

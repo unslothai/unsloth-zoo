@@ -54,13 +54,16 @@ POSSIBLE_RESERVED_TOKENS = (
     # "<|endofprompt|>",          # Phi-4 mini; commented out, clashes with GPT-OSS
 )
 
-# Vision/modality tokens that must never be a pad_token on a text-only model.
-VISION_RESERVED_TOKENS = frozenset((
+# Modality pad tokens. On a text-only model these must never be the pad_token
+# (unsloth#4104); on a multimodal model they are valid pad candidates of last
+# resort. Audio pads are intentionally excluded: we cannot reliably detect an
+# audio-only model, so denylisting them would rewrite a legitimate audio pad.
+_MODALITY_PAD_TOKENS = (
     "<|vision_pad|>",
     "<|image_pad|>",
     "<|video_pad|>",
-    "<|audio_pad|>",
-))
+)
+VISION_RESERVED_TOKENS = frozenset(_MODALITY_PAD_TOKENS)
 
 # model_type fragments that mark a multimodal model whose vision pad tokens are
 # legitimate (so we must not "heal" them). Kept conservative: each fragment only
@@ -152,7 +155,10 @@ def _find_reserved_pad(inner, is_vision, eos_token, vocab_size):
     # Newest tokens last; reverse so reserved blocks are scanned high-id first.
     added = [a for a in added if a][::-1]
 
-    for reserved in POSSIBLE_RESERVED_TOKENS:
+    # On a multimodal model, modality pad tokens are valid pads of last resort;
+    # on a text-only model they stay denied (unsloth#4104).
+    families = POSSIBLE_RESERVED_TOKENS + (_MODALITY_PAD_TOKENS if is_vision else ())
+    for reserved in families:
         if not is_vision and reserved in VISION_RESERVED_TOKENS:
             continue
         matches = [a for a in added if a == reserved or a.startswith(reserved)]
@@ -164,10 +170,22 @@ def _find_reserved_pad(inner, is_vision, eos_token, vocab_size):
         closed = [m for m in matches if m.endswith(_CLOSERS)]
         ordered = closed + [m for m in matches if m not in closed]
         for candidate in ordered:
-            if candidate == eos_token or candidate in VISION_RESERVED_TOKENS:
+            if candidate == eos_token or (not is_vision and candidate in VISION_RESERVED_TOKENS):
                 continue
             if _single_token_id(inner, candidate, vocab_size) is not None:
                 return candidate
+    return None
+
+
+def _unk_fallback(inner, is_vision, eos_token, vocab_size):
+    """Last-resort existing-token pad: reuse unk_token (Llama-2 style), or None."""
+    unk = getattr(inner, "unk_token", None)
+    if not unk or unk == eos_token:
+        return None
+    if not is_vision and unk in VISION_RESERVED_TOKENS:
+        return None
+    if _single_token_id(inner, unk, vocab_size) is not None:
+        return unk
     return None
 
 
@@ -206,6 +224,8 @@ def fix_pad_token(
     result["old_pad"] = getattr(inner, "pad_token", None)
 
     new_pad = _find_reserved_pad(inner, is_vision, eos_token, vocab_size)
+    if new_pad is None:
+        new_pad = _unk_fallback(inner, is_vision, eos_token, vocab_size)
     added = False
 
     if new_pad is None:
