@@ -3640,6 +3640,180 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length, completion_only_los
     return rows
 
 
+def _prepare_custom_collator_text_examples(dataset, max_seq_length):
+    """Prepare tokenized text examples for a user-provided collator."""
+    first_item, replay_dataset = _peek_dataset(dataset)
+    if not isinstance(first_item, dict) or first_item.get("input_ids") is None:
+        raise ValueError(
+            "Unsloth MLX: custom data_collator requires a tokenized text "
+            "dataset with `input_ids`. Raw text, VLM, streaming, packing, "
+            "and skip_prepare_dataset are not supported with custom "
+            "data_collator yet."
+        )
+
+    token_fields = (
+        "input_ids",
+        "labels",
+        "attention_mask",
+        "completion_mask",
+        "assistant_masks",
+        "token_type_ids",
+        "position_ids",
+    )
+    examples = []
+    for item in replay_dataset:
+        if not isinstance(item, dict) or item.get("input_ids") is None:
+            continue
+        input_ids = _to_int_list(item["input_ids"])[:max_seq_length]
+        if len(input_ids) < 2:
+            continue
+        example = dict(item)
+        example["input_ids"] = input_ids
+        for field in token_fields:
+            if field == "input_ids" or field not in item or item[field] is None:
+                continue
+            example[field] = _aligned_text_field(item, field, len(input_ids))
+        examples.append(example)
+
+    if not examples:
+        raise ValueError(
+            "Unsloth MLX: custom data_collator dataset produced no trainable "
+            "token sequences (need at least two input_ids after truncation)."
+        )
+    return examples
+
+
+def _collator_value_to_numpy(value, field):
+    """Convert common collator outputs to a numpy array."""
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    elif hasattr(value, "tolist"):
+        value = value.tolist()
+    array = np.asarray(value)
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    if array.ndim != 2:
+        raise ValueError(
+            f"Unsloth MLX: custom data_collator field `{field}` must be a "
+            f"1D or 2D tensor/array, got shape {array.shape}."
+        )
+    return array
+
+
+def _lengths_from_collator_attention(attention_mask, batch_size, seq_len):
+    """Build MLX [start, end) lengths from a right-padded attention mask."""
+    if attention_mask is None:
+        return np.array([[0, seq_len] for _ in range(batch_size)], dtype=np.int32)
+    mask = _collator_value_to_numpy(attention_mask, "attention_mask")[:, :seq_len]
+    if mask.shape[0] != batch_size:
+        raise ValueError(
+            "Unsloth MLX: custom data_collator attention_mask batch size "
+            f"{mask.shape[0]} does not match input_ids batch size {batch_size}."
+        )
+    if mask.shape[1] < seq_len:
+        raise ValueError(
+            "Unsloth MLX: custom data_collator attention_mask sequence length "
+            f"{mask.shape[1]} is shorter than input_ids sequence length "
+            f"{seq_len}."
+        )
+    lengths = []
+    for row in mask:
+        active = np.flatnonzero(row)
+        if len(active) == 0:
+            lengths.append([0, 0])
+        else:
+            lengths.append([int(active[0]), int(active[-1]) + 1])
+    return np.asarray(lengths, dtype=np.int32)
+
+
+def _collator_output_to_text_batch(output, max_seq_length):
+    """Normalize user collator output to an MLX text batch."""
+    if not isinstance(output, dict) or "input_ids" not in output:
+        raise ValueError(
+            "Unsloth MLX: custom data_collator must return a dictionary "
+            "containing `input_ids`."
+        )
+    input_ids_np = _collator_value_to_numpy(output["input_ids"], "input_ids")
+    if input_ids_np.shape[1] > max_seq_length:
+        input_ids_np = input_ids_np[:, :max_seq_length]
+    batch_size, seq_len = input_ids_np.shape
+    lengths_np = _lengths_from_collator_attention(
+        output.get("attention_mask"), batch_size, seq_len,
+    )
+
+    labels = None
+    if output.get("labels") is not None:
+        labels_np = _collator_value_to_numpy(output["labels"], "labels")
+        if labels_np.shape[0] != batch_size:
+            raise ValueError(
+                "Unsloth MLX: custom data_collator labels batch size "
+                f"{labels_np.shape[0]} does not match input_ids batch size "
+                f"{batch_size}."
+            )
+        if labels_np.shape[1] < seq_len:
+            raise ValueError(
+                "Unsloth MLX: custom data_collator labels sequence length "
+                f"{labels_np.shape[1]} is shorter than input_ids sequence "
+                f"length {seq_len}."
+            )
+        labels = mx.array(labels_np[:, :seq_len])
+
+    return (
+        mx.array(input_ids_np).astype(mx.int32),
+        mx.array(lengths_np),
+        labels,
+    )
+
+
+def _collate_text_examples_with_custom_collator(examples, data_collator, max_seq_length):
+    """Run a user collator and return an MLX text batch."""
+    return _collator_output_to_text_batch(
+        data_collator(examples),
+        max_seq_length,
+    )
+
+
+def create_collated_text_batches(
+    dataset,
+    data_collator,
+    batch_size,
+    max_seq_length,
+    num_batches=None,
+    seed=None,
+    dataset_order="default",
+    num_epochs=None,
+):
+    """Create text batches with a user-provided data_collator."""
+    examples = _prepare_custom_collator_text_examples(dataset, max_seq_length)
+    batches = _create_ordered_text_batches(
+        examples,
+        batch_size,
+        lambda batch_examples: _collate_text_examples_with_custom_collator(
+            batch_examples, data_collator, max_seq_length,
+        ),
+        num_batches=num_batches,
+        seed=seed,
+        dataset_order=dataset_order,
+        num_epochs=num_epochs,
+        empty_message=(
+            "Unsloth MLX: no trainable token sequences were available after "
+            "custom data_collator batching."
+        ),
+    )
+    tensors = []
+    for batch, lengths, labels in batches:
+        tensors.extend([batch, lengths])
+        if labels is not None:
+            tensors.append(labels)
+    if tensors:
+        mx.eval(tensors)
+    return batches
+
+
 def _prompt_completion_text_parts(tokenizer, item, dataset_text_field):
     """Render a text prompt/completion row into prompt and completion strings."""
     prompt = render_mlx_chat_example(

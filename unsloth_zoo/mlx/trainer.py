@@ -59,6 +59,7 @@ from .utils import (
     make_vlm_baseline_loss_fn,
     create_batches,
     create_ordered_batches,
+    create_collated_text_batches,
     iterate_training_batches,
     create_vlm_batches,
     iterate_vlm_training_batches,
@@ -560,6 +561,7 @@ class MLXTrainer:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
+        self.data_collator = data_collator
         # Use args or defaults
         self.args = args or MLXTrainingConfig()
 
@@ -2050,6 +2052,12 @@ class MLXTrainer:
         text_completion_only_loss = _text_completion_only_loss_arg(args)
 
         if is_vlm:
+            if self.data_collator is not None:
+                raise ValueError(
+                    "Unsloth MLX: custom data_collator is supported only for "
+                    "text training. Remove the custom data_collator for "
+                    "vision-language training."
+                )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
             vlm_dataset_order = (
                 "sequential"
@@ -2100,6 +2108,12 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
+                if self.data_collator is not None:
+                    raise ValueError(
+                        "Unsloth MLX: custom data_collator is not supported "
+                        "with streaming=True. Set streaming=False, or use "
+                        "the built-in MLX text batcher."
+                    )
                 # Streaming has no index space; refuse explicit order requests.
                 if (
                     getattr(args, "preserve_dataset_order", False)
@@ -2125,6 +2139,33 @@ class MLXTrainer:
                     completion_only_loss=text_completion_only_loss,
                 )
             else:
+                if self.data_collator is not None:
+                    text_dataset_order = (
+                        "sequential"
+                        if getattr(args, "preserve_dataset_order", False)
+                        else getattr(args, "dataset_order", "default")
+                    )
+                    collator_num_epochs = (
+                        args.num_train_epochs
+                        if (
+                            args.max_steps <= 0
+                            and args.num_train_epochs > 0
+                            and text_dataset_order == "torch_randperm"
+                        )
+                        else None
+                    )
+                    if collator_num_epochs is not None:
+                        self._prepared_batches_include_epochs = True
+                    return create_collated_text_batches(
+                        dataset=self.train_dataset,
+                        data_collator=self.data_collator,
+                        batch_size=args.per_device_train_batch_size,
+                        max_seq_length=args.max_seq_length,
+                        num_batches=total_batches_needed,
+                        seed=args.seed,
+                        dataset_order=text_dataset_order,
+                        num_epochs=collator_num_epochs,
+                    ), None
                 batch_kwargs = dict(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,
