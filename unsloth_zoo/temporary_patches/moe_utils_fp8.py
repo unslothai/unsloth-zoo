@@ -812,12 +812,11 @@ _MOE_QUANT_UNSAFE = object()
 def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_size = None) -> torch.Tensor:
     """Dequant a 2-D float8_e4m3fn weight: W_real = decode_fp8(W) * scale_broadcast.
 
-    Inverse of compressed-tensors / DeepSeek FP8. Handles every dense scale layout
-    the loader accepts: per-tensor scalar, 1-D per-row/col, 2-D per-channel, and 2-D
-    block (ceil(rows/bm), ceil(cols/bn)). block_size (bm, bn) is the configured
-    weight_block_size; without it bm/bn are inferred from the scale grid, which is
-    only exact when rows/cols are block multiples (partial final block needs it).
-    repeat_interleave + trim matches a plain reshape when the scale divides evenly.
+    Inverse of compressed-tensors / DeepSeek FP8. Handles every dense scale layout:
+    per-tensor scalar, 1-D per-row/col, 2-D per-channel, and 2-D block. block_size
+    (bm, bn) is the configured weight_block_size; without it bm/bn are inferred from
+    the scale grid, which is only exact when rows/cols are block multiples (a partial
+    final block needs it).
     """
     rows, cols = W_fp8.shape
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
@@ -825,7 +824,7 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
     # Per-tensor scalar scale.
     if scale_inv.numel() == 1:
         return W * scale_inv.reshape(()).to(out_dtype)
-    # 1-D per-row / per-column scale (broadcast along the matching axis).
+    # 1-D per-row / per-column scale.
     if scale_inv.ndim == 1:
         if scale_inv.shape[0] == rows:
             return W * scale_inv.view(-1, 1).to(out_dtype)

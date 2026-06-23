@@ -16,10 +16,8 @@
 
 """FP8 dense merge-to-16bit (unslothai/unsloth#4919).
 
-Before the fix, dense FP8 weights were written straight back: weight_scale was
-never applied and companion scales were left dangling with no error. These tests
-pin the rewrite path: FP8 dequantizes to 16bit, scale keys drop, and a missing
-scale raises instead of corrupting silently.
+Pins the rewrite path: FP8 dequantizes to 16bit, scale keys drop, and a missing
+scale raises instead of corrupting silently (previously written straight back).
 """
 
 from __future__ import annotations
@@ -55,8 +53,7 @@ def _fp8_quant_channel(W):
 
 
 def _fp8_quant_row_1d(W):
-    """Per-row 1-D scale (fbgemm_fp8 / static channel quant; loader builds
-    FbgemmFp8Linear for ndim==1)."""
+    """Per-row 1-D scale (fbgemm_fp8 / static channel quant)."""
     max_fp8 = 448.0
     amax = W.abs().amax(dim=1).clamp_min(1e-12)  # 1-D, len == out_features
     scale = amax / max_fp8
@@ -200,8 +197,7 @@ def test_fp8_quant_config_detection():
 
 
 def test_fp8_dense_one_d_row_scale_dequantizes(tmp_path):
-    """fbgemm / static FP8 store a 1-D per-row weight_scale (loader builds
-    FbgemmFp8Linear for ndim==1). It must dequantize, not raise."""
+    """A 1-D per-row weight_scale (fbgemm / static FP8) must dequantize, not raise."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(2)
@@ -233,8 +229,8 @@ def test_fp8_dense_one_d_row_scale_dequantizes(tmp_path):
 
 
 def test_fp8_dense_block_scale_partial_block(tmp_path):
-    """Block-quant where a dim is not a multiple of the block size: the configured
-    weight_block_size must dequantize correctly (inferring rows//srows is wrong)."""
+    """Block-quant with a dim not a multiple of the block: weight_block_size must
+    dequantize correctly (inferring rows//srows is wrong)."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(3)
@@ -264,8 +260,8 @@ def test_fp8_dense_block_scale_partial_block(tmp_path):
 
 
 def test_fp8_dense_moe_expert_lora_raises(tmp_path):
-    """Dense FP8 path has no per-expert MoE fusion; a LoRA on fused experts must
-    raise loudly instead of silently dropping the adapter."""
+    """Dense FP8 path has no MoE fusion; a LoRA on fused experts must raise, not
+    silently drop the adapter."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     W_fp8, scale = _fp8_quant_channel(torch.randn(32, 48) * 0.1)
