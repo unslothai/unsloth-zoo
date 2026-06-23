@@ -3520,17 +3520,18 @@ class MLXTrainer:
             except AttributeError:
                 pass  # read-only attribute; the close above already ended it
 
-    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False, want_accuracy=False):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        correct_total = None
         # A stop requested before evaluation must abort before the first pull:
         # an unsized source's next row can block, so cancellation could
         # otherwise never take effect. Rank-synchronized so peers return
         # together instead of diverging at the in-loop status collective.
         should_stop, _ = self._distributed_eval_status()
         if should_stop:
-            return all_losses, ntokens
+            return all_losses, ntokens, correct_total
         iterator = iter(eval_batches)
 
         while True:
@@ -3549,15 +3550,32 @@ class MLXTrainer:
             if not failed and not self.stop_requested:
                 try:
                     if is_vlm:
-                        loss, ntoks = loss_fn(self.model, batch_data)
+                        if want_accuracy:
+                            loss, ntoks, c = loss_fn(
+                                self.model, batch_data, return_correct=True,
+                            )
+                        else:
+                            loss, ntoks = loss_fn(self.model, batch_data)
+                            c = None
                     else:
                         batch, lengths, labels = batch_data
-                        loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                        if want_accuracy:
+                            loss, ntoks, c = loss_fn(
+                                self.model, batch, lengths, labels,
+                                return_correct=True,
+                            )
+                        else:
+                            loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                            c = None
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
                     # distributed all-sum. mx.where never selects the NaN branch.
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
+                    if c is not None:
+                        correct_total = (
+                            c if correct_total is None else correct_total + c
+                        )
                     mx.eval(all_losses, ntokens)
                     # HF dispatches on_prediction_step after each evaluation
                     # batch is folded into the running totals. Raised inside
@@ -3579,7 +3597,7 @@ class MLXTrainer:
             if should_stop:
                 break
 
-        return all_losses, ntokens
+        return all_losses, ntokens, correct_total
 
     def _create_text_eval_batches(
         self,
@@ -3659,6 +3677,7 @@ class MLXTrainer:
         """
         self.model.eval()
         metrics = {}
+        correct_total = None
         if isinstance(eval_batches, dict):
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
@@ -3676,8 +3695,9 @@ class MLXTrainer:
                         if split_index:
                             self._close_split_prediction_bars()
                         handler.eval_dataloader = split_batches
-                    split_losses, split_tokens = self._evaluate_batch_totals(
+                    split_losses, split_tokens, _ = self._evaluate_batch_totals(
                         split_batches, loss_fn, is_vlm=is_vlm,
+                        want_accuracy=False,
                     )
                     split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
                     split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
@@ -3698,8 +3718,8 @@ class MLXTrainer:
                 if handler is not None:
                     handler.eval_dataloader = outer_dataloader
         else:
-            all_losses, ntokens = self._evaluate_batch_totals(
-                eval_batches, loss_fn, is_vlm=is_vlm,
+            all_losses, ntokens, correct_total = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm, want_accuracy=True,
             )
             all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
             ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
@@ -3709,6 +3729,8 @@ class MLXTrainer:
         perplexity = math.exp(min(avg_loss, 100))
         metrics["eval_loss"] = avg_loss
         metrics["eval_perplexity"] = perplexity
+        if correct_total is not None and ntokens.item() > 0:
+            metrics["eval_mean_token_accuracy"] = (correct_total / ntokens).item()
         self._last_eval_metrics = metrics
         return avg_loss, perplexity
 

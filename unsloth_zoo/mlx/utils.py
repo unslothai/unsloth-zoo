@@ -1270,7 +1270,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, return_correct=False):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -1304,6 +1304,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            if return_correct:
+                return loss, ntoks, None
             return loss, ntoks
     else:
         _skip_weight_grad = not _is_lm_head_trainable(model)
@@ -1316,7 +1318,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, return_correct=False):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -1344,6 +1346,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            if return_correct:
+                return loss, ntoks, None
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
@@ -1373,7 +1377,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
     else:
         _token_ce = nn.losses.cross_entropy
 
-    def loss_fn(model, batch, lengths, labels=None):
+    def loss_fn(model, batch, lengths, labels=None, return_correct=False):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
             # (:360, :393, :439) and mlx_lm's lengths convention.
@@ -1387,6 +1391,10 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
             ce = ce.astype(mx.float32).sum() / ntoks
+            if return_correct:
+                preds = mx.argmax(logits, axis=-1)
+                correct = ((preds == targets).astype(mx.float32) * mask).sum()
+                return ce, ntoks, correct
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
@@ -1408,6 +1416,10 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            preds = mx.argmax(logits, axis=-1)
+            correct = ((preds == safe_targets).astype(mx.float32) * mask).sum()
+            return loss, ntoks, correct
         return loss, ntoks
 
     return loss_fn
@@ -1845,7 +1857,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     )
     _assistant_token_id = assistant_token_id
 
-    def loss_fn(model, batch_dict):
+    def loss_fn(model, batch_dict, return_correct=False):
         input_ids = batch_dict["input_ids"]
         pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
@@ -1919,6 +1931,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            preds = mx.argmax(logits, axis=-1)
+            correct = ((preds == safe_targets).astype(mx.float32) * mask).sum()
+            return loss, ntoks, correct
         return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "baseline-ce"
@@ -3171,7 +3187,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             mode=quant_mode,
         )
 
-        def loss_fn(model, batch_dict):
+        def loss_fn(model, batch_dict, return_correct=False):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
@@ -3192,6 +3208,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            if return_correct:
+                return loss, ntoks, None
             return loss, ntoks
     else:
         if _skip_weight_grad:
@@ -3202,7 +3220,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             logit_softcap=softcap,
         )
 
-        def loss_fn(model, batch_dict):
+        def loss_fn(model, batch_dict, return_correct=False):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
@@ -3216,6 +3234,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            if return_correct:
+                return loss, ntoks, None
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
