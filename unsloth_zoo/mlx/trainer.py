@@ -179,6 +179,11 @@ def _validate_custom_collator_eval_support(args, is_vlm):
 
 def _create_text_eval_batches(trainer, eval_dataset, args, text_completion_only_loss):
     """Materialize text eval batches with optional custom collation."""
+    skip_prepare_dataset = bool(
+        (getattr(args, "dataset_kwargs", None) or {}).get(
+            "skip_prepare_dataset", False,
+        )
+    )
     if getattr(trainer, "data_collator", None) is not None:
         return create_collated_text_batches(
             dataset=eval_dataset,
@@ -187,6 +192,12 @@ def _create_text_eval_batches(trainer, eval_dataset, args, text_completion_only_
             max_seq_length=args.max_seq_length,
             seed=args.seed,
             dataset_order=_text_dataset_order_arg(args),
+            skip_prepare_dataset=skip_prepare_dataset,
+        )
+    if skip_prepare_dataset:
+        raise ValueError(
+            "Unsloth MLX: dataset_kwargs={'skip_prepare_dataset': True} "
+            "requires a custom data_collator for text training."
         )
     return create_batches(
         dataset=eval_dataset,
@@ -571,6 +582,7 @@ class MLXTrainingConfig:
     max_seq_length: int = 2048
     packing: bool = False
     dataset_num_proc: int = 2
+    dataset_kwargs: dict | None = None
     chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
     # MLX-specific
@@ -2103,6 +2115,11 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        skip_prepare_dataset = bool(
+            (getattr(args, "dataset_kwargs", None) or {}).get(
+                "skip_prepare_dataset", False,
+            )
+        )
 
         if is_vlm:
             if self.data_collator is not None:
@@ -2214,7 +2231,13 @@ class MLXTrainer:
                         seed=args.seed,
                         dataset_order=text_dataset_order,
                         num_epochs=text_num_epochs,
+                        skip_prepare_dataset=skip_prepare_dataset,
                     ), None
+                if skip_prepare_dataset:
+                    raise ValueError(
+                        "Unsloth MLX: dataset_kwargs={'skip_prepare_dataset': True} "
+                        "requires a custom data_collator for text training."
+                    )
                 batch_kwargs = dict(
                     dataset=self.train_dataset,
                     tokenizer=self.tokenizer,

@@ -58,6 +58,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "logging_steps",
         "output_dir",
         "max_seq_length",
+        "dataset_kwargs",
         "use_cce",
         "compile",
         "gradient_checkpointing",
@@ -896,6 +897,64 @@ def test_custom_text_collator_preserves_default_order(seed):
     assert observed == expected
 
 
+def test_custom_text_collator_skip_prepare_forwards_raw_rows():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    seen = []
+
+    def collator(examples):
+        seen.append([example["text"] for example in examples])
+        return {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0]]),
+            "labels": torch.tensor([[1, 2, 3], [4, 5, -100]]),
+        }
+
+    batches = create_collated_text_batches(
+        [{"text": "first"}, {"text": "second"}],
+        data_collator=collator,
+        batch_size=2,
+        max_seq_length=8,
+        dataset_order="default",
+        skip_prepare_dataset=True,
+    )
+
+    batch, lengths, labels = batches[0]
+    assert seen == [["first", "second"]]
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 0]]
+    assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert labels.tolist() == [[1, 2, 3], [4, 5, -100]]
+
+
+def test_custom_text_collator_skip_prepare_honors_torch_randperm():
+    from unsloth_zoo.mlx.utils import create_collated_text_batches
+
+    seen = []
+
+    def collator(examples):
+        seen.append([example["row"] for example in examples])
+        return {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+        }
+
+    batches = create_collated_text_batches(
+        [{"row": row} for row in range(4)],
+        data_collator=collator,
+        batch_size=2,
+        max_seq_length=8,
+        seed=7,
+        dataset_order="torch_randperm",
+        skip_prepare_dataset=True,
+    )
+    list(batches)
+
+    generator = torch.Generator()
+    generator.manual_seed(7)
+    expected = torch.randperm(4, generator=generator).tolist()
+    assert seen == [expected[:2], expected[2:]]
+
+
 def test_mlx_trainer_routes_tokenized_text_data_collator(monkeypatch):
     import unsloth_zoo.mlx.trainer as trainer_mod
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -950,6 +1009,81 @@ def test_mlx_trainer_routes_tokenized_text_data_collator(monkeypatch):
     assert captured["seed"] == 11
     assert captured["dataset_order"] == "torch_randperm"
     assert captured["num_epochs"] is None
+
+
+def test_mlx_trainer_routes_skip_prepare_text_data_collator(monkeypatch):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    captured = {}
+    expected_batches = [("raw", "batch")]
+
+    def fake_create_collated_text_batches(**kwargs):
+        captured.update(kwargs)
+        return expected_batches
+
+    class Model:
+        _config = {}
+
+        def trainable_parameters(self):
+            return {}
+
+    class Tokenizer:
+        pass
+
+    collator = object()
+    monkeypatch.setattr(
+        trainer_mod,
+        "create_collated_text_batches",
+        fake_create_collated_text_batches,
+    )
+    trainer = MLXTrainer(
+        Model(),
+        Tokenizer(),
+        train_dataset=[{"text": "raw"}],
+        data_collator=collator,
+        args=MLXTrainingConfig(
+            max_steps=1,
+            gradient_accumulation_steps=1,
+            per_device_train_batch_size=1,
+            max_seq_length=16,
+            dataset_kwargs={"skip_prepare_dataset": True},
+        ),
+    )
+
+    batches, iterator = trainer._prepare_data(is_vlm=False)
+
+    assert batches is expected_batches
+    assert iterator is None
+    assert captured["dataset"] == [{"text": "raw"}]
+    assert captured["data_collator"] is collator
+    assert captured["skip_prepare_dataset"] is True
+
+
+def test_mlx_trainer_rejects_skip_prepare_without_collator():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        _config = {}
+
+        def trainable_parameters(self):
+            return {}
+
+    class Tokenizer:
+        pass
+
+    trainer = MLXTrainer(
+        Model(),
+        Tokenizer(),
+        train_dataset=[{"text": "raw"}],
+        args=MLXTrainingConfig(
+            max_steps=1,
+            dataset_kwargs={"skip_prepare_dataset": True},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="skip_prepare_dataset"):
+        trainer._prepare_data(is_vlm=False)
 
 
 def test_custom_text_collator_requires_prepared_dataset():

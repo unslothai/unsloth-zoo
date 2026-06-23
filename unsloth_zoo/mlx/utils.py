@@ -3658,13 +3658,17 @@ _CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
 ))
 
 
-def _prepare_custom_collator_text_examples(dataset, max_seq_length):
+def _prepare_custom_collator_text_examples(
+    dataset, max_seq_length, skip_prepare_dataset=False,
+):
     """Keep/truncate CUDA SFT text columns before user collation.
 
     Only ``input_ids``, ``labels``, ``completion_mask``, and
     ``assistant_masks`` are forwarded; other dataset columns are dropped.
     """
     first_item, replay_dataset = _peek_dataset(dataset)
+    if skip_prepare_dataset:
+        return list(replay_dataset)
     if not isinstance(first_item, Mapping) or first_item.get("input_ids") is None:
         raise ValueError(
             "Unsloth MLX: custom data_collator requires tokenized text "
@@ -3934,13 +3938,20 @@ def create_collated_text_batches(
     seed=None,
     dataset_order="default",
     num_epochs=None,
+    skip_prepare_dataset=False,
 ):
     """Create text batches that call the user collator on batch access.
 
     Tokenized examples are truncated before the collator runs. Packed
     ``seq_lengths`` / padding-free outputs are rejected by this MLX path.
     """
-    examples = _prepare_custom_collator_text_examples(dataset, max_seq_length)
+    examples = _prepare_custom_collator_text_examples(
+        dataset,
+        max_seq_length,
+        skip_prepare_dataset=skip_prepare_dataset,
+    )
+    if skip_prepare_dataset and dataset_order in (None, "default"):
+        dataset_order = "sequential"
     chunks = []
     target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
     for chunk in _iter_text_index_chunks(
