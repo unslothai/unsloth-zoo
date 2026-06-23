@@ -1939,21 +1939,17 @@ pass
 _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
 
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
-    """Dequantize one FP8 dense weight; return (W_real, [scale_keys to drop]).
+    """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
 
     Raises if FP8 but no usable scale (never silent FP8). Handles every dense scale
-    layout (per-tensor, 1-D, 2-D per-channel, 2-D block). weight_block_size (bm, bn)
-    is needed when a weight dim is not an exact multiple of the block.
+    layout (per-tensor, 1-D, 2-D per-channel, 2-D block) plus 3-D fused MoE experts
+    (per-expert). weight_block_size (bm, bn) is needed when a weight dim is not an
+    exact multiple of the block.
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
     if W.dtype != torch.float8_e4m3fn:
         return W, []
-    if W.ndim != 2:
-        raise RuntimeError(
-            f"Unsloth: FP8 weight '{weight_key}' is {W.ndim}-D; only 2-D dense FP8 "
-            "weights are supported on a 16bit merge."
-        )
     base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
     scale_inv = None
     for suffix in (".weight_scale_inv", ".weight_scale"):
@@ -1966,6 +1962,33 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
             f"Unsloth: FP8 weight '{weight_key}' has no companion weight_scale / "
             "weight_scale_inv; cannot dequantize to 16bit. The merged model would be "
             "corrupted. Please file a bug at https://github.com/unslothai/unsloth/issues."
+        )
+    # Drop every companion scale for this weight (input_scale too on static FP8).
+    scale_keys = [base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata]
+    # 3-D fused MoE experts (E, M, N): dequantize each expert with its scale slice.
+    # Expert-LoRA merges are refused upstream, so this only passes base experts
+    # through (e.g. an attention-only adapter on an FP8 MoE checkpoint).
+    if W.ndim == 3:
+        n_experts = W.shape[0]
+        if scale_inv.numel() == 1:
+            expert_scales = [scale_inv] * n_experts
+        elif scale_inv.shape[0] == n_experts:
+            expert_scales = [scale_inv[e] for e in range(n_experts)]
+        else:
+            raise RuntimeError(
+                f"Unsloth: FP8 fused-expert weight '{weight_key}' shape {tuple(W.shape)} has "
+                f"no per-expert scale aligned to its leading dim (scale {tuple(scale_inv.shape)})."
+            )
+        W_real = torch.stack(
+            [_fp8_dequant_blockwise(W[e], expert_scales[e], block_size = weight_block_size)
+             for e in range(n_experts)],
+            dim = 0,
+        )
+        return W_real, scale_keys
+    if W.ndim != 2:
+        raise RuntimeError(
+            f"Unsloth: FP8 weight '{weight_key}' is {W.ndim}-D; only 2-D dense and 3-D "
+            "fused-expert FP8 weights are supported on a 16bit merge."
         )
     rows, cols = W.shape
     _scale_ok = (
@@ -1980,8 +2003,6 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
             f"its scale {tuple(scale_inv.shape)}; cannot dequantize safely."
         )
     W_real = _fp8_dequant_blockwise(W, scale_inv, block_size = weight_block_size)
-    # Drop every companion scale for this weight (input_scale too on static FP8).
-    scale_keys = [base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata]
     return W_real, scale_keys
 
 def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
@@ -3939,15 +3960,23 @@ def _is_fp8_quant_config(quant_config):
     # Dense FP8 method, but not microscaling (mx* keep their own block scales).
     if "fp8" in method and not method.startswith("mx"):
         return True
-    # compressed-tensors: only 8-bit float groups are dense FP8. NVFP4 also uses
-    # type "float", so require num_bits == 8.
+    # compressed-tensors: only 8-bit dense float groups are dense FP8. Microscaling
+    # (mxfp8) and NVFP4 reuse type "float"/num_bits 8 but need a different path, so
+    # exclude their format markers first.
     if method == "compressed-tensors":
-        if str(quant_config.get("format", "")).lower() == "float-quantized":
+        fmt = str(quant_config.get("format", "")).lower()
+        if "mx" in fmt or "nvfp4" in fmt:
+            return False
+        if fmt == "float-quantized":
             return True
         for group in (quant_config.get("config_groups") or {}).values():
             weights = group.get("weights") if isinstance(group, dict) else None
-            if (isinstance(weights, dict)
-                    and str(weights.get("type", "")).lower() == "float"
+            if not isinstance(weights, dict):
+                continue
+            wfmt = str(weights.get("format", "")).lower()
+            if "mx" in wfmt or "nvfp4" in wfmt:
+                continue
+            if (str(weights.get("type", "")).lower() == "float"
                     and int(weights.get("num_bits", 8)) == 8):
                 return True
     return False

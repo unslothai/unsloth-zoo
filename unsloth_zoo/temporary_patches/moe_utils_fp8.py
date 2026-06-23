@@ -835,9 +835,14 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
             f"rows ({rows}) nor cols ({cols}); cannot dequantize."
         )
     srows, scols = scale_inv.shape
+    bm = bn = None
+    # Use the configured block size only when the scale grid actually tiles the weight
+    # by it; per-channel 2-D scales (e.g. (rows, 1)) must fall back to inference.
     if block_size is not None and len(block_size) == 2:
-        bm, bn = block_size
-    else:
+        cand_bm, cand_bn = block_size
+        if srows == -(-rows // cand_bm) and scols == -(-cols // cand_bn):
+            bm, bn = cand_bm, cand_bn
+    if bm is None:
         bm = -(-rows // srows)  # ceil(rows / srows)
         bn = -(-cols // scols)  # ceil(cols / scols)
     scale = scale_inv.to(out_dtype)
