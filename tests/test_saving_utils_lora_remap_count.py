@@ -25,12 +25,18 @@ from __future__ import annotations
 
 import collections
 import importlib.util
-import sys
 import types
 
-# saving_utils imports bitsandbytes at module scope; stub it so CPU-only collection works.
+# saving_utils (and peft.tuners.lora.bnb / transformers import_utils) import
+# bitsandbytes at module scope. On a CPU-only box bitsandbytes is genuinely absent,
+# so install unsloth_zoo's permissive stub: it registers a meta-path finder so any
+# `import bitsandbytes.X.Y` resolves to a no-op module that carries a real __spec__.
+# A bare types.ModuleType has __spec__ is None, which makes the find_spec() probe in
+# transformers' _is_package_available / peft's is_bnb_available raise
+# "ValueError: bitsandbytes.__spec__ is None" and crash collection.
 if importlib.util.find_spec("bitsandbytes") is None:
-    sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
+    from unsloth_zoo.stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb_stub
+    _inject_bnb_stub()
 
 from unsloth_zoo.saving_utils import (  # noqa: E402
     LoraStats,
