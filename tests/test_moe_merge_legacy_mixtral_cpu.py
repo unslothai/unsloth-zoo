@@ -199,6 +199,68 @@ def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
     _reset_moe_merge_state()
 
 
+def test_legacy_mixtral_down_proj_keyed_adapter_is_merged(tmp_path):
+    """down LoRA keyed on .down_proj (PEFT target_parameters for 3D MoE) is still found by the legacy w2 path."""
+    num_layers, num_experts, rank_per = 2, 4, 4
+    hidden, intermediate = 12, 8
+    alpha = 2.0
+    path = str(tmp_path / "model.safetensors")
+
+    base = _build_legacy_shard(path, num_layers, num_experts, hidden, intermediate)
+
+    torch.manual_seed(SEED + 9)
+    TR = num_experts * rank_per
+    lw = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    for L in range(num_layers):
+        prefix = f"model.layers.{L}.mlp.experts"
+        A_gu = torch.randn(TR, hidden, dtype=torch.float32) * 0.05
+        B_gu = torch.randn(2 * intermediate, TR, dtype=torch.float32) * 0.05
+        A_dn = torch.randn(TR, intermediate, dtype=torch.float32) * 0.05
+        B_dn = torch.randn(hidden, TR, dtype=torch.float32) * 0.05
+        lw[prefix + ".base_layer"] = LoraStats(_InnerMoE(num_experts), A_gu, B_gu, alpha)
+        # down keyed on .down_proj instead of the experts module.
+        lw[prefix + ".down_proj"] = LoraStats(_InnerMoE(num_experts), A_dn, B_dn, alpha)
+
+    _reset_moe_merge_state()
+    result = _merge_and_overwrite_lora(
+        save_directory=str(tmp_path),
+        filename="model.safetensors",
+        lora_weights=lw,
+        output_dtype=torch.float32,
+        model_class_name="MixtralForCausalLM",
+    )
+    count = result[0] if isinstance(result, tuple) else result
+    merged = load_file(path)
+
+    n_expert = sum(1 for k in base if ".experts." in k)
+    n_changed = sum(
+        1 for k in base
+        if (base[k].float() - merged[k].float()).abs().max().item() > 1e-6
+    )
+    # Without the .down_proj fallback the w2 deltas would be dropped.
+    assert n_changed == n_expert
+    assert _MOE_MERGE_STATE["fallback"] == 0
+    assert _MOE_MERGE_STATE["first_error"] is None
+    assert count == num_layers * 2
+
+    max_err = 0.0
+    for L in range(num_layers):
+        prefix = f"model.layers.{L}.mlp.experts"
+        A_gu, B_gu = lw[prefix + ".base_layer"].lora_A, lw[prefix + ".base_layer"].lora_B
+        A_dn, B_dn = lw[prefix + ".down_proj"].lora_A, lw[prefix + ".down_proj"].lora_B
+        for e in range(num_experts):
+            dp = f"model.layers.{L}.block_sparse_moe.experts.{e}"
+            gu_delta = _delta(A_gu, B_gu, alpha, e, num_experts)
+            ref_w1 = base[f"{dp}.w1.weight"].to(torch.float64) + gu_delta[:intermediate]
+            ref_w3 = base[f"{dp}.w3.weight"].to(torch.float64) + gu_delta[intermediate:]
+            ref_w2 = base[f"{dp}.w2.weight"].to(torch.float64) + _delta(A_dn, B_dn, alpha, e, num_experts)
+            for ref, key in ((ref_w1, "w1"), (ref_w3, "w3"), (ref_w2, "w2")):
+                got = merged[f"{dp}.{key}.weight"].to(torch.float64)
+                max_err = max(max_err, (got - ref).abs().max().item())
+    assert max_err < 1e-4, f"down_proj keyed legacy merge delta error too large: {max_err:.2e}"
+    _reset_moe_merge_state()
+
+
 def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
     """FP8 legacy Mixtral shard must dequantise -> merge -> requantise and rewrite the scale, not merge raw float8."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
