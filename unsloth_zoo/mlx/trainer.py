@@ -146,6 +146,68 @@ def _text_completion_only_loss_arg(args):
     return None
 
 
+def _text_dataset_order_arg(args):
+    """Resolve the text dataset order used by materialized MLX batches."""
+    return (
+        "sequential"
+        if getattr(args, "preserve_dataset_order", False)
+        else getattr(args, "dataset_order", "default")
+    )
+
+
+def _validate_custom_collator_eval_support(args, is_vlm):
+    """Reject custom-collator eval modes not represented by text batches."""
+    if is_vlm:
+        raise ValueError(
+            "Unsloth MLX: evaluation with custom data_collator is supported "
+            "only for text training. Remove the custom data_collator for "
+            "vision-language evaluation."
+        )
+    if getattr(args, "streaming", False):
+        raise ValueError(
+            "Unsloth MLX: evaluation with custom data_collator is not "
+            "supported with streaming=True. Set streaming=False, or remove "
+            "the custom data_collator."
+        )
+    if getattr(args, "packing", False):
+        raise ValueError(
+            "Unsloth MLX: evaluation with custom data_collator is not "
+            "supported with packing=True. Disable packing, or remove the "
+            "custom data_collator."
+        )
+
+
+def _create_text_eval_batches(trainer, eval_dataset, args, text_completion_only_loss):
+    """Materialize text eval batches with optional custom collation."""
+    if getattr(trainer, "data_collator", None) is not None:
+        return create_collated_text_batches(
+            dataset=eval_dataset,
+            data_collator=trainer.data_collator,
+            batch_size=args.per_device_train_batch_size,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            dataset_order=_text_dataset_order_arg(args),
+        )
+    return create_batches(
+        dataset=eval_dataset,
+        tokenizer=trainer.tokenizer,
+        batch_size=args.per_device_train_batch_size,
+        max_seq_length=args.max_seq_length,
+        seed=args.seed,
+        dataset_text_field=args.dataset_text_field,
+        formatting_func=trainer.formatting_func,
+        chat_template=getattr(args, "chat_template", None),
+        model_name=getattr(trainer.model, "_hf_repo", None),
+        model_type=(
+            getattr(trainer.model, "_config", {}).get("model_type")
+            if isinstance(getattr(trainer.model, "_config", {}), dict)
+            else None
+        ),
+        append_eos=bool(getattr(args, "append_eos", True)),
+        completion_only_loss=text_completion_only_loss,
+    )
+
+
 def _normalize_mlx_optimizer_name(name):
     opt_name = str(name or "adamw").strip().lower()
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
@@ -1204,11 +1266,7 @@ class MLXTrainer:
             and args.eval_steps > 0
             and self.eval_dataset is not None
         ):
-            raise ValueError(
-                "Unsloth MLX: evaluation with custom data_collator is not "
-                "supported yet. Set eval_steps=0, remove eval_dataset, or "
-                "use the built-in MLX batcher."
-            )
+            _validate_custom_collator_eval_support(args, is_vlm)
 
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
@@ -1653,23 +1711,8 @@ class MLXTrainer:
                             formatting_func=self.formatting_func,
                             completion_only_loss=text_completion_only_loss,
                         )
-                    return create_batches(
-                        dataset=eval_dataset,
-                        tokenizer=self.tokenizer,
-                        batch_size=args.per_device_train_batch_size,
-                        max_seq_length=args.max_seq_length,
-                        seed=args.seed,
-                        dataset_text_field=args.dataset_text_field,
-                        formatting_func=self.formatting_func,
-                        chat_template=getattr(args, "chat_template", None),
-                        model_name=getattr(self.model, "_hf_repo", None),
-                        model_type=(
-                            getattr(self.model, "_config", {}).get("model_type")
-                            if isinstance(getattr(self.model, "_config", {}), dict)
-                            else None
-                        ),
-                        append_eos=bool(getattr(args, "append_eos", True)),
-                        completion_only_loss=text_completion_only_loss,
+                    return _create_text_eval_batches(
+                        self, eval_dataset, args, text_completion_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2149,11 +2192,7 @@ class MLXTrainer:
                     completion_only_loss=text_completion_only_loss,
                 )
             else:
-                text_dataset_order = (
-                    "sequential"
-                    if getattr(args, "preserve_dataset_order", False)
-                    else getattr(args, "dataset_order", "default")
-                )
+                text_dataset_order = _text_dataset_order_arg(args)
                 text_num_epochs = (
                     args.num_train_epochs
                     if (

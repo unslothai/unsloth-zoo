@@ -1192,34 +1192,82 @@ def test_custom_text_collator_rejects_batches_without_shifted_targets():
         )[0]
 
 
-def test_custom_text_collator_rejects_eval(monkeypatch):
-    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+def test_custom_text_collator_routes_eval_batches(monkeypatch):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
 
     class Model:
         _config = {}
 
-    trainer = MLXTrainer.__new__(MLXTrainer)
+    class Tokenizer:
+        pass
+
+    trainer = type("Trainer", (), {})()
     trainer.args = MLXTrainingConfig(
         max_steps=1,
         eval_steps=1,
+        per_device_train_batch_size=3,
+        max_seq_length=12,
+        dataset_order="torch_randperm",
+        seed=13,
         use_cce=False,
         compile=False,
         max_grad_norm=0.0,
         max_grad_leaf_norm=0.0,
     )
     trainer.model = Model()
-    trainer._is_vlm = False
-    trainer._batches = None
+    trainer.tokenizer = Tokenizer()
+    trainer.formatting_func = None
     trainer.eval_dataset = [{"input_ids": [1, 2, 3]}]
     trainer.data_collator = lambda examples: examples
 
-    def fail_prepare_data(_self, _is_vlm):
-        raise AssertionError("eval guard should run before train collation")
+    captured = {}
+    expected = [("eval", "batch")]
 
-    monkeypatch.setattr(MLXTrainer, "_prepare_data", fail_prepare_data)
+    def fake_create_collated_text_batches(**kwargs):
+        captured.update(kwargs)
+        return expected
 
-    with pytest.raises(ValueError, match="evaluation with custom data_collator"):
-        trainer._train_inner()
+    monkeypatch.setattr(
+        trainer_mod,
+        "create_collated_text_batches",
+        fake_create_collated_text_batches,
+    )
+
+    result = trainer_mod._create_text_eval_batches(
+        trainer, trainer.eval_dataset, trainer.args, text_completion_only_loss=None,
+    )
+
+    assert result is expected
+    assert captured["dataset"] == trainer.eval_dataset
+    assert captured["data_collator"] is trainer.data_collator
+    assert captured["batch_size"] == 3
+    assert captured["max_seq_length"] == 12
+    assert captured["seed"] == 13
+    assert captured["dataset_order"] == "torch_randperm"
+
+
+@pytest.mark.parametrize(
+    ("is_vlm", "streaming", "packing", "message"),
+    [
+        (True, False, False, "only for text training"),
+        (False, True, False, "streaming=True"),
+        (False, False, True, "packing=True"),
+    ],
+)
+def test_custom_text_collator_eval_rejects_unsupported_modes(
+    is_vlm, streaming, packing, message,
+):
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _validate_custom_collator_eval_support,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _validate_custom_collator_eval_support(
+            MLXTrainingConfig(streaming=streaming, packing=packing),
+            is_vlm=is_vlm,
+        )
 
 
 def test_pretokenized_text_streaming_yields_labeled_batches():
