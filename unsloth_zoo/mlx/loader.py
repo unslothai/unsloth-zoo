@@ -3471,6 +3471,19 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
+        # mlx-lm cannot read bitsandbytes-packed weights; remap unsloth/*-bnb-4bit
+        # to the full-precision base repo and let MLX quantize it to 4-bit affine.
+        if isinstance(model_name, str):
+            for _bnb_suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
+                if model_name.endswith(_bnb_suffix):
+                    _bnb_base = model_name[: -len(_bnb_suffix)]
+                    print(
+                        f"Unsloth: mlx-lm cannot load bitsandbytes 4-bit weights; "
+                        f"loading base '{_bnb_base}' and applying MLX 4-bit "
+                        f"quantization instead of '{model_name}'."
+                    )
+                    model_name = _bnb_base
+                    break
         if full_finetuning and (
             load_in_4bit or load_in_8bit or load_in_fp8
             or load_in_mxfp4 or load_in_nvfp4

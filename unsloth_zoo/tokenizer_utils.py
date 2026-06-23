@@ -588,7 +588,11 @@ def patch_tokenizer(model, tokenizer):
 
         # Check pad token's id must be less than vocab size
         if possible_pad_token is not None:
-            check_pad_token = tokenizer(possible_pad_token, add_special_tokens = False).input_ids
+            # mlx-lm's TokenizerWrapper is not directly callable; fall back to .encode.
+            if callable(tokenizer):
+                check_pad_token = tokenizer(possible_pad_token, add_special_tokens = False).input_ids
+            else:
+                check_pad_token = tokenizer.encode(possible_pad_token, add_special_tokens = False)
             if len(check_pad_token) != 1:
                 possible_pad_token = None
 
