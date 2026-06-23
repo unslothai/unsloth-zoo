@@ -16,10 +16,8 @@
 
 """CPU regression for legacy-Mixtral MoE merge (#5403).
 
-transformers v5 fuses Mixtral experts (w1+w3 -> gate_up_proj, w2 -> down_proj) in
-memory, but save_pretrained still writes them unfused on disk as
-block_sparse_moe.experts.N.w1/w2/w3.weight. The merge must map those disk keys
-back to the mlp.experts LoRA so the expert deltas are not silently dropped.
+transformers v5 fuses Mixtral experts in-memory but still writes them unfused on
+disk; the merge must map those disk keys back to the mlp.experts LoRA.
 """
 
 from __future__ import annotations
@@ -85,9 +83,7 @@ def _delta(A, B, alpha, expert_idx, num_experts):
 
 def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     num_layers, num_experts, rank_per = 2, 4, 4
-    # 2*intermediate != hidden keeps the fused gate_up_proj layout shape-distinct,
-    # so the merge resolves it without relying on the PEFT-version-dependent
-    # ambiguous-layout default (swapped on peft < 0.19, standard on >= 0.19).
+    # 2*intermediate != hidden keeps the fused gate_up_proj shape-distinct (no PEFT default).
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
@@ -106,7 +102,7 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     count = result[0] if isinstance(result, tuple) else result
     merged = load_file(path)
 
-    # Every per-expert tensor changed; nothing was skipped via fallback.
+    # Every per-expert tensor changed; nothing fell back.
     n_expert = sum(1 for k in base if ".experts." in k)
     n_changed = sum(
         1 for k in base
@@ -115,13 +111,13 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     assert n_changed == n_expert
     assert _MOE_MERGE_STATE["fallback"] == 0
     assert _MOE_MERGE_STATE["first_error"] is None
-    # 2 fused LoRA modules per layer (gate_up + down) were counted.
+    # gate_up + down per layer.
     assert count == num_layers * 2
 
-    # Disk layout stays unfused (drop-in for the original checkpoint).
+    # Disk layout stays unfused.
     assert not any("gate_up_proj" in k for k in merged)
 
-    # Numeric correctness against the analytic LoRA delta per expert.
+    # Numeric check against the analytic LoRA delta per expert.
     max_err = 0.0
     for L in range(num_layers):
         prefix = f"model.layers.{L}.mlp.experts"
@@ -141,14 +137,9 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
 
 
 def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
-    """When the gate_up LoRA is keyed on .gate_up_proj (no .base_layer wrapper),
-    the legacy w1/w3 path must still find it, mirroring the per-expert gate/up
-    branch's .base_layer -> .gate_up_proj fallback. Down stays on the module.
-    """
+    """gate_up LoRA keyed on .gate_up_proj (no .base_layer wrapper) is still found by the legacy w1/w3 path."""
     num_layers, num_experts, rank_per = 2, 4, 4
-    # 2*intermediate != hidden keeps the fused gate_up_proj layout shape-distinct,
-    # so the merge resolves it without relying on the PEFT-version-dependent
-    # ambiguous-layout default (swapped on peft < 0.19, standard on >= 0.19).
+    # 2*intermediate != hidden keeps the fused gate_up_proj shape-distinct (no PEFT default).
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
@@ -184,8 +175,7 @@ def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
         1 for k in base
         if (base[k].float() - merged[k].float()).abs().max().item() > 1e-6
     )
-    # The gate/up (w1/w3) deltas would be silently dropped without the
-    # .gate_up_proj fallback; assert every expert tensor moved.
+    # Without the .gate_up_proj fallback the w1/w3 deltas would be dropped.
     assert n_changed == n_expert
     assert _MOE_MERGE_STATE["fallback"] == 0
     assert _MOE_MERGE_STATE["first_error"] is None
@@ -210,29 +200,21 @@ def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
 
 
 def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
-    """FP8 legacy Mixtral shard (w1/w2/w3 stored float8 with companion
-    weight_scale_inv) must dequantise -> merge -> requantise and rewrite the
-    scale, not apply LoRA to raw float8 and leave stale scales.
-    """
+    """FP8 legacy Mixtral shard must dequantise -> merge -> requantise and rewrite the scale, not merge raw float8."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         _fp8_dequant_blockwise,
         _fp8_requant_blockwise,
     )
 
     num_layers, num_experts, rank_per = 1, 2, 4
-    # 2*intermediate != hidden keeps the fused gate_up_proj layout shape-distinct,
-    # so the merge resolves it without relying on the PEFT-version-dependent
-    # ambiguous-layout default (swapped on peft < 0.19, standard on >= 0.19).
+    # 2*intermediate != hidden keeps the fused gate_up_proj shape-distinct (no PEFT default).
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
 
-    # Build an FP8 legacy shard with per-tensor block scale (one block). The base
-    # weights are O(1) so the companion scale is well below 1; merging on raw
-    # float8 (the bug) instead of the dequantised values, and leaving the scale
-    # stale, drops the LoRA delta entirely.
+    # FP8 shard with a single block scale; merging raw float8 (the bug) drops the delta.
     torch.manual_seed(SEED + 11)
-    hp = {}     # dequantised base of each expert weight (what the merge starts from)
+    hp = {}     # dequantised base each merge starts from
     tensors = {}
     for L in range(num_layers):
         for e in range(num_experts):
@@ -247,8 +229,7 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
                 hp[f"{p}.{w_name}.weight"] = _fp8_dequant_blockwise(W_fp8, scale)
     save_file(tensors, path)
 
-    # LoRA deltas sized to be a clear fraction of the (O(1)) base weights so a
-    # dropped/garbled delta is unambiguous.
+    # LoRA deltas sized to a clear fraction of the base so a dropped delta is unambiguous.
     TR = num_experts * rank_per
     lw = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
     for L in range(num_layers):
@@ -281,10 +262,7 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
     assert _MOE_MERGE_STATE["first_error"] is None
     assert count == num_layers * 2
 
-    # The merged-and-requantised expert weights must track (dequant base + LoRA
-    # delta) within FP8 block-quant tolerance, and the applied delta must match
-    # the expected delta. A raw-float8 merge with a stale scale loses the delta
-    # (got ~= base), so the delta-recovery check below fails.
+    # Requantised weights must track dequant base + delta; a raw-float8 merge loses the delta.
     max_err = 0.0
     min_delta_ratio = 1.0
     for L in range(num_layers):
@@ -304,10 +282,10 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
                 ref = base_dq + exp_delta
                 scale = merged[f"{dp}.{w_name}.weight_scale_inv"]
                 got = _fp8_dequant_blockwise(merged[f"{dp}.{w_name}.weight"], scale).to(torch.float64)
-                # Absolute error vs base+delta, relative to the weight magnitude.
+                # Error vs base+delta, relative to weight magnitude.
                 denom = ref.abs().max().item() or 1.0
                 max_err = max(max_err, (got - ref).abs().max().item() / denom)
-                # Fraction of the intended delta that actually landed on disk.
+                # Fraction of the intended delta that landed on disk.
                 got_delta = got - base_dq
                 exp_norm = exp_delta.norm().item() or 1.0
                 ratio = (got_delta.norm().item()) / exp_norm
