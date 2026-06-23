@@ -2084,8 +2084,8 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                 if getattr(lora_stats, "lora_A", None) is None and getattr(lora_stats, "module", None) is not None:
                     # modules_to_save (e.g. resized embed/lm_head): take the saved weight.
                     saved_weight = _get_modules_to_save_weight(lora_stats.module)
-                    if saved_weight is None and hasattr(lora_stats.module, "weight"):
-                        saved_weight = lora_stats.module.weight
+                    if saved_weight is None:
+                        saved_weight = getattr(lora_stats.module, "weight", None)
                     if saved_weight is not None:
                         W = saved_weight.to(W.device, dtype = torch.float32)
                         merged = True
