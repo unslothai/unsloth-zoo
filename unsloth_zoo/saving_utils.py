@@ -623,7 +623,12 @@ def _merge_and_overwrite_lora(
 
     # FP8 grows to 16bit and drops its scales, so full-rewrite (mmap can't resize).
     # 16bit merge only; other save methods keep the quant config and must not dequantize.
-    if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit":
+    # MoE-expert LoRA is left to the in-place quant-aware path below (the dense rewrite cannot
+    # fuse per-expert adapters); dense / non-expert FP8 LoRA dequantizes here.
+    _fp8_moe_expert_lora = any(
+        isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights
+    )
+    if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit" and not _fp8_moe_expert_lora:
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 quantized model detected. Dequantizing to 16bit via full rewrite.")
         return _merge_and_overwrite_lora_fp8(

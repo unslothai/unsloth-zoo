@@ -434,9 +434,11 @@ def test_fp8_dense_block_scale_partial_block(tmp_path):
     assert torch.allclose(merged, W_real, atol=0.05)
 
 
-def test_fp8_dense_moe_expert_lora_raises(tmp_path):
-    """Dense FP8 path has no MoE fusion; a LoRA on fused experts raises, not drops."""
-    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+def test_fp8_dense_path_refuses_moe_expert_lora(tmp_path):
+    """The dense FP8 rewrite cannot fuse per-expert adapters, so it refuses MoE-expert LoRA
+    (the dispatcher routes those to the in-place quant-aware path instead; see
+    test_moe_merge_legacy_mixtral_cpu)."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora_fp8
 
     W_fp8, scale = _fp8_quant_channel(torch.randn(32, 48) * 0.1)
     shard = tmp_path / "model.safetensors"
@@ -449,15 +451,43 @@ def test_fp8_dense_moe_expert_lora_raises(tmp_path):
         lora_A=torch.randn(4, 48) * 0.02, lora_B=torch.randn(32, 4) * 0.02, alpha=1.0,
     )
     with pytest.raises(RuntimeError, match="MoE experts"):
-        _merge_and_overwrite_lora(
+        _merge_and_overwrite_lora_fp8(
             save_directory=str(tmp_path),
             filename="model.safetensors",
             lora_weights=lora,
             output_dtype=torch.bfloat16,
             model_class_name="Qwen3MoeForCausalLM",
-            base_model_is_quantized=True,
-            quant_type="fp8",
         )
+
+
+def test_fp8_moe_expert_lora_routes_to_inplace_not_dense(tmp_path):
+    """The dispatcher must NOT send FP8 + MoE-expert LoRA to the dense rewrite (which would
+    raise); it falls through to the in-place quant-aware path which keeps FP8."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_requant_blockwise, _fp8_dequant_blockwise
+
+    out_f, in_f, r = 32, 48, 4
+    W_hp = torch.randn(out_f, in_f, dtype=torch.float32) * 0.1
+    W_fp8, scale = _fp8_requant_blockwise(W_hp, (out_f, in_f), torch.float32)  # per-tensor-ish block
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": W_fp8,
+        "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv": scale,
+    })
+    lora = defaultdict(_FakeLoraStats)
+    lora["model.layers.0.mlp.experts.base_layer"] = _FakeLoraStats(
+        lora_A=torch.randn(r, in_f) * 0.02, lora_B=torch.randn(2 * out_f, r) * 0.02, alpha=1.0,
+    )
+    # Must not raise the dense "MoE experts" error; routed to the in-place quant-aware path.
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors",
+        lora_weights=lora, output_dtype=torch.bfloat16,
+        model_class_name="Qwen3MoeForCausalLM",
+        base_model_is_quantized=True, quant_type="fp8",
+    )
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        # FP8 is preserved (in-place quant-aware merge), not dequantized to 16bit.
+        assert f.get_tensor("model.layers.0.mlp.experts.0.gate_proj.weight").dtype == torch.float8_e4m3fn
 
 
 def test_fp8_e5m2_dequantizes(tmp_path):
