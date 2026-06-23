@@ -657,6 +657,12 @@ def _merge_and_overwrite_lora(
                     prefix, idx, _ = m.groups()
                     idx = int(idx)
                     moe_num_experts[prefix] = max(moe_num_experts.get(prefix, -1), idx + 1)
+                # Legacy Mixtral disk keys: count under the renamed mlp.experts.
+                m = re.match(r"^(.*)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$", _k)
+                if m:
+                    prefix = m.group(1) + ".mlp.experts"
+                    idx = int(m.group(2))
+                    moe_num_experts[prefix] = max(moe_num_experts.get(prefix, -1), idx + 1)
 
             # Update converted_lora_weights with actual safetensor keys
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -706,6 +712,51 @@ def _merge_and_overwrite_lora(
                     and len(processed_mxfp4_keys) == 0
                 ):
                     logger.info(f"[merge_debug] First shard key example: {key}")
+
+                # Legacy Mixtral disk keys: transformers v5 fuses them under mlp.experts
+                # in-memory (where the LoRA lives), so map disk w1->gate, w3->up, w2->down.
+                m_legacy = re.match(
+                    r"^(.*)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$", key
+                )
+                if m_legacy:
+                    layer_prefix, expert_idx, w_name = m_legacy.groups()
+                    expert_idx = int(expert_idx)
+                    base_prefix = layer_prefix + ".mlp.experts"
+                    available_experts = moe_num_experts.get(base_prefix, None)
+                    if available_experts is not None and expert_idx >= available_experts:
+                        continue
+                    # Fallback count only: the merge helpers re-resolve num_experts from the
+                    # wrapped module (lora_stats), so a shard-local value here is corrected.
+                    num_experts = available_experts
+                    if w_name == "w2":
+                        # down_proj LoRA: experts module, else fused .down_proj when unwrapped.
+                        fused_key = base_prefix
+                        lora_stats = converted_lora_weights.get(fused_key)
+                        if lora_stats is None:
+                            fused_key = base_prefix + ".down_proj"
+                            lora_stats = converted_lora_weights.get(fused_key)
+                        merge_role = "down"
+                        merge_fn = _merge_moe_down_proj_expert
+                    else:
+                        # gate_up_proj LoRA: experts.base_layer, else .gate_up_proj when unwrapped.
+                        fused_key = base_prefix + ".base_layer"
+                        lora_stats = converted_lora_weights.get(fused_key)
+                        if lora_stats is None:
+                            fused_key = base_prefix + ".gate_up_proj"
+                            lora_stats = converted_lora_weights.get(fused_key)
+                        merge_role = "gate" if w_name == "w1" else "up"
+                        merge_fn = _merge_moe_gate_expert if w_name == "w1" else _merge_moe_up_expert
+                    if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
+                        # Quant-aware: FP8/compressed shards dequant->merge->requant; 16-bit pass through.
+                        merged = _merge_moe_expert_quant_aware(
+                            merge_role, key, file, header_metadata, lora_stats,
+                            expert_idx, num_experts, output_dtype, mm, length_of_header,
+                            processed_mxfp4_keys, merge_fn,
+                        )
+                        if merged and fused_key not in counted_lora_modules:
+                            count += 1
+                            counted_lora_modules.add(fused_key)
+                        continue
 
                 # MoE stacked experts: gate_up_proj is fused in the model but
                 # sharded as per-expert gate_proj/up_proj on disk.
@@ -3343,7 +3394,12 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
     if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
         base = key.replace(".base_layer", "")
         cands = set()
-        for b in (base, base.replace(".moe", ".experts")):
+        # Disk aliases: .moe -> .experts (Gemma4); .mlp.experts -> .block_sparse_moe.experts (legacy Mixtral).
+        for b in (
+            base,
+            base.replace(".moe", ".experts"),
+            base.replace(".mlp.experts", ".block_sparse_moe.experts"),
+        ):
             cands.add(b)
             # fused-named key (.gate_up_proj/.down_proj) is also backed by its per-expert
             # descendants, since the merge maps <experts>.<e>.<proj>.weight onto it.
