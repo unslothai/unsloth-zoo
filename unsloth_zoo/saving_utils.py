@@ -3120,6 +3120,27 @@ def merge_and_overwrite_lora(
             f"for model_type={getattr(getattr(_merge_base_model, 'config', None), 'model_type', '?')}."
         )
 
+    # FP8 MoE-expert LoRA + merged_16bit: the dense FP8 rewrite cannot fuse per-expert
+    # adapters, so dequantize the whole model to 16bit first (dense rewrite with no LoRA +
+    # cross-shard scale cleanup), then merge the expert adapters with the standard 16bit MoE
+    # path in the loop below. Keeps a genuine 16bit output instead of FP8-labelled-as-16bit.
+    if (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit"
+            and any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights)):
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("FP8 MoE-expert LoRA detected: dequantizing to 16bit, then merging experts.")
+        for _fn in final_safetensors_list:
+            _merge_and_overwrite_lora_fp8(
+                save_directory, _fn, defaultdict(lambda: None), output_dtype, _merge_model_class_name,
+                tie_word_embeddings = _merge_tie_word_embeddings,
+                weight_block_size = _merge_weight_block_size,
+            )
+        _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list)
+        # Model is now 16bit on disk; merge expert LoRA via the standard (non-quantized) path.
+        base_model_is_quantized = False
+        quant_type = None
+        _merge_weight_block_size = None
+    pass
+
     # FP8 merged_16bit can load a weight's scale from a sibling shard, so the index build and
     # the low-disk upload/remove must wait until every shard is rewritten and the cross-shard
     # scale cleanup has run (otherwise an early shard is removed or indexed with a stale scale).
