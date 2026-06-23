@@ -692,6 +692,7 @@ def _merge_and_overwrite_lora(
                     output_dtype = output_dtype,
                     counted_lora_modules = counted_lora_modules,
                     processed_mxfp4_keys = processed_mxfp4_keys,
+                    weight_block_size = weight_block_size,
                 )
 
             for key in safetensor_keys:
@@ -1027,6 +1028,7 @@ def _merge_moe_expert_quant_aware(
     length_of_header,
     processed_mxfp4_keys,
     merge_fn,
+    weight_block_size = None,
 ) -> bool:
     """Read one expert weight (dequantising via the quant registry), apply
     `merge_fn`, requantise if the handler gave a requant closure, and write
@@ -1039,7 +1041,7 @@ def _merge_moe_expert_quant_aware(
         W = file.get_tensor(key)
         requant_fn = None
     else:
-        loaded = _apply_moe_quant_load(file, header_metadata, key)
+        loaded = _apply_moe_quant_load(file, header_metadata, key, block_size = weight_block_size)
         if loaded[0] is _MOE_QUANT_UNSAFE:
             _record_moe_merge_fallback(
                 role, expert_idx,
@@ -1384,7 +1386,7 @@ def _resolve_moe_num_experts_with_header(prefix, resolution_stats, moe_num_exper
     return num_experts
 
 
-def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys):
+def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys, weight_block_size = None):
     count = 0
     debug_logged = 0
     file_path = getattr(file, "path", None)
@@ -1568,12 +1570,14 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     "gate", gate_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
                     processed_mxfp4_keys, _merge_moe_gate_expert,
+                    weight_block_size = weight_block_size,
                 ):
                     module_updated = True
                 if _merge_moe_expert_quant_aware(
                     "up", up_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
                     processed_mxfp4_keys, _merge_moe_up_expert,
+                    weight_block_size = weight_block_size,
                 ):
                     module_updated = True
             else:
@@ -1582,6 +1586,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     "down", down_key, file, header_metadata, lora_stats,
                     expert_idx, num_experts, output_dtype, mm, length_of_header,
                     processed_mxfp4_keys, _merge_moe_down_proj_expert,
+                    weight_block_size = weight_block_size,
                 ):
                     module_updated = True
         if module_updated and not already_counted:
@@ -1942,6 +1947,8 @@ _FP8_WEIGHT_DTYPES = tuple(
 )
 _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
                        "_scale_inv", "_scale")
+# safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
+_FP8_HEADER_DTYPES = ("F8_E4M3", "F8_E5M2")
 
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
@@ -2041,16 +2048,24 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                 "https://github.com/unslothai/unsloth/issues."
             )
 
-        # Collect companion scale keys to drop (their FP8 weights are dequantized).
+        # Companion scales of an actual FP8 weight (by header dtype) are folded in by the
+        # dequant, so they are dropped. Derive them from the FP8 weights rather than by raw
+        # suffix, so unrelated `*_scale` / `*_scale_inv` tensors (logit_scale, router
+        # per_expert_scale, ...) are not silently lost.
         scale_keys_to_drop = set()
+        for key in safetensor_keys:
+            if header_metadata.get(key, {}).get("dtype") not in _FP8_HEADER_DTYPES:
+                continue
+            base = key[: -len(".weight")] if key.endswith(".weight") else key
+            scale_keys_to_drop.update(base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata)
+
         for key in safetensor_keys:
             if key in scale_keys_to_drop:
                 continue
-            if any(key.endswith(s) for s in _FP8_SCALE_SUFFIXES):
-                continue
 
-            W, scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size)
-            scale_keys_to_drop.update(scale_keys)
+            was_fp8 = header_metadata.get(key, {}).get("dtype") in _FP8_HEADER_DTYPES
+            merged = False
+            W, _scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size)
 
             output_key = key
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
@@ -2073,13 +2088,17 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                         saved_weight = lora_stats.module.weight
                     if saved_weight is not None:
                         W = saved_weight.to(W.device, dtype = torch.float32)
+                        merged = True
                         count += 1
                 elif getattr(lora_stats, "lora_A", None) is not None:
                     W = _merge_lora(W, lora_stats, output_key)
+                    merged = True
                     count += 1
 
-            # Offload merged weights to CPU so the dequantized model doesn't pile up in VRAM.
-            tensors[output_key] = W.to(device = "cpu", dtype = output_dtype).contiguous()
+            # Dequantized FP8 or LoRA-merged tensors take output_dtype; untouched non-FP8
+            # buffers (int64/bool/fp32, e.g. inv_freq) keep their dtype, as the in-place path does.
+            write_dtype = output_dtype if (was_fp8 or merged) else W.dtype
+            tensors[output_key] = W.to(device = "cpu", dtype = write_dtype).contiguous()
             del W
             if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
                 device_empty_cache()
@@ -2717,10 +2736,11 @@ def merge_and_overwrite_lora(
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
 
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
-    # copying it (regenerated below).
+    # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an
+    # FP8 base saved another way keeps its scales and must reuse the original index.
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8")
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
     # ONLY download/copy the original index if we are NOT dequantizing a quantized model
     if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
@@ -2850,7 +2870,11 @@ def merge_and_overwrite_lora(
 
     is_final_safetensors_list_sharded = is_hf_sharded_safetensors(final_safetensors_list)
     # FP8 dequant drops companion scale keys, so a sharded index must be rebuilt too.
-    _quant_dequant_index = base_model_is_quantized and quant_type in ("mxfp4", "fp8")
+    # Mirror the actual dequant conditions (mxfp4: any non-mxfp4 save; fp8: merged_16bit)
+    # so a non-dequantizing FP8 save keeps a correct index instead of none.
+    _quant_dequant_index = (
+        base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
     regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
     weight_map = {}
 

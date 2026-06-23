@@ -177,3 +177,66 @@ def test_apply_moe_quant_load_dispatch():
     assert requant is None
     assert torch.equal(W, torch.tensor([1.0, 2.0, 3.0]))
     assert file.calls == ["plain.weight"]
+
+
+class _FakeFile:
+    def __init__(self, tensors):
+        self._tensors = tensors
+
+    def get_tensor(self, key):
+        return self._tensors[key]
+
+
+def test_fp8_handler_partial_block_needs_block_size():
+    """A weight dim that is not a block multiple (130 rows, 128x128 blocks, 2x2 scale
+    grid) divides the scale grid evenly (130 % 2 == 0), so inference picks bm=65 and
+    misapplies scales. The configured weight_block_size must override that."""
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+        _fp8_save_handler,
+        _fp8_dequant_blockwise,
+        _fp8_requant_blockwise,
+        _MOE_QUANT_UNSAFE,
+    )
+    torch.manual_seed(0)
+    W_real = torch.randn(130, 256, dtype=torch.float32) * 0.1
+    W_fp8, scale_inv = _fp8_requant_blockwise(W_real, (128, 128), torch.float32)
+    assert tuple(scale_inv.shape) == (2, 2)  # ceil(130/128), ceil(256/128)
+
+    header = {"X.weight": {"dtype": "F8_E4M3"}, "X.weight_scale_inv": {"dtype": "F32"}}
+    file = _FakeFile({"X.weight": W_fp8, "X.weight_scale_inv": scale_inv})
+
+    # Without block_size: inference (bm=65) misapplies the scale grid -> wrong dequant.
+    W_inferred, _ = _fp8_save_handler(file, header, "X.weight")
+    assert W_inferred is not _MOE_QUANT_UNSAFE
+    err_inferred = (W_inferred.float() - W_real).abs().max().item()
+
+    # With configured block size: correct 128x128 tiling -> matches the real weight.
+    W_block, requant = _fp8_save_handler(file, header, "X.weight", block_size=(128, 128))
+    assert W_block is not _MOE_QUANT_UNSAFE
+    err_block = (W_block.float() - W_real).abs().max().item()
+    assert err_block < 0.05, f"block-size dequant off: {err_block}"
+    assert err_inferred > err_block * 5, (
+        f"inference should be materially worse (inferred={err_inferred}, block={err_block})"
+    )
+
+    # Requant round-trips for the partial block (no reshape crash, grid preserved).
+    new_fp8, write_dtype, extras = requant(W_block)
+    assert write_dtype == torch.float8_e4m3fn
+    scale_key, new_scale, _ = extras[0]
+    assert tuple(new_scale.shape) == (2, 2)
+    re = _fp8_dequant_blockwise(new_fp8, new_scale, block_size=(128, 128))
+    assert (re.float() - W_real).abs().max().item() < 0.05
+
+
+def test_fp8_handler_block_size_grid_mismatch_is_unsafe():
+    """A configured block size whose ceil grid does not match the stored scale grid is
+    rejected (UNSAFE) rather than silently mis-tiled."""
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+        _fp8_save_handler, _fp8_requant_blockwise, _MOE_QUANT_UNSAFE,
+    )
+    W_real = torch.randn(128, 256, dtype=torch.float32) * 0.1
+    W_fp8, scale_inv = _fp8_requant_blockwise(W_real, (64, 128), torch.float32)  # grid 2x2
+    header = {"X.weight": {"dtype": "F8_E4M3"}, "X.weight_scale_inv": {"dtype": "F32"}}
+    file = _FakeFile({"X.weight": W_fp8, "X.weight_scale_inv": scale_inv})
+    # block_size (128,128) -> ceil grid (1,2) != stored (2,2) -> UNSAFE.
+    assert _fp8_save_handler(file, header, "X.weight", block_size=(128, 128)) == (_MOE_QUANT_UNSAFE, None)

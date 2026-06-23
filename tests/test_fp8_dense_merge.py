@@ -25,11 +25,37 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
+import importlib.machinery
+import sys
+import types
+
 import pytest
 import torch
 
 if not hasattr(torch, "float8_e4m3fn"):
     pytest.skip("float8_e4m3fn unavailable", allow_module_level=True)
+
+# unsloth_zoo / transformers import bitsandbytes at import time (a 4bit-merge path these
+# FP8 tests never reach). Stub it only when absent so the suite runs in a CPU-only core
+# env; a real install is left untouched. The stub carries a valid __spec__ so
+# transformers' importlib.util.find_spec("bitsandbytes") probe returns a spec instead of
+# raising on a spec-less module (and then reports unavailable via missing dist metadata).
+try:
+    import bitsandbytes  # noqa: F401
+except Exception:
+    def _stub_module(name):
+        mod = types.ModuleType(name)
+        mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+        return mod
+    _bnb = _stub_module("bitsandbytes")
+    _bnb.__version__ = "0.0.0"
+    _bnb_nn = _stub_module("bitsandbytes.nn")
+    class _Linear4bit:  # placeholder; isinstance checks just return False here
+        pass
+    _bnb_nn.Linear4bit = _Linear4bit
+    _bnb.nn = _bnb_nn
+    sys.modules.setdefault("bitsandbytes", _bnb)
+    sys.modules.setdefault("bitsandbytes.nn", _bnb_nn)
 
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -465,3 +491,71 @@ def test_resolve_fp8_16bit_sibling_quantized_sibling_ignored(tmp_path):
         '{"model_type": "llama", "quantization_config": {"load_in_4bit": true, "bnb_4bit_quant_type": "nf4"}}'
     )
     assert _resolve_fp8_16bit_sibling(str(tmp_path / "GLM-5.2-FP8")) is None
+
+
+def test_fp8_keeps_non_companion_scale_tensors(tmp_path):
+    """Tensors whose names merely end in `_scale`/`_scale_inv` but are NOT companions of
+    an FP8 weight (logit_scale, router per_expert_scale, ...) must survive the rewrite."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(3)
+    W_real = torch.randn(16, 32, dtype=torch.float32) * 0.1
+    W_fp8, scale = _fp8_quant_channel(W_real)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.down_proj.weight": W_fp8,
+        "model.layers.0.mlp.down_proj.weight_scale": scale,          # real FP8 companion -> dropped
+        "model.layers.0.mlp.router.per_expert_scale": torch.randn(8, dtype=torch.bfloat16),
+        "model.embed_scale": torch.randn(4, dtype=torch.bfloat16),
+        "logit_scale": torch.tensor([2.5], dtype=torch.float32),
+        "model.layers.0.attn.k_scale_inv": torch.randn(2, dtype=torch.bfloat16),
+    })
+
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors",
+        lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.bfloat16,
+        model_class_name="Qwen2ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
+    )
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+        # FP8 companion dropped, weight dequantized.
+        assert "model.layers.0.mlp.down_proj.weight_scale" not in keys
+        assert f.get_tensor("model.layers.0.mlp.down_proj.weight").dtype == torch.bfloat16
+        # Unrelated *_scale / *_scale_inv tensors preserved (not FP8 companions).
+        for k in ("model.layers.0.mlp.router.per_expert_scale", "model.embed_scale",
+                  "logit_scale", "model.layers.0.attn.k_scale_inv"):
+            assert k in keys, f"{k} was wrongly dropped"
+
+
+def test_fp8_preserves_non_fp8_buffer_dtypes(tmp_path):
+    """Non-FP8, non-merged buffers (int64/bool/float32) must keep their dtype, not be cast
+    to output_dtype like a dequantized FP8 weight would be."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(4)
+    W_fp8, scale = _fp8_quant_channel(torch.randn(16, 16, dtype=torch.float32) * 0.1)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.self_attn.q_proj.weight": W_fp8,
+        "model.layers.0.self_attn.q_proj.weight_scale": scale,
+        "model.rotary_emb.inv_freq": torch.randn(8, dtype=torch.float32),
+        "model.layers.0.attn.bias_mask": torch.zeros(4, dtype=torch.bool),
+        "model.position_ids": torch.arange(8, dtype=torch.int64),
+    })
+
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors",
+        lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.bfloat16,
+        model_class_name="Qwen2ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
+    )
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        # FP8 weight dequantized to output_dtype.
+        assert f.get_tensor("model.layers.0.self_attn.q_proj.weight").dtype == torch.bfloat16
+        # Buffers keep their original dtypes.
+        assert f.get_tensor("model.rotary_emb.inv_freq").dtype == torch.float32
+        assert f.get_tensor("model.layers.0.attn.bias_mask").dtype == torch.bool
+        ids = f.get_tensor("model.position_ids")
+        assert ids.dtype == torch.int64
+        assert torch.equal(ids, torch.arange(8, dtype=torch.int64))
