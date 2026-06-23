@@ -1,16 +1,9 @@
 """Regression tests for unsloth#2343: bias training was silently disabled.
 
-The LoRA branch of prepare_model_for_training froze every non-adapter param, so
-LoraConfig(bias="all"/"lora_only") had no effect. The fix preserves PEFT's bias
-decision; properties guarded below:
-  * bias="all"/"lora_only": PEFT-enabled biases stay trainable.
-  * bias="none" (default): biases stay frozen.
-  * a trainable bias keeps its loaded dtype, not fp32 (an fp32 bias on a bf16/fp16
-    Linear breaks the matmul with a dtype mismatch).
-  * gated to PEFT models, so a non-PEFT model's biases stay frozen on the LoRA path.
-
-Pure CPU, tiny random Llama. PEFT tests import-or-skip (peft is excluded on
-darwin/arm64).
+The LoRA branch froze every non-adapter param, so LoraConfig(bias="all"/"lora_only")
+had no effect. The fix preserves PEFT's bias decision (trainable biases keep their
+loaded dtype, frozen on bias="none", gated to PEFT models). Pure CPU, tiny Llama;
+PEFT tests import-or-skip.
 """
 import pytest
 import torch
@@ -75,7 +68,7 @@ def test_peft_bias_all_stays_trainable():
     )
     after = _trainable_bias_count(model)
     assert after == before, f"bias='all' lost trainable biases: {before} -> {after}"
-    # The non-bias base weights must remain frozen.
+    # Base weights stay frozen.
     params = dict(model.named_parameters())
     base_w = next(n for n in params
                   if n.endswith("q_proj.base_layer.weight"))
@@ -96,8 +89,8 @@ def test_peft_bias_none_stays_frozen():
 
 
 def test_peft_trainable_bias_keeps_module_dtype():
-    """A trainable bias keeps its Linear's bf16 dtype, not fp32; an fp32 bias on a
-    bf16 weight raises 'self and mat2 must have the same dtype'."""
+    """A trainable bias keeps its Linear's bf16 dtype, not fp32 (else the matmul
+    dtype mismatches)."""
     pytest.importorskip("peft")
     from unsloth_zoo.training_utils import prepare_model_for_training
 
@@ -127,9 +120,8 @@ def test_peft_bias_gradient_flows_after_backward():
     )
 
     input_ids = torch.randint(0, 64, (1, 8))
-    # Loss from logits, not labels=: with unsloth the labelled forward uses the
-    # fused CUDA cross-entropy, which aborts on a CPU-only build. A logits scalar
-    # stays CPU-only while still driving a real backward.
+    # Loss from logits, not labels=: the labelled forward uses fused CUDA CE that
+    # aborts on a CPU-only build; logits stay CPU-only and still drive a backward.
     logits = model(input_ids=input_ids).logits.float()
     loss = torch.nn.functional.cross_entropy(
         logits.view(-1, logits.size(-1)), input_ids.view(-1))
@@ -141,7 +133,7 @@ def test_peft_bias_gradient_flows_after_backward():
     a_grad = params[a_bias].grad
     assert a_grad is not None, "trainable bias must receive a grad"
     assert torch.isfinite(a_grad).all(), "bias grad must be finite"
-    # Strictly > 0 proves a gradient actually flowed, not just that grad exists.
+    # > 0 proves a gradient actually flowed, not just that grad exists.
     assert a_grad.abs().sum() > 0, "bias grad must be non-zero (gradient flowed)"
     base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
     assert params[base_w].grad is None, "frozen base weight must not accumulate grad"
@@ -169,17 +161,14 @@ def test_non_peft_model_biases_stay_frozen():
 # ---------------- modules_to_save biases are not a bias decision -------------
 
 def test_modules_to_save_bias_not_preserved_on_bias_none():
-    """bias='none' + modules_to_save: PEFT marks the saved module trainable because
-    the whole module is saved, not as a bias decision. With patch_modules_to_save=False
-    the saved weight stays frozen, so its bias must too (else a saved head is partially
-    trained, changing the bias='none' path, #2343 review). Bias and weight must share
-    requires_grad."""
+    """bias='none' + modules_to_save: a saved module is trainable because the whole
+    module is saved, not as a bias decision; with patch_modules_to_save=False bias and
+    weight stay frozen together (#2343 review)."""
     pytest.importorskip("peft")
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.training_utils import prepare_model_for_training
 
-    # gate_proj has a bias (mlp_bias=True) and is not a LoRA target, so PEFT wraps
-    # it as a saved module: gate_proj.modules_to_save.default.*.
+    # gate_proj has a bias and isn't a LoRA target, so PEFT wraps it as a saved module.
     model = get_peft_model(
         _tiny_llama(),
         LoraConfig(
@@ -199,7 +188,6 @@ def test_modules_to_save_bias_not_preserved_on_bias_none():
         full_finetuning=False, patch_modules_to_save=False,
     )
     params = dict(model.named_parameters())
-    # No bias leaks trainable on the bias='none' path...
     assert _trainable_bias_count(model) == 0, "bias='none' must leave all biases frozen"
-    # ...and the saved bias matches its weight (both frozen, not partially trained).
+    # Saved bias matches its weight (both frozen, not partially trained).
     assert params[saved_bias].requires_grad == params[saved_weight].requires_grad

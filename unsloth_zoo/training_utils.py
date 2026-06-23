@@ -369,9 +369,8 @@ def prepare_model_for_training(
             or "norm2." in nm
         )
 
-    # Gate the bias branch to PEFT models: a non-PEFT model's nn.Linear biases
-    # default to requires_grad=True, which would otherwise keep them all trainable
-    # on the LoRA (not full_finetuning) path (#2343 review).
+    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
+    # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
     _is_peft_model = hasattr(model, "peft_config")
 
     for name, param in model.named_parameters():
@@ -386,15 +385,11 @@ def prepare_model_for_training(
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
                     and ".modules_to_save." not in name):
-                # Respect PEFT's bias decision: LoraConfig(bias="all"/"lora_only")
-                # marks biases trainable, and blindly freezing them here disabled
-                # bias training (#2343). bias="none" keeps biases frozen via the else.
-                # Keep the bias at its loaded dtype: upcasting to fp32 while the
-                # Linear weight stays bf16/fp16 breaks the matmul (dtype mismatch).
-                # Exclude modules_to_save: PEFT marks those trainable because the whole
-                # module is saved, not as a bias decision; with the default
-                # patch_modules_to_save=False the saved weight stays frozen, so keeping
-                # its bias would partially train a saved head (#2343 review).
+                # Respect PEFT's bias decision: bias="all"/"lora_only" marks biases
+                # trainable; freezing them here disabled bias training (#2343).
+                # _keep_param_dtype: keep the loaded dtype, since fp32 on a bf16/fp16
+                # Linear breaks the matmul. modules_to_save is excluded so a saved head
+                # with a frozen weight isn't partially trained via its bias (#2343 review).
                 requires_grad = True
                 _keep_param_dtype = True
             else:
@@ -417,8 +412,8 @@ def prepare_model_for_training(
             param.requires_grad_(False)
 
         # Cast storage in place (keeps Parameter identity so tied weights stay tied);
-        # skip externally-managed params (preserve their fp32 cast) and params pinned
-        # to their loaded dtype (trainable biases must match their Linear weight).
+        # skip externally-managed params (preserve their fp32 cast) and dtype-pinned
+        # params (trainable biases must match their Linear weight).
         if (requires_grad
                 and not _keep_param_dtype
                 and id(param) not in _externally_managed_param_ids):
