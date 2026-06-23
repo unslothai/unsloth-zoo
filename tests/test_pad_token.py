@@ -128,6 +128,29 @@ def test_vision_token_never_selected_for_text_model():
     assert tok.pad_token not in VISION_RESERVED_TOKENS
 
 
+def test_out_of_range_pad_is_repicked_when_model_known():
+    # pad looks fine (not eos, not vision) but its id is past the model vocab,
+    # e.g. an earlier model-less swap picked a high-id added token. The
+    # model-aware call must catch it and re-pick an in-range reserved token.
+    vocab = {
+        "<|eot_id|>": 0,                       # eos
+        "<|reserved_special_token_0|>": 100,   # in-range reserved
+        "<pad>": 5000,                         # current pad, beyond vocab_size
+    }
+    tok = FakeTokenizer(vocab, pad_token = "<pad>", eos_token = "<|eot_id|>")
+    cfg = type("Cfg", (), {"vocab_size": 1000})()
+    res = fix_pad_token(tok, model_config = cfg)
+    assert res["reason"] == "out_of_range"
+    assert tok.pad_token == "<|reserved_special_token_0|>"
+
+
+def test_in_range_valid_pad_is_noop_with_vocab_size():
+    tok = FakeTokenizer({"<s>": 1, "</s>": 2, "<pad>": 0},
+                        pad_token = "<pad>", eos_token = "</s>")
+    cfg = type("Cfg", (), {"vocab_size": 1000})()
+    assert fix_pad_token(tok, model_config = cfg)["changed"] is False
+
+
 def test_vision_model_keeps_its_vision_pad():
     # A real multimodal model (model_type without "vl", e.g. llava) must be
     # detected as vision so its vision pad_token is left untouched.

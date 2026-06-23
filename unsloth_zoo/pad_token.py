@@ -105,7 +105,7 @@ def _display_name(model, model_config, inner):
     return "Model"
 
 
-def _classify_bad_pad(inner, is_vision):
+def _classify_bad_pad(inner, is_vision, vocab_size):
     """Return a reason string if the current pad_token is bad, else None."""
     if not hasattr(inner, "pad_token"):
         return None
@@ -120,6 +120,12 @@ def _classify_bad_pad(inner, is_vision):
         return "equals_eos"
     if not is_vision and pad in VISION_RESERVED_TOKENS:
         return "vision_pad"
+    # A pad whose id is past the model's embeddings indexes out of range at
+    # runtime. This catches a pad picked by an earlier model-less call (e.g.
+    # load_correct_tokenizer) that turned out to be beyond the vocab; only
+    # checkable once a model/config gives us vocab_size.
+    if vocab_size is not None and pad_id is not None and pad_id >= vocab_size:
+        return "out_of_range"
     return None
 
 
@@ -188,16 +194,16 @@ def fix_pad_token(
     if inner is None:
         return result
 
+    cfg = model_config if model_config is not None else getattr(model, "config", None)
+    vocab_size = getattr(cfg, "vocab_size", None)
+    eos_token = getattr(inner, "eos_token", None)
+
     is_vision = _infer_vision(tokenizer, inner, model, model_config, is_vision_model)
-    reason = _classify_bad_pad(inner, is_vision)
+    reason = _classify_bad_pad(inner, is_vision, vocab_size)
     if reason is None:
         return result
     result["reason"] = reason
     result["old_pad"] = getattr(inner, "pad_token", None)
-
-    cfg = model_config if model_config is not None else getattr(model, "config", None)
-    vocab_size = getattr(cfg, "vocab_size", None)
-    eos_token = getattr(inner, "eos_token", None)
 
     new_pad = _find_reserved_pad(inner, is_vision, eos_token, vocab_size)
     added = False
