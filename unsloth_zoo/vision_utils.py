@@ -682,6 +682,43 @@ import PIL.Image
 LANCZOS = PIL.Image.Resampling.LANCZOS
 from .dataset_utils import train_on_responses_only as _train_on_responses_only
 
+
+def _resolve_processor_model_name(processor, model = None):
+    """Best-effort human readable name for the processor / model in errors."""
+    for obj in (processor, getattr(model, "config", None), model):
+        if obj is None:
+            continue
+        for attr in ("name_or_path", "_name_or_path"):
+            name = getattr(obj, attr, None)
+            if isinstance(name, str) and len(name) > 0:
+                return name
+    if processor is not None:
+        return processor.__class__.__name__
+    return "this model"
+
+
+def _raise_chat_template_error(error, processor, model = None):
+    """Turn an apply_chat_template failure into an actionable Unsloth error (usually a base
+    checkpoint whose processor has no chat template)."""
+    name = _resolve_processor_model_name(processor, model)
+    msg = str(error)
+    lowered = msg.lower()
+    # newer Transformers says "chat template"; older says "apply_chat_template()/chat_template"
+    if "chat template" in lowered or "chat_template" in lowered:
+        raise RuntimeError(
+            f"Unsloth: The processor for `{name}` has no chat template, so vision "
+            "conversations cannot be formatted.\n"
+            "Use an instruction-tuned checkpoint (e.g. the `-Instruct` / `-it` "
+            "variant of this model), or set a chat template before training via "
+            "`processor.chat_template = ...` -- the collator calls "
+            "`processor.apply_chat_template`, so setting it on a separate tokenizer "
+            "has no effect (you may also pass `chat_template=` to "
+            "`apply_chat_template`).\n"
+            f"(original error: {msg})"
+        ) from error
+    raise RuntimeError(error) from error
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -847,9 +884,9 @@ class UnslothVisionDataCollator:
                     "We will auto fix the data collator to support it!"
                 )
             except Exception as e:
-                raise RuntimeError(e) from e
+                _raise_chat_template_error(e, processor, model)
         except Exception as e:
-            raise RuntimeError(e) from e
+            _raise_chat_template_error(e, processor, model)
         return
 
     def _get_padding_token_ids_on_device(self, device):

@@ -759,11 +759,13 @@ def _rocm_gfx_family(gfx):
     return None
 
 
-def _select_gpu_assets(tag, assets, manifest):
+def _select_gpu_assets(tag, assets, manifest, target = None):
     """Ordered download attempts [(asset_name, url), ...] of unslothai/llama.cpp
     GPU bundles for this host: narrowest CUDA coverage for the torch runtime
     line first, that line's portable build next, then the other line; ROCm by
-    gfx family; macOS by the fork's Metal bundles. Empty list = compile."""
+    gfx family; macOS by the fork's Metal bundles. Empty list = compile.
+    target is the _detect_gpu_target() result; pass it to reuse an already-probed
+    value (the caller's gate probes it once), else it is detected here."""
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64"): arch = "x64"
     elif machine in ("aarch64", "arm64"): arch = "arm64"
@@ -774,7 +776,8 @@ def _select_gpu_assets(tag, assets, manifest):
         name = f"llama-{tag}-bin-macos-{arch}.tar.gz"
         return [(name, assets[name])] if name in assets else []
 
-    target = _detect_gpu_target()
+    if target is None:
+        target = _detect_gpu_target()
     if target is None:
         return []
     artifacts = (manifest or {}).get("artifacts", [])
@@ -858,6 +861,40 @@ def _select_prebuilt_asset(tag, assets):
     return name, assets[name]
 
 
+def _select_cpu_assets(tag, assets, manifest):
+    """Ordered download attempts [(asset_name, url), ...] of the unslothai/llama.cpp
+    fork's CPU bundle for this host -- the final prebuilt fallback before a source
+    compile (its app-*-cpu archive still ships llama-quantize, the only binary the
+    export path needs). On macOS the CPU and GPU bundle are the same Metal archive,
+    named by convention. On Linux/Windows the fork CPU asset names carry a
+    commit-hash suffix, so they are looked up by the manifest's install_kind rather
+    than constructed. Empty list = no fork CPU bundle for this host."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"): arch = "x64"
+    elif machine in ("aarch64", "arm64"): arch = "arm64"
+    else: return []
+    system = platform.system()
+
+    if system == "Darwin":
+        name = f"llama-{tag}-bin-macos-{arch}.tar.gz"
+        return [(name, assets[name])] if name in assets else []
+
+    kind = {
+        ("Linux",   "x64")   : "linux-cpu",
+        ("Linux",   "arm64") : "linux-arm64",
+        ("Windows", "x64")   : "windows-cpu",
+        ("Windows", "arm64") : "windows-arm64",
+    }.get((system, arch))
+    if kind is None:
+        return []
+    artifacts = (manifest or {}).get("artifacts", [])
+    return [
+        (a["asset_name"], assets[a["asset_name"]])
+        for a in artifacts
+        if a.get("install_kind") == kind and a.get("asset_name") in assets
+    ]
+
+
 def _download_archive(url, dest_path):
     response = _requests_get_with_retries(url, headers = _github_auth_headers(), stream = True)
     with open(dest_path, "wb") as f:
@@ -868,19 +905,44 @@ def _download_archive(url, dest_path):
 def _extract_archive(archive_path, extract_dir):
     """Extract a release .zip / .tar.gz, refusing path-escaping members."""
     real_root = os.path.realpath(extract_dir)
+    def _escapes(target):
+        try:
+            return os.path.commonpath([real_root, target]) != real_root
+        except ValueError:
+            return True
     def _check(name):
         target = os.path.realpath(os.path.join(extract_dir, name))
-        if target != real_root and not target.startswith(real_root + os.sep):
+        if _escapes(target):
             raise RuntimeError(f"Unsloth: Archive member escapes extraction dir: {name}")
+        return target
+    def _check_tar_member(member):
+        member_target = _check(member.name)
+        if member.issym() or member.islnk():
+            # Hardlink targets are archive-relative (resolve from the root);
+            # symlink targets resolve from the link's own directory.
+            link_base = real_root if member.islnk() else os.path.dirname(member_target)
+            link_target = member.linkname if os.path.isabs(member.linkname) else os.path.join(link_base, member.linkname)
+            if _escapes(os.path.realpath(link_target)):
+                raise RuntimeError(f"Unsloth: Archive link escapes extraction dir: {member.name} -> {member.linkname}")
+        elif not (member.isfile() or member.isdir()):
+            raise RuntimeError(f"Unsloth: Unsupported archive member type: {member.name}")
     if archive_path.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.namelist(): _check(member)
+            for member in archive.infolist():
+                _check(member.filename)
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise RuntimeError(f"Unsloth: Archive contains an unsupported symlink: {member.filename}")
             archive.extractall(extract_dir)
     else:
         tar_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
         with tarfile.open(archive_path, "r:gz") as archive:
-            for member in archive.getmembers(): _check(member.name)
-            archive.extractall(extract_dir, **tar_kwargs)
+            # Validate every member (rejecting links whose targets escape) before
+            # extracting anything, so no escaping symlink is ever written for a
+            # later member to traverse through. extractall defers directory attrs
+            # until contents are written, which per-member extract would break.
+            members = archive.getmembers()
+            for member in members: _check_tar_member(member)
+            archive.extractall(extract_dir, members = members, **tar_kwargs)
 
 
 def _single_extracted_root(extract_dir):
@@ -919,13 +981,27 @@ def _place_prebuilt_binaries(extracted_root, install_folder):
         raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
 
 
-def _hydrate_converter_sources(tag, install_folder):
+def _hydrate_converter_sources(tag, install_folder, source_assets = None):
     """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
     source tarball so check_llama_cpp and the converter machinery work
-    without a git checkout, and tensor mappings match the binaries."""
+    without a git checkout, and tensor mappings match the binaries.
+
+    Fork releases use "mix" tags (e.g. b9739-mix-2d6bd50) that do NOT exist on
+    ggml-org, so a verbatim ggml-org download 404s and the whole prebuilt install
+    fails into a source compile. Prefer the fork release's own source asset
+    (llama.cpp-source-{tag}.tar.gz, passed in via source_assets) so the converter
+    exactly matches the fork build; otherwise strip the -mix-... suffix and pull
+    the matching upstream tag from ggml-org. Plain ggml-org tags carry no suffix,
+    so this is a no-op for them (upstream_tag == tag)."""
+    fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
+    if source_assets and fork_source_name in source_assets:
+        source_url = source_assets[fork_source_name]
+    else:
+        upstream_tag = tag.split("-mix-")[0]
+        source_url = LLAMA_CPP_SOURCE_TARBALL.format(tag = upstream_tag)
     with tempfile.TemporaryDirectory(dir = os.path.dirname(install_folder) or ".") as source_dir:
         archive_path = os.path.join(source_dir, "source.tar.gz")
-        _download_archive(LLAMA_CPP_SOURCE_TARBALL.format(tag = tag), archive_path)
+        _download_archive(source_url, archive_path)
         extract_dir = os.path.join(source_dir, "extracted")
         os.makedirs(extract_dir)
         _extract_archive(archive_path, extract_dir)
@@ -956,9 +1032,11 @@ def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/lla
         logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
 
 
-def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp"):
+def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None):
     """Download one prebuilt asset, verify, hydrate, validate in staging,
-    then activate into llama_cpp_folder. Raises on any failure."""
+    then activate into llama_cpp_folder. Raises on any failure. source_assets is
+    the release's asset map, used so the converter sources hydrate from the fork's
+    own source tarball for "mix" tags (see _hydrate_converter_sources)."""
     parent_dir = os.path.dirname(llama_cpp_folder) or "."
     os.makedirs(parent_dir, exist_ok = True)
     # Stage next to the target so activation is an atomic same-fs move,
@@ -977,7 +1055,7 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
         staged_install = os.path.join(staging, "install")
         os.makedirs(staged_install)
         _place_prebuilt_binaries(_single_extracted_root(extract_dir), staged_install)
-        _hydrate_converter_sources(tag, staged_install)
+        _hydrate_converter_sources(tag, staged_install, source_assets = source_assets)
         _write_prebuilt_marker(staged_install, tag, asset_name, repo = repo)
         check_llama_cpp(llama_cpp_folder = staged_install)
 
@@ -993,50 +1071,84 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
 
 
 def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_output = False):
-    """Install prebuilt llama.cpp binaries plus same-tag converter sources
-    into llama_cpp_folder. CPU builds come from ggml-org releases; GPU builds
-    from the unslothai/llama.cpp bundles Studio publishes. Returns
-    (quantizer, converter) on success, None on any failure so the caller
-    compiles from source as before."""
+    """Install prebuilt llama.cpp binaries plus same-tag converter sources into
+    llama_cpp_folder, always preferring the unslothai/llama.cpp fork. Tries, in
+    order: the fork GPU bundle (CUDA/ROCm/Metal) when a GPU target is present, the
+    fork CPU bundle (the final prebuilt fallback -- its app-*-cpu archive also ships
+    llama-quantize), then ggml-org's upstream CPU build for extra resilience on
+    non-macOS hosts. Returns (quantizer, converter) on the first asset that installs,
+    else None so the caller compiles from source as before. ggml-org is skipped on
+    macOS: its recent CPU build targets a newer macOS and fails to load on 14/15."""
     try:
-        if gpu_support:
-            # Cheap host check before any network: no detectable GPU target
-            # (and not macOS Metal) means no bundle could match.
-            if platform.system() != "Darwin" and _detect_gpu_target() is None:
-                logger.warning("Unsloth: gpu_support requested but no GPU target detected - compiling instead.")
-                return None
-            repo = "unslothai/llama.cpp"
-            resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
-            if resolved is None:
-                return None
-            tag, assets = resolved
-            manifest = _fetch_release_json_asset(assets, LLAMA_CPP_PREBUILT_MANIFEST_ASSET)
-            checksums = _fetch_release_json_asset(assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
-            checksums = checksums.get("artifacts", {})
-            attempts = _select_gpu_assets(tag, assets, manifest)
-            if not attempts:
-                logger.warning("Unsloth: No prebuilt GPU llama.cpp bundle matches this host in release %s.", tag)
-                return None
-        else:
-            repo = "ggml-org/llama.cpp"
-            resolved = _resolve_llama_cpp_release()
-            if resolved is None:
-                return None
-            tag, assets = resolved
-            checksums = {}
-            selected = _select_prebuilt_asset(tag, assets)
-            if selected is None:
-                logger.warning("Unsloth: No prebuilt llama.cpp asset for this platform in release %s.", tag)
-                return None
-            attempts = [selected]
+        is_darwin = platform.system() == "Darwin"
+        # Each attempt carries its own (repo, tag, checksums, source_assets) so
+        # staging verifies the right sha256 and hydrates the converter from the
+        # matching source. (repo, asset_name) dedups the macOS bundle, which both
+        # fork selectors return.
+        attempts = []          # [(repo, tag, checksums, source_assets, name, url), ...]
+        seen = set()           # {(repo, asset_name)}
 
-        for asset_name, asset_url in attempts:
+        def _extend(repo, tag, checksums, source_assets, selected):
+            for asset_name, asset_url in selected:
+                key = (repo, asset_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                attempts.append((repo, tag, checksums, source_assets, asset_name, asset_url))
+
+        # 1 + 2: unslothai/llama.cpp fork bundles (GPU then CPU). Best-effort: a
+        # failed fork release resolution still lets ggml-org be tried below.
+        fork_repo = "unslothai/llama.cpp"
+        resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
+        if resolved is not None:
+            fork_tag, fork_assets = resolved
+            manifest = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_MANIFEST_ASSET)
+            fork_checksums = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
+            fork_checksums = fork_checksums.get("artifacts", {})
+            # 1: GPU bundle, only with a usable GPU target (or macOS Metal).
+            # Probe the GPU target once and reuse it inside _select_gpu_assets.
+            gpu_target = _detect_gpu_target() if (gpu_support and not is_darwin) else None
+            if gpu_support and (is_darwin or gpu_target is not None):
+                _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
+                        _select_gpu_assets(fork_tag, fork_assets, manifest, target = gpu_target))
+            # 2: CPU bundle -- the final prebuilt fallback for CPU-oriented
+            # installs. Skipped for an explicit GPU request so a failed GPU
+            # prebuilt compiles a GPU-enabled build (the pre-prebuilt behavior)
+            # rather than silently landing on a CPU-only prebuilt. macOS export
+            # passes gpu_support=False and still gets the right archive: on Darwin
+            # the CPU selector returns the same universal macOS/Metal bundle.
+            if not gpu_support:
+                _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
+                        _select_cpu_assets(fork_tag, fork_assets, manifest))
+        else:
+            logger.warning("Unsloth: Could not resolve a unslothai/llama.cpp release - "
+                           "trying upstream ggml-org instead.")
+
+        # 3: ggml-org upstream CPU, non-Darwin CPU installs only (its Darwin CPU
+        # build is unusable on macOS 14/15, and a GPU request must not be shadowed
+        # by a CPU-only prebuilt -- it falls through to a source GPU build).
+        if not is_darwin and not gpu_support:
+            ggml_repo = "ggml-org/llama.cpp"
+            resolved = _resolve_llama_cpp_release()
+            if resolved is not None:
+                ggml_tag, ggml_assets = resolved
+                selected = _select_prebuilt_asset(ggml_tag, ggml_assets)
+                if selected is not None:
+                    _extend(ggml_repo, ggml_tag, {}, None, [selected])
+
+        if not attempts:
+            logger.warning("Unsloth: No prebuilt llama.cpp bundle matches this host - "
+                           "falling back to source build.")
+            return None
+
+        for repo, tag, checksums, source_assets, asset_name, asset_url in attempts:
             print(f"Unsloth: Installing prebuilt llama.cpp {tag} ({asset_name}) - skipping compilation.")
             try:
                 result = _stage_prebuilt_install(
                     llama_cpp_folder, tag, asset_name, asset_url,
                     expected_sha256 = (checksums.get(asset_name) or {}).get("sha256"),
                     repo = repo,
+                    source_assets = source_assets,
                 )
             except Exception as e:
                 logger.warning("Unsloth: Prebuilt %s failed (%s) - trying next option.", asset_name, e)
@@ -1287,9 +1399,14 @@ def install_llama_cpp(
                 # Clean up any partial build
                 try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
-                # Build cmake configure command with library detection
+                # Build cmake configure command with library detection.
+                # Set CMAKE_BUILD_TYPE=Release at configure time: on single-config
+                # generators (Unix Makefiles / Ninja on Linux/macOS) the build
+                # step's `--config Release` is ignored, so without this the
+                # binaries are built unoptimized.
                 cmake_configure = (
                     f"cmake . -B build "
+                    f"-DCMAKE_BUILD_TYPE=Release "
                     f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
                 )
 
@@ -2151,19 +2268,31 @@ def convert_to_gguf(
     if not os.path.exists(input_folder):
         raise RuntimeError(f"Unsloth: `{input_folder}` does not exist?")
 
-    config_file = os.path.join(input_folder, "config.json")
-    if not os.path.exists(config_file):
+    config_path = os.path.join(input_folder, "config.json")
+    if not os.path.exists(config_path):
         raise RuntimeError(f"Unsloth: `config.json` does not exist inside `{input_folder}`.")
 
     # Load config.json
-    with open(config_file, "r", encoding = "utf-8") as config_file:
-        config_file = json.load(config_file)
+    with open(config_path, "r", encoding = "utf-8") as f:
+        config_file = json.load(f)
+
+    # Strip MTP / nextn config keys so the downstream convert_hf_to_gguf.py
+    # doesn't inflate block_count / inject nextn_predict_layers.
+    _changed = False
+    for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
+        if config_file.pop(_key, None) is not None:
+            _changed = True
+        _tc = config_file.get("text_config")
+        if _tc and _tc.pop(_key, None) is not None:
+            _changed = True
+    if _changed:
+        with open(config_path, "w", encoding = "utf-8") as f:
+            json.dump(config_file, f, indent = 2)
     pass
 
     # Check if arch is supported
     supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
-    if supported_types:
-        assert("architectures" in config_file)
+    if supported_types and "architectures" in config_file:
         arch = config_file["architectures"][0]
         if arch not in supported_types:
             raise NotImplementedError(
@@ -2173,8 +2302,11 @@ def convert_to_gguf(
     pass
 
     if is_vlm and supported_vision_archs is not None:
-        arch = config_file["architectures"][0]
-        if arch not in supported_vision_archs:
+        if "architectures" in config_file:
+            arch = config_file["architectures"][0]
+        else:
+            arch = None  # MLX-style config; skip mmproj arch check
+        if arch is not None and arch not in supported_vision_archs:
                 is_vlm = False
                 print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
 

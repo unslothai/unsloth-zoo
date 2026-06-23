@@ -221,8 +221,75 @@ def _resolve_key(adapted_key: str, base_keys: set[str]) -> str | None:
     return None
 
 
+def _load_named_params(model_dir: str) -> dict[str, torch.Tensor]:
+    """Load a saved model and return {param_name: cpu tensor}. In-memory parameter
+    names line up with the PEFT/adapted keys even when the checkpoint uses a
+    different on-disk layout (composite-VLM prefixes, per-expert expert shards):
+    transformers re-packs the experts on load."""
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
+    return {n: p.detach().cpu() for n, p in model.named_parameters()}
+
+
+def assert_merge_correct_model_space(*, family, base_dir, out_dir,
+                                     adapted: dict[str, _Adapted], save_dtype):
+    """Verify a merge in the in-memory (re-packed) parameter space.
+
+    Some architectures keep experts packed in memory (mlp.experts.gate_up_proj)
+    but serialize them per-expert on disk (mlp.experts.<e>.gate_proj.weight), so
+    the packed adapted key maps to no single safetensor. Loading base + merged
+    re-packs the experts, so adapted keys line up with parameter names and
+    _ref_fused / _ref_dense apply directly. The merge does not modify base_dir,
+    so it is loaded as the pre-merge reference.
+    """
+    from unsloth_zoo.saving_utils import _MOE_MERGE_STATE
+
+    base_p = _load_named_params(base_dir)
+    merged_p = _load_named_params(out_dir)
+    assert set(base_p) == set(merged_p), (
+        f"[{family}] merge changed the parameter set "
+        f"(+{sorted(set(merged_p) - set(base_p))[:4]} "
+        f"-{sorted(set(base_p) - set(merged_p))[:4]})"
+    )
+
+    # map each adapted key onto its parameter name (usually identical)
+    resolved: dict[str, _Adapted] = {}
+    for ak, a in adapted.items():
+        if ak in base_p:
+            pname = ak
+        else:
+            cands = [n for n in base_p if n == ak or n.endswith("." + ak) or n.endswith(ak)]
+            cands = [n for n in cands if n != ak]
+            if len(cands) != 1:
+                raise KeyResolutionError(
+                    f"[{family}] adapted key {ak!r} maps to {len(cands)} params {cands[:4]}"
+                )
+            pname = cands[0]
+        resolved[pname] = a
+
+    atol, rtol = _TOL[save_dtype]
+    n_adapted = n_passthru = 0
+    for name, base in base_p.items():
+        got = merged_p[name]
+        if name in resolved:
+            a = resolved[name]
+            ref = (_ref_fused(base, a) if a.fused else _ref_dense(base, a)).to(save_dtype)
+            _assert_close(family, name, got.to(save_dtype), ref, atol, rtol, adapted=True)
+            n_adapted += 1
+        else:
+            _assert_equal(family, name, got, base)
+            n_passthru += 1
+
+    assert n_adapted >= 1, f"[{family}] no adapted params were checked (LoRA not attached?)"
+    assert _MOE_MERGE_STATE.get("fallback", 0) == 0, (
+        f"[{family}] MoE merge fell back: {_MOE_MERGE_STATE}"
+    )
+    return n_adapted, n_passthru
+
+
 def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
-                         adapted: dict[str, _Adapted], allow_missing_adapted=False):
+                         adapted: dict[str, _Adapted], allow_missing_adapted=False,
+                         base_dir=None):
     """Check every merged tensor against the independent reference.
 
     base_tensors : {key: tensor} snapshot of the base BEFORE merge.
@@ -237,6 +304,21 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
     # no adapter remnants leaked
     leaked = [k for k in merged if any(m in k for m in _LORA_REMNANT_MARKERS)]
     assert not leaked, f"[{family}] adapter remnants in merged output: {leaked[:5]}"
+
+    # Fused experts can serialize per-expert on disk (e.g. qwen3_5_moe keeps
+    # mlp.experts.gate_up_proj packed in memory but writes experts.<e>.gate_proj
+    # .weight shards), so the packed adapted key resolves to no single
+    # safetensor. The merge handles this (saving_utils._merge_moe_*); verify in
+    # the in-memory fused space, where param names line up with the adapted keys.
+    if any(a.fused and _resolve_key(ak, base_keys) is None for ak, a in adapted.items()):
+        assert base_dir is not None, (
+            f"[{family}] base_dir is required to verify per-expert-serialized "
+            f"fused experts in model space"
+        )
+        return assert_merge_correct_model_space(
+            family=family, base_dir=base_dir, out_dir=out_dir,
+            adapted=adapted, save_dtype=save_dtype,
+        )
 
     # resolve adapted keys against real base keys (VLM prefix tolerance)
     resolved: dict[str, _Adapted] = {}
@@ -428,9 +510,14 @@ def _shrink_generic(family, kind, cfg, **kw):
                           ("num_attention_heads", _HEADS), ("num_key_value_heads", _KV),
                           ("vocab_size", _VOCAB), ("max_position_embeddings", _POS),
                           ("num_experts", _EXPERTS), ("num_local_experts", _EXPERTS),
-                          ("num_experts_per_tok", 2), ("decoder_sparse_step", 1)):
+                          ("num_experts_per_tok", 2), ("top_k_experts", 2),
+                          ("decoder_sparse_step", 1)):
             if hasattr(obj, attr):
                 setattr(obj, attr, val)
+        # Some families (gemma4) gate MoE behind a flag; enable it so the tiny
+        # config materializes experts to exercise the fused-merge path.
+        if hasattr(obj, "enable_moe_block"):
+            obj.enable_moe_block = True
         # strict/hybrid archs (lfm2_moe, qwen3_5_moe) need an explicit per-layer
         # schedule matching num_hidden_layers or instantiation raises.
         if hasattr(obj, "layer_types") and getattr(obj, "num_hidden_layers", None):
@@ -448,7 +535,18 @@ def build_and_save_base(spec: FamilySpec, base_dir: str, *, dtype=torch.float32,
     """Instantiate the tiny model, save 16bit shards + index, return the model."""
     from transformers import AutoModelForCausalLM
     torch.manual_seed(SEED)
-    model = AutoModelForCausalLM.from_config(spec.config).to(dtype)
+    cfg = spec.config
+    try:
+        model = AutoModelForCausalLM.from_config(cfg).to(dtype)
+    except AttributeError:
+        # Composite (multimodal) MoE configs keep vocab_size under text_config;
+        # some transformers releases build the text backbone straight from the
+        # top-level config and raise AttributeError on the missing attribute
+        # (e.g. qwen3_5_moe on 5.5.0). Mirror unsloth_zoo.create_empty_causal_lm
+        # and retry from text_config so the fused-expert path is still exercised.
+        if hasattr(cfg, "vocab_size") or not hasattr(cfg, "text_config"):
+            raise
+        model = AutoModelForCausalLM.from_config(cfg.text_config).to(dtype)
     model.save_pretrained(base_dir, safe_serialization=True, max_shard_size=max_shard_size)
     model.config._name_or_path = base_dir
     return model
@@ -500,4 +598,5 @@ def run_case(family, scenario, work_dir, *, dtype=torch.float32, max_shard_size=
     return assert_merge_correct(
         family=family, base_tensors=base_tensors, out_dir=out_dir,
         save_dtype=dtype, adapted=adapted, allow_missing_adapted=allow_missing_adapted,
+        base_dir=base_dir,
     )

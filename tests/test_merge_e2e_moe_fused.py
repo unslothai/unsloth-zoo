@@ -93,7 +93,8 @@ def test_fused_moe_full(family, tmp_path):
     try:
         H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
         H.assert_merge_correct(family=family, base_tensors=base_tensors,
-                               out_dir=out_dir, save_dtype=torch.float32, adapted=adapted)
+                               out_dir=out_dir, save_dtype=torch.float32, adapted=adapted,
+                               base_dir=base_dir)
     except Exception as e:
         _skip_or_raise(family, e)
     assert sum(1 for a in adapted.values() if a.fused) >= 2

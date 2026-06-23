@@ -17,6 +17,7 @@
 import torch
 import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
+from contextlib import contextmanager, nullcontext
 import os
 import warnings
 import gc
@@ -53,6 +54,18 @@ INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
+
+
+@contextmanager
+def _no_inference_mode():
+    # Allocate GC buffers outside inference_mode (but in no_grad) so a later
+    # offload copy_ does not raise on an inference tensor (unsloth#3828).
+    try:
+        leave_inference = torch.inference_mode(False)
+    except (TypeError, AttributeError):
+        leave_inference = nullcontext()  # older torch lacks inference_mode(bool)
+    with leave_inference, torch.no_grad():
+        yield
 
 torch_version = torch.__version__
 if Version(torch_version) < Version("2.4.0"):
@@ -224,10 +237,32 @@ def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs)
 pass
 
 
+# Names of the checkpoint shims below; none is the pristine torch fn.
+_UNSLOTH_CKPT_SHIM_NAMES = frozenset({
+    "unsloth_checkpoint",
+    "unsloth_gradient_checkpoint",
+    "unsloth_offloaded_gradient_checkpoint",
+})
+
+
+def _capture_pristine_checkpoint_once():
+    # Stash the genuine torch.utils.checkpoint.checkpoint the first time we patch, before any
+    # shim stacks. The per-patch _old_checkpoint is module-level, so a second patch overwrites
+    # it with the first shim and the pristine fn becomes unreachable. Consumers that must force
+    # use_reentrant=False (e.g. the Gemma-4 KV-sharing fix) read this set-once ref instead.
+    ck = torch.utils.checkpoint
+    if getattr(ck, "_unsloth_pristine_checkpoint", None) is not None:
+        return
+    current = getattr(ck, "checkpoint", None)
+    if current is not None and getattr(current, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES:
+        ck._unsloth_pristine_checkpoint = current
+
+
 def patch_unsloth_gradient_checkpointing():
     print("Unsloth: Patched gradient checkpointing for long context finetuning.")
     import torch.utils
     if torch.utils.checkpoint.checkpoint.__name__ == "unsloth_offloaded_gradient_checkpoint": return
+    _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_offloaded_gradient_checkpoint
     import transformers.modeling_utils
@@ -240,6 +275,7 @@ def patch_gradient_checkpointing():
     print("Unsloth: Patched gradient checkpointing.")
     import torch.utils
     if torch.utils.checkpoint.checkpoint.__name__ == "unsloth_gradient_checkpoint": return
+    _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_gradient_checkpoint
     import transformers.modeling_utils
@@ -350,16 +386,18 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
-    for i in range(200):
-        x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
-        CPU_BUFFERS.append(x)
+    with _no_inference_mode():
+        for i in range(200):
+            x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
+            CPU_BUFFERS.append(x)
     pass
 
     # Allocate one buffer per GPU
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
-        GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+        with _no_inference_mode():
+            GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
         # Double buffering: try to allocate buffer B (can be disabled via env var)
         if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
             GPU_BUFFERS_B = None
@@ -368,7 +406,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             BUFFER_EVENTS_B = None
         else:
             try:
-                GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+                with _no_inference_mode():
+                    GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
                 USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
                 # Per-buffer events prevent double-buffering races; each tracks
                 # when compute on that buffer finishes
@@ -505,7 +544,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
-                            x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
+                            with _no_inference_mode():
+                                x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
                             CPU_BUFFERS.append(x)
                         pass
 
@@ -547,6 +587,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
+                        # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
@@ -626,6 +667,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
+            # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
@@ -661,7 +703,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             device_autocast_ctx = torch.amp.autocast(
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
-            ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
+            ) if torch.amp.is_autocast_available(ctx.device_type) else nullcontext()
 
             # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
@@ -810,6 +852,7 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
         torch.utils.checkpoint.CheckpointFunction = UnslothCheckpointFunction
 
     if torch.utils.checkpoint.checkpoint.__name__ != "unsloth_checkpoint":
+        _capture_pristine_checkpoint_once()
         torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
 
@@ -953,7 +996,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         try:
             n_gpus = len(GPU_BUFFERS)
             dtype = GPU_BUFFERS[0].dtype
-            GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
+            with _no_inference_mode():
+                GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
             if DEVICE_TYPE in ("cuda", "hip"):
                 event_ctor = torch.cuda.Event
             elif DEVICE_TYPE == "xpu":
