@@ -58,9 +58,8 @@ DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable doub
 
 @contextmanager
 def _no_inference_mode():
-    # GC buffers must not be inference tensors, else a later offload copy_ raises
-    # "Inplace update to inference tensor" under GRPO's inference_mode (unsloth#3828).
-    # Leave inference_mode but stay in no_grad.
+    # Allocate GC buffers outside inference_mode (but in no_grad) so a later
+    # offload copy_ does not raise on an inference tensor (unsloth#3828).
     try:
         leave_inference = torch.inference_mode(False)
     except (TypeError, AttributeError):
@@ -565,10 +564,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
-                        # x is a CPU_BUFFERS entry, always allocated outside
-                        # inference_mode, so copy_ into it never trips the
-                        # "inplace update to inference tensor" error (unsloth#3828).
-                        # No need to re-enter _no_inference_mode on this hot path.
+                        # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
@@ -648,9 +644,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
-            # buffer is a GPU_BUFFERS/GPU_BUFFERS_B entry, always allocated
-            # outside inference_mode, so this reload copy_ is safe without
-            # re-entering _no_inference_mode on the hot path (unsloth#3828).
+            # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
