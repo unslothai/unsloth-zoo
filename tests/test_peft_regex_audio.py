@@ -53,7 +53,7 @@ def _add(root: nn.Module, path: str, leaf_module: nn.Module):
 
 class FakeModel(nn.Module):
     """Builds a module tree from (path -> module-kind) specs."""
-    def __init__(self, linear_paths, other_paths=(), name="fake"):
+    def __init__(self, linear_paths, other_paths=(), name="fake", model_type="fake"):
         super().__init__()
         self.model = nn.Module()
         for p in linear_paths:
@@ -61,9 +61,11 @@ class FakeModel(nn.Module):
         for p, kind in other_paths:
             _add(self.model, p, kind())
         class _Cfg:
-            _name_or_path = name
-            model_type = "fake"
-        self.config = _Cfg()
+            pass
+        cfg = _Cfg()
+        cfg._name_or_path = name
+        cfg.model_type = model_type
+        self.config = cfg
 
 
 def linear_names(model):
@@ -160,8 +162,11 @@ def _gemma3n():
     others += [("audio_tower.subsample_conv_projection.conv_0.conv", lambda: nn.Conv2d(1, 8, 3)),
                ("embed_audio.hard_embedding_norm", lambda: nn.LayerNorm(8)),
                ("embed_vision.soft_embedding_norm", lambda: nn.LayerNorm(8))]
+    # Decoy encoder named audio_model.* (NOT audio_tower) to prove the audio branch
+    # keys on the audio_tower segment and never sweeps a differently-named encoder.
+    lin += [f"audio_model.encoder.layers.{i}.self_attn.q_proj" for i in range(2)]
     lin += conf + ["embed_audio.embedding_projection", "embed_vision.embedding_projection"]
-    return FakeModel(lin, others, name="unsloth/gemma-3n-E4B-it")
+    return FakeModel(lin, others, name="unsloth/gemma-3n-E4B-it", model_type="gemma3n")
 
 
 def _gemma4(size="E2B"):
@@ -189,7 +194,7 @@ def _gemma4(size="E2B"):
     lin += ["embed_vision.embedding_projection", "embed_audio.embedding_projection"]
     if size == "12B":
         lin += ["vision_embedder.patch_dense"]
-    return FakeModel(lin, others, name=f"unsloth/gemma-4-{size}-it")
+    return FakeModel(lin, others, name=f"unsloth/gemma-4-{size}-it", model_type="gemma4")
 
 
 # ----------------------------------------------------------------------------- tests
@@ -221,28 +226,32 @@ def test_audio_flag_additive_for_non_audio_archs(arch_name, flags):
 
 def test_qwen2audio_off_no_leak_and_no_qwen_specific_leaves():
     # finetune_audio_layers is scoped to the models we ship notebooks for
-    # (Gemma 4 / Gemma 3N). On a non-notebook audio_tower (Qwen2-Audio) the flag is
-    # a no-op when off, and even when on it must NOT target Qwen-specific leaves
-    # (out_proj / fc1 / fc2) -- we deliberately do not generalize to it here.
-    model = FakeModel(QWEN2_AUDIO)
+    # (Gemma 4 / Gemma 3N) via a model_type / architectures gate. On a non-notebook
+    # audio_tower (Qwen2-Audio, model_type != gemma) the audio branch is never even
+    # built, so the flag is a no-op whether off OR on -- in particular it never
+    # targets Qwen-specific leaves (out_proj / fc1 / fc2).
+    model = FakeModel(QWEN2_AUDIO, model_type="qwen2_audio")
     ns = linear_names(model)
     off = matched(get_peft_regex(model, finetune_audio_layers=False), ns)
+    on  = matched(get_peft_regex(model, finetune_audio_layers=True), ns)
     assert not any("audio_tower" in n for n in off)
-    on_leaves = {leaf(n) for n in matched(get_peft_regex(model, finetune_audio_layers=True), ns)
-                 if "audio_tower" in n}
+    assert off == on, "non-Gemma audio model must be unaffected by finetune_audio_layers"
+    on_leaves = {leaf(n) for n in on if "audio_tower" in n}
     assert not ({"out_proj", "fc1", "fc2"} & on_leaves), \
         f"unexpectedly targeted Qwen-specific audio leaves: {on_leaves}"
 
 
 def test_audio_branch_keys_on_audio_tower_anchor():
-    # The audio branch is anchored on the `audio_tower` segment. An audio encoder
-    # named differently (audio_model.encoder.*) must NOT be swept in.
-    model = FakeModel(WHISPER)
+    # The audio branch is anchored on the `audio_tower` segment. A differently-named
+    # encoder (audio_model.encoder.*) sitting on the SAME Gemma model must NOT be
+    # swept in -- the anchor, not just the model-type gate, has to hold.
+    model = _gemma3n()  # carries an audio_model.encoder decoy alongside audio_tower
     ns = linear_names(model)
     on = matched(get_peft_regex(model, finetune_vision_layers=False,
                                 finetune_language_layers=True,
                                 finetune_audio_layers=True), ns)
     assert any(".language_model." in n for n in on)
+    assert any(".audio_tower." in n for n in on)
     assert not any("audio_model" in n for n in on), \
         f"audio branch leaked into a non-audio_tower encoder: {[n for n in on if 'audio_model' in n]}"
 
@@ -369,8 +378,8 @@ def test_audio_respects_attn_mlp_flags():
 
 
 def test_positional_target_modules_not_shadowed():
-    # finetune_audio_layers must come AFTER target_modules so positional callers
-    # that pass an explicit list as the 6th argument are unaffected.
+    # finetune_audio_layers lives at the END of the signature, so the 6th positional
+    # argument is still target_modules and positional callers are unaffected.
     model = FakeModel(LLAMA)
     ns = linear_names(model)
     kw = get_peft_regex(model, True, True, True, True, ["q_proj", "v_proj"])  # 6th positional = target_modules
@@ -380,6 +389,63 @@ def test_positional_target_modules_not_shadowed():
     assert kw == pos
     m = matched(kw, ns)
     assert m and all(leaf(n) in ("q_proj", "v_proj") for n in m)
+
+
+def test_positional_tag_overrides_not_shadowed():
+    # The tag-override params (vision_tags/language_tags/...) keep their positional
+    # slots: passing a list as the 7th positional must bind to vision_tags, NOT to
+    # finetune_audio_layers (which now sits after the tag params).
+    model = FakeModel(LLAMA)
+    # 7th positional = vision_tags. A made-up tag should appear verbatim in the regex.
+    r = get_peft_regex(model, True, True, True, True, None, ["zzvision"])
+    assert "zzvision" in r, "7th positional did not bind to vision_tags"
+    assert "audio_tower" not in r, "list mis-bound to finetune_audio_layers"
+
+
+def test_embedder_branches_gated_to_gemma_model_type():
+    # empty_model.py lists embed_vision.embedding_projection and
+    # vision_tower.patch_embedder.input_proj as Mistral3 components too. On a
+    # non-Gemma checkpoint that happens to carry those exact Linears, the default
+    # finetune_vision_layers=True must NOT start matching them (byte-identical set).
+    shared = ["embed_vision.embedding_projection",
+              "vision_tower.patch_embedder.input_proj"]
+    mistral = FakeModel(_text_stack("language_model.layers") + shared,
+                        name="mistralai/Mistral-Small-3", model_type="mistral3")
+    ns = linear_names(mistral)
+    on = matched(get_peft_regex(mistral, finetune_vision_layers=True,
+                                finetune_language_layers=True), ns)
+    assert not any(n.endswith(tuple(shared)) for n in on), \
+        f"non-Gemma embedder Linears wrongly targeted: {[n for n in on if n.endswith(tuple(shared))]}"
+    # The very same module names DO attach on a Gemma model.
+    gem = _gemma4("12B")
+    gon = matched(get_peft_regex(gem, finetune_vision_layers=True,
+                                 finetune_language_layers=True), linear_names(gem))
+    assert any(n.endswith("embed_vision.embedding_projection") for n in gon)
+
+
+def test_projector_branches_gated_under_mlp_flag():
+    # The vision/audio projectors are feed-forward projections, so attention-only
+    # runs (finetune_mlp_modules=False) must not pick them up; mlp-on must.
+    model = _gemma3n()
+    ns = linear_names(model)
+    # attention-only -> no projectors
+    attn_only = matched(get_peft_regex(model, finetune_vision_layers=True,
+                                       finetune_language_layers=True,
+                                       finetune_attention_modules=True,
+                                       finetune_mlp_modules=False,
+                                       finetune_audio_layers=True), ns)
+    assert not any(n.endswith("embed_vision.embedding_projection") for n in attn_only), \
+        "vision projector attached under attention-only"
+    assert not any(n.endswith("embed_audio.embedding_projection") for n in attn_only), \
+        "audio projector attached under attention-only"
+    # mlp-on -> projectors present
+    mlp_on = matched(get_peft_regex(model, finetune_vision_layers=True,
+                                    finetune_language_layers=True,
+                                    finetune_attention_modules=False,
+                                    finetune_mlp_modules=True,
+                                    finetune_audio_layers=True), ns)
+    assert any(n.endswith("embed_vision.embedding_projection") for n in mlp_on)
+    assert any(n.endswith("embed_audio.embedding_projection") for n in mlp_on)
 
 
 def test_guard_allows_audio_only_and_blocks_nothing_selected():

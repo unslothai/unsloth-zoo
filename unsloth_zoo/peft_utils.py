@@ -58,11 +58,11 @@ def get_peft_regex(
     finetune_attention_modules : bool = True,
     finetune_mlp_modules       : bool = True,
     target_modules             : List[str] = None,
-    finetune_audio_layers      : bool = False,
     vision_tags                : List[str] = ["vision", "image", "visual", "patch",],
     language_tags              : List[str] = ["language", "text",],
     attention_tags             : List[str] = ["self_attn", "attention", "attn", "mixer",],
     mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense", "mixer",],
+    finetune_audio_layers      : bool = False,
 ) -> str:
     """
     Create a regex pattern to apply LoRA to only select layers of a model.
@@ -150,25 +150,35 @@ def get_peft_regex(
     # leaves carry no attn/mlp component token, so the standard matcher above can
     # never select them. Add dedicated name-anchored branches, gated on the
     # vision/audio flags, scoped to the attention/mlp flags, and -- when an explicit
-    # target_modules list is given -- intersected with it. The branches are anchored
-    # to audio_tower / embed_vision / embed_audio / vision_embedder name segments
-    # that exist only on Gemma 4 / Gemma 3N, and each is appended only if it
-    # re.fullmatch-es a Linear in THIS model (matching PEFT's own matcher), so for
-    # every other architecture the regex is byte-identical. Leading ".*?"; no
-    # trailing ".*?" (a real Linear leaf terminates the match); "(?:\.linear)?" also
-    # covers Gemma4ClippableLinear ".linear" children.
+    # target_modules list is given -- intersected with it. Each branch is appended
+    # only if it re.fullmatch-es a Linear in THIS model (matching PEFT's own matcher).
+    # Some of these leaf names are NOT Gemma-exclusive: empty_model.py also lists
+    # embed_vision.embedding_projection / vision_tower.patch_embedder.input_proj as
+    # Mistral3 components, so a name-only match could change a non-Gemma target set.
+    # Gate the whole block on the Gemma 4 / Gemma 3N model families (via model_type /
+    # architectures) so every other architecture's regex stays byte-identical.
+    # Leading ".*?"; no trailing ".*?" (a real Linear leaf terminates the match);
+    # "(?:\.linear)?" also covers Gemma4ClippableLinear ".linear" children.
     def _scoped(leaves):
         # Honour an explicit target_modules list when one was provided.
         if target_modules is not None:
             return [x for x in leaves if x in only_linear_modules]
         return leaves
 
+    _config        = getattr(model, "config", None)
+    _model_type    = str(getattr(_config, "model_type", "") or "").lower()
+    _architectures = " ".join(getattr(_config, "architectures", None) or []).lower()
+    _is_gemma_mm   = (
+        "gemma4"  in _model_type or "gemma4"  in _architectures or
+        "gemma3n" in _model_type or "gemma3n" in _architectures
+    )
+
     candidate_branches = []
-    if finetune_audio_layers:
+    if finetune_audio_layers and _is_gemma_mm:
         # conv / *norm leaves are not nn.Linear so they are never candidates. The
         # conformer attention leaves are gated by finetune_attention_modules; the
-        # feed-forward / lightweight-conv / subsample / output projections are gated
-        # by finetune_mlp_modules.
+        # feed-forward / lightweight-conv / subsample / output projections (and the
+        # audio projector) are gated by finetune_mlp_modules.
         audio_leaves = []
         if finetune_attention_modules:
             audio_leaves += ["q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj", "post"]
@@ -181,9 +191,13 @@ def get_peft_regex(
             # Require a "." before the leaf so the leaf is a complete path segment --
             # e.g. target_modules=["k_proj"] must not also match "...relative_k_proj".
             candidate_branches.append(r"(?:.*?\baudio_tower\.(?:.*\.)?" + audio_leaf_re + r"(?:\.linear)?)")
-        if _scoped(["embedding_projection"]):
+        # The audio projector is a feed-forward projection -> gate under the mlp flag
+        # so attention-only runs do not pick it up.
+        if finetune_mlp_modules and _scoped(["embedding_projection"]):
             candidate_branches.append(r"(?:.*?\bembed_audio\.embedding_projection(?:\.linear)?)")
-    if finetune_vision_layers:
+    if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
+        # The Gemma vision embedders are flat projection / dense Linears -> like the
+        # audio projector, gate them under the mlp flag (attention-only stays clean).
         vision_embed = []
         if _scoped(["embedding_projection"]): vision_embed.append(r"embed_vision\.embedding_projection")
         if _scoped(["patch_dense"]):          vision_embed.append(r"vision_embedder\.patch_dense")
