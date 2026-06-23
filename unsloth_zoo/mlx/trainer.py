@@ -49,7 +49,7 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
-SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
+SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion", "rmsprop", "adamax", "adagrad", "adadelta")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 from .utils import (
@@ -805,6 +805,18 @@ class MLXTrainer:
         elif opt_name == "lion":
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
+        elif opt_name == "rmsprop":
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.RMSprop(learning_rate=initial_lr)
+        elif opt_name == "adamax":
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.Adamax(learning_rate=initial_lr, **adam_kwargs)
+        elif opt_name == "adagrad":
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.Adagrad(learning_rate=initial_lr)
+        elif opt_name == "adadelta":
+            self._manual_weight_decay = float(wd or 0.0)
+            optimizer = optim.AdaDelta(learning_rate=initial_lr)
         self._resolved_optimizer_name = opt_name
         return optimizer
 
