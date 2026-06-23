@@ -892,12 +892,19 @@ def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
         the new scale alongside it.
     """
     dtype_str = header_metadata.get(weight_key, {}).get("dtype")
+    _e5m2 = getattr(torch, "float8_e5m2", None)
+    # e5m2 is FP8 but this requant path only encodes e4m3; refuse (UNSAFE) so the merge is
+    # skipped and logged rather than writing raw FP8 back with a stale scale.
+    if dtype_str == "F8_E5M2":
+        return _MOE_QUANT_UNSAFE, None
     # Cheap probe: skip non-FP8 keys without paying for a tensor read.
     if dtype_str not in ("F8_E4M3",):
         # Only FP8 keys are our concern; let the generic loader handle the rest.
         if dtype_str is None:
             # Unknown layout — fall back to full read to learn the dtype.
             W = file.get_tensor(weight_key)
+            if _e5m2 is not None and W.dtype == _e5m2:
+                return _MOE_QUANT_UNSAFE, None
             if W.dtype != torch.float8_e4m3fn:
                 return None
         else:

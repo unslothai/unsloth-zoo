@@ -771,6 +771,7 @@ def _merge_and_overwrite_lora(
                             merge_role, key, file, header_metadata, lora_stats,
                             expert_idx, num_experts, output_dtype, mm, length_of_header,
                             processed_mxfp4_keys, merge_fn,
+                            weight_block_size = weight_block_size,
                         )
                         if merged and fused_key not in counted_lora_modules:
                             count += 1
@@ -1536,6 +1537,13 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 gate_up_key = f"{shard_prefix}.gate_up_proj"
                 if gate_up_key in header_metadata:
                     gate_up_W = file.get_tensor(gate_up_key)
+                    if gate_up_W.dtype in _FP8_WEIGHT_DTYPES:
+                        raise RuntimeError(
+                            "Unsloth: FP8 fused MoE expert LoRA merge (gate_up_proj) is not "
+                            "supported; merging raw FP8 without its companion scale would "
+                            "corrupt the delta. Please open an issue at "
+                            "https://github.com/unslothai/unsloth/issues."
+                        )
                     # Merge LoRA into fused 3D tensor
                     merged_gate_up = _merge_moe_fused_gate_up_expert(
                         gate_up_W, lora_stats, output_dtype or gate_up_W.dtype, is_transposed=_is_transposed_format
@@ -1563,6 +1571,13 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 down_key = f"{shard_prefix}.down_proj"
                 if down_key in header_metadata:
                     down_W = file.get_tensor(down_key)
+                    if down_W.dtype in _FP8_WEIGHT_DTYPES:
+                        raise RuntimeError(
+                            "Unsloth: FP8 fused MoE expert LoRA merge (down_proj) is not "
+                            "supported; merging raw FP8 without its companion scale would "
+                            "corrupt the delta. Please open an issue at "
+                            "https://github.com/unslothai/unsloth/issues."
+                        )
                     # Merge LoRA into fused 3D tensor
                     merged_down = _merge_moe_fused_down_proj_expert(
                         down_W, lora_stats, output_dtype or down_W.dtype, is_transposed=_is_transposed_format
@@ -2132,6 +2147,56 @@ def _fp8_scale_key_weight_bases(scale_key):
     return ()
 pass
 
+def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames):
+    """Order-independent cleanup run AFTER every FP8 shard is rewritten: drop any companion
+    scale whose weight is no longer FP8 (i.e. was dequantized, possibly in another shard).
+    Per-shard processing only drops same-shard companions, so a weight/scale split across
+    shards would otherwise leave a stale scale regardless of shard processing order. Returns
+    the set of removed keys."""
+    dtype_by_key = {}
+    headers = {}
+    for filename in filenames:
+        path = os.path.join(save_directory, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as fp:
+                length = int.from_bytes(fp.read(8), "little")
+                header = json.loads(fp.read(length))
+        except Exception:
+            continue
+        headers[filename] = header
+        for key, meta in header.items():
+            if key != "__metadata__" and isinstance(meta, dict):
+                dtype_by_key[key] = meta.get("dtype")
+
+    removed = set()
+    for filename, header in headers.items():
+        drop = set()
+        for key in header:
+            if key == "__metadata__":
+                continue
+            for wk in _fp8_scale_key_weight_bases(key):
+                dt = dtype_by_key.get(wk)
+                if dt is not None and dt not in _FP8_HEADER_DTYPES:
+                    drop.add(key)
+                    break
+        if not drop:
+            continue
+        path = os.path.join(save_directory, filename)
+        tensors = OrderedDict()
+        with safe_open(path, framework = "pt", device = "cpu") as f:
+            for key in f.keys():
+                if key not in drop:
+                    tensors[key] = f.get_tensor(key).contiguous()
+        with tempfile.NamedTemporaryFile(suffix = ".safetensors", dir = save_directory, delete = False) as tmp:
+            tmp_path = tmp.name
+        save_file(tensors, tmp_path, metadata = {"format": "pt"})
+        os.replace(tmp_path, path)
+        removed.update(drop)
+    return removed
+pass
+
 def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
@@ -2186,16 +2251,9 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                 continue
             base = key[: -len(".weight")] if key.endswith(".weight") else key
             scale_keys_to_drop.update(base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata)
-        # Orphaned companion: a scale here whose FP8 weight lives in another shard and has
-        # already been dequantized (now non-FP8). A still-FP8 sibling weight keeps its scale
-        # so its own (later) rewrite can load it cross-shard, avoiding an ordering hazard.
-        if cross_shard:
-            for key in safetensor_keys:
-                for wk in _fp8_scale_key_weight_bases(key):
-                    dt = cross_shard.get(wk, (None, None))[1]
-                    if dt is not None and dt not in _FP8_HEADER_DTYPES:
-                        scale_keys_to_drop.add(key)
-                        break
+        # A scale whose FP8 weight lives in ANOTHER shard is left in place here and removed by
+        # the order-independent post-rewrite cleanup (_drop_resolved_fp8_scales_after_rewrite),
+        # so it survives until that weight's shard has loaded it cross-shard.
 
         for key in safetensor_keys:
             if key in scale_keys_to_drop:
@@ -3062,6 +3120,11 @@ def merge_and_overwrite_lora(
             f"for model_type={getattr(getattr(_merge_base_model, 'config', None), 'model_type', '?')}."
         )
 
+    # FP8 merged_16bit can load a weight's scale from a sibling shard, so the index build and
+    # the low-disk upload/remove must wait until every shard is rewritten and the cross-shard
+    # scale cleanup has run (otherwise an early shard is removed or indexed with a stale scale).
+    _fp8_post_cleanup = base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit"
+    _defer_low_disk = low_disk_space_usage and push_to_hub and _fp8_post_cleanup
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
@@ -3084,16 +3147,37 @@ def merge_and_overwrite_lora(
         file_path = os.path.join(save_directory, filename)
 
         # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
-        if regenerate_index:
+        if regenerate_index and not _fp8_post_cleanup:
             # We must open the file we just created to get its tensor keys
             with safe_open(file_path, framework = "pt", device = "cpu") as f:
                 for key in f.keys():
                     weight_map[key] = filename
 
-        if low_disk_space_usage and push_to_hub:
+        if low_disk_space_usage and push_to_hub and not _defer_low_disk:
             upload_items(filename)
             os.remove(os.path.join(save_directory, filename)) # Remove to conserve disk space
         pass
+    pass
+
+    # FP8 cross-shard scale cleanup: order-independent pass after every shard is rewritten.
+    if _fp8_post_cleanup:
+        for _removed_key in _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list):
+            safetensor_keys_seen.discard(_removed_key)
+        if regenerate_index:
+            for filename in final_safetensors_list:
+                file_path = os.path.join(save_directory, filename)
+                if not os.path.exists(file_path):
+                    continue
+                with safe_open(file_path, framework = "pt", device = "cpu") as f:
+                    for key in f.keys():
+                        weight_map[key] = filename
+        if _defer_low_disk:
+            for filename in final_safetensors_list:
+                upload_items(filename)
+                try:
+                    os.remove(os.path.join(save_directory, filename))
+                except FileNotFoundError:
+                    pass
     pass
 
     # Step 6: Regenerate index for MXFP4 dequantization or shard splitting

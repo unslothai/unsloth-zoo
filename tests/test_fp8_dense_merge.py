@@ -300,38 +300,61 @@ def test_fp8_dense_scale_grid_mismatch_with_block_size_raises(tmp_path):
         )
 
 
-def test_fp8_dense_scale_in_sibling_shard(tmp_path):
-    """A sharded FP8 checkpoint where a weight and its scale companion live in different shards
-    must still dequantize (scale loaded cross-shard) and drop the now-orphaned scale."""
-    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
-
+def _run_cross_shard_merge(tmp_path, weight_in, scale_in, process_order):
+    """Helper: write an FP8 weight and its scale into separate shards, run the per-shard
+    rewrite in the given order, then the orchestrator's order-independent scale cleanup."""
+    from unsloth_zoo.saving_utils import (
+        _merge_and_overwrite_lora, _drop_resolved_fp8_scales_after_rewrite,
+    )
     torch.manual_seed(5)
     W_real = torch.randn(64, 128, dtype=torch.float32) * 0.1
     W_fp8, scale = _fp8_quant_channel(W_real)  # 2-D (64, 1) scale
-    shard1 = tmp_path / "model-00001-of-00002.safetensors"
-    shard2 = tmp_path / "model-00002-of-00002.safetensors"
-    # Weight in shard 1; its scale companion in shard 2.
-    _write_shard(shard1, {"model.layers.0.mlp.down_proj.weight": W_fp8})
-    _write_shard(shard2, {
-        "model.layers.0.mlp.down_proj.weight_scale": scale,
-        "model.layers.1.mlp.up_proj.weight": torch.randn(8, 8, dtype=torch.bfloat16),
-    })
+    s1 = tmp_path / "model-00001-of-00002.safetensors"
+    s2 = tmp_path / "model-00002-of-00002.safetensors"
+    contents = {
+        s1: {"model.layers.1.mlp.up_proj.weight": torch.randn(8, 8, dtype=torch.bfloat16)},
+        s2: {},
+    }
+    contents[weight_in]["model.layers.0.mlp.down_proj.weight"] = W_fp8
+    contents[scale_in]["model.layers.0.mlp.down_proj.weight_scale"] = scale
+    for path, tensors in ((s1, contents[s1]), (s2, contents[s2])):
+        _write_shard(path, tensors)
 
-    for fn in (shard1.name, shard2.name):
+    for fn in process_order:
         _merge_and_overwrite_lora(
             save_directory=str(tmp_path), filename=fn,
             lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.bfloat16,
             model_class_name="Qwen2ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
         )
+    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), [s1.name, s2.name])
 
-    with safe_open(str(shard1), framework="pt", device="cpu") as f:
-        merged = f.get_tensor("model.layers.0.mlp.down_proj.weight")
-        assert merged.dtype == torch.bfloat16  # dequantized via cross-shard scale
+    keys = set()
+    merged = None
+    for path in (s1, s2):
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            keys |= set(f.keys())
+            if "model.layers.0.mlp.down_proj.weight" in f.keys():
+                merged = f.get_tensor("model.layers.0.mlp.down_proj.weight")
+    # Weight dequantized via cross-shard scale; orphaned scale dropped; other tensor kept.
+    assert merged is not None and merged.dtype == torch.bfloat16
     assert torch.allclose(merged.float(), W_real, atol=0.05)
-    with safe_open(str(shard2), framework="pt", device="cpu") as f:
-        keys = set(f.keys())
-    assert "model.layers.0.mlp.down_proj.weight_scale" not in keys  # orphaned scale dropped
-    assert "model.layers.1.mlp.up_proj.weight" in keys              # ordinary tensor kept
+    assert "model.layers.0.mlp.down_proj.weight_scale" not in keys
+    assert "model.layers.1.mlp.up_proj.weight" in keys
+
+
+def test_fp8_dense_scale_in_sibling_shard_weight_first(tmp_path):
+    """Weight in shard 1, scale in shard 2, processed weight-first."""
+    s1 = tmp_path / "model-00001-of-00002.safetensors"
+    s2 = tmp_path / "model-00002-of-00002.safetensors"
+    _run_cross_shard_merge(tmp_path, weight_in=s1, scale_in=s2, process_order=(s1.name, s2.name))
+
+
+def test_fp8_dense_scale_in_sibling_shard_scale_first(tmp_path):
+    """Scale in shard 1, weight in shard 2, processed scale-first: the order-independent
+    cleanup must still drop the orphaned scale (per-shard processing alone cannot)."""
+    s1 = tmp_path / "model-00001-of-00002.safetensors"
+    s2 = tmp_path / "model-00002-of-00002.safetensors"
+    _run_cross_shard_merge(tmp_path, weight_in=s2, scale_in=s1, process_order=(s1.name, s2.name))
 
 
 def test_fp8_fused_expert_3d_dequantizes(tmp_path):
@@ -457,6 +480,32 @@ def test_fp8_dense_path_refuses_moe_expert_lora(tmp_path):
             lora_weights=lora,
             output_dtype=torch.bfloat16,
             model_class_name="Qwen3MoeForCausalLM",
+        )
+
+
+def test_fp8_fused_moe_gate_up_lora_refused(tmp_path):
+    """Merging LoRA onto a fused 3-D FP8 gate_up_proj expert tensor must refuse rather than
+    merge raw FP8 values (which silently loses the delta)."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    n_experts, inter, hidden, r = 2, 8, 12, 4
+    gate_up = (torch.randn(n_experts, 2 * inter, hidden) * 0.1).clamp(-448, 448).to(torch.float8_e4m3fn)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.experts.gate_up_proj": gate_up,
+        "model.layers.0.mlp.experts.gate_up_proj_scale_inv": torch.ones(n_experts, 1, 1, dtype=torch.float32),
+    })
+    lora = defaultdict(_FakeLoraStats)
+    lora["model.layers.0.mlp.experts.base_layer"] = _FakeLoraStats(
+        lora_A=torch.randn(n_experts * r, hidden) * 0.02,
+        lora_B=torch.randn(2 * inter, n_experts * r) * 0.02, alpha=1.0,
+    )
+    with pytest.raises(RuntimeError, match="FP8 fused MoE"):
+        _merge_and_overwrite_lora(
+            save_directory=str(tmp_path), filename="model.safetensors",
+            lora_weights=lora, output_dtype=torch.bfloat16,
+            model_class_name="GptOssForCausalLM",
+            base_model_is_quantized=True, quant_type="fp8",
         )
 
 

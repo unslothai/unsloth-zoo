@@ -243,6 +243,24 @@ def test_fp8_handler_block_size_grid_mismatch_is_unsafe():
     assert _fp8_save_handler(file, header, "X.weight", block_size=(128, 128)) == (_MOE_QUANT_UNSAFE, None)
 
 
+def test_fp8_handler_e5m2_is_unsafe():
+    """The MoE requant path encodes e4m3 only; an e5m2 expert weight must be refused
+    (UNSAFE) rather than merged raw and written back FP8 with a stale scale."""
+    if not hasattr(torch, "float8_e5m2"):
+        import pytest
+        pytest.skip("float8_e5m2 unavailable")
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_save_handler, _MOE_QUANT_UNSAFE
+    W = (torch.randn(16, 16) * 0.1).to(torch.float8_e5m2)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    header = {"X.weight": {"dtype": "F8_E5M2"}, "X.weight_scale_inv": {"dtype": "F32"}}
+    file = _FakeFile({"X.weight": W, "X.weight_scale_inv": scale})
+    assert _fp8_save_handler(file, header, "X.weight") == (_MOE_QUANT_UNSAFE, None)
+    # Also when the header omits dtype (resolved by reading the tensor).
+    header2 = {"X.weight": {}, "X.weight_scale_inv": {"dtype": "F32"}}
+    assert _fp8_save_handler(_FakeFile({"X.weight": W, "X.weight_scale_inv": scale}),
+                             header2, "X.weight") == (_MOE_QUANT_UNSAFE, None)
+
+
 def test_fp8_handler_per_channel_scale_with_block_size_merges():
     """A per-channel (rows,1) scale must still merge when a global block_size is configured:
     the block size does not tile it, so the handler falls back to per-channel inference
