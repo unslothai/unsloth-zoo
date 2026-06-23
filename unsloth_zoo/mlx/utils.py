@@ -3641,24 +3641,30 @@ def _prepare_pretokenized_text_rows(dataset, max_seq_length, completion_only_los
     return rows
 
 
-def _truncate_token_aligned_custom_field(value, input_length, max_seq_length):
-    """Truncate sequence fields that align with input_ids."""
+def _truncate_custom_collator_field(value, max_seq_length):
+    """Truncate list-like fields the same way TRL truncates datasets."""
     if hasattr(value, "tolist"):
         value = value.tolist()
-    if isinstance(value, (list, tuple)) and len(value) == input_length:
+    if isinstance(value, (list, tuple)):
         return list(value)[:max_seq_length]
     return value
 
 
+_CUSTOM_COLLATOR_TEXT_COLUMNS = frozenset((
+    "input_ids",
+    "labels",
+    "completion_mask",
+    "assistant_masks",
+))
+
+
 def _prepare_custom_collator_text_examples(dataset, max_seq_length):
-    """Prepare tokenized text examples for a user-provided collator."""
+    """Prepare tokenized text examples with SFTTrainer text columns."""
     first_item, replay_dataset = _peek_dataset(dataset)
     if not isinstance(first_item, Mapping) or first_item.get("input_ids") is None:
         raise ValueError(
-            "Unsloth MLX: custom data_collator requires a tokenized text "
-            "dataset with `input_ids`. Raw text, VLM, streaming, packing, "
-            "and skip_prepare_dataset are not supported with custom "
-            "data_collator yet."
+            "Unsloth MLX: custom data_collator requires tokenized text "
+            "examples with `input_ids`."
         )
 
     examples = []
@@ -3673,25 +3679,20 @@ def _prepare_custom_collator_text_examples(dataset, max_seq_length):
                 "Unsloth MLX: packed or padding-free examples with "
                 "`seq_lengths` are not supported with custom data_collator "
                 "yet."
-            )
-        input_length = len(item["input_ids"])
-        example = dict(item)
+        )
+        example = {}
         for field, value in item.items():
-            example[field] = _truncate_token_aligned_custom_field(
-                value, input_length, max_seq_length,
-            )
+            if field in _CUSTOM_COLLATOR_TEXT_COLUMNS and value is not None:
+                example[field] = _truncate_custom_collator_field(
+                    value, max_seq_length,
+                )
         example["input_ids"] = _to_int_list(item["input_ids"])[:max_seq_length]
         examples.append(example)
 
-    if not examples:
-        raise ValueError(
-            "Unsloth MLX: no tokenized text examples were available for "
-            "custom data_collator batching."
-        )
     return examples
 
 
-def _collator_value_to_numpy(value, field):
+def _collator_value_to_numpy(value, field, expected_batch_size=None):
     """Convert common collator outputs to a numpy array."""
     if hasattr(value, "detach"):
         value = value.detach()
@@ -3703,11 +3704,22 @@ def _collator_value_to_numpy(value, field):
         value = value.tolist()
     array = np.asarray(value)
     if array.ndim == 1:
+        if expected_batch_size not in (None, 1):
+            raise ValueError(
+                f"Unsloth MLX: custom data_collator field `{field}` must be "
+                "2D when collating multiple examples."
+            )
         array = array.reshape(1, -1)
     if array.ndim != 2:
         raise ValueError(
             f"Unsloth MLX: custom data_collator field `{field}` must be a "
             f"1D or 2D tensor/array, got shape {array.shape}."
+        )
+    if expected_batch_size is not None and array.shape[0] != expected_batch_size:
+        raise ValueError(
+            f"Unsloth MLX: custom data_collator field `{field}` batch size "
+            f"{array.shape[0]} does not match the {expected_batch_size} "
+            "selected examples."
         )
     return array
 
@@ -3716,20 +3728,8 @@ def _lengths_from_collator_attention(attention_mask, batch_size, seq_len):
     """Build MLX [start, end) lengths from a right-padded attention mask."""
     if attention_mask is None:
         return np.array([[0, seq_len] for _ in range(batch_size)], dtype=np.int32)
-    mask = _collator_value_to_numpy(attention_mask, "attention_mask")
-    if mask.shape[0] != batch_size:
-        raise ValueError(
-            "Unsloth MLX: custom data_collator attention_mask batch size "
-            f"{mask.shape[0]} does not match input_ids batch size {batch_size}."
-        )
-    if mask.shape[1] != seq_len:
-        raise ValueError(
-            "Unsloth MLX: custom data_collator attention_mask sequence length "
-            f"{mask.shape[1]} does not match input_ids sequence length "
-            f"{seq_len}."
-        )
     lengths = []
-    for row in mask:
+    for row in attention_mask:
         active = np.flatnonzero(row)
         if len(active) == 0:
             lengths.append([0, 0])
@@ -3749,17 +3749,31 @@ def _lengths_from_collator_attention(attention_mask, batch_size, seq_len):
     return np.asarray(lengths, dtype=np.int32)
 
 
-def _custom_collator_labels_have_targets(labels_np, lengths_np):
-    """Return whether shifted labels contain at least one supervised token."""
+def _validate_custom_collator_shifted_targets(labels_np, lengths_np, attention_mask_np=None):
+    """Validate shifted custom-collator labels against mask and target rules."""
     if labels_np.shape[1] <= 1:
-        return False
+        raise ValueError(
+            "Unsloth MLX: custom data_collator produced a batch with no "
+            "supervised target tokens."
+        )
+    if attention_mask_np is not None:
+        masked_targets = (attention_mask_np[:, 1:] == 0) & (labels_np[:, 1:] != -100)
+        if np.any(masked_targets):
+            raise ValueError(
+                "Unsloth MLX: custom data_collator labels must be -100 wherever "
+                "the shifted attention_mask is 0."
+            )
     targets = labels_np[:, 1:]
     steps = np.arange(1, labels_np.shape[1], dtype=np.int32)
     length_mask = (
         (steps[None, :] >= lengths_np[:, 0:1])
         & (steps[None, :] < lengths_np[:, 1:2])
     )
-    return bool(np.any((targets != -100) & length_mask))
+    if not bool(np.any((targets != -100) & length_mask)):
+        raise ValueError(
+            "Unsloth MLX: custom data_collator produced a batch with no "
+            "supervised target tokens."
+        )
 
 
 def _trim_custom_collator_ignored_tail(
@@ -3791,7 +3805,7 @@ def _trim_custom_collator_ignored_tail(
     return input_ids_np, labels_np, attention_mask_np
 
 
-def _collator_output_to_text_batch(output, max_seq_length):
+def _collator_output_to_text_batch(output, max_seq_length, expected_batch_size=None):
     """Normalize user collator output to an MLX text batch."""
     if not isinstance(output, Mapping) or "input_ids" not in output:
         raise ValueError(
@@ -3800,11 +3814,13 @@ def _collator_output_to_text_batch(output, max_seq_length):
         )
     if output.get("position_ids") is not None or output.get("seq_lengths") is not None:
         raise ValueError(
-            "Unsloth MLX: packed or padding-free custom data_collator "
-            "outputs with `position_ids` or `seq_lengths` are not supported "
-            "yet."
+            "Unsloth MLX: custom data_collator outputs with `position_ids` "
+            "or `seq_lengths` are not supported yet."
         )
-    input_ids_np = _collator_value_to_numpy(output["input_ids"], "input_ids")
+    input_ids_np = _collator_value_to_numpy(
+        output["input_ids"], "input_ids",
+        expected_batch_size=expected_batch_size,
+    )
     batch_size, seq_len = input_ids_np.shape
 
     if output.get("labels") is None:
@@ -3855,11 +3871,9 @@ def _collator_output_to_text_batch(output, max_seq_length):
     lengths_np = _lengths_from_collator_attention(
         attention_mask_np, batch_size, seq_len,
     )
-    if not _custom_collator_labels_have_targets(labels_np, lengths_np):
-        raise ValueError(
-            "Unsloth MLX: custom data_collator produced a batch with no "
-            "supervised target tokens."
-        )
+    _validate_custom_collator_shifted_targets(
+        labels_np, lengths_np, attention_mask_np,
+    )
     labels = _normalize_cce_label_dtype(mx.array(labels_np))
 
     return (
@@ -3869,12 +3883,31 @@ def _collator_output_to_text_batch(output, max_seq_length):
     )
 
 
-def _collate_text_examples_with_custom_collator(examples, data_collator, max_seq_length):
-    """Run a user collator and return an MLX text batch."""
-    return _collator_output_to_text_batch(
-        data_collator(examples),
-        max_seq_length,
-    )
+class _LazyCollatedTextBatches:
+    """List-like text batches that call the user collator on access."""
+
+    def __init__(self, examples, chunks, data_collator, max_seq_length):
+        self._examples = examples
+        self._chunks = chunks
+        self._data_collator = data_collator
+        self._max_seq_length = max_seq_length
+
+    def __len__(self):
+        return len(self._chunks)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += len(self)
+        batch_examples = [self._examples[i] for i in self._chunks[index]]
+        return _collator_output_to_text_batch(
+            self._data_collator(batch_examples),
+            self._max_seq_length,
+            expected_batch_size=len(batch_examples),
+        )
 
 
 def create_collated_text_batches(
@@ -3887,31 +3920,28 @@ def create_collated_text_batches(
     dataset_order="default",
     num_epochs=None,
 ):
-    """Create text batches with a user-provided data_collator."""
+    """Create text batches that call the user collator on batch access.
+
+    Input examples are pruned to SFTTrainer's default text signature columns
+    before the collator runs.
+    """
     examples = _prepare_custom_collator_text_examples(dataset, max_seq_length)
-    batches = _create_ordered_text_batches(
+    chunks = []
+    target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
+    for chunk in _iter_text_index_chunks(
         examples,
         batch_size,
-        lambda batch_examples: _collate_text_examples_with_custom_collator(
-            batch_examples, data_collator, max_seq_length,
-        ),
-        num_batches=num_batches,
         seed=seed,
         dataset_order=dataset_order,
-        num_epochs=num_epochs,
-        empty_message=(
-            "Unsloth MLX: no trainable token sequences were available after "
-            "custom data_collator batching."
-        ),
+        num_epochs=target_epochs,
+        drop_last_default=False,
+    ):
+        chunks.append(list(chunk))
+        if num_batches is not None and len(chunks) >= num_batches:
+            break
+    return _LazyCollatedTextBatches(
+        examples, chunks, data_collator, max_seq_length,
     )
-    tensors = []
-    for batch, lengths, labels in batches:
-        tensors.extend([batch, lengths])
-        if labels is not None:
-            tensors.append(labels)
-    if tensors:
-        mx.eval(tensors)
-    return batches
 
 
 def _prompt_completion_text_parts(tokenizer, item, dataset_text_field):
@@ -4142,7 +4172,14 @@ def _text_item_length(item):
     return len(item)
 
 
-def _iter_text_index_chunks(items, batch_size, seed, dataset_order, num_epochs=None):
+def _iter_text_index_chunks(
+    items,
+    batch_size,
+    seed,
+    dataset_order,
+    num_epochs=None,
+    drop_last_default=True,
+):
     """Yield text batch index chunks using mlx-lm/default or explicit ordering."""
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
@@ -4156,9 +4193,10 @@ def _iter_text_index_chunks(items, batch_size, seed, dataset_order, num_epochs=N
     while num_epochs is None or epoch < int(num_epochs):
         if dataset_order in (None, "default"):
             ordered = sorted(range(length), key=lambda idx: _text_item_length(items[idx]))
+            stop = length - batch_size + 1 if drop_last_default else length
             chunks = [
                 ordered[start:start + batch_size]
-                for start in range(0, length - batch_size + 1, batch_size)
+                for start in range(0, stop, batch_size)
             ]
             if not chunks:
                 raise ValueError(

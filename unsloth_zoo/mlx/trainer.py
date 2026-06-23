@@ -576,20 +576,6 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
-        if self.data_collator is not None and self.args.packing:
-            raise ValueError(
-                "Unsloth MLX: custom data_collator cannot be used with "
-                "packing=True yet. Set packing=False, or remove the custom "
-                "data_collator."
-            )
-        if self.data_collator is not None and self.formatting_func is not None:
-            raise ValueError(
-                "Unsloth MLX: custom data_collator requires an already "
-                "tokenized text dataset with input_ids. Apply formatting_func "
-                "before creating the trainer, or remove the custom "
-                "data_collator."
-            )
-
         if self.args.packing:
             print(
                 "Unsloth: packing=True is not yet supported on MLX. "
@@ -2163,23 +2149,23 @@ class MLXTrainer:
                     completion_only_loss=text_completion_only_loss,
                 )
             else:
+                text_dataset_order = (
+                    "sequential"
+                    if getattr(args, "preserve_dataset_order", False)
+                    else getattr(args, "dataset_order", "default")
+                )
+                text_num_epochs = (
+                    args.num_train_epochs
+                    if (
+                        args.max_steps <= 0
+                        and args.num_train_epochs > 0
+                        and text_dataset_order == "torch_randperm"
+                    )
+                    else None
+                )
+                if text_num_epochs is not None:
+                    self._prepared_batches_include_epochs = True
                 if self.data_collator is not None:
-                    text_dataset_order = (
-                        "sequential"
-                        if getattr(args, "preserve_dataset_order", False)
-                        else getattr(args, "dataset_order", "default")
-                    )
-                    collator_num_epochs = (
-                        args.num_train_epochs
-                        if (
-                            args.max_steps <= 0
-                            and args.num_train_epochs > 0
-                            and text_dataset_order == "torch_randperm"
-                        )
-                        else None
-                    )
-                    if collator_num_epochs is not None:
-                        self._prepared_batches_include_epochs = True
                     return create_collated_text_batches(
                         dataset=self.train_dataset,
                         data_collator=self.data_collator,
@@ -2188,7 +2174,7 @@ class MLXTrainer:
                         num_batches=total_batches_needed,
                         seed=args.seed,
                         dataset_order=text_dataset_order,
-                        num_epochs=collator_num_epochs,
+                        num_epochs=text_num_epochs,
                     ), None
                 batch_kwargs = dict(
                     dataset=self.train_dataset,
@@ -2207,21 +2193,11 @@ class MLXTrainer:
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)
-                    or getattr(args, "dataset_order", "default") != "default"
+                    or text_dataset_order != "default"
                 ):
-                    text_dataset_order = (
-                        "sequential"
-                        if getattr(args, "preserve_dataset_order", False)
-                        else getattr(args, "dataset_order", "default")
-                    )
                     batch_kwargs["dataset_order"] = text_dataset_order
-                    if (
-                        args.max_steps <= 0
-                        and args.num_train_epochs > 0
-                        and text_dataset_order == "torch_randperm"
-                    ):
-                        batch_kwargs["num_epochs"] = args.num_train_epochs
-                        self._prepared_batches_include_epochs = True
+                    if text_num_epochs is not None:
+                        batch_kwargs["num_epochs"] = text_num_epochs
                     batches = create_ordered_batches(**batch_kwargs)
                 else:
                     batches = create_batches(**batch_kwargs)
@@ -2639,7 +2615,7 @@ def train_on_responses_only(
     """Mask instruction tokens from loss — train only on assistant responses.
 
     Call after MLXTrainer(...), before trainer.train(). Works for text and
-    VLM models; mirrors the HF/unsloth API.
+    VLM models without custom data_collator; mirrors the HF/unsloth API.
 
     Args:
         trainer: MLXTrainer (may be None when return_function=True and a
