@@ -394,6 +394,24 @@ def assert_same_keys(model, new_state_dict):
 pass
 
 
+def _get_lora_scaling(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Resolve plural active_adapters or older singular active_adapter (may be a list);
+    # 0.0 if unresolved so counts align. (#2966)
+    active_adapters = getattr(module, "active_adapters", None)
+    if active_adapters:
+        active_adapter = active_adapters[0]
+    else:
+        active_adapter = getattr(module, "active_adapter", "default")
+        if isinstance(active_adapter, (list, tuple)):
+            active_adapter = active_adapter[0] if active_adapter else "default"
+    try:
+        return module.scaling[active_adapter]
+    except Exception:
+        return 0.0
+pass
+
+
 @torch.inference_mode
 def create_lora_statistics(model, merge_into_original = False, return_state_dict = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -423,21 +441,17 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             expand_module_keys(name, module, remove_keys)
 
         elif isinstance(module, Linear_LoRA_Layers):
-            active_adapter = module.active_adapters[0] if \
-                hasattr(module, "active_adapters") else module.active_adapter
-            lora_weights[name].alpha = module.scaling[active_adapter]
+            lora_weights[name].alpha = _get_lora_scaling(module)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
-        # Fallback: some MoE LoRA wrappers are not subclasses of Linear_LoRA_Layers
-        # but still expose `scaling` and `active_adapters`. Capture them so counts align.
-        elif hasattr(module, "scaling") and hasattr(module, "active_adapters"):
-            active_adapter = module.active_adapters[0] if \
-                hasattr(module, "active_adapters") else getattr(module, "active_adapter", "default")
-            try:
-                lora_weights[name].alpha = module.scaling[active_adapter]
-            except Exception:
-                pass
+        # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers:
+        # capture alpha so counts align. Require lora_A/lora_B so a non-LoRA module
+        # with its own `scaling` + `active_adapter` isn't misclassified. (#2966)
+        elif hasattr(module, "scaling") and \
+            (hasattr(module, "lora_A") or hasattr(module, "lora_B")) and \
+            (hasattr(module, "active_adapters") or hasattr(module, "active_adapter")):
+            lora_weights[name].alpha = _get_lora_scaling(module)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
