@@ -654,6 +654,8 @@ def _merge_and_overwrite_lora(
                     available_experts = moe_num_experts.get(base_prefix, None)
                     if available_experts is not None and expert_idx >= available_experts:
                         continue
+                    # Fallback count only: the merge helpers re-resolve num_experts from the
+                    # wrapped module (lora_stats), so a shard-local value here is corrected.
                     num_experts = available_experts
                     if w_name == "w2":
                         # down_proj LoRA: experts module, else fused .down_proj when unwrapped.
