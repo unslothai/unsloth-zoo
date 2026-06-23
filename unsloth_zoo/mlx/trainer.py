@@ -576,6 +576,20 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
+        if self.data_collator is not None and self.args.packing:
+            raise ValueError(
+                "Unsloth MLX: custom data_collator cannot be used with "
+                "packing=True yet. Set packing=False, or remove the custom "
+                "data_collator."
+            )
+        if self.data_collator is not None and self.formatting_func is not None:
+            raise ValueError(
+                "Unsloth MLX: custom data_collator requires an already "
+                "tokenized text dataset with input_ids. Apply formatting_func "
+                "before creating the trainer, or remove the custom "
+                "data_collator."
+            )
+
         if self.args.packing:
             print(
                 "Unsloth: packing=True is not yet supported on MLX. "
@@ -1199,6 +1213,16 @@ class MLXTrainer:
         args = self.args
         model = self.model
         is_vlm = self._is_vlm
+        if (
+            self.data_collator is not None
+            and args.eval_steps > 0
+            and self.eval_dataset is not None
+        ):
+            raise ValueError(
+                "Unsloth MLX: evaluation with custom data_collator is not "
+                "supported yet. Set eval_steps=0, remove eval_dataset, or "
+                "use the built-in MLX batcher."
+            )
 
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
@@ -2635,6 +2659,17 @@ def train_on_responses_only(
     from ..dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
+
+    if (
+        not return_function
+        and trainer is not None
+        and getattr(trainer, "data_collator", None) is not None
+    ):
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only cannot be combined with a "
+            "custom data_collator yet. Apply response masks before creating "
+            "the trainer, or remove the custom data_collator."
+        )
 
     # Resolve tokenizer: kwarg > trainer.tokenizer
     _tokenizer = tokenizer
