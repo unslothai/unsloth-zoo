@@ -126,3 +126,13 @@ def test_vision_token_never_selected_for_text_model():
     tok = _qwen3_text()
     fix_pad_token(tok)
     assert tok.pad_token not in VISION_RESERVED_TOKENS
+
+
+def test_vision_model_keeps_its_vision_pad():
+    # A real multimodal model (model_type without "vl", e.g. llava) must be
+    # detected as vision so its vision pad_token is left untouched.
+    tok = _qwen3_text()  # pad_token = "<|vision_pad|>"
+    cfg = type("Cfg", (), {"model_type": "llava"})()
+    res = fix_pad_token(tok, model_config = cfg)
+    assert res["changed"] is False
+    assert tok.pad_token == "<|vision_pad|>"

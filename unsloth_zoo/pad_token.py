@@ -62,6 +62,13 @@ VISION_RESERVED_TOKENS = frozenset((
     "<|audio_pad|>",
 ))
 
+# model_type fragments that mark a multimodal model whose vision pad tokens are
+# legitimate (so we must not "heal" them). Kept conservative: each fragment only
+# appears in genuinely multimodal model_types, never in text-only ones.
+_VISION_MODEL_TYPES = (
+    "vl", "vision", "llava", "paligemma", "idefics", "pixtral", "mllama",
+)
+
 _CLOSERS = (">", "|>", "]", ")")
 _MANUAL_PAD_TOKEN = "<｜PAD▁TOKEN｜>"
 
@@ -81,11 +88,13 @@ def _resolve_inner(tokenizer):
 def _infer_vision(tokenizer, inner, model, model_config, is_vision_model):
     if is_vision_model is not None:
         return bool(is_vision_model)
-    if hasattr(tokenizer, "image_processor"):
+    # getattr not hasattr: a processor can carry image_processor = None.
+    if getattr(tokenizer, "image_processor", None) is not None:
         return True
     cfg = model_config if model_config is not None else getattr(model, "config", None)
     model_type = (getattr(cfg, "model_type", "") or "") if cfg is not None else ""
-    return "vl" in model_type.lower()
+    model_type = model_type.lower()
+    return any(fragment in model_type for fragment in _VISION_MODEL_TYPES)
 
 
 def _display_name(model, model_config, inner):
@@ -144,9 +153,11 @@ def _find_reserved_pad(inner, is_vision, eos_token, vocab_size):
         if not matches:
             continue
         # Prefer a closed token (e.g. "<|reserved_special_token_0|>") that is
-        # distinct from eos and encodes to a single in-vocab id.
+        # distinct from eos and encodes to a single in-vocab id. Closed tokens
+        # are a subset of matches, so order them first without duplicating.
         closed = [m for m in matches if m.endswith(_CLOSERS)]
-        for candidate in closed + matches:
+        ordered = closed + [m for m in matches if m not in closed]
+        for candidate in ordered:
             if candidate == eos_token or candidate in VISION_RESERVED_TOKENS:
                 continue
             if _single_token_id(inner, candidate, vocab_size) is not None:
@@ -196,7 +207,8 @@ def fix_pad_token(
             # No model here to resize embeddings; let the model-aware call repair.
             return result
         new_pad = _MANUAL_PAD_TOKEN
-        while new_pad in inner.get_vocab():
+        vocab = inner.get_vocab()
+        while new_pad in vocab:
             new_pad = f"<｜{new_pad}｜>"
         added = True
 
@@ -211,8 +223,9 @@ def fix_pad_token(
                     model.resize_token_embeddings(len(inner))
             except Exception:
                 pass
-        if hasattr(model, "config"):
-            model.config.update({"pad_token_id": inner.pad_token_id})
+        model_cfg = getattr(model, "config", None)
+        if model_cfg is not None:
+            model_cfg.update({"pad_token_id": inner.pad_token_id})
         if getattr(model, "generation_config", None) is not None:
             model.generation_config.update(pad_token_id=inner.pad_token_id)
 

@@ -504,9 +504,10 @@ def patch_tokenizer(model, tokenizer):
     # may still be missing pad_token_id - mirror it across.
     if not result["changed"] and model is not None and model_config is not None:
         if getattr(model_config, "pad_token_id", None) is None:
-            model.config.update({"pad_token_id" : tokenizer.pad_token_id})
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+            model.config.update({"pad_token_id" : pad_token_id})
             if getattr(model, "generation_config", None) is not None:
-                model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
+                model.generation_config.update(pad_token_id = pad_token_id)
     pass
 
     if model is not None:
