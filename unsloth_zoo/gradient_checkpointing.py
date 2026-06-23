@@ -59,8 +59,8 @@ DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable doub
 @contextmanager
 def _no_inference_mode():
     # GC buffers must not be inference tensors, else a later offload copy_ raises
-    # "Inplace update to inference tensor" (GRPO log-probs run under inference_mode,
-    # unsloth#3828). Leave inference_mode but stay in no_grad for the copies.
+    # "Inplace update to inference tensor" under GRPO's inference_mode (unsloth#3828).
+    # Leave inference_mode but stay in no_grad.
     try:
         leave_inference = torch.inference_mode(False)
     except (TypeError, AttributeError):
@@ -565,7 +565,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
-                        # copy_ must not hit an inference tensor (unsloth#3828)
+                        # _no_inference_mode: copy_ target must not be an inference tensor (unsloth#3828)
                         with _no_inference_mode(), torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
@@ -645,7 +645,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
-            # copy_ must not hit an inference tensor (unsloth#3828)
             with _no_inference_mode(), torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
@@ -973,7 +972,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
         try:
             n_gpus = len(GPU_BUFFERS)
             dtype = GPU_BUFFERS[0].dtype
-            with _no_inference_mode():  # keep buffers out of inference mode (unsloth#3828)
+            with _no_inference_mode():
                 GPU_BUFFERS_B = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
             if DEVICE_TYPE in ("cuda", "hip"):
                 event_ctor = torch.cuda.Event
