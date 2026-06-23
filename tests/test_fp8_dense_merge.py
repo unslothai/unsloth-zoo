@@ -194,8 +194,7 @@ def test_fp8_quant_config_detection():
         "format": "nvfp4-pack-quantized",
         "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 4}}},
     })
-    # compressed-tensors MXFP8: method is "compressed-tensors" and weights are 8-bit
-    # float, but it is microscaling, not dense FP8; the MX marker must exclude it.
+    # compressed-tensors MXFP8: 8-bit float but microscaling; the MX marker excludes it.
     assert not _is_fp8_quant_config({
         "quant_method": "compressed-tensors",
         "format": "mxfp8-quantized",
@@ -208,9 +207,8 @@ def test_fp8_quant_config_detection():
 
 
 def test_fp8_dense_per_channel_2d_scale_ignores_block_size(tmp_path):
-    """A 2-D per-channel (out, 1) scale must dequantize correctly even when a
-    config weight_block_size is supplied (it must not be applied to a scale grid
-    that does not tile the weight by it)."""
+    """A 2-D per-channel (out, 1) scale dequantizes correctly even with a config
+    weight_block_size that does not tile the weight (it must not be applied)."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(7)
@@ -240,8 +238,7 @@ def test_fp8_dense_per_channel_2d_scale_ignores_block_size(tmp_path):
 
 
 def test_fp8_fused_expert_3d_dequantizes(tmp_path):
-    """A 3-D fused MoE expert FP8 tensor must dequantize per-expert (attention-only
-    adapter) instead of hard-failing on rank 3."""
+    """A 3-D fused MoE expert FP8 tensor dequantizes per-expert, not hard-fails on rank 3."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(8)
@@ -310,8 +307,8 @@ def test_fp8_dense_one_d_row_scale_dequantizes(tmp_path):
 
 
 def test_fp8_dense_block_scale_partial_block(tmp_path):
-    """Block-quant with a dim not a multiple of the block: weight_block_size must
-    dequantize correctly (inferring rows//srows is wrong)."""
+    """Block-quant with a dim not a block multiple: weight_block_size dequantizes
+    correctly (inferring rows//srows is wrong)."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(3)
@@ -341,8 +338,7 @@ def test_fp8_dense_block_scale_partial_block(tmp_path):
 
 
 def test_fp8_dense_moe_expert_lora_raises(tmp_path):
-    """Dense FP8 path has no MoE fusion; a LoRA on fused experts must raise, not
-    silently drop the adapter."""
+    """Dense FP8 path has no MoE fusion; a LoRA on fused experts raises, not drops."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     W_fp8, scale = _fp8_quant_channel(torch.randn(32, 48) * 0.1)
@@ -400,8 +396,8 @@ def test_fp8_e5m2_dequantizes(tmp_path):
 
 
 def test_fp8_fused_expert_underscore_scale(tmp_path):
-    """Fused expert FP8 whose companion uses the <key>_scale_inv naming (no .weight
-    suffix) must be found and dequantized, not raise a missing-scale error."""
+    """Fused expert FP8 with <key>_scale_inv naming (no .weight suffix) is found and
+    dequantized, not a missing-scale error."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(12)

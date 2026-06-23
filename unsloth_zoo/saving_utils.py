@@ -607,9 +607,8 @@ def _merge_and_overwrite_lora(
         )
     pass
 
-    # FP8 grows to 16bit and drops its companion scales, so use the mxfp4
-    # full-rewrite path (in-place mmap can't resize). Only for a 16bit merge: other
-    # save methods (e.g. mxfp4) keep the quant config / index and must not dequantize.
+    # FP8 grows to 16bit and drops its scales, so full-rewrite (mmap can't resize).
+    # 16bit merge only; other save methods keep the quant config and must not dequantize.
     if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 quantized model detected. Dequantizing to 16bit via full rewrite.")
@@ -1936,9 +1935,8 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     return count, safetensor_keys_seen
 pass
 
-# FP8 weight dtypes and companion scale suffixes (scales dropped on merge). The
-# underscore variants cover fused params (e.g. experts.gate_up_proj) whose scale is
-# stored as <key>_scale(_inv) rather than <key>.weight_scale(_inv).
+# FP8 weight dtypes and companion scale suffixes (dropped on merge). Underscore
+# variants cover fused params whose scale is <key>_scale(_inv), not <key>.weight_scale.
 _FP8_WEIGHT_DTYPES = tuple(
     getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
 )
@@ -1948,18 +1946,16 @@ _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
 
-    Raises if FP8 but no usable scale (never silent FP8). Handles every dense scale
-    layout (per-tensor, 1-D, 2-D per-channel, 2-D block) plus 3-D fused MoE experts
-    (per-expert). weight_block_size (bm, bn) is needed when a weight dim is not an
-    exact multiple of the block.
+    Raises if FP8 with no usable scale (never silent). Handles every dense scale layout
+    (per-tensor, 1-D, 2-D per-channel/block) plus 3-D fused MoE experts (per-expert).
+    weight_block_size (bm, bn) is needed for a weight dim that isn't a block multiple.
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
     if W.dtype not in _FP8_WEIGHT_DTYPES:
         return W, []
     base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
-    # <base>.weight_scale(_inv) for .weight tensors; <key>_scale(_inv) for fused params
-    # without a .weight suffix (e.g. experts.gate_up_proj).
+    # <base>.weight_scale(_inv) for .weight; <key>_scale(_inv) for fused params.
     scale_inv = None
     for suffix in (".weight_scale_inv", ".weight_scale", "_scale_inv", "_scale"):
         cand = base + suffix
@@ -1975,8 +1971,7 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
     # Drop every companion scale for this weight (input_scale too on static FP8).
     scale_keys = [base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata]
     # 3-D fused MoE experts (E, M, N): dequantize each expert with its scale slice.
-    # Expert-LoRA merges are refused upstream, so this only passes base experts
-    # through (e.g. an attention-only adapter on an FP8 MoE checkpoint).
+    # Expert-LoRA merges are refused upstream, so only base experts reach here.
     if W.ndim == 3:
         n_experts = W.shape[0]
         if scale_inv.numel() == 1:
@@ -2026,7 +2021,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
 
-        # Read the header so we skip scale companions without a tensor read.
+        # Read the header to skip scale companions without a tensor read.
         raw_pointer = open(filename_original, "r+b")
         try:
             length_of_header = int.from_bytes(raw_pointer.read(8), "little")
@@ -2861,8 +2856,8 @@ def merge_and_overwrite_lora(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
     # FP8 block dequant needs the block size for partial final blocks; capture it
-    # before merge16bit strips the config. finegrained_fp8/fbgemm keep it top-level;
-    # compressed-tensors nests it under config_groups[*].weights.block_structure.
+    # before merge16bit strips the config. Top-level for finegrained_fp8/fbgemm;
+    # under config_groups[*].weights.block_structure for compressed-tensors.
     _merge_weight_block_size = None
     if base_model_is_quantized and quant_type == "fp8":
         _qc = getattr(_merge_base_model.config, "quantization_config", None)
@@ -3964,18 +3959,17 @@ def check_local_model_exists(model_path):
 pass
 
 def _is_fp8_quant_config(quant_config):
-    """True for a dense 8-bit FP8 scheme (finegrained_fp8, fbgemm_fp8, or
-    compressed-tensors float-quantized) to dequantize on a 16bit merge. Excludes
-    microscaling (mxfp8/mxfp4) and sub-8-bit floats (e.g. NVFP4)."""
+    """True for a dense 8-bit FP8 scheme (finegrained_fp8, fbgemm_fp8, compressed-tensors
+    float-quantized) to dequantize on a 16bit merge. Excludes microscaling (mxfp8/mxfp4)
+    and sub-8-bit floats (e.g. NVFP4)."""
     if not isinstance(quant_config, dict):
         return False
     method = str(quant_config.get("quant_method", "")).lower()
     # Dense FP8 method, but not microscaling (mx* keep their own block scales).
     if "fp8" in method and not method.startswith("mx"):
         return True
-    # compressed-tensors: only 8-bit dense float groups are dense FP8. Microscaling
-    # (mxfp8) and NVFP4 reuse type "float"/num_bits 8 but need a different path, so
-    # exclude their format markers first.
+    # compressed-tensors: only 8-bit dense float groups. mxfp8/NVFP4 reuse type
+    # "float"/num_bits 8, so exclude their format markers first.
     if method == "compressed-tensors":
         fmt = str(quant_config.get("format", "")).lower()
         if "mx" in fmt or "nvfp4" in fmt:

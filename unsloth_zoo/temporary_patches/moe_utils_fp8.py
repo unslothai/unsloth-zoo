@@ -812,19 +812,16 @@ _MOE_QUANT_UNSAFE = object()
 def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_size = None) -> torch.Tensor:
     """Dequant a 2-D float8_e4m3fn weight: W_real = decode_fp8(W) * scale_broadcast.
 
-    Inverse of compressed-tensors / DeepSeek FP8. Handles every dense scale layout:
-    per-tensor scalar, 1-D per-row/col, 2-D per-channel, and 2-D block. block_size
-    (bm, bn) is the configured weight_block_size; without it bm/bn are inferred from
-    the scale grid, which is only exact when rows/cols are block multiples (a partial
-    final block needs it).
+    Inverse of compressed-tensors / DeepSeek FP8. Handles every dense scale layout
+    (per-tensor, 1-D per-row/col, 2-D per-channel, 2-D block). block_size (bm, bn) is
+    the configured weight_block_size; without it bm/bn are inferred from the scale grid,
+    which is only exact when rows/cols are block multiples.
     """
     rows, cols = W_fp8.shape
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
     W = W_fp8.to(out_dtype)
-    # Per-tensor scalar scale.
     if scale_inv.numel() == 1:
         return W * scale_inv.reshape(()).to(out_dtype)
-    # 1-D per-row / per-column scale.
     if scale_inv.ndim == 1:
         if scale_inv.shape[0] == rows:
             return W * scale_inv.view(-1, 1).to(out_dtype)
@@ -836,8 +833,8 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
         )
     srows, scols = scale_inv.shape
     bm = bn = None
-    # Use the configured block size only when the scale grid actually tiles the weight
-    # by it; per-channel 2-D scales (e.g. (rows, 1)) must fall back to inference.
+    # Use the configured block size only when the scale grid tiles the weight by it;
+    # per-channel 2-D scales (e.g. (rows, 1)) fall back to inference.
     if block_size is not None and len(block_size) == 2:
         cand_bm, cand_bn = block_size
         if srows == -(-rows // cand_bm) and scols == -(-cols // cand_bn):
