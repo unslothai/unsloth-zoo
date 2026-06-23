@@ -555,7 +555,6 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
     def __init__(self, *args, **kwargs):
-        """Initialize config fields while remembering explicit warmup_steps."""
         config_fields = [field for field in fields(type(self)) if field.init]
         if len(args) > len(config_fields):
             raise TypeError(
@@ -733,7 +732,6 @@ class MLXTrainer:
         )
 
     def _resolve_warmup_steps(self, total_steps):
-        """Return warmup steps, resolving warmup_ratio after total_steps exists."""
         get_warmup_steps = getattr(self.args, "get_warmup_steps", None)
         if callable(get_warmup_steps):
             return max(0, int(get_warmup_steps(total_steps)))
