@@ -27,13 +27,9 @@ import collections
 import importlib.util
 import types
 
-# saving_utils (and peft.tuners.lora.bnb / transformers import_utils) import
-# bitsandbytes at module scope. On a CPU-only box bitsandbytes is genuinely absent,
-# so install unsloth_zoo's permissive stub: it registers a meta-path finder so any
-# `import bitsandbytes.X.Y` resolves to a no-op module that carries a real __spec__.
-# A bare types.ModuleType has __spec__ is None, which makes the find_spec() probe in
-# transformers' _is_package_available / peft's is_bnb_available raise
-# "ValueError: bitsandbytes.__spec__ is None" and crash collection.
+# saving_utils imports bitsandbytes at module scope. When absent (CPU-only), use
+# unsloth_zoo's permissive stub (carries a real __spec__) so the find_spec() probes in
+# peft / transformers don't raise on a bare ModuleType whose __spec__ is None.
 if importlib.util.find_spec("bitsandbytes") is None:
     from unsloth_zoo.stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb_stub
     _inject_bnb_stub()
@@ -398,7 +394,7 @@ def test_get_lora_scaling_active_adapters_plural():
     assert _get_lora_scaling(m) == 4.0
 
 def test_get_lora_scaling_active_adapter_singular():
-    """Older peft / custom wrappers expose only singular active_adapter."""
+    """Older peft exposes only the singular active_adapter."""
     m = types.SimpleNamespace(active_adapter="default", scaling=_Scalar())
     assert _get_lora_scaling(m) == 4.0
 
@@ -408,8 +404,7 @@ def test_get_lora_scaling_unresolved_returns_zero():
 
 
 class _FakeLoRALinear(nn.Module):
-    """LoRA wrapper not surfaced by get_lora_layer_modules() exposing only the
-    singular active_adapter, mimicking the layout behind #2966."""
+    """LoRA wrapper not surfaced by get_lora_layer_modules(), exposing only the singular active_adapter (#2966)."""
     def __init__(self, n=8, r=4, alpha=8):
         super().__init__()
         self.base_layer = nn.Linear(n, n, bias=False)
@@ -432,8 +427,7 @@ class _PeftLike(nn.Module):
         self.base_model = _BM(inner)
 
 def test_create_lora_statistics_counts_align_for_unmatched_class():
-    """Class-mismatched LoRA layers (the #2966 case) must have scaling captured so
-    counts align and the delta is not merged with the default alpha = 0."""
+    """Class-mismatched LoRA layers (#2966) must have scaling captured so the delta isn't merged with alpha = 0."""
     model = _PeftLike(_Inner(3))
     lora_weights, _ = create_lora_statistics(model, merge_into_original=True, return_state_dict=False)
     alphas = [v.alpha for v in lora_weights.values() if v.lora_A is not None]

@@ -163,18 +163,8 @@ def get_lora_layer_modules():
     for file in files:
         if file == "__init__.py" or not file.endswith(".py"): continue
         item = f"peft.tuners.lora.{file[:-len('.py')]}"
-        # Some peft.tuners.lora submodules import an optional quantization backend
-        # (bnb, eetq, awq, aqlm, hqq, gptq, ...) at module scope. When that backend is
-        # absent or only partially installed the import raises:
-        #   * ImportError / ModuleNotFoundError - backend not installed at all,
-        #   * OSError                            - native library present but fails to load,
-        #   * ValueError                         - importlib.util.find_spec on a spec-less stub,
-        #   * AttributeError / TypeError         - a partially-present backend / stub whose
-        #                                          import-time is_*_available() probe touches a
-        #                                          missing attribute (e.g. bnb.nn.Linear4bit).
-        # This block only imports a peft submodule and reads its dir(), so none of these can
-        # mask a genuine Unsloth bug. Skip the single un-importable backend rather than crashing
-        # LoRA-layer discovery (and therefore create_lora_statistics) for everyone.
+        # Skip a submodule whose optional backend (bnb/eetq/awq/...) is absent or
+        # partially installed, rather than crashing the whole LoRA-layer discovery.
         try:
             exec(f"import {item}", locals(), globals())
         except (ImportError, OSError, ValueError, AttributeError, TypeError) as exception:
