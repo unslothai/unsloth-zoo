@@ -78,6 +78,7 @@ from .utils import (
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
+    _get_text_model,
 )
 from .compile import (
     build_compile_policy,
@@ -502,6 +503,7 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -1072,11 +1074,68 @@ class MLXTrainer:
             pass
         self._prior_metal_limits = {}
 
+    def _install_neftune(self):
+        """NEFTune: add scaled uniform noise to input embeddings during training.
+        Text models only; no-op in eval. Uses __class__ reassignment (a real
+        subclass) rather than a module swap, so the embedding object is
+        unchanged -- .weight stays readable for tied LM-head models, and
+        __call__ resolves on the subtype so interception actually fires."""
+        alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
+        if alpha <= 0:
+            return
+        if self._is_vlm:
+            print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
+                  "for VLM models on MLX; ignoring.")
+            return
+        try:
+            tm = _get_text_model(self.model)
+            backbone = getattr(tm, "model", tm)
+            emb = backbone.embed_tokens
+        except Exception as e:
+            print(f"Unsloth: NEFTune could not locate embed_tokens ({e}); ignoring.")
+            return
+        if getattr(emb, "_unsloth_neftune_active", False):
+            return
+
+        _Base = type(emb)
+        _alpha = alpha
+
+        class _NEFTuneEmbed(_Base):
+            _unsloth_neftune_active = True
+            def __call__(self, x):
+                out = _Base.__call__(self, x)
+                if getattr(self, "training", False):
+                    dim = out.shape[-1] * out.shape[-2]
+                    scale = _alpha / (dim ** 0.5)
+                    noise = mx.random.uniform(
+                        low=-1.0, high=1.0, shape=out.shape
+                    ).astype(out.dtype) * scale
+                    return out + noise
+                return out
+
+        self._neftune_emb = emb
+        self._neftune_base_cls = _Base
+        emb.__class__ = _NEFTuneEmbed
+        print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}).")
+
+    def _remove_neftune(self):
+        emb = getattr(self, "_neftune_emb", None)
+        base = getattr(self, "_neftune_base_cls", None)
+        if emb is not None and base is not None:
+            try:
+                emb.__class__ = base
+            except Exception:
+                pass
+        self._neftune_emb = None
+        self._neftune_base_cls = None
+
+
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
+        self._install_neftune()
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
@@ -1168,6 +1227,7 @@ class MLXTrainer:
 
             return self._train_inner()
         finally:
+            self._remove_neftune()
             if args.gradient_checkpointing:
                 try:
                     remove_gradient_checkpointing(model)
