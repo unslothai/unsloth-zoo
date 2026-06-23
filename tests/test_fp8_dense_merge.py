@@ -365,3 +365,65 @@ def test_fp8_dense_moe_expert_lora_raises(tmp_path):
             base_model_is_quantized=True,
             quant_type="fp8",
         )
+
+
+def test_fp8_e5m2_dequantizes(tmp_path):
+    """float8_e5m2 weights must be dequantized (scale applied), not passed through raw."""
+    if not hasattr(torch, "float8_e5m2"):
+        pytest.skip("float8_e5m2 unavailable")
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(11)
+    W_real = torch.randn(32, 64, dtype=torch.float32) * 0.1
+    amax = W_real.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+    scale = (amax / 57344.0).to(torch.float32)  # e5m2 max ~57344
+    q = (W_real / scale).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
+    ref = q.to(torch.float32) * scale  # the correct dequantization
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.down_proj.weight": q,
+        "model.layers.0.mlp.down_proj.weight_scale": scale,
+    })
+
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors",
+        lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.float32,
+        model_class_name="Qwen2ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
+    )
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        merged = f.get_tensor("model.layers.0.mlp.down_proj.weight")
+        assert merged.dtype not in (torch.float8_e5m2, torch.float8_e4m3fn)
+        merged = merged.float()
+    # Matches the scaled dequantization; raw pass-through (no scale) would not.
+    assert torch.allclose(merged, ref, atol=1e-4)
+
+
+def test_fp8_fused_expert_underscore_scale(tmp_path):
+    """Fused expert FP8 whose companion uses the <key>_scale_inv naming (no .weight
+    suffix) must be found and dequantized, not raise a missing-scale error."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(12)
+    n_experts, out_f, in_f = 2, 16, 24
+    W_real = torch.randn(n_experts, out_f, in_f, dtype=torch.float32) * 0.1
+    q = [_fp8_quant_channel(W_real[e]) for e in range(n_experts)]
+    W_fp8 = torch.stack([w for w, _ in q], dim=0)
+    scale = torch.stack([s for _, s in q], dim=0)  # (E, out, 1)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.experts.gate_up_proj": W_fp8,
+        "model.layers.0.mlp.experts.gate_up_proj_scale_inv": scale,  # underscore naming
+    })
+
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors",
+        lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.float32,
+        model_class_name="Qwen3MoeForCausalLM", base_model_is_quantized=True, quant_type="fp8",
+    )
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        assert "model.layers.0.mlp.experts.gate_up_proj_scale_inv" not in keys  # scale dropped
+        merged = f.get_tensor("model.layers.0.mlp.experts.gate_up_proj").float()
+    assert torch.allclose(merged, W_real, atol=0.05)

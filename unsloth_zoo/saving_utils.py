@@ -608,8 +608,9 @@ def _merge_and_overwrite_lora(
     pass
 
     # FP8 grows to 16bit and drops its companion scales, so use the mxfp4
-    # full-rewrite path (in-place mmap can't resize).
-    if base_model_is_quantized and quant_type == "fp8":
+    # full-rewrite path (in-place mmap can't resize). Only for a 16bit merge: other
+    # save methods (e.g. mxfp4) keep the quant config / index and must not dequantize.
+    if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 quantized model detected. Dequantizing to 16bit via full rewrite.")
         return _merge_and_overwrite_lora_fp8(
@@ -1935,8 +1936,14 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     return count, safetensor_keys_seen
 pass
 
-# FP8 companion scale suffixes (dropped on merge).
-_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
+# FP8 weight dtypes and companion scale suffixes (scales dropped on merge). The
+# underscore variants cover fused params (e.g. experts.gate_up_proj) whose scale is
+# stored as <key>_scale(_inv) rather than <key>.weight_scale(_inv).
+_FP8_WEIGHT_DTYPES = tuple(
+    getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
+)
+_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
+                       "_scale_inv", "_scale")
 
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
@@ -1948,11 +1955,13 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
-    if W.dtype != torch.float8_e4m3fn:
+    if W.dtype not in _FP8_WEIGHT_DTYPES:
         return W, []
     base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
+    # <base>.weight_scale(_inv) for .weight tensors; <key>_scale(_inv) for fused params
+    # without a .weight suffix (e.g. experts.gate_up_proj).
     scale_inv = None
-    for suffix in (".weight_scale_inv", ".weight_scale"):
+    for suffix in (".weight_scale_inv", ".weight_scale", "_scale_inv", "_scale"):
         cand = base + suffix
         if cand in header_metadata:
             scale_inv = file.get_tensor(cand)
@@ -2861,10 +2870,14 @@ def merge_and_overwrite_lora(
         if _qc_get is not None:
             _wbs = _qc_get("weight_block_size", None)
             if _wbs is None:
-                for _grp in (_qc_get("config_groups", None) or {}).values():
-                    _w = _grp.get("weights") if isinstance(_grp, dict) else None
-                    if isinstance(_w, dict) and isinstance(_w.get("block_structure"), (list, tuple)):
-                        _wbs = _w["block_structure"]
+                # config_groups (and its weights) may be dicts or transformers objects.
+                _grps = _qc_get("config_groups", None) or {}
+                _grps_iter = _grps.values() if hasattr(_grps, "values") else _grps
+                for _grp in _grps_iter:
+                    _w = _grp.get("weights") if isinstance(_grp, dict) else getattr(_grp, "weights", None)
+                    _bs = _w.get("block_structure") if isinstance(_w, dict) else getattr(_w, "block_structure", None)
+                    if isinstance(_bs, (list, tuple)) and len(_bs) == 2:
+                        _wbs = _bs
                         break
             if isinstance(_wbs, (list, tuple)) and len(_wbs) == 2:
                 _merge_weight_block_size = tuple(int(x) for x in _wbs)
