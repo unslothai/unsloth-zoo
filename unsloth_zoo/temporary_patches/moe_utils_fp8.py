@@ -918,14 +918,15 @@ def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
     rows, cols = W.shape
     srows, scols = scale_inv.shape
     # Prefer the configured block size when its grid tiles the weight (handles partial
-    # final blocks, e.g. 130x256 with 128x128 blocks). Else infer, requiring exact division.
+    # final blocks, e.g. 130x256 with 128x128 blocks). Otherwise fall back to exact-division
+    # inference, which also covers per-channel scales like (rows, 1) that a global block size
+    # does not tile.
+    block_shape = None
     if block_size is not None and len(block_size) == 2:
         cand_bm, cand_bn = block_size
         if srows == -(-rows // cand_bm) and scols == -(-cols // cand_bn):
             block_shape = (cand_bm, cand_bn)
-        else:
-            return _MOE_QUANT_UNSAFE, None
-    else:
+    if block_shape is None:
         if rows % srows != 0 or cols % scols != 0:
             return _MOE_QUANT_UNSAFE, None
         block_shape = (rows // srows, cols // scols)

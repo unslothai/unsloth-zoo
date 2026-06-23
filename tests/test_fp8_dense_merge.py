@@ -230,6 +230,15 @@ def test_fp8_quant_config_detection():
         "quant_method": "compressed-tensors",
         "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 8, "format": "mxfp8"}}},
     })
+    # Malformed num_bits (null / non-int) must not crash; treated as not-FP8.
+    assert not _is_fp8_quant_config({
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": None}}},
+    })
+    assert not _is_fp8_quant_config({
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": "eight"}}},
+    })
 
 
 def test_fp8_dense_per_channel_2d_scale_ignores_block_size(tmp_path):
@@ -261,6 +270,68 @@ def test_fp8_dense_per_channel_2d_scale_ignores_block_size(tmp_path):
     with safe_open(str(shard), framework="pt", device="cpu") as f:
         merged = f.get_tensor("model.layers.0.mlp.down_proj.weight").float()
     assert torch.allclose(merged, W_real, atol=0.05)
+
+
+def test_fp8_dense_scale_grid_mismatch_with_block_size_raises(tmp_path):
+    """A 2-D scale grid that neither exact-divides the weight nor ceil-matches the configured
+    block size must raise, not silently dequantize with inferred tiles."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    # 130x256 weight, block (128,128) -> matching grid would be (2,2). A (3,2) grid matches
+    # neither exact division (130 % 3 != 0) nor the block-size ceil grid.
+    W_fp8 = (torch.randn(130, 256) * 0.1).clamp(-448, 448).to(torch.float8_e4m3fn)
+    bad_scale = torch.rand(3, 2, dtype=torch.float32) + 0.5
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.down_proj.weight": W_fp8,
+        "model.layers.0.mlp.down_proj.weight_scale_inv": bad_scale,
+    })
+
+    with pytest.raises(RuntimeError, match="not tiled"):
+        _merge_and_overwrite_lora(
+            save_directory=str(tmp_path),
+            filename="model.safetensors",
+            lora_weights=defaultdict(_FakeLoraStats),
+            output_dtype=torch.float32,
+            model_class_name="Qwen2ForCausalLM",
+            base_model_is_quantized=True,
+            quant_type="fp8",
+            weight_block_size=(128, 128),
+        )
+
+
+def test_fp8_dense_scale_in_sibling_shard(tmp_path):
+    """A sharded FP8 checkpoint where a weight and its scale companion live in different shards
+    must still dequantize (scale loaded cross-shard) and drop the now-orphaned scale."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(5)
+    W_real = torch.randn(64, 128, dtype=torch.float32) * 0.1
+    W_fp8, scale = _fp8_quant_channel(W_real)  # 2-D (64, 1) scale
+    shard1 = tmp_path / "model-00001-of-00002.safetensors"
+    shard2 = tmp_path / "model-00002-of-00002.safetensors"
+    # Weight in shard 1; its scale companion in shard 2.
+    _write_shard(shard1, {"model.layers.0.mlp.down_proj.weight": W_fp8})
+    _write_shard(shard2, {
+        "model.layers.0.mlp.down_proj.weight_scale": scale,
+        "model.layers.1.mlp.up_proj.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+    })
+
+    for fn in (shard1.name, shard2.name):
+        _merge_and_overwrite_lora(
+            save_directory=str(tmp_path), filename=fn,
+            lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.bfloat16,
+            model_class_name="Qwen2ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
+        )
+
+    with safe_open(str(shard1), framework="pt", device="cpu") as f:
+        merged = f.get_tensor("model.layers.0.mlp.down_proj.weight")
+        assert merged.dtype == torch.bfloat16  # dequantized via cross-shard scale
+    assert torch.allclose(merged.float(), W_real, atol=0.05)
+    with safe_open(str(shard2), framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+    assert "model.layers.0.mlp.down_proj.weight_scale" not in keys  # orphaned scale dropped
+    assert "model.layers.1.mlp.up_proj.weight" in keys              # ordinary tensor kept
 
 
 def test_fp8_fused_expert_3d_dequantizes(tmp_path):

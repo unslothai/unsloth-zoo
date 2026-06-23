@@ -229,14 +229,40 @@ def test_fp8_handler_partial_block_needs_block_size():
 
 
 def test_fp8_handler_block_size_grid_mismatch_is_unsafe():
-    """A configured block size whose ceil grid does not match the stored scale grid is
-    rejected (UNSAFE) rather than silently mis-tiled."""
+    """A scale grid that matches neither the configured block size's ceil grid nor an exact
+    division of the weight is rejected (UNSAFE) rather than silently mis-tiled."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
-        _fp8_save_handler, _fp8_requant_blockwise, _MOE_QUANT_UNSAFE,
+        _fp8_save_handler, _MOE_QUANT_UNSAFE,
     )
-    W_real = torch.randn(128, 256, dtype=torch.float32) * 0.1
-    W_fp8, scale_inv = _fp8_requant_blockwise(W_real, (64, 128), torch.float32)  # grid 2x2
+    # 130x256 weight, (3,2) grid: ceil(130/128)=2 != 3 (block mismatch) and 130 % 3 != 0
+    # (no exact division) -> UNSAFE.
+    W_fp8 = (torch.randn(130, 256) * 0.1).clamp(-448, 448).to(torch.float8_e4m3fn)
+    scale_inv = torch.rand(3, 2, dtype=torch.float32) + 0.5
     header = {"X.weight": {"dtype": "F8_E4M3"}, "X.weight_scale_inv": {"dtype": "F32"}}
     file = _FakeFile({"X.weight": W_fp8, "X.weight_scale_inv": scale_inv})
-    # block_size (128,128) -> ceil grid (1,2) != stored (2,2) -> UNSAFE.
     assert _fp8_save_handler(file, header, "X.weight", block_size=(128, 128)) == (_MOE_QUANT_UNSAFE, None)
+
+
+def test_fp8_handler_per_channel_scale_with_block_size_merges():
+    """A per-channel (rows,1) scale must still merge when a global block_size is configured:
+    the block size does not tile it, so the handler falls back to per-channel inference
+    instead of aborting the whole FP8 MoE merge."""
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+        _fp8_save_handler, _MOE_QUANT_UNSAFE,
+    )
+    torch.manual_seed(21)
+    rows, cols = 256, 128
+    W_real = torch.randn(rows, cols, dtype=torch.float32) * 0.1
+    scale = (W_real.abs().amax(dim=1, keepdim=True) / 448.0).clamp_min(1e-12)  # (rows, 1)
+    W_fp8 = (W_real / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    header = {"X.weight": {"dtype": "F8_E4M3"}, "X.weight_scale_inv": {"dtype": "F32"}}
+    file = _FakeFile({"X.weight": W_fp8, "X.weight_scale_inv": scale})
+
+    loaded = _fp8_save_handler(file, header, "X.weight", block_size=(128, 128))
+    assert loaded[0] is not _MOE_QUANT_UNSAFE, "per-channel scale wrongly rejected"
+    W_bf16, requant = loaded
+    assert (W_bf16.float() - W_real).abs().max().item() < 0.05
+    # Requant round-trips and preserves the (rows, 1) grid.
+    _new_fp8, _dtype, extras = requant(W_bf16)
+    _key, new_scale, _sd = extras[0]
+    assert tuple(new_scale.shape) == (rows, 1)

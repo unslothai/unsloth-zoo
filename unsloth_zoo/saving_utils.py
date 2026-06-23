@@ -1964,12 +1964,14 @@ _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
 # safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
 _FP8_HEADER_DTYPES = ("F8_E4M3", "F8_E5M2")
 
-def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None):
+def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None, extra_scale_lookup = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
 
     Raises if FP8 with no usable scale (never silent). Handles every dense scale layout
     (per-tensor, 1-D, 2-D per-channel/block) plus 3-D fused MoE experts (per-expert).
     weight_block_size (bm, bn) is needed for a weight dim that isn't a block multiple.
+    extra_scale_lookup(key) loads a scale companion from a sibling shard when HF sharding
+    placed the weight and its scale in different files.
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
@@ -1983,6 +1985,12 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
         if cand in header_metadata:
             scale_inv = file.get_tensor(cand)
             break
+    if scale_inv is None and extra_scale_lookup is not None:
+        # Scale companion landed in a different shard (HF shards weight/scale independently).
+        for suffix in (".weight_scale_inv", ".weight_scale", "_scale_inv", "_scale"):
+            scale_inv = extra_scale_lookup(base + suffix)
+            if scale_inv is not None:
+                break
     if scale_inv is None:
         raise RuntimeError(
             f"Unsloth: FP8 weight '{weight_key}' has no companion weight_scale / "
@@ -2020,7 +2028,11 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
         scale_inv.numel() == 1
         or (scale_inv.ndim == 1 and scale_inv.shape[0] in (rows, cols))
         or (scale_inv.ndim == 2 and rows % scale_inv.shape[0] == 0 and cols % scale_inv.shape[1] == 0)
-        or (scale_inv.ndim == 2 and weight_block_size is not None and len(weight_block_size) == 2)
+        # Configured block size: only if its ceil grid matches the stored scale grid, else a
+        # grid for a different block size would silently dequantize with inferred tiles.
+        or (scale_inv.ndim == 2 and weight_block_size is not None and len(weight_block_size) == 2
+            and scale_inv.shape[0] == -(-rows // weight_block_size[0])
+            and scale_inv.shape[1] == -(-cols // weight_block_size[1]))
     )
     if not _scale_ok:
         raise RuntimeError(
@@ -2029,6 +2041,40 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
         )
     W_real = _fp8_dequant_blockwise(W, scale_inv, block_size = weight_block_size)
     return W_real, scale_keys
+
+def _build_cross_shard_fp8_index(save_directory, current_filename):
+    """{key: (filename, dtype)} for tensors in the OTHER *.safetensors shards (headers only,
+    no tensor reads). HF shards a weight and its scale companion independently, so an FP8
+    weight and its `*.weight_scale(_inv)` can land in different files; this lets the rewrite
+    find a scale elsewhere and drop a scale whose weight was dequantized elsewhere."""
+    index = {}
+    try:
+        siblings = [f for f in os.listdir(save_directory)
+                    if f.endswith(".safetensors") and f != current_filename]
+    except OSError:
+        return index
+    for fn in siblings:
+        try:
+            with open(os.path.join(save_directory, fn), "rb") as fp:
+                length = int.from_bytes(fp.read(8), "little")
+                hdr = json.loads(fp.read(length))
+        except Exception:
+            continue
+        for k, meta in hdr.items():
+            if k != "__metadata__" and isinstance(meta, dict):
+                index.setdefault(k, (fn, meta.get("dtype")))
+    return index
+pass
+
+def _fp8_scale_key_weight_bases(scale_key):
+    """Candidate FP8 weight keys a companion scale belongs to (most specific suffix wins),
+    used to drop a scale whose dequantized weight lives in another shard."""
+    for suffix in (".weight_scale_inv", ".weight_scale", ".input_scale", "_scale_inv", "_scale"):
+        if scale_key.endswith(suffix):
+            base = scale_key[: -len(suffix)]
+            return (base + ".weight", base)  # .weight_* -> <base>.weight ; fused -> <base>
+    return ()
+pass
 
 def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2042,8 +2088,10 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
 
-        # Read the header to skip scale companions without a tensor read.
-        raw_pointer = open(filename_original, "r+b")
+        # Read the header to skip scale companions without a tensor read. Read-only: the merge
+        # writes a temp file and os.replace()s it, so no write handle is needed (and "r+b"
+        # alongside safe_open's handle can trigger a PermissionError on Windows).
+        raw_pointer = open(filename_original, "rb")
         try:
             length_of_header = int.from_bytes(raw_pointer.read(8), "little")
             header_metadata = json.loads(raw_pointer.read(length_of_header))
@@ -2062,6 +2110,16 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                 "https://github.com/unslothai/unsloth/issues."
             )
 
+        # FP8 weight/scale pairs can be split across shards, so index the other shards once.
+        cross_shard = _build_cross_shard_fp8_index(save_directory, filename)
+
+        def _load_cross_shard_scale(scale_key):
+            entry = cross_shard.get(scale_key)
+            if entry is None:
+                return None
+            with safe_open(os.path.join(save_directory, entry[0]), framework = "pt", device = "cpu") as f2:
+                return f2.get_tensor(scale_key)
+
         # Companion scales of an actual FP8 weight (by header dtype) are folded in by the
         # dequant, so they are dropped. Derive them from the FP8 weights rather than by raw
         # suffix, so unrelated `*_scale` / `*_scale_inv` tensors (logit_scale, router
@@ -2072,6 +2130,16 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
                 continue
             base = key[: -len(".weight")] if key.endswith(".weight") else key
             scale_keys_to_drop.update(base + s for s in _FP8_SCALE_SUFFIXES if base + s in header_metadata)
+        # Orphaned companion: a scale here whose FP8 weight lives in another shard and has
+        # already been dequantized (now non-FP8). A still-FP8 sibling weight keeps its scale
+        # so its own (later) rewrite can load it cross-shard, avoiding an ordering hazard.
+        if cross_shard:
+            for key in safetensor_keys:
+                for wk in _fp8_scale_key_weight_bases(key):
+                    dt = cross_shard.get(wk, (None, None))[1]
+                    if dt is not None and dt not in _FP8_HEADER_DTYPES:
+                        scale_keys_to_drop.add(key)
+                        break
 
         for key in safetensor_keys:
             if key in scale_keys_to_drop:
@@ -2079,7 +2147,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
 
             was_fp8 = header_metadata.get(key, {}).get("dtype") in _FP8_HEADER_DTYPES
             merged = False
-            W, _scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size)
+            W, _scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size, extra_scale_lookup = _load_cross_shard_scale)
 
             output_key = key
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
@@ -4031,8 +4099,11 @@ def _is_fp8_quant_config(quant_config):
             wfmt = str(weights.get("format", "")).lower()
             if "mx" in wfmt or "nvfp4" in wfmt:
                 continue
-            if (str(weights.get("type", "")).lower() == "float"
-                    and int(weights.get("num_bits", 8)) == 8):
+            try:
+                num_bits = int(weights.get("num_bits", 8))
+            except (TypeError, ValueError):
+                num_bits = 0  # malformed (null / non-int) -> do not classify as FP8
+            if str(weights.get("type", "")).lower() == "float" and num_bits == 8:
                 return True
     return False
 pass
