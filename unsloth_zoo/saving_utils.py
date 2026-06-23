@@ -4301,6 +4301,12 @@ def check_model_quantization_status(model_name_or_path, token=None):
         except:
             pass
 
+    # Detection keys off config.json["quantization_config"]. NVIDIA ModelOpt FP8 checkpoints
+    # (e.g. *-Nemotron-*-FP8) instead carry their spec in a separate hf_quant_config.json
+    # ("quantization": {"quant_algo": "FP8"}) with no config.json quantization_config, so they
+    # are not detected here and a 16bit merge will not dequantize them. The dense FP8 dequant
+    # math already handles their per-tensor layout; only this detection is missing. Tracked as
+    # a follow-up (ModelOpt also emits NVFP4 / INT4_AWQ, which must NOT take the 8-bit path).
     if config and "quantization_config" in config:
         quant_config = config["quantization_config"]
 
