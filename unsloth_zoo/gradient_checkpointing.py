@@ -565,8 +565,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
-                        # _no_inference_mode: copy_ target must not be an inference tensor (unsloth#3828)
-                        with _no_inference_mode(), torch_gpu_stream(EXTRA_STREAM):
+                        # x is a CPU_BUFFERS entry, always allocated outside
+                        # inference_mode, so copy_ into it never trips the
+                        # "inplace update to inference tensor" error (unsloth#3828).
+                        # No need to re-enter _no_inference_mode on this hot path.
+                        with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
                         global NEXT_BUFFER_SLOT
@@ -645,7 +648,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
-            with _no_inference_mode(), torch_gpu_stream(EXTRA_STREAM):
+            # buffer is a GPU_BUFFERS/GPU_BUFFERS_B entry, always allocated
+            # outside inference_mode, so this reload copy_ is safe without
+            # re-entering _no_inference_mode on the hot path (unsloth#3828).
+            with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
             # No GPU buffer seen
