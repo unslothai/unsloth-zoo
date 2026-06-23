@@ -510,9 +510,14 @@ def _shrink_generic(family, kind, cfg, **kw):
                           ("num_attention_heads", _HEADS), ("num_key_value_heads", _KV),
                           ("vocab_size", _VOCAB), ("max_position_embeddings", _POS),
                           ("num_experts", _EXPERTS), ("num_local_experts", _EXPERTS),
-                          ("num_experts_per_tok", 2), ("decoder_sparse_step", 1)):
+                          ("num_experts_per_tok", 2), ("top_k_experts", 2),
+                          ("decoder_sparse_step", 1)):
             if hasattr(obj, attr):
                 setattr(obj, attr, val)
+        # Some families (gemma4) gate MoE behind a flag; enable it so the tiny
+        # config materializes experts to exercise the fused-merge path.
+        if hasattr(obj, "enable_moe_block"):
+            obj.enable_moe_block = True
         # strict/hybrid archs (lfm2_moe, qwen3_5_moe) need an explicit per-layer
         # schedule matching num_hidden_layers or instantiation raises.
         if hasattr(obj, "layer_types") and getattr(obj, "num_hidden_layers", None):

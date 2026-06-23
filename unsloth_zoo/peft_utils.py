@@ -60,8 +60,8 @@ def get_peft_regex(
     target_modules             : List[str] = None,
     vision_tags                : List[str] = ["vision", "image", "visual", "patch",],
     language_tags              : List[str] = ["language", "text",],
-    attention_tags             : List[str] = ["self_attn", "attention", "attn",],
-    mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense",],
+    attention_tags             : List[str] = ["self_attn", "attention", "attn", "mixer",],
+    mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense", "mixer",],
 ) -> str:
     """
     Create a regex pattern to apply LoRA to only select layers of a model.
@@ -118,10 +118,14 @@ def get_peft_regex(
     regex_components  = "|".join(regex_components)
 
     match_linear_modules = r"(?:" + "|".join(re.escape(x) for x in only_linear_modules) + r")"
+    # No trailing ".*?" after the linear-module group: PEFT uses re.fullmatch, so ".*?" would let
+    # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
+    # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
+    # so ending at the group keeps every real target and drops same-prefix non-linear modules.
     regex_matcher = \
         r".*?(?:"  + regex_model_parts + \
         r").*?(?:" + regex_components + \
-        r").*?"    + match_linear_modules + ".*?"
+        r").*?"    + match_linear_modules
 
     # Also account for model.layers.0.self_attn/mlp type modules like Qwen
     if finetune_language_layers:
@@ -135,7 +139,7 @@ def get_peft_regex(
     if not check:
         regex_matcher = \
             r".*?(?:" + regex_components + \
-            r").*?"   + match_linear_modules + ".*?"
+            r").*?"   + match_linear_modules
     pass
 
     # Final check to confirm if matches exist
@@ -163,7 +167,16 @@ def get_lora_layer_modules():
     for file in files:
         if file == "__init__.py" or not file.endswith(".py"): continue
         item = f"peft.tuners.lora.{file[:-len('.py')]}"
-        exec(f"import {item}", locals(), globals())
+        # Skip submodules whose optional backend (bnb/eetq/awq/...) is missing
+        # instead of crashing LoRA-layer discovery.
+        try:
+            exec(f"import {item}", locals(), globals())
+        except (ImportError, OSError, ValueError, AttributeError, TypeError) as exception:
+            logger.debug(
+                f"Unsloth: Skipping LoRA layers from `{item}` "
+                f"(optional backend unavailable): {exception}"
+            )
+            continue
         modules = dir(eval(item))
         modules = [x for x in modules if x.startswith("Linear") or x.endswith("Linear")]
         if len(modules) == 0: continue

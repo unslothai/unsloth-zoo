@@ -369,15 +369,29 @@ def prepare_model_for_training(
             or "norm2." in nm
         )
 
+    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
+    # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
+    _is_peft_model = hasattr(model, "peft_config")
+
     for name, param in model.named_parameters():
         original_name = name
         upcast = False
         requires_grad = False
+        _keep_param_dtype = False
         _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
             if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
                 upcast = True
                 requires_grad = True
+            elif (_is_peft_model and "bias" in name and param.requires_grad
+                    and ".modules_to_save." not in name):
+                # Respect PEFT's bias decision: bias="all"/"lora_only" marks biases
+                # trainable; freezing them here disabled bias training (#2343).
+                # _keep_param_dtype: keep the loaded dtype, since fp32 on a bf16/fp16
+                # Linear breaks the matmul. modules_to_save is excluded so a saved head
+                # with a frozen weight isn't partially trained via its bias (#2343 review).
+                requires_grad = True
+                _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
@@ -398,8 +412,11 @@ def prepare_model_for_training(
             param.requires_grad_(False)
 
         # Cast storage in place (keeps Parameter identity so tied weights stay tied);
-        # skip externally-managed params so we don't undo their fp32 cast.
-        if requires_grad and id(param) not in _externally_managed_param_ids:
+        # skip externally-managed params (preserve their fp32 cast) and dtype-pinned
+        # params (trainable biases must match their Linear weight).
+        if (requires_grad
+                and not _keep_param_dtype
+                and id(param) not in _externally_managed_param_ids):
             dtype = torch.float32 if upcast else mixed_precision_dtype
             if param.dtype != dtype:
                 param.data = param.data.to(dtype)
