@@ -20,11 +20,15 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 (which pulls in CUDA kernels).
 """
 
+import gc
 import json
 import importlib
 import inspect
 import math
 import os
+import re
+import shutil
+import sys
 import tempfile
 import types
 import warnings
@@ -2738,6 +2742,129 @@ def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, pre
     return model, updated_config
 
 
+# Real (non-stub) bitsandbytes modules, cached after the first import. bnb
+# registers torch custom operators at import time, which cannot be registered
+# twice, so it must be imported once per process and reused — re-importing
+# after purging it from sys.modules raises "Tried to register an operator".
+_REAL_BITSANDBYTES_MODULES = {}
+
+
+def _bnb_module_names():
+    return [
+        name for name in sys.modules
+        if name == "bitsandbytes" or name.startswith("bitsandbytes.")
+    ]
+
+
+def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
+    """Dequantize a bitsandbytes (NF4) repo to fp16 and write a clean,
+    non-quantized copy to a temp dir, returning its path.
+
+    unsloth_zoo stubs out bitsandbytes on Apple Silicon (stubs/bitsandbytes_stub),
+    so the real wheel is imported here with the stub temporarily lifted and
+    restored afterwards. bnb itself dequantizes the NF4 weights; the caller then
+    re-quantizes via MLX's affine path. Raises if bitsandbytes (or its dequant)
+    is unavailable so the caller can fall back to the clear bnb-unsupported error.
+    """
+    global _REAL_BITSANDBYTES_MODULES
+    saved_meta = list(sys.meta_path)
+    stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
+    ]
+    for name in _bnb_module_names():
+        del sys.modules[name]
+    # Reuse the already-initialized real bnb if we imported it earlier; only a
+    # cold process re-imports (and re-registers torch ops) for the first time.
+    sys.modules.update(_REAL_BITSANDBYTES_MODULES)
+    try:
+        import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
+        import torch
+        from transformers import AutoConfig, AutoTokenizer
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+        # Pick the right auto class: VLMs have a vision_config attribute or are
+        # explicitly listed in transformers' image-text-to-text mapping.
+        # AutoModelForCausalLM is text-only and rejects Qwen3VLConfig etc.
+        cfg = AutoConfig.from_pretrained(
+            source, token=token, trust_remote_code=trust_remote_code,
+        )
+        _is_vlm = (
+            hasattr(cfg, "vision_config")
+            or getattr(cfg, "model_type", "").endswith("_vl")
+            or getattr(cfg, "model_type", "") in (
+                "qwen3_vl", "qwen2_vl", "qwen2_5_vl", "llava", "llava_next",
+                "idefics2", "idefics3", "paligemma", "gemma3", "mllama",
+                "smolvlm", "internvl",
+            )
+        )
+        if _is_vlm:
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+            auto_cls = AutoModelForImageTextToText
+        else:
+            from transformers import AutoModelForCausalLM
+            auto_cls = AutoModelForCausalLM
+
+        model = auto_cls.from_pretrained(
+            source,
+            dtype=torch.float16,
+            device_map={"": device},
+            token=token,
+            trust_remote_code=trust_remote_code,
+        ).dequantize()
+        # After dequantize, the model config still carries bnb's
+        # quantization_config plus _pre_quantization_dtype (a torch.dtype).
+        # For VLMs these also live in sub-configs (vision_config, text_config,
+        # etc.). The dtype is not JSON-serializable and breaks save_pretrained.
+        # The dequantized weights no longer need any of this metadata.
+        def _strip_quant_meta(cfg):
+            if cfg is None:
+                return
+            for _attr in ("quantization_config", "_pre_quantization_dtype"):
+                if hasattr(cfg, _attr):
+                    try:
+                        delattr(cfg, _attr)
+                    except Exception:
+                        pass
+            # Walk known sub-config attrs that VLMs use to nest configs.
+            for _sub in (
+                "vision_config", "text_config", "audio_config",
+                "speech_config", "image_config", "encoder_config",
+                "decoder_config",
+            ):
+                _strip_quant_meta(getattr(cfg, _sub, None))
+        _strip_quant_meta(model.config)
+        tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
+        model.save_pretrained(tmpdir, safe_serialization=True)
+        # VLMs need the full processor (image preprocessor + tokenizer); text
+        # models only need the tokenizer. Use the right class so downstream
+        # mlx-vlm / mlx-lm loads can read the saved artifacts.
+        if _is_vlm:
+            AutoProcessor.from_pretrained(
+                source, token=token, trust_remote_code=trust_remote_code,
+            ).save_pretrained(tmpdir)
+        else:
+            AutoTokenizer.from_pretrained(
+                source, token=token, trust_remote_code=trust_remote_code,
+            ).save_pretrained(tmpdir)
+        # Release the fp16 model and bnb's MPS allocator cache so the caller's
+        # MLX re-quantization (and any later loads) aren't starved of memory.
+        del model
+        gc.collect()
+        if device == "mps":
+            torch.mps.empty_cache()
+        return tmpdir
+    finally:
+        _REAL_BITSANDBYTES_MODULES = {
+            name: sys.modules[name] for name in _bnb_module_names()
+        }
+        for name in _bnb_module_names():
+            del sys.modules[name]
+        sys.modules.update(stub_modules)
+        sys.meta_path[:] = saved_meta
+
+
 def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     if not spec.enabled:
         model._unsloth_quantization_config = None
@@ -3606,6 +3733,89 @@ class FastMLXModel:
                 local_path,
                 config_data,
             )
+
+        # bitsandbytes-quantized repos store NF4 weights MLX cannot read. When
+        # the real bitsandbytes wheel is importable, let bnb dequantize to fp16
+        # and re-enter the normal load on a clean copy so MLX's affine path
+        # re-quantizes it (the user gets an MLX 4-bit model, never seeing bnb).
+        # If bitsandbytes is unavailable, fall back to a clear, actionable error.
+        _existing_quant = _get_existing_mlx_quantization(config_data)
+        if (
+            isinstance(_existing_quant, dict)
+            and _existing_quant.get("quant_method") == "bitsandbytes"
+        ):
+            _suggested = re.sub(
+                r"-(?:unsloth-)?bnb-\d+bit$", "", model_name,
+            ) or model_name
+            _suggestion_line = (
+                f"  - Try the non-bnb variant: '{_suggested}'\n"
+                if _suggested != model_name
+                else "  - Try the non-bnb variant of this model (drop the "
+                     "'-bnb-4bit' suffix)\n"
+            )
+            try:
+                _dequant_dir = _dequantize_bnb_to_tempdir(
+                    local_path or model_name,
+                    token=token,
+                    trust_remote_code=trust_remote_code,
+                )
+            except ImportError:
+                raise ValueError(
+                    f"Unsloth: '{model_name}' is a bitsandbytes-quantized model "
+                    "and bitsandbytes is not available to dequantize it on this "
+                    "machine.\n"
+                    f"{_suggestion_line}"
+                    "  - Or install a bitsandbytes build that runs here so "
+                    "Unsloth can dequantize and re-quantize via MLX"
+                )
+            except Exception as _bnb_exc:
+                raise ValueError(
+                    f"Unsloth: failed to dequantize the bitsandbytes model "
+                    f"'{model_name}' "
+                    f"({type(_bnb_exc).__name__}: {_bnb_exc}).\n"
+                    f"{_suggestion_line}"
+                ) from _bnb_exc
+            try:
+                model, tokenizer = FastMLXModel.from_pretrained(
+                    _dequant_dir,
+                    max_seq_length=max_seq_length,
+                    dtype=dtype,
+                    load_in_4bit=load_in_4bit,
+                    load_in_8bit=load_in_8bit,
+                    load_in_16bit=load_in_16bit,
+                    load_in_fp8=load_in_fp8,
+                    load_in_mxfp4=load_in_mxfp4,
+                    load_in_nvfp4=load_in_nvfp4,
+                    full_finetuning=full_finetuning,
+                    token=token,
+                    trust_remote_code=trust_remote_code,
+                    text_only=text_only,
+                    patch_mode=patch_mode,
+                    revision=None,
+                    random_state=random_state,
+                    float32_mixed_precision=float32_mixed_precision,
+                    chat_template=chat_template,
+                    q_bits=q_bits,
+                    q_group_size=q_group_size,
+                    q_mode=q_mode,
+                    quant_predicate=quant_predicate,
+                    quantize_modules=quantize_modules,
+                    force_requantize=force_requantize,
+                    **(
+                        {"mlx_quantization_config": mlx_quantization_config}
+                        if mlx_quantization_config is not None
+                        else {}
+                    ),
+                )
+            finally:
+                # MLX has materialized its weights by now; the fp16 scratch copy
+                # (several GB) is no longer needed.
+                shutil.rmtree(_dequant_dir, ignore_errors=True)
+            model._hf_repo = model_name
+            model._src_path = local_path
+            model._unsloth_base_revision = revision
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
+            return model, tokenizer
 
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
         # aren't trainable (our CCE backward zeros the quantized weight grad),
