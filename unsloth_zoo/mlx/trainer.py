@@ -921,24 +921,33 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
-    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False, want_accuracy=False):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        correct_total = None
 
         for batch_data in eval_batches:
             if self.stop_requested:
                 break
             if is_vlm:
-                loss, ntoks = loss_fn(self.model, batch_data)
+                if want_accuracy:
+                    loss, ntoks, c = loss_fn(self.model, batch_data, return_correct=True)
+                else:
+                    loss, ntoks = loss_fn(self.model, batch_data); c = None
             else:
                 batch, lengths, labels = batch_data
-                loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                if want_accuracy:
+                    loss, ntoks, c = loss_fn(self.model, batch, lengths, labels, return_correct=True)
+                else:
+                    loss, ntoks = loss_fn(self.model, batch, lengths, labels); c = None
             all_losses += loss * ntoks
             ntokens += ntoks
+            if c is not None:
+                correct_total = (c if correct_total is None else correct_total + c)
             mx.eval(all_losses, ntokens)
 
-        return all_losses, ntokens
+        return all_losses, ntokens, correct_total
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
@@ -948,12 +957,13 @@ class MLXTrainer:
         """
         self.model.eval()
         metrics = {}
+        correct_total = None
         if isinstance(eval_batches, dict):
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
             for split_name, split_batches in eval_batches.items():
-                split_losses, split_tokens = self._evaluate_batch_totals(
-                    split_batches, loss_fn, is_vlm=is_vlm,
+                split_losses, split_tokens, _ = self._evaluate_batch_totals(
+                    split_batches, loss_fn, is_vlm=is_vlm, want_accuracy=False,
                 )
                 all_losses += split_losses
                 ntokens += split_tokens
@@ -969,8 +979,8 @@ class MLXTrainer:
                 if self.stop_requested:
                     break
         else:
-            all_losses, ntokens = self._evaluate_batch_totals(
-                eval_batches, loss_fn, is_vlm=is_vlm,
+            all_losses, ntokens, correct_total = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm, want_accuracy=True,
             )
 
         self.model.train()
@@ -978,6 +988,8 @@ class MLXTrainer:
         perplexity = math.exp(min(avg_loss, 100))
         metrics["eval_loss"] = avg_loss
         metrics["eval_perplexity"] = perplexity
+        if correct_total is not None and ntokens.item() > 0:
+            metrics["eval_mean_token_accuracy"] = (correct_total / ntokens).item()
         self._last_eval_metrics = metrics
         return avg_loss, perplexity
 
