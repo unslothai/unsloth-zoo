@@ -656,8 +656,7 @@ def _merge_and_overwrite_lora(
                         continue
                     num_experts = available_experts
                     if w_name == "w2":
-                        # down_proj LoRA: on the experts module, else the fused
-                        # .down_proj key when unwrapped (mirrors the gate/up branch).
+                        # down_proj LoRA: experts module, else fused .down_proj when unwrapped.
                         fused_key = base_prefix
                         lora_stats = converted_lora_weights.get(fused_key)
                         if lora_stats is None:
@@ -666,7 +665,7 @@ def _merge_and_overwrite_lora(
                         merge_role = "down"
                         merge_fn = _merge_moe_down_proj_expert
                     else:
-                        # gate_up_proj LoRA: on experts.base_layer, else .gate_up_proj when unwrapped.
+                        # gate_up_proj LoRA: experts.base_layer, else .gate_up_proj when unwrapped.
                         fused_key = base_prefix + ".base_layer"
                         lora_stats = converted_lora_weights.get(fused_key)
                         if lora_stats is None:

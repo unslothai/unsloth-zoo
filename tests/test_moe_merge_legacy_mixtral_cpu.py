@@ -83,7 +83,7 @@ def _delta(A, B, alpha, expert_idx, num_experts):
 
 def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     num_layers, num_experts, rank_per = 2, 4, 4
-    # 2*intermediate != hidden keeps the fused gate_up_proj shape-distinct (no PEFT default).
+    # 2*intermediate != hidden keeps gate_up_proj shape-distinct.
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
@@ -139,7 +139,7 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
 def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
     """gate_up LoRA keyed on .gate_up_proj (no .base_layer wrapper) is still found by the legacy w1/w3 path."""
     num_layers, num_experts, rank_per = 2, 4, 4
-    # 2*intermediate != hidden keeps the fused gate_up_proj shape-distinct (no PEFT default).
+    # 2*intermediate != hidden keeps gate_up_proj shape-distinct.
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
@@ -269,7 +269,7 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
     )
 
     num_layers, num_experts, rank_per = 1, 2, 4
-    # 2*intermediate != hidden keeps the fused gate_up_proj shape-distinct (no PEFT default).
+    # 2*intermediate != hidden keeps gate_up_proj shape-distinct.
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
@@ -344,7 +344,6 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
                 ref = base_dq + exp_delta
                 scale = merged[f"{dp}.{w_name}.weight_scale_inv"]
                 got = _fp8_dequant_blockwise(merged[f"{dp}.{w_name}.weight"], scale).to(torch.float64)
-                # Error vs base+delta, relative to weight magnitude.
                 denom = ref.abs().max().item() or 1.0
                 max_err = max(max_err, (got - ref).abs().max().item() / denom)
                 # Fraction of the intended delta that landed on disk.
