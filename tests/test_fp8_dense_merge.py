@@ -423,3 +423,45 @@ def test_fp8_fused_expert_underscore_scale(tmp_path):
         assert "model.layers.0.mlp.experts.gate_up_proj_scale_inv" not in keys  # scale dropped
         merged = f.get_tensor("model.layers.0.mlp.experts.gate_up_proj").float()
     assert torch.allclose(merged, W_real, atol=0.05)
+
+
+def test_strip_fp8_suffix():
+    from unsloth_zoo.saving_utils import _strip_fp8_suffix
+    assert _strip_fp8_suffix("unsloth/GLM-5.2-FP8") == "unsloth/GLM-5.2"
+    assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct-FP8-Dynamic") == "unsloth/Llama-3.1-8B-Instruct"
+    assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct-FP8-Block") == "unsloth/Llama-3.1-8B-Instruct"
+    assert _strip_fp8_suffix("org/Model-FP8-Static") == "org/Model"
+    assert _strip_fp8_suffix("org/model-fp8") == "org/model"
+    # No marker -> None (do not touch 16bit names).
+    assert _strip_fp8_suffix("unsloth/GLM-5.2") is None
+    assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct") is None
+
+
+def _write_16bit_model(path):
+    path.mkdir(parents=True, exist_ok=True)
+    save_file({"w": torch.zeros(2, 2)}, str(path / "model.safetensors"), metadata={"format": "pt"})
+    (path / "config.json").write_text('{"model_type": "llama"}')
+
+
+def test_resolve_fp8_16bit_sibling_local(tmp_path):
+    from unsloth_zoo.saving_utils import _resolve_fp8_16bit_sibling
+    # Existing non-quantized 16bit sibling -> resolved (merge onto full precision).
+    _write_16bit_model(tmp_path / "GLM-5.2")
+    got = _resolve_fp8_16bit_sibling(str(tmp_path / "GLM-5.2-FP8"))
+    assert got is not None and str(got).endswith("GLM-5.2") and "FP8" not in str(got)
+    # No sibling on disk -> None (fall back to FP8 dequant).
+    assert _resolve_fp8_16bit_sibling(str(tmp_path / "Nonexistent-FP8")) is None
+    # Plain 16bit name (no FP8 marker) -> None (nothing to resolve).
+    assert _resolve_fp8_16bit_sibling(str(tmp_path / "GLM-5.2")) is None
+
+
+def test_resolve_fp8_16bit_sibling_quantized_sibling_ignored(tmp_path):
+    from unsloth_zoo.saving_utils import _resolve_fp8_16bit_sibling
+    # A sibling that is itself quantized must NOT be used as the 16bit base.
+    base = tmp_path / "GLM-5.2"
+    base.mkdir(parents=True)
+    save_file({"w": torch.zeros(2, 2)}, str(base / "model.safetensors"), metadata={"format": "pt"})
+    (base / "config.json").write_text(
+        '{"model_type": "llama", "quantization_config": {"load_in_4bit": true, "bnb_4bit_quant_type": "nf4"}}'
+    )
+    assert _resolve_fp8_16bit_sibling(str(tmp_path / "GLM-5.2-FP8")) is None

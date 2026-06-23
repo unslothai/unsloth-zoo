@@ -2416,6 +2416,16 @@ def merge_and_overwrite_lora(
         pass
 
         final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+        # For a 16bit merge of an FP8 base, prefer an existing 16bit sibling (e.g.
+        # unsloth/GLM-5.2-FP8 -> unsloth/GLM-5.2) and merge LoRA onto full-precision
+        # weights, mirroring the 4bit flow. Only dequantize the FP8 if no sibling exists.
+        if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit":
+            _sibling = _resolve_fp8_16bit_sibling(model_name, token)
+            if _sibling is not None:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.info(f"Unsloth: FP8 base detected; merging onto 16bit sibling `{_sibling}`.")
+                model_name = _sibling
+                final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
         if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
             warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
             return None
@@ -4037,6 +4047,35 @@ def check_model_quantization_status(model_name_or_path, token=None):
                 return (True, quant_type if quant_type else "bitsandbytes")
 
     return (False, None)
+pass
+
+def _strip_fp8_suffix(model_name):
+    """Strip a trailing FP8 quant marker (-FP8, -FP8-Dynamic/Static/Block/Row, -fp8, ...)
+    and everything after it. Returns the 16bit base name, or None if there is no marker.
+    Uses the last marker so an `fp8` inside a path/base name is not mistaken for it."""
+    low = str(model_name).lower()
+    idx = max(low.rfind("-fp8"), low.rfind("_fp8"))
+    if idx <= 0:
+        return None
+    return model_name[:idx] or None
+pass
+
+def _resolve_fp8_16bit_sibling(model_name, token=None):
+    """If model_name is an FP8 variant with an existing, non-quantized 16bit sibling
+    (e.g. unsloth/GLM-5.2-FP8 -> unsloth/GLM-5.2), return the sibling so a 16bit merge
+    folds LoRA onto full-precision weights instead of dequantizing the FP8. Else None."""
+    base = _strip_fp8_suffix(model_name)
+    if not base:
+        return None
+    try:
+        local = check_local_model_exists(base)
+        if local and not check_model_quantization_status(local)[0]:
+            return local
+        if check_hf_model_exists(base, token) and not check_model_quantization_status(base, token)[0]:
+            return base
+    except Exception:
+        return None
+    return None
 pass
 
 def determine_base_model_source(model_name, token=None):
