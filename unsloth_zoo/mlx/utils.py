@@ -5611,7 +5611,7 @@ def save_pretrained_gguf(
             if _changed:
                 _config_path.write_text(json.dumps(_cfg, indent=2))
 
-        # Step 2: Ensure llama.cpp is installed and gguf package is available
+        # Step 2: Ensure llama.cpp is installed.
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
@@ -5648,25 +5648,6 @@ def save_pretrained_gguf(
                 _install_llama_cpp_macos(llama_cpp_folder)
                 quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
-
-        # Ensure gguf is installed (may be missing if llama.cpp was built
-        # in a different venv)
-        try:
-            import gguf  # noqa: F401
-        except ImportError:
-            import subprocess
-            gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
-            if os.path.exists(gguf_py_dir):
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", gguf_py_dir],
-                    check=True, capture_output=True,
-                )
-            else:
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "gguf"],
-                    check=True, capture_output=True,
-                )
-            print("Unsloth: Installed gguf Python package.")
 
         # Step 3: Download and patch convert_hf_to_gguf.py.
         # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
@@ -5714,7 +5695,23 @@ def save_pretrained_gguf(
         if supported_text_archs is not None:
             kwargs["supported_text_archs"] = supported_text_archs
             kwargs["supported_vision_archs"] = supported_vision_archs
-        convert_to_gguf(**kwargs)
+        gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
+        has_local_gguf = os.path.isdir(gguf_py_dir)
+        original_pythonpath = os.environ.get("PYTHONPATH")
+        if has_local_gguf:
+            os.environ["PYTHONPATH"] = (
+                gguf_py_dir
+                if not original_pythonpath
+                else gguf_py_dir + os.pathsep + original_pythonpath
+            )
+        try:
+            convert_to_gguf(**kwargs)
+        finally:
+            if has_local_gguf:
+                if original_pythonpath is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = original_pythonpath
 
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
