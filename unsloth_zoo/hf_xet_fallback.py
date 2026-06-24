@@ -128,7 +128,9 @@ def _default_prepare_for_http(
                 if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
                     try:
                         blob.unlink()
-                    except FileNotFoundError:
+                    except OSError:
+                        # A locked / permission-denied blob (common on Windows)
+                        # must not abort cleanup of the rest of the partials.
                         continue
     except Exception as e:
         logger.debug("default prepare_for_http failed for %s: %s", repo_id, e)
@@ -154,8 +156,14 @@ def get_hf_download_state(
         total = 0
         has_incomplete = False
         for repo_id in repo_ids or []:
-            # Skip local paths: HF IDs never start with / . ~ or contain "\".
-            if not repo_id or repo_id.startswith(("/", ".", "~")) or "\\" in repo_id:
+            # Skip local paths: HF IDs never start with / . ~, contain "\", or a
+            # drive-letter ":" (e.g. C:/models or C:\models on Windows).
+            if (
+                not repo_id
+                or repo_id.startswith(("/", ".", "~"))
+                or "\\" in repo_id
+                or ":" in repo_id
+            ):
                 continue
             for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
                 blobs_dir = entry / "blobs"
@@ -208,6 +216,10 @@ def start_watchdog(
             now = time.monotonic()
 
             if state is None:
+                # Unmeasurable this tick (transient FS error): treat as progress
+                # so a long unmeasurable gap cannot trip a false stall the instant
+                # the state becomes readable again.
+                last_change = now
                 if on_heartbeat is not None:
                     on_heartbeat(f"Downloading ({transport} transport)...")
                 continue
@@ -453,9 +465,12 @@ def _run_download_attempt(
             except queue.Empty:
                 continue
         else:
-            # Process exited; drain any result it enqueued.
+            # Process exited; drain any result it enqueued. Use a short timeout,
+            # not get_nowait(): the child can exit microseconds before its queue
+            # feeder flushes the pipe, and a bare get_nowait() would then spuriously
+            # report "exited without a result" on an otherwise successful download.
             try:
-                result = result_queue.get_nowait()
+                result = result_queue.get(timeout = 1.0)
             except queue.Empty:
                 result = None
     finally:

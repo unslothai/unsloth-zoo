@@ -165,7 +165,9 @@ def test_get_state_absent_cache_root(tmp_path, monkeypatch):
 
 def test_get_state_skips_local_paths(hf_cache):
     # Filesystem paths are not HF repo IDs and must be ignored without error.
-    assert xf.get_hf_download_state(["/abs/path", "./rel", "~user", "c:\\x"]) == (0, False)
+    assert xf.get_hf_download_state(
+        ["/abs/path", "./rel", "~user", "c:\\x", "c:/x"]
+    ) == (0, False)
 
 
 def test_get_state_sparse_aware(hf_cache):
