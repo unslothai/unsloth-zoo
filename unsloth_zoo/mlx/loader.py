@@ -3472,11 +3472,15 @@ class FastMLXModel:
                 False — force VLM via mlx-vlm
         """
         # mlx-lm cannot read bitsandbytes-packed weights; remap unsloth/*-bnb-4bit
-        # to the full-precision base repo and let MLX quantize it to 4-bit affine.
-        if isinstance(model_name, str):
+        # Hub IDs to the full-precision base repo and let MLX quantize to 4-bit.
+        # Only unsloth/* Hub IDs (whose base repo is known to exist) are remapped,
+        # so local paths and third-party repos keep the exact name given.
+        if isinstance(model_name, str) and model_name.startswith("unsloth/"):
             for _bnb_suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
                 if model_name.endswith(_bnb_suffix):
                     _bnb_base = model_name[: -len(_bnb_suffix)]
+                    # A caller revision pins the bnb repo, not the base; drop it.
+                    revision = None
                     print(
                         f"Unsloth: mlx-lm cannot load bitsandbytes 4-bit weights; "
                         f"loading base '{_bnb_base}' and applying MLX 4-bit "
