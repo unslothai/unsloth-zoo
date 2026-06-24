@@ -56,6 +56,10 @@ DEFAULT_STALL_TIMEOUT = 180.0
 DEFAULT_GRACE_PERIOD = 10.0
 _POLL_INTERVAL = 0.5
 
+# Serializes the brief parent-env mutation around a child spawn (below) so
+# concurrent downloads cannot observe each other's transport env.
+_SPAWN_ENV_LOCK = threading.Lock()
+
 # Hugging Face boolean env convention: 1 / ON / YES / TRUE, case-insensitive.
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -267,6 +271,7 @@ def _child_download(*, kind: str, params: dict, token: Optional[str], repo_type:
         repo_type = repo_type,
         token = token,
         revision = params.get("revision"),
+        cache_dir = params.get("cache_dir"),
     )
 
 
@@ -392,7 +397,26 @@ def _run_download_attempt(
         ),
         daemon = True,
     )
-    proc.start()
+    # Set the transport env in THIS process around the spawn so the child inherits
+    # it from creation. HF reads HF_HUB_DISABLE_XET into constants at import time,
+    # and a spawn child re-imports the (heavy) unsloth_zoo package -- importing
+    # huggingface_hub -- before the child body runs, so a child-side os.environ
+    # assignment would land too late. The child still sets it too, defensively.
+    child_env = {"HF_HUB_DISABLE_PROGRESS_BARS": "1"}
+    if disable_xet:
+        child_env["HF_HUB_DISABLE_XET"] = "1"
+        child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    with _SPAWN_ENV_LOCK:
+        saved_env = {k: os.environ.get(k) for k in child_env}
+        try:
+            os.environ.update(child_env)
+            proc.start()
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
     # Bind the child to the parent lifetime when running under Studio (best-effort).
     try:
@@ -533,6 +557,7 @@ def hf_hub_download_with_xet_fallback(
     cancel_event: Optional[threading.Event] = None,
     repo_type: str = "model",
     revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     grace_period: float = DEFAULT_GRACE_PERIOD,
@@ -549,7 +574,9 @@ def hf_hub_download_with_xet_fallback(
     try:
         from huggingface_hub import try_to_load_from_cache
 
-        cached = try_to_load_from_cache(repo_id, filename, repo_type = repo_type, revision = revision)
+        cached = try_to_load_from_cache(
+            repo_id, filename, repo_type = repo_type, revision = revision, cache_dir = cache_dir
+        )
         if isinstance(cached, str) and os.path.exists(cached):
             return cached
     except Exception as e:
@@ -559,7 +586,7 @@ def hf_hub_download_with_xet_fallback(
         repo_id = repo_id,
         label = f"{repo_id}/{filename}",
         kind = "file",
-        params = {"repo_id": repo_id, "filename": filename, "revision": revision},
+        params = {"repo_id": repo_id, "filename": filename, "revision": revision, "cache_dir": cache_dir},
         token = token,
         repo_type = repo_type,
         cancel_event = cancel_event,

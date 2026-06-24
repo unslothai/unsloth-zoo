@@ -13,6 +13,7 @@ tests do not import the full ``unsloth_zoo`` package (which pulls in torch + GPU
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import threading
@@ -272,6 +273,7 @@ class _FakeAttempt:
                 repo_id = repo_id,
                 kind = kind,
                 target = params.get("filename", repo_id),
+                cache_dir = params.get("cache_dir"),
                 disable_xet = disable_xet,
                 repo_type = repo_type,
             )
@@ -388,6 +390,94 @@ def test_unsloth_disable_xet_stall_raises_no_retry(monkeypatch):
     with pytest.raises(xf.DownloadStallError):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert len(fake.calls) == 1
+
+
+def test_file_path_accepts_cache_dir(monkeypatch):
+    """The single-file wrapper accepts cache_dir (no TypeError) and threads it through."""
+    fake = _install(monkeypatch, [("ok", "/cache/model.gguf")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, cache_dir = "/custom/cache")
+    assert out == "/cache/model.gguf"
+    assert fake.calls[0].cache_dir == "/custom/cache"
+
+
+# --------------------------------------------------------------------------- #
+# Spawn env-timing: the parent sets HF_HUB_DISABLE_XET before the child starts,
+# so the child inherits it before re-importing huggingface_hub (whose constants
+# cache the value at import). Uses a fake spawn context -- no real subprocess.
+# --------------------------------------------------------------------------- #
+class _FakeProc:
+    def __init__(self, recorder):
+        self._rec = recorder
+        self.pid = 4242
+        self.exitcode = 0
+
+    def start(self):
+        self._rec["disable_xet"] = os.environ.get("HF_HUB_DISABLE_XET")
+        self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout = None):
+        pass
+
+
+class _FakeQueue:
+    def __init__(self, result):
+        self._result = result
+
+    def get(self, timeout = None):
+        return self._result
+
+    def get_nowait(self):
+        return self._result
+
+    def put(self, item):
+        pass
+
+
+class _FakeCtx:
+    def __init__(self, recorder, result):
+        self._rec = recorder
+        self._result = result
+
+    def Process(self, *, target = None, kwargs = None, daemon = None):
+        return _FakeProc(self._rec)
+
+    def Queue(self):
+        return _FakeQueue(self._result)
+
+
+def test_http_retry_sets_disable_xet_before_spawn(monkeypatch):
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising = False)
+    monkeypatch.delenv("HF_HUB_ENABLE_HF_TRANSFER", raising = False)
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+
+    kind_result, payload = xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = True, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert (kind_result, payload) == ("ok", "/cache/x")
+    # Child inherited HTTP transport env at spawn time.
+    assert rec["disable_xet"] == "1"
+    assert rec["hf_transfer"] == "0"
+    # Parent env is restored afterwards (was unset).
+    assert "HF_HUB_DISABLE_XET" not in os.environ
+
+
+def test_xet_attempt_does_not_force_disable_before_spawn(monkeypatch):
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising = False)
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    # On the Xet-first attempt we must NOT force-disable Xet for the child.
+    assert rec["disable_xet"] is None
 
 
 # --------------------------------------------------------------------------- #
