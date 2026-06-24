@@ -69,6 +69,79 @@ class MLXTrainOutput(dict):
         return self.get("train_loss", 0.0)
 
 
+class _MLXTokenizedDatasetView:
+    """Lazy public dataset view that adds input_ids for SFTTrainer parity."""
+
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        max_seq_length,
+        formatting_func=None,
+        dataset_text_field="text",
+        chat_template=None,
+        model_name=None,
+        model_type=None,
+        append_eos=True,
+    ):
+        self._dataset = dataset
+        self._tokenizer = normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        self._max_seq_length = max_seq_length
+        self._formatting_func = formatting_func
+        self._dataset_text_field = dataset_text_field
+        self._append_eos = append_eos
+
+    def __getattr__(self, name):
+        return getattr(self._dataset, name)
+
+    def __len__(self):
+        return len(self._dataset)
+
+    def __iter__(self):
+        for item in self._dataset:
+            yield self._with_input_ids(item)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._dataset[key]
+        if not isinstance(key, int):
+            return self._dataset[key]
+        return self._with_input_ids(self._dataset[key])
+
+    def _with_input_ids(self, item):
+        if not isinstance(item, dict) or "input_ids" in item:
+            return item
+
+        source = self._formatting_func(item) if self._formatting_func is not None else item
+        texts = collect_mlx_texts(
+            self._tokenizer,
+            source,
+            dataset_text_field=self._dataset_text_field,
+            is_vlm=False,
+        )
+        if not texts:
+            return item
+
+        encoded = encode_mlx_text(self._tokenizer, texts[0])
+        eos_id = getattr(self._tokenizer, "eos_token_id", None)
+        if self._append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
+            encoded = list(encoded) + [eos_id]
+        if self._max_seq_length and len(encoded) > self._max_seq_length:
+            encoded = encoded[:self._max_seq_length]
+
+        item = dict(item)
+        item["input_ids"] = encoded
+        item["attention_mask"] = [1] * len(encoded)
+        return item
+
+
 from .utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
@@ -540,6 +613,7 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    per_device_eval_batch_size: int | None = None
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -567,6 +641,7 @@ class MLXTrainingConfig:
     disable_memory_limits: bool = False
     cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
     append_eos: bool = True  # True = mlx-lm parity; Studio sets False (template owns EOS)
+    image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -654,6 +729,27 @@ class MLXTrainer:
                 "Falling back to packing=False (standard padding)."
             )
             self.args.packing = False
+
+        if (
+            not self._is_vlm
+            and self.train_dataset is not None
+            and self.tokenizer is not None
+            and hasattr(self.train_dataset, "__getitem__")
+            and hasattr(self.train_dataset, "__len__")
+        ):
+            config = getattr(self.model, "_config", {})
+            model_type = config.get("model_type") if isinstance(config, dict) else None
+            self.train_dataset = _MLXTokenizedDatasetView(
+                self.train_dataset,
+                self.tokenizer,
+                self.args.max_seq_length,
+                formatting_func=self.formatting_func,
+                dataset_text_field=self.args.dataset_text_field,
+                chat_template=getattr(self.args, "chat_template", None),
+                model_name=getattr(self.model, "_hf_repo", None),
+                model_type=model_type,
+                append_eos=bool(getattr(self.args, "append_eos", True)),
+            )
 
         # Freeze non-LoRA params when LoRA is detected. Otherwise LayerNorm
         # weights stay trainable and adaptive optimizers NaN on step 1 (their
@@ -1721,6 +1817,10 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
+            eval_batch_size = (
+                getattr(args, "per_device_eval_batch_size", None)
+                or args.per_device_train_batch_size
+            )
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
@@ -1736,8 +1836,9 @@ class MLXTrainer:
                             dataset=eval_dataset,
                             processor=processor,
                             config=config,
-                            batch_size=args.per_device_train_batch_size,
+                            batch_size=eval_batch_size,
                             max_seq_length=args.max_seq_length,
+                            image_size=getattr(args, "image_size", None),
                             seed=args.seed,
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
@@ -1746,7 +1847,7 @@ class MLXTrainer:
                     return create_batches(
                         dataset=eval_dataset,
                         tokenizer=self.tokenizer,
-                        batch_size=args.per_device_train_batch_size,
+                        batch_size=eval_batch_size,
                         max_seq_length=args.max_seq_length,
                         seed=args.seed,
                         dataset_text_field=args.dataset_text_field,
@@ -2054,7 +2155,8 @@ class MLXTrainer:
         return MLXTrainOutput({
             "train_loss": avg_loss,
             "train_runtime": total_time,
-            "train_steps": total_steps,
+            "train_steps": self._global_step,
+            "total_train_steps": total_steps,
             "trained_tokens": trained_tokens,
             "train_samples_per_second": (
                 trained_tokens / total_time if total_time > 0 else 0
@@ -2173,6 +2275,7 @@ class MLXTrainer:
                     config=config,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
+                    image_size=getattr(args, "image_size", None),
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
@@ -2187,6 +2290,7 @@ class MLXTrainer:
                     config=config,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
+                    image_size=getattr(args, "image_size", None),
                     num_batches=total_batches_needed,
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
@@ -2795,13 +2899,18 @@ def train_on_responses_only(
 
         # Process eval dataset too
         if trainer.eval_dataset is not None:
+            eval_batch_size = (
+                getattr(args, "per_device_eval_batch_size", None)
+                or args.per_device_train_batch_size
+            )
+
             def _create_labeled_eval_batches(eval_dataset):
                 """Build response-masked eval batches for one dataset split."""
                 batches, response_masked_dataset = _create_labeled_batches(
                     dataset=eval_dataset,
                     tokenizer=_tokenizer,
                     mask_fn=mask_fn,
-                    batch_size=args.per_device_train_batch_size,
+                    batch_size=eval_batch_size,
                     max_seq_length=args.max_seq_length,
                     formatting_func=trainer.formatting_func,
                     dataset_text_field=args.dataset_text_field,

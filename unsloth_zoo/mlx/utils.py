@@ -3198,7 +3198,8 @@ def _filter_trainable_vlm_indices(
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
-                       num_epochs=None, completion_only_loss=None):
+                       num_epochs=None, completion_only_loss=None,
+                       image_size=None):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -3206,7 +3207,8 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     """
     import numpy as np
 
-    image_size = _get_vlm_image_size(config, processor)
+    if image_size is None:
+        image_size = _get_vlm_image_size(config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
     batch_list = []
@@ -3309,7 +3311,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   response_mask_fn=None,
                                   formatting_func=None,
                                   dataset_order="default",
-                                  completion_only_loss=None):
+                                  completion_only_loss=None,
+                                  image_size=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -3317,7 +3320,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     """
     import numpy as np
 
-    image_size = _get_vlm_image_size(config, processor)
+    if image_size is None:
+        image_size = _get_vlm_image_size(config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
     base_seed = _normalize_seed(seed)
 
