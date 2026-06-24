@@ -34,7 +34,6 @@ import os
 import queue
 import re
 import signal
-import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -110,12 +109,14 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
-def _default_prepare_for_http(repo_type: str, repo_id: str) -> None:
+def _default_prepare_for_http(
+    repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
+) -> None:
     """Generic 'make the partial safe for an HTTP resume': delete the repo's active
     ``*.incomplete`` blobs (an HTTP resume over a sparse Xet/hf_transfer partial
     silently corrupts the blob). Studio injects its marker-aware version instead."""
     try:
-        for entry in iter_active_repo_cache_dirs(repo_type, repo_id):
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
             if not blobs_dir.is_dir():
                 continue
@@ -130,16 +131,20 @@ def _default_prepare_for_http(repo_type: str, repo_id: str) -> None:
 
 
 def get_hf_download_state(
-    repo_ids: Optional[list[str]] = None, *, repo_type: str = "model"
+    repo_ids: Optional[list[str]] = None,
+    *,
+    repo_type: str = "model",
+    cache_dir: Optional[str] = None,
 ) -> Optional[tuple[int, bool]]:
-    """Return ``(total_on_disk_bytes, has_incomplete)`` for the active HF cache.
+    """Return ``(total_on_disk_bytes, has_incomplete)`` for the HF cache being written.
 
-    Sparse-aware (st_blocks based) so a sparse Xet/``hf_transfer`` ``.incomplete``
-    is not mistaken for full-size progress. ``None`` means the state could not be
-    measured, so callers skip stall logic for that tick.
+    Scans *cache_dir* when the download targets a caller-supplied cache, else the
+    active ``HF_HUB_CACHE``. Sparse-aware (st_blocks based) so a sparse Xet/
+    ``hf_transfer`` ``.incomplete`` is not mistaken for full-size progress. ``None``
+    means the state could not be measured, so callers skip stall logic for that tick.
     """
     try:
-        if hf_cache_root() is None:
+        if hf_cache_root(cache_dir = cache_dir) is None:
             return (0, False)
 
         total = 0
@@ -148,7 +153,7 @@ def get_hf_download_state(
             # Skip local paths: HF IDs never start with / . ~ or contain "\".
             if not repo_id or repo_id.startswith(("/", ".", "~")) or "\\" in repo_id:
                 continue
-            for entry in iter_active_repo_cache_dirs(repo_type, repo_id):
+            for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
                 blobs_dir = entry / "blobs"
                 if not blobs_dir.is_dir():
                     continue
@@ -158,7 +163,7 @@ def get_hf_download_state(
                             total += blob_bytes_present(blob)
                     except OSError:
                         pass
-            if has_active_incomplete_blobs(repo_type, repo_id):
+            if has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir):
                 has_incomplete = True
         return (total, has_incomplete)
     except Exception as e:
@@ -171,6 +176,7 @@ def start_watchdog(
     repo_ids: list[str],
     on_stall: Callable[[str], None],
     repo_type: str = "model",
+    cache_dir: Optional[str] = None,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     xet_disabled: bool = False,
@@ -179,8 +185,9 @@ def start_watchdog(
     """Start a daemon thread that fires ``on_stall(message)`` exactly once iff a
     ``*.incomplete`` is present AND the on-disk size is unchanged for
     *stall_timeout* seconds. The timer resets while no ``*.incomplete`` exists, so
-    post-download init is never misread as a stall. Returns a stop event the
-    caller sets when the download phase ends.
+    post-download init is never misread as a stall. Scans *cache_dir* when the
+    download targets a caller-supplied cache, else the active ``HF_HUB_CACHE``.
+    Returns a stop event the caller sets when the download phase ends.
     """
     stop = threading.Event()
     transport = "https" if xet_disabled else "xet"
@@ -188,12 +195,12 @@ def start_watchdog(
 
     def _beat() -> None:
         nonlocal fired
-        state = get_hf_download_state(repo_ids, repo_type = repo_type)
+        state = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
         last_size = state[0] if state is not None else 0
         last_change = time.monotonic()
 
         while not stop.wait(interval):
-            state = get_hf_download_state(repo_ids, repo_type = repo_type)
+            state = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
             now = time.monotonic()
 
             if state is None:
@@ -400,6 +407,7 @@ def _run_download_attempt(
         repo_ids = [repo_id],
         on_stall = lambda msg: stalled.set(),
         repo_type = repo_type,
+        cache_dir = params.get("cache_dir"),
         interval = interval,
         stall_timeout = stall_timeout,
         xet_disabled = disable_xet,
@@ -460,7 +468,7 @@ def _download_with_xet_fallback(
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("Cancelled")
 
-    prepare_for_http = prepare_for_http_fn or _default_prepare_for_http
+    cache_dir = params.get("cache_dir")
     # The Unsloth/HF knobs can force HTTP from the very first attempt.
     disable_xet = xet_force_disabled()
 
@@ -468,8 +476,13 @@ def _download_with_xet_fallback(
         if disable_xet:
             # Purge a non-HTTP partial before resuming over HTTP: an HTTP resume
             # over a sparse Xet/hf_transfer partial silently corrupts the blob.
+            # The generic purge is cache_dir-aware; an injected (Studio) hook owns
+            # its own cache accounting and keeps the (repo_type, repo_id) signature.
             try:
-                prepare_for_http(repo_type, repo_id)
+                if prepare_for_http_fn is None:
+                    _default_prepare_for_http(repo_type, repo_id, cache_dir = cache_dir)
+                else:
+                    prepare_for_http_fn(repo_type, repo_id)
             except Exception as e:
                 logger.debug("prepare_for_http failed for %s: %s", repo_id, e)
 

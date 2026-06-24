@@ -46,6 +46,9 @@ if "unsloth_zoo" not in sys.modules:
 _load("unsloth_zoo.hf_cache_state", "hf_cache_state.py")
 xf = _load("unsloth_zoo.hf_xet_fallback", "hf_xet_fallback.py")
 
+# Real prep impl, captured before the autouse fixture stubs the module attribute.
+_REAL_DEFAULT_PREPARE = xf._default_prepare_for_http
+
 
 # --------------------------------------------------------------------------- #
 # Watchdog: fires only on a constant-size .incomplete, sparse-aware byte total.
@@ -177,6 +180,42 @@ def test_get_state_sparse_aware(hf_cache):
     assert total < st.st_size, "sparse partial counted at apparent size, not allocated blocks"
 
 
+def test_custom_cache_dir_is_watched_and_cleaned(tmp_path, monkeypatch):
+    """A stall under a caller-supplied snapshot ``cache_dir`` (not HF_HUB_CACHE)
+    must still be seen by the state probe, the watchdog, and the HTTP-prep purge."""
+    default_cache = tmp_path / "default"
+    custom_cache = tmp_path / "custom"
+    default_cache.mkdir()
+    custom_cache.mkdir()
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(default_cache))
+
+    blobs = custom_cache / f"models--{REPO.replace('/', '--')}" / "blobs"
+    blobs.mkdir(parents = True)
+    partial = blobs / "stalled.incomplete"
+    partial.write_bytes(b"partial-bytes")
+
+    # Default cache sees nothing; the custom cache sees the active partial.
+    assert xf.get_hf_download_state([REPO]) == (0, False)
+    total, has_incomplete = xf.get_hf_download_state([REPO], cache_dir = str(custom_cache))
+    assert has_incomplete is True and total > 0
+
+    # The watchdog fires for the custom cache, not the (empty) default one.
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, cache_dir = str(custom_cache),
+        interval = 0.05, stall_timeout = 0.3,
+    )
+    try:
+        assert _wait(lambda: len(calls) >= 1, timeout = 3.0), "watchdog ignored the custom cache_dir"
+    finally:
+        stop.set()
+
+    # The HTTP-prep purge removes the unsafe partial from the custom cache
+    # (call the real impl; the autouse fixture stubs the module attribute).
+    _REAL_DEFAULT_PREPARE("model", REPO, cache_dir = str(custom_cache))
+    assert not partial.exists()
+
+
 # --------------------------------------------------------------------------- #
 # Transport policy: cached short-circuit, cancel, error propagation, the single
 # Xet->HTTP fallback, the injected prepare seam, and the UNSLOTH_DISABLE_XET knob.
@@ -286,7 +325,7 @@ def test_immediate_success_uses_xet_only(monkeypatch):
 
 def test_stall_then_http_fallback_succeeds(monkeypatch):
     prepared = []
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda repo_type, repo_id: prepared.append((repo_type, repo_id)))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda repo_type, repo_id, cache_dir = None: prepared.append((repo_type, repo_id)))
     fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
 
     out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
@@ -372,7 +411,7 @@ def test_snapshot_fast_path_no_child(monkeypatch):
 
 def test_snapshot_stall_then_http(monkeypatch):
     prepared = []
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda rt, rid: prepared.append((rt, rid)))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda rt, rid, cache_dir = None: prepared.append((rt, rid)))
     fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/snap-dir")])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/snap-dir"

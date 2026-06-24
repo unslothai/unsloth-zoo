@@ -54,17 +54,22 @@ def _safe_is_dir(path: Path) -> bool:
         return False
 
 
-def hf_cache_root(*, create: bool = False) -> Optional[Path]:
-    """The active hub cache root (``HF_HUB_CACHE``), or None if unavailable.
+def hf_cache_root(*, create: bool = False, cache_dir: "Optional[str | Path]" = None) -> Optional[Path]:
+    """The hub cache root to scan, or None if unavailable.
 
-    Read lazily so any cache redirect applied at import time (see
+    When *cache_dir* is given (a caller-supplied ``snapshot_download`` cache), it
+    is used verbatim; otherwise the active ``HF_HUB_CACHE`` is read lazily so any
+    redirect applied at import time (see
     ``unsloth_zoo.hf_cache.redirect_hf_cache_if_readonly``) is honored.
     """
-    try:
-        from huggingface_hub import constants as hf_constants
-    except ImportError:
-        return None
-    root = Path(hf_constants.HF_HUB_CACHE)
+    if cache_dir is not None:
+        root = Path(cache_dir)
+    else:
+        try:
+            from huggingface_hub import constants as hf_constants
+        except ImportError:
+            return None
+        root = Path(hf_constants.HF_HUB_CACHE)
     if create:
         try:
             root.mkdir(parents = True, exist_ok = True)
@@ -165,9 +170,11 @@ def _repo_dir_has_broken_snapshot_symlinks(repo_dir: Path) -> bool:
     return False
 
 
-def iter_active_repo_cache_dirs(repo_type: str, repo_id: str) -> Iterator[Path]:
-    """Yield the repo's cache dir(s) under the single active ``HF_HUB_CACHE`` root."""
-    root = hf_cache_root()
+def iter_active_repo_cache_dirs(
+    repo_type: str, repo_id: str, *, cache_dir: "Optional[str | Path]" = None
+) -> Iterator[Path]:
+    """Yield the repo's cache dir(s) under *cache_dir* (or the active ``HF_HUB_CACHE``)."""
+    root = hf_cache_root(cache_dir = cache_dir)
     if root is None:
         return
     target = target_dir_name(repo_type, repo_id)
@@ -186,8 +193,10 @@ def repo_cache_dir_has_incomplete_blobs(repo_dir: Path) -> bool:
     )
 
 
-def has_active_incomplete_blobs(repo_type: str, repo_id: str) -> bool:
-    for entry in iter_active_repo_cache_dirs(repo_type, repo_id):
+def has_active_incomplete_blobs(
+    repo_type: str, repo_id: str, *, cache_dir: "Optional[str | Path]" = None
+) -> bool:
+    for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
         if repo_cache_dir_has_incomplete_blobs(entry):
             return True
     return False
