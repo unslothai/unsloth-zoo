@@ -27,11 +27,17 @@ from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
+# Import each independently: convert_moe_packed_tensors_cpu is injected at runtime by Unsloth's
+# mxfp4 patch and is absent from stock transformers, so a single combined import would fail and
+# null BOTH names, wrongly tripping the `convert_moe_packed_tensors is None` guard below even
+# though the base function exists in transformers.
 try:
-    from transformers.integrations.mxfp4 import convert_moe_packed_tensors, convert_moe_packed_tensors_cpu
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 except (ImportError, ModuleNotFoundError):
-    # Absent unless mxfp4 is in use
-    convert_moe_packed_tensors     = None
+    convert_moe_packed_tensors = None
+try:
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
+except (ImportError, ModuleNotFoundError):
     convert_moe_packed_tensors_cpu = None
 pass
 
