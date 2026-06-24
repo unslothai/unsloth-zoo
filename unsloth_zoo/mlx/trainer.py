@@ -2384,7 +2384,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             model_name=None, model_type=None,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
-                            num_epochs=None):
+                            num_epochs=None, return_dataset=False):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -2556,7 +2556,22 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         all_tensors.extend([batch_arr, lengths_arr, labels_arr])
     mx.eval(all_tensors)
 
+    if return_dataset:
+        return batches, _create_response_masked_dataset(all_items)
     return batches
+
+
+def _create_response_masked_dataset(items):
+    """Build a Dataset-like public view from tokenized response-masked rows."""
+    rows = [
+        {"input_ids": list(input_ids), "labels": list(labels)}
+        for input_ids, labels in items
+    ]
+    try:
+        from datasets import Dataset
+    except ImportError:
+        return rows
+    return Dataset.from_list(rows)
 
 
 def _check_all_masked(batches, max_check=100):
@@ -2729,7 +2744,7 @@ def train_on_responses_only(
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
-        batches = _create_labeled_batches(
+        batches, response_masked_dataset = _create_labeled_batches(
             dataset=trainer.train_dataset,
             tokenizer=_tokenizer,
             mask_fn=mask_fn,
@@ -2750,7 +2765,9 @@ def train_on_responses_only(
             dataset_order=getattr(args, "dataset_order", "default"),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
+            return_dataset=True,
         )
+        trainer.train_dataset = response_masked_dataset
 
         # Safety check: detect all-masked labels early
         _check_all_masked(batches)
@@ -2763,7 +2780,7 @@ def train_on_responses_only(
         if trainer.eval_dataset is not None:
             def _create_labeled_eval_batches(eval_dataset):
                 """Build response-masked eval batches for one dataset split."""
-                return _create_labeled_batches(
+                batches, response_masked_dataset = _create_labeled_batches(
                     dataset=eval_dataset,
                     tokenizer=_tokenizer,
                     mask_fn=mask_fn,
@@ -2782,15 +2799,20 @@ def train_on_responses_only(
                     append_eos=bool(getattr(args, "append_eos", True)),
                     dataset_order=getattr(args, "dataset_order", "default"),
                     preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                    return_dataset=True,
                 )
+                return batches, response_masked_dataset
 
             if isinstance(trainer.eval_dataset, dict):
-                eval_batches = {
-                    key: _create_labeled_eval_batches(value)
-                    for key, value in trainer.eval_dataset.items()
-                }
+                eval_batches = {}
+                for key, value in trainer.eval_dataset.items():
+                    split_batches, split_dataset = _create_labeled_eval_batches(value)
+                    eval_batches[key] = split_batches
+                    trainer.eval_dataset[key] = split_dataset
             else:
-                eval_batches = _create_labeled_eval_batches(trainer.eval_dataset)
+                eval_batches, trainer.eval_dataset = _create_labeled_eval_batches(
+                    trainer.eval_dataset
+                )
             trainer._eval_batches_labeled = eval_batches
 
         print(f"Unsloth: train_on_responses_only enabled "
