@@ -3260,6 +3260,136 @@ def _mlx_prompt_to_ids(prompt):
     )
 
 
+def _mlx_put_streamer_tokens(streamer, token_ids):
+    """Send token ids to a HF TextStreamer-compatible object."""
+    if streamer is None:
+        return
+    import mlx.core as mx
+    streamer.put(mx.array(token_ids))
+
+
+def _mlx_token_to_int(token):
+    """Convert an MLX scalar / Python scalar token into a Python int."""
+    if token is None:
+        return None
+    if hasattr(token, "item"):
+        token = token.item()
+    return int(token)
+
+
+def _mlx_generate_vlm(self, *args, **kwargs):
+    """HF-style VLM generate() shim backed by mlx-vlm stream_generate."""
+    import mlx.core as mx
+    from mlx_vlm import stream_generate
+    from .utils import _to_mx_vlm_batch
+
+    processor = getattr(self, "_tokenizer", None)
+    if processor is None:
+        raise ValueError("Unsloth MLX: VLM generate() requires model._tokenizer.")
+
+    inputs = {}
+    if args:
+        if len(args) > 1:
+            raise TypeError(
+                "Unsloth MLX: VLM generate() accepts at most one positional "
+                "input argument."
+            )
+        positional = args[0]
+        if isinstance(positional, dict):
+            inputs.update(positional)
+        elif "input_ids" not in kwargs:
+            inputs["input_ids"] = positional
+        else:
+            raise TypeError(
+                "Unsloth MLX: pass input_ids either positionally or by keyword, "
+                "not both."
+            )
+    inputs.update(kwargs)
+
+    streamer = inputs.pop("streamer", None)
+    max_tokens = inputs.pop("max_tokens", None)
+    max_new_tokens = inputs.pop("max_new_tokens", None)
+    max_length = inputs.pop("max_length", None)
+
+    # HF generation flags commonly present in notebooks but not consumed by
+    # mlx-vlm's generation loop.
+    do_sample = inputs.pop("do_sample", None)
+    inputs.pop("use_cache", None)
+    inputs.pop("return_dict_in_generate", None)
+    inputs.pop("output_scores", None)
+    inputs.pop("output_attentions", None)
+    inputs.pop("output_hidden_states", None)
+    inputs.pop("pad_token_id", None)
+
+    eos_token_id = inputs.pop("eos_token_id", None)
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if hasattr(tokenizer, "stopping_criteria"):
+        eos = eos_token_id
+        if eos is None:
+            eos = getattr(getattr(self, "config", None), "eos_token_id", None)
+        tokenizer.stopping_criteria.reset(eos)
+
+    batch = _to_mx_vlm_batch(inputs)
+    batch = {
+        key: value for key, value in batch.items()
+        if key != "labels" and not key.startswith("_unsloth_")
+    }
+    input_ids = batch.get("input_ids")
+    if input_ids is None:
+        raise ValueError("Unsloth MLX: VLM generate() requires input_ids.")
+    if len(input_ids.shape) != 2 or input_ids.shape[0] != 1:
+        raise ValueError("Unsloth MLX: VLM generate() only supports batch size 1.")
+
+    if "mask" not in batch and "attention_mask" in batch:
+        batch["mask"] = batch.pop("attention_mask")
+    else:
+        batch.pop("attention_mask", None)
+
+    prompt_ids = [int(token) for token in input_ids.flatten().tolist()]
+    if max_tokens is None:
+        if max_new_tokens is not None:
+            max_tokens = int(max_new_tokens)
+        elif max_length is not None:
+            max_tokens = max(0, int(max_length) - len(prompt_ids))
+        else:
+            max_tokens = 256
+
+    if do_sample is False and "temperature" not in batch and "temp" not in batch:
+        batch["temperature"] = 0.0
+    if "temp" in batch and "temperature" not in batch:
+        batch["temperature"] = batch.pop("temp")
+    if batch.get("temperature", None) is None:
+        batch.pop("temperature", None)
+
+    _mlx_put_streamer_tokens(streamer, input_ids)
+
+    generated_ids = []
+    last_generation_tokens = None
+    for response in stream_generate(
+        self,
+        processor,
+        "",
+        max_tokens=max_tokens,
+        **batch,
+    ):
+        token_id = _mlx_token_to_int(getattr(response, "token", None))
+        if token_id is None:
+            continue
+        generation_tokens = getattr(response, "generation_tokens", None)
+        if (
+            generation_tokens is not None
+            and generation_tokens == last_generation_tokens
+        ):
+            continue
+        last_generation_tokens = generation_tokens
+        generated_ids.append(token_id)
+        _mlx_put_streamer_tokens(streamer, [token_id])
+
+    if streamer is not None:
+        streamer.end()
+    return mx.array([prompt_ids + generated_ids])
+
+
 def _mlx_generate(self, *args, **kwargs):
     """HF-style text generate() shim backed by mlx-lm stream_generate."""
     import mlx.core as mx
@@ -3267,11 +3397,7 @@ def _mlx_generate(self, *args, **kwargs):
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
     if getattr(self, "_is_vlm_model", False):
-        raise NotImplementedError(
-            "Unsloth MLX: HF-style model.generate() is currently implemented "
-            "for text models only. Use the VLM notebook inference cell for "
-            "multimodal generation."
-        )
+        return _mlx_generate_vlm(self, *args, **kwargs)
 
     tokenizer = getattr(self, "_tokenizer", None)
     if tokenizer is None:
@@ -3339,9 +3465,8 @@ def _mlx_generate(self, *args, **kwargs):
         ),
     )
 
-    if streamer is not None:
-        # HF TextStreamer(skip_prompt=True) expects one prompt callback first.
-        streamer.put(mx.array([prompt_ids]))
+    # HF TextStreamer(skip_prompt=True) expects one prompt callback first.
+    _mlx_put_streamer_tokens(streamer, [prompt_ids])
 
     generated_ids = []
     for response in stream_generate(
@@ -3355,13 +3480,12 @@ def _mlx_generate(self, *args, **kwargs):
     ):
         token = getattr(response, "token", None)
         finish_reason = getattr(response, "finish_reason", None)
-        if token is None:
+        token_id = _mlx_token_to_int(token)
+        if token_id is None:
             continue
-        token_id = int(token.item() if hasattr(token, "item") else token)
         if finish_reason is None or finish_reason == "length":
             generated_ids.append(token_id)
-            if streamer is not None:
-                streamer.put(mx.array([token_id]))
+            _mlx_put_streamer_tokens(streamer, [token_id])
 
     if streamer is not None:
         streamer.end()
