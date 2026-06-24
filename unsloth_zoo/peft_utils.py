@@ -173,12 +173,34 @@ def get_peft_regex(
         "gemma3n" in _model_type or "gemma3n" in _architectures
     )
 
+    def _linear_aware_branches(cores):
+        # For each "core" (a regex that, after a leading ".*?", should fullmatch a
+        # real Linear's dotted module name), emit a branch matching ONLY the actual
+        # nn.Linear -- the bare module and/or the ".linear" child of a
+        # Gemma4ClippableLinear wrapper, whichever genuinely exists in this model.
+        # On Gemma 4 a projection appears in named_modules() as BOTH the wrapper
+        # ("...q_proj", not an nn.Linear) and its inner Linear ("...q_proj.linear").
+        # A blanket optional "(?:\.linear)?" would fullmatch the wrapper too, so PEFT
+        # would try to adapt the unsupported wrapper / double-process the inner
+        # Linear. Deciding per-core against linear_modules (which holds the real
+        # Linear names, including the appended ".linear" children) keeps Gemma 3N's
+        # bare leaves and Gemma 4's ".linear" children both correct.
+        out = []
+        for core in cores:
+            if any(re.fullmatch(r".*?" + core + r"\.linear", name, flags = re.DOTALL) for name in linear_modules):
+                out.append(r"(?:.*?" + core + r"\.linear)")
+            if any(re.fullmatch(r".*?" + core, name, flags = re.DOTALL) for name in linear_modules):
+                out.append(r"(?:.*?" + core + r")")
+        return out
+
     candidate_branches = []
     if finetune_audio_layers and _is_gemma_mm:
         # conv / *norm leaves are not nn.Linear so they are never candidates. The
         # conformer attention leaves are gated by finetune_attention_modules; the
         # feed-forward / lightweight-conv / subsample / output projections (and the
-        # audio projector) are gated by finetune_mlp_modules.
+        # audio projector) are gated by finetune_mlp_modules. A "." is required
+        # before each leaf (the "(?:.*\.)?" segment) so e.g. target_modules=["k_proj"]
+        # does not also match "...relative_k_proj".
         audio_leaves = []
         if finetune_attention_modules:
             audio_leaves += ["q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj", "post"]
@@ -186,24 +208,21 @@ def get_peft_regex(
             audio_leaves += ["ffw_layer_1", "ffw_layer_2", "linear_start", "linear_end",
                              "input_proj_linear", "output_proj"]
         audio_leaves = _scoped(audio_leaves)
-        if audio_leaves:
-            audio_leaf_re = r"(?:" + "|".join(re.escape(x) for x in audio_leaves) + r")"
-            # Require a "." before the leaf so the leaf is a complete path segment --
-            # e.g. target_modules=["k_proj"] must not also match "...relative_k_proj".
-            candidate_branches.append(r"(?:.*?\baudio_tower\.(?:.*\.)?" + audio_leaf_re + r"(?:\.linear)?)")
-        # The audio projector is a feed-forward projection -> gate under the mlp flag
-        # so attention-only runs do not pick it up.
+        audio_cores = [r"\baudio_tower\.(?:.*\.)?" + re.escape(x) for x in audio_leaves]
+        # The audio projector is a feed-forward projection -> gate under the mlp flag.
         if finetune_mlp_modules and _scoped(["embedding_projection"]):
-            candidate_branches.append(r"(?:.*?\bembed_audio\.embedding_projection(?:\.linear)?)")
+            audio_cores.append(r"\bembed_audio\.embedding_projection")
+        candidate_branches += _linear_aware_branches(audio_cores)
     if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
         # The Gemma vision embedders are flat projection / dense Linears -> like the
         # audio projector, gate them under the mlp flag (attention-only stays clean).
-        vision_embed = []
-        if _scoped(["embedding_projection"]): vision_embed.append(r"embed_vision\.embedding_projection")
-        if _scoped(["patch_dense"]):          vision_embed.append(r"vision_embedder\.patch_dense")
-        if _scoped(["input_proj"]):           vision_embed.append(r"vision_tower\.patch_embedder\.input_proj")
-        if vision_embed:
-            candidate_branches.append(r"(?:.*?\b(?:" + "|".join(vision_embed) + r")(?:\.linear)?)")
+        vision_cores = []
+        if _scoped(["embedding_projection"]): vision_cores.append(r"\bembed_vision\.embedding_projection")
+        if _scoped(["patch_dense"]):          vision_cores.append(r"\bvision_embedder\.patch_dense")
+        if _scoped(["input_proj"]):           vision_cores.append(r"\bvision_tower\.patch_embedder\.input_proj")
+        candidate_branches += _linear_aware_branches(vision_cores)
+    # _linear_aware_branches already only emits branches that fullmatch a real Linear;
+    # re-filter for safety / to mirror PEFT's own re.fullmatch matcher exactly.
     extra_branches = [
         branch for branch in candidate_branches
         if any(re.fullmatch(branch, name, flags = re.DOTALL) for name in linear_modules)

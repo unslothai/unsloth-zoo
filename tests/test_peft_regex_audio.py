@@ -346,6 +346,40 @@ def test_audio_respects_explicit_target_modules():
     assert not any(n.endswith("embed_audio.embedding_projection") for n in on)
 
 
+def all_module_names(model):
+    return [n for n, m in model.named_modules()]
+
+
+@pytest.mark.parametrize("builder,name", [(lambda: _gemma4("E2B"), "gemma4_e2b"),
+                                          (lambda: _gemma4("12B"), "gemma4_12b")])
+def test_gemma4_audio_matches_inner_linear_not_wrapper(builder, name):
+    # On Gemma 4 each audio projection is a Gemma4ClippableLinear wrapper: it appears
+    # in named_modules() as BOTH "...q_proj" (the wrapper, NOT an nn.Linear) and
+    # "...q_proj.linear" (the real inner Linear). PEFT runs the regex over EVERY
+    # module, so the regex must match only the inner Linear -- never the wrapper
+    # container, or PEFT tries to adapt the unsupported wrapper / double-processes
+    # the inner Linear.
+    model = builder()
+    r = get_peft_regex(model, finetune_vision_layers=True, finetune_language_layers=True,
+                       finetune_audio_layers=True)
+    lin = set(linear_names(model))
+    # The audio branch (the part this PR adds) must not match any NON-Linear module
+    # under audio_tower / the embedders -- PEFT iterates EVERY module, so a matched
+    # wrapper would be adapted as an unsupported module / double-process its inner
+    # Linear. (vision_tower.encoder wrappers are matched by the pre-existing main
+    # regex + handled by the _create_and_replace monkeypatch; out of scope here.)
+    def _ours(n):
+        return ".audio_tower." in n or "embed_audio" in n or "embed_vision" in n
+    bad = [n for n in all_module_names(model) if _ours(n) and n not in lin and re.fullmatch(r, n)]
+    assert not bad, f"{name}: regex matched non-Linear audio/embedder modules (wrappers?): {bad[:6]}"
+    # The inner ".linear" audio Linears DO attach.
+    inner = [n for n in lin if ".audio_tower." in n and n.endswith(".linear")]
+    assert inner and all(re.fullmatch(r, n) for n in inner), f"{name}: inner audio Linears not matched"
+    # ...and bare audio Linears (subsample/output projections) still attach.
+    bare = [n for n in lin if ".audio_tower." in n and not n.endswith(".linear")]
+    assert bare and all(re.fullmatch(r, n) for n in bare), f"{name}: bare audio Linears not matched"
+
+
 def test_explicit_leaf_matches_full_segment_not_prefix():
     # target_modules=["k_proj"] must match audio_tower ...attn.k_proj but NOT
     # ...attn.relative_k_proj (the ".*?" before the leaf must stop at a "." boundary).
