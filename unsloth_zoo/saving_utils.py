@@ -1642,6 +1642,35 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
     return count
 
 
+def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, rank,
+                                   dim_A, dim_B, alpha, use_transpose):
+    """In-place per-expert LoRA merge for a fused MoE weight: merged[e] += alpha * delta_e, where
+    delta_e = lora_B_e @ lora_A_e (transposed for GPT-OSS-style layouts). lora_B is contiguous-r
+    per expert (see moe_utils.py _canonical_lora_weights_for_grouped_mm), so a plain reshape
+    recovers the per-expert blocks the loop sliced.
+
+    On CUDA this batches every expert into a single bmm (no Python loop, faster for many experts);
+    on CPU it keeps the loop, where the batched matmul is not a win. The batched path computes the
+    same per-expert delta = B_e @ A_e and the same `merged[e] += alpha * delta` as the loop (a
+    plain bmm + add_, NOT a fused baddbmm, so the rounding matches the loop exactly), so the result
+    is bitwise-identical to the loop in fp32/bf16/fp16. The merge callers run this in fp32."""
+    if merged.device.type == "cuda":
+        # (E, dim_B, rank) @ (E, rank, dim_A) -> (E, dim_B, dim_A) = per-expert delta.
+        B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
+        A_exp = lora_A_dev.reshape(num_experts, rank, dim_A).contiguous()
+        delta = torch.bmm(B_exp, A_exp)
+        merged.add_(delta.transpose(1, 2) if use_transpose else delta, alpha=alpha)
+    else:
+        for expert_idx in range(num_experts):
+            start, end = expert_idx * rank, (expert_idx + 1) * rank
+            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
+            merged[expert_idx] = merged[expert_idx].add(
+                delta.T if use_transpose else delta, alpha=alpha
+            )
+    return merged
+pass
+
+
 def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_transposed=None):
     """
     Merge LoRA for fused gate_up_proj 3D tensor.
@@ -1704,16 +1733,10 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
         lora_A_dev = lora_stats.lora_A.to(device, dtype=torch.float32, non_blocking=True)
         lora_B_dev = lora_stats.lora_B.to(device, dtype=torch.float32, non_blocking=True)
 
-        for expert_idx in range(num_experts):
-            start, end = expert_idx * rank, (expert_idx + 1) * rank
-            # lora_B is contiguous-r per expert (see moe_utils.py
-            # _canonical_lora_weights_for_grouped_mm); must match for the saved
-            # checkpoint to reproduce the training-time forward.
-            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
-
-            gate_up_merged[expert_idx] = gate_up_merged[expert_idx].add(
-                delta.T if use_transpose else delta, alpha=lora_stats.alpha
-            )
+        gate_up_merged = _apply_fused_expert_lora_delta(
+            gate_up_merged, lora_A_dev, lora_B_dev, num_experts, rank,
+            dim_A, dim_B, lora_stats.alpha, use_transpose,
+        )
 
         _MOE_MERGE_STATE["applied"] += 1
         return gate_up_merged.to(output_dtype)
@@ -1787,14 +1810,10 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
         lora_A_dev = lora_stats.lora_A.to(device, dtype=torch.float32, non_blocking=True)
         lora_B_dev = lora_stats.lora_B.to(device, dtype=torch.float32, non_blocking=True)
 
-        for expert_idx in range(num_experts):
-            start, end = expert_idx * rank, (expert_idx + 1) * rank
-            # See _merge_moe_fused_gate_up_expert for the slicing rationale.
-            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
-
-            down_merged[expert_idx] = down_merged[expert_idx].add(
-                delta.T if use_transpose else delta, alpha=lora_stats.alpha
-            )
+        down_merged = _apply_fused_expert_lora_delta(
+            down_merged, lora_A_dev, lora_B_dev, num_experts, rank,
+            dim_A, dim_B, lora_stats.alpha, use_transpose,
+        )
 
         _MOE_MERGE_STATE["applied"] += 1
         return down_merged.to(output_dtype)
