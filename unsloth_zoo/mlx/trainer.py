@@ -52,6 +52,23 @@ _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
+
+class MLXTrainOutput(dict):
+    """Dict-compatible train() result with HF Trainer-style attributes."""
+
+    @property
+    def metrics(self):
+        return self
+
+    @property
+    def global_step(self):
+        return self.get("train_steps", 0)
+
+    @property
+    def training_loss(self):
+        return self.get("train_loss", 0.0)
+
+
 from .utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
@@ -2034,7 +2051,7 @@ class MLXTrainer:
         else:
             print(f"Unsloth: Saved final adapters to {args.output_dir}")
 
-        return {
+        return MLXTrainOutput({
             "train_loss": avg_loss,
             "train_runtime": total_time,
             "train_steps": total_steps,
@@ -2069,7 +2086,7 @@ class MLXTrainer:
             "base_quantized_source": getattr(
                 self.model, "_unsloth_quantized_source", None,
             ),
-        }
+        })
 
     def _resolve_vlm_processor(self):
         """Resolve the processor used for VLM collation without mutating model."""
