@@ -3171,6 +3171,39 @@ def _mlx_supported_kwargs(kwargs, supported):
     return {key: kwargs[key] for key in supported if key in kwargs}
 
 
+def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
+    """Upload MLX LoRA adapters through the HF-style push_to_hub API."""
+    import tempfile
+    tokenizer = kwargs.pop("tokenizer", None) or getattr(self, "_tokenizer", None)
+    save_directory = kwargs.pop("save_directory", None)
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        (
+            "token", "private", "tags", "commit_message",
+            "commit_description", "create_pr", "revision",
+        ),
+    )
+    if save_directory is not None:
+        _mlx_save_pretrained_merged(
+            self,
+            save_directory,
+            tokenizer=tokenizer,
+            push_to_hub=True,
+            repo_id=repo_id,
+            **kwargs,
+        )
+        return
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _mlx_save_pretrained_merged(
+            self,
+            tmp_dir,
+            tokenizer=tokenizer,
+            push_to_hub=True,
+            repo_id=repo_id,
+            **kwargs,
+        )
+
+
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
     from .utils import save_pretrained_gguf
@@ -3203,11 +3236,164 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None):
     save_lora_adapters(self, path, adapter_config=adapter_config)
 
 
+def _mlx_prompt_to_ids(prompt):
+    """Normalize HF/torch/MLX tokenizer outputs into one token-id list."""
+    if prompt is None:
+        raise ValueError("Unsloth MLX: generate() requires input_ids or a prompt.")
+    if isinstance(prompt, dict):
+        prompt = prompt.get("input_ids")
+    if isinstance(prompt, str):
+        return prompt
+    if hasattr(prompt, "tolist"):
+        prompt = prompt.tolist()
+    if isinstance(prompt, tuple):
+        prompt = list(prompt)
+    if isinstance(prompt, list):
+        if len(prompt) == 1 and isinstance(prompt[0], (list, tuple)):
+            prompt = list(prompt[0])
+        elif prompt and isinstance(prompt[0], (list, tuple)):
+            raise ValueError("Unsloth MLX: generate() only supports batch size 1.")
+        return [int(token) for token in prompt]
+    raise TypeError(
+        "Unsloth MLX: generate() expected input_ids as a string, list, "
+        "or tensor-like object with .tolist()."
+    )
+
+
+def _mlx_generate(self, *args, **kwargs):
+    """HF-style text generate() shim backed by mlx-lm stream_generate."""
+    import mlx.core as mx
+    from mlx_lm import stream_generate
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+    if getattr(self, "_is_vlm_model", False):
+        raise NotImplementedError(
+            "Unsloth MLX: HF-style model.generate() is currently implemented "
+            "for text models only. Use the VLM notebook inference cell for "
+            "multimodal generation."
+        )
+
+    tokenizer = getattr(self, "_tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("Unsloth MLX: generate() requires model._tokenizer.")
+
+    prompt = kwargs.pop("input_ids", None)
+    if args:
+        if prompt is None:
+            prompt = args[0]
+        else:
+            raise TypeError(
+                "Unsloth MLX: pass prompt input either positionally or as "
+                "input_ids, not both."
+            )
+    prompt_ids = _mlx_prompt_to_ids(prompt)
+    if isinstance(prompt_ids, str):
+        add_special_tokens = (
+            getattr(tokenizer, "bos_token", None) is None
+            or not prompt_ids.startswith(getattr(tokenizer, "bos_token", ""))
+        )
+        try:
+            prompt_ids = tokenizer.encode(
+                prompt_ids,
+                add_special_tokens=add_special_tokens,
+            )
+        except TypeError:
+            prompt_ids = tokenizer.encode(prompt_ids)
+
+    streamer = kwargs.pop("streamer", None)
+    max_tokens = kwargs.pop("max_tokens", None)
+    max_new_tokens = kwargs.pop("max_new_tokens", None)
+    max_length = kwargs.pop("max_length", None)
+    if max_tokens is None:
+        if max_new_tokens is not None:
+            max_tokens = int(max_new_tokens)
+        elif max_length is not None:
+            max_tokens = max(0, int(max_length) - len(prompt_ids))
+        else:
+            max_tokens = 256
+
+    temp = kwargs.pop("temperature", kwargs.pop("temp", 0.0))
+    if temp is None:
+        temp = 0.0
+    sampler = kwargs.pop("sampler", None) or make_sampler(
+        temp=float(temp),
+        top_p=float(kwargs.pop("top_p", 0.0) or 0.0),
+        min_p=float(kwargs.pop("min_p", 0.0) or 0.0),
+        top_k=int(kwargs.pop("top_k", 0) or 0),
+    )
+    logits_processors = kwargs.pop("logits_processors", None)
+    if logits_processors is None:
+        logits_processors = make_logits_processors(
+            logit_bias=kwargs.pop("logit_bias", None),
+            repetition_penalty=kwargs.pop("repetition_penalty", None),
+            presence_penalty=kwargs.pop("presence_penalty", None),
+            frequency_penalty=kwargs.pop("frequency_penalty", None),
+        )
+
+    stream_kwargs = _mlx_supported_kwargs(
+        kwargs,
+        (
+            "max_kv_size", "prompt_cache", "prefill_step_size",
+            "kv_bits", "kv_group_size", "quantized_kv_start",
+            "prompt_progress_callback", "input_embeddings",
+        ),
+    )
+
+    if streamer is not None:
+        # HF TextStreamer(skip_prompt=True) expects one prompt callback first.
+        streamer.put(mx.array([prompt_ids]))
+
+    generated_ids = []
+    for response in stream_generate(
+        self,
+        tokenizer,
+        prompt_ids,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        **stream_kwargs,
+    ):
+        token = getattr(response, "token", None)
+        finish_reason = getattr(response, "finish_reason", None)
+        if token is None:
+            continue
+        token_id = int(token.item() if hasattr(token, "item") else token)
+        if finish_reason is None or finish_reason == "length":
+            generated_ids.append(token_id)
+            if streamer is not None:
+                streamer.put(mx.array([token_id]))
+
+    if streamer is not None:
+        streamer.end()
+    return mx.array([prompt_ids + generated_ids])
+
+
+def _patch_mlx_tokenizer_call(tokenizer):
+    """Make mlx-lm TokenizerWrapper callable like its wrapped HF tokenizer."""
+    if tokenizer is None:
+        return
+    cls = type(tokenizer)
+    if cls.__name__ != "TokenizerWrapper" or "__call__" in cls.__dict__:
+        return
+    if not hasattr(tokenizer, "_tokenizer") or not callable(tokenizer._tokenizer):
+        return
+
+    def tokenizer_wrapper_call(self, *args, **kwargs):
+        return self._tokenizer(*args, **kwargs)
+
+    tokenizer_wrapper_call._unsloth_mlx_call = True
+    cls.__call__ = tokenizer_wrapper_call
+
+
 def _patch_mlx_saving(model, tokenizer):
     """Attach save/push methods to the model, matching unsloth's CUDA pattern."""
+    _patch_mlx_tokenizer_call(tokenizer)
     model._tokenizer = tokenizer
+    model.generate               = types.MethodType(_mlx_generate, model)
+    model.save_pretrained        = types.MethodType(_mlx_save_pretrained_merged, model)
     model.save_pretrained_merged = types.MethodType(_mlx_save_pretrained_merged, model)
     model.save_pretrained_gguf   = types.MethodType(_mlx_save_pretrained_gguf, model)
+    model.push_to_hub            = types.MethodType(_mlx_push_to_hub, model)
     model.push_to_hub_merged     = types.MethodType(_mlx_push_to_hub_merged, model)
     model.push_to_hub_gguf       = types.MethodType(_mlx_push_to_hub_gguf, model)
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
