@@ -2147,13 +2147,40 @@ def _fp8_scale_key_weight_bases(scale_key):
     return ()
 pass
 
-def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames):
-    """Order-independent cleanup run AFTER every FP8 shard is rewritten: drop any companion
-    scale whose weight is no longer FP8 (i.e. was dequantized, possibly in another shard).
-    Per-shard processing only drops same-shard companions, so a weight/scale split across
-    shards would otherwise leave a stale scale regardless of shard processing order. Returns
-    the set of removed keys."""
-    dtype_by_key = {}
+def _collect_fp8_weight_keys(save_directory, filenames):
+    """Keys whose current on-disk dtype is FP8 (header-only read). Capture this BEFORE the
+    FP8 -> 16bit rewrite so the post-rewrite scale cleanup can anchor on the weights that were
+    actually FP8, rather than on a name-suffix heuristic that would also match unrelated
+    `*_scale` buffers."""
+    fp8_keys = set()
+    for filename in filenames:
+        path = os.path.join(save_directory, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as fp:
+                length = int.from_bytes(fp.read(8), "little")
+                header = json.loads(fp.read(length))
+        except Exception:
+            continue
+        for key, meta in header.items():
+            if key != "__metadata__" and isinstance(meta, dict) and meta.get("dtype") in _FP8_HEADER_DTYPES:
+                fp8_keys.add(key)
+    return fp8_keys
+pass
+
+def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrite_fp8_keys):
+    """Order-independent cleanup run AFTER every FP8 shard is rewritten: drop each companion
+    scale of a weight that WAS FP8 before the rewrite (prerewrite_fp8_keys), even when the
+    weight and its scale were split across shards. Per-shard processing only drops same-shard
+    companions, so a cross-shard scale would otherwise survive regardless of processing order.
+
+    Anchored on the pre-rewrite FP8 weight set, NOT on a post-rewrite `*_scale` name match:
+    once every weight is 16bit, a name heuristic ("base weight now exists and is non-FP8")
+    would also delete an unrelated `*_scale` buffer (router / logit scales, etc.) whose base
+    weight happens to exist. Returns the set of removed keys."""
+    if not prerewrite_fp8_keys:
+        return set()
     headers = {}
     for filename in filenames:
         path = os.path.join(save_directory, filename)
@@ -2166,9 +2193,6 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames):
         except Exception:
             continue
         headers[filename] = header
-        for key, meta in header.items():
-            if key != "__metadata__" and isinstance(meta, dict):
-                dtype_by_key[key] = meta.get("dtype")
 
     removed = set()
     for filename, header in headers.items():
@@ -2176,11 +2200,8 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames):
         for key in header:
             if key == "__metadata__":
                 continue
-            for wk in _fp8_scale_key_weight_bases(key):
-                dt = dtype_by_key.get(wk)
-                if dt is not None and dt not in _FP8_HEADER_DTYPES:
-                    drop.add(key)
-                    break
+            if any(wk in prerewrite_fp8_keys for wk in _fp8_scale_key_weight_bases(key)):
+                drop.add(key)
         if not drop:
             continue
         path = os.path.join(save_directory, filename)
@@ -3128,13 +3149,14 @@ def merge_and_overwrite_lora(
             and any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights)):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("FP8 MoE-expert LoRA detected: dequantizing to 16bit, then merging experts.")
+        _prerewrite_fp8_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list)
         for _fn in final_safetensors_list:
             _merge_and_overwrite_lora_fp8(
                 save_directory, _fn, defaultdict(lambda: None), output_dtype, _merge_model_class_name,
                 tie_word_embeddings = _merge_tie_word_embeddings,
                 weight_block_size = _merge_weight_block_size,
             )
-        _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list)
+        _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list, _prerewrite_fp8_keys)
         # Model is now 16bit on disk; merge expert LoRA via the standard (non-quantized) path.
         base_model_is_quantized = False
         quant_type = None
@@ -3145,6 +3167,9 @@ def merge_and_overwrite_lora(
     # the low-disk upload/remove must wait until every shard is rewritten and the cross-shard
     # scale cleanup has run (otherwise an early shard is removed or indexed with a stale scale).
     _fp8_post_cleanup = base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit"
+    # Capture FP8 weight keys BEFORE the loop rewrites them to 16bit, so the post-rewrite scale
+    # cleanup anchors on weights that were actually FP8 (not a `*_scale` name heuristic).
+    _fp8_prerewrite_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list) if _fp8_post_cleanup else set()
     _defer_low_disk = low_disk_space_usage and push_to_hub and _fp8_post_cleanup
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
@@ -3182,7 +3207,7 @@ def merge_and_overwrite_lora(
 
     # FP8 cross-shard scale cleanup: order-independent pass after every shard is rewritten.
     if _fp8_post_cleanup:
-        for _removed_key in _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list):
+        for _removed_key in _drop_resolved_fp8_scales_after_rewrite(save_directory, final_safetensors_list, _fp8_prerewrite_keys):
             safetensor_keys_seen.discard(_removed_key)
         if regenerate_index:
             for filename in final_safetensors_list:

@@ -31,6 +31,7 @@ from safetensors.torch import load_file, save_file
 from unsloth_zoo.saving_utils import (
     LoraStats,
     _MOE_MERGE_STATE,
+    _collect_fp8_weight_keys,
     _drop_resolved_fp8_scales_after_rewrite,
     _merge_and_overwrite_lora,
     _merge_and_overwrite_lora_fp8,
@@ -453,11 +454,12 @@ def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
     save_file(tensors, path)
 
     # Phase 1: dequantize to 16bit (no LoRA), then drop the now-resolved scales.
+    prerewrite_fp8 = _collect_fp8_weight_keys(str(tmp_path), ["model.safetensors"])
     _merge_and_overwrite_lora_fp8(
         str(tmp_path), "model.safetensors",
         collections.defaultdict(lambda: None), torch.bfloat16, "MixtralForCausalLM",
     )
-    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), ["model.safetensors"])
+    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), ["model.safetensors"], prerewrite_fp8)
     dq = load_file(path)
     assert not any(k.endswith(("weight_scale", "weight_scale_inv")) for k in dq), "scales not dropped"
     assert all(v.dtype == torch.bfloat16 for k, v in dq.items() if k.endswith(".weight")), "not 16bit"

@@ -305,6 +305,7 @@ def _run_cross_shard_merge(tmp_path, weight_in, scale_in, process_order):
     rewrite in the given order, then the orchestrator's order-independent scale cleanup."""
     from unsloth_zoo.saving_utils import (
         _merge_and_overwrite_lora, _drop_resolved_fp8_scales_after_rewrite,
+        _collect_fp8_weight_keys,
     )
     torch.manual_seed(5)
     W_real = torch.randn(64, 128, dtype=torch.float32) * 0.1
@@ -320,13 +321,14 @@ def _run_cross_shard_merge(tmp_path, weight_in, scale_in, process_order):
     for path, tensors in ((s1, contents[s1]), (s2, contents[s2])):
         _write_shard(path, tensors)
 
+    prerewrite_fp8 = _collect_fp8_weight_keys(str(tmp_path), [s1.name, s2.name])
     for fn in process_order:
         _merge_and_overwrite_lora(
             save_directory=str(tmp_path), filename=fn,
             lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.bfloat16,
             model_class_name="Qwen2ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
         )
-    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), [s1.name, s2.name])
+    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), [s1.name, s2.name], prerewrite_fp8)
 
     keys = set()
     merged = None
@@ -355,6 +357,43 @@ def test_fp8_dense_scale_in_sibling_shard_scale_first(tmp_path):
     s1 = tmp_path / "model-00001-of-00002.safetensors"
     s2 = tmp_path / "model-00002-of-00002.safetensors"
     _run_cross_shard_merge(tmp_path, weight_in=s2, scale_in=s1, process_order=(s1.name, s2.name))
+
+
+def test_fp8_post_pass_preserves_unrelated_scale(tmp_path):
+    """The post-rewrite cleanup must drop FP8 companion scales but NOT an unrelated `*_scale`
+    buffer whose base weight exists and was never FP8 (regression: anchoring on a post-rewrite
+    name heuristic deleted such buffers, since every weight is 16bit by then)."""
+    from unsloth_zoo.saving_utils import (
+        _merge_and_overwrite_lora_fp8, _drop_resolved_fp8_scales_after_rewrite,
+        _collect_fp8_weight_keys,
+    )
+    torch.manual_seed(7)
+    W_real = torch.randn(64, 128, dtype=torch.float32) * 0.1
+    W_fp8, scale = _fp8_quant_channel(W_real)
+    shard = tmp_path / "model.safetensors"
+    _write_shard(shard, {
+        "model.layers.0.mlp.down_proj.weight": W_fp8,                                    # FP8 weight
+        "model.layers.0.mlp.down_proj.weight_scale": scale,                              # its companion
+        "model.layers.0.mlp.router.weight": torch.randn(4, 128, dtype=torch.bfloat16),   # never FP8
+        "model.layers.0.mlp.router_scale": torch.randn(4, dtype=torch.bfloat16),         # unrelated buffer
+    })
+    prerewrite_fp8 = _collect_fp8_weight_keys(str(tmp_path), [shard.name])
+    assert "model.layers.0.mlp.down_proj.weight" in prerewrite_fp8
+    assert "model.layers.0.mlp.router.weight" not in prerewrite_fp8
+
+    _merge_and_overwrite_lora_fp8(
+        str(tmp_path), "model.safetensors",
+        defaultdict(lambda: None), torch.bfloat16, "Qwen2ForCausalLM",
+    )
+    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), [shard.name], prerewrite_fp8)
+
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+        merged = f.get_tensor("model.layers.0.mlp.down_proj.weight")
+    assert merged.dtype == torch.bfloat16
+    assert "model.layers.0.mlp.down_proj.weight_scale" not in keys   # FP8 companion dropped
+    assert "model.layers.0.mlp.router.weight" in keys                # unrelated weight kept
+    assert "model.layers.0.mlp.router_scale" in keys                 # unrelated scale NOT dropped
 
 
 def test_fp8_fused_expert_3d_dequantizes(tmp_path):
