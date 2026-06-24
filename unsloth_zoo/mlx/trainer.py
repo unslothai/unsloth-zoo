@@ -47,6 +47,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx_lm.tuner.lora import LoRALinear
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
@@ -58,8 +59,9 @@ from .utils import (
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
     create_batches,
-    create_orpo_batches,
+    create_preference_batches,
     make_orpo_loss_fn,
+    make_dpo_loss_fn,
     create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
@@ -506,6 +508,8 @@ class MLXTrainingConfig:
     eval_steps: int = 0  # 0 = disabled
     loss_type: str = "sft"  # "sft" or "orpo"
     orpo_beta: float = 0.1  # ORPO odds-ratio weight (TRL default)
+    dpo_beta: float = 0.1  # DPO beta (TRL default)
+    reference_free: bool = False  # DPO: drop the reference term if True
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -1234,6 +1238,15 @@ class MLXTrainer:
                 _ob = getattr(args, "orpo_beta", 0.1)
                 loss_fn = make_orpo_loss_fn(beta=_ob)
                 print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
+            elif getattr(args, "loss_type", "sft") == "dpo":
+                _db = getattr(args, "dpo_beta", 0.1)
+                _rf = bool(getattr(args, "reference_free", False))
+                _lora_mods = [mod for _, mod in tree_flatten(
+                    model, is_leaf=lambda x: isinstance(x, LoRALinear))
+                    if isinstance(mod, LoRALinear)]
+                loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
+                print("Unsloth: Using DPO loss (beta=" + str(_db) +
+                      (", reference_free" if _rf else "") + ").")
             elif use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
@@ -1626,9 +1639,9 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
-        if (getattr(args, "loss_type", "sft") == "orpo"
+        if (getattr(args, "loss_type", "sft") in ("orpo", "dpo")
                 and args.eval_steps > 0 and self.eval_dataset is not None):
-            print("Unsloth: eval is not yet supported for ORPO; skipping eval.")
+            print(f"Unsloth: eval is not yet supported for {args.loss_type}; skipping eval.")
         elif args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
@@ -2059,12 +2072,12 @@ class MLXTrainer:
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
 
-        if getattr(args, "loss_type", "sft") == "orpo":
+        if getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
             if is_vlm:
                 raise ValueError(
-                    "ORPO is not yet supported for VLM models on MLX."
+                    f"{args.loss_type.upper()} is not yet supported for VLM models on MLX."
                 )
-            batches = create_orpo_batches(
+            batches = create_preference_batches(
                 dataset=self.train_dataset,
                 tokenizer=self.tokenizer,
                 batch_size=args.per_device_train_batch_size,

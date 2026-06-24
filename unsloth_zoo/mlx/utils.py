@@ -519,7 +519,7 @@ def make_orpo_loss_fn(beta=0.1):
     -> (loss, ntoks), so it drops into the trainer's text step path unchanged.
 
     Expects ``batch`` shape (2B, L) where rows [0:B] are chosen and rows [B:2B]
-    are rejected, paired by index (produced by ``create_orpo_batches``).
+    are rejected, paired by index (produced by ``create_preference_batches``).
     ``lengths`` is (2B, 2) with per-row [response_start, seq_end); only response
     tokens are scored (the prompt is masked).
     """
@@ -548,11 +548,67 @@ def make_orpo_loss_fn(beta=0.1):
     return loss_fn
 
 
-def create_orpo_batches(dataset, tokenizer, batch_size, max_seq_length,
+def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
+    """Create a DPO (Direct Preference Optimization) loss function.
+
+    Operates on a concatenated [chosen; rejected] batch (same layout as
+    make_orpo_loss_fn / create_preference_batches): rows [0:B] chosen,
+    [B:2B] rejected. Signature matches the other loss fns:
+    (model, batch, lengths, labels=None) -> (loss, ntoks).
+
+    DPO compares the policy's per-response log-probs against a frozen
+    reference. For LoRA models the reference is the base model: obtained by
+    temporarily zeroing the LoRA scales (adapters off), running the reference
+    forward under stop_gradient, then restoring the scales in a finally block.
+    Mirrors TRL's disable-adapter approach (no second model copy). With
+    reference_free=True the reference term is dropped, matching TRL.
+
+    ``lora_mods`` is the list of LoRALinear modules to toggle; collected once
+    by the trainer at setup.
+    """
+    _mods = list(lora_mods) if lora_mods is not None else []
+
+    def _row_logp_and_mask(model, batch, lengths):
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        logits = model(inputs)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = mx.logical_and(
+            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
+        ).astype(mx.float32)
+        logp_tok = -nn.losses.cross_entropy(logits, targets) * mask
+        return logp_tok.sum(axis=1), mask.sum()
+
+    def loss_fn(model, batch, lengths, labels=None):
+        B = batch.shape[0] // 2
+        pol, ntoks = _row_logp_and_mask(model, batch, lengths)
+        pol_c, pol_r = pol[:B], pol[B:]
+
+        if reference_free or not _mods:
+            ref_c = mx.zeros(pol_c.shape)
+            ref_r = mx.zeros(pol_r.shape)
+        else:
+            saved = [md.scale for md in _mods]
+            try:
+                for md in _mods:
+                    md.scale = 0.0
+                ref, _ = _row_logp_and_mask(model, batch, lengths)
+                ref = mx.stop_gradient(ref)
+            finally:
+                for md, s in zip(_mods, saved):
+                    md.scale = s
+            ref_c, ref_r = ref[:B], ref[B:]
+
+        logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
+        loss = -mx.mean(nn.log_sigmoid(logits))
+        return loss, ntoks
+    return loss_fn
+
+def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
                         num_batches=None):
-    """Build concatenated [chosen; rejected] preference batches for ORPO.
+    """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
     Pairs are length-sorted (by max of the two), grouped into batches of
