@@ -3413,6 +3413,26 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
             )
 
 
+def _remap_unsloth_bnb_hub_id_for_mlx(model_name, revision):
+    """Map an unsloth/*-bnb-4bit Hub ID to its full-precision base repo.
+
+    mlx-lm cannot read bitsandbytes-packed weights, so load the base repo and
+    let MLX quantize to 4-bit. Returns (name, revision, remapped_from); the
+    bnb-pinned revision is dropped since it does not apply to the base repo.
+    Local paths and third-party repos keep the exact name given.
+    """
+    if (
+        not isinstance(model_name, str)
+        or not model_name.startswith("unsloth/")
+        or os.path.exists(model_name)
+    ):
+        return model_name, revision, None
+    for _bnb_suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
+        if model_name.endswith(_bnb_suffix):
+            return model_name[: -len(_bnb_suffix)], None, model_name
+    return model_name, revision, None
+
+
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
 
@@ -3471,23 +3491,15 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
-        # mlx-lm cannot read bitsandbytes-packed weights; remap unsloth/*-bnb-4bit
-        # Hub IDs to the full-precision base repo and let MLX quantize to 4-bit.
-        # Only unsloth/* Hub IDs (whose base repo is known to exist) are remapped,
-        # so local paths and third-party repos keep the exact name given.
-        if isinstance(model_name, str) and model_name.startswith("unsloth/"):
-            for _bnb_suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
-                if model_name.endswith(_bnb_suffix):
-                    _bnb_base = model_name[: -len(_bnb_suffix)]
-                    # A caller revision pins the bnb repo, not the base; drop it.
-                    revision = None
-                    print(
-                        f"Unsloth: mlx-lm cannot load bitsandbytes 4-bit weights; "
-                        f"loading base '{_bnb_base}' and applying MLX 4-bit "
-                        f"quantization instead of '{model_name}'."
-                    )
-                    model_name = _bnb_base
-                    break
+        model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
+            model_name, revision
+        )
+        if _bnb_remapped_from is not None:
+            print(
+                f"Unsloth: mlx-lm cannot load bitsandbytes 4-bit weights; "
+                f"loading base '{model_name}' and applying MLX 4-bit "
+                f"quantization instead of '{_bnb_remapped_from}'."
+            )
         if full_finetuning and (
             load_in_4bit or load_in_8bit or load_in_fp8
             or load_in_mxfp4 or load_in_nvfp4
@@ -3658,6 +3670,17 @@ class FastMLXModel:
                         or adapter_cfg.get("base_quantization_map")
                     )
                     adapter_base_revision = _adapter_base_revision(adapter_cfg)
+                    # Keep the base repo consistent across the recursive load,
+                    # metadata download, and recorded _hf_repo when the adapter
+                    # base is an unsloth/*-bnb-4bit Hub ID.
+                    base_model_id, adapter_base_revision, _adapter_base_bnb = (
+                        _remap_unsloth_bnb_hub_id_for_mlx(base_model_id, adapter_base_revision)
+                    )
+                    if _adapter_base_bnb is not None:
+                        print(
+                            f"Unsloth: adapter base '{_adapter_base_bnb}' is bitsandbytes "
+                            f"4-bit; loading base '{base_model_id}' for MLX instead."
+                        )
                     adapter_requires_runtime_quant = _adapter_needs_runtime_quantization(
                         adapter_cfg,
                         adapter_quant_policy,

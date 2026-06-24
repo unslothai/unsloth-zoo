@@ -354,7 +354,10 @@ def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
 
 
 def _normalize_mlx_scheduler_type(name):
+    if hasattr(name, "value"):
+        name = name.value
     sched_type = str(name or "linear").strip().lower()
+    sched_type = sched_type.rsplit(".", 1)[-1].replace("-", "_")
     if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
         supported = ", ".join(SUPPORTED_MLX_LR_SCHEDULERS)
         raise ValueError(
