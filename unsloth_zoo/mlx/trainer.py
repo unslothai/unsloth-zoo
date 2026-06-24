@@ -58,6 +58,8 @@ from .utils import (
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
     create_batches,
+    create_orpo_batches,
+    make_orpo_loss_fn,
     create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
@@ -502,6 +504,8 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    loss_type: str = "sft"  # "sft" or "orpo"
+    orpo_beta: float = 0.1  # ORPO odds-ratio weight (TRL default)
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -1226,7 +1230,11 @@ class MLXTrainer:
                 )
                 print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
-            if use_cce:
+            if getattr(args, "loss_type", "sft") == "orpo":
+                _ob = getattr(args, "orpo_beta", 0.1)
+                loss_fn = make_orpo_loss_fn(beta=_ob)
+                print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
+            elif use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 print(f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training.")
@@ -1618,7 +1626,10 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
-        if args.eval_steps > 0 and self.eval_dataset is not None:
+        if (getattr(args, "loss_type", "sft") == "orpo"
+                and args.eval_steps > 0 and self.eval_dataset is not None):
+            print("Unsloth: eval is not yet supported for ORPO; skipping eval.")
+        elif args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
@@ -2047,6 +2058,20 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+
+        if getattr(args, "loss_type", "sft") == "orpo":
+            if is_vlm:
+                raise ValueError(
+                    "ORPO is not yet supported for VLM models on MLX."
+                )
+            batches = create_orpo_batches(
+                dataset=self.train_dataset,
+                tokenizer=self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+            )
+            return batches, None
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)

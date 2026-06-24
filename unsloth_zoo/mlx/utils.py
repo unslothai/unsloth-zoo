@@ -502,6 +502,108 @@ def make_cce_loss_fn(model):
     return loss_fn
 
 
+# ============================================================================
+# ORPO (Odds Ratio Preference Optimization) — text models.
+# Mirrors TRL/CUDA's concatenated-forward: chosen and rejected are stacked into
+# one batch (chosen block then rejected block) and run through a single forward,
+# then split. Loss follows the ORPO paper: L = L_SFT + beta * L_OR, where
+# L_OR = -log(sigmoid(log_odds_chosen - log_odds_rejected)) and the odds use the
+# full p/(1-p) form (not a simplified log-prob ratio). Built on this module's
+# own length-mask convention (see make_baseline_loss_fn), not ported from TRL
+# (no TRL on MLX) or copied from third-party MLX projects.
+# ============================================================================
+def make_orpo_loss_fn(beta=0.1):
+    """Create an ORPO loss function over a concatenated [chosen; rejected] batch.
+
+    Signature matches make_baseline_loss_fn: (model, batch, lengths, labels=None)
+    -> (loss, ntoks), so it drops into the trainer's text step path unchanged.
+
+    Expects ``batch`` shape (2B, L) where rows [0:B] are chosen and rows [B:2B]
+    are rejected, paired by index (produced by ``create_orpo_batches``).
+    ``lengths`` is (2B, 2) with per-row [response_start, seq_end); only response
+    tokens are scored (the prompt is masked).
+    """
+    def loss_fn(model, batch, lengths, labels=None):
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        logits = model(inputs)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = mx.logical_and(
+            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
+        ).astype(mx.float32)
+        logp_tok = -nn.losses.cross_entropy(logits, targets) * mask
+        ntok_row = mask.sum(axis=1)
+        logp = logp_tok.sum(axis=1) / mx.maximum(ntok_row, mx.array(1.0))
+        B = batch.shape[0] // 2
+        logp_c, logp_r = logp[:B], logp[B:]
+        # SFT term: NLL on chosen (length-normalized).
+        sft = -mx.mean(logp_c)
+        # Odds-ratio term. log(p/(1-p)) per side; 1-exp(logp) stabilized.
+        val_c = mx.maximum(-mx.expm1(logp_c), mx.array(1e-12, logp_c.dtype))
+        val_r = mx.maximum(-mx.expm1(logp_r), mx.array(1e-12, logp_r.dtype))
+        log_odds = (logp_c - mx.log(val_c)) - (logp_r - mx.log(val_r))
+        or_loss = -mx.mean(nn.log_sigmoid(log_odds))
+        loss = sft + beta * or_loss
+        return loss, mask.sum()
+    return loss_fn
+
+
+def create_orpo_batches(dataset, tokenizer, batch_size, max_seq_length,
+                        prompt_key="prompt", chosen_key="chosen",
+                        rejected_key="rejected", pad_to_multiple=32,
+                        num_batches=None):
+    """Build concatenated [chosen; rejected] preference batches for ORPO.
+
+    Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
+    Pairs are length-sorted (by max of the two), grouped into batches of
+    ``batch_size`` PAIRS, and every row in a batch is padded to that batch's
+    max length, rounded up to ``pad_to_multiple`` (Apple-Silicon padding).
+
+    Returns a list of ``(batch, lengths, None)`` tuples:
+      batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
+      lengths: (2B, 2) — per row [response_start, seq_end)
+    """
+    hf = getattr(tokenizer, "_tokenizer", tokenizer)
+    pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
+
+    rows = []
+    for ex in dataset:
+        if prompt_key not in ex or chosen_key not in ex or rejected_key not in ex:
+            raise ValueError(
+                f"ORPO requires '{prompt_key}', '{chosen_key}', '{rejected_key}' "
+                f"columns; got {sorted(ex.keys())}."
+            )
+        prompt = ex[prompt_key]
+        p_ids = hf.encode(prompt)
+        c_ids = hf.encode(prompt + ex[chosen_key])[:max_seq_length]
+        r_ids = hf.encode(prompt + ex[rejected_key])[:max_seq_length]
+        pe = min(len(p_ids), len(c_ids), len(r_ids))
+        rows.append((pe, c_ids, r_ids))
+
+    rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
+
+    out = []
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i + batch_size]
+        Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
+        if pad_to_multiple:
+            Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+        chosen_rows, rejected_rows, lengths = [], [], []
+        for pe, c, r in chunk:
+            chosen_rows.append(c + [pad_id] * (Lmax - len(c)))
+            lengths.append([pe, len(c)])
+        for pe, c, r in chunk:
+            rejected_rows.append(r + [pad_id] * (Lmax - len(r)))
+            lengths.append([pe, len(r)])
+        batch = mx.array(chosen_rows + rejected_rows, dtype=mx.int32)
+        lengths_arr = mx.array(lengths)
+        out.append((batch, lengths_arr, None))
+        if num_batches is not None and len(out) >= num_batches:
+            break
+    mx.eval([b for b, _, _ in out] + [l for _, l, _ in out])
+    return out
+
+
 def make_baseline_loss_fn():
     """Create a standard cross-entropy loss function (full logits via LM head).
 
