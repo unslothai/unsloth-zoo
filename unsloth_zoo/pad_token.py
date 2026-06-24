@@ -16,10 +16,14 @@
 """Generic pad_token repair shared by unsloth and unsloth-zoo.
 
 A wrong/missing pad_token breaks training: pad == eos makes the loss ignore real
-pad positions, and a vision pad_token baked into a text-only tokenizer produces
-NaN losses (unsloth#3155, unsloth#4104). `fix_pad_token` heals such tokenizers by
-picking a reserved pad-like token already in the vocab; if none exists it adds one.
-It is a no-op for tokenizers that already have a valid, distinct pad_token.
+pad positions (the model never learns to stop). `fix_pad_token` heals such
+tokenizers by picking a reserved pad-like token already in the vocab; if none
+exists it adds one. It is a no-op for an already valid, distinct pad_token.
+
+Any "*pad*"-named token (e.g. <|vision_pad|>, <|fim_pad|>, [PAD]) is a valid pad and
+is kept as-is. Qwen3 text models share Qwen3-VL's vocab and ship
+pad_token=<|vision_pad|>, which is fine. The old NaN reports (unsloth#3155, #4104)
+were a masking artifact (collators set labels=-100 on pad), not a pad-identity bug.
 """
 
 __all__ = [
@@ -54,23 +58,15 @@ POSSIBLE_RESERVED_TOKENS = (
     # "<|endofprompt|>",          # Phi-4 mini; commented out, clashes with GPT-OSS
 )
 
-# Modality pad tokens. On a text-only model these must never be the pad_token
-# (unsloth#4104); on a multimodal model they are valid pad candidates of last
-# resort. Audio pads are intentionally excluded: we cannot reliably detect an
-# audio-only model, so denylisting them would rewrite a legitimate audio pad.
+# Modality pad tokens: pad-named, so valid pads on any model. Appended as
+# last-resort replacement candidates after the curated families above.
 _MODALITY_PAD_TOKENS = (
     "<|vision_pad|>",
     "<|image_pad|>",
     "<|video_pad|>",
 )
+# Re-exported for backwards compatibility; no longer used to reject pads.
 VISION_RESERVED_TOKENS = frozenset(_MODALITY_PAD_TOKENS)
-
-# model_type fragments that mark a multimodal model whose vision pad tokens are
-# legitimate (so we must not "heal" them). Kept conservative: each fragment only
-# appears in genuinely multimodal model_types, never in text-only ones.
-_VISION_MODEL_TYPES = (
-    "vl", "vision", "llava", "paligemma", "idefics", "pixtral", "mllama",
-)
 
 _CLOSERS = (">", "|>", "]", ")")
 _MANUAL_PAD_TOKEN = "<｜PAD▁TOKEN｜>"
@@ -82,22 +78,15 @@ def _token_content(token):
     return content if isinstance(content, str) else str(token)
 
 
+def _is_pad_named(token):
+    """True if the token name contains "pad" (e.g. <|vision_pad|>, <|fim_pad|>, [PAD])."""
+    return "pad" in _token_content(token).lower()
+
+
 def _resolve_inner(tokenizer):
     # Processors wrap the real tokenizer under .tokenizer.
     inner = getattr(tokenizer, "tokenizer", None)
     return inner if inner is not None else tokenizer
-
-
-def _infer_vision(tokenizer, inner, model, model_config, is_vision_model):
-    if is_vision_model is not None:
-        return bool(is_vision_model)
-    # getattr not hasattr: a processor can carry image_processor = None.
-    if getattr(tokenizer, "image_processor", None) is not None:
-        return True
-    cfg = model_config if model_config is not None else getattr(model, "config", None)
-    model_type = (getattr(cfg, "model_type", "") or "") if cfg is not None else ""
-    model_type = model_type.lower()
-    return any(fragment in model_type for fragment in _VISION_MODEL_TYPES)
 
 
 def _display_name(model, model_config, inner):
@@ -108,8 +97,12 @@ def _display_name(model, model_config, inner):
     return "Model"
 
 
-def _classify_bad_pad(inner, is_vision, vocab_size):
-    """Return a reason string if the current pad_token is bad, else None."""
+def _classify_bad_pad(inner, vocab_size):
+    """Return a reason string if the current pad_token is bad, else None.
+
+    A pad-named token (e.g. <|vision_pad|>) is valid; only missing, eos-collision
+    and out-of-range pads are healed.
+    """
     if not hasattr(inner, "pad_token"):
         return None
     pad = inner.pad_token
@@ -121,11 +114,7 @@ def _classify_bad_pad(inner, is_vision, vocab_size):
     pad_id, eos_id = getattr(inner, "pad_token_id", None), getattr(inner, "eos_token_id", None)
     if pad_id is not None and eos_id is not None and pad_id == eos_id:
         return "equals_eos"
-    if not is_vision and pad in VISION_RESERVED_TOKENS:
-        return "vision_pad"
-    # A pad whose id is past the model's embeddings indexes out of range at
-    # runtime. This catches a pad picked by an earlier model-less call (e.g.
-    # load_correct_tokenizer) that turned out to be beyond the vocab; only
+    # A pad id past the model's embeddings indexes out of range at runtime; only
     # checkable once a model/config gives us vocab_size.
     if vocab_size is not None and pad_id is not None and pad_id >= vocab_size:
         return "out_of_range"
@@ -146,8 +135,8 @@ def _single_token_id(inner, token, vocab_size):
     return token_id
 
 
-def _find_reserved_pad(inner, is_vision, eos_token, vocab_size):
-    """Pick the best reserved pad-like token already in the vocab, or None."""
+def _find_reserved_pad(inner, eos_token, vocab_size):
+    """Pick the best reserved/pad-named token already in the vocab, or None."""
     try:
         added = [_token_content(t) for t in inner.added_tokens_decoder.values()]
     except Exception:
@@ -155,34 +144,36 @@ def _find_reserved_pad(inner, is_vision, eos_token, vocab_size):
     # Newest tokens last; reverse so reserved blocks are scanned high-id first.
     added = [a for a in added if a][::-1]
 
-    # On a multimodal model, modality pad tokens are valid pads of last resort;
-    # on a text-only model they stay denied (unsloth#4104).
-    families = POSSIBLE_RESERVED_TOKENS + (_MODALITY_PAD_TOKENS if is_vision else ())
+    # Modality pads are valid on any model; appended as last-resort candidates.
+    families = POSSIBLE_RESERVED_TOKENS + _MODALITY_PAD_TOKENS
     for reserved in families:
-        if not is_vision and reserved in VISION_RESERVED_TOKENS:
-            continue
         matches = [a for a in added if a == reserved or a.startswith(reserved)]
         if not matches:
             continue
-        # Prefer a closed token (e.g. "<|reserved_special_token_0|>") that is
-        # distinct from eos and encodes to a single in-vocab id. Closed tokens
+        # Prefer a closed token (e.g. "<|reserved_special_token_0|>"); closed tokens
         # are a subset of matches, so order them first without duplicating.
         closed = [m for m in matches if m.endswith(_CLOSERS)]
         ordered = closed + [m for m in matches if m not in closed]
         for candidate in ordered:
-            if candidate == eos_token or (not is_vision and candidate in VISION_RESERVED_TOKENS):
+            if candidate == eos_token:
                 continue
             if _single_token_id(inner, candidate, vocab_size) is not None:
                 return candidate
+
+    # Last resort: any added "*pad*" token (e.g. <|fim_pad|>). Only added tokens are
+    # scanned, never the vocab, so words like "padding" can't be picked.
+    for candidate in added:
+        if candidate == eos_token or not _is_pad_named(candidate):
+            continue
+        if _single_token_id(inner, candidate, vocab_size) is not None:
+            return candidate
     return None
 
 
-def _unk_fallback(inner, is_vision, eos_token, vocab_size):
+def _unk_fallback(inner, eos_token, vocab_size):
     """Last-resort existing-token pad: reuse unk_token (Llama-2 style), or None."""
     unk = getattr(inner, "unk_token", None)
     if not unk or unk == eos_token:
-        return None
-    if not is_vision and unk in VISION_RESERVED_TOKENS:
         return None
     if _single_token_id(inner, unk, vocab_size) is not None:
         return unk
@@ -203,6 +194,8 @@ def fix_pad_token(
     `changed=False`) when the pad_token is already valid and distinct from eos.
     With `allow_add=False` (tokenizer-only callers with no model to resize) a brand
     new pad token is never added; repair is deferred to the model-aware call.
+    `is_vision_model` is accepted for API compatibility but unused: any pad-named
+    token is a valid pad regardless of modality.
     """
     result = {"changed": False, "reason": None, "old_pad": None, "new_pad": None, "added": False}
     if tokenizer is None:
@@ -216,16 +209,15 @@ def fix_pad_token(
     vocab_size = getattr(cfg, "vocab_size", None)
     eos_token = getattr(inner, "eos_token", None)
 
-    is_vision = _infer_vision(tokenizer, inner, model, model_config, is_vision_model)
-    reason = _classify_bad_pad(inner, is_vision, vocab_size)
+    reason = _classify_bad_pad(inner, vocab_size)
     if reason is None:
         return result
     result["reason"] = reason
     result["old_pad"] = getattr(inner, "pad_token", None)
 
-    new_pad = _find_reserved_pad(inner, is_vision, eos_token, vocab_size)
+    new_pad = _find_reserved_pad(inner, eos_token, vocab_size)
     if new_pad is None:
-        new_pad = _unk_fallback(inner, is_vision, eos_token, vocab_size)
+        new_pad = _unk_fallback(inner, eos_token, vocab_size)
     added = False
 
     if new_pad is None:

@@ -18,7 +18,7 @@ _spec = importlib.util.spec_from_file_location("_unsloth_pad_token_offline", _PA
 _pad_token = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pad_token)
 fix_pad_token = _pad_token.fix_pad_token
-VISION_RESERVED_TOKENS = _pad_token.VISION_RESERVED_TOKENS
+_is_pad_named = _pad_token._is_pad_named
 
 
 class FakeTokenizer:
@@ -66,11 +66,19 @@ def _qwen3_text():
     return FakeTokenizer(vocab, pad_token="<|vision_pad|>", eos_token="<|im_end|>")
 
 
-def test_qwen3_vision_pad_heals_to_endoftext():
+def test_is_pad_named():
+    for t in ("<|vision_pad|>", "<|fim_pad|>", "[PAD]", "<pad>", "<|PAD|>"):
+        assert _is_pad_named(t)
+    for t in ("<|endoftext|>", "<|im_end|>", "<unk>"):
+        assert not _is_pad_named(t)
+
+
+def test_qwen3_vision_pad_is_kept():
+    # <|vision_pad|> is a pad-named token distinct from eos -> kept as-is.
     tok = _qwen3_text()
     res = fix_pad_token(tok)
-    assert res["changed"] and res["reason"] == "vision_pad"
-    assert tok.pad_token == "<|endoftext|>"          # not a vision token
+    assert res["changed"] is False
+    assert tok.pad_token == "<|vision_pad|>"
     assert tok.pad_token != tok.eos_token
 
 
@@ -136,10 +144,14 @@ def test_zero_token_candidate_does_not_crash():
     assert res["changed"] is False
 
 
-def test_vision_token_never_selected_for_text_model():
-    tok = _qwen3_text()
-    fix_pad_token(tok)
-    assert tok.pad_token not in VISION_RESERVED_TOKENS
+def test_text_model_pad_equals_eos_uses_modality_pad_when_only_option():
+    # Qwen3-Base: pad == eos == <|endoftext|> and only a modality pad available ->
+    # use it instead of adding/raising (the #4104 / Qwen3-GRPO load crash).
+    tok = FakeTokenizer({"<|endoftext|>": 0, "<|vision_pad|>": 5},
+                        pad_token="<|endoftext|>", eos_token="<|endoftext|>")
+    res = fix_pad_token(tok)
+    assert res["changed"] and tok.pad_token == "<|vision_pad|>"
+    assert tok.pad_token != tok.eos_token
 
 
 def test_out_of_range_pad_is_repicked_when_model_known():
@@ -165,9 +177,8 @@ def test_in_range_valid_pad_is_noop_with_vocab_size():
     assert fix_pad_token(tok, model_config = cfg)["changed"] is False
 
 
-def test_vision_model_keeps_its_vision_pad():
-    # A real multimodal model (model_type without "vl", e.g. llava) must be
-    # detected as vision so its vision pad_token is left untouched.
+def test_vision_pad_kept_regardless_of_model_type():
+    # A pad-named modality token is kept whether or not the model is multimodal.
     tok = _qwen3_text()  # pad_token = "<|vision_pad|>"
     cfg = type("Cfg", (), {"model_type": "llava"})()
     res = fix_pad_token(tok, model_config = cfg)
@@ -185,20 +196,16 @@ def test_unk_token_fallback_when_no_reserved():
     assert res["changed"] and tok.pad_token == "<unk>"
 
 
-def test_vision_model_reuses_vision_pad_when_only_option():
-    # Vision model with pad == eos and only a modality pad available -> reuse it
-    # instead of adding/raising.
+def test_pad_equals_eos_reuses_modality_pad_when_only_option():
+    # pad == eos and only a modality pad available -> reuse it instead of adding/raising.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|vision_pad|>": 2},
                         pad_token = "<|im_end|>", eos_token = "<|im_end|>")
-    cfg = type("Cfg", (), {"model_type": "qwen2_vl"})()
-    res = fix_pad_token(tok, model_config = cfg)
+    res = fix_pad_token(tok)
     assert res["changed"] and tok.pad_token == "<|vision_pad|>"
 
 
-def test_audio_pad_not_denylisted_for_audio_model():
-    # <|audio_pad|> is not a denied token (we cannot detect audio-only models),
-    # so an audio tokenizer keeping it as pad is a no-op.
+def test_audio_pad_is_kept():
+    # <|audio_pad|> is pad-named and distinct from eos -> kept as-is.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|audio_pad|>": 2},
                         pad_token = "<|audio_pad|>", eos_token = "<|im_end|>")
     assert fix_pad_token(tok)["changed"] is False
-    assert "<|audio_pad|>" not in VISION_RESERVED_TOKENS
