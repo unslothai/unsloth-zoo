@@ -34,6 +34,7 @@ import os
 import queue
 import re
 import signal
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -44,6 +45,8 @@ from unsloth_zoo.hf_cache_state import (
     has_active_incomplete_blobs,
     hf_cache_root,
     iter_active_repo_cache_dirs,
+    latest_snapshot_dir,
+    repo_cache_dir_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,9 +59,13 @@ DEFAULT_STALL_TIMEOUT = 180.0
 DEFAULT_GRACE_PERIOD = 10.0
 _POLL_INTERVAL = 0.5
 
-# Serializes the brief parent-env mutation around a child spawn (below) so
-# concurrent downloads cannot observe each other's transport env.
+# Serializes the brief parent-env (and __main__.__file__) mutation around a child
+# spawn (below) so concurrent downloads cannot observe each other's transport env.
 _SPAWN_ENV_LOCK = threading.Lock()
+
+# Sentinel: "__main__.__file__ was not touched for this spawn" (distinct from a
+# real saved value of None, which means the attribute was absent).
+_UNSET = object()
 
 # Hugging Face boolean env convention: 1 / ON / YES / TRUE, case-insensitive.
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -113,25 +120,65 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
+def _destructive_repo_cache_dirs(
+    repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
+) -> list:
+    """Repo cache dir(s) safe to delete from: an exact-case match, or a single
+    unambiguous case-insensitive match.
+
+    ``iter_active_repo_cache_dirs`` matches case-insensitively, which is correct
+    for read-only state probing but unsafe for deletion: on a case-sensitive
+    filesystem with both ``models--Org--Repo`` and ``models--org--repo`` present,
+    preparing HTTP for ``Org/Repo`` would also delete the other repo's partial.
+    """
+    entries = list(iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir))
+    exact_name = repo_cache_dir_name(repo_type, repo_id)
+    exact = [entry for entry in entries if entry.name == exact_name]
+    if exact:
+        return exact
+    if len(entries) <= 1:
+        return entries
+    logger.debug(
+        "Ambiguous case-colliding cache dirs for %s; skipping destructive HTTP prep", repo_id
+    )
+    return []
+
+
 def _default_prepare_for_http(
     repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
 ) -> None:
     """Generic 'make the partial safe for an HTTP resume': delete the repo's active
     ``*.incomplete`` blobs (an HTTP resume over a sparse Xet/hf_transfer partial
-    silently corrupts the blob). Studio injects its marker-aware version instead."""
+    silently corrupts the blob) and any broken snapshot symlinks the incomplete
+    detector counts as active (else the HTTP retry inherits stale 'incomplete'
+    state and trips the watchdog again). Studio injects its marker-aware version
+    instead."""
     try:
-        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+        for entry in _destructive_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
-            if not blobs_dir.is_dir():
-                continue
-            for blob in blobs_dir.iterdir():
-                if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
-                    try:
-                        blob.unlink()
-                    except OSError:
-                        # A locked / permission-denied blob (common on Windows)
-                        # must not abort cleanup of the rest of the partials.
-                        continue
+            if blobs_dir.is_dir():
+                for blob in blobs_dir.iterdir():
+                    if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
+                        try:
+                            blob.unlink()
+                        except OSError:
+                            # A locked / permission-denied blob (common on Windows)
+                            # must not abort cleanup of the rest of the partials.
+                            continue
+            # repo_cache_dir_has_incomplete_blobs() also flags a broken snapshot
+            # symlink as active incomplete state; clear those too so the detector
+            # reads clean after prep.
+            latest = latest_snapshot_dir(entry)
+            if latest is not None:
+                try:
+                    for link in latest.rglob("*"):
+                        if link.is_symlink() and not link.exists():
+                            try:
+                                link.unlink()
+                            except OSError:
+                                continue
+                except OSError:
+                    pass
     except Exception as e:
         logger.debug("default prepare_for_http failed for %s: %s", repo_id, e)
 
@@ -273,6 +320,7 @@ def _child_download(*, kind: str, params: dict, token: Optional[str], repo_type:
             cache_dir = params.get("cache_dir"),
             allow_patterns = params.get("allow_patterns"),
             ignore_patterns = params.get("ignore_patterns"),
+            force_download = params.get("force_download", False),
         )
 
     from huggingface_hub import hf_hub_download
@@ -284,6 +332,7 @@ def _child_download(*, kind: str, params: dict, token: Optional[str], repo_type:
         token = token,
         revision = params.get("revision"),
         cache_dir = params.get("cache_dir"),
+        force_download = params.get("force_download", False),
     )
 
 
@@ -420,6 +469,19 @@ def _run_download_attempt(
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     with _SPAWN_ENV_LOCK:
         saved_env = {k: os.environ.get(k) for k in child_env}
+        # multiprocessing 'spawn' re-opens __main__.__file__ in the child. From a
+        # notebook / `python -` / `python -c` / unguarded top-level script that
+        # file is missing or a pseudo-path like '<stdin>', so proc.start() raises
+        # before the child runs and the download never happens. Point __main__ at
+        # this importable module (no top-level download side effects) just for the
+        # spawn, then restore it.
+        main_module = sys.modules.get("__main__")
+        saved_main_file = _UNSET
+        if main_module is not None:
+            main_file = getattr(main_module, "__file__", None)
+            if not main_file or str(main_file).startswith("<"):
+                saved_main_file = main_file
+                main_module.__file__ = __file__
         try:
             os.environ.update(child_env)
             proc.start()
@@ -429,6 +491,14 @@ def _run_download_attempt(
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            if saved_main_file is not _UNSET:
+                if saved_main_file is None:
+                    try:
+                        delattr(main_module, "__file__")
+                    except AttributeError:
+                        pass
+                else:
+                    main_module.__file__ = saved_main_file
 
     # Bind the child to the parent lifetime when running under Studio (best-effort).
     try:
@@ -573,6 +643,7 @@ def hf_hub_download_with_xet_fallback(
     repo_type: str = "model",
     revision: Optional[str] = None,
     cache_dir: Optional[str] = None,
+    force_download: bool = False,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     grace_period: float = DEFAULT_GRACE_PERIOD,
@@ -584,24 +655,33 @@ def hf_hub_download_with_xet_fallback(
     Returns the local cache path. Raises ``RuntimeError("Cancelled")`` if
     *cancel_event* is set, re-raises a deterministic child error unchanged (no
     fallback), and raises ``DownloadStallError`` only if BOTH transports stall.
+    ``force_download=True`` re-fetches even if cached (skips the cache short-circuit).
     """
-    # Finalized blob already cached: return it with no child and no network.
-    try:
-        from huggingface_hub import try_to_load_from_cache
+    # Finalized blob already cached: return it with no child and no network
+    # (skipped when force_download re-fetches unconditionally).
+    if not force_download:
+        try:
+            from huggingface_hub import try_to_load_from_cache
 
-        cached = try_to_load_from_cache(
-            repo_id, filename, repo_type = repo_type, revision = revision, cache_dir = cache_dir
-        )
-        if isinstance(cached, str) and os.path.exists(cached):
-            return cached
-    except Exception as e:
-        logger.debug("Cached probe failed for %s/%s: %s", repo_id, filename, e)
+            cached = try_to_load_from_cache(
+                repo_id, filename, repo_type = repo_type, revision = revision, cache_dir = cache_dir
+            )
+            if isinstance(cached, str) and os.path.exists(cached):
+                return cached
+        except Exception as e:
+            logger.debug("Cached probe failed for %s/%s: %s", repo_id, filename, e)
 
     return _download_with_xet_fallback(
         repo_id = repo_id,
         label = f"{repo_id}/{filename}",
         kind = "file",
-        params = {"repo_id": repo_id, "filename": filename, "revision": revision, "cache_dir": cache_dir},
+        params = {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": revision,
+            "cache_dir": cache_dir,
+            "force_download": force_download,
+        },
         token = token,
         repo_type = repo_type,
         cancel_event = cancel_event,
@@ -622,6 +702,7 @@ def snapshot_download_with_xet_fallback(
     cache_dir: Optional[str] = None,
     allow_patterns: Optional[Any] = None,
     ignore_patterns: Optional[Any] = None,
+    force_download: bool = False,
     cancel_event: Optional[threading.Event] = None,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
@@ -635,23 +716,26 @@ def snapshot_download_with_xet_fallback(
     Used by Unsloth's ``from_pretrained`` to warm the cache in a killable child
     BEFORE the in-process model load (which then hits a warm cache and cannot
     hang on a native Xet thread). A fully cached repo short-circuits in-process
-    via ``local_files_only`` with no child and no network.
+    via ``local_files_only`` with no child and no network. ``force_download=True``
+    re-fetches in the killable child even if cached (skips that short-circuit).
     """
-    # Fast path: everything already on disk -> resolve in-process (no Xet, no hang).
-    try:
-        from huggingface_hub import snapshot_download
+    # Fast path: everything already on disk -> resolve in-process (no Xet, no
+    # hang). Skipped when force_download re-fetches unconditionally.
+    if not force_download:
+        try:
+            from huggingface_hub import snapshot_download
 
-        return snapshot_download(
-            repo_id = repo_id,
-            repo_type = repo_type,
-            revision = revision,
-            cache_dir = cache_dir,
-            allow_patterns = allow_patterns,
-            ignore_patterns = ignore_patterns,
-            local_files_only = True,
-        )
-    except Exception as e:
-        logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
+            return snapshot_download(
+                repo_id = repo_id,
+                repo_type = repo_type,
+                revision = revision,
+                cache_dir = cache_dir,
+                allow_patterns = allow_patterns,
+                ignore_patterns = ignore_patterns,
+                local_files_only = True,
+            )
+        except Exception as e:
+            logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
 
     return _download_with_xet_fallback(
         repo_id = repo_id,
@@ -663,6 +747,7 @@ def snapshot_download_with_xet_fallback(
             "cache_dir": cache_dir,
             "allow_patterns": allow_patterns,
             "ignore_patterns": ignore_patterns,
+            "force_download": force_download,
         },
         token = token,
         repo_type = repo_type,

@@ -219,6 +219,46 @@ def test_custom_cache_dir_is_watched_and_cleaned(tmp_path, monkeypatch):
     assert not partial.exists()
 
 
+def test_prepare_for_http_clears_broken_snapshot_symlink(tmp_path):
+    """A broken snapshot symlink is counted as active-incomplete state by the
+    detector, so HTTP prep must clear it too or the retry re-trips the watchdog."""
+    repo = "ztest/broken-symlink"
+    repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
+    snap = repo_dir / "snapshots" / "abc123"
+    snap.mkdir(parents = True)
+    link = snap / "model.safetensors"
+    link.symlink_to(repo_dir / "blobs" / "missing-blob")  # dangling
+    assert link.is_symlink() and not link.exists()
+
+    # Detector treats the dangling link as active incomplete state.
+    assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, True)
+
+    _REAL_DEFAULT_PREPARE("model", repo, cache_dir = str(tmp_path))
+
+    assert not link.is_symlink(), "broken snapshot symlink not cleared by HTTP prep"
+    assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, False)
+
+
+def test_prepare_for_http_preserves_case_colliding_repo(tmp_path):
+    """On a case-sensitive filesystem, preparing HTTP for ``Org/Repo`` must purge
+    only its exact-case cache dir, never a case-colliding ``org/repo``."""
+    upper = tmp_path / "models--Org--Repo" / "blobs"
+    lower = tmp_path / "models--org--repo" / "blobs"
+    upper.mkdir(parents = True)
+    lower.mkdir(parents = True)
+    if upper.parent.resolve() == lower.parent.resolve():
+        pytest.skip("case-insensitive filesystem; cannot collide cache dirs")
+    upper_partial = upper / "a.incomplete"
+    lower_partial = lower / "b.incomplete"
+    upper_partial.write_bytes(b"x")
+    lower_partial.write_bytes(b"y")
+
+    _REAL_DEFAULT_PREPARE("model", "Org/Repo", cache_dir = str(tmp_path))
+
+    assert not upper_partial.exists(), "exact-case partial should be purged"
+    assert lower_partial.exists(), "case-colliding repo's partial must be preserved"
+
+
 # --------------------------------------------------------------------------- #
 # Transport policy: cached short-circuit, cancel, error propagation, the single
 # Xet->HTTP fallback, the injected prepare seam, and the UNSLOTH_DISABLE_XET knob.
@@ -276,6 +316,7 @@ class _FakeAttempt:
                 kind = kind,
                 target = params.get("filename", repo_id),
                 cache_dir = params.get("cache_dir"),
+                force_download = params.get("force_download"),
                 disable_xet = disable_xet,
                 repo_type = repo_type,
             )
@@ -510,6 +551,31 @@ def test_snapshot_stall_then_http(monkeypatch):
     assert [c.kind for c in fake.calls] == ["snapshot", "snapshot"]
     assert [c.disable_xet for c in fake.calls] == [False, True]
     assert prepared == [("model", DL_REPO)]
+
+
+def test_force_download_skips_fast_path_and_threads(monkeypatch):
+    """force_download=True must bypass the warm-cache short-circuit and re-fetch in
+    the killable child, forwarding force_download into the download params."""
+    def _snap(*a, **k):
+        pytest.fail("force_download must not take the local_files_only fast path")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _snap)
+    fake = _install(monkeypatch, [("ok", "/cache/snap-dir")])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, force_download = True)
+    assert out == "/cache/snap-dir"
+    assert len(fake.calls) == 1 and fake.calls[0].force_download is True
+
+
+def test_force_download_file_skips_cache_probe(monkeypatch, tmp_path):
+    """The single-file path must also skip the cached-blob short-circuit and thread
+    force_download through when force_download=True."""
+    cached = tmp_path / "cached.gguf"
+    cached.write_bytes(b"\0" * 8)
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: str(cached))
+    fake = _install(monkeypatch, [("ok", "/cache/x")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, force_download = True)
+    assert out == "/cache/x"
+    assert len(fake.calls) == 1 and fake.calls[0].force_download is True
 
 
 # --------------------------------------------------------------------------- #
