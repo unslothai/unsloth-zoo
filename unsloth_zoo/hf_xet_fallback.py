@@ -22,7 +22,13 @@ cancellation propagate without a fallback.
 Unsloth's ``from_pretrained`` uses to warm the cache in a killable child before
 the in-process load). Studio-specific cache/secret/process helpers are used
 best-effort (imported only if present) or injected, so the same code runs both
-inside Studio and standalone.
+inside Unsloth Studio and in Unsloth itself.
+
+Like the rest of ``unsloth_zoo``, this module is imported with ``unsloth``
+installed; the package ``__init__`` runs its device init on first import. The
+download spawn child does not need that and sets ``UNSLOTH_ZOO_DISABLE_GPU_INIT=1``
+before it imports the package, which selects ``unsloth_zoo``'s lightweight import
+path (no torch/transformers), keeping each child fast.
 """
 
 from __future__ import annotations
@@ -125,7 +131,9 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     if not text:
         return text
     out = text
-    if hf_token:
+    # HF callers commonly pass token=True ("use the cached token"); only a real
+    # string token can be substring-redacted (str.replace(True, ...) raises).
+    if isinstance(hf_token, str) and hf_token:
         out = out.replace(hf_token, "***")
     out = re.sub(r"hf_[A-Za-z0-9]{8,}", "***", out)
     out = re.sub(r"([Bb]earer\s+)[A-Za-z0-9._\-]+", r"\1***", out)
@@ -469,19 +477,21 @@ def _run_download_attempt(
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     with _SPAWN_ENV_LOCK:
         saved_env = {k: os.environ.get(k) for k in child_env}
-        # multiprocessing 'spawn' re-opens __main__.__file__ in the child. From a
-        # notebook / `python -` / `python -c` / unguarded top-level script that
-        # file is missing or a pseudo-path like '<stdin>', so proc.start() raises
-        # before the child runs and the download never happens. Point __main__ at
-        # this importable module (no top-level download side effects) just for the
-        # spawn, then restore it.
+        # multiprocessing 'spawn' reconstructs __main__ in the child from
+        # __main__.__file__. If that is a pseudo-path ('<stdin>', a notebook) the
+        # child fails to start; if it is a real but UNGUARDED caller script the
+        # child re-imports it as __mp_main__ and re-runs the top-level
+        # from_pretrained/download, hitting the "start a new process before
+        # bootstrapping" error -> the parent then sees the child exit without a
+        # result. In every case we only need the child to unpickle and run
+        # _download_child_entry, so point __main__ at THIS importable, side-effect
+        # -free module for the spawn (and restore it after). The child imports us
+        # as __mp_main__ instead of re-executing the caller's script.
         main_module = sys.modules.get("__main__")
         saved_main_file = _UNSET
         if main_module is not None:
-            main_file = getattr(main_module, "__file__", None)
-            if not main_file or str(main_file).startswith("<"):
-                saved_main_file = main_file
-                main_module.__file__ = __file__
+            saved_main_file = getattr(main_module, "__file__", _UNSET)
+            main_module.__file__ = __file__
         try:
             os.environ.update(child_env)
             proc.start()
@@ -491,8 +501,9 @@ def _run_download_attempt(
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-            if saved_main_file is not _UNSET:
-                if saved_main_file is None:
+            if main_module is not None:
+                if saved_main_file is _UNSET:
+                    # __file__ was absent before; remove the one we added.
                     try:
                         delattr(main_module, "__file__")
                     except AttributeError:
@@ -594,6 +605,16 @@ def _download_with_xet_fallback(
                     prepare_for_http_fn(repo_type, repo_id)
             except Exception as e:
                 logger.debug("prepare_for_http failed for %s: %s", repo_id, e)
+            # If an unsafe partial could not be cleared (e.g. a locked file or a
+            # permission error), an HTTP resume over a sparse Xet/hf_transfer
+            # partial would silently corrupt the blob. Force a clean re-download
+            # for this HTTP attempt instead of resuming over it.
+            if has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir):
+                logger.warning(
+                    "Unsafe partial for '%s' could not be cleared; forcing a clean "
+                    "HTTP re-download instead of an unsafe resume.", label
+                )
+                params = {**params, "force_download": True}
 
         kind_result, payload = _run_download_attempt(
             repo_id,
@@ -621,8 +642,10 @@ def _download_with_xet_fallback(
             logger.warning(
                 "Download stalled for '%s' -- retrying with HF_HUB_DISABLE_XET=1", label
             )
-            if on_status is not None:
-                on_status(f"{label}: Xet stalled, retrying over HTTP")
+            # _safe_status: a raising status hook (e.g. a disconnected client) must
+            # not abort the retry before disable_xet is set, turning a recoverable
+            # stall into a failed download.
+            _safe_status(on_status, f"{label}: Xet stalled, retrying over HTTP")
             disable_xet = True
             continue
         raise DownloadStallError(
@@ -637,7 +660,7 @@ def _download_with_xet_fallback(
 def hf_hub_download_with_xet_fallback(
     repo_id: str,
     filename: str,
-    token: Optional[str],
+    token: Optional[str] = None,
     *,
     cancel_event: Optional[threading.Event] = None,
     repo_type: Optional[str] = "model",
@@ -727,7 +750,7 @@ def snapshot_download_with_xet_fallback(
         try:
             from huggingface_hub import snapshot_download
 
-            return snapshot_download(
+            cached_dir = snapshot_download(
                 repo_id = repo_id,
                 repo_type = repo_type,
                 revision = revision,
@@ -736,6 +759,14 @@ def snapshot_download_with_xet_fallback(
                 ignore_patterns = ignore_patterns,
                 local_files_only = True,
             )
+            # local_files_only returns a snapshot dir whenever refs/<rev> and
+            # snapshots/<sha> exist, even if a prior download was interrupted and
+            # left .incomplete blobs or broken symlinks. Only short-circuit when
+            # the cache is actually clean; otherwise complete it in the killable
+            # child so the in-process load does not proceed with missing files.
+            if not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir):
+                return cached_dir
+            logger.debug("Cached snapshot for %s has incomplete state; downloading.", repo_id)
         except Exception as e:
             logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
 

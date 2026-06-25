@@ -521,6 +521,7 @@ class _FakeProc:
         self._rec["disable_xet"] = os.environ.get("HF_HUB_DISABLE_XET")
         self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
         self._rec["skip_gpu_init"] = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT")
+        self._rec["main_file"] = getattr(sys.modules.get("__main__"), "__file__", None)
 
     def is_alive(self):
         return False
@@ -602,6 +603,72 @@ def test_child_skips_gpu_init_env_set_before_spawn_and_restored(monkeypatch):
     )
     assert rec["skip_gpu_init"] == "1"  # set in the parent before proc.start()
     assert "UNSLOTH_ZOO_DISABLE_GPU_INIT" not in os.environ  # restored after
+
+
+def test_spawn_repoints_main_file_and_restores(monkeypatch):
+    """For an unguarded top-level caller script, the spawn child must import this
+    side-effect-free module as __mp_main__ rather than re-execute the caller, so the
+    parent repoints __main__.__file__ here at spawn and restores it afterwards."""
+    main_mod = sys.modules["__main__"]
+    monkeypatch.setattr(main_mod, "__file__", "/fake/user_script.py", raising = False)
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert rec["main_file"] == xf.__file__       # child imports the helper, not the script
+    assert main_mod.__file__ == "/fake/user_script.py"  # restored in the parent
+
+
+def test_scrub_secrets_handles_boolean_token():
+    """token=True ("use the cached token") must not crash the child error scrubber."""
+    out = xf._default_scrub_secrets("auth failed for hf_abcdefghij", hf_token = True)
+    assert "hf_abcdefghij" not in out and "***" in out
+
+
+def test_file_download_defaults_token_to_none(monkeypatch):
+    """The single-file helper accepts no token (parity with hf_hub_download)."""
+    fake = _install(monkeypatch, [("ok", "/cache/x")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE)  # no token arg
+    assert out == "/cache/x" and len(fake.calls) == 1
+
+
+def test_incomplete_cached_snapshot_not_short_circuited(hf_cache, monkeypatch):
+    """A cached-but-incomplete snapshot (interrupted download) must not take the
+    fast path; it must complete in the killable child instead."""
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: "/cache/snap")
+    (_blobs_dir(hf_cache, DL_REPO) / "x.incomplete").write_bytes(b"abc")  # active partial
+    fake = _install(monkeypatch, [("ok", "/cache/snap-fresh")])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert out == "/cache/snap-fresh" and len(fake.calls) == 1
+
+
+def test_retry_status_failure_does_not_abort_fallback(monkeypatch):
+    """A raising on_status during the Xet->HTTP retry must not abort the fallback."""
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+
+    def boom(_message):
+        raise RuntimeError("client gone")
+
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, on_status = boom)
+    assert out == "/cache/x"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_unclearable_partial_forces_clean_redownload(hf_cache, monkeypatch):
+    """When prep cannot clear an unsafe partial, the HTTP attempt forces a clean
+    re-download instead of an unsafe resume over the sparse partial."""
+    # The autouse fixture makes _default_prepare_for_http a no-op (simulates a
+    # cleanup that left the partial in place).
+    (_blobs_dir(hf_cache, DL_REPO) / "x.incomplete").write_bytes(b"abc")
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert out == "/cache/x"
+    assert fake.calls[0].force_download is False   # Xet attempt: not forced
+    assert fake.calls[1].force_download is True     # HTTP attempt: forced clean
 
 
 # --------------------------------------------------------------------------- #
