@@ -18,19 +18,35 @@ _spec = importlib.util.spec_from_file_location("_unsloth_pad_token_offline", _PA
 _pad_token = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pad_token)
 fix_pad_token = _pad_token.fix_pad_token
-VISION_RESERVED_TOKENS = _pad_token.VISION_RESERVED_TOKENS
+_is_pad_named = _pad_token._is_pad_named
+
+
+class _AddedToken:
+    """Stand-in for transformers' AddedToken (content + special flag)."""
+
+    def __init__(self, content, special):
+        self.content = content
+        self.special = special
+
+    def __str__(self):
+        return self.content
 
 
 class FakeTokenizer:
     """Minimal stand-in: vocab is a {token: id} dict; reserved tokens are 'added'."""
 
-    def __init__(self, vocab, pad_token, eos_token, added=None):
+    def __init__(self, vocab, pad_token, eos_token, added=None, non_special=()):
         self._vocab = dict(vocab)
         self.pad_token = pad_token
         self.eos_token = eos_token
-        # added_tokens_decoder maps id -> token content (subset treated as "added")
+        # added_tokens_decoder maps id -> AddedToken; tokens in non_special are
+        # ordinary add_tokens() entries (special=False), the rest are special.
         added = added if added is not None else list(vocab)
-        self.added_tokens_decoder = {self._vocab[t]: t for t in added if t in self._vocab}
+        non_special = set(non_special)
+        self.added_tokens_decoder = {
+            self._vocab[t]: _AddedToken(t, special=t not in non_special)
+            for t in added if t in self._vocab
+        }
 
     # ids
     @property
@@ -53,7 +69,7 @@ class FakeTokenizer:
         tok = mapping["pad_token"]
         if tok not in self._vocab:
             self._vocab[tok] = max(self._vocab.values()) + 1
-            self.added_tokens_decoder[self._vocab[tok]] = tok
+            self.added_tokens_decoder[self._vocab[tok]] = _AddedToken(tok, special=True)
         self.pad_token = tok
 
 
@@ -66,11 +82,22 @@ def _qwen3_text():
     return FakeTokenizer(vocab, pad_token="<|vision_pad|>", eos_token="<|im_end|>")
 
 
-def test_qwen3_vision_pad_heals_to_endoftext():
+def test_is_pad_named():
+    # Bracketed pad sentinels qualify ...
+    for t in ("<|vision_pad|>", "<|fim_pad|>", "[PAD]", "<pad>", "<|PAD|>"):
+        assert _is_pad_named(t)
+    # ... ordinary words containing "pad" and non-pad tokens do not.
+    for t in ("keypad", "padding", "Notepad", "pad",
+              "<|endoftext|>", "<|im_end|>", "<unk>"):
+        assert not _is_pad_named(t)
+
+
+def test_qwen3_vision_pad_is_kept():
+    # <|vision_pad|> is a pad-named token distinct from eos -> kept as-is.
     tok = _qwen3_text()
     res = fix_pad_token(tok)
-    assert res["changed"] and res["reason"] == "vision_pad"
-    assert tok.pad_token == "<|endoftext|>"          # not a vision token
+    assert res["changed"] is False
+    assert tok.pad_token == "<|vision_pad|>"
     assert tok.pad_token != tok.eos_token
 
 
@@ -136,10 +163,14 @@ def test_zero_token_candidate_does_not_crash():
     assert res["changed"] is False
 
 
-def test_vision_token_never_selected_for_text_model():
-    tok = _qwen3_text()
-    fix_pad_token(tok)
-    assert tok.pad_token not in VISION_RESERVED_TOKENS
+def test_text_model_pad_equals_eos_uses_modality_pad_when_only_option():
+    # Qwen3-Base: pad == eos == <|endoftext|> and only a modality pad available ->
+    # use it instead of adding/raising (the #4104 / Qwen3-GRPO load crash).
+    tok = FakeTokenizer({"<|endoftext|>": 0, "<|vision_pad|>": 5},
+                        pad_token="<|endoftext|>", eos_token="<|endoftext|>")
+    res = fix_pad_token(tok)
+    assert res["changed"] and tok.pad_token == "<|vision_pad|>"
+    assert tok.pad_token != tok.eos_token
 
 
 def test_out_of_range_pad_is_repicked_when_model_known():
@@ -165,9 +196,8 @@ def test_in_range_valid_pad_is_noop_with_vocab_size():
     assert fix_pad_token(tok, model_config = cfg)["changed"] is False
 
 
-def test_vision_model_keeps_its_vision_pad():
-    # A real multimodal model (model_type without "vl", e.g. llava) must be
-    # detected as vision so its vision pad_token is left untouched.
+def test_vision_pad_kept_regardless_of_model_type():
+    # A pad-named modality token is kept whether or not the model is multimodal.
     tok = _qwen3_text()  # pad_token = "<|vision_pad|>"
     cfg = type("Cfg", (), {"model_type": "llava"})()
     res = fix_pad_token(tok, model_config = cfg)
@@ -185,20 +215,45 @@ def test_unk_token_fallback_when_no_reserved():
     assert res["changed"] and tok.pad_token == "<unk>"
 
 
-def test_vision_model_reuses_vision_pad_when_only_option():
-    # Vision model with pad == eos and only a modality pad available -> reuse it
-    # instead of adding/raising.
+def test_pad_equals_eos_reuses_modality_pad_when_only_option():
+    # pad == eos and only a modality pad available -> reuse it instead of adding/raising.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|vision_pad|>": 2},
                         pad_token = "<|im_end|>", eos_token = "<|im_end|>")
-    cfg = type("Cfg", (), {"model_type": "qwen2_vl"})()
-    res = fix_pad_token(tok, model_config = cfg)
+    res = fix_pad_token(tok)
     assert res["changed"] and tok.pad_token == "<|vision_pad|>"
 
 
-def test_audio_pad_not_denylisted_for_audio_model():
-    # <|audio_pad|> is not a denied token (we cannot detect audio-only models),
-    # so an audio tokenizer keeping it as pad is a no-op.
+def test_audio_pad_is_kept():
+    # <|audio_pad|> is pad-named and distinct from eos -> kept as-is.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|audio_pad|>": 2},
                         pad_token = "<|audio_pad|>", eos_token = "<|im_end|>")
     assert fix_pad_token(tok)["changed"] is False
-    assert "<|audio_pad|>" not in VISION_RESERVED_TOKENS
+
+
+def test_pad_name_fallback_ignores_bare_word_token():
+    # pad == eos; "keypad" is a bare word (not a bracketed sentinel) and must not be
+    # promoted, while the bracketed <|custom_pad|> is picked.
+    tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5, "<|custom_pad|>": 6},
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
+    res = fix_pad_token(tok)
+    assert res["changed"] and tok.pad_token == "<|custom_pad|>"
+
+
+def test_bare_word_pad_name_not_promoted_when_only_option():
+    # pad == eos and the only "*pad*" token is a bare word -> do not promote it;
+    # with allow_add=False the repair defers and leaves pad unchanged.
+    tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5},
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
+    res = fix_pad_token(tok, allow_add = False)
+    assert res["changed"] is False
+    assert tok.pad_token == "<|endoftext|>"
+
+
+def test_non_special_fim_pad_is_eligible():
+    # A pipe-wrapped FIM pad is a valid replacement even when the tokenizer marks it
+    # special=False (Qwen does), since eligibility is by sentinel form, not the flag.
+    tok = FakeTokenizer({"<|endoftext|>": 0, "<|fim_pad|>": 6},
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
+                        non_special = ["<|fim_pad|>"])
+    res = fix_pad_token(tok)
+    assert res["changed"] and tok.pad_token == "<|fim_pad|>"
