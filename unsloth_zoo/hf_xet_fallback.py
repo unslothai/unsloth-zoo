@@ -46,7 +46,6 @@ from unsloth_zoo.hf_cache_state import (
     hf_cache_root,
     iter_active_repo_cache_dirs,
     latest_snapshot_dir,
-    repo_cache_dir_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,30 +119,6 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
-def _destructive_repo_cache_dirs(
-    repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
-) -> list:
-    """Repo cache dir(s) safe to delete from: an exact-case match, or a single
-    unambiguous case-insensitive match.
-
-    ``iter_active_repo_cache_dirs`` matches case-insensitively, which is correct
-    for read-only state probing but unsafe for deletion: on a case-sensitive
-    filesystem with both ``models--Org--Repo`` and ``models--org--repo`` present,
-    preparing HTTP for ``Org/Repo`` would also delete the other repo's partial.
-    """
-    entries = list(iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir))
-    exact_name = repo_cache_dir_name(repo_type, repo_id)
-    exact = [entry for entry in entries if entry.name == exact_name]
-    if exact:
-        return exact
-    if len(entries) <= 1:
-        return entries
-    logger.debug(
-        "Ambiguous case-colliding cache dirs for %s; skipping destructive HTTP prep", repo_id
-    )
-    return []
-
-
 def _default_prepare_for_http(
     repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
 ) -> None:
@@ -152,9 +127,13 @@ def _default_prepare_for_http(
     silently corrupts the blob) and any broken snapshot symlinks the incomplete
     detector counts as active (else the HTTP retry inherits stale 'incomplete'
     state and trips the watchdog again). Studio injects its marker-aware version
-    instead."""
+    instead.
+
+    ``iter_active_repo_cache_dirs`` is case-collision safe, so this destructive
+    purge only touches an exact-case (or single unambiguous) repo cache dir.
+    """
     try:
-        for entry in _destructive_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
             if blobs_dir.is_dir():
                 for blob in blobs_dir.iterdir():
@@ -186,7 +165,7 @@ def _default_prepare_for_http(
 def get_hf_download_state(
     repo_ids: Optional[list[str]] = None,
     *,
-    repo_type: str = "model",
+    repo_type: Optional[str] = "model",
     cache_dir: Optional[str] = None,
 ) -> Optional[tuple[int, bool]]:
     """Return ``(total_on_disk_bytes, has_incomplete)`` for the HF cache being written.
@@ -234,7 +213,7 @@ def start_watchdog(
     *,
     repo_ids: list[str],
     on_stall: Callable[[str], None],
-    repo_type: str = "model",
+    repo_type: Optional[str] = "model",
     cache_dir: Optional[str] = None,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
@@ -640,7 +619,7 @@ def hf_hub_download_with_xet_fallback(
     token: Optional[str],
     *,
     cancel_event: Optional[threading.Event] = None,
-    repo_type: str = "model",
+    repo_type: Optional[str] = "model",
     revision: Optional[str] = None,
     cache_dir: Optional[str] = None,
     force_download: bool = False,
@@ -657,6 +636,7 @@ def hf_hub_download_with_xet_fallback(
     fallback), and raises ``DownloadStallError`` only if BOTH transports stall.
     ``force_download=True`` re-fetches even if cached (skips the cache short-circuit).
     """
+    repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Finalized blob already cached: return it with no child and no network
     # (skipped when force_download re-fetches unconditionally).
     if not force_download:
@@ -698,7 +678,7 @@ def snapshot_download_with_xet_fallback(
     *,
     revision: Optional[str] = None,
     token: Optional[str] = None,
-    repo_type: str = "model",
+    repo_type: Optional[str] = "model",
     cache_dir: Optional[str] = None,
     allow_patterns: Optional[Any] = None,
     ignore_patterns: Optional[Any] = None,
@@ -719,6 +699,7 @@ def snapshot_download_with_xet_fallback(
     via ``local_files_only`` with no child and no network. ``force_download=True``
     re-fetches in the killable child even if cached (skips that short-circuit).
     """
+    repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Fast path: everything already on disk -> resolve in-process (no Xet, no
     # hang). Skipped when force_download re-fetches unconditionally.
     if not force_download:

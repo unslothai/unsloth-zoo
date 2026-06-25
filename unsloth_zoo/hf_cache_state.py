@@ -79,11 +79,15 @@ def hf_cache_root(*, create: bool = False, cache_dir: "Optional[str | Path]" = N
     return root if _safe_is_dir(root) else None
 
 
-def target_dir_name(repo_type: str, repo_id: str) -> str:
+def target_dir_name(repo_type: Optional[str], repo_id: str) -> str:
     return repo_cache_dir_name(repo_type, repo_id).lower()
 
 
-def repo_cache_dir_name(repo_type: str, repo_id: str) -> str:
+def repo_cache_dir_name(repo_type: Optional[str], repo_id: str) -> str:
+    # Hugging Face treats repo_type=None as the default "model"; mirror that here
+    # so a caller forwarding repo_type=None still resolves models--<id> (not
+    # Nones--<id>, which would make the cache-state probe miss real partials).
+    repo_type = repo_type or "model"
     return f"{repo_type}s--{repo_id.replace('/', '--')}"
 
 
@@ -170,20 +174,43 @@ def _repo_dir_has_broken_snapshot_symlinks(repo_dir: Path) -> bool:
     return False
 
 
+def _case_safe_repo_cache_dirs(root: Path, repo_type: Optional[str], repo_id: str) -> list:
+    """Cache dirs that can be safely attributed to this exact repo id.
+
+    The cache dir name is case-folded by the Hub, so a case-insensitive match is
+    needed for compatibility, but a bare case-insensitive match is unsafe: on a
+    case-sensitive filesystem ``models--Org--Repo`` and ``models--org--repo`` are
+    distinct repos. Prefer an exact-case match; otherwise accept a single
+    unambiguous folded match; on a 2+ way collision attribute to neither, so a
+    stale partial in one repo cannot be charged to the other (which would let the
+    watchdog kill an unrelated active download or HTTP-prep purge the wrong repo).
+    """
+    target = repo_cache_dir_name(repo_type, repo_id)
+    folded_target = target.lower()
+    try:
+        entries = [entry for entry in root.iterdir() if entry.name.lower() == folded_target]
+    except OSError:
+        return []
+    exact = [entry for entry in entries if entry.name == target]
+    if exact:
+        return exact
+    if len(entries) <= 1:
+        return entries
+    return []
+
+
 def iter_active_repo_cache_dirs(
-    repo_type: str, repo_id: str, *, cache_dir: "Optional[str | Path]" = None
+    repo_type: Optional[str], repo_id: str, *, cache_dir: "Optional[str | Path]" = None
 ) -> Iterator[Path]:
-    """Yield the repo's cache dir(s) under *cache_dir* (or the active ``HF_HUB_CACHE``)."""
+    """Yield the repo's cache dir(s) under *cache_dir* (or the active ``HF_HUB_CACHE``).
+
+    Case-collision safe (see ``_case_safe_repo_cache_dirs``), so both the read /
+    watchdog path and the destructive HTTP-prep path share one attribution rule.
+    """
     root = hf_cache_root(cache_dir = cache_dir)
     if root is None:
         return
-    target = target_dir_name(repo_type, repo_id)
-    try:
-        for entry in root.iterdir():
-            if entry.name.lower() == target:
-                yield entry
-    except OSError:
-        return
+    yield from _case_safe_repo_cache_dirs(root, repo_type, repo_id)
 
 
 def repo_cache_dir_has_incomplete_blobs(repo_dir: Path) -> bool:

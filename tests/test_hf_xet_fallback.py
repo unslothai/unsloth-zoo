@@ -259,6 +259,34 @@ def test_prepare_for_http_preserves_case_colliding_repo(tmp_path):
     assert lower_partial.exists(), "case-colliding repo's partial must be preserved"
 
 
+def test_repo_type_none_resolves_model_cache(hf_cache):
+    """A caller forwarding repo_type=None (HF's default model) must still see the
+    real models--<id> partial, not look up a bogus Nones--<id> dir."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "x.incomplete").write_bytes(b"abc")
+
+    model_state = xf.get_hf_download_state([REPO], repo_type = "model")
+    none_state = xf.get_hf_download_state([REPO], repo_type = None)
+    assert model_state == none_state
+    assert none_state[1] is True and none_state[0] > 0
+
+
+def test_state_ignores_case_colliding_repo_partial(tmp_path, monkeypatch):
+    """The read/watchdog path attributes a partial only to an exact-case repo dir,
+    so a stale partial in a case-colliding repo cannot trip the watchdog."""
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path))
+    exact = tmp_path / "models--Org--Repo" / "blobs"
+    other = tmp_path / "models--org--repo" / "blobs"
+    exact.mkdir(parents = True)
+    other.mkdir(parents = True)
+    if exact.parent.resolve() == other.parent.resolve():
+        pytest.skip("case-insensitive filesystem; cannot collide cache dirs")
+    (other / "stale.incomplete").write_bytes(b"x")  # only the lowercase repo
+
+    # Org/Repo has no partial of its own; the lowercase repo's must not count.
+    assert xf.get_hf_download_state(["Org/Repo"]) == (0, False)
+
+
 # --------------------------------------------------------------------------- #
 # Transport policy: cached short-circuit, cancel, error propagation, the single
 # Xet->HTTP fallback, the injected prepare seam, and the UNSLOTH_DISABLE_XET knob.
