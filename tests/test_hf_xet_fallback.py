@@ -287,6 +287,41 @@ def test_state_ignores_case_colliding_repo_partial(tmp_path, monkeypatch):
     assert xf.get_hf_download_state(["Org/Repo"]) == (0, False)
 
 
+def test_cache_dir_is_expanded(tmp_path, monkeypatch):
+    """A custom cache_dir with ~ must be expanded (as HF does on write), else the
+    state probe scans the literal '~/...' path and misses the partial."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home var
+    blobs = tmp_path / "hfcache" / f"models--{REPO.replace('/', '--')}" / "blobs"
+    blobs.mkdir(parents = True)
+    (blobs / "p.incomplete").write_bytes(b"abc")
+
+    total, has_incomplete = xf.get_hf_download_state([REPO], cache_dir = "~/hfcache")
+    assert has_incomplete is True and total > 0
+
+
+def test_status_callback_failure_does_not_kill_watchdog(hf_cache):
+    """A raising on_heartbeat (e.g. a disconnected client) must not stop the
+    daemon watchdog from detecting a real stall and firing on_stall."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "x.incomplete").write_bytes(b"\0" * 1024)  # constant size -> stalls
+
+    def boom(_message):
+        raise RuntimeError("client disconnected")
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, on_heartbeat = boom,
+        interval = 0.05, stall_timeout = 0.3,
+    )
+    try:
+        assert _wait(
+            lambda: len(calls) >= 1, timeout = 3.0
+        ), "a raising on_heartbeat killed stall detection"
+    finally:
+        stop.set()
+
+
 # --------------------------------------------------------------------------- #
 # Transport policy: cached short-circuit, cancel, error propagation, the single
 # Xet->HTTP fallback, the injected prepare seam, and the UNSLOTH_DISABLE_XET knob.

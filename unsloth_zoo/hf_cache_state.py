@@ -63,7 +63,9 @@ def hf_cache_root(*, create: bool = False, cache_dir: "Optional[str | Path]" = N
     ``unsloth_zoo.hf_cache.redirect_hf_cache_if_readonly``) is honored.
     """
     if cache_dir is not None:
-        root = Path(cache_dir)
+        # Match huggingface_hub, which expands ~ before writing; scanning the
+        # literal path would otherwise miss a partial under e.g. ~/hf-cache.
+        root = Path(cache_dir).expanduser()
     else:
         try:
             from huggingface_hub import constants as hf_constants

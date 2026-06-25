@@ -74,6 +74,19 @@ def _is_true(value: Optional[str]) -> bool:
     return value is not None and str(value).strip().lower() in _TRUTHY
 
 
+def _safe_status(callback: Optional[Callable[[str], None]], message: str) -> None:
+    """Invoke a caller status/heartbeat callback without letting it kill the
+    daemon watchdog thread. A disconnected Studio client can make on_status raise;
+    if that propagated, stall detection for a genuinely hung child would stop and
+    the HTTP retry would never fire."""
+    if callback is None:
+        return
+    try:
+        callback(message)
+    except Exception as e:
+        logger.debug("watchdog status callback raised (ignored): %s", e)
+
+
 class DownloadStallError(RuntimeError):
     """Raised when no download progress is observed for too long.
 
@@ -246,8 +259,7 @@ def start_watchdog(
                 # so a long unmeasurable gap cannot trip a false stall the instant
                 # the state becomes readable again.
                 last_change = now
-                if on_heartbeat is not None:
-                    on_heartbeat(f"Downloading ({transport} transport)...")
+                _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
                 continue
 
             current_size, has_incomplete = state
@@ -268,8 +280,7 @@ def start_watchdog(
                     )
                 return
 
-            if on_heartbeat is not None:
-                on_heartbeat(f"Downloading ({transport} transport)...")
+            _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
 
     threading.Thread(target = _beat, daemon = True, name = "hf-xet-watchdog").start()
     return stop
@@ -400,8 +411,12 @@ def _terminate_process_group(proc: "mp.process.BaseProcess", grace_period: float
 
     _signal_group(getattr(signal, "SIGTERM", signal.SIGINT))
     proc.join(timeout = grace_period)
+    # Always send the post-grace SIGKILL to the whole group, even if the Python
+    # leader already exited on SIGTERM: a Xet helper left in the group can keep
+    # the stalled writer alive while the parent starts HTTP cleanup. killpg on an
+    # already-dead group is a no-op (ProcessLookupError is caught in _signal_group).
+    _signal_group(getattr(signal, "SIGKILL", signal.SIGTERM))
     if proc.is_alive():
-        _signal_group(getattr(signal, "SIGKILL", signal.SIGTERM))
         proc.join(timeout = 5.0)
 
 
