@@ -520,6 +520,7 @@ class _FakeProc:
     def start(self):
         self._rec["disable_xet"] = os.environ.get("HF_HUB_DISABLE_XET")
         self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
+        self._rec["skip_gpu_init"] = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT")
 
     def is_alive(self):
         return False
@@ -584,6 +585,23 @@ def test_xet_attempt_does_not_force_disable_before_spawn(monkeypatch):
     )
     # On the Xet-first attempt we must NOT force-disable Xet for the child.
     assert rec["disable_xet"] is None
+
+
+def test_child_skips_gpu_init_env_set_before_spawn_and_restored(monkeypatch):
+    """The download child inherits UNSLOTH_ZOO_DISABLE_GPU_INIT=1 at spawn (so its
+    fresh unsloth_zoo import skips heavy torch/transformers init), and the parent's
+    env is restored afterwards."""
+    monkeypatch.delenv("UNSLOTH_ZOO_DISABLE_GPU_INIT", raising = False)
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert rec["skip_gpu_init"] == "1"  # set in the parent before proc.start()
+    assert "UNSLOTH_ZOO_DISABLE_GPU_INIT" not in os.environ  # restored after
 
 
 # --------------------------------------------------------------------------- #

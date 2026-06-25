@@ -457,7 +457,13 @@ def _run_download_attempt(
     # and a spawn child re-imports the (heavy) unsloth_zoo package -- importing
     # huggingface_hub -- before the child body runs, so a child-side os.environ
     # assignment would land too late. The child still sets it too, defensively.
-    child_env = {"HF_HUB_DISABLE_PROGRESS_BARS": "1"}
+    child_env = {
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        # The download child is a fresh spawn interpreter that only needs
+        # huggingface_hub; tell unsloth_zoo's __init__ to skip its heavy torch /
+        # transformers / device init in that process (the parent keeps full init).
+        "UNSLOTH_ZOO_DISABLE_GPU_INIT": "1",
+    }
     if disable_xet:
         child_env["HF_HUB_DISABLE_XET"] = "1"
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"

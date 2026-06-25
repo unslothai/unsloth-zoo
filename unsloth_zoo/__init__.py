@@ -132,20 +132,31 @@ if _is_mlx_only:
     ALLOW_PREQUANTIZED_MODELS = True
     del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
+    _IS_MLX = True
     _SKIP_GPU_INIT = True
 else:
-    _SKIP_GPU_INIT = False
+    _IS_MLX = False
+    # Opt-in lightweight import. A short-lived helper subprocess that only needs
+    # the cache/download utilities (e.g. the unsloth_zoo.hf_xet_fallback download
+    # child) can set UNSLOTH_ZOO_DISABLE_GPU_INIT=1 to skip the heavy torch /
+    # transformers / device init it never uses. Off by default, so normal
+    # CUDA/CPU runs are byte-for-byte unchanged; the parent only sets it around
+    # spawning that child, never for a training/inference process. The
+    # unconditional HF cache redirect above still runs, so the child writes to the
+    # same cache as the parent.
+    _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
 
-# Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
-# CUDA-only imports don't error at startup. _SKIP_GPU_INIT is True only on
-# Darwin/arm64 with mlx installed (the exact case stubs are needed).
-if _SKIP_GPU_INIT:
+# Inject triton & bitsandbytes stubs only on Apple Silicon with MLX so unsloth's
+# CUDA-only imports don't error at startup (the generic light-import path never
+# imports triton/bitsandbytes, so it must not mask the real modules).
+if _IS_MLX:
     from .stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
     from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
     _inject_bnb()
     del _inject_triton, _inject_bnb
+del _IS_MLX
 
 # Lazy bridge for downstream code that still imports the old flat MLX module
 # names. Installed on every host so external scripts don't hit a hard
