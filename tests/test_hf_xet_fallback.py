@@ -44,7 +44,7 @@ if "unsloth_zoo" not in sys.modules:
     _pkg.__path__ = [str(_ZOO_DIR)]
     sys.modules["unsloth_zoo"] = _pkg
 
-_load("unsloth_zoo.hf_cache_state", "hf_cache_state.py")
+hcs = _load("unsloth_zoo.hf_cache_state", "hf_cache_state.py")
 xf = _load("unsloth_zoo.hf_xet_fallback", "hf_xet_fallback.py")
 
 # Real prep impl, captured before the autouse fixture stubs the module attribute.
@@ -236,6 +236,74 @@ def test_prepare_for_http_clears_broken_snapshot_symlink(tmp_path):
     _REAL_DEFAULT_PREPARE("model", repo, cache_dir = str(tmp_path))
 
     assert not link.is_symlink(), "broken snapshot symlink not cleared by HTTP prep"
+    assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, False)
+
+
+def test_snapshot_dir_has_broken_symlinks_unit(tmp_path):
+    """The new per-snapshot primitive flags a dangling link and is clean otherwise."""
+    snap = tmp_path / "snapshots" / "sha"
+    snap.mkdir(parents = True)
+    good = snap / "config.json"
+    good.write_text("{}")
+    assert hcs.snapshot_dir_has_broken_symlinks(snap) is False
+    (snap / "model.safetensors").symlink_to(tmp_path / "blobs" / "missing")
+    assert hcs.snapshot_dir_has_broken_symlinks(snap) is True
+
+
+def test_broken_older_snapshot_detected_when_newer_is_clean(tmp_path):
+    """Detector must inspect every snapshot, not just the newest by mtime: an older
+    revision with a dangling symlink must read as incomplete even when a more
+    recently landed snapshot is fully present."""
+    repo = "ztest/two-snaps"
+    repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
+    old = repo_dir / "snapshots" / "oldsha"
+    new = repo_dir / "snapshots" / "newsha"
+    old.mkdir(parents = True)
+    new.mkdir(parents = True)
+    # Broken (older) revision; clean (newer) revision.
+    (old / "model.safetensors").symlink_to(repo_dir / "blobs" / "missing")
+    (new / "config.json").write_text("{}")
+    # Make the clean snapshot the newest by mtime so a latest-only check would
+    # report the repo healthy.
+    os.utime(new, (time.time() + 10, time.time() + 10))
+    assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, True)
+
+
+def test_snapshot_fast_path_rejects_broken_requested_revision(tmp_path, monkeypatch):
+    """snapshot_download(local_files_only=True) can hand back an older requested
+    revision whose snapshot is broken while the repo-wide scan is clean. The fast
+    path must validate the EXACT returned dir and complete in the killable child
+    rather than short-circuiting to a snapshot with missing files."""
+    snap = tmp_path / "snapshots" / "oldsha"
+    snap.mkdir(parents = True)
+    (snap / "model.safetensors").symlink_to(tmp_path / "blobs" / "missing")  # dangling
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(snap))
+    # Repo-wide incomplete-blob scan sees nothing (empty cache root), so only the
+    # per-revision symlink check can catch the broken returned dir.
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path / "empty-cache"))
+    fake = _install(monkeypatch, [("ok", "/cache/snap-fresh")])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert out == "/cache/snap-fresh", "fast path returned a broken requested revision"
+    assert len(fake.calls) == 1
+
+
+def test_prepare_for_http_clears_broken_symlink_in_older_snapshot(tmp_path):
+    """HTTP prep must clear dangling links across all snapshots, not just the
+    newest, so the incomplete detector reads clean afterwards."""
+    repo = "ztest/old-broken"
+    repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
+    old = repo_dir / "snapshots" / "oldsha"
+    new = repo_dir / "snapshots" / "newsha"
+    old.mkdir(parents = True)
+    new.mkdir(parents = True)
+    link = old / "model.safetensors"
+    link.symlink_to(repo_dir / "blobs" / "missing")  # dangling, older snapshot
+    (new / "config.json").write_text("{}")
+    os.utime(new, (time.time() + 10, time.time() + 10))  # newer snapshot is clean
+
+    assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, True)
+    _REAL_DEFAULT_PREPARE("model", repo, cache_dir = str(tmp_path))
+    assert not link.is_symlink(), "broken symlink in older snapshot not cleared"
     assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, False)
 
 

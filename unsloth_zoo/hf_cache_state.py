@@ -35,6 +35,7 @@ __all__ = [
     "repo_cache_dir_name",
     "blob_bytes_present",
     "latest_snapshot_dir",
+    "snapshot_dir_has_broken_symlinks",
     "iter_active_repo_cache_dirs",
     "repo_cache_dir_has_incomplete_blobs",
     "has_active_incomplete_blobs",
@@ -163,17 +164,40 @@ def latest_snapshot_dir(repo_dir: Path) -> Optional[Path]:
         return None
 
 
-def _repo_dir_has_broken_snapshot_symlinks(repo_dir: Path) -> bool:
-    latest = latest_snapshot_dir(repo_dir)
-    if latest is None:
-        return False
+def snapshot_dir_has_broken_symlinks(snapshot_dir: Path) -> bool:
+    """True if *snapshot_dir* contains a dangling symlink -- a file the snapshot
+    references whose blob is missing or still an ``.incomplete`` partial, i.e. an
+    interrupted download. Used to validate one specific (caller-requested)
+    revision, not just the newest one on disk."""
     try:
-        for entry in latest.rglob("*"):
+        for entry in snapshot_dir.rglob("*"):
             if entry.is_symlink() and not entry.exists():
                 return True
     except OSError:
         return False
     return False
+
+
+def _iter_snapshot_dirs(repo_dir: Path) -> Iterator[Path]:
+    snapshots_dir = repo_dir / "snapshots"
+    try:
+        if not snapshots_dir.is_dir():
+            return
+        children = [entry for entry in snapshots_dir.iterdir() if entry.is_dir()]
+    except OSError:
+        return
+    yield from children
+
+
+def _repo_dir_has_broken_snapshot_symlinks(repo_dir: Path) -> bool:
+    # Check every snapshot, not just the newest by mtime: a caller may request an
+    # older revision whose snapshot is broken while a more recent one is clean, so
+    # a latest-only check would report the repo healthy and let the interrupted
+    # revision load with missing files.
+    return any(
+        snapshot_dir_has_broken_symlinks(snapshot)
+        for snapshot in _iter_snapshot_dirs(repo_dir)
+    )
 
 
 def _case_safe_repo_cache_dirs(root: Path, repo_type: Optional[str], repo_id: str) -> list:

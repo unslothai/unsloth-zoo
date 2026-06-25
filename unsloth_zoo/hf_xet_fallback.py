@@ -43,6 +43,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from unsloth_zoo.hf_cache_state import (
@@ -51,7 +52,7 @@ from unsloth_zoo.hf_cache_state import (
     has_active_incomplete_blobs,
     hf_cache_root,
     iter_active_repo_cache_dirs,
-    latest_snapshot_dir,
+    snapshot_dir_has_broken_symlinks,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,18 +168,25 @@ def _default_prepare_for_http(
                             continue
             # repo_cache_dir_has_incomplete_blobs() also flags a broken snapshot
             # symlink as active incomplete state; clear those too so the detector
-            # reads clean after prep.
-            latest = latest_snapshot_dir(entry)
-            if latest is not None:
+            # reads clean after prep. Sweep EVERY snapshot, not just the newest:
+            # the broken-symlink detector now inspects all of them, so a stale
+            # dangling link under an older revision would otherwise keep the repo
+            # marked incomplete after prep and re-trip the watchdog.
+            snapshots_dir = entry / "snapshots"
+            try:
+                snapshot_dirs = [s for s in snapshots_dir.iterdir() if s.is_dir()]
+            except OSError:
+                snapshot_dirs = []
+            for snapshot in snapshot_dirs:
                 try:
-                    for link in latest.rglob("*"):
+                    for link in snapshot.rglob("*"):
                         if link.is_symlink() and not link.exists():
                             try:
                                 link.unlink()
                             except OSError:
                                 continue
                 except OSError:
-                    pass
+                    continue
     except Exception as e:
         logger.debug("default prepare_for_http failed for %s: %s", repo_id, e)
 
@@ -379,7 +387,13 @@ def _download_child_entry(
         try:
             from huggingface_hub.constants import HF_HUB_CACHE
 
-            blobs = os.path.join(HF_HUB_CACHE, "models--" + repo_id.replace("/", "--"), "blobs")
+            # Write the fake partial under the SAME cache the watchdog scans
+            # (params["cache_dir"] when the caller set one, else HF_HUB_CACHE) and
+            # under the repo_type-correct dir name, so has_active_incomplete_blobs
+            # sees it and the stall/HTTP fallback actually fires in tests.
+            cache_root = params.get("cache_dir") or HF_HUB_CACHE
+            repo_dir_name = f"{repo_type or 'model'}s--" + repo_id.replace("/", "--")
+            blobs = os.path.join(cache_root, repo_dir_name, "blobs")
             os.makedirs(blobs, exist_ok = True)
             with open(os.path.join(blobs, "xet-force-stall.incomplete"), "wb") as fh:
                 fh.write(b"\0" * 4096)
@@ -764,7 +778,13 @@ def snapshot_download_with_xet_fallback(
             # left .incomplete blobs or broken symlinks. Only short-circuit when
             # the cache is actually clean; otherwise complete it in the killable
             # child so the in-process load does not proceed with missing files.
-            if not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir):
+            # Validate the EXACT returned revision dir (snapshot_download may hand
+            # back an older requested revision while a newer one is clean), plus
+            # the repo-wide .incomplete blob check.
+            if (
+                not snapshot_dir_has_broken_symlinks(Path(cached_dir))
+                and not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir)
+            ):
                 return cached_dir
             logger.debug("Cached snapshot for %s has incomplete state; downloading.", repo_id)
         except Exception as e:
