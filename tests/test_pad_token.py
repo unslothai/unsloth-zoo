@@ -21,16 +21,32 @@ fix_pad_token = _pad_token.fix_pad_token
 _is_pad_named = _pad_token._is_pad_named
 
 
+class _AddedToken:
+    """Stand-in for transformers' AddedToken (content + special flag)."""
+
+    def __init__(self, content, special):
+        self.content = content
+        self.special = special
+
+    def __str__(self):
+        return self.content
+
+
 class FakeTokenizer:
     """Minimal stand-in: vocab is a {token: id} dict; reserved tokens are 'added'."""
 
-    def __init__(self, vocab, pad_token, eos_token, added=None):
+    def __init__(self, vocab, pad_token, eos_token, added=None, non_special=()):
         self._vocab = dict(vocab)
         self.pad_token = pad_token
         self.eos_token = eos_token
-        # added_tokens_decoder maps id -> token content (subset treated as "added")
+        # added_tokens_decoder maps id -> AddedToken; tokens in non_special are
+        # ordinary add_tokens() entries (special=False), the rest are special.
         added = added if added is not None else list(vocab)
-        self.added_tokens_decoder = {self._vocab[t]: t for t in added if t in self._vocab}
+        non_special = set(non_special)
+        self.added_tokens_decoder = {
+            self._vocab[t]: _AddedToken(t, special=t not in non_special)
+            for t in added if t in self._vocab
+        }
 
     # ids
     @property
@@ -53,7 +69,7 @@ class FakeTokenizer:
         tok = mapping["pad_token"]
         if tok not in self._vocab:
             self._vocab[tok] = max(self._vocab.values()) + 1
-            self.added_tokens_decoder[self._vocab[tok]] = tok
+            self.added_tokens_decoder[self._vocab[tok]] = _AddedToken(tok, special=True)
         self.pad_token = tok
 
 
@@ -209,3 +225,24 @@ def test_audio_pad_is_kept():
     tok = FakeTokenizer({"<|im_end|>": 1, "<|audio_pad|>": 2},
                         pad_token = "<|audio_pad|>", eos_token = "<|im_end|>")
     assert fix_pad_token(tok)["changed"] is False
+
+
+def test_pad_name_fallback_ignores_non_special_added_token():
+    # pad == eos; "keypad" is an ordinary (non-special) added token and must not be
+    # promoted, while the special <|custom_pad|> is picked.
+    tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5, "<|custom_pad|>": 6},
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
+                        non_special = ["keypad"])
+    res = fix_pad_token(tok)
+    assert res["changed"] and tok.pad_token == "<|custom_pad|>"
+
+
+def test_non_special_pad_name_not_promoted_when_only_option():
+    # pad == eos and the only "*pad*" token is a non-special ordinary token -> do not
+    # promote it; with allow_add=False the repair defers and leaves pad unchanged.
+    tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5},
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
+                        non_special = ["keypad"])
+    res = fix_pad_token(tok, allow_add = False)
+    assert res["changed"] is False
+    assert tok.pad_token == "<|endoftext|>"

@@ -136,12 +136,15 @@ def _single_token_id(inner, token, vocab_size):
 
 
 def _find_reserved_pad(inner, eos_token, vocab_size):
-    """Pick the best reserved/pad-named token already in the vocab, or None."""
+    """Pick the best reserved/pad-named special token already in the vocab, or None."""
     try:
-        added = [_token_content(t) for t in inner.added_tokens_decoder.values()]
+        decoder = inner.added_tokens_decoder.values()
     except Exception:
         return None
-    # Newest tokens last; reverse so reserved blocks are scanned high-id first.
+    # Only special tokens are eligible: added_tokens_decoder also holds ordinary
+    # add_tokens() entries, and an everyday token like "keypad" must never become
+    # the pad (it would be masked out of attention/loss). Newest first.
+    added = [_token_content(t) for t in decoder if getattr(t, "special", True)]
     added = [a for a in added if a][::-1]
 
     # Modality pads are valid on any model; appended as last-resort candidates.
@@ -160,8 +163,8 @@ def _find_reserved_pad(inner, eos_token, vocab_size):
             if _single_token_id(inner, candidate, vocab_size) is not None:
                 return candidate
 
-    # Last resort: any added "*pad*" token (e.g. <|fim_pad|>). Only added tokens are
-    # scanned, never the vocab, so words like "padding" can't be picked.
+    # Last resort: any special token whose name contains "pad" and is not in a
+    # curated family above.
     for candidate in added:
         if candidate == eos_token or not _is_pad_named(candidate):
             continue
