@@ -83,9 +83,12 @@ def _qwen3_text():
 
 
 def test_is_pad_named():
+    # Bracketed pad sentinels qualify ...
     for t in ("<|vision_pad|>", "<|fim_pad|>", "[PAD]", "<pad>", "<|PAD|>"):
         assert _is_pad_named(t)
-    for t in ("<|endoftext|>", "<|im_end|>", "<unk>"):
+    # ... ordinary words containing "pad" and non-pad tokens do not.
+    for t in ("keypad", "padding", "Notepad", "pad",
+              "<|endoftext|>", "<|im_end|>", "<unk>"):
         assert not _is_pad_named(t)
 
 
@@ -227,22 +230,30 @@ def test_audio_pad_is_kept():
     assert fix_pad_token(tok)["changed"] is False
 
 
-def test_pad_name_fallback_ignores_non_special_added_token():
-    # pad == eos; "keypad" is an ordinary (non-special) added token and must not be
-    # promoted, while the special <|custom_pad|> is picked.
+def test_pad_name_fallback_ignores_bare_word_token():
+    # pad == eos; "keypad" is a bare word (not a bracketed sentinel) and must not be
+    # promoted, while the bracketed <|custom_pad|> is picked.
     tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5, "<|custom_pad|>": 6},
-                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
-                        non_special = ["keypad"])
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
     res = fix_pad_token(tok)
     assert res["changed"] and tok.pad_token == "<|custom_pad|>"
 
 
-def test_non_special_pad_name_not_promoted_when_only_option():
-    # pad == eos and the only "*pad*" token is a non-special ordinary token -> do not
-    # promote it; with allow_add=False the repair defers and leaves pad unchanged.
+def test_bare_word_pad_name_not_promoted_when_only_option():
+    # pad == eos and the only "*pad*" token is a bare word -> do not promote it;
+    # with allow_add=False the repair defers and leaves pad unchanged.
     tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5},
-                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
-                        non_special = ["keypad"])
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
     res = fix_pad_token(tok, allow_add = False)
     assert res["changed"] is False
     assert tok.pad_token == "<|endoftext|>"
+
+
+def test_non_special_fim_pad_is_eligible():
+    # A pipe-wrapped FIM pad is a valid replacement even when the tokenizer marks it
+    # special=False (Qwen does), since eligibility is by sentinel form, not the flag.
+    tok = FakeTokenizer({"<|endoftext|>": 0, "<|fim_pad|>": 6},
+                        pad_token = "<|endoftext|>", eos_token = "<|endoftext|>",
+                        non_special = ["<|fim_pad|>"])
+    res = fix_pad_token(tok)
+    assert res["changed"] and tok.pad_token == "<|fim_pad|>"

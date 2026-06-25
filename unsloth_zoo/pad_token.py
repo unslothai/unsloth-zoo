@@ -79,8 +79,13 @@ def _token_content(token):
 
 
 def _is_pad_named(token):
-    """True if the token name contains "pad" (e.g. <|vision_pad|>, <|fim_pad|>, [PAD])."""
-    return "pad" in _token_content(token).lower()
+    """True if the token is a dedicated pad sentinel: contains "pad" and is bracketed
+    (e.g. <|vision_pad|>, <|fim_pad|>, <pad>, [PAD]), not an ordinary word like
+    "keypad". The bracket form, not the unreliable `.special` flag (Qwen marks
+    <|fim_pad|> non-special), is what distinguishes a sentinel from a real word."""
+    content = _token_content(token)
+    return ("pad" in content.lower()
+            and content.startswith(("<", "[")) and content.endswith(_CLOSERS))
 
 
 def _resolve_inner(tokenizer):
@@ -136,15 +141,12 @@ def _single_token_id(inner, token, vocab_size):
 
 
 def _find_reserved_pad(inner, eos_token, vocab_size):
-    """Pick the best reserved/pad-named special token already in the vocab, or None."""
+    """Pick the best reserved/pad-named token already in the vocab, or None."""
     try:
-        decoder = inner.added_tokens_decoder.values()
+        added = [_token_content(t) for t in inner.added_tokens_decoder.values()]
     except Exception:
         return None
-    # Only special tokens are eligible: added_tokens_decoder also holds ordinary
-    # add_tokens() entries, and an everyday token like "keypad" must never become
-    # the pad (it would be masked out of attention/loss). Newest first.
-    added = [_token_content(t) for t in decoder if getattr(t, "special", True)]
+    # Newest tokens last; reverse so reserved blocks are scanned high-id first.
     added = [a for a in added if a][::-1]
 
     # Modality pads are valid on any model; appended as last-resort candidates.
@@ -163,8 +165,10 @@ def _find_reserved_pad(inner, eos_token, vocab_size):
             if _single_token_id(inner, candidate, vocab_size) is not None:
                 return candidate
 
-    # Last resort: any special token whose name contains "pad" and is not in a
-    # curated family above.
+    # Last resort: any pad sentinel (a bracketed "*pad*" token such as <|fim_pad|>)
+    # not in a curated family above. The bracket form in _is_pad_named excludes
+    # ordinary added words like "keypad" / "padding" that would be masked out of
+    # attention and loss if promoted.
     for candidate in added:
         if candidate == eos_token or not _is_pad_named(candidate):
             continue
