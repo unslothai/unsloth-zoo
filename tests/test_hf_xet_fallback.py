@@ -840,14 +840,24 @@ def test_file_download_defaults_token_to_none(monkeypatch):
     assert out == "/cache/x" and len(fake.calls) == 1
 
 
-def test_incomplete_cached_snapshot_not_short_circuited(hf_cache, monkeypatch):
-    """A cached-but-incomplete snapshot (interrupted download) must not take the
-    fast path; it must complete in the killable child instead."""
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: "/cache/snap")
-    (_blobs_dir(hf_cache, DL_REPO) / "x.incomplete").write_bytes(b"abc")  # active partial
-    fake = _install(monkeypatch, [("ok", "/cache/snap-fresh")])
+def test_unrelated_partial_does_not_block_clean_cached_snapshot(hf_cache, monkeypatch):
+    """A clean requested snapshot must short-circuit in-process even when the same
+    repo cache holds a stale .incomplete from another (unrelated) revision: the fast
+    path validates only the returned snapshot dir, not the whole repo, so a sibling
+    mid-download does not force a needless re-fetch of a snapshot that is complete."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    repo_dir = blobs.parent
+    snap = repo_dir / "snapshots" / "goodsha"
+    snap.mkdir(parents = True)
+    good = blobs / "good"
+    good.write_bytes(b"weights")
+    (snap / "model.safetensors").symlink_to(good)        # resolves -> snapshot is clean
+    (blobs / "other.incomplete").write_bytes(b"abc")     # unrelated stale partial
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(snap))
+    fake = _install(monkeypatch, [])                     # must NOT spawn a child
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
-    assert out == "/cache/snap-fresh" and len(fake.calls) == 1
+    assert out == str(snap), "clean cached snapshot rejected by an unrelated partial"
+    assert fake.calls == [], "spawned a download despite a clean requested snapshot"
 
 
 def test_retry_status_failure_does_not_abort_fallback(monkeypatch):

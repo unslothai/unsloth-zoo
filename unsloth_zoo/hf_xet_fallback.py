@@ -863,16 +863,15 @@ def snapshot_download_with_xet_fallback(
             )
             # local_files_only returns a snapshot dir whenever refs/<rev> and
             # snapshots/<sha> exist, even if a prior download was interrupted and
-            # left .incomplete blobs or broken symlinks. Only short-circuit when
-            # the cache is actually clean; otherwise complete it in the killable
-            # child so the in-process load does not proceed with missing files.
-            # Validate the EXACT returned revision dir (snapshot_download may hand
-            # back an older requested revision while a newer one is clean), plus
-            # the repo-wide .incomplete blob check.
-            if (
-                not snapshot_dir_has_broken_symlinks(Path(cached_dir))
-                and not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir)
-            ):
+            # left broken symlinks. Validate the EXACT returned revision dir (a
+            # dangling symlink there means a referenced blob is missing or still an
+            # .incomplete partial); if broken, complete it in the killable child so
+            # the in-process load never proceeds with missing files. Scope the check
+            # to the returned snapshot, NOT the whole repo: snapshot_download already
+            # validated this exact revision, so an unrelated revision mid-download (a
+            # stale .incomplete blob or a broken older snapshot elsewhere in the same
+            # repo cache) must not force a needless re-fetch of a complete snapshot.
+            if not snapshot_dir_has_broken_symlinks(Path(cached_dir)):
                 return cached_dir
             logger.debug("Cached snapshot for %s has incomplete state; downloading.", repo_id)
         except Exception as e:
