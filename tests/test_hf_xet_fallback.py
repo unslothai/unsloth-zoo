@@ -183,6 +183,21 @@ def test_get_state_sparse_aware(hf_cache):
     assert total < st.st_size, "sparse partial counted at apparent size, not allocated blocks"
 
 
+def test_blob_bytes_present_zero_blocks_is_zero(tmp_path):
+    """A freshly truncated, fully-sparse .incomplete reports st_size > 0 with 0
+    allocated blocks; it must count as 0 bytes present, not full size (a > 0 guard
+    would mis-read an empty partial as complete)."""
+    p = tmp_path / "sparse.incomplete"
+    with open(p, "wb") as f:
+        f.truncate(8 * 1024 * 1024)  # apparent 8 MiB, nothing actually written
+    st = p.stat()
+    if getattr(st, "st_blocks", None) is None:
+        pytest.skip("st_blocks not reported on this platform")
+    if st.st_blocks != 0:
+        pytest.skip("filesystem pre-allocated blocks for the sparse file")
+    assert hcs.blob_bytes_present(p) == 0
+
+
 def test_custom_cache_dir_is_watched_and_cleaned(tmp_path, monkeypatch):
     """A stall under a caller-supplied snapshot ``cache_dir`` (not HF_HUB_CACHE)
     must still be seen by the state probe, the watchdog, and the HTTP-prep purge."""

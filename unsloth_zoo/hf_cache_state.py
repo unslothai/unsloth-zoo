@@ -110,8 +110,12 @@ def blob_bytes_present(path: Path) -> int:
     ``st_blocks``, falling back to ``st_size`` where it is unreported (Windows,
     some network filesystems)."""
     st = path.stat()
-    blocks = getattr(st, "st_blocks", 0)
-    if blocks > 0:
+    blocks = getattr(st, "st_blocks", None)
+    if blocks is not None:
+        # st_blocks is reported (POSIX): trust it even when 0. A freshly truncated
+        # sparse .incomplete reports st_size == full but 0 allocated blocks, and
+        # must count as 0 bytes present, not full size (a > 0 guard would fall
+        # through to st_size and read an empty partial as complete).
         return min(blocks * 512, st.st_size)
     if sys.platform == "win32":
         allocated = _windows_allocated_size(path)
