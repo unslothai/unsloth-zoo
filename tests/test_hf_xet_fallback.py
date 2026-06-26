@@ -355,6 +355,23 @@ def test_state_ignores_case_colliding_repo_partial(tmp_path, monkeypatch):
     assert xf.get_hf_download_state(["Org/Repo"]) == (0, False)
 
 
+def test_single_folded_match_rejected_on_case_sensitive_fs(tmp_path, monkeypatch):
+    """A single folded-but-not-exact cache dir must not be attributed to a
+    differently-cased repo on a case-sensitive filesystem -- it is a different
+    repo, and charging its partial here could misread the watchdog or let HTTP-prep
+    delete it. Only an exact-case dir (or a folded dir the FS resolves to the same
+    entry on a case-insensitive FS) counts."""
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path))
+    lower = tmp_path / "models--org--repo" / "blobs"
+    lower.mkdir(parents = True)
+    if (tmp_path / "models--Org--Repo").exists():
+        pytest.skip("case-insensitive filesystem; the folded dir is the same entry")
+    (lower / "stale.incomplete").write_bytes(b"x")  # only the lowercase repo exists
+    # Request the exact-case repo, which has no dir of its own: the lowercase repo's
+    # partial must not be attributed to it.
+    assert xf.get_hf_download_state(["Org/Repo"]) == (0, False)
+
+
 def test_cache_dir_is_expanded(tmp_path, monkeypatch):
     """A custom cache_dir with ~ must be expanded (as HF does on write), else the
     state probe scans the literal '~/...' path and misses the partial."""
@@ -695,6 +712,75 @@ def test_scrub_secrets_handles_boolean_token():
     """token=True ("use the cached token") must not crash the child error scrubber."""
     out = xf._default_scrub_secrets("auth failed for hf_abcdefghij", hf_token = True)
     assert "hf_abcdefghij" not in out and "***" in out
+
+
+def test_scrub_redacts_presigned_url():
+    """A presigned S3/CAS blob URL in a child error carries temporary credentials in
+    its query string; the default scrubber must redact the query before it is
+    raised/logged in the parent, while leaving non-signed URLs intact."""
+    url = (
+        "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc/def"
+        "?X-Amz-Signature=deadbeefcafe&X-Amz-Credential=AKIAEXAMPLE123"
+    )
+    out = xf._default_scrub_secrets(f"403 Client Error for url: {url}")
+    assert "X-Amz-Signature" not in out
+    assert "deadbeefcafe" not in out and "AKIAEXAMPLE123" not in out
+    assert "cas-bridge.xethub.hf.co/xet-bridge-us/abc/def?***" in out
+    # A non-signed URL keeps its (harmless) query string.
+    plain = xf._default_scrub_secrets("see https://huggingface.co/org/repo?download=true now")
+    assert "download=true" in plain
+
+
+def test_local_files_only_file_resolves_in_process(monkeypatch):
+    """local_files_only resolves the single file from cache in-process and never
+    spawns a network child (Hugging Face offline semantics)."""
+    seen = {}
+
+    def _dl(*a, **k):
+        seen.update(k)
+        return "/cache/file.gguf"
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _dl)
+    fake = _install(monkeypatch, [])  # the download seam must not be called
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, local_files_only = True)
+    assert out == "/cache/file.gguf"
+    assert seen.get("local_files_only") is True
+    assert fake.calls == [], "local_files_only must not spawn a download child"
+
+
+def test_local_files_only_snapshot_resolves_in_process(monkeypatch):
+    seen = {}
+
+    def _snap(*a, **k):
+        seen.update(k)
+        return "/cache/snap"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _snap)
+    fake = _install(monkeypatch, [])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, local_files_only = True)
+    assert out == "/cache/snap"
+    assert seen.get("local_files_only") is True
+    assert fake.calls == [], "local_files_only must not spawn a download child"
+
+
+def test_file_probe_uses_expanded_cache_dir(monkeypatch, tmp_path):
+    """The single-file cache probe must use the expanded cache_dir (HF expands ~
+    before writing), or a finalized file under ~/hf-cache is missed and a child is
+    spawned for an already-cached file."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows home var
+    seen = {}
+
+    def _probe(repo_id, filename, *, repo_type, revision, cache_dir):
+        seen["cache_dir"] = cache_dir
+        return None  # not cached -> falls through to the (faked) download seam
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _probe)
+    fake = _install(monkeypatch, [("ok", "/cache/x")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, cache_dir = "~/hfcache")
+    assert seen["cache_dir"] == str(tmp_path / "hfcache")
+    # The expanded cache_dir is also what the download attempt receives.
+    assert fake.calls[0].cache_dir == str(tmp_path / "hfcache")
 
 
 def test_file_download_defaults_token_to_none(monkeypatch):

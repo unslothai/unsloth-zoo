@@ -138,6 +138,20 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
         out = out.replace(hf_token, "***")
     out = re.sub(r"hf_[A-Za-z0-9]{8,}", "***", out)
     out = re.sub(r"([Bb]earer\s+)[A-Za-z0-9._\-]+", r"\1***", out)
+    # HF download errors can embed the presigned S3/CAS blob URL, whose query
+    # string carries temporary credentials (X-Amz-Signature, sig, token, ...).
+    # Redact the query of any URL that looks signed so it is not echoed back to
+    # the parent and logged. Non-signed URLs (e.g. ...?download=true) are kept.
+    def _redact_signed_query(match: "re.Match") -> str:
+        base, query = match.group(1), match.group(2)
+        if re.search(
+            r"(X-Amz-|[Ss]ignature|(?:^|&)(?:sig|token|key|Expires|Policy|Key-Pair-Id)=)",
+            query,
+        ):
+            return f"{base}?***"
+        return match.group(0)
+
+    out = re.sub(r"(https?://[^\s?]+)\?([^\s]*)", _redact_signed_query, out)
     return out
 
 
@@ -503,9 +517,18 @@ def _run_download_attempt(
         # as __mp_main__ instead of re-executing the caller's script.
         main_module = sys.modules.get("__main__")
         saved_main_file = _UNSET
+        saved_main_spec = _UNSET
         if main_module is not None:
             saved_main_file = getattr(main_module, "__file__", _UNSET)
             main_module.__file__ = __file__
+            # When the caller was launched as a module (python -m pkg), spawn's
+            # preparation prefers __main__.__spec__.name over __file__ and re-imports
+            # the user's module BY NAME -> re-runs its top-level from_pretrained in
+            # the child and hits the bootstrapping error. Clearing __spec__ forces
+            # the path branch, which uses the __file__ we just repointed at this
+            # side-effect-free helper module.
+            saved_main_spec = getattr(main_module, "__spec__", _UNSET)
+            main_module.__spec__ = None
         try:
             os.environ.update(child_env)
             proc.start()
@@ -524,6 +547,13 @@ def _run_download_attempt(
                         pass
                 else:
                     main_module.__file__ = saved_main_file
+                if saved_main_spec is _UNSET:
+                    try:
+                        delattr(main_module, "__spec__")
+                    except AttributeError:
+                        pass
+                else:
+                    main_module.__spec__ = saved_main_spec
 
     # Bind the child to the parent lifetime when running under Studio (best-effort).
     try:
@@ -688,6 +718,7 @@ def hf_hub_download_with_xet_fallback(
     revision: Optional[str] = None,
     cache_dir: Optional[str] = None,
     force_download: bool = False,
+    local_files_only: bool = False,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     grace_period: float = DEFAULT_GRACE_PERIOD,
@@ -700,8 +731,29 @@ def hf_hub_download_with_xet_fallback(
     *cancel_event* is set, re-raises a deterministic child error unchanged (no
     fallback), and raises ``DownloadStallError`` only if BOTH transports stall.
     ``force_download=True`` re-fetches even if cached (skips the cache short-circuit).
+    ``local_files_only=True`` resolves from cache in-process and never spawns a
+    network child (matching Hugging Face offline semantics).
     """
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
+    # Expand ~ as huggingface_hub does before writing, so the cache probe below and
+    # the child both resolve to the same on-disk location (else a warm ~/hf-cache
+    # is missed and we spawn a child for an already-cached file).
+    if isinstance(cache_dir, str):
+        cache_dir = os.path.expanduser(cache_dir)
+    # Offline: resolve purely from the local cache, never reaching the network. HF
+    # raises LocalEntryNotFoundError if it is not cached; let that propagate.
+    if local_files_only:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(
+            repo_id = repo_id,
+            filename = filename,
+            token = token,
+            repo_type = repo_type,
+            revision = revision,
+            cache_dir = cache_dir,
+            local_files_only = True,
+        )
     # Finalized blob already cached: return it with no child and no network
     # (skipped when force_download re-fetches unconditionally).
     if not force_download:
@@ -748,6 +800,7 @@ def snapshot_download_with_xet_fallback(
     allow_patterns: Optional[Any] = None,
     ignore_patterns: Optional[Any] = None,
     force_download: bool = False,
+    local_files_only: bool = False,
     cancel_event: Optional[threading.Event] = None,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
@@ -763,8 +816,28 @@ def snapshot_download_with_xet_fallback(
     hang on a native Xet thread). A fully cached repo short-circuits in-process
     via ``local_files_only`` with no child and no network. ``force_download=True``
     re-fetches in the killable child even if cached (skips that short-circuit).
+    ``local_files_only=True`` resolves from cache in-process and never spawns a
+    network child (matching Hugging Face offline semantics).
     """
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
+    # Expand ~ as huggingface_hub does before writing, so the probe and the child
+    # resolve to the same on-disk cache location.
+    if isinstance(cache_dir, str):
+        cache_dir = os.path.expanduser(cache_dir)
+    # Offline: resolve purely from the local cache, never reaching the network. HF
+    # raises if the snapshot is not cached; let that propagate.
+    if local_files_only:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            repo_id = repo_id,
+            repo_type = repo_type,
+            revision = revision,
+            cache_dir = cache_dir,
+            allow_patterns = allow_patterns,
+            ignore_patterns = ignore_patterns,
+            local_files_only = True,
+        )
     # Fast path: everything already on disk -> resolve in-process (no Xet, no
     # hang). Skipped when force_download re-fetches unconditionally.
     if not force_download:

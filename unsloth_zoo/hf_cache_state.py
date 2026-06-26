@@ -206,10 +206,11 @@ def _case_safe_repo_cache_dirs(root: Path, repo_type: Optional[str], repo_id: st
     The cache dir name is case-folded by the Hub, so a case-insensitive match is
     needed for compatibility, but a bare case-insensitive match is unsafe: on a
     case-sensitive filesystem ``models--Org--Repo`` and ``models--org--repo`` are
-    distinct repos. Prefer an exact-case match; otherwise accept a single
-    unambiguous folded match; on a 2+ way collision attribute to neither, so a
-    stale partial in one repo cannot be charged to the other (which would let the
-    watchdog kill an unrelated active download or HTTP-prep purge the wrong repo).
+    distinct repos. Prefer an exact-case match; otherwise accept a single folded
+    match ONLY when the filesystem is case-insensitive (so the folded dir really is
+    the same entry); on a 2+ way collision attribute to neither, so a stale partial
+    in one repo cannot be charged to the other (which would let the watchdog kill an
+    unrelated active download or HTTP-prep purge the wrong repo).
     """
     target = repo_cache_dir_name(repo_type, repo_id)
     folded_target = target.lower()
@@ -220,8 +221,17 @@ def _case_safe_repo_cache_dirs(root: Path, repo_type: Optional[str], repo_id: st
     exact = [entry for entry in entries if entry.name == target]
     if exact:
         return exact
-    if len(entries) <= 1:
-        return entries
+    if len(entries) == 1:
+        # A single folded-but-not-exact match. Attribute it to this repo only when
+        # the filesystem is case-insensitive: looking up the exact-case name then
+        # resolves to that same directory. On a case-sensitive filesystem the
+        # exact-case path does not exist, so the folded dir is a DIFFERENT repo and
+        # must not be charged here.
+        try:
+            if (root / target).exists():
+                return entries
+        except OSError:
+            return []
     return []
 
 
