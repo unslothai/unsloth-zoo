@@ -533,7 +533,7 @@ def test_nonstall_error_propagates_without_fallback(monkeypatch):
 
 def test_immediate_success_uses_xet_only(monkeypatch):
     prepared = []
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a: prepared.append(a))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: prepared.append(a))
     fake = _install(monkeypatch, [("ok", "/cache/model.gguf")])
     out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert out == "/cache/model.gguf"
@@ -543,7 +543,7 @@ def test_immediate_success_uses_xet_only(monkeypatch):
 
 def test_stall_then_http_fallback_succeeds(monkeypatch):
     prepared = []
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda repo_type, repo_id, cache_dir = None: prepared.append((repo_type, repo_id)))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda repo_type, repo_id, cache_dir = None, **k: prepared.append((repo_type, repo_id)))
     fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
 
     out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
@@ -557,7 +557,7 @@ def test_stall_then_http_fallback_succeeds(monkeypatch):
 def test_injected_prepare_for_http_used(monkeypatch):
     """Studio injects its marker-aware prepare; the generic default must not run."""
     monkeypatch.setattr(
-        xf, "_default_prepare_for_http", lambda *a: pytest.fail("generic prepare ran")
+        xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("generic prepare ran")
     )
     injected = []
     _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
@@ -1054,6 +1054,38 @@ def test_dataset_snapshot_without_weights_is_accepted(monkeypatch, tmp_path):
     assert out == str(files) and len(fake.calls) == 1
 
 
+def test_model_snapshot_with_weights_excluded_is_accepted(monkeypatch, tmp_path):
+    """A model repo fetched with ignore_patterns that drop every weight format (e.g. to
+    warm only config / tokenizer files) legitimately yields a weightless snapshot; the
+    result must be accepted, not rejected for lacking weights."""
+    cfg_only = tmp_path / "cfg"
+    cfg_only.mkdir()
+    (cfg_only / "config.json").write_text("{}")
+    fake = _install(monkeypatch, [("ok", str(cfg_only))])
+    out = xf.snapshot_download_with_xet_fallback(
+        DL_REPO,
+        token = None,
+        ignore_patterns = [
+            "*.safetensors", "*.bin", "*.h5", "*.msgpack", "*.gguf",
+            "*.pt", "*.pth", "*.ckpt", "*.onnx", "*.pdparams", "*.index.json",
+        ],
+    )
+    assert out == str(cfg_only) and len(fake.calls) == 1
+
+
+def test_request_can_include_weights_unit():
+    """Unsloth's default prefetch ignores (onnx/h5/msgpack/gguf, never safetensors) still
+    count as including weights, so model warmups keep requiring them; excluding every
+    weight format does not."""
+    assert hcs.request_can_include_weights(None, None) is True
+    assert hcs.request_can_include_weights(None, ["*.onnx", "*.h5", "*.msgpack", "*.gguf"]) is True
+    assert hcs.request_can_include_weights(["config.json"], None) is False
+    assert hcs.request_can_include_weights(
+        None, ["*.safetensors", "*.bin", "*.h5", "*.msgpack", "*.gguf",
+               "*.pt", "*.pth", "*.ckpt", "*.onnx", "*.pdparams", "*.index.json"]
+    ) is False
+
+
 def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
     """The generic HTTP-prep purge must not unlink a concurrent download's still-active
     .incomplete temp file: only stale (old-mtime) partials are removed, so a sibling
@@ -1073,7 +1105,7 @@ def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
 
 def test_snapshot_stall_then_http(monkeypatch):
     prepared = []
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda rt, rid, cache_dir = None: prepared.append((rt, rid)))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda rt, rid, cache_dir = None, **k: prepared.append((rt, rid)))
     fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/snap-dir")])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/snap-dir"

@@ -37,6 +37,7 @@ __all__ = [
     "latest_snapshot_dir",
     "snapshot_dir_has_broken_symlinks",
     "snapshot_dir_is_complete",
+    "request_can_include_weights",
     "iter_active_repo_cache_dirs",
     "repo_cache_dir_has_incomplete_blobs",
     "has_active_incomplete_blobs",
@@ -267,6 +268,52 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
         elif name.endswith(_WEIGHT_FILE_SUFFIXES) and _safe_is_file(entry):
             has_weight = True
     return has_weight
+
+
+def request_can_include_weights(
+    allow_patterns: "Optional[list]" = None, ignore_patterns: "Optional[list]" = None
+) -> bool:
+    """Whether a download restricted by *allow_patterns* / *ignore_patterns* can still
+    include a model weight file.
+
+    Used to decide whether snapshot completeness should require weights: a request that
+    filters every weight format out (e.g. ``ignore_patterns`` covering ``*.safetensors``
+    and ``*.bin`` to fetch only config / tokenizer files from a model repo) legitimately
+    yields a weightless snapshot, so requiring a weight there would reject a valid result.
+    An unfiltered request -- or one any weight filename survives -- includes weights."""
+    if not allow_patterns and not ignore_patterns:
+        return True
+    try:
+        from huggingface_hub.utils import filter_repo_objects
+    except Exception:
+        return True  # cannot evaluate the filter -> assume weights are expected
+    # One canonical filename per recognized weight format (plus sharded / index variants);
+    # if any survives the filter, the requested set can include weights.
+    probes = [
+        "model.safetensors",
+        "model-00001-of-00002.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model-00001-of-00002.bin",
+        "pytorch_model.bin.index.json",
+        "tf_model.h5",
+        "flax_model.msgpack",
+        "model.gguf",
+        "model.pt",
+        "model.pth",
+        "model.ckpt",
+        "model.onnx",
+        "model.pdparams",
+    ]
+    try:
+        kept = list(
+            filter_repo_objects(
+                probes, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+            )
+        )
+    except Exception:
+        return True
+    return len(kept) > 0
 
 
 def _iter_snapshot_dirs(repo_dir: Path) -> Iterator[Path]:

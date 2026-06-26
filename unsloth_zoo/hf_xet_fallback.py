@@ -52,6 +52,7 @@ from unsloth_zoo.hf_cache_state import (
     has_active_incomplete_blobs,
     hf_cache_root,
     iter_active_repo_cache_dirs,
+    request_can_include_weights,
     snapshot_dir_has_broken_symlinks,
     snapshot_dir_is_complete,
 )
@@ -156,15 +157,12 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
-# A *.incomplete blob touched more recently than this is treated as another
-# concurrent download's still-active temp file and left in place (see
-# _default_prepare_for_http). Smaller than any realistic stall_timeout, so our own
-# killed-then-stalled partial (static for >= stall_timeout) is still always purged.
-_ACTIVE_PARTIAL_GRACE = 30.0
-
-
 def _default_prepare_for_http(
-    repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
+    repo_type: str,
+    repo_id: str,
+    *,
+    cache_dir: Optional[str] = None,
+    active_grace: float = DEFAULT_STALL_TIMEOUT,
 ) -> None:
     """Generic 'make the partial safe for an HTTP resume': delete the repo's active
     ``*.incomplete`` blobs (an HTTP resume over a sparse Xet/hf_transfer partial
@@ -184,15 +182,15 @@ def _default_prepare_for_http(
                     if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
                         try:
                             # Do not unlink a partial another concurrent download is
-                            # still actively writing (recent mtime): on POSIX that lets
-                            # the sibling keep writing to an unlinked path and then fail
-                            # when the Hub moves its temp file into place. Our own killed
-                            # partial has been static for the stall timeout, so it is
-                            # older than this window; if a very short stall_timeout left
-                            # it inside the window, the has_active_incomplete_blobs guard
-                            # downstream still forces a clean HTTP re-download, so the
-                            # HTTP attempt never resumes unsafely over it.
-                            if time.time() - blob.stat().st_mtime < _ACTIVE_PARTIAL_GRACE:
+                            # still actively writing: on POSIX that lets the sibling keep
+                            # writing to an unlinked path and then fail when the Hub moves
+                            # its temp file into place. Spare any partial written within
+                            # active_grace (the stall timeout in use): the watchdog only
+                            # declares a download stalled after that long with no growth,
+                            # so a slower sibling that simply has not written recently is
+                            # not stalled and must be left alone. Our own killed partial
+                            # has been static for the full stall timeout, so it is purged.
+                            if time.time() - blob.stat().st_mtime < active_grace:
                                 continue
                             blob.unlink()
                         except OSError:
@@ -641,28 +639,29 @@ def _run_download_attempt(
 
 
 def _snapshot_is_acceptable(
-    snapshot_dir: Path, *, repo_type: str, allow_patterns: Any
+    snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any
 ) -> bool:
     """Whether a cached / downloaded snapshot dir is complete enough to use, scoped to the
     caller's intent.
 
-    A FULL model warmup (``repo_type == "model"`` and no ``allow_patterns``) must have its
-    weight files present: this wrapper exists to warm those weights before an in-process
-    load, so a result with no weights means the download did not finish (HF silently
-    returns a stale local snapshot on an offline / timed-out request rather than raising).
+    Weight files are required only when the request can actually include them: a model
+    repo (``repo_type == "model"``) whose ``allow_patterns`` / ``ignore_patterns`` do not
+    filter every weight format out. This wrapper exists to warm those weights before an
+    in-process load, so a result with no weights then means the download did not finish (HF
+    silently returns a stale local snapshot on an offline / timed-out request rather than
+    raising).
 
-    A PATTERNED or non-model snapshot (``allow_patterns`` set, or ``repo_type`` such as
-    ``"dataset"``) legitimately holds only the requested subset -- e.g. just
-    ``config.json`` / ``tokenizer*`` files, or dataset files with no model weights at all
-    -- so requiring a weight file there would reject a perfectly valid result. For those it
-    is enough that no symlink dangles (every file the snapshot references is on disk)."""
-    if repo_type == "model" and not allow_patterns:
+    A PATTERNED or non-model snapshot that legitimately holds only a subset -- a dataset, or
+    a model repo fetched with ``allow_patterns=["config.json"]`` or ``ignore_patterns`` that
+    drop all weights -- would be wrongly rejected by a weight requirement, so for those it is
+    enough that no symlink dangles (every file the snapshot references is on disk)."""
+    if repo_type == "model" and request_can_include_weights(allow_patterns, ignore_patterns):
         return snapshot_dir_is_complete(snapshot_dir)
     return not snapshot_dir_has_broken_symlinks(snapshot_dir)
 
 
 def _snapshot_payload_incomplete(
-    payload: Any, *, repo_type: str, allow_patterns: Any
+    payload: Any, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any
 ) -> bool:
     """True when a snapshot download returned a real directory that is not acceptable for
     the request (see ``_snapshot_is_acceptable``). Guarded to an existing directory so a
@@ -679,7 +678,9 @@ def _snapshot_payload_incomplete(
             return False
     except OSError:
         return False
-    return not _snapshot_is_acceptable(path, repo_type = repo_type, allow_patterns = allow_patterns)
+    return not _snapshot_is_acceptable(
+        path, repo_type = repo_type, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+    )
 
 
 def _download_with_xet_fallback(
@@ -713,7 +714,9 @@ def _download_with_xet_fallback(
             # its own cache accounting and keeps the (repo_type, repo_id) signature.
             try:
                 if prepare_for_http_fn is None:
-                    _default_prepare_for_http(repo_type, repo_id, cache_dir = cache_dir)
+                    _default_prepare_for_http(
+                        repo_type, repo_id, cache_dir = cache_dir, active_grace = stall_timeout
+                    )
                 else:
                     prepare_for_http_fn(repo_type, repo_id)
             except Exception as e:
@@ -745,7 +748,10 @@ def _download_with_xet_fallback(
 
         if kind_result == "ok":
             if kind == "snapshot" and _snapshot_payload_incomplete(
-                payload, repo_type = repo_type, allow_patterns = params.get("allow_patterns")
+                payload,
+                repo_type = repo_type,
+                allow_patterns = params.get("allow_patterns"),
+                ignore_patterns = params.get("ignore_patterns"),
             ):
                 # HF can return an existing, incomplete snapshot dir on an offline or
                 # timed-out request instead of fetching the missing files. Never hand an
@@ -954,7 +960,10 @@ def snapshot_download_with_xet_fallback(
             # unrelated revision mid-download (a stale .incomplete blob or a broken older
             # snapshot elsewhere in the same repo cache) must not force a needless re-fetch.
             if _snapshot_is_acceptable(
-                Path(cached_dir), repo_type = repo_type, allow_patterns = allow_patterns
+                Path(cached_dir),
+                repo_type = repo_type,
+                allow_patterns = allow_patterns,
+                ignore_patterns = ignore_patterns,
             ):
                 return cached_dir
             logger.debug("Cached snapshot for %s is incomplete; downloading.", repo_id)
