@@ -110,7 +110,18 @@ class _MLXTokenizedDatasetView:
 
     def __getitem__(self, key):
         if isinstance(key, str):
-            return self._dataset[key]
+            if key in ("input_ids", "attention_mask"):
+                return [self._with_input_ids(self._dataset[idx])[key] for idx in range(len(self))]
+            try:
+                return self._dataset[key]
+            except (KeyError, TypeError):
+                values = []
+                for idx in range(len(self)):
+                    item = self._dataset[idx]
+                    if not isinstance(item, dict) or key not in item:
+                        raise
+                    values.append(item[key])
+                return values
         if not isinstance(key, int):
             return self._dataset[key]
         return self._with_input_ids(self._dataset[key])
@@ -613,7 +624,6 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
-    per_device_eval_batch_size: int | None = None
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -641,13 +651,14 @@ class MLXTrainingConfig:
     disable_memory_limits: bool = False
     cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
     append_eos: bool = True  # True = mlx-lm parity; Studio sets False (template owns EOS)
-    image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
     completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
+    per_device_eval_batch_size: int | None = None
+    image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -717,6 +728,7 @@ class MLXTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.train_dataset = train_dataset
+        self._mlx_train_dataset_for_batches = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
         # Use args or defaults
@@ -777,6 +789,10 @@ class MLXTrainer:
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
         self.stop_requested = False  # Set True to stop training early
+
+    def _train_dataset_for_batches(self):
+        """Return the internal dataset used for MLX batch construction."""
+        return getattr(self, "_mlx_train_dataset_for_batches", self.train_dataset)
 
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
@@ -2237,6 +2253,7 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
@@ -2280,7 +2297,7 @@ class MLXTrainer:
             )
             if args.streaming:
                 return None, iterate_vlm_training_batches(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     processor=processor,
                     config=config,
                     batch_size=args.per_device_train_batch_size,
@@ -2295,7 +2312,7 @@ class MLXTrainer:
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
                 batches = create_vlm_batches(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     processor=processor,
                     config=config,
                     batch_size=args.per_device_train_batch_size,
@@ -2326,7 +2343,7 @@ class MLXTrainer:
                         "streaming or materialize batches."
                     )
                 return None, iterate_training_batches(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     tokenizer=self.tokenizer,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
@@ -2340,7 +2357,7 @@ class MLXTrainer:
                 )
             else:
                 batch_kwargs = dict(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     tokenizer=self.tokenizer,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
@@ -2875,8 +2892,9 @@ def train_on_responses_only(
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
+        train_dataset = trainer._train_dataset_for_batches()
         batches, response_masked_dataset = _create_labeled_batches(
-            dataset=trainer.train_dataset,
+            dataset=train_dataset,
             tokenizer=_tokenizer,
             mask_fn=mask_fn,
             batch_size=args.per_device_train_batch_size,
@@ -2899,6 +2917,7 @@ def train_on_responses_only(
             return_dataset=True,
         )
         trainer.train_dataset = response_masked_dataset
+        trainer._mlx_train_dataset_for_batches = response_masked_dataset
 
         # Safety check: detect all-masked labels early
         _check_all_masked(batches)

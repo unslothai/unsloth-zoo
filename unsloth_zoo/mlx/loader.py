@@ -3262,6 +3262,81 @@ def _mlx_prompt_to_ids(prompt):
     )
 
 
+def _mlx_attention_mask_to_list(attention_mask):
+    """Normalize HF/torch/MLX attention masks into one mask list."""
+    if attention_mask is None:
+        return None
+    if hasattr(attention_mask, "tolist"):
+        attention_mask = attention_mask.tolist()
+    if isinstance(attention_mask, tuple):
+        attention_mask = list(attention_mask)
+    if isinstance(attention_mask, list):
+        if len(attention_mask) == 1 and isinstance(attention_mask[0], (list, tuple)):
+            attention_mask = list(attention_mask[0])
+        elif attention_mask and isinstance(attention_mask[0], (list, tuple)):
+            raise ValueError("Unsloth MLX: generate() only supports batch size 1.")
+        return [int(token) for token in attention_mask]
+    raise TypeError(
+        "Unsloth MLX: generate() expected attention_mask as a list "
+        "or tensor-like object with .tolist()."
+    )
+
+
+def _mlx_apply_attention_mask(prompt_ids, attention_mask):
+    """Drop padded prompt ids before MLX generation and max_length math."""
+    mask = _mlx_attention_mask_to_list(attention_mask)
+    if mask is None or isinstance(prompt_ids, str):
+        return prompt_ids
+    if len(mask) != len(prompt_ids):
+        raise ValueError(
+            "Unsloth MLX: attention_mask length must match input_ids length."
+        )
+    return [token for token, keep in zip(prompt_ids, mask) if keep != 0]
+
+
+def _mlx_eos_token_id_set(eos_token_id):
+    """Normalize HF-style eos_token_id values into a set of token ids."""
+    if eos_token_id is None:
+        return None
+    if hasattr(eos_token_id, "tolist"):
+        eos_token_id = eos_token_id.tolist()
+    if isinstance(eos_token_id, tuple):
+        eos_token_id = list(eos_token_id)
+    if isinstance(eos_token_id, list):
+        if len(eos_token_id) == 1 and isinstance(eos_token_id[0], (list, tuple)):
+            eos_token_id = list(eos_token_id[0])
+        return {int(token) for token in eos_token_id}
+    return {int(eos_token_id)}
+
+
+def _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id):
+    """Temporarily override mlx-lm tokenizer EOS ids for one generate call."""
+    eos_ids = _mlx_eos_token_id_set(eos_token_id)
+    if eos_ids is None:
+        return None
+    had_attr = hasattr(tokenizer, "eos_token_ids")
+    original = getattr(tokenizer, "eos_token_ids", None)
+    try:
+        tokenizer.eos_token_ids = eos_ids
+    except Exception:
+        return None
+    return (had_attr, original)
+
+
+def _mlx_restore_tokenizer_eos_ids(tokenizer, restore_state):
+    """Restore tokenizer EOS ids after a temporary generate override."""
+    if restore_state is None:
+        return
+    had_attr, original = restore_state
+    try:
+        if had_attr:
+            tokenizer.eos_token_ids = original
+        else:
+            delattr(tokenizer, "eos_token_ids")
+    except Exception:
+        pass
+
+
 def _mlx_put_streamer_tokens(streamer, token_ids):
     """Send token ids to a HF TextStreamer-compatible object."""
     if streamer is None:
@@ -3356,11 +3431,17 @@ def _mlx_generate_vlm(self, *args, **kwargs):
         else:
             max_tokens = 256
 
-    if do_sample is False and "temperature" not in batch and "temp" not in batch:
-        batch["temperature"] = 0.0
     if "temp" in batch and "temperature" not in batch:
         batch["temperature"] = batch.pop("temp")
-    if batch.get("temperature", None) is None:
+    if do_sample is False:
+        batch["temperature"] = 0.0
+        batch.pop("temp", None)
+        batch.pop("top_p", None)
+        batch.pop("top_k", None)
+        batch.pop("min_p", None)
+    elif do_sample is True and batch.get("temperature", None) is None:
+        batch["temperature"] = 1.0
+    elif batch.get("temperature", None) is None:
         batch.pop("temperature", None)
 
     _mlx_put_streamer_tokens(streamer, input_ids)
@@ -3406,15 +3487,19 @@ def _mlx_generate(self, *args, **kwargs):
         raise ValueError("Unsloth MLX: generate() requires model._tokenizer.")
 
     prompt = kwargs.pop("input_ids", None)
+    attention_mask = kwargs.pop("attention_mask", None)
     if args:
         if prompt is None:
             prompt = args[0]
+            if attention_mask is None and isinstance(prompt, dict):
+                attention_mask = prompt.get("attention_mask")
         else:
             raise TypeError(
                 "Unsloth MLX: pass prompt input either positionally or as "
                 "input_ids, not both."
             )
     prompt_ids = _mlx_prompt_to_ids(prompt)
+    prompt_ids = _mlx_apply_attention_mask(prompt_ids, attention_mask)
     if isinstance(prompt_ids, str):
         add_special_tokens = (
             getattr(tokenizer, "bos_token", None) is None
@@ -3441,8 +3526,12 @@ def _mlx_generate(self, *args, **kwargs):
             max_tokens = 256
 
     do_sample = kwargs.pop("do_sample", None)
+    eos_token_id = kwargs.pop("eos_token_id", None)
     sampler = kwargs.pop("sampler", None)
-    temp = kwargs.pop("temperature", kwargs.pop("temp", 0.0))
+    _missing_temperature = object()
+    temp = kwargs.pop("temperature", kwargs.pop("temp", _missing_temperature))
+    if temp is _missing_temperature:
+        temp = 1.0 if do_sample is True else 0.0
     if temp is None:
         temp = 0.0
     top_p = float(kwargs.pop("top_p", 0.0) or 0.0)
@@ -3481,23 +3570,25 @@ def _mlx_generate(self, *args, **kwargs):
     _mlx_put_streamer_tokens(streamer, [prompt_ids])
 
     generated_ids = []
-    for response in stream_generate(
-        self,
-        tokenizer,
-        prompt_ids,
-        max_tokens=max_tokens,
-        sampler=sampler,
-        logits_processors=logits_processors,
-        **stream_kwargs,
-    ):
-        token = getattr(response, "token", None)
-        finish_reason = getattr(response, "finish_reason", None)
-        token_id = _mlx_token_to_int(token)
-        if token_id is None:
-            continue
-        if finish_reason is None or finish_reason == "length":
+    eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
+    try:
+        for response in stream_generate(
+            self,
+            tokenizer,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            **stream_kwargs,
+        ):
+            token = getattr(response, "token", None)
+            token_id = _mlx_token_to_int(token)
+            if token_id is None:
+                continue
             generated_ids.append(token_id)
             _mlx_put_streamer_tokens(streamer, [token_id])
+    finally:
+        _mlx_restore_tokenizer_eos_ids(tokenizer, eos_restore_state)
 
     if streamer is not None:
         streamer.end()

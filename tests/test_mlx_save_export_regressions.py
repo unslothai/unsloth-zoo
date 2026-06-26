@@ -229,6 +229,7 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
 
     class Tokenizer:
         bos_token = None
+        eos_token_ids = {2}
 
         def encode(self, prompt, add_special_tokens=True):
             return [1, 2, 3]
@@ -237,32 +238,79 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
         calls["sampler"] = kwargs
         return "sampler"
 
-    def fake_stream_generate(*args, **kwargs):
+    def fake_stream_generate(_model, tokenizer, prompt, max_tokens=None, **kwargs):
+        calls["prompt"] = prompt
+        calls["max_tokens"] = max_tokens
         calls["stream_sampler"] = kwargs["sampler"]
-        return iter(())
+        calls["eos_during_stream"] = set(tokenizer.eos_token_ids)
+        yield types.SimpleNamespace(token=9, finish_reason=None)
+        yield types.SimpleNamespace(token=5, finish_reason="stop")
 
     monkeypatch.setattr(sample_utils, "make_sampler", fake_make_sampler)
     monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
 
-    model = types.SimpleNamespace(_tokenizer=Tokenizer(), _is_vlm_model=False)
+    tokenizer = Tokenizer()
+    model = types.SimpleNamespace(_tokenizer=tokenizer, _is_vlm_model=False)
     out = loader._mlx_generate(
         model,
-        input_ids=[1, 2, 3],
+        input_ids=[[0, 1, 2, 0]],
+        attention_mask=[[0, 1, 1, 0]],
         do_sample=False,
         temperature=0.7,
         top_p=0.9,
         top_k=32,
-        max_new_tokens=1,
+        eos_token_id=5,
+        max_length=4,
     )
 
-    assert out.tolist() == [[1, 2, 3]]
+    assert out.tolist() == [[1, 2, 9, 5]]
     assert calls["sampler"] == {
         "temp": 0.0,
         "top_p": 0.0,
         "min_p": 0.0,
         "top_k": 0,
     }
+    assert calls["prompt"] == [1, 2]
+    assert calls["max_tokens"] == 2
     assert calls["stream_sampler"] == "sampler"
+    assert calls["eos_during_stream"] == {5}
+    assert tokenizer.eos_token_ids == {2}
+
+
+def test_vlm_generate_hf_kwargs(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    calls = []
+
+    def fake_stream_generate(_model, _processor, _prompt, max_tokens=None, **batch):
+        calls.append((max_tokens, batch))
+        return iter(())
+
+    fake_mlx_vlm.stream_generate = fake_stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    model = types.SimpleNamespace(
+        _tokenizer=types.SimpleNamespace(tokenizer=object()),
+        _is_vlm_model=True,
+        config=types.SimpleNamespace(eos_token_id=None),
+    )
+    out = loader._mlx_generate_vlm(
+        model,
+        input_ids=[1, 2],
+        attention_mask=[1, 1],
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+        max_new_tokens=1,
+    )
+
+    assert out.tolist() == [[1, 2]]
+    assert calls[0][0] == 1
+    assert tuple(calls[0][1]["input_ids"].shape) == (1, 2)
+    assert tuple(calls[0][1]["mask"].shape) == (1, 2)
+    assert calls[0][1]["temperature"] == 0.0
+    assert "top_p" not in calls[0][1]
 
 
 def test_bound_save_pretrained_defaults_to_full_save_without_lora(

@@ -1943,6 +1943,22 @@ def _get_vlm_image_size(config, processor):
     return 512
 
 
+def _is_vlm_no_resize_image_size(image_size):
+    """Return True when a VLM image-size override means preserve full size."""
+    return image_size is None or (
+        isinstance(image_size, str) and image_size.lower() == "max"
+    )
+
+
+def _resolve_vlm_image_size(image_size, config, processor):
+    """Resolve omitted VLM image size while preserving explicit no-resize."""
+    if isinstance(image_size, str) and image_size.lower() == "max":
+        return None
+    if image_size is None:
+        return _get_vlm_image_size(config, processor)
+    return image_size
+
+
 def _has_chat_template(obj):
     template = getattr(obj, "chat_template", None)
     return isinstance(template, str) and len(template.strip()) > 0
@@ -2496,7 +2512,9 @@ def _resize_vlm_images(images, image_size):
     for image in images:
         if isinstance(image, Image.Image):
             image = image.convert("RGB")
-            if isinstance(image_size, int):
+            if _is_vlm_no_resize_image_size(image_size):
+                pass
+            elif isinstance(image_size, int):
                 # Match UnslothVisionDataCollator resize="min": shrink large
                 # images to the model limit, but let processors handle upscaling.
                 # Scale on the larger side so tall portrait images (e.g.
@@ -2669,6 +2687,12 @@ def _to_mx_vlm_batch(inputs):
                 batch[key] = mx.array(value[0]) if not isinstance(value[0], mx.array) else value[0]
         else:
             batch[key] = value
+
+    for key in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"):
+        if key in batch and not isinstance(batch[key], mx.array):
+            batch[key] = mx.array(batch[key])
+        if key in batch and len(batch[key].shape) == 1:
+            batch[key] = batch[key].reshape((1, -1))
 
     if "input_ids" in batch:
         # Preserve raw input_ids under a private key BEFORE the int32 narrow
@@ -3207,8 +3231,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     """
     import numpy as np
 
-    if image_size is None:
-        image_size = _get_vlm_image_size(config, processor)
+    image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
     batch_list = []
@@ -3320,8 +3343,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     """
     import numpy as np
 
-    if image_size is None:
-        image_size = _get_vlm_image_size(config, processor)
+    image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
     base_seed = _normalize_seed(seed)
 

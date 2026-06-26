@@ -41,7 +41,8 @@ def _install_shim():
 def test_mlx_training_config_is_dataclass_with_all_fields():
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     assert dataclasses.is_dataclass(MLXTrainingConfig)
-    fields = {f.name for f in dataclasses.fields(MLXTrainingConfig)}
+    field_names = [f.name for f in dataclasses.fields(MLXTrainingConfig)]
+    fields = set(field_names)
     # Required SFT-compat fields
     for must_have in (
         "per_device_train_batch_size",
@@ -66,6 +67,10 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "completion_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
+    assert field_names[field_names.index("eval_steps") + 1] == "dataset_text_field"
+    assert field_names[field_names.index("append_eos") + 1] == "train_on_completions"
+    assert field_names.index("per_device_eval_batch_size") > field_names.index("vlm_chat_template")
+    assert field_names.index("image_size") > field_names.index("vlm_chat_template")
 
 
 def test_mlx_training_config_exposes_completion_only_loss():
