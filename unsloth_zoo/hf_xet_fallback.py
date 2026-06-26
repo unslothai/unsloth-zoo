@@ -571,6 +571,13 @@ def _run_download_attempt(
     finally:
         stop_watchdog.set()
         proc.join(timeout = grace_period)
+        # Any exit from the loop -- normal completion, cancel/stall, or an
+        # unexpected exception (e.g. KeyboardInterrupt) -- must not leak the child.
+        # If it is still alive after the grace join, kill its whole process group.
+        # _terminate_process_group is idempotent, so a redundant call after the
+        # cancel/stall branch already terminated it is a harmless no-op.
+        if proc.is_alive():
+            _terminate_process_group(proc, grace_period)
 
     if result is None:
         return (

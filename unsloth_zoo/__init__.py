@@ -132,10 +132,8 @@ if _is_mlx_only:
     ALLOW_PREQUANTIZED_MODELS = True
     del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
-    _IS_MLX = True
     _SKIP_GPU_INIT = True
 else:
-    _IS_MLX = False
     # Opt-in lightweight import. A short-lived helper subprocess that only needs
     # the cache/download utilities (e.g. the unsloth_zoo.hf_xet_fallback download
     # child) can set UNSLOTH_ZOO_DISABLE_GPU_INIT=1 to skip the heavy torch /
@@ -147,16 +145,17 @@ else:
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
 
-# Inject triton & bitsandbytes stubs only on Apple Silicon with MLX so unsloth's
-# CUDA-only imports don't error at startup (the generic light-import path never
-# imports triton/bitsandbytes, so it must not mask the real modules).
-if _IS_MLX:
+# Inject triton & bitsandbytes stubs whenever GPU init is skipped: Apple Silicon
+# with MLX (torch/CUDA absent), or the opt-in light-import download child. unsloth's
+# CUDA-only imports then resolve to a loud no-op stub instead of a hard ImportError;
+# the stub is never touched by the cache/download-only child, so it is inert there.
+# On a normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
+if _SKIP_GPU_INIT:
     from .stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
     from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
     _inject_bnb()
     del _inject_triton, _inject_bnb
-del _IS_MLX
 
 # Lazy bridge for downstream code that still imports the old flat MLX module
 # names. Installed on every host so external scripts don't hit a hard
