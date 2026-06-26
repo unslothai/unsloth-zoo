@@ -16,6 +16,7 @@
 
 __all__ = [
     "train_on_responses_only",
+    "mask_thinking_tokens",
     "sft_prepare_dataset",
     "standardize_data_formats",
     "patch_torchcodec_audio_decoder",
@@ -432,6 +433,134 @@ def train_on_responses_only(
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
     from .training_utils import fix_zero_training_loss
     fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
+    return trainer
+pass
+
+
+def mask_thinking_tokens(
+    trainer,
+    think_token     = "</think>",
+    tokenizer       = None,  # Optional
+    return_function = False, # Useful for iterating over lists
+    num_proc        = None,
+):
+    """Mask the thinking closing token (e.g. </think>) to -100 in the labels.
+
+    Inspired by Nemotron Ultra, which masks out </think> during training so the
+    model is not trained on the reasoning terminator and does not memorise a
+    fixed reasoning length. Use it like train_on_responses_only - apply it after
+    train_on_responses_only (or on any tokenized dataset whose labels the data
+    collator preserves). Only the label positions matching think_token are set
+    to -100; every other label is left untouched.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if tokenizer is None and trainer is not None:
+        tokenizer = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("Unsloth: A tokenizer must be provided or be accessible from the trainer!")
+    # Get non vision tokenizer
+    if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
+
+    # Tokenize the thinking token to its id(s) - it can be one or many ids
+    think_ids = tokenizer(think_token, add_special_tokens = False)["input_ids"]
+    if len(think_ids) == 0:
+        raise ValueError(f"Unsloth: think_token = `{think_token}` does not tokenize to any token ids!")
+    len_think    = len(think_ids)
+    first_think  = think_ids[0]
+    torch_Tensor = torch.Tensor
+    torch_int64  = torch.int64
+
+    def _mask_thinking_tokens(examples):
+        input_ids_ = examples["input_ids"]
+        use_tensors = False
+        if type(input_ids_) is torch_Tensor:
+            use_tensors = True
+            input_ids_ = input_ids_.tolist()
+        if "labels" in examples:
+            labels_ = examples["labels"]
+            if type(labels_) is torch_Tensor:
+                use_tensors = True
+                labels_ = labels_.tolist()
+            assert(len(labels_) == len(input_ids_))
+        else:
+            # No labels yet - derive from input_ids so the masking still applies
+            labels_ = input_ids_
+
+        all_labels = []
+        for input_ids, old_labels in zip(input_ids_, labels_):
+            labels = list(old_labels)
+            n = len(input_ids)
+            j = 0
+            while j <= n - len_think:
+                if input_ids[j] == first_think and input_ids[j : j + len_think] == think_ids:
+                    for k in range(j, j + len_think):
+                        labels[k] = -100
+                    j += len_think
+                else:
+                    j += 1
+            pass
+            all_labels.append(labels)
+        pass
+        return { "labels" : torch.tensor(all_labels, dtype = torch_int64) if use_tensors else all_labels }
+    pass
+    if return_function:
+        return _mask_thinking_tokens
+
+    # A Trainer (not a Dataset) is expected here. A Dataset exposes .map but has
+    # no train/eval datasets, so it would silently no-op - guide such callers.
+    if hasattr(trainer, "map"):
+        raise TypeError(
+            "Unsloth: mask_thinking_tokens expects a Trainer as the first argument. "
+            "To apply it directly to a dataset, use return_function = True."
+        )
+
+    import multiprocessing as _mp
+    if num_proc is None or type(num_proc) is not int:
+        if _mp.get_start_method() != 'fork':
+            num_proc = None
+        else:
+            import psutil
+            num_proc = min(max((psutil.cpu_count() or 1) + 4, 2), 64)
+            # Cap by available memory to avoid OOM (1 proc per GB; 1 if <=2GB)
+            memory_gb_left = psutil.virtual_memory().available / (1024**3)
+            if memory_gb_left <= 2:
+                num_proc = 1
+            else:
+                num_proc = min(num_proc, int(memory_gb_left))
+
+    def _apply(dataset):
+        if not hasattr(dataset, "map"):
+            raise TypeError("Unsloth: mask_thinking_tokens does not work on lists!")
+        if isinstance(dataset, IterableDataset):
+            return dataset.map(_mask_thinking_tokens, batch_size = dataset._ex_iterable.batch_size, batched = True)
+        return dataset.map(_mask_thinking_tokens, batched = True, num_proc = num_proc)
+    pass
+
+    if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
+        trainer.train_dataset = _apply(trainer.train_dataset)
+    pass
+
+    if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
+        if type(trainer.eval_dataset) is dict:
+            for key, value in trainer.eval_dataset.items():
+                trainer.eval_dataset[key] = _apply(value)
+        else:
+            trainer.eval_dataset = _apply(trainer.eval_dataset)
+    pass
+
+    # The masked -100 labels must survive collation. The default SFT collator can
+    # rebuild labels from input_ids and overwrite them, so switch to the
+    # label-preserving collator (skip when packing) - same as train_on_responses_only.
+    from transformers import DataCollatorForSeq2Seq
+    packing_enabled = getattr(trainer.args, "packing", False)
+    if (
+        hasattr(trainer, "data_collator")
+        and not isinstance(trainer.data_collator, DataCollatorForSeq2Seq)
+        and not packing_enabled
+    ):
+        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+
     return trainer
 pass
 
