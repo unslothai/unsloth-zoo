@@ -36,6 +36,7 @@ __all__ = [
     "blob_bytes_present",
     "latest_snapshot_dir",
     "snapshot_dir_has_broken_symlinks",
+    "snapshot_dir_is_complete",
     "iter_active_repo_cache_dirs",
     "repo_cache_dir_has_incomplete_blobs",
     "has_active_incomplete_blobs",
@@ -51,6 +52,15 @@ def _safe_is_dir(path: Path) -> bool:
     cache enumeration skips that root rather than erroring."""
     try:
         return path.is_dir()
+    except OSError:
+        return False
+
+
+def _safe_is_file(path: Path) -> bool:
+    """``Path.is_file()`` (follows symlinks) returning False instead of raising on an
+    unreadable path or a dangling link, so snapshot enumeration never errors out."""
+    try:
+        return path.is_file()
     except OSError:
         return False
 
@@ -180,6 +190,83 @@ def snapshot_dir_has_broken_symlinks(snapshot_dir: Path) -> bool:
     except OSError:
         return False
     return False
+
+
+# Model weight file extensions. A snapshot with none of these is config/tokenizer
+# only (e.g. a prior AutoConfig fetch), so it is not a warm cache for a weight load.
+_WEIGHT_FILE_SUFFIXES = (
+    ".safetensors",
+    ".bin",
+    ".pt",
+    ".pth",
+    ".gguf",
+    ".ckpt",
+    ".onnx",
+    ".msgpack",
+    ".h5",
+    ".pdparams",
+)
+
+
+def _weight_shard_index_complete(index_path: Path) -> bool:
+    """True if every shard a HF weight index (``model.safetensors.index.json`` /
+    ``pytorch_model.bin.index.json``) lists is present next to the index. An unreadable
+    or non-sharded index is treated as satisfied (nothing extra to verify), so this only
+    ever rejects an index whose shards are demonstrably missing on disk."""
+    import json
+
+    try:
+        with open(index_path, "r", encoding = "utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return True
+    weight_map = data.get("weight_map") if isinstance(data, dict) else None
+    if not isinstance(weight_map, dict):
+        return True
+    # weight_map values are filenames relative to the index file's own directory.
+    base = index_path.parent
+    for shard in set(weight_map.values()):
+        try:
+            if not (base / shard).exists():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
+    """Best-effort check that a cached snapshot actually holds its model weights.
+
+    ``snapshot_download(local_files_only=True)`` returns a snapshot dir whenever
+    ``refs/<rev>`` and ``snapshots/<sha>`` exist, even one left by a prior interrupted
+    or patterned download (a config-only snapshot from an ``AutoConfig`` fetch, or a
+    partial shard pull). A dangling-symlink check alone misses those: the missing files
+    were never symlinked, so nothing dangles. Treating such a snapshot as a warm cache
+    skips the killable child and lets the in-process load hit Xet on the absent weights.
+
+    A snapshot is complete only when it has no dangling symlinks, every weight-shard
+    index it ships resolves all its shards on disk, and it contains at least one weight
+    file. This does NOT assert that every non-weight file is present (no offline manifest
+    exists for that); the killable child completes anything else still missing. The aim
+    is simply to never short-circuit a snapshot whose weights are not on disk."""
+    if snapshot_dir_has_broken_symlinks(snapshot_dir):
+        return False
+    try:
+        entries = list(snapshot_dir.rglob("*"))
+    except OSError:
+        return False
+    has_weight = False
+    for entry in entries:
+        name = entry.name
+        if name.endswith((".safetensors.index.json", ".bin.index.json")):
+            if not _safe_is_file(entry):
+                continue
+            if not _weight_shard_index_complete(entry):
+                return False
+            has_weight = True
+        elif name.endswith(_WEIGHT_FILE_SUFFIXES) and _safe_is_file(entry):
+            has_weight = True
+    return has_weight
 
 
 def _iter_snapshot_dirs(repo_dir: Path) -> Iterator[Path]:

@@ -53,6 +53,7 @@ from unsloth_zoo.hf_cache_state import (
     hf_cache_root,
     iter_active_repo_cache_dirs,
     snapshot_dir_has_broken_symlinks,
+    snapshot_dir_is_complete,
 )
 
 logger = logging.getLogger(__name__)
@@ -621,6 +622,30 @@ def _run_download_attempt(
     return ("error", result.get("error") or "unknown download error")
 
 
+def _snapshot_payload_incomplete(payload: Any) -> bool:
+    """True when a snapshot download returned a real directory with dangling symlinks (a
+    referenced blob missing or still an .incomplete partial). Guarded to an existing
+    directory so a mocked / non-path payload (unit tests) or an unexpected return is
+    trusted rather than rejected; in production the child always returns a real snapshot
+    dir, where this catches HF handing back an existing broken snapshot on an offline or
+    timed-out request.
+
+    Unlike the fast-path snapshot_dir_is_complete check, this does NOT require weight
+    files to be present: the child just performed a full download, so an absent weight
+    format means the repo ships none (accept it), whereas a dangling symlink means a file
+    the snapshot references is genuinely missing (reject it)."""
+    try:
+        path = Path(payload)
+    except TypeError:
+        return False
+    try:
+        if not path.is_dir():
+            return False
+    except OSError:
+        return False
+    return snapshot_dir_has_broken_symlinks(path)
+
+
 def _download_with_xet_fallback(
     *,
     repo_id: str,
@@ -683,6 +708,24 @@ def _download_with_xet_fallback(
         )
 
         if kind_result == "ok":
+            if kind == "snapshot" and _snapshot_payload_incomplete(payload):
+                # HF can return an existing, incomplete snapshot dir on an offline or
+                # timed-out request instead of fetching the missing files. Never hand a
+                # snapshot with absent weights to the in-process load: retry over HTTP,
+                # and if it still comes back incomplete, fail loudly rather than silently
+                # loading a broken cache.
+                if not disable_xet:
+                    logger.warning(
+                        "Download for '%s' returned an incomplete snapshot -- "
+                        "retrying with HF_HUB_DISABLE_XET=1", label
+                    )
+                    _safe_status(on_status, f"{label}: incomplete snapshot, retrying over HTTP")
+                    disable_xet = True
+                    continue
+                raise DownloadStallError(
+                    f"Download for '{label}' returned an incomplete snapshot even with "
+                    f"HF_HUB_DISABLE_XET=1 -- missing weight files, check your network connection"
+                )
             return payload  # type: ignore[return-value]
         if kind_result == "cancelled":
             raise RuntimeError("Cancelled")
@@ -862,18 +905,18 @@ def snapshot_download_with_xet_fallback(
                 local_files_only = True,
             )
             # local_files_only returns a snapshot dir whenever refs/<rev> and
-            # snapshots/<sha> exist, even if a prior download was interrupted and
-            # left broken symlinks. Validate the EXACT returned revision dir (a
-            # dangling symlink there means a referenced blob is missing or still an
-            # .incomplete partial); if broken, complete it in the killable child so
-            # the in-process load never proceeds with missing files. Scope the check
-            # to the returned snapshot, NOT the whole repo: snapshot_download already
-            # validated this exact revision, so an unrelated revision mid-download (a
-            # stale .incomplete blob or a broken older snapshot elsewhere in the same
-            # repo cache) must not force a needless re-fetch of a complete snapshot.
-            if not snapshot_dir_has_broken_symlinks(Path(cached_dir)):
+            # snapshots/<sha> exist, even one left by a prior interrupted or patterned
+            # download (a config-only snapshot from an AutoConfig fetch, or a partial
+            # shard pull). Validate that the EXACT returned revision dir is actually
+            # complete -- no dangling symlinks AND its weight files present on disk --
+            # and complete it in the killable child otherwise, so the in-process load
+            # never proceeds with missing weights. Scope the check to the returned
+            # snapshot, NOT the whole repo: an unrelated revision mid-download (a stale
+            # .incomplete blob or a broken older snapshot elsewhere in the same repo
+            # cache) must not force a needless re-fetch of a complete snapshot.
+            if snapshot_dir_is_complete(Path(cached_dir)):
                 return cached_dir
-            logger.debug("Cached snapshot for %s has incomplete state; downloading.", repo_id)
+            logger.debug("Cached snapshot for %s is incomplete; downloading.", repo_id)
         except Exception as e:
             logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
 

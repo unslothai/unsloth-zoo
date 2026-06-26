@@ -13,6 +13,7 @@ tests do not import the full ``unsloth_zoo`` package (which pulls in torch + GPU
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -888,20 +889,129 @@ def test_unclearable_partial_forces_clean_redownload(hf_cache, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Snapshot variant: in-process fast path on a warm cache, else watched download.
 # --------------------------------------------------------------------------- #
-def test_snapshot_fast_path_no_child(monkeypatch):
-    """A fully cached repo resolves in-process via local_files_only -- no attempt."""
+def test_snapshot_fast_path_no_child(hf_cache, monkeypatch):
+    """A fully cached repo (weights present) resolves in-process via local_files_only
+    -- no child attempt."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    snap = blobs.parent / "snapshots" / "sha"
+    snap.mkdir(parents = True)
+    weight = blobs / "w"
+    weight.write_bytes(b"\0" * 16)
+    (snap / "model.safetensors").symlink_to(weight)   # weights present -> complete
+    (snap / "config.json").write_text("{}")
     seen = {}
 
     def _snap(*a, **k):
         seen["local_files_only"] = k.get("local_files_only")
-        return "/cache/snap-dir"
+        return str(snap)
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _snap)
     fake = _install(monkeypatch, [])  # must not be called
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
-    assert out == "/cache/snap-dir"
+    assert out == str(snap)
     assert seen["local_files_only"] is True
     assert fake.calls == [], "spawned a download for an already-cached snapshot"
+
+
+def test_snapshot_dir_is_complete_unit(tmp_path):
+    """Weight presence drives completeness: a config-only snapshot is incomplete; one
+    with a resolvable weight file is complete."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    assert hcs.snapshot_dir_is_complete(snap) is False  # no weights
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"weights")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_snapshot_dir_is_complete_broken_symlink(tmp_path):
+    """A dangling weight symlink reads as incomplete."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "model.safetensors").symlink_to(tmp_path / "missing")
+    assert hcs.snapshot_dir_is_complete(snap) is False
+
+
+def test_snapshot_dir_is_complete_missing_shard(tmp_path):
+    """A shard index whose shards are not all on disk reads as incomplete until they are."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    assert hcs.snapshot_dir_is_complete(snap) is False  # shard 2 missing
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
+    """HF's local_files_only returns a config-only snapshot (e.g. left by an earlier
+    AutoConfig fetch) without checking weights. The fast path must reject it and complete
+    the download in the killable child rather than load with missing weights."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    snap = blobs.parent / "snapshots" / "sha"
+    snap.mkdir(parents = True)
+    cfg_blob = blobs / "cfg"
+    cfg_blob.write_text("{}")
+    (snap / "config.json").symlink_to(cfg_blob)   # only config, no weights
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(snap))
+    fake = _install(monkeypatch, [("ok", "/cache/snap-fresh")])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert out == "/cache/snap-fresh" and len(fake.calls) == 1
+
+
+def test_child_broken_snapshot_retries_over_http(monkeypatch, tmp_path):
+    """A real but broken child snapshot result (HF offline-fallback returning a dir with
+    dangling symlinks) is rejected on the Xet attempt and retried over HTTP; a clean
+    second result is accepted."""
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "model.safetensors").symlink_to(tmp_path / "missing")   # dangling
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    blob = tmp_path / "b"
+    blob.write_bytes(b"x")
+    (clean / "model.safetensors").symlink_to(blob)
+    fake = _install(monkeypatch, [("ok", str(broken)), ("ok", str(clean))])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert out == str(clean)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_child_broken_snapshot_after_http_raises(monkeypatch, tmp_path):
+    """If even the HTTP attempt returns a broken snapshot, fail loudly rather than hand
+    missing files to the load."""
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "model.safetensors").symlink_to(tmp_path / "missing")
+    fake = _install(monkeypatch, [("ok", str(broken)), ("ok", str(broken))])
+    with pytest.raises(xf.DownloadStallError, match = "incomplete snapshot"):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_child_weightless_snapshot_is_accepted(monkeypatch, tmp_path):
+    """A child result that simply has no weight files (the repo ships none) must NOT be
+    rejected: the child just did a full download, so absent weights mean the repo has
+    none, not a partial. Only a dangling symlink marks a broken child result."""
+    cfg_only = tmp_path / "cfg"
+    cfg_only.mkdir()
+    (cfg_only / "config.json").write_text("{}")   # no weights, but no broken links
+    fake = _install(monkeypatch, [("ok", str(cfg_only))])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert out == str(cfg_only) and len(fake.calls) == 1
 
 
 def test_snapshot_stall_then_http(monkeypatch):
