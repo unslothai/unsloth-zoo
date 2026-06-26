@@ -1029,6 +1029,31 @@ def test_child_weight_incomplete_snapshot_retries_over_http(monkeypatch, tmp_pat
     assert [c.disable_xet for c in fake.calls] == [False, True]
 
 
+def test_patterned_snapshot_without_weights_is_accepted(monkeypatch, tmp_path):
+    """A patterned download (allow_patterns) legitimately returns only the requested files
+    (e.g. config / tokenizer, no model weights). The child result must be accepted as-is,
+    not rejected and retried for lacking weights."""
+    cfg_only = tmp_path / "cfg"
+    cfg_only.mkdir()
+    (cfg_only / "config.json").write_text("{}")   # exactly what was requested, no weights
+    fake = _install(monkeypatch, [("ok", str(cfg_only))])
+    out = xf.snapshot_download_with_xet_fallback(
+        DL_REPO, token = None, allow_patterns = ["config.json"]
+    )
+    assert out == str(cfg_only) and len(fake.calls) == 1
+
+
+def test_dataset_snapshot_without_weights_is_accepted(monkeypatch, tmp_path):
+    """A non-model snapshot (repo_type='dataset') has no model weights by nature; its
+    child result must be accepted rather than retried/raised as 'incomplete'."""
+    files = tmp_path / "ds"
+    files.mkdir()
+    (files / "data.json").write_text("[]")
+    fake = _install(monkeypatch, [("ok", str(files))])
+    out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, repo_type = "dataset")
+    assert out == str(files) and len(fake.calls) == 1
+
+
 def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
     """The generic HTTP-prep purge must not unlink a concurrent download's still-active
     .incomplete temp file: only stale (old-mtime) partials are removed, so a sibling

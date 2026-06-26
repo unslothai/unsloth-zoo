@@ -640,20 +640,36 @@ def _run_download_attempt(
     return ("error", result.get("error") or "unknown download error")
 
 
-def _snapshot_payload_incomplete(payload: Any) -> bool:
-    """True when a snapshot download returned a real directory that is not weight-complete
-    (dangling symlinks, missing shards, or no weight file at all). Guarded to an existing
-    directory so a mocked / non-path payload (unit tests) or an unexpected return is
-    trusted rather than rejected; in production the child always returns a real snapshot
-    dir, where this catches HF silently handing back an existing partial snapshot on an
-    offline or timed-out request (verified: snapshot_download(local_files_only=False)
-    returns the stale local snapshot rather than raising when the Hub is unreachable).
+def _snapshot_is_acceptable(
+    snapshot_dir: Path, *, repo_type: str, allow_patterns: Any
+) -> bool:
+    """Whether a cached / downloaded snapshot dir is complete enough to use, scoped to the
+    caller's intent.
 
-    This reuses the fast-path weight-completeness check: snapshot_download_with_xet_fallback
-    is used to warm a model repo for an imminent load, so a result with no weight files
-    means the download did not finish, not that the repo is genuinely weightless (which
-    could not be loaded as a model anyway). Sending that on would drop from_pretrained back
-    onto missing weights and an in-process Xet load -- exactly what this wrapper prevents."""
+    A FULL model warmup (``repo_type == "model"`` and no ``allow_patterns``) must have its
+    weight files present: this wrapper exists to warm those weights before an in-process
+    load, so a result with no weights means the download did not finish (HF silently
+    returns a stale local snapshot on an offline / timed-out request rather than raising).
+
+    A PATTERNED or non-model snapshot (``allow_patterns`` set, or ``repo_type`` such as
+    ``"dataset"``) legitimately holds only the requested subset -- e.g. just
+    ``config.json`` / ``tokenizer*`` files, or dataset files with no model weights at all
+    -- so requiring a weight file there would reject a perfectly valid result. For those it
+    is enough that no symlink dangles (every file the snapshot references is on disk)."""
+    if repo_type == "model" and not allow_patterns:
+        return snapshot_dir_is_complete(snapshot_dir)
+    return not snapshot_dir_has_broken_symlinks(snapshot_dir)
+
+
+def _snapshot_payload_incomplete(
+    payload: Any, *, repo_type: str, allow_patterns: Any
+) -> bool:
+    """True when a snapshot download returned a real directory that is not acceptable for
+    the request (see ``_snapshot_is_acceptable``). Guarded to an existing directory so a
+    mocked / non-path payload (unit tests) or an unexpected return is trusted rather than
+    rejected; in production the child always returns a real snapshot dir, where this
+    catches HF handing back an existing partial snapshot on an offline / timed-out
+    request."""
     try:
         path = Path(payload)
     except TypeError:
@@ -663,7 +679,7 @@ def _snapshot_payload_incomplete(payload: Any) -> bool:
             return False
     except OSError:
         return False
-    return not snapshot_dir_is_complete(path)
+    return not _snapshot_is_acceptable(path, repo_type = repo_type, allow_patterns = allow_patterns)
 
 
 def _download_with_xet_fallback(
@@ -728,12 +744,15 @@ def _download_with_xet_fallback(
         )
 
         if kind_result == "ok":
-            if kind == "snapshot" and _snapshot_payload_incomplete(payload):
+            if kind == "snapshot" and _snapshot_payload_incomplete(
+                payload, repo_type = repo_type, allow_patterns = params.get("allow_patterns")
+            ):
                 # HF can return an existing, incomplete snapshot dir on an offline or
-                # timed-out request instead of fetching the missing files. Never hand a
-                # snapshot with absent weights to the in-process load: retry over HTTP,
-                # and if it still comes back incomplete, fail loudly rather than silently
-                # loading a broken cache.
+                # timed-out request instead of fetching the missing files. Never hand an
+                # incomplete snapshot to the in-process load: retry over HTTP, and if it
+                # still comes back incomplete, fail loudly rather than silently loading a
+                # broken cache. (A patterned / non-model request is judged by its own
+                # requested subset, so this never rejects a valid weightless snapshot.)
                 if not disable_xet:
                     logger.warning(
                         "Download for '%s' returned an incomplete snapshot -- "
@@ -744,7 +763,7 @@ def _download_with_xet_fallback(
                     continue
                 raise DownloadStallError(
                     f"Download for '{label}' returned an incomplete snapshot even with "
-                    f"HF_HUB_DISABLE_XET=1 -- missing weight files, check your network connection"
+                    f"HF_HUB_DISABLE_XET=1 -- missing files, check your network connection"
                 )
             return payload  # type: ignore[return-value]
         if kind_result == "cancelled":
@@ -927,14 +946,16 @@ def snapshot_download_with_xet_fallback(
             # local_files_only returns a snapshot dir whenever refs/<rev> and
             # snapshots/<sha> exist, even one left by a prior interrupted or patterned
             # download (a config-only snapshot from an AutoConfig fetch, or a partial
-            # shard pull). Validate that the EXACT returned revision dir is actually
-            # complete -- no dangling symlinks AND its weight files present on disk --
-            # and complete it in the killable child otherwise, so the in-process load
-            # never proceeds with missing weights. Scope the check to the returned
-            # snapshot, NOT the whole repo: an unrelated revision mid-download (a stale
-            # .incomplete blob or a broken older snapshot elsewhere in the same repo
-            # cache) must not force a needless re-fetch of a complete snapshot.
-            if snapshot_dir_is_complete(Path(cached_dir)):
+            # shard pull). Validate the EXACT returned revision dir against the request:
+            # a full model warmup requires its weight files on disk, a patterned / non-model
+            # request only its referenced files (no dangling symlinks). Complete it in the
+            # killable child otherwise, so the in-process load never proceeds with missing
+            # files. Scope the check to the returned snapshot, NOT the whole repo: an
+            # unrelated revision mid-download (a stale .incomplete blob or a broken older
+            # snapshot elsewhere in the same repo cache) must not force a needless re-fetch.
+            if _snapshot_is_acceptable(
+                Path(cached_dir), repo_type = repo_type, allow_patterns = allow_patterns
+            ):
                 return cached_dir
             logger.debug("Cached snapshot for %s is incomplete; downloading.", repo_id)
         except Exception as e:
