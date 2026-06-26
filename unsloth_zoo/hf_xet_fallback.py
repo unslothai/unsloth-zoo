@@ -156,6 +156,13 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
+# A *.incomplete blob touched more recently than this is treated as another
+# concurrent download's still-active temp file and left in place (see
+# _default_prepare_for_http). Smaller than any realistic stall_timeout, so our own
+# killed-then-stalled partial (static for >= stall_timeout) is still always purged.
+_ACTIVE_PARTIAL_GRACE = 30.0
+
+
 def _default_prepare_for_http(
     repo_type: str, repo_id: str, *, cache_dir: Optional[str] = None
 ) -> None:
@@ -176,6 +183,17 @@ def _default_prepare_for_http(
                 for blob in blobs_dir.iterdir():
                     if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
                         try:
+                            # Do not unlink a partial another concurrent download is
+                            # still actively writing (recent mtime): on POSIX that lets
+                            # the sibling keep writing to an unlinked path and then fail
+                            # when the Hub moves its temp file into place. Our own killed
+                            # partial has been static for the stall timeout, so it is
+                            # older than this window; if a very short stall_timeout left
+                            # it inside the window, the has_active_incomplete_blobs guard
+                            # downstream still forces a clean HTTP re-download, so the
+                            # HTTP attempt never resumes unsafely over it.
+                            if time.time() - blob.stat().st_mtime < _ACTIVE_PARTIAL_GRACE:
+                                continue
                             blob.unlink()
                         except OSError:
                             # A locked / permission-denied blob (common on Windows)
@@ -623,17 +641,19 @@ def _run_download_attempt(
 
 
 def _snapshot_payload_incomplete(payload: Any) -> bool:
-    """True when a snapshot download returned a real directory with dangling symlinks (a
-    referenced blob missing or still an .incomplete partial). Guarded to an existing
+    """True when a snapshot download returned a real directory that is not weight-complete
+    (dangling symlinks, missing shards, or no weight file at all). Guarded to an existing
     directory so a mocked / non-path payload (unit tests) or an unexpected return is
     trusted rather than rejected; in production the child always returns a real snapshot
-    dir, where this catches HF handing back an existing broken snapshot on an offline or
-    timed-out request.
+    dir, where this catches HF silently handing back an existing partial snapshot on an
+    offline or timed-out request (verified: snapshot_download(local_files_only=False)
+    returns the stale local snapshot rather than raising when the Hub is unreachable).
 
-    Unlike the fast-path snapshot_dir_is_complete check, this does NOT require weight
-    files to be present: the child just performed a full download, so an absent weight
-    format means the repo ships none (accept it), whereas a dangling symlink means a file
-    the snapshot references is genuinely missing (reject it)."""
+    This reuses the fast-path weight-completeness check: snapshot_download_with_xet_fallback
+    is used to warm a model repo for an imminent load, so a result with no weight files
+    means the download did not finish, not that the repo is genuinely weightless (which
+    could not be loaded as a model anyway). Sending that on would drop from_pretrained back
+    onto missing weights and an in-process Xet load -- exactly what this wrapper prevents."""
     try:
         path = Path(payload)
     except TypeError:
@@ -643,7 +663,7 @@ def _snapshot_payload_incomplete(payload: Any) -> bool:
             return False
     except OSError:
         return False
-    return snapshot_dir_has_broken_symlinks(path)
+    return not snapshot_dir_is_complete(path)
 
 
 def _download_with_xet_fallback(

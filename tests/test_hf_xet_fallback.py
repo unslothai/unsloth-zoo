@@ -230,7 +230,10 @@ def test_custom_cache_dir_is_watched_and_cleaned(tmp_path, monkeypatch):
         stop.set()
 
     # The HTTP-prep purge removes the unsafe partial from the custom cache
-    # (call the real impl; the autouse fixture stubs the module attribute).
+    # (call the real impl; the autouse fixture stubs the module attribute). Age it
+    # past the active-partial grace so it reads as a stalled, not in-flight, blob.
+    old = time.time() - 600
+    os.utime(partial, (old, old))
     _REAL_DEFAULT_PREPARE("model", REPO, cache_dir = str(custom_cache))
     assert not partial.exists()
 
@@ -336,6 +339,11 @@ def test_prepare_for_http_preserves_case_colliding_repo(tmp_path):
     lower_partial = lower / "b.incomplete"
     upper_partial.write_bytes(b"x")
     lower_partial.write_bytes(b"y")
+    # Age both past the active-partial grace so the purge is exercised on stalled blobs
+    # (lower is preserved by repo attribution, not mtime).
+    old = time.time() - 600
+    os.utime(upper_partial, (old, old))
+    os.utime(lower_partial, (old, old))
 
     _REAL_DEFAULT_PREPARE("model", "Org/Repo", cache_dir = str(tmp_path))
 
@@ -1002,16 +1010,40 @@ def test_child_broken_snapshot_after_http_raises(monkeypatch, tmp_path):
     assert [c.disable_xet for c in fake.calls] == [False, True]
 
 
-def test_child_weightless_snapshot_is_accepted(monkeypatch, tmp_path):
-    """A child result that simply has no weight files (the repo ships none) must NOT be
-    rejected: the child just did a full download, so absent weights mean the repo has
-    none, not a partial. Only a dangling symlink marks a broken child result."""
+def test_child_weight_incomplete_snapshot_retries_over_http(monkeypatch, tmp_path):
+    """A child result with no weight files (HF silently returning a stale config-only
+    snapshot on an offline / timed-out request) is rejected on the Xet attempt and retried
+    over HTTP; a complete second result is accepted. The helper warms model repos, so a
+    weight-less result means the download did not finish, not that the repo is weightless."""
     cfg_only = tmp_path / "cfg"
     cfg_only.mkdir()
-    (cfg_only / "config.json").write_text("{}")   # no weights, but no broken links
-    fake = _install(monkeypatch, [("ok", str(cfg_only))])
+    (cfg_only / "config.json").write_text("{}")   # no weights
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    blob = tmp_path / "b"
+    blob.write_bytes(b"x")
+    (complete / "model.safetensors").symlink_to(blob)
+    fake = _install(monkeypatch, [("ok", str(cfg_only)), ("ok", str(complete))])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
-    assert out == str(cfg_only) and len(fake.calls) == 1
+    assert out == str(complete)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
+    """The generic HTTP-prep purge must not unlink a concurrent download's still-active
+    .incomplete temp file: only stale (old-mtime) partials are removed, so a sibling
+    download of another file in the same repo keeps writing safely."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    stale = blobs / "stalled.incomplete"
+    stale.write_bytes(b"\0" * 16)
+    active = blobs / "sibling.incomplete"
+    active.write_bytes(b"\0" * 16)
+    # Age the stalled partial well past the active-partial grace; leave the sibling current.
+    old = time.time() - 600
+    os.utime(stale, (old, old))
+    _REAL_DEFAULT_PREPARE("model", DL_REPO, cache_dir = str(hf_cache))
+    assert not stale.exists(), "stale partial should be purged for the HTTP resume"
+    assert active.exists(), "an actively-written sibling partial must be preserved"
 
 
 def test_snapshot_stall_then_http(monkeypatch):
