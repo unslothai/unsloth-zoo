@@ -348,6 +348,7 @@ def _child_download(*, kind: str, params: dict, token: Optional[str], repo_type:
     return hf_hub_download(
         repo_id = params["repo_id"],
         filename = params["filename"],
+        subfolder = params.get("subfolder"),
         repo_type = repo_type,
         token = token,
         revision = params.get("revision"),
@@ -717,6 +718,7 @@ def hf_hub_download_with_xet_fallback(
     repo_type: Optional[str] = "model",
     revision: Optional[str] = None,
     cache_dir: Optional[str] = None,
+    subfolder: Optional[str] = None,
     force_download: bool = False,
     local_files_only: bool = False,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
@@ -732,14 +734,16 @@ def hf_hub_download_with_xet_fallback(
     fallback), and raises ``DownloadStallError`` only if BOTH transports stall.
     ``force_download=True`` re-fetches even if cached (skips the cache short-circuit).
     ``local_files_only=True`` resolves from cache in-process and never spawns a
-    network child (matching Hugging Face offline semantics).
+    network child (matching Hugging Face offline semantics). ``subfolder`` is
+    forwarded to ``hf_hub_download`` for files stored under a repo subdirectory.
     """
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Expand ~ as huggingface_hub does before writing, so the cache probe below and
     # the child both resolve to the same on-disk location (else a warm ~/hf-cache
-    # is missed and we spawn a child for an already-cached file).
-    if isinstance(cache_dir, str):
-        cache_dir = os.path.expanduser(cache_dir)
+    # is missed and we spawn a child for an already-cached file). Path-like cache
+    # dirs are normalized too, since HF accepts pathlib.Path.
+    if isinstance(cache_dir, (str, os.PathLike)):
+        cache_dir = os.path.expanduser(os.fspath(cache_dir))
     # Offline: resolve purely from the local cache, never reaching the network. HF
     # raises LocalEntryNotFoundError if it is not cached; let that propagate.
     if local_files_only:
@@ -748,6 +752,7 @@ def hf_hub_download_with_xet_fallback(
         return hf_hub_download(
             repo_id = repo_id,
             filename = filename,
+            subfolder = subfolder,
             token = token,
             repo_type = repo_type,
             revision = revision,
@@ -755,13 +760,15 @@ def hf_hub_download_with_xet_fallback(
             local_files_only = True,
         )
     # Finalized blob already cached: return it with no child and no network
-    # (skipped when force_download re-fetches unconditionally).
+    # (skipped when force_download re-fetches unconditionally). The cache stores a
+    # subfolder file under "<subfolder>/<filename>", which is what the probe wants.
     if not force_download:
         try:
             from huggingface_hub import try_to_load_from_cache
 
+            probe_filename = f"{subfolder}/{filename}" if subfolder else filename
             cached = try_to_load_from_cache(
-                repo_id, filename, repo_type = repo_type, revision = revision, cache_dir = cache_dir
+                repo_id, probe_filename, repo_type = repo_type, revision = revision, cache_dir = cache_dir
             )
             if isinstance(cached, str) and os.path.exists(cached):
                 return cached
@@ -775,6 +782,7 @@ def hf_hub_download_with_xet_fallback(
         params = {
             "repo_id": repo_id,
             "filename": filename,
+            "subfolder": subfolder,
             "revision": revision,
             "cache_dir": cache_dir,
             "force_download": force_download,
@@ -822,8 +830,8 @@ def snapshot_download_with_xet_fallback(
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Expand ~ as huggingface_hub does before writing, so the probe and the child
     # resolve to the same on-disk cache location.
-    if isinstance(cache_dir, str):
-        cache_dir = os.path.expanduser(cache_dir)
+    if isinstance(cache_dir, (str, os.PathLike)):
+        cache_dir = os.path.expanduser(os.fspath(cache_dir))
     # Offline: resolve purely from the local cache, never reaching the network. HF
     # raises if the snapshot is not cached; let that propagate.
     if local_files_only:

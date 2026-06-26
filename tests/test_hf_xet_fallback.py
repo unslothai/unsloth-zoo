@@ -464,6 +464,7 @@ class _FakeAttempt:
                 kind = kind,
                 target = params.get("filename", repo_id),
                 cache_dir = params.get("cache_dir"),
+                subfolder = params.get("subfolder"),
                 force_download = params.get("force_download"),
                 disable_xet = disable_xet,
                 repo_type = repo_type,
@@ -781,6 +782,40 @@ def test_file_probe_uses_expanded_cache_dir(monkeypatch, tmp_path):
     assert seen["cache_dir"] == str(tmp_path / "hfcache")
     # The expanded cache_dir is also what the download attempt receives.
     assert fake.calls[0].cache_dir == str(tmp_path / "hfcache")
+
+
+def test_pathlib_cache_dir_is_expanded(monkeypatch, tmp_path):
+    """A pathlib.Path cache_dir with ~ must be normalized too (HF accepts Path), or
+    the child writes under the literal '~/...' while the watchdog watches $HOME/...
+    and the stall is never detected."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    fake = _install(monkeypatch, [("ok", "/cache/snap")])
+    xf.snapshot_download_with_xet_fallback(
+        DL_REPO, token = None, cache_dir = Path("~/hfcache")
+    )
+    # Normalized to an expanded string for the child attempt + probes.
+    assert fake.calls[0].cache_dir == str(tmp_path / "hfcache")
+
+
+def test_subfolder_forwarded_to_file_download(monkeypatch):
+    """A single-file caller passing subfolder must not get a TypeError; subfolder
+    is forwarded into the download params (and the cache probe uses the combined
+    '<subfolder>/<filename>' path)."""
+    probed = {}
+
+    def _probe(repo_id, filename, *, repo_type, revision, cache_dir):
+        probed["filename"] = filename
+        return None  # not cached -> falls through to the faked attempt
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _probe)
+    fake = _install(monkeypatch, [("ok", "/cache/x")])
+    out = xf.hf_hub_download_with_xet_fallback(
+        DL_REPO, FILE, None, subfolder = "checkpoint-10"
+    )
+    assert out == "/cache/x"
+    assert probed["filename"] == f"checkpoint-10/{FILE}"  # probe uses combined path
+    assert fake.calls[0].subfolder == "checkpoint-10"  # forwarded to the child
 
 
 def test_file_download_defaults_token_to_none(monkeypatch):
