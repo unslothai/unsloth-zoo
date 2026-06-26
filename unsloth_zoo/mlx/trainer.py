@@ -62,6 +62,7 @@ from .utils import (
     create_preference_batches,
     make_orpo_loss_fn,
     make_dpo_loss_fn,
+    make_grpo_loss_fn,
     create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
@@ -557,6 +558,19 @@ class MLXDPOConfig(MLXTrainingConfig):
     """DPO config mirroring TRL's DPOConfig. Presets loss_type='dpo';
     tune dpo_beta / reference_free (inherited). Use with MLXDPOTrainer."""
     loss_type: str = "dpo"
+
+
+@dataclass
+class MLXGRPOConfig(MLXTrainingConfig):
+    """GRPO config mirroring TRL's GRPOConfig. Presets loss_type='grpo'.
+    Use with MLXGRPOTrainer (pass reward_funcs to the trainer)."""
+    loss_type: str = "grpo"
+    num_generations: int = 4          # completions per prompt (the group)
+    grpo_beta: float = 0.04           # KL penalty weight (TRL default)
+    grpo_epsilon: float = 0.2         # PPO clip epsilon (low and high)
+    temperature: float = 1.0          # rollout sampling temperature
+    max_completion_length: int = 128  # max new tokens per completion
+    reference_free: bool = False      # drop the KL term if True
 
 
 class MLXTrainer:
@@ -1261,6 +1275,16 @@ class MLXTrainer:
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
+            elif getattr(args, "loss_type", "sft") == "grpo":
+                _gb = getattr(args, "grpo_beta", 0.04)
+                _ge = getattr(args, "grpo_epsilon", 0.2)
+                _grf = bool(getattr(args, "reference_free", False))
+                _lora_mods = [mod for _, mod in tree_flatten(
+                    model, is_leaf=lambda x: isinstance(x, LoRALinear))
+                    if isinstance(mod, LoRALinear)]
+                loss_fn = make_grpo_loss_fn(beta=_gb, lora_mods=_lora_mods,
+                    reference_free=_grf, epsilon_low=_ge, epsilon_high=_ge)
+                print("Unsloth: Using GRPO loss (beta=" + str(_gb) + ").")
             elif use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
@@ -2372,6 +2396,87 @@ class MLXDPOTrainer(MLXTrainer):
         super().__init__(model, tokenizer, train_dataset, eval_dataset,
                          dataset_text_field, max_seq_length, packing,
                          data_collator, args, formatting_func, processor)
+
+
+class MLXGRPOTrainer(MLXTrainer):
+    """GRPO trainer mirroring TRL's GRPOTrainer. Forces loss_type='grpo'.
+
+    Unlike SFT/DPO/ORPO (static data), GRPO generates rollouts on the fly:
+    each step generates ``num_generations`` completions per prompt, scores
+    them with ``reward_funcs``, computes group-relative advantages, and yields
+    a (batch, lengths, advantages) tuple to the training loop. Rollout runs
+    uncompiled (mlx-lm generation); only the grad step is compiled.
+
+    reward_funcs: a callable or list of callables, each
+        ``fn(completions, prompts=..., **kwargs) -> list[float]`` (TRL signature).
+        Multiple reward functions are summed.
+    """
+    def __init__(self, model, tokenizer, train_dataset, reward_funcs,
+                 eval_dataset=None, args=None, formatting_func=None, processor=None):
+        if args is None:
+            args = MLXGRPOConfig()
+        elif getattr(args, "loss_type", "sft") != "grpo":
+            args.loss_type = "grpo"
+        if not isinstance(reward_funcs, (list, tuple)):
+            reward_funcs = [reward_funcs]
+        self.reward_funcs = list(reward_funcs)
+        super().__init__(model, tokenizer, train_dataset, eval_dataset,
+                         None, None, None, None, args, formatting_func, processor)
+
+    def _grpo_prompts(self):
+        """Extract prompt strings from the dataset (expects a 'prompt' column)."""
+        prompts = []
+        for ex in self.train_dataset:
+            if "prompt" not in ex:
+                raise ValueError("GRPO requires a 'prompt' column in the dataset.")
+            prompts.append(ex["prompt"])
+        return prompts
+
+    def _grpo_rollout_generator(self):
+        """Infinite generator: each next() does generate->reward->advantage
+        and yields (batch, lengths, advantages). Runs uncompiled."""
+        from mlx_lm import batch_generate
+        from mlx_lm.sample_utils import make_sampler
+        args = self.args
+        hf = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
+        pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
+        N = args.num_generations
+        sampler = make_sampler(temp=getattr(args, "temperature", 1.0))
+        prompts = self._grpo_prompts()
+        idx = 0
+        while True:
+            prompt = prompts[idx % len(prompts)]
+            idx += 1
+            pids = hf.encode(prompt)
+            resp = batch_generate(
+                self.model, self.tokenizer, prompts=[pids] * N,
+                max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
+            )
+            comps = resp.texts
+            # rewards: sum across reward functions (TRL-style)
+            total = [0.0] * N
+            for rf in self.reward_funcs:
+                vals = rf(completions=comps, prompts=[prompt] * N)
+                for i, v in enumerate(vals):
+                    total[i] += float(v)
+            rewards = mx.array(total)
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+            # build the concatenated group batch
+            pe = len(pids)
+            rows, lengths = [], []
+            for c in comps:
+                full = hf.encode(prompt + c)[: args.max_seq_length]
+                rows.append(full)
+                lengths.append([pe, len(full)])
+            L = max(len(r) for r in rows)
+            batch = mx.array([r + [pad_id] * (L - len(r)) for r in rows], dtype=mx.int32)
+            yield batch, mx.array(lengths), advantages
+
+    def _prepare_data(self, is_vlm):
+        if is_vlm:
+            raise ValueError("GRPO is not yet supported for VLM models on MLX.")
+        # GRPO drives the loop with a rollout generator, not static batches.
+        return None, self._grpo_rollout_generator()
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,

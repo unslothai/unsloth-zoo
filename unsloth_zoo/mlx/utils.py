@@ -610,6 +610,70 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
         return loss, ntoks
     return loss_fn
 
+def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
+                      epsilon_low=0.2, epsilon_high=0.2):
+    """Create a GRPO loss function (TRL-parity, token-level).
+
+    Signature matches the other loss fns so it drops into the trainer's text
+    step: (model, batch, lengths, advantages) -> (loss, ntoks). The
+    generator yields (batch, lengths, advantages); the step passes slot[2]
+    (advantages) through. ``lengths`` is (N,2) [resp_start, end); advantages
+    is per-row (N,). lengths sits in slot[1] to match the other loss fns.
+
+    Loss follows TRL's GRPOTrainer._compute_loss:
+      per_token_kl = exp(ref-pol) - (ref-pol) - 1            (k3, beta term)
+      coef_1 = exp(logp - stop_grad(logp))  (==1 at num_iter=1)
+      coef_2 = clip(coef_1, 1-eps_low, 1+eps_high)
+      per_token_loss = -min(coef_1*adv, coef_2*adv) + beta*per_token_kl
+      loss = masked-mean over completion tokens, then mean over group.
+
+    Reference (for KL) is the base model via LoRA-disable: zero the LoRA
+    scales under stop_gradient, restore in finally (same mechanism as DPO).
+    """
+    _mods = list(lora_mods) if lora_mods is not None else []
+
+    def _per_token_logp_and_mask(model, batch, lengths):
+        inp = batch[:, :-1]
+        tgt = batch[:, 1:]
+        logits = model(inp)
+        steps = mx.arange(1, tgt.shape[1] + 1)
+        mask = mx.logical_and(
+            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
+        ).astype(mx.float32)
+        logp = -nn.losses.cross_entropy(logits, tgt)
+        return logp, mask
+
+    def loss_fn(model, batch, lengths, advantages):
+        pol_logp, mask = _per_token_logp_and_mask(model, batch, lengths)
+
+        if beta != 0.0 and not reference_free and _mods:
+            saved = [md.scale for md in _mods]
+            try:
+                for md in _mods:
+                    md.scale = 0.0
+                ref_logp, _ = _per_token_logp_and_mask(model, batch, lengths)
+                ref_logp = mx.stop_gradient(ref_logp)
+            finally:
+                for md, s in zip(_mods, saved):
+                    md.scale = s
+            per_token_kl = mx.exp(ref_logp - pol_logp) - (ref_logp - pol_logp) - 1
+        else:
+            per_token_kl = mx.zeros(pol_logp.shape)
+
+        old_logp = mx.stop_gradient(pol_logp)
+        coef_1 = mx.exp(pol_logp - old_logp)
+        coef_2 = mx.clip(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+        adv = advantages.reshape(-1, 1)
+        per_token_loss = -mx.minimum(coef_1 * adv, coef_2 * adv)
+        if beta != 0.0:
+            per_token_loss = per_token_loss + beta * per_token_kl
+
+        tok_per_row = mx.maximum(mask.sum(-1), 1.0)
+        loss = ((per_token_loss * mask).sum(-1) / tok_per_row).mean()
+        return loss, mask.sum()
+    return loss_fn
+
+
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
