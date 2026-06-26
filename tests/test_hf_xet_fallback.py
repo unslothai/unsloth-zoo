@@ -964,6 +964,22 @@ def test_snapshot_dir_is_complete_missing_shard(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is True
 
 
+def test_snapshot_dir_is_complete_missing_shard_without_index(tmp_path):
+    """A leftover single numbered shard with NO index sidecar (an interrupted multi-shard
+    pull where the index was never cached) must read as incomplete: the shard name itself
+    states the full set, so the missing siblings are detectable without a manifest."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model-00001-of-00003.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is False  # shards 2 and 3 missing
+    (snap / "model-00002-of-00003.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is False  # shard 3 still missing
+    (snap / "model-00003-of-00003.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
     """HF's local_files_only returns a config-only snapshot (e.g. left by an earlier
     AutoConfig fetch) without checking weights. The fast path must reject it and complete
@@ -1084,6 +1100,19 @@ def test_request_can_include_weights_unit():
         None, ["*.safetensors", "*.bin", "*.h5", "*.msgpack", "*.gguf",
                "*.pt", "*.pth", "*.ckpt", "*.onnx", "*.pdparams", "*.index.json"]
     ) is False
+
+
+def test_request_can_include_weights_index_json_only():
+    """A metadata-only request that matches the shard *index* sidecars but no real weight
+    file must read as weightless: the index is JSON, not weights, so a JSON-only warmup
+    (allow_patterns=['*.json'] or ['*.index.json']) should not be forced to land shards."""
+    assert hcs.request_can_include_weights(["*.json"], None) is False
+    assert hcs.request_can_include_weights(["*.index.json"], None) is False
+    assert hcs.request_can_include_weights(
+        ["model.safetensors.index.json", "pytorch_model.bin.index.json"], None
+    ) is False
+    # A real weight pattern still counts as including weights.
+    assert hcs.request_can_include_weights(["*.safetensors"], None) is True
 
 
 def test_prepare_for_http_spares_active_sibling_partial(hf_cache):

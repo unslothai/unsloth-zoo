@@ -23,6 +23,7 @@ are download-manager concerns that live in the consumer, not in this module.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Iterator, Optional
@@ -209,6 +210,47 @@ _WEIGHT_FILE_SUFFIXES = (
 )
 
 
+# Numbered shard naming, e.g. ``model-00001-of-00002.safetensors`` or
+# ``pytorch_model-00003-of-00004.bin``: prefix, 1-based index, total, suffix.
+_NUMBERED_SHARD_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<idx>\d+)-of-(?P<total>\d+)(?P<suffix>\.[^.]+)$"
+)
+
+
+def _numbered_shard_set_present(entry: Path) -> bool:
+    """For a numbered weight shard (``model-00001-of-00002.safetensors``), True only when
+    every shard in its ``-of-NNNNN`` set is present in the same directory.
+
+    A leftover single shard from an interrupted multi-shard download reads as a weight
+    file on its own, so without this an incomplete pull (one shard on disk, the rest
+    never fetched) would short-circuit as a warm cache. This catches that even when the
+    shard *index* sidecar was never cached (so ``_weight_shard_index_complete`` has
+    nothing to check). A non-numbered / single-file weight matches no shard pattern and
+    is trivially satisfied."""
+    match = _NUMBERED_SHARD_RE.match(entry.name)
+    if match is None:
+        return True
+    total_str = match.group("total")
+    try:
+        total = int(total_str)
+    except ValueError:
+        return True
+    if total <= 0:
+        return True
+    prefix = match.group("prefix")
+    suffix = match.group("suffix")
+    width = len(total_str)
+    base = entry.parent
+    for i in range(1, total + 1):
+        shard_name = f"{prefix}-{i:0{width}d}-of-{total_str}{suffix}"
+        try:
+            if not (base / shard_name).exists():
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _weight_shard_index_complete(index_path: Path) -> bool:
     """True if every shard a HF weight index (``model.safetensors.index.json`` /
     ``pytorch_model.bin.index.json``) lists is present next to the index. An unreadable
@@ -246,10 +288,11 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
     skips the killable child and lets the in-process load hit Xet on the absent weights.
 
     A snapshot is complete only when it has no dangling symlinks, every weight-shard
-    index it ships resolves all its shards on disk, and it contains at least one weight
-    file. This does NOT assert that every non-weight file is present (no offline manifest
-    exists for that); the killable child completes anything else still missing. The aim
-    is simply to never short-circuit a snapshot whose weights are not on disk."""
+    index it ships resolves all its shards on disk, every numbered shard set present has
+    all its members on disk (even with no index sidecar), and it contains at least one
+    weight file. This does NOT assert that every non-weight file is present (no offline
+    manifest exists for that); the killable child completes anything else still missing.
+    The aim is simply to never short-circuit a snapshot whose weights are not on disk."""
     if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False
     try:
@@ -266,6 +309,8 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
                 return False
             has_weight = True
         elif name.endswith(_WEIGHT_FILE_SUFFIXES) and _safe_is_file(entry):
+            if not _numbered_shard_set_present(entry):
+                return False
             has_weight = True
     return has_weight
 
@@ -287,15 +332,17 @@ def request_can_include_weights(
         from huggingface_hub.utils import filter_repo_objects
     except Exception:
         return True  # cannot evaluate the filter -> assume weights are expected
-    # One canonical filename per recognized weight format (plus sharded / index variants);
-    # if any survives the filter, the requested set can include weights.
+    # One canonical filename per recognized weight format (plus sharded variants);
+    # if any survives the filter, the requested set can include weights. The shard
+    # *index* sidecars (``*.safetensors.index.json`` / ``*.bin.index.json``) are NOT
+    # probed: they are JSON metadata, not weights, so a metadata-only request such as
+    # ``allow_patterns=["*.json"]`` (or ``["*.index.json"]``) must read as weightless
+    # rather than being treated as a full weight load that requires shards on disk.
     probes = [
         "model.safetensors",
         "model-00001-of-00002.safetensors",
-        "model.safetensors.index.json",
         "pytorch_model.bin",
         "pytorch_model-00001-of-00002.bin",
-        "pytorch_model.bin.index.json",
         "tf_model.h5",
         "flax_model.msgpack",
         "model.gguf",
