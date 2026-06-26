@@ -3161,8 +3161,10 @@ def _ensure_vlm_prompt_utils_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
-    from .utils import save_pretrained_merged
+    from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
+    if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
+        kwargs["save_method"] = "merged_16bit"
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
@@ -3438,14 +3440,24 @@ def _mlx_generate(self, *args, **kwargs):
         else:
             max_tokens = 256
 
+    do_sample = kwargs.pop("do_sample", None)
+    sampler = kwargs.pop("sampler", None)
     temp = kwargs.pop("temperature", kwargs.pop("temp", 0.0))
     if temp is None:
         temp = 0.0
-    sampler = kwargs.pop("sampler", None) or make_sampler(
+    top_p = float(kwargs.pop("top_p", 0.0) or 0.0)
+    min_p = float(kwargs.pop("min_p", 0.0) or 0.0)
+    top_k = int(kwargs.pop("top_k", 0) or 0)
+    if do_sample is False and sampler is None:
+        temp = 0.0
+        top_p = 0.0
+        min_p = 0.0
+        top_k = 0
+    sampler = sampler or make_sampler(
         temp=float(temp),
-        top_p=float(kwargs.pop("top_p", 0.0) or 0.0),
-        min_p=float(kwargs.pop("min_p", 0.0) or 0.0),
-        top_k=int(kwargs.pop("top_k", 0) or 0),
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
     )
     logits_processors = kwargs.pop("logits_processors", None)
     if logits_processors is None:
@@ -4068,6 +4080,12 @@ class FastMLXModel:
                                     "Use the saved base quantization policy or retrain "
                                     "the adapter for the requested base quantization."
                                 )
+                    elif _adapter_base_bnb is not None:
+                        adapter_mlx_quant_config = {
+                            "bits": 4,
+                            "group_size": _MLX_QUANT_MODE_DEFAULTS["affine"][0],
+                            "mode": "affine",
+                        }
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).

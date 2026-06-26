@@ -683,7 +683,17 @@ class MLXTrainingConfig:
                 )
             setattr(self, field.name, value)
 
-        self._unsloth_mlx_warmup_steps_explicit = "warmup_steps" in provided
+        warmup_steps_default = type(self).warmup_steps
+        warmup_ratio_default = type(self).warmup_ratio
+        copied_all_fields = len(provided) == len(config_fields)
+        copied_default_warmup_with_ratio = (
+            copied_all_fields
+            and getattr(self, "warmup_steps", None) == warmup_steps_default
+            and getattr(self, "warmup_ratio", None) != warmup_ratio_default
+        )
+        self._unsloth_mlx_warmup_steps_explicit = (
+            "warmup_steps" in provided and not copied_default_warmup_with_ratio
+        )
 
 
 class MLXTrainer:

@@ -136,6 +136,13 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
         ratio_trainer.args.learning_rate,
     )
 
+    copied_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    copied_ratio_trainer.args = dataclasses.replace(
+        MLXTrainingConfig(learning_rate=5e-5, lr_scheduler_type="linear"),
+        warmup_ratio=0.1,
+    )
+    assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
     explicit_default_trainer = MLXTrainer.__new__(MLXTrainer)
     explicit_default_trainer.args = MLXTrainingConfig(
         learning_rate=5e-5,

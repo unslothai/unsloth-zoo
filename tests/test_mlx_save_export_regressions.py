@@ -220,6 +220,131 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
     }
 
 
+def test_text_generate_honors_do_sample_false(monkeypatch):
+    import mlx_lm
+    import mlx_lm.sample_utils as sample_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = {}
+
+    class Tokenizer:
+        bos_token = None
+
+        def encode(self, prompt, add_special_tokens=True):
+            return [1, 2, 3]
+
+    def fake_make_sampler(**kwargs):
+        calls["sampler"] = kwargs
+        return "sampler"
+
+    def fake_stream_generate(*args, **kwargs):
+        calls["stream_sampler"] = kwargs["sampler"]
+        return iter(())
+
+    monkeypatch.setattr(sample_utils, "make_sampler", fake_make_sampler)
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+
+    model = types.SimpleNamespace(_tokenizer=Tokenizer(), _is_vlm_model=False)
+    out = loader._mlx_generate(
+        model,
+        input_ids=[1, 2, 3],
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=32,
+        max_new_tokens=1,
+    )
+
+    assert out.tolist() == [[1, 2, 3]]
+    assert calls["sampler"] == {
+        "temp": 0.0,
+        "top_p": 0.0,
+        "min_p": 0.0,
+        "top_k": 0,
+    }
+    assert calls["stream_sampler"] == "sampler"
+
+
+def test_bound_save_pretrained_defaults_to_full_save_without_lora(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+
+    def fake_save_pretrained_merged(model, tokenizer, save_directory, **kwargs):
+        calls["tokenizer"] = tokenizer
+        calls["save_directory"] = Path(save_directory)
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(mutils, "collect_mlx_lora_adapter_tensors", lambda model: {})
+    monkeypatch.setattr(mutils, "save_pretrained_merged", fake_save_pretrained_merged)
+
+    tokenizer = object()
+    model = types.SimpleNamespace(_tokenizer=tokenizer)
+    loader._mlx_save_pretrained_merged(model, tmp_path)
+
+    assert calls == {
+        "tokenizer": tokenizer,
+        "save_directory": tmp_path,
+        "kwargs": {"save_method": "merged_16bit"},
+    }
+
+
+def test_adapter_bnb_base_remap_defaults_to_mlx_4bit_quantization(
+    monkeypatch,
+    tmp_path,
+):
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": "unsloth/tinyllama-bnb-4bit",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {}
+    original_from_pretrained = loader.FastMLXModel.from_pretrained
+
+    class StopAdapterLoad(RuntimeError):
+        pass
+
+    def fake_download(model_name, revision=None):
+        assert model_name == str(adapter_dir)
+        return adapter_dir
+
+    def fake_recursive_from_pretrained(model_name, **kwargs):
+        calls["model_name"] = model_name
+        calls["kwargs"] = kwargs
+        raise StopAdapterLoad("Unsloth: stop after recursive adapter base load")
+
+    monkeypatch.setattr(mlx_lm_utils, "_download", fake_download)
+    monkeypatch.setattr(
+        loader.FastMLXModel,
+        "from_pretrained",
+        staticmethod(fake_recursive_from_pretrained),
+    )
+
+    with pytest.raises(StopAdapterLoad):
+        original_from_pretrained(str(adapter_dir))
+
+    assert calls["model_name"] == "unsloth/tinyllama"
+    assert calls["kwargs"]["load_in_4bit"] is False
+    assert calls["kwargs"]["mlx_quantization_config"] == {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+    }
+
+
 def test_lora_push_uses_lora_adapter_hub_path(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
