@@ -222,6 +222,33 @@ def _default_prepare_for_http(
         logger.debug("default prepare_for_http failed for %s: %s", repo_id, e)
 
 
+def _active_incomplete_blob_sizes(
+    repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
+) -> dict[str, int]:
+    """Map ``{blob_filename: bytes_present}`` for the repo's ``*.incomplete`` partials.
+
+    Sparse-aware (st_blocks based). The single-file watchdog uses this to follow only the
+    partials its own child created, so a concurrent sibling download of a different file in
+    the same repo (its partial already present when this download began) cannot mask this
+    file's stall by contributing its own progress.
+    """
+    sizes: dict[str, int] = {}
+    try:
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+            blobs_dir = entry / "blobs"
+            if not blobs_dir.is_dir():
+                continue
+            for blob in blobs_dir.iterdir():
+                try:
+                    if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
+                        sizes[blob.name] = blob_bytes_present(blob)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return sizes
+
+
 def get_hf_download_state(
     repo_ids: Optional[list[str]] = None,
     *,
@@ -279,6 +306,8 @@ def start_watchdog(
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     xet_disabled: bool = False,
     on_heartbeat: Optional[Callable[[str], None]] = None,
+    watch_new_partials_only: bool = False,
+    baseline_incomplete_blobs: Optional[set] = None,
 ) -> threading.Event:
     """Start a daemon thread that fires ``on_stall(message)`` exactly once iff a
     ``*.incomplete`` is present AND the on-disk size is unchanged for
@@ -286,19 +315,35 @@ def start_watchdog(
     post-download init is never misread as a stall. Scans *cache_dir* when the
     download targets a caller-supplied cache, else the active ``HF_HUB_CACHE``.
     Returns a stop event the caller sets when the download phase ends.
+
+    When *watch_new_partials_only* is set (single-file downloads), progress is measured
+    only over ``*.incomplete`` partials that were NOT present in *baseline_incomplete_blobs*
+    (captured before the child started) -- i.e. the child's own partials. This keeps a
+    concurrent sibling download of a different file in the same repo from resetting the
+    stall timer with its progress, which would otherwise keep a hung child alive forever.
+    Snapshot downloads keep the repo-wide measurement (every blob is part of the one pull).
     """
     stop = threading.Event()
     transport = "https" if xet_disabled else "xet"
     fired = False
+    baseline = set(baseline_incomplete_blobs or ())
+    single_repo_id = repo_ids[0] if repo_ids else ""
+
+    def _measure() -> Optional[tuple[int, bool]]:
+        if watch_new_partials_only:
+            sizes = _active_incomplete_blob_sizes(repo_type, single_repo_id, cache_dir)
+            owned = {name: n for name, n in sizes.items() if name not in baseline}
+            return (sum(owned.values()), len(owned) > 0)
+        return get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
 
     def _beat() -> None:
         nonlocal fired
-        state = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+        state = _measure()
         last_size = state[0] if state is not None else 0
         last_change = time.monotonic()
 
         while not stop.wait(interval):
-            state = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+            state = _measure()
             now = time.monotonic()
 
             if state is None:
@@ -493,6 +538,15 @@ def _run_download_attempt(
     Returns ``("ok", path)``, ``("stall", None)``, ``("cancelled", None)``, or
     ``("error", message)``. This is the seam tests monkeypatch to avoid spawning.
     """
+    # A single-file download scopes its stall detection to its own child's partials.
+    # Capture the partials already on disk for this repo BEFORE spawning, so the watchdog
+    # can ignore a concurrent sibling's in-flight partial (a different file in the same
+    # repo) and only follow the blob(s) this child newly writes. Snapshots stay repo-wide.
+    baseline_partials: Optional[set] = None
+    if kind == "file":
+        baseline_partials = set(
+            _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
+        )
     result_queue: Any = _CTX.Queue()
     proc = _CTX.Process(
         target = _download_child_entry,
@@ -591,6 +645,8 @@ def _run_download_attempt(
         stall_timeout = stall_timeout,
         xet_disabled = disable_xet,
         on_heartbeat = on_status,
+        watch_new_partials_only = (kind == "file"),
+        baseline_incomplete_blobs = baseline_partials,
     )
 
     result: Optional[dict] = None

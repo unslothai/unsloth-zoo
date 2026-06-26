@@ -209,6 +209,38 @@ _WEIGHT_FILE_SUFFIXES = (
     ".pdparams",
 )
 
+# Trainer / optimizer state files carry weight suffixes (.bin / .pt / .pth) but are NOT
+# loadable model weights. A checkpoint dir or a patterned pull can leave only these behind,
+# so they must not satisfy the "snapshot holds its weights" check (which would skip the
+# killable download while from_pretrained still lacks real weights).
+_NON_WEIGHT_BASENAMES = frozenset({
+    "training_args.bin",
+    "optimizer.bin",
+    "optimizer.pt",
+    "scheduler.bin",
+    "scheduler.pt",
+    "scaler.pt",
+    "rng_state.pt",
+    "rng_state.pth",
+})
+# Distributed trainer runs shard the RNG state as rng_state_0.pth, rng_state_1.pth, ...
+_NON_WEIGHT_BASENAME_PREFIXES = ("rng_state_",)
+
+
+def _is_loadable_weight_file(name: str) -> bool:
+    """True if *name* is a loadable model-weight file: a recognized weight suffix that is
+    not a known trainer / optimizer state artifact (training_args.bin, optimizer.pt,
+    scheduler.pt, rng_state.pth, ...). Those share weight suffixes but are not model
+    weights, so a cache holding only them is not a warm model cache."""
+    if not name.endswith(_WEIGHT_FILE_SUFFIXES):
+        return False
+    lowered = name.lower()
+    if lowered in _NON_WEIGHT_BASENAMES:
+        return False
+    if any(lowered.startswith(prefix) for prefix in _NON_WEIGHT_BASENAME_PREFIXES):
+        return False
+    return True
+
 
 # Numbered shard naming, e.g. ``model-00001-of-00002.safetensors`` or
 # ``pytorch_model-00003-of-00004.bin``: prefix, 1-based index, total, suffix.
@@ -308,11 +340,49 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
             if not _weight_shard_index_complete(entry):
                 return False
             has_weight = True
-        elif name.endswith(_WEIGHT_FILE_SUFFIXES) and _safe_is_file(entry):
+        elif _is_loadable_weight_file(name) and _safe_is_file(entry):
             if not _numbered_shard_set_present(entry):
                 return False
             has_weight = True
     return has_weight
+
+
+# One canonical filename per recognized weight format (plus a representative first shard);
+# the probe set for "can this request include a weight file". The shard *index* sidecars
+# (``*.safetensors.index.json`` / ``*.bin.index.json``) are intentionally absent: they are
+# JSON metadata, not weights, so a metadata-only request such as ``allow_patterns=["*.json"]``
+# (or ``["*.index.json"]``) must read as weightless rather than as a full weight load.
+_WEIGHT_PROBE_NAMES = (
+    "model.safetensors",
+    "model-00001-of-00002.safetensors",
+    "pytorch_model.bin",
+    "pytorch_model-00001-of-00002.bin",
+    "tf_model.h5",
+    "flax_model.msgpack",
+    "model.gguf",
+    "model.pt",
+    "model.pth",
+    "model.ckpt",
+    "model.onnx",
+    "model.pdparams",
+)
+
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def _has_glob(text: str) -> bool:
+    return any(ch in text for ch in _GLOB_CHARS)
+
+
+def _pattern_basename_targets_weight(pattern: str) -> bool:
+    """True if *pattern*'s final path component looks like it selects a weight file: a
+    catch-all (``*`` / ``**``) or a name / glob ending in a recognized weight suffix.
+    Used only when the pattern's parent directory is itself globbed, so no concrete probe
+    path can be formed."""
+    base = pattern.rsplit("/", 1)[-1].lower()
+    if base in ("*", "**"):
+        return True
+    return base.endswith(_WEIGHT_FILE_SUFFIXES)
 
 
 def request_can_include_weights(
@@ -325,33 +395,40 @@ def request_can_include_weights(
     filters every weight format out (e.g. ``ignore_patterns`` covering ``*.safetensors``
     and ``*.bin`` to fetch only config / tokenizer files from a model repo) legitimately
     yields a weightless snapshot, so requiring a weight there would reject a valid result.
-    An unfiltered request -- or one any weight filename survives -- includes weights."""
+    An unfiltered request -- or one any weight filename survives -- includes weights.
+
+    Path-qualified requests are handled too: ``allow_patterns`` such as
+    ``["checkpoint-10/*"]`` or ``["models/*.safetensors"]`` probe the canonical weight
+    names re-rooted under that directory, and a bare non-first shard like
+    ``["model-00002-of-00005.safetensors"]`` is probed verbatim, so a request that does
+    target weights inside a subfolder / at a specific shard is not misread as weightless."""
     if not allow_patterns and not ignore_patterns:
         return True
     try:
         from huggingface_hub.utils import filter_repo_objects
     except Exception:
         return True  # cannot evaluate the filter -> assume weights are expected
-    # One canonical filename per recognized weight format (plus sharded variants);
-    # if any survives the filter, the requested set can include weights. The shard
-    # *index* sidecars (``*.safetensors.index.json`` / ``*.bin.index.json``) are NOT
-    # probed: they are JSON metadata, not weights, so a metadata-only request such as
-    # ``allow_patterns=["*.json"]`` (or ``["*.index.json"]``) must read as weightless
-    # rather than being treated as a full weight load that requires shards on disk.
-    probes = [
-        "model.safetensors",
-        "model-00001-of-00002.safetensors",
-        "pytorch_model.bin",
-        "pytorch_model-00001-of-00002.bin",
-        "tf_model.h5",
-        "flax_model.msgpack",
-        "model.gguf",
-        "model.pt",
-        "model.pth",
-        "model.ckpt",
-        "model.onnx",
-        "model.pdparams",
-    ]
+
+    probes = list(_WEIGHT_PROBE_NAMES)
+    for pat in (allow_patterns or ()):
+        if "/" in pat:
+            prefix = pat.rsplit("/", 1)[0]
+            if _has_glob(prefix):
+                # Globbed parent dir (e.g. "checkpoint-*/*.safetensors"): no concrete path
+                # to test, so decide from the basename. Only a weight-targeting basename
+                # flips this on, so config/tokenizer globs under a wildcard dir stay
+                # weightless and are not forced into a strict weight check.
+                if _pattern_basename_targets_weight(pat):
+                    return True
+                continue
+            # Concrete parent dir: re-root the canonical weight probes under it so a
+            # path-qualified request is checked inside that directory, not only at the root.
+            probes.extend(f"{prefix}/{name}" for name in _WEIGHT_PROBE_NAMES)
+        # A bare concrete weight filename (e.g. a specific non-first shard, or a
+        # subfolder-qualified weight) is itself a probe the filter can match verbatim.
+        if not _has_glob(pat) and pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
+            probes.append(pat)
+
     try:
         kept = list(
             filter_repo_objects(

@@ -155,6 +155,95 @@ def test_stall_fires_at_most_once(hf_cache):
         stop.set()
 
 
+def test_file_watchdog_scopes_to_child_partial(hf_cache):
+    """A single-file download follows only its own child's partials. A concurrent sibling
+    download of a different file in the same repo (its partial already in flight, so in the
+    baseline) keeps growing, but must not keep resetting this file's stall timer -- the
+    constant child partial still fires."""
+    blobs = _blobs_dir(hf_cache)
+    sibling = blobs / "sibling.incomplete"   # already in flight -> captured in baseline
+    sibling.write_bytes(b"\0" * 1024)
+    baseline = {"sibling.incomplete"}
+
+    grow_stop = threading.Event()
+
+    def _grow():
+        size = 1024
+        while not grow_stop.wait(0.05):
+            size += 4096
+            sibling.write_bytes(b"\0" * size)   # healthy sibling keeps making progress
+
+    grower = threading.Thread(target = _grow, daemon = True)
+    grower.start()
+
+    # This download's child writes its own constant (stalled) partial, not in the baseline.
+    (blobs / "child.incomplete").write_bytes(b"\0" * 2048)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+        watch_new_partials_only = True, baseline_incomplete_blobs = baseline,
+    )
+    try:
+        assert _wait(lambda: len(calls) >= 1, timeout = 3.0), (
+            "file watchdog never fired: a growing sibling partial masked the stalled child"
+        )
+    finally:
+        stop.set()
+        grow_stop.set()
+
+
+def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
+    """Contrast for the single-file scoping: the default repo-wide measurement sums every
+    blob, so a growing sibling resets the timer and a constant partial never trips. This is
+    correct for snapshots (all blobs are one pull) and is exactly what file-scoping avoids."""
+    blobs = _blobs_dir(hf_cache)
+    sibling = blobs / "sibling.incomplete"
+    sibling.write_bytes(b"\0" * 1024)
+    (blobs / "child.incomplete").write_bytes(b"\0" * 2048)   # constant
+
+    grow_stop = threading.Event()
+
+    def _grow():
+        size = 1024
+        while not grow_stop.wait(0.05):
+            size += 4096
+            sibling.write_bytes(b"\0" * size)
+
+    grower = threading.Thread(target = _grow, daemon = True)
+    grower.start()
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(   # default: repo-wide (watch_new_partials_only = False)
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+    )
+    try:
+        time.sleep(1.0)   # well past stall_timeout, but repo-wide bytes keep growing
+        assert calls == [], "repo-wide watchdog should be reset by the growing sibling"
+    finally:
+        stop.set()
+        grow_stop.set()
+
+
+def test_file_watchdog_ignores_baseline_only_partials(hf_cache):
+    """If the only active partial is a baseline sibling's (this child has not written one
+    yet), the file watchdog sees no owned progress and must not fire: there is nothing of
+    ours to stall on, so post-spawn metadata/connect time is never misread as our stall."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "sibling.incomplete").write_bytes(b"\0" * 4096)   # constant baseline sibling
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.2,
+        watch_new_partials_only = True, baseline_incomplete_blobs = {"sibling.incomplete"},
+    )
+    try:
+        time.sleep(0.8)
+        assert calls == [], "file watchdog fired on a baseline sibling partial it must ignore"
+    finally:
+        stop.set()
+
+
 def test_get_state_empty_cache(hf_cache):
     assert xf.get_hf_download_state([REPO]) == (0, False)
 
@@ -980,6 +1069,25 @@ def test_snapshot_dir_is_complete_missing_shard_without_index(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is True
 
 
+def test_snapshot_dir_is_complete_ignores_trainer_artifacts(tmp_path):
+    """Trainer / optimizer state files carry weight suffixes (.bin/.pt/.pth) but are not
+    loadable model weights. A checkpoint cache holding only those must read as incomplete
+    so the killable child still fetches the real weights."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    for junk in (
+        "training_args.bin", "optimizer.pt", "scheduler.pt",
+        "rng_state.pth", "rng_state_0.pth", "scaler.pt",
+    ):
+        (snap / junk).symlink_to(blob)
+    (snap / "config.json").write_text("{}")
+    assert hcs.snapshot_dir_is_complete(snap) is False  # only trainer state, no weights
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True   # real weight present
+
+
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
     """HF's local_files_only returns a config-only snapshot (e.g. left by an earlier
     AutoConfig fetch) without checking weights. The fast path must reject it and complete
@@ -1113,6 +1221,29 @@ def test_request_can_include_weights_index_json_only():
     ) is False
     # A real weight pattern still counts as including weights.
     assert hcs.request_can_include_weights(["*.safetensors"], None) is True
+
+
+def test_request_can_include_weights_path_qualified():
+    """Path-qualified allow_patterns must be resolved inside their directory, and a bare
+    non-first shard recognized, so a subfolder / checkpoint / specific-shard weight request
+    is not misread as weightless (which would skip the killable child)."""
+    # Concrete subfolder globs: weights live under the directory.
+    assert hcs.request_can_include_weights(["checkpoint-10/*"], None) is True
+    assert hcs.request_can_include_weights(["checkpoint-10/*.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["models/*.bin"], None) is True
+    # A specific (non-first) shard named verbatim.
+    assert hcs.request_can_include_weights(["model-00002-of-00005.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["checkpoint-10/pytorch_model.bin"], None) is True
+    # Globbed parent dir, weight-targeting basename -> can include weights.
+    assert hcs.request_can_include_weights(["checkpoint-*/*.safetensors"], None) is True
+    # Subfolder requests that target only non-weight files stay weightless.
+    assert hcs.request_can_include_weights(["checkpoint-10/config.json"], None) is False
+    assert hcs.request_can_include_weights(["checkpoint-10/*.json"], None) is False
+    assert hcs.request_can_include_weights(["checkpoint-*/tokenizer.json"], None) is False
+    # The unsloth subfolder warmup shape: "<sub>/*" plus root aux files -> weights expected.
+    assert hcs.request_can_include_weights(
+        ["checkpoint-10/*", "config.json", "tokenizer.json"], None
+    ) is True
 
 
 def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
