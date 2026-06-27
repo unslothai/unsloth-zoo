@@ -329,6 +329,30 @@ def test_file_watchdog_pid_scope_ignores_unowned_sibling(hf_cache):
         child.wait(timeout = 5)
 
 
+def test_file_watchdog_empty_open_set_ignores_sibling(hf_cache, monkeypatch):
+    """hf_xet writes in-process and holds its .incomplete fd continuously, so an EMPTY child
+    open-set means the child owns no partial YET (the connect / metadata phase), NOT that a
+    helper process owns one. A concurrent sibling's post-baseline partial must therefore NOT be
+    attributed to a still-connecting child -- otherwise a stalled sibling would kill it and force
+    a needless HTTP retry. The precise empty-set branch owns nothing, so no stall fires."""
+    blobs = _blobs_dir(hf_cache)
+    # A sibling partial created after baseline (not name-excluded), constant (stalled).
+    (blobs / "sibling.incomplete").write_bytes(b"\0" * 4096)
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda pid: set())  # child owns none
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.2,
+        watch_new_partials_only = True, baseline_incomplete_blobs = set(),
+        child_pid = 4242,   # non-None so the precise child-open path is taken
+    )
+    try:
+        time.sleep(0.8)
+        assert calls == [], "watchdog falsely fired on a sibling partial the child does not own"
+    finally:
+        stop.set()
+
+
 def test_get_state_empty_cache(hf_cache):
     assert xf.get_hf_download_state([REPO]) == (0, False)
 
@@ -762,7 +786,16 @@ def test_is_retryable_download_error_classification():
 
     assert f(_Status429("Too Many Requests")) is True
 
+    class _Status408(Exception):
+        status_code = 408
+
+    assert f(_Status408("Request Timeout")) is True  # 408 is transient
+
     # Deterministic Hub errors -> not retryable (matched by class name or 4xx status).
+    class _Status416(Exception):
+        status_code = 416
+
+    assert f(_Status416("Range Not Satisfiable")) is False  # a retry would fail identically
     class RepositoryNotFoundError(Exception):
         pass
 
@@ -1676,6 +1709,88 @@ def test_request_can_include_weights_trainer_artifacts_weightless(tmp_path):
     assert xf._snapshot_is_acceptable(
         snap, repo_type = "model", allow_patterns = ["optimizer.pt"], ignore_patterns = None
     ) is True
+
+
+def test_request_can_include_weights_empty_allow_list(tmp_path):
+    """allow_patterns=[] is a real filter that selects NO objects (Hugging Face semantics), so
+    the request is weightless -- it must not collapse with None (an unfiltered warmup) and
+    reject a legitimately empty snapshot (Codex #829). ignore_patterns=[] ignores nothing, so
+    it stays weight-including."""
+    assert hcs.request_can_include_weights([], None) is False
+    assert hcs.request_can_include_weights(None, None) is True
+    assert hcs.request_can_include_weights(None, []) is True
+    assert hcs.request_can_include_weights([], []) is False
+    # snapshot_dir_is_complete agrees: allow=[] is a scoped (select-nothing) request, not a full
+    # warmup, so a snapshot carrying an unrelated weight is not read as complete for it.
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = []) is False
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = None) is True
+
+
+def test_request_can_include_weights_non_weight_subfolders():
+    """A generic glob under a plain (non-checkpoint) subfolder such as tokenizer/* or runs/*
+    must read as weightless -- the unconditional canonical re-rooting would otherwise add a
+    synthetic tokenizer/model.safetensors probe and misclassify a tokenizer-only download as a
+    model warmup (Codex #829). A checkpoint/weight dir or a weight-targeting basename still
+    includes weights."""
+    assert hcs.request_can_include_weights(["tokenizer/*"], None) is False
+    assert hcs.request_can_include_weights(["runs/*"], None) is False
+    assert hcs.request_can_include_weights(["logs/*.txt"], None) is False
+    # Weight-bearing cases stay weight-including.
+    assert hcs.request_can_include_weights(["checkpoint-10/*"], None) is True
+    assert hcs.request_can_include_weights(["*/model.*"], None) is True
+    assert hcs.request_can_include_weights(["models/*.safetensors"], None) is True
+    # A weight-suffix basename under a plain subfolder is still recognized (self-probe).
+    assert hcs.request_can_include_weights(["tokenizer/*.safetensors"], None) is True
+    # A checkpoint dir nested anywhere in the parent path counts.
+    assert hcs.request_can_include_weights(["runs/checkpoint-5/*"], None) is True
+
+
+def test_request_can_include_weights_weight_bearing_subfolders(tmp_path):
+    """A component / quant subfolder (unet/, transformer/, original/, BF16/, Q8_0/) holds
+    weights, so a bare catch-all under it must stay weight-including -- reading an unknown
+    subfolder as weightless would accept a stale config-only cache and re-open the silent Xet
+    hang. Only KNOWN auxiliary dirs (tokenizer/, runs/) are weightless (Codex #829)."""
+    for d in ["unet/*", "transformer/*", "text_encoder/*", "vae/*", "original/*",
+              "mp_rank_00/*", "BF16/*", "Q8_0/*", "Q4_K_M/*", "unknown_component/*"]:
+        assert hcs.request_can_include_weights([d], None) is True, d
+    # End to end: a stale config-only BF16/ snapshot (weight missing, no dangling symlink) must
+    # NOT be short-circuited as warm -- the guarded download still runs.
+    snap = tmp_path / "snap"
+    (snap / "BF16").mkdir(parents = True)
+    (snap / "BF16" / "config.json").write_text("{}")          # config only, no weight
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["BF16/*"], ignore_patterns = None,
+        require_named_weights = True,
+    ) is False
+    # Once the weight is present, it is acceptable.
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "BF16" / "model.safetensors").symlink_to(blob)
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["BF16/*"], ignore_patterns = None,
+    ) is True
+
+
+def test_basename_weight_classification_helpers():
+    """Lock the catch-all-vs-weight distinction the subfolder gating rests on: a weight-stem
+    basename targets a weight, a config / tokenizer glob is clearly non-weight, and a bare
+    catch-all ('*') is NEITHER (so it defaults to weight-including under an unknown dir)."""
+    tw, nw = hcs._basename_targets_weight, hcs._basename_is_non_weight
+    assert tw("model.*") is True and nw("model.*") is False
+    assert tw("*.safetensors") is True and nw("*.safetensors") is False
+    assert tw("adapter_model.*") is True
+    assert tw("*.json") is False and nw("*.json") is True
+    assert tw("tokenizer.*") is False and nw("tokenizer.*") is True
+    assert tw("config.json") is False and nw("config.json") is True
+    # A catch-all matches both a weight and a non-weight representative -> neither classifier.
+    assert tw("*") is False and nw("*") is False
+    # *.bin matches a weight (pytorch_model.bin) AND a non-weight (training_args.bin) -> neither.
+    assert tw("*.bin") is False and nw("*.bin") is False
 
 
 def test_request_can_include_weights_string_form():

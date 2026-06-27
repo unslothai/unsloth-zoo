@@ -60,6 +60,19 @@ from unsloth_zoo.hf_cache_state import (
 
 logger = logging.getLogger(__name__)
 
+# Public surface (Studio imports from this module, including a `import *` re-export shim), so
+# an explicit list keeps the stdlib imports (os, re, signal, errno, ...) out of `import *`.
+__all__ = [
+    "DownloadStallError",
+    "hf_hub_download_with_xet_fallback",
+    "snapshot_download_with_xet_fallback",
+    "start_watchdog",
+    "get_hf_download_state",
+    "is_hf_xet_available",
+    "xet_force_disabled",
+    "child_should_disable_xet",
+]
+
 _CTX = mp.get_context("spawn")
 
 # Defaults match the existing Studio inference watchdog and hub shutdown deadline.
@@ -378,11 +391,17 @@ def start_watchdog(
             sizes = _active_incomplete_blob_sizes(repo_type, single_repo_id, cache_dir)
             open_names = _child_open_incomplete_blobs(child_pid) if child_pid else None
             if open_names is not None:
-                # Precise: only the partials this child holds open (handles a resumed
-                # partial that reuses a baseline blob-hash name, and excludes siblings).
+                # Precise: only the partials this child process holds open (handles a resumed
+                # partial that reuses a baseline blob-hash name, and excludes siblings). hf_xet
+                # writes in-process and holds the .incomplete fd continuously, so an EMPTY set
+                # here means the child owns no partial YET (the connect / metadata phase), NOT
+                # that a helper process owns one -- it must own nothing this tick, so a stalled
+                # sibling's post-baseline partial cannot be misattributed and kill a connecting
+                # child.
                 owned = {name: n for name, n in sizes.items() if name in open_names}
             else:
-                # Fallback (no psutil / no /proc): follow only newly-created partials.
+                # Cannot inspect the child (no psutil / no /proc): best-effort fall back to
+                # following only newly-created partials (not in the pre-spawn baseline).
                 owned = {name: n for name, n in sizes.items() if name not in baseline}
             return (sum(owned.values()), len(owned) > 0)
         return get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
@@ -481,7 +500,9 @@ def _is_retryable_download_error(exc: BaseException) -> bool:
     if not isinstance(status, int):
         status = getattr(exc, "status_code", None)
     if isinstance(status, int):
-        return status >= 500 or status == 429
+        # 5xx server errors, 429 rate-limit, 408 request-timeout are transient; other 4xx
+        # (401 / 403 / 404 / 416) are deterministic and would fail identically over HTTP.
+        return status >= 500 or status in (408, 429)
     text = f"{name}: {exc}".lower()
     return any(hint in text for hint in _TRANSIENT_ERROR_HINTS)
 
@@ -764,6 +785,14 @@ def _run_download_attempt(
                 _terminate_process_group(proc, grace_period)
                 return ("cancelled", None)
             if stalled.is_set():
+                # Prefer a result the child enqueued in the same ~interval window the watchdog
+                # fired in over a late stall, so a download that just succeeded is not killed and
+                # needlessly retried over HTTP.
+                try:
+                    result = result_queue.get_nowait()
+                    break
+                except queue.Empty:
+                    pass
                 _terminate_process_group(proc, grace_period)
                 return ("stall", None)
             try:
@@ -790,6 +819,14 @@ def _run_download_attempt(
         # cancel/stall branch already terminated it is a harmless no-op.
         if proc.is_alive():
             _terminate_process_group(proc, grace_period)
+        # Release the queue's pipe fds deterministically rather than waiting for GC (which is
+        # fragile when the child was killed mid-put). The result, if any, is already extracted,
+        # and a killed child has nothing more to flush, so cancel the feeder join before close.
+        try:
+            result_queue.cancel_join_thread()
+            result_queue.close()
+        except Exception:
+            pass
 
     if result is None:
         # The child exited without enqueuing a result: a process-level crash (e.g. a native

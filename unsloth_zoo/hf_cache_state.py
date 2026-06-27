@@ -23,6 +23,7 @@ are download-manager concerns that live in the consumer, not in this module.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import sys
 from pathlib import Path
@@ -391,7 +392,10 @@ def snapshot_dir_is_complete(
         return False
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
-    has_patterns = bool(allow_patterns or ignore_patterns)
+    # An empty allow list is a real (select-nothing) filter, not "unpatterned": treat any
+    # non-None patterns as a scoped request so allow_patterns=[] does not fall into the full
+    # warmup branch (consistent with request_can_include_weights).
+    has_patterns = allow_patterns is not None or ignore_patterns is not None
 
     index_entries: list = []
     weight_entries: list = []  # (entry, repo-relative path)
@@ -426,13 +430,17 @@ def snapshot_dir_is_complete(
     # safetensors-only repo). A glob may legitimately select a subset, so only concrete
     # filenames are required, and one the ignore filter drops is not actually requested.
     if require_named_weights and allow_patterns:
-        present_rels = [rel for _, rel in weight_entries]
+        present_rels = set(rel for _, rel in weight_entries)
         for pat in allow_patterns:
             if _has_glob(pat) or not str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
                 continue
             if ignore_patterns and not _filter_paths([pat], None, ignore_patterns):
                 continue
-            if not _filter_paths(present_rels, [pat], None):
+            # pat is a concrete (glob-free) weight path, so presence is an exact match. A direct
+            # membership test (not _filter_paths, which fails OPEN by returning all paths on a
+            # filter error) keeps this strict check fail-SAFE: an unevaluable case requires the
+            # guarded download rather than silently accepting a stale cache as warm.
+            if pat not in present_rels:
                 return False
 
     # Every selected numbered shard needs the sibling shards the request also selects (the
@@ -527,8 +535,6 @@ def _bracket_member(content: str) -> str:
         return content[0] if content else "x"
     # Negated: pick a filler the class does not exclude (fnmatch mirrors HF's matcher).
     try:
-        import fnmatch
-
         cls = "[" + content + "]"
         for cand in ("x", "0", "a", "z", "9", "_", "-", "A"):
             if fnmatch.fnmatch(cand, cls):
@@ -564,6 +570,69 @@ def _concretize_glob(pattern: str) -> str:
             out.append(ch)
             i += 1
     return "".join(out)
+
+
+# Representative NON-weight files a catch-all ("*") or a config / tokenizer glob ("*.json")
+# would also match -- used to tell a weight-specific basename (model.*, *.safetensors) from a
+# catch-all when deciding whether a path-qualified request under a plain subfolder targets
+# weights. Not exhaustive; just enough common names to disqualify a non-weight glob.
+_NON_WEIGHT_PROBE_NAMES = (
+    "config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "vocab.json",
+    "merges.txt",
+    "readme.md",
+    "training_args.bin",
+    "optimizer.pt",
+)
+
+
+# Subfolders that, by convention, hold only auxiliary / telemetry files -- never model weights.
+# A catch-all glob under one of these (tokenizer/*, runs/*) is read as weightless. Kept
+# deliberately narrow: an unknown subfolder (unet/, transformer/, original/, a new arch's
+# component dir) must stay weight-including, so a weight-bearing dir is never misread as
+# weightless (that would re-open the silent-Xet-hang accept-stale this module exists to prevent).
+_NON_WEIGHT_DIR_NAMES = frozenset({
+    "tokenizer", "runs", "run", "logs", "log", "samples", "sample", "tensorboard", "tb",
+    "events", "eval", "evals", "evaluation", "metrics", "wandb", "assets", "images", "media",
+})
+
+
+def _basename_targets_weight(basename: str) -> bool:
+    """True when a path-qualified pattern's basename specifically selects a model weight
+    (``model.*``, ``adapter_model.*``, ``*.safetensors``), so the request is weight-including
+    even under a non-weight parent dir. A catch-all (``*``) matches both weights and non-weights
+    and a non-weight glob (``*.json``) matches no weight, so neither counts."""
+    base = basename.lower()
+    if not any(fnmatch.fnmatchcase(name, base) for name in _WEIGHT_PROBE_NAMES):
+        return False
+    return not any(fnmatch.fnmatchcase(name, base) for name in _NON_WEIGHT_PROBE_NAMES)
+
+
+def _basename_is_non_weight(basename: str) -> bool:
+    """True when a path-qualified pattern's basename clearly selects only non-weight files
+    (``*.json``, ``config.json``, ``tokenizer.*``, ``*.txt``): it matches a known non-weight
+    representative but no weight name. A catch-all (``*``) matches a weight too, so it is NOT
+    clearly non-weight and stays weight-including (the parent dir may hold weights)."""
+    base = basename.lower()
+    if not any(fnmatch.fnmatchcase(name, base) for name in _NON_WEIGHT_PROBE_NAMES):
+        return False
+    return not any(fnmatch.fnmatchcase(name, base) for name in _WEIGHT_PROBE_NAMES)
+
+
+def _parent_is_non_weight_dir(prefix: str) -> bool:
+    """True when *prefix* is a known auxiliary / telemetry dir (tokenizer/, runs/, logs/) and no
+    component looks like a checkpoint / weight dir, so a catch-all glob under it holds no weights.
+    An unknown subfolder returns False (stays weight-including) to avoid accept-stale."""
+    parts = [p.lower() for p in prefix.split("/") if p]
+    if any(_looks_like_checkpoint_dir(p) for p in parts):
+        return False
+    return any(p in _NON_WEIGHT_DIR_NAMES for p in parts)
 
 
 def _weight_self_probe(pattern: str) -> "Optional[str]":
@@ -606,7 +675,11 @@ def request_can_include_weights(
     Hugging Face itself accepts."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
-    if not allow_patterns and not ignore_patterns:
+    # Only a truly unfiltered request (both None) is an unconditional weight warmup. An empty
+    # allow list is NOT None: Hugging Face's filter_repo_objects treats allow_patterns=[] as
+    # selecting NO objects, so the request is weightless -- collapsing [] with None here would
+    # reject a legitimately empty snapshot and loop the guarded download.
+    if allow_patterns is None and ignore_patterns is None:
         return True
     try:
         from huggingface_hub.utils import filter_repo_objects
@@ -622,12 +695,21 @@ def request_can_include_weights(
         self_probe = _weight_self_probe(pat)
         if "/" in pat:
             # Path-qualified: re-root the canonical weight probes under the parent dir
-            # (concretized when the parent itself is globbed) so the request is checked inside
-            # that directory, not only at the root. No early return -- the final filter still
-            # applies ignore_patterns (e.g. allow=["checkpoint-*/*"] + an all-weights ignore).
-            prefix = pat.rsplit("/", 1)[0]
-            concrete_parent = _concretize_glob(prefix) if _has_glob(prefix) else prefix
-            probes.extend(f"{concrete_parent}/{name}" for name in _WEIGHT_PROBE_NAMES)
+            # (concretized when the parent is globbed) so the request is checked inside that
+            # directory. Default to re-rooting (weight-including), because an unknown subfolder
+            # (unet/, transformer/, original/, mp_rank_*/) may hold weights and reading it as
+            # weightless would accept a stale config-only cache -> the silent Xet hang. Skip the
+            # re-root only when the request is clearly non-weight: a non-weight basename glob
+            # (*.json, tokenizer.*, *.txt), or a catch-all under a known auxiliary dir
+            # (tokenizer/*, runs/*) that does not itself target a weight. A weight-suffix
+            # basename is still recognized by self_probe below; the final filter applies ignores.
+            prefix, base = pat.rsplit("/", 1)
+            clearly_weightless = _basename_is_non_weight(base) or (
+                _parent_is_non_weight_dir(prefix) and not _basename_targets_weight(base)
+            )
+            if not clearly_weightless:
+                concrete_parent = _concretize_glob(prefix) if _has_glob(prefix) else prefix
+                probes.extend(f"{concrete_parent}/{name}" for name in _WEIGHT_PROBE_NAMES)
         elif _has_glob(pat) and ("." not in pat or _looks_like_checkpoint_dir(pat)):
             # A no-slash DIRECTORY glob ("checkpoint-*", "global_step*", the dotted
             # "checkpoint-v1.*"): HF's fnmatch "*" spans "/", so it matches nested weights like
