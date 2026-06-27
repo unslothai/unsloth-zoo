@@ -704,6 +704,24 @@ def test_nonstall_error_propagates_without_fallback(monkeypatch):
     assert fake.calls[0].disable_xet is False
 
 
+def test_crashed_child_retries_over_http(monkeypatch):
+    """A silent process-level crash (child exits without a result, e.g. a native hf_xet
+    abort) is not a deterministic error, so it retries over HTTP; a clean second result is
+    accepted."""
+    fake = _install(monkeypatch, [("crashed", "exited without a result"), ("ok", "/cache/x")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert out == "/cache/x"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_crashed_child_on_both_transports_raises(monkeypatch):
+    """If the child crashes on Xet AND on HTTP, surface a hard error after both attempts."""
+    fake = _install(monkeypatch, [("crashed", "boom"), ("crashed", "boom")])
+    with pytest.raises(RuntimeError, match = "boom"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
 def test_immediate_success_uses_xet_only(monkeypatch):
     prepared = []
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: prepared.append(a))
@@ -869,6 +887,40 @@ def test_xet_attempt_does_not_force_disable_before_spawn(monkeypatch):
     )
     # On the Xet-first attempt we must NOT force-disable Xet for the child.
     assert rec["disable_xet"] is None
+
+
+class _EmptyQueue:
+    def get(self, timeout = None):
+        import queue as _queue
+        raise _queue.Empty
+
+    def get_nowait(self):
+        import queue as _queue
+        raise _queue.Empty
+
+    def put(self, item):
+        pass
+
+
+def test_run_attempt_no_result_is_crashed(monkeypatch):
+    """A child that exits without enqueuing a result maps to 'crashed' (a process-level
+    crash that HTTP may still recover), not a deterministic 'error'."""
+    rec: dict = {}
+
+    class _Ctx:
+        def Process(self, *, target = None, kwargs = None, daemon = None):
+            return _FakeProc(rec)
+
+        def Queue(self):
+            return _EmptyQueue()
+
+    monkeypatch.setattr(xf, "_CTX", _Ctx())
+    kind_result, _ = xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert kind_result == "crashed"
 
 
 def test_child_skips_gpu_init_env_set_before_spawn_and_restored(monkeypatch):
@@ -1207,6 +1259,22 @@ def test_snapshot_dir_is_complete_requires_requested_subfolder_weight(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
 
 
+def test_snapshot_dir_is_complete_single_shard_request(tmp_path):
+    """A deliberate single-shard request is satisfied by that one shard; the full -of-NNNNN
+    set is required only for an unpatterned full warm."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model-00002-of-00005.safetensors").symlink_to(blob)
+    # Just the requested shard present -> complete for that request.
+    assert hcs.snapshot_dir_is_complete(
+        snap, allow_patterns = ["model-00002-of-00005.safetensors"]
+    ) is True
+    # An unpatterned full warm requires the whole set -> incomplete (4 shards missing).
+    assert hcs.snapshot_dir_is_complete(snap) is False
+
+
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
     """HF's local_files_only returns a config-only snapshot (e.g. left by an earlier
     AutoConfig fetch) without checking weights. The fast path must reject it and complete
@@ -1382,6 +1450,30 @@ def test_request_can_include_weights_no_slash_dir_glob():
     # File globs with an extension are not directory globs.
     assert hcs.request_can_include_weights(["tokenizer.*"], None) is False
     assert hcs.request_can_include_weights(["*.json"], None) is False
+    # A dotted no-slash glob whose stem names a checkpoint DIRECTORY still includes weights.
+    assert hcs.request_can_include_weights(["checkpoint-v1.*"], None) is True
+    assert hcs.request_can_include_weights(["global_step100.*"], None) is True
+
+
+def test_request_can_include_weights_wildcard_parent():
+    """A wildcard parent dir with a weight basename glob (checkpoint-*/adapter_model.*,
+    */model.*) must read as weight-including, and ignore_patterns must still be applied to a
+    wildcard-parent request rather than bypassed by an early return."""
+    assert hcs.request_can_include_weights(["checkpoint-*/adapter_model.*"], None) is True
+    assert hcs.request_can_include_weights(["*/model.*"], None) is True
+    assert hcs.request_can_include_weights(["checkpoint-*/*.safetensors"], None) is True
+    # ignore_patterns applies under a wildcard parent: dropping every weight format -> weightless.
+    assert hcs.request_can_include_weights(
+        ["checkpoint-*/*"],
+        ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
+         "*.h5", "*.msgpack", "*.ckpt", "*.onnx", "*.pdparams"],
+    ) is False
+    # Dropping only some formats leaves the request able to include the others.
+    assert hcs.request_can_include_weights(
+        ["checkpoint-*/*"], ["*.safetensors", "*.bin"]
+    ) is True
+    # A non-weight basename under a wildcard parent stays weightless.
+    assert hcs.request_can_include_weights(["checkpoint-*/tokenizer.json"], None) is False
 
 
 def test_request_can_include_weights_weight_selecting_globs():

@@ -735,8 +735,12 @@ def _run_download_attempt(
             _terminate_process_group(proc, grace_period)
 
     if result is None:
+        # The child exited without enqueuing a result: a process-level crash (e.g. a native
+        # hf_xet abort / segfault), NOT a captured Hub exception. No deterministic error was
+        # observed, so the other transport may still succeed -- report it as "crashed" so the
+        # caller can retry over HTTP rather than surfacing a hard error.
         return (
-            "error",
+            "crashed",
             f"download process for '{repo_id}' exited "
             f"(code={proc.exitcode}) without a result",
         )
@@ -888,7 +892,20 @@ def _download_with_xet_fallback(
         if kind_result == "cancelled":
             raise RuntimeError("Cancelled")
         if kind_result == "error":
-            # Deterministic failure: the other transport would fail identically.
+            # Deterministic failure (a captured Hub exception): the other transport would
+            # fail identically, so do not retry.
+            raise RuntimeError(payload)
+        if kind_result == "crashed":
+            # A process-level crash with no captured exception: HTTP may still succeed, so
+            # retry over it once before surfacing a hard error (mirrors the stall path).
+            if not disable_xet:
+                logger.warning(
+                    "Download process for '%s' crashed without a result -- "
+                    "retrying with HF_HUB_DISABLE_XET=1", label
+                )
+                _safe_status(on_status, f"{label}: download crashed, retrying over HTTP")
+                disable_xet = True
+                continue
             raise RuntimeError(payload)
         # kind_result == "stall"
         if not disable_xet:

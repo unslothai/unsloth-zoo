@@ -249,16 +249,48 @@ _NUMBERED_SHARD_RE = re.compile(
 )
 
 
-def _numbered_shard_set_present(entry: Path) -> bool:
+def _filter_paths(
+    paths: list,
+    allow_patterns: "Optional[list]" = None,
+    ignore_patterns: "Optional[list]" = None,
+) -> list:
+    """Filter repo-relative *paths* by Hugging Face allow / ignore patterns, mirroring how
+    ``snapshot_download`` selects files. On any failure, treat all paths as selected so a
+    snapshot that does hold weights is never rejected for an unevaluable filter."""
+    try:
+        from huggingface_hub.utils import filter_repo_objects
+
+        return list(
+            filter_repo_objects(
+                paths, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+            )
+        )
+    except Exception:
+        return list(paths)
+
+
+def _numbered_shard_set_present(
+    entry: Path,
+    *,
+    snapshot_dir: "Optional[Path]" = None,
+    allow_patterns: "Optional[list]" = None,
+    ignore_patterns: "Optional[list]" = None,
+) -> bool:
     """For a numbered weight shard (``model-00001-of-00002.safetensors``), True only when
-    every shard in its ``-of-NNNNN`` set is present in the same directory.
+    every shard in its ``-of-NNNNN`` set that the request selects is present in the same
+    directory.
 
     A leftover single shard from an interrupted multi-shard download reads as a weight
     file on its own, so without this an incomplete pull (one shard on disk, the rest
     never fetched) would short-circuit as a warm cache. This catches that even when the
     shard *index* sidecar was never cached (so ``_weight_shard_index_complete`` has
     nothing to check). A non-numbered / single-file weight matches no shard pattern and
-    is trivially satisfied."""
+    is trivially satisfied.
+
+    When *allow_patterns* / *ignore_patterns* are given, a sibling shard is required only
+    if the request actually selects it: a deliberate single-shard request
+    (``allow_patterns=["model-00002-of-00005.safetensors"]``) is satisfied by that one shard
+    and must not demand the rest."""
     match = _NUMBERED_SHARD_RE.match(entry.name)
     if match is None:
         return True
@@ -273,10 +305,18 @@ def _numbered_shard_set_present(entry: Path) -> bool:
     suffix = match.group("suffix")
     width = len(total_str)
     base = entry.parent
+    scoped = bool(allow_patterns or ignore_patterns) and snapshot_dir is not None
     for i in range(1, total + 1):
-        shard_name = f"{prefix}-{i:0{width}d}-of-{total_str}{suffix}"
+        shard_path = base / f"{prefix}-{i:0{width}d}-of-{total_str}{suffix}"
+        if scoped:
+            try:
+                rel = shard_path.relative_to(snapshot_dir).as_posix()
+            except ValueError:
+                rel = shard_path.name
+            if not _filter_paths([rel], allow_patterns, ignore_patterns):
+                continue  # this sibling is not part of the request -> do not require it
         try:
-            if not (base / shard_name).exists():
+            if not shard_path.exists():
                 return False
         except OSError:
             return False
@@ -334,47 +374,61 @@ def snapshot_dir_is_complete(
     When *allow_patterns* / *ignore_patterns* are given, the weight that must be present is
     one the request actually selects: a request for ``adapter_model.safetensors`` (or a
     specific checkpoint shard) is satisfied only by that weight on disk, not by some other
-    weight the snapshot happens to also carry. With no patterns, any loadable weight does."""
+    weight the snapshot happens to also carry. A deliberate single-shard request likewise
+    requires only that shard, not its whole ``-of-NNNNN`` set. With no patterns, any loadable
+    weight does, and every numbered shard set present must be complete."""
     if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
         return False
-    weight_rels: list = []
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    has_patterns = bool(allow_patterns or ignore_patterns)
+
+    index_entries: list = []
+    weight_entries: list = []  # (entry, repo-relative path)
     for entry in entries:
         name = entry.name
         if name.endswith((".safetensors.index.json", ".bin.index.json")):
-            if not _safe_is_file(entry):
-                continue
-            if not _weight_shard_index_complete(entry):
-                return False
+            if _safe_is_file(entry):
+                index_entries.append(entry)
         elif _is_loadable_weight_file(name) and _safe_is_file(entry):
-            if not _numbered_shard_set_present(entry):
-                return False
             try:
-                weight_rels.append(entry.relative_to(snapshot_dir).as_posix())
+                rel = entry.relative_to(snapshot_dir).as_posix()
             except ValueError:
-                weight_rels.append(name)
-    if not weight_rels:
-        return False
-    allow_patterns = _as_pattern_list(allow_patterns)
-    ignore_patterns = _as_pattern_list(ignore_patterns)
-    if not allow_patterns and not ignore_patterns:
-        return True
-    # A patterned request must find a weight it actually selects on disk, not just any
-    # weight: the snapshot can carry an unrelated weight while the requested one is missing.
-    try:
-        from huggingface_hub.utils import filter_repo_objects
+                rel = name
+            weight_entries.append((entry, rel))
 
-        matched = list(
-            filter_repo_objects(
-                weight_rels, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
-            )
-        )
-    except Exception:
-        return True  # cannot evaluate the filter -> do not reject a snapshot that has weights
-    return len(matched) > 0
+    # The weights the request selects that are present on disk (any present weight when the
+    # request is unpatterned). The snapshot can carry an unrelated weight while the requested
+    # one is missing, so a patterned request must find one it actually selects.
+    if has_patterns:
+        selected = set(_filter_paths([rel for _, rel in weight_entries], allow_patterns, ignore_patterns))
+    else:
+        selected = {rel for _, rel in weight_entries}
+    if not selected:
+        return False
+
+    # Every selected numbered shard needs the sibling shards the request also selects (the
+    # whole set when unpatterned), so an interrupted multi-shard pull is not read as warm.
+    for entry, rel in weight_entries:
+        if rel not in selected:
+            continue
+        if not _numbered_shard_set_present(
+            entry, snapshot_dir = snapshot_dir,
+            allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
+        ):
+            return False
+
+    # A full (unpatterned) warm also validates any shard index ships all its shards; a
+    # patterned request may legitimately want only a subset, so the index is not enforced.
+    if not has_patterns:
+        for index_entry in index_entries:
+            if not _weight_shard_index_complete(index_entry):
+                return False
+    return True
 
 
 # Representative loadable-weight filenames -- the probe set for "can this request include a
@@ -423,15 +477,18 @@ def _as_pattern_list(patterns: "Optional[object]") -> "Optional[list]":
     return list(patterns)
 
 
-def _pattern_basename_targets_weight(pattern: str) -> bool:
-    """True if *pattern*'s final path component looks like it selects a weight file: a
-    catch-all (``*`` / ``**``) or a name / glob ending in a recognized weight suffix.
-    Used only when the pattern's parent directory is itself globbed, so no concrete probe
-    path can be formed."""
-    base = pattern.rsplit("/", 1)[-1].lower()
-    if base in ("*", "**"):
-        return True
-    return base.endswith(_WEIGHT_FILE_SUFFIXES)
+# Stems that, by convention, name a per-checkpoint DIRECTORY (whose weights live inside),
+# not a file. Used to disambiguate a dotted no-slash glob like ``checkpoint-v1.*`` (a
+# checkpoint directory, weights nested) from a file glob like ``tokenizer.*`` -- both are
+# structurally ``<stem>.*`` but only the former can include weights.
+_CHECKPOINT_DIR_PREFIXES = (
+    "checkpoint", "ckpt", "epoch", "step", "global_step", "iter", "iteration",
+)
+
+
+def _looks_like_checkpoint_dir(pattern: str) -> bool:
+    lowered = pattern.lower()
+    return any(lowered.startswith(prefix) for prefix in _CHECKPOINT_DIR_PREFIXES)
 
 
 def _concretize_glob(pattern: str) -> str:
@@ -491,12 +548,14 @@ def request_can_include_weights(
         if "/" in pat:
             prefix = pat.rsplit("/", 1)[0]
             if _has_glob(prefix):
-                # Globbed parent dir (e.g. "checkpoint-*/*.safetensors"): no concrete path
-                # to test, so decide from the basename. Only a weight-targeting basename
-                # flips this on, so config/tokenizer globs under a wildcard dir stay
-                # weightless and are not forced into a strict weight check.
-                if _pattern_basename_targets_weight(pat):
-                    return True
+                # Globbed parent dir (e.g. "checkpoint-*/*.safetensors" or
+                # "checkpoint-*/adapter_model.*"): re-root the canonical weight probes under a
+                # concretized form of the parent and let the final filter decide. This both
+                # recognizes a weight-targeting basename and still applies ignore_patterns --
+                # an early True here would skip the ignores and wrongly require weights for,
+                # e.g., allow=["checkpoint-*/*"] + ignore that drops every weight format.
+                concrete = _concretize_glob(prefix)
+                probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
                 continue
             # Concrete parent dir: re-root the canonical weight probes under it so a
             # path-qualified request is checked inside that directory, not only at the root.
@@ -508,14 +567,14 @@ def request_can_include_weights(
             # A bare concrete weight filename (e.g. a specific non-first shard).
             if pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
                 probes.append(pat)
-        elif "." not in pat:
-            # A no-slash directory glob (e.g. "checkpoint-*"). HF's fnmatch "*" spans "/", so
-            # it matches nested weights like checkpoint-10/model.safetensors. Probe the
-            # canonical weights re-rooted under a concretized form of the glob, so the request
-            # is recognized as weight-including (still subject to ignore_patterns). A no-slash
-            # glob that carries an extension (e.g. "*.json", "adapter_model.*") is a file glob
-            # handled by the canonical / representative probes, so it is excluded here -- which
-            # keeps "tokenizer.*" / "*.json" correctly weightless.
+        elif "." not in pat or _looks_like_checkpoint_dir(pat):
+            # A no-slash DIRECTORY glob (e.g. "checkpoint-*", "global_step*", or the dotted
+            # "checkpoint-v1.*"). HF's fnmatch "*" spans "/", so it matches nested weights like
+            # checkpoint-10/model.safetensors. Probe the canonical weights re-rooted under a
+            # concretized form of the glob, so the request is recognized as weight-including
+            # (still subject to ignore_patterns). A no-slash FILE glob with an extension
+            # ("*.json", "adapter_model.*", "tokenizer.*") is handled by the canonical /
+            # representative probes, so it is excluded here and stays correctly weightless.
             concrete = _concretize_glob(pat)
             probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
 
