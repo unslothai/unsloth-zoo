@@ -566,6 +566,24 @@ def _concretize_glob(pattern: str) -> str:
     return "".join(out)
 
 
+def _weight_self_probe(pattern: str) -> "Optional[str]":
+    """A concretized stand-in for *pattern* when it names a loadable model weight by suffix
+    (``lora_*.safetensors`` -> ``lora_x.safetensors``, ``checkpoint-10/lora_*.bin`` ->
+    ``checkpoint-10/lora_x.bin``, a bare ``model-00002-of-00005.safetensors``), so a custom
+    weight basename that matches no canonical probe is still recognized. Returns None when the
+    suffix is not a weight suffix, or when the (concretized) basename is a known trainer /
+    optimizer artifact (``optimizer.pt``, ``training_args.bin``, ``rng_state_*.pth``): those
+    carry weight suffixes but the snapshot completeness check filters them out as non-weights,
+    so classifying such a request as weight-including would loop the guarded download."""
+    if not pattern.lower().endswith(_WEIGHT_FILE_SUFFIXES):
+        return None
+    concrete = _concretize_glob(pattern)
+    basename = concrete.rsplit("/", 1)[-1]
+    if not _is_loadable_weight_file(basename):
+        return None
+    return concrete
+
+
 def request_can_include_weights(
     allow_patterns: "Optional[list]" = None, ignore_patterns: "Optional[list]" = None
 ) -> bool:
@@ -597,47 +615,34 @@ def request_can_include_weights(
 
     probes = list(_WEIGHT_PROBE_NAMES)
     for pat in (allow_patterns or ()):
+        # A concretized stand-in when the pattern itself names a loadable weight by suffix
+        # (lora_*.safetensors, checkpoint-10/lora_*.bin, a bare non-first shard). None for a
+        # non-weight suffix and for a known trainer artifact (optimizer.pt, training_args.bin),
+        # keeping this consistent with the snapshot completeness check.
+        self_probe = _weight_self_probe(pat)
         if "/" in pat:
+            # Path-qualified: re-root the canonical weight probes under the parent dir
+            # (concretized when the parent itself is globbed) so the request is checked inside
+            # that directory, not only at the root. No early return -- the final filter still
+            # applies ignore_patterns (e.g. allow=["checkpoint-*/*"] + an all-weights ignore).
             prefix = pat.rsplit("/", 1)[0]
-            if _has_glob(prefix):
-                # Globbed parent dir (e.g. "checkpoint-*/*.safetensors" or
-                # "checkpoint-*/adapter_model.*"): re-root the canonical weight probes under a
-                # concretized form of the parent and let the final filter decide. This both
-                # recognizes a weight-targeting basename and still applies ignore_patterns --
-                # an early True here would skip the ignores and wrongly require weights for,
-                # e.g., allow=["checkpoint-*/*"] + ignore that drops every weight format.
-                concrete = _concretize_glob(prefix)
-                probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
-                continue
-            # Concrete parent dir: re-root the canonical weight probes under it so a
-            # path-qualified request is checked inside that directory, not only at the root.
-            probes.extend(f"{prefix}/{name}" for name in _WEIGHT_PROBE_NAMES)
-            # A subfolder-qualified concrete weight filename is also a probe verbatim.
-            if not _has_glob(pat) and pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
-                probes.append(pat)
-        elif not _has_glob(pat):
-            # A bare concrete weight filename (e.g. a specific non-first shard).
-            if pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
-                probes.append(pat)
-        else:
-            # A no-slash glob. Two weight-including shapes:
-            #  - a DIRECTORY glob ("checkpoint-*", "global_step*", or the dotted
-            #    "checkpoint-v1.*"): HF's fnmatch "*" spans "/", so it matches nested weights
-            #    like checkpoint-10/model.safetensors. Probe the canonical weights re-rooted
-            #    under a concretized form of the glob.
-            #  - a FILE glob naming a weight by suffix ("lora_*.safetensors", "*.bin",
-            #    "model-*.safetensors"): its stem need not match any canonical probe name, so
-            #    add a concretized self-probe so it is recognized rather than misread as
-            #    weightless.
-            # A plain extension file glob with a non-weight suffix ("*.json", "tokenizer.*")
-            # matches no probe here and stays correctly weightless; "adapter_model.*" still
-            # rides the canonical adapter probe. Everything is subject to the final
-            # ignore_patterns filter below.
-            if "." not in pat or _looks_like_checkpoint_dir(pat):
-                concrete = _concretize_glob(pat)
-                probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
-            if pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
-                probes.append(_concretize_glob(pat))
+            concrete_parent = _concretize_glob(prefix) if _has_glob(prefix) else prefix
+            probes.extend(f"{concrete_parent}/{name}" for name in _WEIGHT_PROBE_NAMES)
+        elif _has_glob(pat) and ("." not in pat or _looks_like_checkpoint_dir(pat)):
+            # A no-slash DIRECTORY glob ("checkpoint-*", "global_step*", the dotted
+            # "checkpoint-v1.*"): HF's fnmatch "*" spans "/", so it matches nested weights like
+            # checkpoint-10/model.safetensors. Probe the canonical weights re-rooted under a
+            # concretized form of the glob. A plain extension file glob ("*.json", "tokenizer.*")
+            # is not a directory glob and stays weightless unless it names a weight (self_probe).
+            concrete = _concretize_glob(pat)
+            probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
+        # A pattern that itself names a loadable weight -- a bare filename, a path-qualified
+        # name, or a weight-suffix glob whose stem matches no canonical probe (lora_*.safetensors,
+        # checkpoint-*/lora_*.bin) -- is recognized via its self-probe. "adapter_model.*" rides
+        # the canonical adapter probe instead, and a trainer artifact yields no self-probe and
+        # stays weightless. Everything is subject to the final ignore_patterns filter below.
+        if self_probe is not None:
+            probes.append(self_probe)
 
     try:
         kept = list(

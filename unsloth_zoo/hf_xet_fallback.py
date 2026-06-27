@@ -33,6 +33,7 @@ path (no torch/transformers), keeping each child fast.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import multiprocessing as mp
 import logging
@@ -439,6 +440,52 @@ def _scrub_in_child(text: str, token: Optional[str]) -> str:
         return _default_scrub_secrets(text, hf_token = token)
 
 
+# Deterministic Hub failures that recur identically over either transport, so switching from
+# Xet to HTTP is pointless: surface them. Matched by exception class name so the parent need
+# not import huggingface_hub's error classes.
+_DETERMINISTIC_ERROR_NAMES = frozenset({
+    "RepositoryNotFoundError",
+    "RevisionNotFoundError",
+    "EntryNotFoundError",
+    "GatedRepoError",
+    "DisabledRepoError",
+    "LocalEntryNotFoundError",
+    "BadRequestError",
+})
+# Substrings that mark a transient transport failure (hf_xet / CAS error, timeout, reset,
+# HTTP 5xx / 429) that disabling Xet and retrying over HTTP may recover.
+_TRANSIENT_ERROR_HINTS = (
+    "xet", "casclient", "cas_", "timeout", "timed out", "connection", "reset by peer",
+    "temporarily", "try again", "incompleteread", "protocolerror", "remotedisconnected",
+    "broken pipe", "ssl", "eof occurred", "502", "503", "504", "500 server", "429",
+    "too many requests", "service unavailable", "bad gateway", "gateway time",
+    "connection aborted",
+)
+
+
+def _is_retryable_download_error(exc: BaseException) -> bool:
+    """True when a captured download exception looks like a transient transport failure (an
+    ``hf_xet`` / CAS error, connection reset, timeout, HTTP 5xx / 429) that the OTHER transport
+    may recover, vs a deterministic Hub error (auth, not-found, gated, disk-full) that would
+    fail identically. Unknown errors are treated as deterministic, so a real repeatable failure
+    is surfaced rather than looped between transports."""
+    name = type(exc).__name__
+    if name in _DETERMINISTIC_ERROR_NAMES:
+        return False
+    # Disk full / quota: a different transport cannot help.
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in (errno.ENOSPC, errno.EDQUOT):
+        return False
+    # An HTTP status (HfHubHTTPError carries a requests / httpx response): 5xx and 429 are
+    # transient; other 4xx (401 / 403 / 404 / 416) are deterministic.
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status >= 500 or status == 429
+    text = f"{name}: {exc}".lower()
+    return any(hint in text for hint in _TRANSIENT_ERROR_HINTS)
+
+
 def _child_download(*, kind: str, params: dict, token: Optional[str], repo_type: str) -> str:
     """Run the actual HF download for one attempt inside the spawn child."""
     if kind == "snapshot":
@@ -533,7 +580,14 @@ def _download_child_entry(
         path = _child_download(kind = kind, params = params, token = token, repo_type = repo_type)
         result_queue.put({"ok": True, "path": path})
     except BaseException as e:  # noqa: BLE001 - report every failure to the parent
-        result_queue.put({"ok": False, "error": _scrub_in_child(f"{type(e).__name__}: {e}", token)})
+        # Classify here, where the exception object (status code, errno, type) is intact, so the
+        # parent can retry a transient Xet transport failure over HTTP and still surface a
+        # deterministic Hub error without a pointless second attempt.
+        result_queue.put({
+            "ok": False,
+            "error": _scrub_in_child(f"{type(e).__name__}: {e}", token),
+            "retryable": _is_retryable_download_error(e),
+        })
 
 
 def _terminate_process_group(proc: "mp.process.BaseProcess", grace_period: float) -> None:
@@ -585,8 +639,11 @@ def _run_download_attempt(
 ) -> tuple[str, Optional[str]]:
     """Run one download in a spawn child supervised by the no-progress watchdog.
 
-    Returns ``("ok", path)``, ``("stall", None)``, ``("cancelled", None)``, or
-    ``("error", message)``. This is the seam tests monkeypatch to avoid spawning.
+    Returns ``("ok", path)``, ``("stall", None)``, ``("cancelled", None)``,
+    ``("crashed", message)`` (process-level crash, no captured exception),
+    ``("retryable_error", message)`` (a transient Xet transport failure worth an HTTP retry),
+    or ``("error", message)`` (a deterministic Hub error). This is the seam tests monkeypatch
+    to avoid spawning.
     """
     # A single-file download scopes its stall detection to its own child's partials.
     # Capture the partials already on disk for this repo BEFORE spawning, so the watchdog
@@ -746,7 +803,11 @@ def _run_download_attempt(
         )
     if result.get("ok"):
         return ("ok", result["path"])
-    return ("error", result.get("error") or "unknown download error")
+    message = result.get("error") or "unknown download error"
+    if result.get("retryable"):
+        # A transient transport failure the child flagged as worth another transport.
+        return ("retryable_error", message)
+    return ("error", message)
 
 
 def _snapshot_is_acceptable(
@@ -899,8 +960,22 @@ def _download_with_xet_fallback(
         if kind_result == "cancelled":
             raise RuntimeError("Cancelled")
         if kind_result == "error":
-            # Deterministic failure (a captured Hub exception): the other transport would
-            # fail identically, so do not retry.
+            # Deterministic failure (a captured Hub exception: auth, not-found, gated, disk
+            # full): the other transport would fail identically, so do not retry.
+            raise RuntimeError(payload)
+        if kind_result == "retryable_error":
+            # A transient transport failure (hf_xet CAS timeout, 5xx, connection reset) rather
+            # than a deterministic Hub error: disabling Xet and retrying over HTTP may recover,
+            # so try the other transport once before surfacing it (mirrors the crash / stall
+            # paths). If HTTP also failed, there is no other transport left -- raise.
+            if not disable_xet:
+                logger.warning(
+                    "Download for '%s' hit a transient Xet transport error -- retrying "
+                    "with HF_HUB_DISABLE_XET=1: %s", label, payload
+                )
+                _safe_status(on_status, f"{label}: transient Xet error, retrying over HTTP")
+                disable_xet = True
+                continue
             raise RuntimeError(payload)
         if kind_result == "crashed":
             # A process-level crash with no captured exception: HTTP may still succeed, so

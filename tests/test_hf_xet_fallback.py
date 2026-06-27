@@ -12,6 +12,7 @@ tests do not import the full ``unsloth_zoo`` package (which pulls in torch + GPU
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -720,6 +721,60 @@ def test_crashed_child_on_both_transports_raises(monkeypatch):
     with pytest.raises(RuntimeError, match = "boom"):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_retryable_xet_error_retries_over_http(monkeypatch):
+    """A transient Xet transport failure (CAS timeout / 5xx) is not a deterministic Hub error,
+    so it retries over HTTP; a clean HTTP result is accepted (Codex #829)."""
+    fake = _install(monkeypatch, [("retryable_error", "CasClientError: request timed out"), ("ok", "/cache/x")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert out == "/cache/x"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_retryable_xet_error_on_both_transports_raises(monkeypatch):
+    """A transient error on Xet AND on HTTP has no other transport left, so it surfaces after
+    both attempts rather than looping (Codex #829)."""
+    fake = _install(monkeypatch, [("retryable_error", "503 Server Error"), ("retryable_error", "503 Server Error")])
+    with pytest.raises(RuntimeError, match = "503"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_is_retryable_download_error_classification():
+    """Transient transport failures (hf_xet / CAS, timeout, reset, HTTP 5xx / 429) are
+    retryable; deterministic Hub errors (not-found, gated, 4xx, disk full) and unknown errors
+    are not, so a real repeatable failure is surfaced rather than looped (Codex #829)."""
+    f = xf._is_retryable_download_error
+
+    # Transient transport failures -> retryable.
+    assert f(Exception("hf_xet download failed: data processing error")) is True
+    assert f(TimeoutError("connection reset by peer")) is True
+    assert f(Exception("CasClientError: deadline exceeded")) is True
+
+    class _Resp503(Exception):
+        response = type("R", (), {"status_code": 503})()
+
+    assert f(_Resp503("server error")) is True
+
+    class _Status429(Exception):
+        status_code = 429
+
+    assert f(_Status429("Too Many Requests")) is True
+
+    # Deterministic Hub errors -> not retryable (matched by class name or 4xx status).
+    class RepositoryNotFoundError(Exception):
+        pass
+
+    assert f(RepositoryNotFoundError("404 Client Error")) is False
+
+    class _Resp404(Exception):
+        response = type("R", (), {"status_code": 404})()
+
+    assert f(_Resp404("not found")) is False
+    assert f(OSError(errno.ENOSPC, "No space left on device")) is False
+    # An unknown / generic error stays deterministic -> surfaced, not looped over transports.
+    assert f(ValueError("unexpected response payload")) is False
 
 
 def test_immediate_success_uses_xet_only(monkeypatch):
@@ -1589,6 +1644,38 @@ def test_request_can_include_weights_bracket_globs():
     assert hcs._concretize_glob("layer_[a-f]") == "layer_a"
     # A negated class yields a filler the class does not exclude (here a non-digit).
     assert not hcs._concretize_glob("checkpoint-[!0-9]").endswith(tuple("0123456789"))
+
+
+def test_request_can_include_weights_path_qualified_custom_globs():
+    """A path-qualified custom weight glob (checkpoint-10/lora_*.safetensors, with a globbed
+    parent too) names a weight whose basename matches no canonical probe; it must read as
+    weight-including via a concretized self-probe, not weightless (Codex #829)."""
+    assert hcs.request_can_include_weights(["checkpoint-10/lora_*.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["checkpoint-*/lora_*.bin"], None) is True
+    assert hcs.request_can_include_weights(["models/custom_*.pt"], None) is True
+    assert hcs.request_can_include_weights(["checkpoint-10/model-[0-9].safetensors"], None) is True
+    # A non-weight basename under a subfolder stays weightless.
+    assert hcs.request_can_include_weights(["checkpoint-10/tokenizer.json"], None) is False
+
+
+def test_request_can_include_weights_trainer_artifacts_weightless(tmp_path):
+    """A trainer / optimizer artifact (optimizer.pt, training_args.bin, rng_state_*.pth) carries
+    a weight suffix but is not a loadable weight: request_can_include_weights must read it as
+    weightless, matching snapshot_dir_is_complete -- otherwise a child that fetches exactly that
+    artifact loops as an 'incomplete snapshot' (Codex #829)."""
+    for art in ["optimizer.pt", "training_args.bin", "scheduler.pt", "rng_state_0.pth",
+                "checkpoint-10/optimizer.pt"]:
+        assert hcs.request_can_include_weights([art], None) is False, art
+    # Consistency: a snapshot holding only the requested artifact is acceptable (weightless
+    # path), so the guarded download is not retried into an incomplete-snapshot failure.
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "optimizer.pt").symlink_to(blob)
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["optimizer.pt"], ignore_patterns = None
+    ) is True
 
 
 def test_request_can_include_weights_string_form():
