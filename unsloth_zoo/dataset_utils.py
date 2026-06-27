@@ -240,20 +240,23 @@ def get_chat_template_parts(tokenizer):
         response_part    = strip_lead(resp_gap, eos + "\n", eos, bos)
         instruction_part = strip_lead(instr_gap, eos + "\n", eos, bos)
 
-    # Drop leading bos/eos and trailing spaces that would merge into the first content token
-    instruction_part = strip_lead(instruction_part, eos + "\n", eos, bos).rstrip(" \t")
-    response_part    = strip_lead(response_part, bos).rstrip(" \t")
+    # Drop leading bos/eos/space separators and trailing spaces that would merge into the content token
+    instruction_part = strip_lead(instruction_part, " ", "\t", eos + "\n", eos, bos).rstrip(" \t")
+    response_part    = strip_lead(response_part, " ", "\t", eos + "\n", eos, bos).rstrip(" \t")
     if not instruction_part or not response_part:
         raise ValueError("Unsloth: Auto-detection produced an empty marker - pass instruction_part and response_part.")
 
-    # Markers must appear as token cores in a tokenized probe, else masking would
-    # silently train on nothing (non-atomic role tags whose ids shift by context)
+    # Each marker must tokenize to a core present in a tokenized probe, else masking would
+    # silently train on nothing (role tags that are not atomic tokens, or whose ids shift by
+    # context). Some SentencePiece tokenizers need a leading space, so try that variant too.
     probe_ids = tok(full, add_special_tokens = False).input_ids
-    for part in (instruction_part, response_part):
-        core = _find_common_token_ids(part, tok, True)[0]
-        if not any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
-            raise ValueError("Unsloth: Could not reliably auto-detect masking markers - pass instruction_part and response_part.")
-    return instruction_part, response_part
+    def validate(part):
+        for cand in (part, " " + part):
+            core = _find_common_token_ids(cand, tok, True)[0]
+            if core and any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
+                return cand
+        raise ValueError("Unsloth: Could not reliably auto-detect masking markers - pass instruction_part and response_part.")
+    return validate(instruction_part), validate(response_part)
 pass
 
 
