@@ -761,9 +761,15 @@ def _snapshot_is_acceptable(
     A PATTERNED or non-model snapshot that legitimately holds only a subset -- a dataset, or
     a model repo fetched with ``allow_patterns=["config.json"]`` or ``ignore_patterns`` that
     drop all weights -- would be wrongly rejected by a weight requirement, so for those it is
-    enough that no symlink dangles (every file the snapshot references is on disk)."""
+    enough that no symlink dangles (every file the snapshot references is on disk).
+
+    The completeness check is scoped to the requested patterns, so a request for a specific
+    weight (e.g. ``allow_patterns=["adapter_model.safetensors"]`` or a checkpoint shard) is
+    satisfied only when THAT weight is on disk, not by some other weight already cached."""
     if repo_type == "model" and request_can_include_weights(allow_patterns, ignore_patterns):
-        return snapshot_dir_is_complete(snapshot_dir)
+        return snapshot_dir_is_complete(
+            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+        )
     return not snapshot_dir_has_broken_symlinks(snapshot_dir)
 
 

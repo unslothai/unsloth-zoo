@@ -309,8 +309,13 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     return True
 
 
-def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
-    """Best-effort check that a cached snapshot actually holds its model weights.
+def snapshot_dir_is_complete(
+    snapshot_dir: Path,
+    *,
+    allow_patterns: "Optional[object]" = None,
+    ignore_patterns: "Optional[object]" = None,
+) -> bool:
+    """Best-effort check that a cached snapshot actually holds the requested model weights.
 
     ``snapshot_download(local_files_only=True)`` returns a snapshot dir whenever
     ``refs/<rev>`` and ``snapshots/<sha>`` exist, even one left by a prior interrupted
@@ -324,14 +329,19 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
     all its members on disk (even with no index sidecar), and it contains at least one
     weight file. This does NOT assert that every non-weight file is present (no offline
     manifest exists for that); the killable child completes anything else still missing.
-    The aim is simply to never short-circuit a snapshot whose weights are not on disk."""
+    The aim is simply to never short-circuit a snapshot whose weights are not on disk.
+
+    When *allow_patterns* / *ignore_patterns* are given, the weight that must be present is
+    one the request actually selects: a request for ``adapter_model.safetensors`` (or a
+    specific checkpoint shard) is satisfied only by that weight on disk, not by some other
+    weight the snapshot happens to also carry. With no patterns, any loadable weight does."""
     if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
         return False
-    has_weight = False
+    weight_rels: list = []
     for entry in entries:
         name = entry.name
         if name.endswith((".safetensors.index.json", ".bin.index.json")):
@@ -339,12 +349,32 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
                 continue
             if not _weight_shard_index_complete(entry):
                 return False
-            has_weight = True
         elif _is_loadable_weight_file(name) and _safe_is_file(entry):
             if not _numbered_shard_set_present(entry):
                 return False
-            has_weight = True
-    return has_weight
+            try:
+                weight_rels.append(entry.relative_to(snapshot_dir).as_posix())
+            except ValueError:
+                weight_rels.append(name)
+    if not weight_rels:
+        return False
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    if not allow_patterns and not ignore_patterns:
+        return True
+    # A patterned request must find a weight it actually selects on disk, not just any
+    # weight: the snapshot can carry an unrelated weight while the requested one is missing.
+    try:
+        from huggingface_hub.utils import filter_repo_objects
+
+        matched = list(
+            filter_repo_objects(
+                weight_rels, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+            )
+        )
+    except Exception:
+        return True  # cannot evaluate the filter -> do not reject a snapshot that has weights
+    return len(matched) > 0
 
 
 # Representative loadable-weight filenames -- the probe set for "can this request include a
@@ -404,6 +434,29 @@ def _pattern_basename_targets_weight(pattern: str) -> bool:
     return base.endswith(_WEIGHT_FILE_SUFFIXES)
 
 
+def _concretize_glob(pattern: str) -> str:
+    """Replace glob wildcards in *pattern* with a literal filler so it can stand in as a
+    concrete directory name (e.g. ``checkpoint-*`` -> ``checkpoint-x``). A ``[...]`` class
+    collapses to one filler char. Used to probe weights nested under a no-slash directory
+    glob, since Hugging Face's ``fnmatch`` ``*`` spans ``/``."""
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch in ("*", "?"):
+            out.append("x")
+            i += 1
+        elif ch == "[":
+            j = pattern.find("]", i + 1)
+            out.append("x")
+            i = (j + 1) if j != -1 else (i + 1)
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def request_can_include_weights(
     allow_patterns: "Optional[list]" = None, ignore_patterns: "Optional[list]" = None
 ) -> bool:
@@ -448,10 +501,23 @@ def request_can_include_weights(
             # Concrete parent dir: re-root the canonical weight probes under it so a
             # path-qualified request is checked inside that directory, not only at the root.
             probes.extend(f"{prefix}/{name}" for name in _WEIGHT_PROBE_NAMES)
-        # A bare concrete weight filename (e.g. a specific non-first shard, or a
-        # subfolder-qualified weight) is itself a probe the filter can match verbatim.
-        if not _has_glob(pat) and pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
-            probes.append(pat)
+            # A subfolder-qualified concrete weight filename is also a probe verbatim.
+            if not _has_glob(pat) and pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
+                probes.append(pat)
+        elif not _has_glob(pat):
+            # A bare concrete weight filename (e.g. a specific non-first shard).
+            if pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
+                probes.append(pat)
+        elif "." not in pat:
+            # A no-slash directory glob (e.g. "checkpoint-*"). HF's fnmatch "*" spans "/", so
+            # it matches nested weights like checkpoint-10/model.safetensors. Probe the
+            # canonical weights re-rooted under a concretized form of the glob, so the request
+            # is recognized as weight-including (still subject to ignore_patterns). A no-slash
+            # glob that carries an extension (e.g. "*.json", "adapter_model.*") is a file glob
+            # handled by the canonical / representative probes, so it is excluded here -- which
+            # keeps "tokenizer.*" / "*.json" correctly weightless.
+            concrete = _concretize_glob(pat)
+            probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
 
     try:
         kept = list(

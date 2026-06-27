@@ -1172,6 +1172,41 @@ def test_snapshot_dir_is_complete_ignores_trainer_artifacts(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is True   # real weight present
 
 
+def test_snapshot_dir_is_complete_requires_the_requested_weight(tmp_path):
+    """A patterned request is satisfied only by a weight it actually selects: a snapshot that
+    carries some other weight but not the requested one (e.g. adapter / checkpoint) reads as
+    incomplete, so the guarded download still runs."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model.safetensors").symlink_to(blob)            # base weight only
+    # Requesting the adapter weight: the base weight does not satisfy it.
+    assert hcs.snapshot_dir_is_complete(
+        snap, allow_patterns = ["adapter_model.safetensors"]
+    ) is False
+    # No patterns: any loadable weight suffices.
+    assert hcs.snapshot_dir_is_complete(snap) is True
+    # Once the requested adapter weight is present, the request is satisfied.
+    (snap / "adapter_model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(
+        snap, allow_patterns = ["adapter_model.safetensors"]
+    ) is True
+
+
+def test_snapshot_dir_is_complete_requires_requested_subfolder_weight(tmp_path):
+    """A subfolder request is satisfied only by a weight under that subfolder, not by a
+    root-level weight the snapshot also carries."""
+    snap = tmp_path / "snap"
+    (snap / "checkpoint-10").mkdir(parents = True)
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model.safetensors").symlink_to(blob)            # root weight only
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is False
+    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
+
+
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
     """HF's local_files_only returns a config-only snapshot (e.g. left by an earlier
     AutoConfig fetch) without checking weights. The fast path must reject it and complete
@@ -1328,6 +1363,25 @@ def test_request_can_include_weights_path_qualified():
     assert hcs.request_can_include_weights(
         ["checkpoint-10/*", "config.json", "tokenizer.json"], None
     ) is True
+
+
+def test_request_can_include_weights_no_slash_dir_glob():
+    """A no-slash directory glob (checkpoint-*, global_step*) matches nested weights via HF's
+    fnmatch '*'-spans-'/' rule, so it must read as weight-including; a no-slash file glob with
+    an extension (tokenizer.*, *.json) stays weightless."""
+    assert hcs.request_can_include_weights(["checkpoint-*"], None) is True
+    assert hcs.request_can_include_weights(["epoch-*"], None) is True
+    assert hcs.request_can_include_weights(["global_step*"], None) is True
+    assert hcs.request_can_include_weights(["*"], None) is True
+    # ignore_patterns that drop every weight format still wins over the dir glob.
+    assert hcs.request_can_include_weights(
+        ["checkpoint-*"],
+        ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
+         "*.h5", "*.msgpack", "*.ckpt", "*.onnx", "*.pdparams"],
+    ) is False
+    # File globs with an extension are not directory globs.
+    assert hcs.request_can_include_weights(["tokenizer.*"], None) is False
+    assert hcs.request_can_include_weights(["*.json"], None) is False
 
 
 def test_request_can_include_weights_weight_selecting_globs():
