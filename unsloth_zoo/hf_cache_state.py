@@ -354,6 +354,7 @@ def snapshot_dir_is_complete(
     *,
     allow_patterns: "Optional[object]" = None,
     ignore_patterns: "Optional[object]" = None,
+    require_named_weights: bool = False,
 ) -> bool:
     """Best-effort check that a cached snapshot actually holds the requested model weights.
 
@@ -376,7 +377,12 @@ def snapshot_dir_is_complete(
     specific checkpoint shard) is satisfied only by that weight on disk, not by some other
     weight the snapshot happens to also carry. A deliberate single-shard request likewise
     requires only that shard, not its whole ``-of-NNNNN`` set. With no patterns, any loadable
-    weight does, and every numbered shard set present must be complete."""
+    weight does, and every numbered shard set present must be complete.
+
+    *require_named_weights* additionally requires every explicitly named exact weight in
+    *allow_patterns* (e.g. ``["model.safetensors", "adapter_model.safetensors"]``) to be on
+    disk, so a stale cache holding only one of them is not treated as complete. Off by default
+    (used by the pre-download cache probe); a glob still selects a subset freely."""
     if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False
     try:
@@ -410,6 +416,24 @@ def snapshot_dir_is_complete(
         selected = {rel for _, rel in weight_entries}
     if not selected:
         return False
+
+    # A request that explicitly names exact weight files (e.g. a base model plus a PEFT
+    # adapter, ["model.safetensors", "adapter_model.safetensors"]) needs EACH of them, not
+    # just one: a stale cache holding only the first must not be accepted. Enforced only when
+    # the caller asks (the pre-download cache short-circuit), so the post-download check stays
+    # lenient and never errors when a named weight simply does not exist in the repo (an
+    # "either format" list like ["pytorch_model.bin", "model.safetensors"] against a
+    # safetensors-only repo). A glob may legitimately select a subset, so only concrete
+    # filenames are required, and one the ignore filter drops is not actually requested.
+    if require_named_weights and allow_patterns:
+        present_rels = [rel for _, rel in weight_entries]
+        for pat in allow_patterns:
+            if _has_glob(pat) or not str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
+                continue
+            if ignore_patterns and not _filter_paths([pat], None, ignore_patterns):
+                continue
+            if not _filter_paths(present_rels, [pat], None):
+                return False
 
     # Every selected numbered shard needs the sibling shards the request also selects (the
     # whole set when unpatterned), so an interrupted multi-shard pull is not read as warm.
@@ -491,11 +515,35 @@ def _looks_like_checkpoint_dir(pattern: str) -> bool:
     return any(lowered.startswith(prefix) for prefix in _CHECKPOINT_DIR_PREFIXES)
 
 
+def _bracket_member(content: str) -> str:
+    """A single character that a glob ``[...]`` class *matches*, for concretizing a bracket
+    expression into a probe that still satisfies the caller's own pattern. ``[0-9]`` -> ``0``,
+    ``[a-z]`` -> ``a``; a negated class (``[!...]`` / ``[^...]``) -> a filler the class does
+    not exclude. Replacing the class with a non-member (a literal ``x`` for ``[0-9]``) would
+    make the probe fail the caller's pattern and misread the request as weightless."""
+    negated = content[:1] in ("!", "^")
+    if not negated:
+        # The first listed item is a member: a literal char, or the low end of a leading range.
+        return content[0] if content else "x"
+    # Negated: pick a filler the class does not exclude (fnmatch mirrors HF's matcher).
+    try:
+        import fnmatch
+
+        cls = "[" + content + "]"
+        for cand in ("x", "0", "a", "z", "9", "_", "-", "A"):
+            if fnmatch.fnmatch(cand, cls):
+                return cand
+    except Exception:
+        pass
+    return "x"
+
+
 def _concretize_glob(pattern: str) -> str:
     """Replace glob wildcards in *pattern* with a literal filler so it can stand in as a
     concrete directory name (e.g. ``checkpoint-*`` -> ``checkpoint-x``). A ``[...]`` class
-    collapses to one filler char. Used to probe weights nested under a no-slash directory
-    glob, since Hugging Face's ``fnmatch`` ``*`` spans ``/``."""
+    collapses to one member char it actually matches (so the probe still satisfies the
+    pattern). Used to probe weights nested under a no-slash directory glob, since Hugging
+    Face's ``fnmatch`` ``*`` spans ``/``."""
     out = []
     i = 0
     n = len(pattern)
@@ -506,8 +554,12 @@ def _concretize_glob(pattern: str) -> str:
             i += 1
         elif ch == "[":
             j = pattern.find("]", i + 1)
-            out.append("x")
-            i = (j + 1) if j != -1 else (i + 1)
+            if j != -1:
+                out.append(_bracket_member(pattern[i + 1 : j]))
+                i = j + 1
+            else:
+                out.append("x")  # unterminated class: treat "[" as a literal filler
+                i += 1
         else:
             out.append(ch)
             i += 1
@@ -567,16 +619,25 @@ def request_can_include_weights(
             # A bare concrete weight filename (e.g. a specific non-first shard).
             if pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
                 probes.append(pat)
-        elif "." not in pat or _looks_like_checkpoint_dir(pat):
-            # A no-slash DIRECTORY glob (e.g. "checkpoint-*", "global_step*", or the dotted
-            # "checkpoint-v1.*"). HF's fnmatch "*" spans "/", so it matches nested weights like
-            # checkpoint-10/model.safetensors. Probe the canonical weights re-rooted under a
-            # concretized form of the glob, so the request is recognized as weight-including
-            # (still subject to ignore_patterns). A no-slash FILE glob with an extension
-            # ("*.json", "adapter_model.*", "tokenizer.*") is handled by the canonical /
-            # representative probes, so it is excluded here and stays correctly weightless.
-            concrete = _concretize_glob(pat)
-            probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
+        else:
+            # A no-slash glob. Two weight-including shapes:
+            #  - a DIRECTORY glob ("checkpoint-*", "global_step*", or the dotted
+            #    "checkpoint-v1.*"): HF's fnmatch "*" spans "/", so it matches nested weights
+            #    like checkpoint-10/model.safetensors. Probe the canonical weights re-rooted
+            #    under a concretized form of the glob.
+            #  - a FILE glob naming a weight by suffix ("lora_*.safetensors", "*.bin",
+            #    "model-*.safetensors"): its stem need not match any canonical probe name, so
+            #    add a concretized self-probe so it is recognized rather than misread as
+            #    weightless.
+            # A plain extension file glob with a non-weight suffix ("*.json", "tokenizer.*")
+            # matches no probe here and stays correctly weightless; "adapter_model.*" still
+            # rides the canonical adapter probe. Everything is subject to the final
+            # ignore_patterns filter below.
+            if "." not in pat or _looks_like_checkpoint_dir(pat):
+                concrete = _concretize_glob(pat)
+                probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
+            if pat.lower().endswith(_WEIGHT_FILE_SUFFIXES):
+                probes.append(_concretize_glob(pat))
 
     try:
         kept = list(

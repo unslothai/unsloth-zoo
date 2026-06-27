@@ -750,7 +750,8 @@ def _run_download_attempt(
 
 
 def _snapshot_is_acceptable(
-    snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any
+    snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
+    require_named_weights: bool = False,
 ) -> bool:
     """Whether a cached / downloaded snapshot dir is complete enough to use, scoped to the
     caller's intent.
@@ -769,10 +770,16 @@ def _snapshot_is_acceptable(
 
     The completeness check is scoped to the requested patterns, so a request for a specific
     weight (e.g. ``allow_patterns=["adapter_model.safetensors"]`` or a checkpoint shard) is
-    satisfied only when THAT weight is on disk, not by some other weight already cached."""
+    satisfied only when THAT weight is on disk, not by some other weight already cached.
+
+    ``require_named_weights`` makes a request that explicitly names multiple exact weights
+    require each of them on disk (set on the pre-download cache probe so a stale snapshot
+    missing one is not short-circuited; left off post-download so a named weight that simply
+    does not exist in the repo never turns a finished download into a spurious failure)."""
     if repo_type == "model" and request_can_include_weights(allow_patterns, ignore_patterns):
         return snapshot_dir_is_complete(
-            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
+            require_named_weights = require_named_weights,
         )
     return not snapshot_dir_has_broken_symlinks(snapshot_dir)
 
@@ -1094,6 +1101,9 @@ def snapshot_download_with_xet_fallback(
                 repo_type = repo_type,
                 allow_patterns = allow_patterns,
                 ignore_patterns = ignore_patterns,
+                # Pre-download short-circuit: require each explicitly named weight so a stale
+                # snapshot missing one (base present, adapter not) is completed, not accepted.
+                require_named_weights = True,
             ):
                 return cached_dir
             logger.debug("Cached snapshot for %s is incomplete; downloading.", repo_id)

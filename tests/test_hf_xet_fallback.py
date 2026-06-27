@@ -1275,6 +1275,40 @@ def test_snapshot_dir_is_complete_single_shard_request(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is False
 
 
+def test_snapshot_dir_is_complete_requires_each_named_weight(tmp_path):
+    """require_named_weights makes a request naming multiple exact weights (base + adapter)
+    need EACH on disk, so the pre-download cache probe does not short-circuit a stale snapshot
+    holding only the base. Off (the post-download check) it stays lenient, so an "either
+    format" list (pytorch_model.bin + model.safetensors) against a safetensors-only repo is not
+    turned into a spurious incomplete-snapshot failure."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model.safetensors").symlink_to(blob)            # base only; adapter missing
+    pair = ["model.safetensors", "adapter_model.safetensors"]
+    # Strict (pre-download): adapter missing -> incomplete -> do not short-circuit a stale cache.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is False
+    # Lenient (post-download default): a present selected weight suffices.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = False) is True
+    # Either-format list, safetensors-only repo: strict still won't short-circuit, but the
+    # lenient check must NOT reject it (no error-forever on a name that doesn't exist).
+    either = ["pytorch_model.bin", "model.safetensors"]
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = True) is False
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = False) is True
+    # Both present -> strict is satisfied.
+    (snap / "adapter_model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is True
+    # A named weight the ignore filter drops is not actually requested, so it is not required.
+    (snap / "adapter_model.safetensors").unlink()
+    assert hcs.snapshot_dir_is_complete(
+        snap, allow_patterns = pair, ignore_patterns = ["adapter_model.safetensors"],
+        require_named_weights = True,
+    ) is True
+    # A glob may legitimately select a subset, so it is never forced to be exhaustive.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"], require_named_weights = True) is True
+
+
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
     """HF's local_files_only returns a config-only snapshot (e.g. left by an earlier
     AutoConfig fetch) without checking weights. The fast path must reject it and complete
@@ -1289,6 +1323,44 @@ def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
     fake = _install(monkeypatch, [("ok", "/cache/snap-fresh")])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/snap-fresh" and len(fake.calls) == 1
+
+
+def test_fast_path_requires_each_named_weight(hf_cache, monkeypatch):
+    """The pre-download cache short-circuit must not accept a stale snapshot holding only one
+    of several explicitly named weights: base + adapter requested, only the base cached -> the
+    guarded child still runs to fetch the rest (Codex #829)."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    snap = blobs.parent / "snapshots" / "sha"
+    snap.mkdir(parents = True)
+    base_blob = blobs / "w"
+    base_blob.write_bytes(b"x")
+    (snap / "model.safetensors").symlink_to(base_blob)   # base only; adapter missing
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(snap))
+    fake = _install(monkeypatch, [("ok", "/cache/snap-fresh")])
+    out = xf.snapshot_download_with_xet_fallback(
+        DL_REPO, token = None,
+        allow_patterns = ["model.safetensors", "adapter_model.safetensors"],
+    )
+    assert out == "/cache/snap-fresh" and len(fake.calls) == 1
+
+
+def test_fast_path_either_format_not_failed_post_download(hf_cache, monkeypatch):
+    """An "either format" request (pytorch_model.bin + model.safetensors) against a repo that
+    only ships safetensors must not error: the child's safetensors-only snapshot is accepted
+    post-download, since the strict named-weight rule is pre-download only (no spurious
+    incomplete-snapshot failure for a name that does not exist, Codex #829)."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    child = blobs.parent / "snapshots" / "fresh"
+    child.mkdir(parents = True)
+    w = blobs / "w"
+    w.write_bytes(b"x")
+    (child / "model.safetensors").symlink_to(w)          # safetensors only; no pytorch_model.bin
+    fake = _install(monkeypatch, [("ok", str(child))])
+    out = xf.snapshot_download_with_xet_fallback(
+        DL_REPO, token = None, force_download = True,
+        allow_patterns = ["pytorch_model.bin", "model.safetensors"],
+    )
+    assert out == str(child) and len(fake.calls) == 1
 
 
 def test_child_broken_snapshot_retries_over_http(monkeypatch, tmp_path):
@@ -1488,6 +1560,35 @@ def test_request_can_include_weights_weight_selecting_globs():
     assert hcs.request_can_include_weights(["adapter*.safetensors"], None) is True
     # A non-weight basename glob stays weightless.
     assert hcs.request_can_include_weights(["tokenizer.*"], None) is False
+
+
+def test_request_can_include_weights_custom_weight_suffix_globs():
+    """A no-slash FILE glob whose stem matches no canonical probe but whose suffix is a weight
+    suffix (lora_*.safetensors, *.bin, model-*.safetensors, custom_*.pt) must read as
+    weight-including, so a stale snapshot missing it is not accepted on the weightless path. A
+    non-weight-suffix file glob (*.json) stays weightless, and ignore_patterns still wins."""
+    assert hcs.request_can_include_weights(["lora_*.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["*.bin"], None) is True
+    assert hcs.request_can_include_weights(["model-*.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["my_custom_*.pt"], None) is True
+    assert hcs.request_can_include_weights(["*.json"], None) is False
+    # ignore_patterns dropping that very format wins over the weight-suffix glob.
+    assert hcs.request_can_include_weights(["lora_*.safetensors"], ["*.safetensors"]) is False
+
+
+def test_request_can_include_weights_bracket_globs():
+    """A bracket / range glob (checkpoint-[0-9]/*.safetensors, model-[0-9].safetensors) is
+    concretized to a member the class actually matches, so the weight probe still satisfies the
+    caller's own pattern and the request reads as weight-including, not misclassified
+    weightless."""
+    assert hcs.request_can_include_weights(["checkpoint-[0-9]/*.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["model-[0-9].safetensors"], None) is True
+    assert hcs.request_can_include_weights(["ckpt-[0-9][0-9]/*"], None) is True
+    # The concretizer picks an in-class member, not a literal 'x' that the class would reject.
+    assert hcs._concretize_glob("checkpoint-[0-9]") == "checkpoint-0"
+    assert hcs._concretize_glob("layer_[a-f]") == "layer_a"
+    # A negated class yields a filler the class does not exclude (here a non-digit).
+    assert not hcs._concretize_glob("checkpoint-[!0-9]").endswith(tuple("0123456789"))
 
 
 def test_request_can_include_weights_string_form():
