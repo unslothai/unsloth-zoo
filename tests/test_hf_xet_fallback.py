@@ -1330,6 +1330,20 @@ def test_request_can_include_weights_path_qualified():
     ) is True
 
 
+def test_request_can_include_weights_weight_selecting_globs():
+    """Weight-selecting basename globs whose stem is not the canonical 'model' -- PEFT
+    adapters, consolidated / original checkpoints, diffusers -- must read as including
+    weights, so a stale snapshot missing them is not accepted on the weightless path."""
+    assert hcs.request_can_include_weights(["adapter_model.*"], None) is True
+    assert hcs.request_can_include_weights(["adapter_model.safetensors"], None) is True
+    assert hcs.request_can_include_weights(["consolidated.*"], None) is True
+    assert hcs.request_can_include_weights(["consolidated.00.pth"], None) is True
+    assert hcs.request_can_include_weights(["diffusion_pytorch_model.*"], None) is True
+    assert hcs.request_can_include_weights(["adapter*.safetensors"], None) is True
+    # A non-weight basename glob stays weightless.
+    assert hcs.request_can_include_weights(["tokenizer.*"], None) is False
+
+
 def test_request_can_include_weights_string_form():
     """Hugging Face accepts allow / ignore patterns as a bare string; it must be treated as
     one pattern, not iterated character by character (which would misclassify a subfolder

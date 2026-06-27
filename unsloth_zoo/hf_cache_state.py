@@ -347,16 +347,24 @@ def snapshot_dir_is_complete(snapshot_dir: Path) -> bool:
     return has_weight
 
 
-# One canonical filename per recognized weight format (plus a representative first shard);
-# the probe set for "can this request include a weight file". The shard *index* sidecars
-# (``*.safetensors.index.json`` / ``*.bin.index.json``) are intentionally absent: they are
-# JSON metadata, not weights, so a metadata-only request such as ``allow_patterns=["*.json"]``
-# (or ``["*.index.json"]``) must read as weightless rather than as a full weight load.
+# Representative loadable-weight filenames -- the probe set for "can this request include a
+# weight file". One per recognized format and naming convention (full model, sharded, PEFT
+# adapter, consolidated / original checkpoint, diffusers), so a weight-selecting glob like
+# ``adapter_model.*`` or ``consolidated.*`` matches a probe and is not misread as weightless.
+# The shard *index* sidecars (``*.safetensors.index.json`` / ``*.bin.index.json``) are
+# intentionally absent: they are JSON metadata, not weights, so a metadata-only request such
+# as ``allow_patterns=["*.json"]`` (or ``["*.index.json"]``) must read as weightless.
 _WEIGHT_PROBE_NAMES = (
     "model.safetensors",
     "model-00001-of-00002.safetensors",
     "pytorch_model.bin",
     "pytorch_model-00001-of-00002.bin",
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "consolidated.00.pth",
+    "consolidated.safetensors",
+    "diffusion_pytorch_model.safetensors",
+    "diffusion_pytorch_model.bin",
     "tf_model.h5",
     "flax_model.msgpack",
     "model.gguf",
