@@ -16,6 +16,7 @@
 
 __all__ = [
     "train_on_responses_only",
+    "get_chat_template_parts",
     "sft_prepare_dataset",
     "standardize_data_formats",
     "patch_torchcodec_audio_decoder",
@@ -161,6 +162,101 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 pass
 
 
+def get_chat_template_parts(tokenizer):
+    """Auto-detect (instruction_part, response_part) from the tokenizer's chat
+    template, so train_on_responses_only needs no manual markers."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    import re
+    from collections import Counter
+
+    tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+    if getattr(tok, "chat_template", None) is None:
+        raise ValueError("Unsloth: No chat_template to auto-detect from - pass instruction_part and response_part.")
+
+    # Sentinels survive Jinja |trim and never collide with real tokens
+    U, A = "⁠USERPROBE7q⁠", "⁠ASSTPROBE4z⁠"
+    render = lambda msgs, gen: tok.apply_chat_template(msgs, tokenize = False, add_generation_prompt = gen)
+    starts = lambda text, n: [m.start() for m in re.finditer(re.escape(n), text)]
+    ends   = lambda text, n: [m.end()   for m in re.finditer(re.escape(n), text)]
+    eos = getattr(tok, "eos_token", "") or ""
+    bos = getattr(tok, "bos_token", "") or ""
+    try:    added = set(tok.get_added_vocab().keys())
+    except Exception: added = set()
+    specials = sorted(set(getattr(tok, "all_special_tokens", []) or []) | added, key = len, reverse = True)
+
+    def strip_lead(s, *prefixes):
+        # Remove any of the given leading strings, repeatedly
+        changed = True
+        while changed:
+            changed = False
+            for p in prefixes:
+                if p and s.startswith(p): s, changed = s[len(p):], True
+        return s
+
+    def strip_shared(a, b):
+        # Drop leading special-tokens/whitespace common to both until roles differ
+        while True:
+            wa, wb = re.match(r"\s+", a), re.match(r"\s+", b)
+            if wa and wb and wa.group() == wb.group():
+                a, b = a[wa.end():], b[wb.end():]
+                continue
+            t = next((s for s in specials if a.startswith(s)), None)
+            if t and b.startswith(t):
+                a, b = a[len(t):], b[len(t):]
+                continue
+            break
+        return a, b
+
+    def gap_mode(from_ends, to_starts):
+        # Most common text between adjacent content blocks
+        out = []
+        for e in from_ends:
+            nxt = [s for s in to_starts if s >= e]
+            if nxt: out.append(full[e : min(nxt)])
+        return Counter(out).most_common(1)[0][0] if out else ""
+
+    # Render a 3-turn probe; read markers off the gaps between content blocks
+    convo = [{"role": "user", "content": U}, {"role": "assistant", "content": A}] * 3
+    full = render(convo, False)
+    if not starts(full, U) or not starts(full, A):
+        raise ValueError("Unsloth: Could not auto-detect chat template structure - pass instruction_part and response_part.")
+    instr_gap = gap_mode(ends(full, A), starts(full, U))
+    resp_gap  = gap_mode(ends(full, U), starts(full, A))
+
+    # Clean assistant header = generation prompt. Diff the tails after the last user
+    # turn; shared leading special-tokens are the turn terminator, so drop them.
+    end_user = convo[:-1]
+    tail = lambda s: s[s.rfind(U) + len(U):]
+    asst_header, _ = strip_shared(tail(render(end_user, True)), tail(render(end_user, False)))
+
+    if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
+        # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
+        response_part, instruction_part = asst_header, strip_lead(instr_gap, resp_gap[:-len(asst_header)])
+    elif asst_header and asst_header == resp_gap:
+        # Terminator leaked into the gen-diff (Phi-3): strip shared separators
+        response_part, instruction_part = strip_shared(asst_header, instr_gap)
+    else:
+        # Headerless template (Mistral [INST]/[/INST]): the marker lives in the gap
+        response_part    = strip_lead(resp_gap, eos + "\n", eos, bos)
+        instruction_part = strip_lead(instr_gap, eos + "\n", eos, bos)
+
+    # Drop leading bos/eos and trailing spaces that would merge into the first content token
+    instruction_part = strip_lead(instruction_part, eos + "\n", eos, bos).rstrip(" \t")
+    response_part    = strip_lead(response_part, bos).rstrip(" \t")
+    if not instruction_part or not response_part:
+        raise ValueError("Unsloth: Auto-detection produced an empty marker - pass instruction_part and response_part.")
+
+    # Markers must appear as token cores in a tokenized probe, else masking would
+    # silently train on nothing (non-atomic role tags whose ids shift by context)
+    probe_ids = tok(full, add_special_tokens = False).input_ids
+    for part in (instruction_part, response_part):
+        core = _find_common_token_ids(part, tok, True)[0]
+        if not any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
+            raise ValueError("Unsloth: Could not reliably auto-detect masking markers - pass instruction_part and response_part.")
+    return instruction_part, response_part
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -186,8 +282,12 @@ def train_on_responses_only(
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
         
-        if instruction_part is None or response_part is None:
-            raise ValueError("Unsloth: instruction_part and response_part must be given!")
+        if instruction_part is None and response_part is None:
+            # Neither given: auto-detect both from the chat template
+            instruction_part, response_part = get_chat_template_parts(tokenizer)
+            print(f"Unsloth: Auto-detected instruction_part = {repr(instruction_part)} and response_part = {repr(response_part)}")
+        elif instruction_part is None or response_part is None:
+            raise ValueError("Unsloth: Give both instruction_part and response_part, or neither to auto-detect!")
         pass
     elif (instruction_part is not None or response_part is not None) and \
         (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):
