@@ -417,7 +417,12 @@ def snapshot_dir_is_complete(
     if has_patterns:
         selected = set(_filter_paths([rel for _, rel in weight_entries], allow_patterns, ignore_patterns))
     else:
-        selected = {rel for _, rel in weight_entries}
+        # Unpatterned warm = a bare from_pretrained, which reads ROOT model weights. A weight that
+        # lives only inside a per-checkpoint dir (checkpoint-500/model.safetensors, left behind by
+        # a prior allow_patterns=["checkpoint-500/*"] pull) is not a root weight, so it must not
+        # make a checkpoint-only snapshot read as a warm root model -- that would let the guarded
+        # download be skipped and hand from_pretrained a snapshot whose root weights are missing.
+        selected = {rel for _, rel in weight_entries if not _path_under_checkpoint_dir(rel)}
     if not selected:
         return False
 
@@ -455,9 +460,17 @@ def snapshot_dir_is_complete(
             return False
 
     # A full (unpatterned) warm also validates any shard index ships all its shards; a
-    # patterned request may legitimately want only a subset, so the index is not enforced.
+    # patterned request may legitimately want only a subset, so the index is not enforced. A
+    # per-checkpoint index (checkpoint-500/model.safetensors.index.json) does not gate a root
+    # warm for the same reason its weights do not, so it is skipped here too.
     if not has_patterns:
         for index_entry in index_entries:
+            try:
+                index_rel = index_entry.relative_to(snapshot_dir).as_posix()
+            except ValueError:
+                index_rel = index_entry.name
+            if _path_under_checkpoint_dir(index_rel):
+                continue
             if not _weight_shard_index_complete(index_entry):
                 return False
     return True
@@ -521,6 +534,17 @@ _CHECKPOINT_DIR_PREFIXES = (
 def _looks_like_checkpoint_dir(pattern: str) -> bool:
     lowered = pattern.lower()
     return any(lowered.startswith(prefix) for prefix in _CHECKPOINT_DIR_PREFIXES)
+
+
+def _path_under_checkpoint_dir(rel: str) -> bool:
+    """True when a repo-relative *rel* lives inside a per-checkpoint directory
+    (``checkpoint-500/model.safetensors``, ``global_step1000/pytorch_model.bin``). Only the
+    PARENT components are checked -- the final component is the filename itself. Used to keep a
+    checkpoint-dir weight from satisfying an unpatterned (root-model) warmup: such a weight is
+    what a prior ``allow_patterns=["checkpoint-500/*"]`` pull leaves behind, not the root weight
+    a bare ``from_pretrained`` reads."""
+    parts = rel.split("/")
+    return any(_looks_like_checkpoint_dir(p) for p in parts[:-1] if p)
 
 
 def _bracket_member(content: str) -> str:
@@ -592,14 +616,19 @@ _NON_WEIGHT_PROBE_NAMES = (
 )
 
 
-# Subfolders that, by convention, hold only auxiliary / telemetry files -- never model weights.
-# A catch-all glob under one of these (tokenizer/*, runs/*) is read as weightless. Kept
-# deliberately narrow: an unknown subfolder (unet/, transformer/, original/, a new arch's
-# component dir) must stay weight-including, so a weight-bearing dir is never misread as
-# weightless (that would re-open the silent-Xet-hang accept-stale this module exists to prevent).
+# Subfolders that, by convention, hold only auxiliary / telemetry / config files -- never model
+# weights. A catch-all glob under one of these (tokenizer/*, runs/*, scheduler/*) is read as
+# weightless. Kept deliberately narrow: an unknown subfolder (unet/, transformer/, original/, a
+# new arch's component dir) must stay weight-including, so a weight-bearing dir is never misread
+# as weightless (that would re-open the silent-Xet-hang accept-stale this module exists to
+# prevent). The Diffusers pipeline components listed here (scheduler/, feature_extractor/, the
+# extra tokenizers) ship only *_config.json / vocab files; the weight-bearing pipeline dirs
+# (unet/, transformer/, vae/, text_encoder*/, image_encoder/, safety_checker/) are deliberately
+# absent so a catch-all under them stays weight-including.
 _NON_WEIGHT_DIR_NAMES = frozenset({
-    "tokenizer", "runs", "run", "logs", "log", "samples", "sample", "tensorboard", "tb",
-    "events", "eval", "evals", "evaluation", "metrics", "wandb", "assets", "images", "media",
+    "tokenizer", "tokenizer_2", "tokenizer_3", "runs", "run", "logs", "log", "samples", "sample",
+    "tensorboard", "tb", "events", "eval", "evals", "evaluation", "metrics", "wandb", "assets",
+    "images", "media", "scheduler", "feature_extractor",
 })
 
 
