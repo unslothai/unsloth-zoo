@@ -249,6 +249,46 @@ def _active_incomplete_blob_sizes(
     return sizes
 
 
+def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
+    """Basenames of the ``*.incomplete`` blob files the download child *pid* currently has
+    open.
+
+    This pinpoints exactly the partial THIS child is writing -- including a resumed prior
+    partial that reuses the same blob-hash filename (which Hugging Face does on a retry), so
+    a hung resume is still detected -- without confusing it for a concurrent sibling
+    download's partial (held open by a different pid). Returns ``None`` when it cannot be
+    determined (no ``psutil`` and no ``/proc``, or the process is gone), so the caller falls
+    back to a coarser measure; an empty set means the child is running but not yet writing a
+    partial (connect / metadata phase).
+    """
+    # Cross-platform (Linux / macOS / Windows) when psutil is available.
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        try:
+            files = psutil.Process(pid).open_files()
+        except Exception:
+            return None
+        return {os.path.basename(f.path) for f in files if f.path.endswith(INCOMPLETE_SUFFIX)}
+    # Linux fallback: read the open fds directly from /proc.
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        entries = os.listdir(fd_dir)
+    except OSError:
+        return None  # no /proc (non-Linux) or the process is already gone
+    open_blobs: set = set()
+    for fd in entries:
+        try:
+            target = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if target.endswith(INCOMPLETE_SUFFIX):
+            open_blobs.add(os.path.basename(target))
+    return open_blobs
+
+
 def get_hf_download_state(
     repo_ids: Optional[list[str]] = None,
     *,
@@ -308,6 +348,7 @@ def start_watchdog(
     on_heartbeat: Optional[Callable[[str], None]] = None,
     watch_new_partials_only: bool = False,
     baseline_incomplete_blobs: Optional[set] = None,
+    child_pid: Optional[int] = None,
 ) -> threading.Event:
     """Start a daemon thread that fires ``on_stall(message)`` exactly once iff a
     ``*.incomplete`` is present AND the on-disk size is unchanged for
@@ -316,11 +357,13 @@ def start_watchdog(
     download targets a caller-supplied cache, else the active ``HF_HUB_CACHE``.
     Returns a stop event the caller sets when the download phase ends.
 
-    When *watch_new_partials_only* is set (single-file downloads), progress is measured
-    only over ``*.incomplete`` partials that were NOT present in *baseline_incomplete_blobs*
-    (captured before the child started) -- i.e. the child's own partials. This keeps a
-    concurrent sibling download of a different file in the same repo from resetting the
-    stall timer with its progress, which would otherwise keep a hung child alive forever.
+    When *watch_new_partials_only* is set (single-file downloads), progress is measured only
+    over the child's own partial, so a concurrent sibling download of a different file in the
+    same repo cannot reset the stall timer with its progress (which would keep a hung child
+    alive forever). The child's partial is identified, in order of preference, by the
+    ``*.incomplete`` blobs the *child_pid* process actually has open (precise across a
+    resumed download that reuses a prior blob-hash filename), else by the partials that did
+    NOT already exist in *baseline_incomplete_blobs* (captured before the child started).
     Snapshot downloads keep the repo-wide measurement (every blob is part of the one pull).
     """
     stop = threading.Event()
@@ -332,7 +375,14 @@ def start_watchdog(
     def _measure() -> Optional[tuple[int, bool]]:
         if watch_new_partials_only:
             sizes = _active_incomplete_blob_sizes(repo_type, single_repo_id, cache_dir)
-            owned = {name: n for name, n in sizes.items() if name not in baseline}
+            open_names = _child_open_incomplete_blobs(child_pid) if child_pid else None
+            if open_names is not None:
+                # Precise: only the partials this child holds open (handles a resumed
+                # partial that reuses a baseline blob-hash name, and excludes siblings).
+                owned = {name: n for name, n in sizes.items() if name in open_names}
+            else:
+                # Fallback (no psutil / no /proc): follow only newly-created partials.
+                owned = {name: n for name, n in sizes.items() if name not in baseline}
             return (sum(owned.values()), len(owned) > 0)
         return get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
 
@@ -647,6 +697,7 @@ def _run_download_attempt(
         on_heartbeat = on_status,
         watch_new_partials_only = (kind == "file"),
         baseline_incomplete_blobs = baseline_partials,
+        child_pid = proc.pid,
     )
 
     result: Optional[dict] = None

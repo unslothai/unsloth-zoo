@@ -374,6 +374,17 @@ def _has_glob(text: str) -> bool:
     return any(ch in text for ch in _GLOB_CHARS)
 
 
+def _as_pattern_list(patterns: "Optional[object]") -> "Optional[list]":
+    """Normalize an allow / ignore pattern argument to a list. Hugging Face accepts a bare
+    ``str`` as well as a list, and iterating the ``str`` form would walk it character by
+    character (so ``"checkpoint-10/*"`` would never match), misclassifying the request."""
+    if patterns is None:
+        return None
+    if isinstance(patterns, str):
+        return [patterns]
+    return list(patterns)
+
+
 def _pattern_basename_targets_weight(pattern: str) -> bool:
     """True if *pattern*'s final path component looks like it selects a weight file: a
     catch-all (``*`` / ``**``) or a name / glob ending in a recognized weight suffix.
@@ -401,7 +412,12 @@ def request_can_include_weights(
     ``["checkpoint-10/*"]`` or ``["models/*.safetensors"]`` probe the canonical weight
     names re-rooted under that directory, and a bare non-first shard like
     ``["model-00002-of-00005.safetensors"]`` is probed verbatim, so a request that does
-    target weights inside a subfolder / at a specific shard is not misread as weightless."""
+    target weights inside a subfolder / at a specific shard is not misread as weightless.
+
+    *allow_patterns* / *ignore_patterns* accept the ``str`` or ``list[str]`` forms that
+    Hugging Face itself accepts."""
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
     if not allow_patterns and not ignore_patterns:
         return True
     try:

@@ -244,6 +244,90 @@ def test_file_watchdog_ignores_baseline_only_partials(hf_cache):
         stop.set()
 
 
+def _spawn_holding_open(path: Path) -> "subprocess.Popen":
+    """A real child process that opens *path* and holds it open without writing, modelling a
+    hung download. Prints 'ok' once the file is open so the caller can synchronize."""
+    code = (
+        "import sys, time\n"
+        "f = open(sys.argv[1], 'r+b')\n"
+        "sys.stdout.write('ok'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(path)], stdout = subprocess.PIPE
+    )
+    assert proc.stdout.read(2) == b"ok"   # wait until the child holds the file open
+    return proc
+
+
+def test_file_watchdog_detects_resumed_baseline_partial(hf_cache):
+    """A resumed single-file download reuses the prior blob-hash .incomplete, so it sits in
+    the baseline. Name-based exclusion would never flag a hung resume; scoping to the
+    partials the child process holds open detects it."""
+    blobs = _blobs_dir(hf_cache)
+    partial = blobs / "resumed.incomplete"
+    partial.write_bytes(b"\0" * 4096)        # leftover from a prior interrupted download
+    baseline = {"resumed.incomplete"}        # present before the (resuming) child starts
+
+    child = _spawn_holding_open(partial)      # hung resume: holds it open, never grows it
+    try:
+        calls: list[str] = []
+        stop = xf.start_watchdog(
+            repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+            watch_new_partials_only = True, baseline_incomplete_blobs = baseline,
+            child_pid = child.pid,
+        )
+        try:
+            assert _wait(lambda: len(calls) >= 1, timeout = 3.0), (
+                "watchdog did not fire on a hung resume of a baseline partial"
+            )
+        finally:
+            stop.set()
+    finally:
+        child.terminate()
+        child.wait(timeout = 5)
+
+
+def test_file_watchdog_pid_scope_ignores_unowned_sibling(hf_cache):
+    """With pid scoping, a sibling partial this child does NOT hold open is ignored even if
+    it grows, so the child's own constant partial still trips the stall."""
+    blobs = _blobs_dir(hf_cache)
+    owned_partial = blobs / "owned.incomplete"
+    owned_partial.write_bytes(b"\0" * 2048)   # the child holds this open, constant (hung)
+    sibling = blobs / "sibling.incomplete"
+    sibling.write_bytes(b"\0" * 1024)
+
+    grow_stop = threading.Event()
+
+    def _grow():
+        size = 1024
+        while not grow_stop.wait(0.05):
+            size += 4096
+            sibling.write_bytes(b"\0" * size)   # an unrelated sibling making progress
+
+    grower = threading.Thread(target = _grow, daemon = True)
+    grower.start()
+
+    child = _spawn_holding_open(owned_partial)
+    try:
+        calls: list[str] = []
+        stop = xf.start_watchdog(
+            repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+            watch_new_partials_only = True, baseline_incomplete_blobs = set(),
+            child_pid = child.pid,
+        )
+        try:
+            assert _wait(lambda: len(calls) >= 1, timeout = 3.0), (
+                "pid-scoped watchdog never fired: an unowned growing sibling masked the stall"
+            )
+        finally:
+            stop.set()
+    finally:
+        grow_stop.set()
+        child.terminate()
+        child.wait(timeout = 5)
+
+
 def test_get_state_empty_cache(hf_cache):
     assert xf.get_hf_download_state([REPO]) == (0, False)
 
@@ -1244,6 +1328,21 @@ def test_request_can_include_weights_path_qualified():
     assert hcs.request_can_include_weights(
         ["checkpoint-10/*", "config.json", "tokenizer.json"], None
     ) is True
+
+
+def test_request_can_include_weights_string_form():
+    """Hugging Face accepts allow / ignore patterns as a bare string; it must be treated as
+    one pattern, not iterated character by character (which would misclassify a subfolder
+    weight request as weightless)."""
+    assert hcs.request_can_include_weights("checkpoint-10/*", None) is True
+    assert hcs.request_can_include_weights("*.safetensors", None) is True
+    assert hcs.request_can_include_weights("config.json", None) is False
+    assert hcs.request_can_include_weights(None, "*.safetensors") is True   # ignore as str
+    # A string ignore that drops every weight format leaves the request weightless.
+    assert hcs.request_can_include_weights(
+        "config.json", ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
+                        "*.h5", "*.msgpack", "*.ckpt", "*.onnx", "*.pdparams"]
+    ) is False
 
 
 def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
