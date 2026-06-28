@@ -1460,27 +1460,27 @@ def test_snapshot_dir_is_complete_checkpoint_index_does_not_gate_root(tmp_path):
 
 
 def test_snapshot_dir_is_complete_requires_each_named_weight(tmp_path):
-    """require_named_weights makes a request naming multiple exact weights (base + adapter)
-    need EACH on disk, so the pre-download cache probe does not short-circuit a stale snapshot
-    holding only the base. Off (the post-download check) it stays lenient, so an "either
-    format" list (pytorch_model.bin + model.safetensors) against a safetensors-only repo is not
-    turned into a spurious incomplete-snapshot failure."""
+    """require_named_weights makes a request naming multiple exact weights (base + adapter) need
+    EACH logical weight on disk -- so a stale snapshot holding only the base is rejected -- while
+    grouping format variants of one logical weight so an "either format" list (pytorch_model.bin +
+    model.safetensors) is satisfied by whichever format the repo actually ships (no error-forever on
+    a name that doesn't exist)."""
     snap = tmp_path / "snap"
     snap.mkdir()
     blob = tmp_path / "blob"
     blob.write_bytes(b"x")
     (snap / "model.safetensors").symlink_to(blob)            # base only; adapter missing
     pair = ["model.safetensors", "adapter_model.safetensors"]
-    # Strict (pre-download): adapter missing -> incomplete -> do not short-circuit a stale cache.
+    # base + adapter are two LOGICAL weights -> both required; the adapter is missing -> incomplete.
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is False
-    # Lenient (post-download default): a present selected weight suffices.
+    # Lenient (require_named_weights off): a present selected weight suffices.
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = False) is True
-    # Either-format list, safetensors-only repo: strict still won't short-circuit, but the
-    # lenient check must NOT reject it (no error-forever on a name that doesn't exist).
+    # Either-format list = ONE logical weight: whichever format is present satisfies it, under both
+    # the strict and lenient checks (no spurious failure on the absent format).
     either = ["pytorch_model.bin", "model.safetensors"]
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = True) is False
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = True) is True
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = False) is True
-    # Both present -> strict is satisfied.
+    # Both present -> the base + adapter request is satisfied.
     (snap / "adapter_model.safetensors").symlink_to(blob)
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is True
     # A named weight the ignore filter drops is not actually requested, so it is not required.
@@ -2379,3 +2379,95 @@ def test_instantiate_preserving_type_paths():
         exc = xf._instantiate_preserving_type(cls, "the message")
         assert isinstance(exc, cls)
         assert "the message" in str(exc)
+
+
+# --------------------------------------------------------------------------- #
+# Codex round: dir/ wildcard, logical-weight grouping post-download, errno preservation.
+# --------------------------------------------------------------------------- #
+def test_dir_pattern_treated_as_wildcard(tmp_path):
+    """A trailing-slash directory allow pattern (unet/) is a wildcard -- HF's filter_repo_objects
+    expands it to unet/* -- not an exact filename, so the strict named-file checks must not reject a
+    fully cached component directory by looking for a literal 'unet/' entry (Codex #829)."""
+    assert hcs._has_glob("unet/") is True
+    assert hcs._has_glob("checkpoint-10/") is True
+    assert hcs._has_glob("config.json") is False
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "unet").mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    (snap / "unet" / "config.json").write_text("{}")
+    # A dir/ pattern is best-effort (glob), never an exact-name requirement.
+    assert hcs.requested_named_files_present(snap, allow_patterns = ["unet/"]) is True
+    # The component-dir weight satisfies the request; not rejected for a literal 'unet/'.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["unet/"]) is True
+
+
+def test_weight_logical_key_groups_formats():
+    """Format / shard variants of one logical weight share a key; different stems or subdirs do
+    not, so an either-format list is one group while base + adapter are two (Codex #829)."""
+    k = hcs._weight_logical_key
+    assert k("pytorch_model.bin") == k("model.safetensors")               # either-format -> 1 group
+    assert k("model-00001-of-00002.safetensors") == k("model.safetensors")  # shard -> same group
+    assert k("model.safetensors") != k("adapter_model.safetensors")       # base vs adapter
+    assert k("unet/model.safetensors") != k("vae/model.safetensors")      # different subdirs
+
+
+def test_post_download_rejects_stale_named_weight(hf_cache, monkeypatch):
+    """A finished child snapshot missing an explicitly named LOGICAL weight (base present, adapter
+    missing) is now treated as incomplete post-download and retried over HTTP, instead of being
+    returned with the adapter still missing (Codex #829)."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    base_only = blobs.parent / "snapshots" / "xet"
+    base_only.mkdir(parents = True)
+    w = blobs / "w"
+    w.write_bytes(b"x")
+    (base_only / "model.safetensors").symlink_to(w)        # base only; adapter missing
+    complete = blobs.parent / "snapshots" / "http"
+    complete.mkdir(parents = True)
+    (complete / "model.safetensors").symlink_to(w)
+    (complete / "adapter_model.safetensors").symlink_to(w)
+    fake = _install(monkeypatch, [("ok", str(base_only)), ("ok", str(complete))])
+    out = xf.snapshot_download_with_xet_fallback(
+        DL_REPO, token = None, force_download = True,
+        allow_patterns = ["model.safetensors", "adapter_model.safetensors"],
+    )
+    assert out == str(complete)
+    assert [c.disable_xet for c in fake.calls] == [False, True]  # the stale base-only result retried
+
+
+def test_post_download_either_format_still_accepted(hf_cache, monkeypatch):
+    """An either-format list against a single-format child snapshot stays accepted post-download
+    (the formats group to one logical weight), so require_named_weights does not error-forever on a
+    format the repo never ships (Codex #829)."""
+    blobs = _blobs_dir(hf_cache, DL_REPO)
+    child = blobs.parent / "snapshots" / "only-st"
+    child.mkdir(parents = True)
+    w = blobs / "w"
+    w.write_bytes(b"x")
+    (child / "model.safetensors").symlink_to(w)            # safetensors only; no pytorch_model.bin
+    fake = _install(monkeypatch, [("ok", str(child))])
+    out = xf.snapshot_download_with_xet_fallback(
+        DL_REPO, token = None, force_download = True,
+        allow_patterns = ["pytorch_model.bin", "model.safetensors"],
+    )
+    assert out == str(child) and len(fake.calls) == 1
+
+
+def test_parse_errno():
+    assert xf._parse_errno("OSError: [Errno 28] No space left on device") == 28
+    assert xf._parse_errno("OSError: [Errno 122] Disk quota exceeded") == 122
+    assert xf._parse_errno("OSError: some message with no errno") is None
+
+
+def test_oserror_errno_preserved(monkeypatch):
+    """A disk-full child OSError keeps its errno (ENOSPC) across the spawn boundary, so a caller's
+    `except OSError` cleanup can still branch on exc.errno -- not see errno=None (Codex #829)."""
+    import errno as _errno
+
+    fake = _install(monkeypatch, [("error", "OSError: [Errno 28] No space left on device")])
+    with pytest.raises(OSError) as excinfo:
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert excinfo.value.errno == _errno.ENOSPC
+    assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"

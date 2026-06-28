@@ -527,6 +527,19 @@ def _instantiate_preserving_type(exc_cls: type, message: str) -> "Optional[BaseE
         return None
 
 
+def _parse_errno(message: str) -> "Optional[int]":
+    """Pull the errno out of a stringified OSError. CPython formats it as ``[Errno 28] ...``, so a
+    disk-full (ENOSPC) / quota (EDQUOT) error keeps its code across the spawn boundary when the
+    parent reconstructs the OSError, letting callers branch on ``exc.errno``."""
+    match = re.search(r"\[Errno (\d+)\]", message)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def _raise_child_error(message: str) -> None:
     """Re-raise a deterministic child download error, preserving its original exception TYPE when it
     is a known Hub / OS error, so callers that catch ``RepositoryNotFoundError`` / ``GatedRepoError``
@@ -538,6 +551,13 @@ def _raise_child_error(message: str) -> None:
     exc_cls = _resolve_exception_class(type_name)
     if exc_cls is None:
         raise RuntimeError(message)
+    if exc_cls is OSError:
+        # Preserve errno (ENOSPC / EDQUOT ...) so a caller's `except OSError` cleanup can still
+        # branch on exc.errno; OSError(message) alone would leave errno = None.
+        errno_val = _parse_errno(message)
+        if errno_val is not None:
+            raise OSError(errno_val, message)
+        raise OSError(message)
     exc = _instantiate_preserving_type(exc_cls, message)
     if exc is None:
         raise RuntimeError(message)
@@ -939,10 +959,12 @@ def _snapshot_is_acceptable(
     weight (e.g. ``allow_patterns=["adapter_model.safetensors"]`` or a checkpoint shard) is
     satisfied only when THAT weight is on disk, not by some other weight already cached.
 
-    ``require_named_weights`` makes a request that explicitly names multiple exact weights
-    require each of them on disk (set on the pre-download cache probe so a stale snapshot
-    missing one is not short-circuited; left off post-download so a named weight that simply
-    does not exist in the repo never turns a finished download into a spurious failure)."""
+    ``require_named_weights`` makes a request that explicitly names files require them on disk
+    (each named non-weight, and at least one format/shard variant of each named LOGICAL weight),
+    so a stale snapshot missing one is neither short-circuited (pre-download) nor accepted
+    (post-download). Format variants of one weight are grouped, so an "either format" name list
+    against a single-format repo is satisfied by whichever variant exists -- never an error-forever
+    on a name that does not exist in the repo."""
     if repo_type == "model" and request_can_include_weights(allow_patterns, ignore_patterns):
         return snapshot_dir_is_complete(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
@@ -981,8 +1003,15 @@ def _snapshot_payload_incomplete(
             return False
     except OSError:
         return False
+    # require_named_weights so a finished download that handed back a stale snapshot missing an
+    # explicitly named file -- a base + adapter list (["model.safetensors",
+    # "adapter_model.safetensors"]) where only the base materialized, or a weight + named
+    # tokenizer.json -- is still treated as incomplete and retried, not returned with files
+    # missing. Format / shard variants of one logical weight are grouped, so an "either format"
+    # list stays satisfied by whichever variant the repo actually ships (no error-forever).
     return not _snapshot_is_acceptable(
-        path, repo_type = repo_type, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+        path, repo_type = repo_type, allow_patterns = allow_patterns,
+        ignore_patterns = ignore_patterns, require_named_weights = True,
     )
 
 

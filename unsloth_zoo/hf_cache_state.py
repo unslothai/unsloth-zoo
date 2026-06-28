@@ -474,21 +474,20 @@ def snapshot_dir_is_complete(
     if not selected:
         return False
 
-    # A request that explicitly names exact files needs EACH of them on disk, not just one, so a
-    # stale cache holding a subset is not short-circuited past the guarded download. WHICH names
-    # are required depends on the request shape:
-    #   * An exact-file request (no globs) -- ["model.safetensors", "tokenizer.json"], or a base
-    #     plus a PEFT adapter ["model.safetensors", "adapter_model.safetensors"] -- names every
-    #     file it wants, so each concrete name (weight OR non-weight) must be present. A cache with
-    #     just the weight must not accept-warm while the named tokenizer / config is still missing.
-    #   * A request containing ANY glob is a broad "warm what matches" selection where named aux
-    #     files are best-effort (an optional vocab.txt / spiece.model the repo may simply lack), so
-    #     only its concrete WEIGHT names are required -- demanding every optional aux file there
-    #     would defeat the warm-cache short-circuit for normal repos.
-    # Enforced only at the pre-download probe (require_named_weights), so the post-download check
-    # stays lenient and never errors on an "either format" name (["pytorch_model.bin",
-    # "model.safetensors"] against a safetensors-only repo) that does not exist in the repo. A name
-    # the ignore filter drops is not actually requested.
+    # A request that explicitly names exact files needs them on disk before a stale cache is
+    # short-circuited (pre-download) or accepted (post-download) past the guarded download. WHICH
+    # names are required depends on the request shape:
+    #   * Each named NON-WEIGHT file (tokenizer.json, config.json) must be present -- but only for an
+    #     exact-file request (no globs). A glob-bearing list treats aux names as best-effort (an
+    #     optional vocab.txt / spiece.model the repo may lack), so unsloth's glob warms still
+    #     short-circuit on a warm cache rather than re-downloading on every load.
+    #   * Named WEIGHT files are grouped by LOGICAL weight: format / shard variants of the same
+    #     weight share a key, and each group needs at least ONE variant present. So an "either
+    #     format" list (["pytorch_model.bin", "model.safetensors"]) is satisfied by whichever the
+    #     repo actually ships -- never an error-forever on a name that does not exist -- while a
+    #     base + adapter list (["model.safetensors", "adapter_model.safetensors"]) is TWO groups and
+    #     needs both, so a stale cache holding only the base is rejected.
+    # A name the ignore filter drops is not actually requested.
     if require_named_weights and allow_patterns:
         exact_only = not any(_has_glob(p) for p in allow_patterns)
         if exact_only:
@@ -501,18 +500,25 @@ def snapshot_dir_is_complete(
                         present.add(entry.name)
         else:
             present = set(rel for _, rel in weight_entries)
+        weight_groups: dict = {}
         for pat in allow_patterns:
             if _has_glob(pat):
                 continue
-            if not exact_only and not str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
-                continue
             if ignore_patterns and not _filter_paths([pat], None, ignore_patterns):
-                continue
-            # pat is a concrete (glob-free) path, so presence is an exact match. A direct
-            # membership test (not _filter_paths, which fails OPEN by returning all paths on a
-            # filter error) keeps this strict check fail-SAFE: an unevaluable case requires the
-            # guarded download rather than silently accepting a stale cache as warm.
-            if pat not in present:
+                continue  # a name the ignore filter drops is not actually requested
+            if str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
+                weight_groups.setdefault(_weight_logical_key(pat), []).append(pat)
+            elif exact_only:
+                # A named non-weight (tokenizer.json, config.json) is required as-is. A direct
+                # membership test (not _filter_paths, which fails OPEN by returning all paths on a
+                # filter error) keeps this fail-SAFE: an unevaluable case requires the guarded
+                # download rather than silently accepting a stale cache as warm.
+                if pat not in present:
+                    return False
+        # Each logical weight group needs at least one of its named format / shard variants on disk
+        # (an interrupted shard SET is caught separately by the numbered-shard check below).
+        for names in weight_groups.values():
+            if not any(n in present for n in names):
                 return False
 
     # Every selected numbered shard needs the sibling shards the request also selects (the
@@ -575,7 +581,40 @@ _GLOB_CHARS = ("*", "?", "[")
 
 
 def _has_glob(text: str) -> bool:
-    return any(ch in text for ch in _GLOB_CHARS)
+    # A trailing-slash directory pattern ("unet/", "checkpoint-10/") is NOT an exact filename:
+    # Hugging Face's filter_repo_objects expands it to match everything under that directory (as
+    # if "unet/*"). Treat it as a wildcard so the strict exact-name checks do not look for a
+    # literal "unet/" entry and wrongly reject a fully cached directory / component download.
+    return text.endswith("/") or any(ch in text for ch in _GLOB_CHARS)
+
+
+# Weight stems that are format-family variants of the SAME logical weight (Transformers reads one):
+# the PyTorch / TF / Flax / safetensors "model" forms collapse to one key, so an "either format"
+# named request is satisfied by whichever variant the repo actually ships.
+_WEIGHT_FORMAT_FAMILY = {
+    "pytorch_model": "model",
+    "tf_model": "model",
+    "flax_model": "model",
+    "model": "model",
+}
+
+
+def _weight_logical_key(name: str) -> tuple:
+    """A grouping key for a named weight file so format / shard variants of the SAME logical weight
+    share it. Keyed by (directory, normalized stem): the weight suffix and any ``-NNNNN-of-NNNNN``
+    shard suffix are stripped, and the pytorch_model / tf_model / flax_model / model family collapses
+    to ``model``. So ``["pytorch_model.bin", "model.safetensors"]`` is ONE group (either format
+    satisfies it) while ``["model.safetensors", "adapter_model.safetensors"]`` -- or the same stem in
+    two different subdirs -- are separate groups, each independently required."""
+    norm = name.replace("\\", "/")
+    dirname, _, base = norm.rpartition("/")
+    base = base.lower()
+    for suf in _WEIGHT_FILE_SUFFIXES:
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    base = re.sub(r"-\d+-of-\d+$", "", base)
+    return (dirname, _WEIGHT_FORMAT_FAMILY.get(base, base))
 
 
 def _as_pattern_list(patterns: "Optional[object]") -> "Optional[list]":
