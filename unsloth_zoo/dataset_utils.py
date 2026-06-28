@@ -249,12 +249,25 @@ def get_chat_template_parts(tokenizer):
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
 
-    # Reasoning templates inject an empty think block into the generation prompt
-    # (e.g. "<|im_start|>assistant\n<think></think>"). That empty tag is absent from a
-    # real assistant turn that contains reasoning, so a response marker carrying it
-    # would miss the trained turn. Drop a trailing empty paired tag so the marker is
-    # just the assistant header and matches every turn (Nemotron Nano reasoning, etc.).
-    response_part = re.sub(r"<([^\s/>]+)>\s*</\1>\s*$", "", response_part)
+    # A reasoning template may inject an empty paired tag into the generation prompt
+    # (e.g. "<|im_start|>assistant\n<think></think>"). If a real assistant turn that
+    # carries reasoning renders "<think>...</think>" instead, that tag is not part of
+    # the turn and a marker holding it would miss the trained turn. Do not assume this:
+    # re-probe with a reasoning-filled turn of the same tag and drop it only when the
+    # tag is confirmed to be scaffolding (gone from in front of the content). Templates
+    # that always emit the empty tag keep it. Dropping only shortens the marker to the
+    # assistant header, so it can never unmask user content.
+    mt = re.search(r"<([^\s/>]+)>\s*</\1>\s*$", response_part)
+    if mt:
+        tag = mt.group(1)
+        empty = f"<{tag}></{tag}>"
+        try:
+            filled = render([{"role": "user", "content": U},
+                             {"role": "assistant", "content": f"<{tag}>rZ9</{tag}>{A}"}], False)
+            if not filled[:filled.rfind(A)].rstrip().endswith(empty):
+                response_part = response_part[:mt.start()]
+        except Exception:
+            pass
 
     # Only strip whitespace from header markers: do NOT strip bos here, since for some
     # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
