@@ -2528,11 +2528,11 @@ def quantize_gguf(
         n_threads *= 2
 
     def _quote(s):
-        """Quote a path for shell usage, handling both Windows and Unix."""
+        """Quote a path for shell usage (the command runs under shell=True)."""
         s = str(s)
         if IS_WINDOWS:
-            # On Windows cmd, wrap in double quotes if path contains spaces
-            return f'"{s}"' if ' ' in s else s
+            # cmd.exe: always wrap so spaces and metachars (& | ^) stay literal.
+            return f'"{s}"'
         import shlex
         return shlex.quote(s)
 
@@ -2553,8 +2553,10 @@ def quantize_gguf(
         )
         quant_type = "q2_k"
 
-    # An imatrix unlocks the IQ low-bit quants; prepend it (before the positional args) and quote.
-    if imatrix is not None and str(imatrix) != "":
+    # An imatrix unlocks the IQ low-bit quants; prepend it (before positional args) and quote.
+    if imatrix is not None and str(imatrix).strip() != "":
+        if not os.path.exists(imatrix):
+            raise FileNotFoundError(f"Unsloth: imatrix file `{imatrix}` does not exist.")
         _extra_flags = f"--imatrix {_quote(imatrix)} " + _extra_flags
 
     command = (
