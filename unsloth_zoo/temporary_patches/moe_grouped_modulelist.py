@@ -172,21 +172,29 @@ def _grouped_expert_gemm(x, offsets, weight_fn, recompute):
     return _grouped_mm_fix(x, weight_fn(), offsets)
 
 
+def _experts_have_lora(experts, spec) -> bool:
+    """True if any expert projection gained LoRA / a PEFT base_layer after patching
+    (so the frozen grouped path no longer holds). Cheap next to the per-call dequant."""
+    for ex in experts:
+        for name in spec[:3]:
+            lin = getattr(ex, name, None)
+            if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
+                return True
+    return False
+
+
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
     # Fall back to the original forward for CPU/offloaded inputs or experts that gained
     # LoRA after patching (grouped stays on the frozen-expert CUDA path only).
-    lin0 = getattr(experts[0], spec[0], None)
-    if (not hidden_states.is_cuda) or getattr(lin0, "lora_A", None) is not None \
-            or getattr(lin0, "base_layer", None) is not None:
+    if (not hidden_states.is_cuda) or _experts_have_lora(experts, spec):
         return self._orig_moe_forward(hidden_states)
     is_3d = hidden_states.dim() == 3
     if is_3d:
         bsz, seqlen, hidden_dim = hidden_states.shape
     else:
         seqlen, hidden_dim = hidden_states.shape
-        bsz = 1
     hidden_states = hidden_states.view(-1, hidden_dim)
     if self.training and getattr(self, "jitter_noise", 0):   # Mixtral router jitter
         hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
