@@ -721,6 +721,37 @@ def test_cancel_before_start_raises_no_attempt(monkeypatch):
     assert fake.calls == []
 
 
+def test_cancel_honored_even_when_file_cached(monkeypatch, tmp_path):
+    """A cancel_event set before the call must raise even when the file is ALREADY cached: the
+    warm-cache short-circuit returns without reaching _download_with_xet_fallback (the other
+    cancel check), so it must honor cancellation first rather than hand back the cached path
+    (Codex #829)."""
+    cached = tmp_path / "cached.gguf"
+    cached.write_bytes(b"\0" * 8)
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: str(cached))
+    fake = _install(monkeypatch, [])  # the attempt must never run
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(RuntimeError, match = "Cancelled"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, cancel_event = ev)
+    assert fake.calls == []
+
+
+def test_snapshot_cancel_honored_even_when_cached(monkeypatch, tmp_path):
+    """The snapshot wrapper must also honor a pre-set cancel before its warm-cache short-circuit,
+    so a cancelled request does not resolve a cached snapshot (Codex #829)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "model.safetensors").write_bytes(b"x")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: str(snap))
+    fake = _install(monkeypatch, [])  # the attempt must never run
+    ev = threading.Event()
+    ev.set()
+    with pytest.raises(RuntimeError, match = "Cancelled"):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, cancel_event = ev)
+    assert fake.calls == []
+
+
 def test_nonstall_error_propagates_without_fallback(monkeypatch):
     fake = _install(monkeypatch, [("error", "RepositoryNotFoundError: 404 not found")])
     with pytest.raises(RuntimeError, match = "RepositoryNotFoundError"):
@@ -1440,6 +1471,32 @@ def test_snapshot_dir_is_complete_requires_each_named_weight(tmp_path):
     ) is True
     # A glob may legitimately select a subset, so it is never forced to be exhaustive.
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"], require_named_weights = True) is True
+
+
+def test_snapshot_dir_is_complete_requires_named_non_weight_exact_only(tmp_path):
+    """An EXACT-file request (no globs) naming a non-weight alongside a weight requires the
+    non-weight on disk too: a stale cache holding only the weight must not short-circuit past the
+    guarded download that should still fetch the explicitly named tokenizer / config (Codex #829).
+    A request containing ANY glob is instead a broad selection where aux files are best-effort, so
+    only its concrete weights are required -- keeping unsloth's glob-bearing adapter / tokenizer
+    warms able to short-circuit on a warm cache rather than re-downloading on every load."""
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "model.safetensors").symlink_to(blob)        # weight present; tokenizer.json missing
+    pair = ["model.safetensors", "tokenizer.json"]
+    # Strict (pre-download): the named tokenizer.json is missing -> incomplete -> guarded download.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is False
+    # Lenient (post-download): a present selected weight suffices (no error on a possibly-absent name).
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = False) is True
+    # Once the named non-weight is on disk, strict is satisfied.
+    (snap / "tokenizer.json").write_text("{}")
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is True
+    # A list containing ANY glob is a broad warm: optional aux names are NOT required, only weights.
+    (snap / "tokenizer.json").unlink()
+    globbed = ["model.safetensors", "tokenizer.json", "modeling_*.py"]
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globbed, require_named_weights = True) is True
 
 
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):

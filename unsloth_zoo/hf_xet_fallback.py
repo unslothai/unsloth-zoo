@@ -1081,6 +1081,12 @@ def hf_hub_download_with_xet_fallback(
     # dirs are normalized too, since HF accepts pathlib.Path.
     if isinstance(cache_dir, (str, os.PathLike)):
         cache_dir = os.path.expanduser(os.fspath(cache_dir))
+    # Honor an already-set cancellation before any cache probe or network work. The offline and
+    # warm-cache short-circuits below return without reaching _download_with_xet_fallback (which
+    # holds the only other cancel check), so a request cancelled before this point must not
+    # resolve and hand back a cached file.
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Cancelled")
     # Offline: resolve purely from the local cache, never reaching the network. HF
     # raises LocalEntryNotFoundError if it is not cached; let that propagate.
     if local_files_only:
@@ -1169,6 +1175,12 @@ def snapshot_download_with_xet_fallback(
     # resolve to the same on-disk cache location.
     if isinstance(cache_dir, (str, os.PathLike)):
         cache_dir = os.path.expanduser(os.fspath(cache_dir))
+    # Honor an already-set cancellation before any cache probe or network work. The offline and
+    # warm-cache short-circuits below return without reaching _download_with_xet_fallback (which
+    # holds the only other cancel check), so a request cancelled before this point must not
+    # resolve and hand back a snapshot.
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Cancelled")
     # Offline: resolve purely from the local cache, never reaching the network. HF
     # raises if the snapshot is not cached; let that propagate.
     if local_files_only:

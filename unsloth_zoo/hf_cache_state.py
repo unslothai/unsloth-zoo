@@ -426,26 +426,45 @@ def snapshot_dir_is_complete(
     if not selected:
         return False
 
-    # A request that explicitly names exact weight files (e.g. a base model plus a PEFT
-    # adapter, ["model.safetensors", "adapter_model.safetensors"]) needs EACH of them, not
-    # just one: a stale cache holding only the first must not be accepted. Enforced only when
-    # the caller asks (the pre-download cache short-circuit), so the post-download check stays
-    # lenient and never errors when a named weight simply does not exist in the repo (an
-    # "either format" list like ["pytorch_model.bin", "model.safetensors"] against a
-    # safetensors-only repo). A glob may legitimately select a subset, so only concrete
-    # filenames are required, and one the ignore filter drops is not actually requested.
+    # A request that explicitly names exact files needs EACH of them on disk, not just one, so a
+    # stale cache holding a subset is not short-circuited past the guarded download. WHICH names
+    # are required depends on the request shape:
+    #   * An exact-file request (no globs) -- ["model.safetensors", "tokenizer.json"], or a base
+    #     plus a PEFT adapter ["model.safetensors", "adapter_model.safetensors"] -- names every
+    #     file it wants, so each concrete name (weight OR non-weight) must be present. A cache with
+    #     just the weight must not accept-warm while the named tokenizer / config is still missing.
+    #   * A request containing ANY glob is a broad "warm what matches" selection where named aux
+    #     files are best-effort (an optional vocab.txt / spiece.model the repo may simply lack), so
+    #     only its concrete WEIGHT names are required -- demanding every optional aux file there
+    #     would defeat the warm-cache short-circuit for normal repos.
+    # Enforced only at the pre-download probe (require_named_weights), so the post-download check
+    # stays lenient and never errors on an "either format" name (["pytorch_model.bin",
+    # "model.safetensors"] against a safetensors-only repo) that does not exist in the repo. A name
+    # the ignore filter drops is not actually requested.
     if require_named_weights and allow_patterns:
-        present_rels = set(rel for _, rel in weight_entries)
+        exact_only = not any(_has_glob(p) for p in allow_patterns)
+        if exact_only:
+            present = set()
+            for entry in entries:
+                if _safe_is_file(entry):
+                    try:
+                        present.add(entry.relative_to(snapshot_dir).as_posix())
+                    except ValueError:
+                        present.add(entry.name)
+        else:
+            present = set(rel for _, rel in weight_entries)
         for pat in allow_patterns:
-            if _has_glob(pat) or not str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
+            if _has_glob(pat):
+                continue
+            if not exact_only and not str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
                 continue
             if ignore_patterns and not _filter_paths([pat], None, ignore_patterns):
                 continue
-            # pat is a concrete (glob-free) weight path, so presence is an exact match. A direct
+            # pat is a concrete (glob-free) path, so presence is an exact match. A direct
             # membership test (not _filter_paths, which fails OPEN by returning all paths on a
             # filter error) keeps this strict check fail-SAFE: an unevaluable case requires the
             # guarded download rather than silently accepting a stale cache as warm.
-            if pat not in present_rels:
+            if pat not in present:
                 return False
 
     # Every selected numbered shard needs the sibling shards the request also selects (the
