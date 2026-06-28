@@ -152,14 +152,14 @@ class _GroupedFrozenMM(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, offsets, weight_fn):
         ctx.weight_fn = weight_fn
-        ctx.save_for_backward(x, offsets)
+        ctx.save_for_backward(offsets)   # x is unused in backward (frozen base -> dX only)
         with torch.no_grad():
             out = _grouped_mm_fix(x, weight_fn(), offsets)
         return out
 
     @staticmethod
     def backward(ctx, g):
-        x, offsets = ctx.saved_tensors
+        (offsets,) = ctx.saved_tensors
         with torch.no_grad():
             Wt = ctx.weight_fn().transpose(1, 2).contiguous()
             dX = _grouped_mm_fix(g.contiguous(), Wt, offsets)
@@ -174,6 +174,13 @@ def _grouped_expert_gemm(x, offsets, weight_fn, recompute):
 
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
+    experts = self.experts
+    # Fall back to the original forward for CPU/offloaded inputs or experts that gained
+    # LoRA after patching (grouped stays on the frozen-expert CUDA path only).
+    lin0 = getattr(experts[0], spec[0], None)
+    if (not hidden_states.is_cuda) or getattr(lin0, "lora_A", None) is not None \
+            or getattr(lin0, "base_layer", None) is not None:
+        return self._orig_moe_forward(hidden_states)
     is_3d = hidden_states.dim() == 3
     if is_3d:
         bsz, seqlen, hidden_dim = hidden_states.shape
@@ -181,12 +188,14 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         seqlen, hidden_dim = hidden_states.shape
         bsz = 1
     hidden_states = hidden_states.view(-1, hidden_dim)
+    if self.training and getattr(self, "jitter_noise", 0):   # Mixtral router jitter
+        hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
+            1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
     T = hidden_states.shape[0]
     num_experts = self.num_experts
     top_k = self.top_k
     dev = hidden_states.device
     dtype = hidden_states.dtype
-    experts = self.experts
 
     router_logits = self.gate(hidden_states)
     rw, sel = spec[3](self, router_logits, top_k)   # exact per-model router
@@ -207,7 +216,8 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     act = getattr(experts[0], "act_fn", None) or F.silu
 
     if cache:
-        if getattr(self, "_cached_gate_up", None) is None:
+        cu = getattr(self, "_cached_gate_up", None)
+        if cu is None or cu.device != dev or cu.dtype != dtype:   # (re)build on device/dtype change
             with torch.no_grad():
                 self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype)
                 self._cached_down = _build_down_stack(experts, spec, dtype)
@@ -244,18 +254,18 @@ def _block_is_eligible(block):
         if getattr(block, attr, None) is not None:
             return None
     g_name, u_name, d_name, _ = spec
-    e0 = experts[0]
-    for name in (g_name, u_name, d_name):
-        lin = getattr(e0, name, None)
-        w = getattr(lin, "weight", None)
-        if w is None:
-            return None
-        if getattr(lin, "lora_A", None) is not None or hasattr(lin, "base_layer"):  # LoRA on experts -> defer
-            return None
-        is_4bit = HAS_BNB and isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None
-        is_plain_frozen = (not w.requires_grad) and w.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        if not (is_4bit or is_plain_frozen):
-            return None
+    for ex in experts:   # every expert must be frozen with no LoRA, else run the original loop
+        for name in (g_name, u_name, d_name):
+            lin = getattr(ex, name, None)
+            w = getattr(lin, "weight", None)
+            if w is None:
+                return None
+            if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
+                return None
+            is_4bit = HAS_BNB and isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None
+            is_plain_frozen = (not w.requires_grad) and w.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            if not (is_4bit or is_plain_frozen):
+                return None
     return spec
 
 
@@ -266,14 +276,15 @@ def _uses_grad_checkpointing(model) -> bool:
 
 
 def _restore_block(module):
-    if hasattr(module, "_orig_moe_forward"):
-        module.forward = module._orig_moe_forward
-        for attr in ("_orig_moe_forward", "_unsloth_moe_spec", "_moe_recompute",
-                     "_moe_cache", "_cached_gate_up", "_cached_down"):
-            if hasattr(module, attr):
-                delattr(module, attr)
-        return True
-    return False
+    if not hasattr(module, "_orig_moe_forward"):
+        return False
+    if getattr(getattr(module, "forward", None), "__func__", None) is grouped_moe_forward:
+        module.forward = module._orig_moe_forward   # only restore our own patch
+    for attr in ("_orig_moe_forward", "_unsloth_moe_spec", "_moe_recompute",
+                 "_moe_cache", "_cached_gate_up", "_cached_down"):
+        if hasattr(module, attr):
+            delattr(module, attr)
+    return True
 
 
 def enable_grouped_moe(model, recompute=None, cache=None, verbose=True):
@@ -319,7 +330,7 @@ def auto_enable_grouped_moe(model):
         if model is not None and hasattr(model, "modules"):
             enable_grouped_moe(model, verbose=True)
     except Exception:
-        pass
+        pass  # optional speedup; never block model loading
 
 
 def wrap_loader_for_grouped_moe(func):
@@ -335,7 +346,7 @@ def wrap_loader_for_grouped_moe(func):
         try:
             auto_enable_grouped_moe(result[0] if isinstance(result, tuple) and result else result)
         except Exception:
-            pass
+            pass  # optional speedup; never block model loading
         return result
 
     wrapper._unsloth_grouped_moe_wrapped = True
