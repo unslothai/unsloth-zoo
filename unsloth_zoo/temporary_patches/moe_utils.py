@@ -189,14 +189,14 @@ class _GroupedMMRecompute(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, offsets, weight_provider):
         ctx.weight_provider = weight_provider
-        ctx.save_for_backward(inputs, offsets)
+        ctx.save_for_backward(offsets)   # inputs is unused in backward (frozen base -> dX only)
         with torch.no_grad():
             out = _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        inputs, offsets = ctx.saved_tensors
+        (offsets,) = ctx.saved_tensors
         with torch.no_grad():
             weight_t = ctx.weight_provider().transpose(-2, -1).contiguous()
             grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
@@ -686,7 +686,11 @@ def _get_base_weight(param):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        return bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        original_shape = getattr(param, "_original_shape", None)
+        if original_shape is not None and weight.shape != original_shape:
+            weight = weight.reshape(original_shape)
+        return weight
 
     if hasattr(param, "get_param"):
         return param.get_param()
