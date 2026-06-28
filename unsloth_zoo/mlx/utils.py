@@ -552,8 +552,8 @@ def make_baseline_loss_fn():
 # VLM helpers
 # ---------------------------------------------------------------------------
 
-# Image/vision special tokens that should never contribute to loss.
-# Mirrors unsloth's IMAGE_TOKENS list in vision_utils.py.
+# Image/vision/audio special tokens that should never contribute to loss.
+# Mirrors unsloth's IMAGE_TOKENS and AUDIO_TOKENS lists in vision_utils.py.
 _IMAGE_TOKEN_STRINGS = (
     "<|image|>",           # Llama 3.2 Vision, Phi 3.5, Gemma4
     "<|vision_start|>",    # Qwen
@@ -569,6 +569,12 @@ _IMAGE_TOKEN_STRINGS = (
     "<image_soft_token>",  # Gemma 3
     "<start_of_image>",    # Gemma 3
     "<end_of_image>",      # Gemma 3
+    "<|image>",            # Gemma 4 (begin image)
+    "<image|>",            # Gemma 4 (end image)
+    "<|video|>",           # Gemma 4
+    "<|audio|>",           # Gemma 4
+    "<|audio>",            # Gemma 4 (begin audio)
+    "<audio|>",            # Gemma 4 (end audio)
     "<|START_OF_IMG|>",    # Cohere
     "<|END_OF_IMG|>",      # Cohere
     "<|IMG_LINE_BREAK|>",  # Cohere
