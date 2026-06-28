@@ -33,34 +33,9 @@ __all__ = [
     "UnslothVisionDataCollator",
 ]
 
-IMAGE_TOKENS = [
-    "<|image|>",          # Llama 3.2 Vision, Phi 3.5
-    "<|vision_start|>",   # Qwen
-    "<|vision_end|>",     # Qwen
-    "<|vision_pad|>",     # Qwen
-    "<|image_pad|>",      # Qwen
-    "<|video_pad|>",      # Qwen
-    "<image>",            # PaliGemma / Llava
-    "[IMG]",              # Mistral
-    "[IMG_BREAK]",        # Mistral
-    "[IMG_END]",          # Mistral
-    "<image_soft_token>", # Gemma 3
-    "<start_of_image>",   # Gemma 3
-    "<end_of_image>",     # Gemma 3
-    "<|image>",           # Gemma 4 (begin image; <|image|> already listed above)
-    "<image|>",           # Gemma 4 (end image)
-    "<|video|>",          # Gemma 4
-    "<|START_OF_IMG|>",   # Cohere
-    "<|END_OF_IMG|>",     # Cohere
-    "<|IMG_LINE_BREAK|>", # Cohere
-    "<|IMG_PATCH|>",      # Cohere
-]
-
-AUDIO_TOKENS = [
-    "<|audio|>",  # Gemma 4
-    "<|audio>",   # Gemma 4 (begin audio)
-    "<audio|>",   # Gemma 4 (end audio)
-]
+# Canonical media placeholder tokens live in vlm_tokens so the CUDA and MLX paths
+# share one source of truth. Re-exported here for backwards compatibility.
+from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
