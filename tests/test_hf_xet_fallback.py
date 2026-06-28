@@ -2090,3 +2090,123 @@ def test_default_leaves_xet_enabled():
         f"without the env var, constants.HF_HUB_DISABLE_XET was not False "
         f"(rc={proc.returncode}): {proc.stderr}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Exported Xet knobs + child-leak safety + malformed-index resilience.
+# --------------------------------------------------------------------------- #
+def test_xet_availability_and_disable_helpers(monkeypatch):
+    """The exported Xet knobs: child_should_disable_xet reads the per-worker config flag;
+    xet_force_disabled honors every documented env knob; is_hf_xet_available reflects the
+    importability of hf_xet and treats a probe error as 'unavailable'."""
+    assert xf.child_should_disable_xet({"disable_xet": True}) is True
+    assert xf.child_should_disable_xet({"disable_xet": False}) is False
+    assert xf.child_should_disable_xet({}) is False
+
+    for knob in ("UNSLOTH_DISABLE_XET", "UNSLOTH_STABLE_DOWNLOADS", "HF_HUB_DISABLE_XET"):
+        for k in ("UNSLOTH_DISABLE_XET", "UNSLOTH_STABLE_DOWNLOADS", "HF_HUB_DISABLE_XET"):
+            monkeypatch.delenv(k, raising = False)
+        assert xf.xet_force_disabled() is False
+        monkeypatch.setenv(knob, "1")
+        assert xf.xet_force_disabled() is True, knob
+
+    monkeypatch.setattr(xf.importlib.util, "find_spec", lambda name: object())
+    assert xf.is_hf_xet_available() is True
+    monkeypatch.setattr(xf.importlib.util, "find_spec", lambda name: None)
+    assert xf.is_hf_xet_available() is False
+
+    def _raise(name):
+        raise ImportError("boom")
+
+    monkeypatch.setattr(xf.importlib.util, "find_spec", _raise)
+    assert xf.is_hf_xet_available() is False  # a probe exception -> treated as unavailable
+
+
+def test_run_attempt_terminates_child_if_watchdog_start_raises(monkeypatch):
+    """If start_watchdog raises (e.g. thread/FD exhaustion: 'can't start new thread') AFTER the
+    download child has already spawned, the child must STILL be reaped -- no leaked process. The
+    error then propagates (a watchdog-start failure is not a transport fault to retry over HTTP)."""
+    rec = {"terminated": False}
+
+    class _AliveProc:
+        def __init__(self):
+            self.pid = None  # None -> _terminate_process_group skips killpg, uses terminate()
+            self.exitcode = None
+            self._alive = True
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return self._alive
+
+        def terminate(self):
+            rec["terminated"] = True
+            self._alive = False
+
+        def kill(self):
+            rec["terminated"] = True
+            self._alive = False
+
+        def join(self, timeout = None):
+            pass
+
+    class _Ctx:
+        def Process(self, *, target = None, kwargs = None, daemon = None):
+            return _AliveProc()
+
+        def Queue(self):
+            return _FakeQueue({"ok": True, "path": "/cache/x"})
+
+    monkeypatch.setattr(xf, "_CTX", _Ctx())
+
+    def _boom(*a, **k):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(xf, "start_watchdog", _boom)
+
+    with pytest.raises(RuntimeError, match = "can't start new thread"):
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.05, on_status = None,
+        )
+    assert rec["terminated"] is True  # child reaped despite the watchdog-start failure
+
+
+def test_snapshot_dir_is_complete_tolerates_non_string_shard(tmp_path):
+    """A weight index whose ``weight_map`` carries a non-string value (malformed / arbitrary JSON)
+    must not crash the completeness probe: the bad entry is skipped, the string shards still
+    gate, so a real missing shard is still detected (Codex #829). Uses a non-numbered weight name
+    so only the index path -- not the numbered-shard-name expansion -- is exercised."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model.safetensors",
+                    "b": ["not", "a", "string"],  # malformed entry -> skipped, no crash
+                }
+            }
+        )
+    )
+    # The one concrete file it names is present; the malformed entry is ignored, so no crash and
+    # the snapshot reads as complete (only demonstrably-missing string shards reject).
+    assert hcs.snapshot_dir_is_complete(snap) is True
+    # A genuinely missing string shard still gates, with the malformed entry still skipped.
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model.safetensors",
+                    "b": "absent-extra.safetensors",
+                    "c": {"bad": "object"},
+                }
+            }
+        )
+    )
+    assert hcs.snapshot_dir_is_complete(snap) is False  # 'absent-extra' missing, bad entry skipped

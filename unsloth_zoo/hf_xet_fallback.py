@@ -635,12 +635,13 @@ def _terminate_process_group(proc: "mp.process.BaseProcess", grace_period: float
 
     _signal_group(getattr(signal, "SIGTERM", signal.SIGINT))
     proc.join(timeout = grace_period)
-    # Always send the post-grace SIGKILL to the whole group, even if the Python
-    # leader already exited on SIGTERM: a Xet helper left in the group can keep
-    # the stalled writer alive while the parent starts HTTP cleanup. killpg on an
-    # already-dead group is a no-op (ProcessLookupError is caught in _signal_group).
-    _signal_group(getattr(signal, "SIGKILL", signal.SIGTERM))
+    # Post-grace SIGKILL only while the leader is still alive, so its pid (== pgid after setsid) is
+    # a live target. Once proc.join() reaps a leader that exited on SIGTERM, that pid is free and a
+    # busy host can recycle it into an unrelated setsid'd group within the grace window -- a
+    # killpg(pid) would then signal the WRONG group. hf_xet 1.5.x writes in-process and spawns no
+    # helper procs, so a reaped leader leaves nothing in the group to clean up.
     if proc.is_alive():
+        _signal_group(getattr(signal, "SIGKILL", signal.SIGTERM))
         proc.join(timeout = 5.0)
 
 
@@ -764,22 +765,25 @@ def _run_download_attempt(
         pass
 
     stalled = threading.Event()
-    stop_watchdog = start_watchdog(
-        repo_ids = [repo_id],
-        on_stall = lambda msg: stalled.set(),
-        repo_type = repo_type,
-        cache_dir = params.get("cache_dir"),
-        interval = interval,
-        stall_timeout = stall_timeout,
-        xet_disabled = disable_xet,
-        on_heartbeat = on_status,
-        watch_new_partials_only = (kind == "file"),
-        baseline_incomplete_blobs = baseline_partials,
-        child_pid = proc.pid,
-    )
-
+    # start_watchdog creates and starts a thread; if that raises (e.g. "can't start new thread"
+    # under thread/FD exhaustion), the child already started above must STILL be terminated. So it
+    # runs inside the try whose finally reaps the child; stop_watchdog stays None until it succeeds.
+    stop_watchdog = None
     result: Optional[dict] = None
     try:
+        stop_watchdog = start_watchdog(
+            repo_ids = [repo_id],
+            on_stall = lambda msg: stalled.set(),
+            repo_type = repo_type,
+            cache_dir = params.get("cache_dir"),
+            interval = interval,
+            stall_timeout = stall_timeout,
+            xet_disabled = disable_xet,
+            on_heartbeat = on_status,
+            watch_new_partials_only = (kind == "file"),
+            baseline_incomplete_blobs = baseline_partials,
+            child_pid = proc.pid,
+        )
         while proc.is_alive():
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_process_group(proc, grace_period)
@@ -787,9 +791,11 @@ def _run_download_attempt(
             if stalled.is_set():
                 # Prefer a result the child enqueued in the same ~interval window the watchdog
                 # fired in over a late stall, so a download that just succeeded is not killed and
-                # needlessly retried over HTTP.
+                # needlessly retried over HTTP. A spawn Queue has a child-side feeder thread, so a
+                # result put microseconds earlier is not yet readable by get_nowait(); use a short
+                # timeout (matching the process-exit drain below) to let the pipe flush.
                 try:
-                    result = result_queue.get_nowait()
+                    result = result_queue.get(timeout = 1.0)
                     break
                 except queue.Empty:
                     pass
@@ -810,7 +816,8 @@ def _run_download_attempt(
             except queue.Empty:
                 result = None
     finally:
-        stop_watchdog.set()
+        if stop_watchdog is not None:
+            stop_watchdog.set()
         proc.join(timeout = grace_period)
         # Any exit from the loop -- normal completion, cancel/stall, or an
         # unexpected exception (e.g. KeyboardInterrupt) -- must not leak the child.
@@ -893,7 +900,9 @@ def _snapshot_payload_incomplete(
     request."""
     try:
         path = Path(payload)
-    except TypeError:
+    except (TypeError, ValueError, OSError):
+        # Non-path payload (unit-test sentinel) or, on Windows, a path with invalid characters
+        # (ValueError / OSError): trust it rather than reject -- production always returns a real dir.
         return False
     try:
         if not path.is_dir():

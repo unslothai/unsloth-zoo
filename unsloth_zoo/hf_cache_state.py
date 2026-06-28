@@ -79,7 +79,12 @@ def hf_cache_root(*, create: bool = False, cache_dir: "Optional[str | Path]" = N
     if cache_dir is not None:
         # Match huggingface_hub, which expands ~ before writing; scanning the
         # literal path would otherwise miss a partial under e.g. ~/hf-cache.
-        root = Path(cache_dir).expanduser()
+        # Path.expanduser() raises RuntimeError when no home can be resolved (a restricted
+        # container with HOME unset); fall back to the literal path rather than crash the probe.
+        try:
+            root = Path(cache_dir).expanduser()
+        except (RuntimeError, OSError):
+            root = Path(cache_dir)
     else:
         try:
             from huggingface_hub import constants as hf_constants
@@ -339,9 +344,12 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     weight_map = data.get("weight_map") if isinstance(data, dict) else None
     if not isinstance(weight_map, dict):
         return True
-    # weight_map values are filenames relative to the index file's own directory.
+    # weight_map values are filenames relative to the index file's own directory. They come from
+    # arbitrary JSON: a non-string (e.g. list/dict) value is both unhashable -- so it would break
+    # set() -- and invalid for ``base / shard``, so filter to strings BEFORE de-duplicating rather
+    # than crash (consistent with the fail-open parse handling above).
     base = index_path.parent
-    for shard in set(weight_map.values()):
+    for shard in {s for s in weight_map.values() if isinstance(s, str)}:
         try:
             if not (base / shard).exists():
                 return False
@@ -864,7 +872,7 @@ def repo_cache_dir_has_incomplete_blobs(repo_dir: Path) -> bool:
 
 
 def has_active_incomplete_blobs(
-    repo_type: str, repo_id: str, *, cache_dir: "Optional[str | Path]" = None
+    repo_type: "Optional[str]", repo_id: str, *, cache_dir: "Optional[str | Path]" = None
 ) -> bool:
     for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
         if repo_cache_dir_has_incomplete_blobs(entry):
