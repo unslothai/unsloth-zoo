@@ -3413,6 +3413,30 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
             )
 
 
+def _coerce_list_extra_special_tokens():
+    # mlx-lm loads tokenizers via transformers AutoTokenizer without unsloth's
+    # TEMPORARY_PATCHES, so configs storing extra_special_tokens as a list (v5
+    # TokenizersBackend exports, some Mistral configs) crash transformers that
+    # expect a dict ("'list' object has no attribute 'keys'"). Coerce to {}.
+    # Shares the guard attr with patch_tokenizer_extra_special_tokens so neither
+    # double-wraps the other.
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception:
+        return
+    init = PreTrainedTokenizerBase.__init__
+    if getattr(init, "_unsloth_extra_special_tokens_patched", False):
+        return
+
+    def patched_init(self, **kwargs):
+        if isinstance(kwargs.get("extra_special_tokens", {}), list):
+            kwargs["extra_special_tokens"] = {}
+        return init(self, **kwargs)
+
+    patched_init._unsloth_extra_special_tokens_patched = True
+    PreTrainedTokenizerBase.__init__ = patched_init
+
+
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
 
@@ -3471,6 +3495,10 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
+        # Coerce list-valued extra_special_tokens before mlx-lm loads the
+        # tokenizer (this path bypasses unsloth's TEMPORARY_PATCHES).
+        _coerce_list_extra_special_tokens()
+
         if full_finetuning and (
             load_in_4bit or load_in_8bit or load_in_fp8
             or load_in_mxfp4 or load_in_nvfp4
