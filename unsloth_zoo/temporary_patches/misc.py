@@ -82,10 +82,8 @@ TEMPORARY_PATCHES.append(patch_tokenizer_convert_added_tokens)
 
 
 def patch_tokenizer_extra_special_tokens():
-    # Some tokenizer configs store extra_special_tokens as a list. Older
-    # transformers run list(...).keys() and crash; v5 supports lists natively, so
-    # only coerce to {} on the path that would otherwise crash (coercing on v5
-    # drops those special tokens).
+    # why: old transformers crash on a list extra_special_tokens; v5 accepts it,
+    # so only coerce on failure (coercing v5 would drop those tokens).
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     except Exception as e:

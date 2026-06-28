@@ -3414,12 +3414,8 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
 
 
 def _coerce_list_extra_special_tokens():
-    # mlx-lm loads tokenizers via transformers AutoTokenizer without unsloth's
-    # TEMPORARY_PATCHES. Older transformers run list(extra_special_tokens.keys())
-    # and crash on a list ("'list' object has no attribute 'keys'"); v5 supports
-    # lists natively, so only coerce to {} on the path that would otherwise crash
-    # (coercing on v5 drops those special tokens). Shares the guard attr with
-    # patch_tokenizer_extra_special_tokens so neither double-wraps the other.
+    # why: the MLX path skips unsloth's TEMPORARY_PATCHES. Old transformers crash
+    # on a list extra_special_tokens; v5 accepts it, so only coerce on failure.
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     except Exception:
@@ -3501,8 +3497,6 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
-        # Coerce list-valued extra_special_tokens before mlx-lm loads the
-        # tokenizer (this path bypasses unsloth's TEMPORARY_PATCHES).
         _coerce_list_extra_special_tokens()
 
         if full_finetuning and (
