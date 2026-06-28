@@ -826,6 +826,18 @@ def _run_download_attempt(
         try:
             os.environ.update(child_env)
             proc.start()
+        except BaseException:
+            # proc.start() can raise (e.g. OSError "can't start new process" under fd /
+            # thread exhaustion). The result_queue's OS pipe fds were allocated above, but
+            # the lifecycle try/finally that closes them is only entered AFTER a successful
+            # start, so on a failed spawn that cleanup never runs and the fds leak. Close
+            # the queue here so a failed spawn is deterministic rather than fd-leaking.
+            try:
+                result_queue.cancel_join_thread()
+                result_queue.close()
+            except Exception:
+                pass
+            raise
         finally:
             for k, v in saved_env.items():
                 if v is None:
@@ -1051,8 +1063,13 @@ def _download_with_xet_fallback(
         raise RuntimeError("Cancelled")
 
     cache_dir = params.get("cache_dir")
-    # The Unsloth/HF knobs can force HTTP from the very first attempt.
-    disable_xet = xet_force_disabled()
+    # The Unsloth/HF knobs can force HTTP from the very first attempt. xet_force_disabled() reads
+    # os.environ["HF_HUB_DISABLE_XET"] live, and a CONCURRENT download briefly sets that var in the
+    # parent env around its spawn (under _SPAWN_ENV_LOCK) so its child inherits it. Read under the
+    # same lock so this download cannot observe the other's child-only value and wrongly force itself
+    # onto HTTP from the start.
+    with _SPAWN_ENV_LOCK:
+        disable_xet = xet_force_disabled()
 
     for attempt in range(2):
         if disable_xet:

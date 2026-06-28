@@ -2856,3 +2856,165 @@ def test_processor_glob_is_weightless():
     assert hcs.request_can_include_weights(allow_patterns = ["processor*"]) is False
     # control: a real weight glob stays weight-including
     assert hcs.request_can_include_weights(allow_patterns = ["model*"]) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the 3-reviewer (Opus) review round on #829.
+# Each maps to one accepted finding; the rejected "variant shard after the count"
+# finding is covered (and disproven) by test_snapshot_dir_is_complete_variant_sharded_index.
+# ---------------------------------------------------------------------------
+def test_request_can_include_weights_subfolder_variant_component_glob():
+    """R3-4: a path-qualified variant component glob (["unet/diffusion_pytorch_model.fp16*"],
+    ["text_encoder/model.fp16*"]) selects a real variant weight inside a pipeline subfolder. It does
+    not end in a weight suffix and the re-rooted canonical probes (unet/model.safetensors, ...) do not
+    match the variant name, so without a path-qualified self-probe it would read as WEIGHTLESS and the
+    fast path could accept a config-only component snapshot -> the silent Xet hang (accept-stale). It
+    must read as weight-including. A non-weight subfolder glob (unet/config*) stays weightless."""
+    assert hcs.request_can_include_weights(["unet/diffusion_pytorch_model.fp16*"], None) is True
+    assert hcs.request_can_include_weights(["text_encoder/model.fp16*"], None) is True
+    assert hcs.request_can_include_weights(["transformer/diffusion_pytorch_model.bf16*"], None) is True
+    # A non-weight subfolder glob is not over-classified.
+    assert hcs.request_can_include_weights(["unet/config*"], None) is False
+    assert hcs.request_can_include_weights(["text_encoder/tokenizer*"], None) is False
+    # The self-probe re-roots the synthetic weight under the requested subfolder.
+    assert hcs._weight_self_probe("unet/diffusion_pytorch_model.fp16*") == \
+        "unet/diffusion_pytorch_model.fp16.safetensors"
+
+
+def test_request_can_include_weights_index_glob_weightless_weight_glob_kept():
+    """R3-2: a trailing-wildcard shard-index glob (["model.safetensors.index*"],
+    ["model.bin.index*"]) selects only the index sidecar (no weight), so it reads as WEIGHTLESS -- the
+    synthetic-suffix branch must not turn the .index stem into a fake model.safetensors.index.safetensors
+    weight. A plain weight-stem glob (["model.safetensors*"], ["pytorch_model.bin*"]) still reads as
+    weight-including via the canonical weight probe (no accept-stale)."""
+    assert hcs.request_can_include_weights(["model.safetensors.index*"], None) is False
+    assert hcs.request_can_include_weights(["model.bin.index*"], None) is False
+    assert hcs.request_can_include_weights(["model.safetensors*"], None) is True
+    assert hcs.request_can_include_weights(["pytorch_model.bin*"], None) is True
+
+
+def test_weight_self_probe_artifact_and_sidecar_stems():
+    """R3-3: _weight_self_probe must not synthesize a fake weight for a trailing-wildcard glob whose
+    stem is a trainer artifact (scheduler*, rng_state*, scaler*, optimizer*) or an index / weight
+    sidecar (model.safetensors.index*, model.safetensors*) -- the absorbed-suffix branch would
+    otherwise return scheduler.safetensors / model.safetensors.index.safetensors and make the request
+    require a weight that does not exist (over-reject). A genuine variant weight stem still resolves."""
+    for artifact in ("scheduler*", "rng_state*", "rng_state_*", "scaler*", "optimizer*", "training_args*"):
+        assert hcs._weight_self_probe(artifact) is None, artifact
+    for sidecar in ("model.safetensors.index*", "model.bin.index*", "model.safetensors*",
+                    "pytorch_model.bin*"):
+        assert hcs._weight_self_probe(sidecar) is None, sidecar
+    # A real variant weight stem still resolves to its concrete weight name (the suffix loop tries
+    # .safetensors first, so a stem that admits either suffix resolves to the safetensors form).
+    assert hcs._weight_self_probe("model.fp16*") == "model.fp16.safetensors"
+    assert hcs._weight_self_probe("pytorch_model.fp16*") == "pytorch_model.fp16.safetensors"
+
+
+def test_snapshot_dir_is_complete_diffusion_sharded_component_requires_index(tmp_path):
+    """R1: a diffusers pipeline whose weight-bearing component (transformer/, unet/) holds a complete
+    NUMBERED-shard set but no index sidecar is INCOMPLETE -- transformers cannot load a local sharded
+    component without its index, so reporting complete would warm a cache the in-process load then
+    re-fetches (the silent Xet hang). Adding the component index makes it complete."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"w")
+    (snap / "model_index.json").write_text(
+        json.dumps({"_class_name": "FluxPipeline",
+                    "transformer": ["diffusers", "FluxTransformer2DModel"]})
+    )
+    comp = _make_diffusion_component(snap, blob, "transformer")
+    (comp / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob)
+    (comp / "diffusion_pytorch_model-00002-of-00002.safetensors").symlink_to(blob)
+    # Complete shard set, NO index -> incomplete.
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    (comp / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                                   "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}})
+    )
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_failed_spawn_closes_result_queue(monkeypatch):
+    """R2-2: if proc.start() raises (e.g. OSError "can't start new process" under fd / thread
+    exhaustion), the result_queue's OS pipe fds -- allocated before the spawn -- must be closed
+    rather than leaked. The lifecycle try/finally that closes them is only entered after a
+    successful start, so a dedicated except around the spawn must close the queue and re-raise."""
+    closed = {"cancel_join": False, "close": False}
+
+    class _FakeQueue:
+        def cancel_join_thread(self):
+            closed["cancel_join"] = True
+
+        def close(self):
+            closed["close"] = True
+
+    class _FakeProc:
+        def __init__(self, *a, **k):
+            self.pid = None
+
+        def start(self):
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    class _FakeCtx:
+        def Queue(self):
+            return _FakeQueue()
+
+        def Process(self, *a, **k):
+            return _FakeProc()
+
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx())
+    with pytest.raises(OSError):
+        xf._run_download_attempt(
+            "owner/repo",
+            kind = "snapshot",
+            params = {},
+            token = None,
+            repo_type = "model",
+            disable_xet = False,
+            cancel_event = None,
+            stall_timeout = 1.0,
+            interval = 0.1,
+            grace_period = 0.1,
+            on_status = None,
+        )
+    assert closed["close"] is True
+    assert closed["cancel_join"] is True
+
+
+def test_disable_xet_read_under_spawn_lock(monkeypatch):
+    """R2-1: _download_with_xet_fallback must read xet_force_disabled() while holding
+    _SPAWN_ENV_LOCK. A concurrent download briefly sets the child-only HF_HUB_DISABLE_XET=1 in the
+    parent os.environ around its spawn (under the same lock); reading the live env outside the lock
+    could observe that value and wrongly force THIS download onto HTTP from the first attempt."""
+    seen = {}
+    real = xf.xet_force_disabled
+
+    def _spy():
+        # A plain (non-reentrant) Lock cannot be re-acquired by its owner, so a non-blocking acquire
+        # FAILS iff the read is happening inside `with _SPAWN_ENV_LOCK:`. If the read were outside the
+        # lock, the acquire would succeed.
+        got = xf._SPAWN_ENV_LOCK.acquire(blocking = False)
+        if got:
+            xf._SPAWN_ENV_LOCK.release()
+        seen["held"] = not got
+        return real()
+
+    monkeypatch.setattr(xf, "xet_force_disabled", _spy)
+    monkeypatch.setattr(xf, "_run_download_attempt", lambda *a, **k: ("ok", "/tmp/warm"))
+    out = xf._download_with_xet_fallback(
+        repo_id = "owner/repo",
+        label = "test",
+        kind = "snapshot",
+        params = {},
+        token = None,
+        repo_type = "model",
+        cancel_event = None,
+        stall_timeout = 1.0,
+        interval = 0.1,
+        grace_period = 0.1,
+        on_status = None,
+        prepare_for_http_fn = None,
+    )
+    assert out == "/tmp/warm"
+    assert seen.get("held") is True

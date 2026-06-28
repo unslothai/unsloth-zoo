@@ -231,6 +231,11 @@ _NON_WEIGHT_BASENAMES = frozenset({
 })
 # Distributed trainer runs shard the RNG state as rng_state_0.pth, rng_state_1.pth, ...
 _NON_WEIGHT_BASENAME_PREFIXES = ("rng_state_",)
+# The stems (basename without the suffix) of the trainer-artifact names above -- optimizer,
+# scheduler, scaler, rng_state, training_args. A trailing-wildcard glob over one of these
+# (``scheduler*``, ``rng_state*``) selects only a trainer artifact, so the synthetic-weight-suffix
+# probe must NOT classify it as weight-including.
+_NON_WEIGHT_STEMS = frozenset(name.rsplit(".", 1)[0] for name in _NON_WEIGHT_BASENAMES)
 
 
 def _is_loadable_weight_file(name: str) -> bool:
@@ -329,6 +334,15 @@ def _numbered_shard_set_present(
     return True
 
 
+def _is_weight_shard_index(name: str) -> bool:
+    """True if *name* is a weight-shard index sidecar: the canonical
+    ``model.safetensors.index.json`` / ``pytorch_model.bin.index.json`` AND the variant form
+    ``model.safetensors.index.fp16.json`` (transformers' ``_add_variant`` inserts the variant token
+    before the trailing ``.json``). A plain ``*.safetensors.index.json`` suffix test misses the
+    variant form, leaving its listed shards unvalidated."""
+    return name.endswith(".json") and (".safetensors.index." in name or ".bin.index." in name)
+
+
 def _weight_shard_index_complete(index_path: Path) -> bool:
     """True if every shard a HF weight index (``model.safetensors.index.json`` /
     ``pytorch_model.bin.index.json``) lists is present next to the index. An unreadable
@@ -367,13 +381,12 @@ def _has_root_shard_index(snapshot_dir: Path, entries: list) -> bool:
     be wrongly judged index-less. A subfolder index does not count -- a bare root load never reads
     it. *entries* is the already-collected ``rglob`` listing, reused to avoid a second walk."""
     for entry in entries:
-        name = entry.name
-        if ".index." not in name or not name.endswith(".json"):
+        if not _is_weight_shard_index(entry.name):
             continue
         try:
             rel = entry.relative_to(snapshot_dir).as_posix()
         except ValueError:
-            rel = name
+            rel = entry.name
         if "/" in rel:
             continue  # a subfolder index the bare root load never reads
         if _safe_is_file(entry):
@@ -452,8 +465,26 @@ def _diffusion_pipeline_complete(snapshot_dir: Path, weight_dirs: set) -> bool:
         component_dir = snapshot_dir / key
         if not _safe_is_dir(component_dir) or not _dir_has_any_file(component_dir):
             return False  # a declared component's subfolder is missing / empty -- interrupted warm
-        if key in _WEIGHT_BEARING_PIPELINE_DIRS and key not in weight_dirs:
-            return False  # the component dir exists but carries no weight -- partial component
+        if key in _WEIGHT_BEARING_PIPELINE_DIRS:
+            if key not in weight_dirs:
+                return False  # the component dir exists but carries no weight -- partial component
+            # A SHARDED component is loadable locally only via its in-component index sidecar
+            # (diffusers, like transformers, never globs shard files), so a component holding
+            # numbered shards but no diffusion_pytorch_model.safetensors.index.json is incomplete --
+            # an interrupted warm that dropped the tiny index blob would make the pipeline load fetch
+            # it in-process over unprotected Xet. Mirrors the root transformers index requirement.
+            try:
+                comp_entries = list(component_dir.rglob("*"))
+            except OSError:
+                comp_entries = []
+            has_numbered_shard = any(
+                _NUMBERED_SHARD_RE.match(e.name) is not None
+                and _is_loadable_weight_file(e.name)
+                and _safe_is_file(e)
+                for e in comp_entries
+            )
+            if has_numbered_shard and not _has_root_shard_index(component_dir, comp_entries):
+                return False
     return True
 
 
@@ -668,7 +699,7 @@ def snapshot_dir_is_complete(
     weight_entries: list = []  # (entry, repo-relative path)
     for entry in entries:
         name = entry.name
-        if name.endswith((".safetensors.index.json", ".bin.index.json")):
+        if _is_weight_shard_index(name):
             if _safe_is_file(entry):
                 index_entries.append(entry)
         elif _is_loadable_weight_file(name) and _safe_is_file(entry):
@@ -1070,14 +1101,32 @@ def _weight_self_probe(pattern: str) -> "Optional[str]":
         if not _is_loadable_weight_file(basename):
             return None
         return concrete
-    # Trailing-wildcard glob: try each weight suffix in place of the absorbing wildcard.
-    if "/" not in pattern and pattern.endswith(("*", "?")) and not _basename_is_non_weight(pattern):
-        stem = _concretize_glob(pattern.rstrip("*?"))
-        if stem:
-            for suffix in _WEIGHT_FILE_SUFFIXES:
-                candidate = stem + suffix
-                if fnmatch.fnmatchcase(candidate, pattern) and _is_loadable_weight_file(candidate):
-                    return candidate
+    # Trailing-wildcard glob whose wildcard ABSORBS the weight suffix (``model.fp16*`` ->
+    # ``model.fp16.safetensors``, ``unet/diffusion_pytorch_model.fp16*`` -> the same re-rooted under
+    # ``unet/``): try each weight suffix in place of the trailing wildcard. Applies to a path-qualified
+    # basename too, so a subfolder variant-component glob is not misread as weightless.
+    if pattern.endswith(("*", "?")):
+        prefix, _, base = pattern.rpartition("/")
+        if not _basename_is_non_weight(base):
+            stem = _concretize_glob(base.rstrip("*?"))
+            stem_lower = stem.lower()
+            # A stem that is itself a trainer artifact (scheduler*, rng_state*, optimizer*) selects no
+            # weight; a stem already ending in ``.index`` or a weight suffix is an index sidecar /
+            # canonical-probe case the synthetic suffix would only corrupt (model.safetensors.index*,
+            # model.safetensors*). Skip both so the request is not over-classified weight-including.
+            is_artifact_stem = (
+                stem_lower in _NON_WEIGHT_STEMS
+                or stem_lower.startswith(_NON_WEIGHT_BASENAME_PREFIXES)
+            )
+            is_sidecar_stem = stem_lower.endswith(".index") or stem_lower.endswith(_WEIGHT_FILE_SUFFIXES)
+            if stem and not is_artifact_stem and not is_sidecar_stem:
+                for suffix in _WEIGHT_FILE_SUFFIXES:
+                    candidate_base = stem + suffix
+                    if fnmatch.fnmatchcase(candidate_base, base) and _is_loadable_weight_file(candidate_base):
+                        if not prefix:
+                            return candidate_base
+                        concrete_prefix = _concretize_glob(prefix) if _has_glob(prefix) else prefix
+                        return f"{concrete_prefix}/{candidate_base}"
     return None
 
 
