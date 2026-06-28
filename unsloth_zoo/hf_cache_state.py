@@ -358,6 +358,82 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     return True
 
 
+# Diffusers pipeline subfolders that carry loadable WEIGHTS (every other declared component --
+# scheduler, tokenizer, feature_extractor, processor -- is config-only). A weight-bearing
+# component whose subfolder exists but holds no weight is a partially fetched component, so the
+# in-process pipeline load would still fetch the weight in-process over Xet.
+_WEIGHT_BEARING_PIPELINE_DIRS = frozenset({
+    "unet",
+    "transformer",
+    "vae",
+    "vqvae",
+    "movq",
+    "prior",
+    "decoder",
+    "text_encoder",
+    "text_encoder_2",
+    "text_encoder_3",
+    "image_encoder",
+    "safety_checker",
+    "controlnet",
+})
+
+
+def _dir_has_any_file(path: Path) -> bool:
+    """True if *path* contains at least one regular file (recursively). A dangling symlink left by
+    an interrupted blob fetch is NOT a regular file (``is_file()`` follows the link and returns
+    False), so a component subfolder that only ever received pointer symlinks reads as having no
+    files -- i.e. as an unfinished component."""
+    try:
+        for entry in path.rglob("*"):
+            if _safe_is_file(entry):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _diffusion_pipeline_complete(snapshot_dir: Path, weight_dirs: set) -> bool:
+    """True unless a diffusers pipeline snapshot is missing a declared sub-model. A diffusers
+    pipeline lists its components in a root ``model_index.json`` where each non-``_`` key maps to a
+    ``[library, class]`` pair; a warm killed mid-pipeline can leave one component fully cached and
+    another entirely absent, and the in-process pipeline load would then fetch the missing
+    component over unprotected Xet (the silent-hang risk). Require every declared (non-null)
+    component's subfolder to exist with files, and every weight-bearing component
+    (unet / transformer / vae / text_encoder / ...) to carry a weight in *weight_dirs*.
+
+    Returns True (do not block) when there is no readable ``model_index.json`` -- a plain
+    transformers / GGUF snapshot, or a non-diffusion repo -- so only an actual pipeline warm is
+    affected. Intended for a FULL pipeline warm (no allow_patterns); a scoped subfolder request is
+    already validated by its own selection."""
+    import json
+
+    index_path = snapshot_dir / "model_index.json"
+    if not _safe_is_file(index_path):
+        return True  # not a diffusers pipeline (or an older layout) -- nothing pipeline-specific
+    try:
+        with open(index_path, "r", encoding = "utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return True  # unreadable index: defer to the generic checks rather than over-reject
+    if not isinstance(data, dict):
+        return True
+    for key, value in data.items():
+        if isinstance(key, str) and key.startswith("_"):
+            continue  # _class_name / _diffusers_version metadata, not a component
+        if not (isinstance(value, (list, tuple)) and len(value) == 2):
+            continue  # not a [library, class] component spec
+        library, class_name = value
+        if library is None or class_name is None:
+            continue  # an explicitly absent component (e.g. a disabled safety_checker)
+        component_dir = snapshot_dir / key
+        if not _safe_is_dir(component_dir) or not _dir_has_any_file(component_dir):
+            return False  # a declared component's subfolder is missing / empty -- interrupted warm
+        if key in _WEIGHT_BEARING_PIPELINE_DIRS and key not in weight_dirs:
+            return False  # the component dir exists but carries no weight -- partial component
+    return True
+
+
 def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
     """Repo-relative posix paths of every dangling symlink in *snapshot_dir* -- a referenced file
     whose blob is missing or still an ``.incomplete`` partial (an interrupted download). Empty when
@@ -565,6 +641,16 @@ def snapshot_dir_is_complete(
                 continue
             if not _weight_shard_index_complete(index_entry):
                 return False
+
+    # A FULL pipeline warm (no allow_patterns) must carry every sub-model a diffusers
+    # model_index.json declares: a warm killed mid-pipeline can leave one component cached and
+    # another entirely absent, which the in-process pipeline load would then fetch over
+    # unprotected Xet. A scoped (allow_patterns) request targets its own subset, so the
+    # whole-pipeline rule does not apply -- only enforce it for the unpatterned warm.
+    if allow_patterns is None:
+        weight_dirs = {rel.split("/", 1)[0] for _, rel in weight_entries if "/" in rel}
+        if not _diffusion_pipeline_complete(snapshot_dir, weight_dirs):
+            return False
     return True
 
 

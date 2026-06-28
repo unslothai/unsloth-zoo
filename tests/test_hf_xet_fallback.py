@@ -1298,6 +1298,93 @@ def test_snapshot_dir_is_complete_unit(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is True
 
 
+def _make_diffusion_component(snap, blob, name, weight_filename = None):
+    """Create a diffusers pipeline subfolder with a config and (optionally) a weight symlink."""
+    comp = snap / name
+    comp.mkdir()
+    (comp / "config.json").write_text("{}")
+    if weight_filename is not None:
+        (comp / weight_filename).symlink_to(blob)
+    return comp
+
+
+def test_snapshot_dir_is_complete_diffusion_missing_component(tmp_path):
+    """A full pipeline warm killed with one component absent reads as incomplete. model_index.json
+    declares unet / vae / text_encoder; the snapshot warmed unet + vae but never started
+    text_encoder, so the in-process pipeline load would fetch it over unprotected Xet."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"weights")
+    (snap / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "StableDiffusionPipeline",
+                "_diffusers_version": "0.30.0",
+                "unet": ["diffusers", "UNet2DConditionModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+                "text_encoder": ["transformers", "CLIPTextModel"],
+                "scheduler": ["diffusers", "PNDMScheduler"],
+                "safety_checker": [None, None],
+            }
+        )
+    )
+    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
+    _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
+    (snap / "scheduler").mkdir()
+    (snap / "scheduler" / "scheduler_config.json").write_text("{}")
+    # text_encoder subfolder never created -> interrupted pipeline warm
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    # Once the missing component is on disk the pipeline reads complete.
+    _make_diffusion_component(snap, blob, "text_encoder", "model.safetensors")
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_snapshot_dir_is_complete_diffusion_partial_weight_component(tmp_path):
+    """A weight-bearing component whose subfolder holds only a config (no weight) reads as
+    incomplete: the component started but its weight was never fetched."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"weights")
+    (snap / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "StableDiffusionPipeline",
+                "unet": ["diffusers", "UNet2DConditionModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+            }
+        )
+    )
+    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
+    _make_diffusion_component(snap, blob, "vae", weight_filename = None)  # config only, no weight
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    (snap / "vae" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_snapshot_dir_is_complete_diffusion_scoped_request_not_blocked(tmp_path):
+    """A scoped subfolder request (allow_patterns=["unet/*"]) targets its own subset, so the
+    whole-pipeline completeness rule does not apply: a unet-only snapshot reads complete even
+    though the pipeline declares more components."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"weights")
+    (snap / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "StableDiffusionPipeline",
+                "unet": ["diffusers", "UNet2DConditionModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+                "text_encoder": ["transformers", "CLIPTextModel"],
+            }
+        )
+    )
+    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["unet/*"]) is True
+
+
 def test_snapshot_dir_is_complete_broken_symlink(tmp_path):
     """A dangling weight symlink reads as incomplete."""
     snap = tmp_path / "snap"
