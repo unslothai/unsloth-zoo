@@ -290,15 +290,18 @@ def train_on_responses_only(
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    # Keep the original object (may be a VLM processor) so auto-detect can read a
+    # chat template that lives only on the processor; the matcher uses the inner one.
+    processor = tokenizer
     # Get non vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
-        
+
         if instruction_part is None and response_part is None:
             # Neither given: auto-detect both from the chat template
-            instruction_part, response_part = get_chat_template_parts(tokenizer)
+            instruction_part, response_part = get_chat_template_parts(processor)
             print(f"Unsloth: Auto-detected instruction_part = {repr(instruction_part)} and response_part = {repr(response_part)}")
         elif instruction_part is None or response_part is None:
             raise ValueError("Unsloth: Give both instruction_part and response_part, or neither to auto-detect!")
