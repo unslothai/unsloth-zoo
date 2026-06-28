@@ -249,6 +249,13 @@ def get_chat_template_parts(tokenizer):
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
 
+    # Reasoning templates inject an empty think block into the generation prompt
+    # (e.g. "<|im_start|>assistant\n<think></think>"). That empty tag is absent from a
+    # real assistant turn that contains reasoning, so a response marker carrying it
+    # would miss the trained turn. Drop a trailing empty paired tag so the marker is
+    # just the assistant header and matches every turn (Nemotron Nano reasoning, etc.).
+    response_part = re.sub(r"<([^\s/>]+)>\s*</\1>\s*$", "", response_part)
+
     # Only strip whitespace from header markers: do NOT strip bos here, since for some
     # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
     # stripping it would leave an unanchored marker that matches inside user content.
