@@ -92,6 +92,63 @@ def test_mlx_training_config_exposes_completion_only_loss():
     ) is True
 
 
+def test_mlx_trainer_distributed_defaults_world_size_one():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer(
+        model=DummyModel(),
+        tokenizer=None,
+        train_dataset=[],
+        args=MLXTrainingConfig(),
+    )
+
+    assert trainer._distributed_initialized is False
+    assert trainer.distributed_rank == 0
+    assert trainer.distributed_world_size == 1
+    assert trainer.is_main_process is True
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 1,
+        "distributed_rank": 0,
+        "distributed_is_main_process": True,
+    }
+
+
+def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self):
+            return 1
+
+        def size(self):
+            return 2
+
+    calls = []
+
+    def fake_init():
+        calls.append("init")
+        return FakeWorld()
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert calls == ["init"]
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    assert trainer.is_main_process is False
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 2,
+        "distributed_rank": 1,
+        "distributed_is_main_process": False,
+    }
+
+
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
 def test_mlx_training_config_each_optim(optim_name):
     """Every supported optim string constructs cleanly in config."""

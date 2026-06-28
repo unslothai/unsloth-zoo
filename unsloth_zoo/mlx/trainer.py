@@ -902,10 +902,75 @@ class MLXTrainer:
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
+        self._distributed_world = None
+        self._distributed_initialized = False
+        self._distributed_rank = 0
+        self._distributed_world_size = 1
+        self._distributed_is_main_process = True
 
     def _train_dataset_for_batches(self):
         """Return the internal dataset used for MLX batch construction."""
         return getattr(self, "_mlx_train_dataset_for_batches", self.train_dataset)
+
+    def _ensure_distributed(self):
+        """Initialize and cache MLX distributed metadata.
+
+        MLX distributed collectives are no-ops at world size 1. The torch-backed
+        MLX test shim returns ``None`` from ``mx.distributed.init()``, so keep a
+        rank-0/world-size-1 fallback for non-real distributed runtimes.
+        """
+        if getattr(self, "_distributed_initialized", False):
+            return getattr(self, "_distributed_world", None)
+
+        world = None
+        rank = 0
+        world_size = 1
+        distributed = getattr(mx, "distributed", None)
+        init = getattr(distributed, "init", None) if distributed is not None else None
+        if callable(init):
+            world = init()
+            if world is not None:
+                rank = int(world.rank())
+                world_size = int(world.size())
+
+        self._distributed_world = world
+        self._distributed_rank = rank
+        self._distributed_world_size = world_size
+        self._distributed_is_main_process = rank == 0
+        self._distributed_initialized = True
+        return world
+
+    @property
+    def distributed_world(self):
+        """Return the cached MLX distributed group, initializing it if needed."""
+        return self._ensure_distributed()
+
+    @property
+    def distributed_rank(self):
+        """Return this process rank in the MLX distributed group."""
+        self._ensure_distributed()
+        return self._distributed_rank
+
+    @property
+    def distributed_world_size(self):
+        """Return the number of processes in the MLX distributed group."""
+        self._ensure_distributed()
+        return self._distributed_world_size
+
+    @property
+    def is_main_process(self):
+        """Return whether this process should own user-visible side effects."""
+        self._ensure_distributed()
+        return self._distributed_is_main_process
+
+    def _distributed_result_fields(self):
+        """Fields included in training results for DDP inspection."""
+        self._ensure_distributed()
+        return {
+            "distributed_world_size": self._distributed_world_size,
+            "distributed_rank": self._distributed_rank,
+            "distributed_is_main_process": self._distributed_is_main_process,
+        }
 
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
@@ -1555,6 +1620,7 @@ class MLXTrainer:
         with gradient accumulation. Returns a dict of training metrics."""
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
+        self._ensure_distributed()
         self._setup_report_to_callbacks()
         self._install_neftune()
         args = self.args
@@ -2533,6 +2599,7 @@ class MLXTrainer:
             "base_quantized_source": getattr(
                 self.model, "_unsloth_quantized_source", None,
             ),
+            **self._distributed_result_fields(),
         })
 
     def _resolve_vlm_processor(self):
