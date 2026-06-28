@@ -3415,11 +3415,11 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
 
 def _coerce_list_extra_special_tokens():
     # mlx-lm loads tokenizers via transformers AutoTokenizer without unsloth's
-    # TEMPORARY_PATCHES, so configs storing extra_special_tokens as a list (v5
-    # TokenizersBackend exports, some Mistral configs) crash transformers that
-    # expect a dict ("'list' object has no attribute 'keys'"). Coerce to {}.
-    # Shares the guard attr with patch_tokenizer_extra_special_tokens so neither
-    # double-wraps the other.
+    # TEMPORARY_PATCHES. Older transformers run list(extra_special_tokens.keys())
+    # and crash on a list ("'list' object has no attribute 'keys'"); v5 supports
+    # lists natively, so only coerce to {} on the path that would otherwise crash
+    # (coercing on v5 drops those special tokens). Shares the guard attr with
+    # patch_tokenizer_extra_special_tokens so neither double-wraps the other.
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     except Exception:
@@ -3428,10 +3428,16 @@ def _coerce_list_extra_special_tokens():
     if getattr(init, "_unsloth_extra_special_tokens_patched", False):
         return
 
-    def patched_init(self, **kwargs):
-        if isinstance(kwargs.get("extra_special_tokens", {}), list):
+    def patched_init(*args, **kwargs):
+        if not isinstance(kwargs.get("extra_special_tokens"), list):
+            return init(*args, **kwargs)
+        try:
+            return init(*args, **kwargs)
+        except AttributeError as e:
+            if "keys" not in str(e):
+                raise
             kwargs["extra_special_tokens"] = {}
-        return init(self, **kwargs)
+            return init(*args, **kwargs)
 
     patched_init._unsloth_extra_special_tokens_patched = True
     PreTrainedTokenizerBase.__init__ = patched_init

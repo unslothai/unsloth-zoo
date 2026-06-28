@@ -82,8 +82,10 @@ TEMPORARY_PATCHES.append(patch_tokenizer_convert_added_tokens)
 
 
 def patch_tokenizer_extra_special_tokens():
-    # Some Mistral tokenizer configs store extra_special_tokens as a list, but
-    # transformers expects a dict.
+    # Some tokenizer configs store extra_special_tokens as a list. Older
+    # transformers run list(...).keys() and crash; v5 supports lists natively, so
+    # only coerce to {} on the path that would otherwise crash (coercing on v5
+    # drops those special tokens).
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     except Exception as e:
@@ -93,12 +95,16 @@ def patch_tokenizer_extra_special_tokens():
     if hasattr(original_init, "_unsloth_extra_special_tokens_patched"):
         return
 
-    def patched_init(self, **kwargs):
-        extra_special_tokens = kwargs.get("extra_special_tokens", {})
-        if isinstance(extra_special_tokens, list):
-            # Coerce list to empty dict; the tokens remain in added_tokens_decoder.
+    def patched_init(*args, **kwargs):
+        if not isinstance(kwargs.get("extra_special_tokens"), list):
+            return original_init(*args, **kwargs)
+        try:
+            return original_init(*args, **kwargs)
+        except AttributeError as e:
+            if "keys" not in str(e):
+                raise
             kwargs["extra_special_tokens"] = {}
-        return original_init(self, **kwargs)
+            return original_init(*args, **kwargs)
 
     patched_init._unsloth_extra_special_tokens_patched = True
     PreTrainedTokenizerBase.__init__ = patched_init
