@@ -455,17 +455,37 @@ def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
     return out
 
 
+# Catch-all allow patterns that select the WHOLE repo, exactly like an unpatterned warm. HF's
+# fnmatch ``*`` spans ``/``, so a bare ``*`` (or ``**``) matches every path including checkpoint
+# subdirs -- but a root ``from_pretrained`` still reads ROOT weights, so such a request must be
+# treated like an unpatterned root warm (drop checkpoint-dir paths), not trusted as a deliberate
+# checkpoint selection.
+_CATCHALL_ALLOW_PATTERNS = frozenset({"*", "**"})
+
+
+def _is_pure_catchall(allow_patterns: "Optional[list]") -> bool:
+    """True when *allow_patterns* is a non-empty list whose every entry is a bare catch-all
+    (``*`` / ``**``). Such a list selects the whole repo just like an unpatterned warm, so a root
+    load still reads ROOT weights and a checkpoint-dir-only cache must not satisfy it. A list with
+    any path-bearing or name-specific pattern (``checkpoint-10/*``, ``model.safetensors``) is
+    trusted as-is -- a caller that names a checkpoint path opts back into it."""
+    if not allow_patterns:
+        return False
+    return all(isinstance(p, str) and p.strip() in _CATCHALL_ALLOW_PATTERNS for p in allow_patterns)
+
+
 def _requested_scope_filter(
     rels: list, allow_patterns: "Optional[list]", ignore_patterns: "Optional[list]"
 ) -> list:
     """The subset of repo-relative *rels* a request selects. Applies the allow / ignore filter, and
     when there is no ``allow_patterns`` (an UNPATTERNED or IGNORE-ONLY request -- a bare
-    ``from_pretrained`` that reads ROOT weights) also drops per-checkpoint-dir paths the root load
-    never reads, so a checkpoint-dir file neither satisfies the warm nor (as a dangling symlink)
-    blocks it. An explicit ``allow_patterns`` is trusted as-is: a caller that names a checkpoint
-    path opts back into it."""
+    ``from_pretrained`` that reads ROOT weights) OR the allow list is a pure catch-all
+    (``["*"]``, which selects the whole repo just like an unpatterned warm) also drops
+    per-checkpoint-dir paths the root load never reads, so a checkpoint-dir file neither satisfies
+    the warm nor (as a dangling symlink) blocks it. A path-bearing ``allow_patterns`` is trusted
+    as-is: a caller that names a checkpoint path opts back into it."""
     kept = _filter_paths(list(rels), allow_patterns, ignore_patterns)
-    if allow_patterns is None:
+    if allow_patterns is None or _is_pure_catchall(allow_patterns):
         kept = [r for r in kept if not _path_under_checkpoint_dir(r)]
     return kept
 
@@ -642,12 +662,12 @@ def snapshot_dir_is_complete(
             if not _weight_shard_index_complete(index_entry):
                 return False
 
-    # A FULL pipeline warm (no allow_patterns) must carry every sub-model a diffusers
-    # model_index.json declares: a warm killed mid-pipeline can leave one component cached and
-    # another entirely absent, which the in-process pipeline load would then fetch over
-    # unprotected Xet. A scoped (allow_patterns) request targets its own subset, so the
-    # whole-pipeline rule does not apply -- only enforce it for the unpatterned warm.
-    if allow_patterns is None:
+    # A FULL pipeline warm (no allow_patterns, or a pure catch-all ``["*"]`` that selects the
+    # whole repo the same way) must carry every sub-model a diffusers model_index.json declares:
+    # a warm killed mid-pipeline can leave one component cached and another entirely absent, which
+    # the in-process pipeline load would then fetch over unprotected Xet. A scoped (path-bearing)
+    # request targets its own subset, so the whole-pipeline rule does not apply there.
+    if allow_patterns is None or _is_pure_catchall(allow_patterns):
         weight_dirs = {rel.split("/", 1)[0] for _, rel in weight_entries if "/" in rel}
         if not _diffusion_pipeline_complete(snapshot_dir, weight_dirs):
             return False
@@ -837,14 +857,15 @@ _NON_WEIGHT_PROBE_NAMES = (
 # weightless. Kept deliberately narrow: an unknown subfolder (unet/, transformer/, original/, a
 # new arch's component dir) must stay weight-including, so a weight-bearing dir is never misread
 # as weightless (that would re-open the silent-Xet-hang accept-stale this module exists to
-# prevent). The Diffusers pipeline components listed here (scheduler/, feature_extractor/, the
-# extra tokenizers) ship only *_config.json / vocab files; the weight-bearing pipeline dirs
-# (unet/, transformer/, vae/, text_encoder*/, image_encoder/, safety_checker/) are deliberately
-# absent so a catch-all under them stays weight-including.
+# prevent). The Diffusers / multimodal preprocessing components listed here (scheduler/,
+# feature_extractor/, processor/, image_processor/, the extra tokenizers) ship only
+# *_config.json / vocab files; the weight-bearing pipeline dirs (unet/, transformer/, vae/,
+# text_encoder*/, image_encoder/, safety_checker/) are deliberately absent so a catch-all under
+# them stays weight-including.
 _NON_WEIGHT_DIR_NAMES = frozenset({
     "tokenizer", "tokenizer_2", "tokenizer_3", "runs", "run", "logs", "log", "samples", "sample",
     "tensorboard", "tb", "events", "eval", "evals", "evaluation", "metrics", "wandb", "assets",
-    "images", "media", "scheduler", "feature_extractor",
+    "images", "media", "scheduler", "feature_extractor", "processor", "image_processor",
 })
 
 

@@ -1527,6 +1527,41 @@ def test_snapshot_dir_is_complete_checkpoint_only_not_warm_root(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap2) is False
 
 
+def test_snapshot_dir_is_complete_catchall_not_warm_root(tmp_path):
+    """A pure catch-all allow list (["*"]) selects the whole repo just like an unpatterned warm, so
+    a root from_pretrained still reads ROOT weights. A checkpoint-only cache (left by a prior
+    allow_patterns=["checkpoint-10/*"] pull) must NOT read as complete for ["*"] -- HF's fnmatch
+    "*" spans "/" and would otherwise count the checkpoint weight as satisfying the catch-all
+    (Codex #829). A path-bearing pattern that names the checkpoint is still trusted."""
+    snap = tmp_path / "snap"
+    (snap / "checkpoint-10").mkdir(parents = True)
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)   # checkpoint weight only
+    (snap / "config.json").write_text("{}")
+    # Catch-all is treated like an unpatterned root warm: the checkpoint weight does not count.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*"]) is False
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["**"]) is False
+    # A path-bearing checkpoint pattern IS satisfied by it (deliberate checkpoint selection).
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
+    # Once a root weight is present, the catch-all completes.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*"]) is True
+
+
+def test_request_can_include_weights_processor_subfolder():
+    """A processor / image_processor subfolder ships only *_config.json + vocab files (no weights),
+    so a catch-all warm under it (processor/*) reads as WEIGHTLESS. Without this, the synthetic
+    processor/model.safetensors weight probe makes the request look weight-bearing and a
+    processor-only snapshot is wrongly rejected for lacking a weight (Codex #829). A weight under
+    the same subfolder is still recognized as weight-including."""
+    assert hcs.request_can_include_weights(["processor/*"], None) is False
+    assert hcs.request_can_include_weights(["image_processor/*"], None) is False
+    assert hcs.request_can_include_weights(["processor/"], None) is False
+    # A weight name under the subfolder still reads as weight-including (no accept-stale).
+    assert hcs.request_can_include_weights(["processor/model.safetensors"], None) is True
+
+
 def test_snapshot_dir_is_complete_checkpoint_index_does_not_gate_root(tmp_path):
     """A per-checkpoint shard index with missing shards must not fail an unpatterned root warm:
     the root weights are what the load reads, so an incomplete checkpoint index is irrelevant to
