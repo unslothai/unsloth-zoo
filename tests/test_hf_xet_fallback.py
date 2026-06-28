@@ -1549,6 +1549,76 @@ def test_snapshot_dir_is_complete_catchall_not_warm_root(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*"]) is True
 
 
+def test_snapshot_dir_is_complete_root_file_glob_not_checkpoint(tmp_path):
+    """A no-slash root weight glob (["*.safetensors"]) reads from the repo ROOT, but HF's fnmatch
+    "*" spans "/" and also matches checkpoint-10/model.safetensors. A checkpoint-only cache must
+    NOT read as complete for the root safetensors warm (Codex #829) -- the root model.safetensors
+    from_pretrained reads is still missing. A path-bearing pattern naming the checkpoint is
+    trusted."""
+    snap = tmp_path / "snap"
+    (snap / "checkpoint-10").mkdir(parents = True)
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)
+    (snap / "config.json").write_text("{}")
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
+    # A path-bearing checkpoint pattern IS satisfied by the checkpoint weight.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
+    # A root weight completes the root glob.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
+
+
+def test_snapshot_dir_is_complete_root_warm_ignores_subfolder_weight(tmp_path):
+    """A root warm (allow_patterns=None, or a no-slash glob) is not satisfied by a weight that
+    lives only in a NON-checkpoint subfolder such as a precision variant (BF16/, fp16/). A prior
+    allow_patterns=["BF16/*"] pull leaves BF16/model.safetensors but no root weight; a root
+    from_pretrained never reads that subfolder, so the snapshot must read as incomplete (Codex
+    #829). A root weight, or an explicit BF16/ request, still completes."""
+    snap = tmp_path / "snap"
+    (snap / "BF16").mkdir(parents = True)
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "BF16" / "model.safetensors").symlink_to(blob)
+    (snap / "config.json").write_text("{}")
+    # Unpatterned and no-slash-glob root warms both ignore the subfolder weight.
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
+    # An explicit subfolder request IS satisfied by it (deliberate subfolder selection).
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["BF16/*"]) is True
+    # A root weight completes the root warm (the subfolder variant is ignored).
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_snapshot_dir_is_complete_diffusion_file_glob_validates_components(tmp_path):
+    """A full diffusers warm expressed as file globs (["*.safetensors", "*.json"]) still selects
+    nested component files, so the model_index.json component check must run: a stale snapshot with
+    only unet/ but a declared vae / text_encoder reads as incomplete (Codex #829), not accepted as
+    a scoped subset."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"weights")
+    (snap / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "StableDiffusionPipeline",
+                "unet": ["diffusers", "UNet2DConditionModel"],
+                "vae": ["diffusers", "AutoencoderKL"],
+                "text_encoder": ["transformers", "CLIPTextModel"],
+            }
+        )
+    )
+    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
+    globs = ["*.safetensors", "*.json"]
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is False
+    # Once the other declared components land, the file-glob warm completes.
+    _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
+    _make_diffusion_component(snap, blob, "text_encoder", "model.safetensors")
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is True
+
+
 def test_request_can_include_weights_processor_subfolder():
     """A processor / image_processor subfolder ships only *_config.json + vocab files (no weights),
     so a catch-all warm under it (processor/*) reads as WEIGHTLESS. Without this, the synthetic

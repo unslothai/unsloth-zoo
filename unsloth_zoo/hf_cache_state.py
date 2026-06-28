@@ -474,18 +474,46 @@ def _is_pure_catchall(allow_patterns: "Optional[list]") -> bool:
     return all(isinstance(p, str) and p.strip() in _CATCHALL_ALLOW_PATTERNS for p in allow_patterns)
 
 
+def _targets_root_only(allow_patterns: "Optional[list]") -> bool:
+    """True when a request reads from the repo ROOT rather than a specific subfolder: there is no
+    ``allow_patterns`` at all, or every allow pattern is a no-slash name / glob (``*``,
+    ``*.safetensors``, ``model*``, ``config.json``). HF's fnmatch ``*`` spans ``/``, so such a glob
+    also matches nested ``subdir/...`` files, but the LOAD a bare ``from_pretrained`` performs reads
+    only root-level files. A path-bearing pattern (``checkpoint-10/*``, ``BF16/*``, ``unet/*``)
+    deliberately targets a subfolder and is trusted as-is."""
+    if allow_patterns is None:
+        return True
+    if not allow_patterns:
+        return False  # allow_patterns=[] selects nothing -- a scoped (empty) request, not a root warm
+    return all(isinstance(p, str) and "/" not in p for p in allow_patterns)
+
+
 def _requested_scope_filter(
-    rels: list, allow_patterns: "Optional[list]", ignore_patterns: "Optional[list]"
+    rels: list,
+    allow_patterns: "Optional[list]",
+    ignore_patterns: "Optional[list]",
+    *,
+    root_weights_only: bool = False,
 ) -> list:
-    """The subset of repo-relative *rels* a request selects. Applies the allow / ignore filter, and
-    when there is no ``allow_patterns`` (an UNPATTERNED or IGNORE-ONLY request -- a bare
-    ``from_pretrained`` that reads ROOT weights) OR the allow list is a pure catch-all
-    (``["*"]``, which selects the whole repo just like an unpatterned warm) also drops
-    per-checkpoint-dir paths the root load never reads, so a checkpoint-dir file neither satisfies
-    the warm nor (as a dangling symlink) blocks it. A path-bearing ``allow_patterns`` is trusted
-    as-is: a caller that names a checkpoint path opts back into it."""
+    """The subset of repo-relative *rels* a request selects. Applies the allow / ignore filter, then
+    drops paths a root load never reads:
+
+    * *root_weights_only* (a root-level warm of a NON-pipeline model) drops EVERY subfolder path:
+      a bare ``from_pretrained`` reads only repo-ROOT files, so a weight that lives solely in a
+      subfolder (``BF16/model.safetensors``, ``fp16/``, ``checkpoint-500/``, an ``onnx/`` export) is
+      an alternate the load never reads and must neither satisfy the warm nor (as a dangling
+      symlink) block it.
+    * otherwise, when there is no ``allow_patterns`` (an UNPATTERNED or IGNORE-ONLY request) or the
+      allow list is a pure catch-all (``["*"]``), drop only per-checkpoint-dir paths -- this is the
+      diffusers-pipeline / path-trusting case where genuine component subfolders (``unet/``,
+      ``vae/``) must survive.
+
+    A path-bearing ``allow_patterns`` is otherwise trusted as-is: a caller that names a subfolder
+    path opts back into it."""
     kept = _filter_paths(list(rels), allow_patterns, ignore_patterns)
-    if allow_patterns is None or _is_pure_catchall(allow_patterns):
+    if root_weights_only:
+        kept = [r for r in kept if "/" not in r]
+    elif allow_patterns is None or _is_pure_catchall(allow_patterns):
         kept = [r for r in kept if not _path_under_checkpoint_dir(r)]
     return kept
 
@@ -554,14 +582,24 @@ def snapshot_dir_is_complete(
     # warmup branch (consistent with request_can_include_weights).
     has_patterns = allow_patterns is not None or ignore_patterns is not None
 
+    # A root-level warm (no path-bearing allow pattern) of a NON-pipeline model reads only repo-ROOT
+    # files, so a weight under any subfolder (BF16/, fp16/, a checkpoint dir) is an alternate the
+    # load never reads. A diffusers pipeline is the exception -- its component weights legitimately
+    # live in subfolders (unet/, vae/, text_encoder/), validated by _diffusion_pipeline_complete --
+    # so it keeps the (narrower) checkpoint-dir scoping instead.
+    is_pipeline = _safe_is_file(snapshot_dir / "model_index.json")
+    root_weights_only = _targets_root_only(allow_patterns) and not is_pipeline
+
     # A dangling symlink marks an interrupted download, but only one for a file the request
     # actually selects should reject the snapshot. A stale dangling root model.safetensors must
     # not fail an allow_patterns=["adapter_model.safetensors"] probe whose adapter weight IS on
-    # disk, so scope the broken-symlink check to the requested files (and, for a root warm with no
-    # allow_patterns, drop checkpoint-dir paths the bare load never reads) -- the same selection
+    # disk, so scope the broken-symlink check to the requested files (and, for a root warm, drop the
+    # subfolder / checkpoint-dir paths the bare load never reads) -- the same selection
     # _requested_scope_filter applies to the weights below.
     broken = _broken_symlink_rel_paths(snapshot_dir)
-    if broken and _requested_scope_filter(broken, allow_patterns, ignore_patterns):
+    if broken and _requested_scope_filter(
+        broken, allow_patterns, ignore_patterns, root_weights_only = root_weights_only
+    ):
         return False
 
     index_entries: list = []
@@ -580,12 +618,15 @@ def snapshot_dir_is_complete(
 
     # The weights the request selects that are present on disk (any present root weight when the
     # request is unpatterned). The snapshot can carry an unrelated weight while the requested one
-    # is missing, so a patterned request must find one it actually selects. _requested_scope_filter
-    # also excludes per-checkpoint-dir weights (checkpoint-500/model.safetensors, left behind by a
-    # prior allow_patterns=["checkpoint-500/*"] pull) whenever there is no allow_patterns -- an
-    # UNPATTERNED *or* IGNORE-ONLY root warm (e.g. ignore_patterns=["*.onnx"]) is still a bare
-    # from_pretrained reading ROOT weights, so a checkpoint-only snapshot must not read as warm.
-    selected = set(_requested_scope_filter([rel for _, rel in weight_entries], allow_patterns, ignore_patterns))
+    # is missing, so a patterned request must find one it actually selects. For a root-level warm of
+    # a non-pipeline model, _requested_scope_filter drops EVERY subfolder weight (BF16/, fp16/,
+    # checkpoint-500/, an onnx/ export, left behind by a prior patterned pull): an UNPATTERNED,
+    # IGNORE-ONLY, or no-slash-glob (["*.safetensors"]) root warm is still a bare from_pretrained
+    # reading ROOT weights, so a subfolder-only snapshot must not read as warm.
+    selected = set(_requested_scope_filter(
+        [rel for _, rel in weight_entries], allow_patterns, ignore_patterns,
+        root_weights_only = root_weights_only,
+    ))
     if not selected:
         return False
 
@@ -662,12 +703,13 @@ def snapshot_dir_is_complete(
             if not _weight_shard_index_complete(index_entry):
                 return False
 
-    # A FULL pipeline warm (no allow_patterns, or a pure catch-all ``["*"]`` that selects the
-    # whole repo the same way) must carry every sub-model a diffusers model_index.json declares:
-    # a warm killed mid-pipeline can leave one component cached and another entirely absent, which
-    # the in-process pipeline load would then fetch over unprotected Xet. A scoped (path-bearing)
-    # request targets its own subset, so the whole-pipeline rule does not apply there.
-    if allow_patterns is None or _is_pure_catchall(allow_patterns):
+    # A FULL pipeline warm -- no allow_patterns, a pure catch-all ``["*"]``, or a no-slash file glob
+    # (``["*.safetensors", "*.json"]``) that HF's matcher spreads across every nested component --
+    # must carry every sub-model a diffusers model_index.json declares: a warm killed mid-pipeline
+    # can leave one component cached and another entirely absent, which the in-process pipeline load
+    # would then fetch over unprotected Xet. A scoped (path-bearing) request targets its own subset,
+    # so the whole-pipeline rule does not apply there.
+    if _targets_root_only(allow_patterns):
         weight_dirs = {rel.split("/", 1)[0] for _, rel in weight_entries if "/" in rel}
         if not _diffusion_pipeline_complete(snapshot_dir, weight_dirs):
             return False
