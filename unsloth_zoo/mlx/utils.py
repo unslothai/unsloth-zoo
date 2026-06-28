@@ -3560,7 +3560,8 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None, append_eos=True):
+                   model_name=None, model_type=None, append_eos=True,
+                   comm_group=None):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -3570,6 +3571,11 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     Tokenization is delegated to mlx_lm's TextDataset (appends EOS, etc.)
     so behaviour matches ``mlx_lm.lora`` exactly.
+
+    In DDP, ``batch_size`` remains the local per-rank micro-batch size. The
+    optional ``comm_group`` is used only to derive a global batch for sharding,
+    then tail global batches are padded so every rank yields the same number
+    of local batches.
 
     Returns:
         List of (batch, lengths) tuples, where batch has shape
@@ -3586,22 +3592,154 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         append_eos=append_eos,
     )
 
-    batch_pairs = []
-    for batch, lengths_info in iterate_batches(
-        ds, batch_size, max_seq_length,
-        loop=(num_batches is not None),
-        seed=seed,
-    ):
-        max_length = int(mx.max(lengths_info[:, 1]).item())
-        batch = batch[:, :max_length]
-        batch_pairs.append((batch, lengths_info, None))
-        if num_batches is not None and len(batch_pairs) >= num_batches:
-            break
+    if _distributed_rank_size(comm_group)[1] > 1:
+        batch_pairs = _create_distributed_text_batches(
+            ds, batch_size, max_seq_length,
+            num_batches=num_batches,
+            seed=seed,
+            comm_group=comm_group,
+        )
+    else:
+        batch_pairs = []
+        for batch, lengths_info in iterate_batches(
+            ds, batch_size, max_seq_length,
+            loop=(num_batches is not None),
+            seed=seed,
+        ):
+            max_length = int(mx.max(lengths_info[:, 1]).item())
+            batch = batch[:, :max_length]
+            batch_pairs.append((batch, lengths_info, None))
+            if num_batches is not None and len(batch_pairs) >= num_batches:
+                break
 
     mx.eval(
         [b for b, lengths, _ in batch_pairs]
         + [lengths for _, lengths, _ in batch_pairs]
     )
+    return batch_pairs
+
+
+def _distributed_rank_size(comm_group=None):
+    """Return ``(rank, world_size)`` for an optional MLX distributed group."""
+    if comm_group is None:
+        return 0, 1
+    rank = int(comm_group.rank())
+    world_size = int(comm_group.size())
+    if world_size < 1:
+        raise ValueError(f"Invalid MLX distributed world_size={world_size}.")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Invalid MLX distributed rank={rank} for world_size={world_size}."
+        )
+    return rank, world_size
+
+
+def _distributed_global_batch_size(local_batch_size, comm_group=None):
+    """Return the global micro-batch size implied by local batch and world."""
+    _, world_size = _distributed_rank_size(comm_group)
+    return int(local_batch_size) * world_size
+
+
+def _rank_slice_distributed_batch(
+    items,
+    local_batch_size,
+    comm_group=None,
+    pad_source=None,
+):
+    """Return this rank's local slice from one global DDP micro-batch.
+
+    Tail global batches are padded by cycling valid items so every rank executes
+    the same number of micro-batches and collectives stay aligned.
+    """
+    rank, world_size = _distributed_rank_size(comm_group)
+    items = list(items)
+    if world_size <= 1:
+        return items
+
+    target_size = int(local_batch_size) * world_size
+    if target_size <= 0:
+        raise ValueError("local_batch_size must be positive for distributed batching.")
+    if len(items) > target_size:
+        items = items[:target_size]
+    if len(items) < target_size:
+        source = list(pad_source) if pad_source is not None else list(items)
+        if not source:
+            return []
+        pad_pos = 0
+        while len(items) < target_size:
+            items.append(source[pad_pos % len(source)])
+            pad_pos += 1
+    return items[rank:target_size:world_size]
+
+
+def _create_distributed_text_batches(
+    dataset,
+    batch_size,
+    max_seq_length,
+    *,
+    num_batches=None,
+    seed=42,
+    comm_group=None,
+):
+    """Distributed variant of mlx-lm's length-sorted text batch iterator."""
+    from mlx_lm.tuner.datasets import CacheDataset
+
+    if isinstance(dataset, CacheDataset):
+        len_fn = lambda idx: dataset.itemlen(idx)
+    else:
+        len_fn = lambda idx: len(dataset[idx][0])
+    idx = sorted(range(len(dataset)), key=len_fn)
+    if not idx:
+        raise ValueError("Dataset must have at least one example.")
+
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+    batch_idx = [
+        idx[i : i + global_batch_size]
+        for i in range(0, len(idx), global_batch_size)
+    ]
+    if seed:
+        np.random.seed(seed)
+
+    batch_pairs = []
+    while True:
+        indices = np.random.permutation(len(batch_idx))
+        for i in indices:
+            local_idx = _rank_slice_distributed_batch(
+                batch_idx[i],
+                batch_size,
+                comm_group=comm_group,
+                pad_source=idx,
+            )
+            if not local_idx:
+                continue
+            batch = [dataset[j] for j in local_idx]
+            if len(batch[0]) == 2:
+                batch, offsets = zip(*batch)
+            else:
+                offsets = [0] * len(batch)
+            lengths = [len(x) for x in batch]
+            if max(lengths) > max_seq_length:
+                print(
+                    f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
+                    f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
+                    "Consider pre-splitting your data to save memory."
+                )
+
+            pad_to = 32
+            max_length_in_batch = 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to)
+            max_length_in_batch = min(max_length_in_batch, max_seq_length)
+            batch_arr = np.zeros((len(batch), max_length_in_batch), np.int32)
+            for j in range(len(batch)):
+                truncated_length = min(lengths[j], max_seq_length)
+                batch_arr[j, :truncated_length] = batch[j][:truncated_length]
+                lengths[j] = truncated_length
+            batch_pairs.append(
+                (mx.array(batch_arr), mx.array(list(zip(offsets, lengths))), None)
+            )
+            if num_batches is not None and len(batch_pairs) >= num_batches:
+                return batch_pairs
+        if num_batches is None:
+            break
     return batch_pairs
 
 
@@ -3623,11 +3761,16 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True):
+                           num_epochs=None, append_eos=True,
+                           comm_group=None):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
+
+    In DDP, ``batch_size`` remains local to each rank. ``comm_group`` expands
+    the ordered stream into global micro-batches, pads the final global batch
+    if needed, and returns only this rank's local slice.
     """
 
     ds = _prepare_dataset(
@@ -3664,6 +3807,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     order = make_order(epoch)
     order_pos = 0
     seen = 0
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     target_items = (
         len(tokenized) * (1 if num_epochs is None else int(num_epochs))
         if num_batches is None else None
@@ -3682,7 +3826,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             order = make_order(epoch)
             order_pos = 0
 
-        chunk = order[order_pos : order_pos + batch_size]
+        chunk = order[order_pos : order_pos + global_batch_size]
         if not chunk:
             break
         order_pos += len(chunk)
@@ -3690,6 +3834,14 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is None and target_items is not None and seen > target_items:
             chunk = chunk[: len(chunk) - (seen - target_items)]
             seen = target_items
+        chunk = _rank_slice_distributed_batch(
+            chunk,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=order,
+        )
+        if not chunk:
+            break
         batch_items = [tokenized[i] for i in chunk]
 
         max_length = max(len(ids) for ids in batch_items)

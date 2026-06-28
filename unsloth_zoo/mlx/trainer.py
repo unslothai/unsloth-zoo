@@ -180,6 +180,8 @@ from .utils import (
     remove_gradient_checkpointing,
     _is_vlm_model,
     _get_text_model,
+    _distributed_global_batch_size,
+    _rank_slice_distributed_batch,
 )
 from .compile import (
     build_compile_policy,
@@ -2664,6 +2666,7 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        comm_group = self.distributed_world
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -2755,6 +2758,7 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    comm_group=comm_group,
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)
@@ -2918,7 +2922,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             model_name=None, model_type=None,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
-                            num_epochs=None, return_dataset=False):
+                            num_epochs=None, return_dataset=False,
+                            comm_group=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -3046,11 +3051,18 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     )
     rng = random.Random(seed)
     batches = []
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     for epoch_idx in range(_n_epochs_materialize):
         epoch_items = _order_samples_for_epoch(all_items, epoch_idx)
         epoch_batches = []
-        for start in range(0, len(epoch_items), batch_size):
-            batch_items = epoch_items[start:start + batch_size]
+        for start in range(0, len(epoch_items), global_batch_size):
+            batch_items = epoch_items[start:start + global_batch_size]
+            batch_items = _rank_slice_distributed_batch(
+                batch_items,
+                batch_size,
+                comm_group=comm_group,
+                pad_source=epoch_items,
+            )
             if not batch_items:
                 continue
             max_len = max(len(ids) for ids, _ in batch_items)
@@ -3288,6 +3300,7 @@ def train_on_responses_only(
             else None
         )
         train_dataset = trainer._train_dataset_for_batches()
+        comm_group = getattr(trainer, "distributed_world", None)
         batches, response_masked_dataset = _create_labeled_batches(
             dataset=train_dataset,
             tokenizer=_tokenizer,
@@ -3310,6 +3323,7 @@ def train_on_responses_only(
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
             return_dataset=True,
+            comm_group=comm_group,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
