@@ -670,8 +670,12 @@ def _extract_lora_weights(
     return result[0], result[1], result[2]
 
 
-def _get_base_weight(param):
-    """Get base weight from a potentially wrapped parameter or module."""
+def _get_base_weight(param, target_dtype=None):
+    """Get base weight from a potentially wrapped parameter or module.
+
+    target_dtype mirrors _dequantize_bnb4bit_expert_weights for the recompute
+    providers: restore the packed Params4bit to its logical shape and cast.
+    """
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
@@ -690,6 +694,8 @@ def _get_base_weight(param):
         original_shape = getattr(param, "_original_shape", None)
         if original_shape is not None and weight.shape != original_shape:
             weight = weight.reshape(original_shape)
+        if target_dtype is not None:
+            weight = weight.to(target_dtype)
         return weight
 
     if hasattr(param, "get_param"):
@@ -1120,8 +1126,8 @@ def forward_native_grouped_mm(
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim):
-            return preprocess_weight(_get_base_weight(_src), "gate_up", _h, _mt)
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
+            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt)
         mm1_out = _base_grouped_mm(
             permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
         )
@@ -1254,8 +1260,8 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim):
-            return preprocess_weight(_get_base_weight(_src), "down", _h, _mt)
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
+            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt)
         mm2_out = _base_grouped_mm(
             inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
         )
