@@ -438,20 +438,28 @@ def train_on_responses_only(
                     idx += 1
         except Exception:
             # Datasets with a custom transform may need other columns; fall back.
-            return dataset.filter(_has_valid_labels)
+            return dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
         if not dropped:
             return dataset  # nothing fully masked
         # Most rows masked away across the WHOLE dataset usually means truncation.
         # Only fatal when no rows survive; otherwise warn and keep the valid rows.
         if len(dropped) / n_before >= 0.9:
             _diagnose_truncation(dataset, dropped, fatal = len(dropped) == n_before)
+        # Everything masked and not from truncation: the markers do not match the
+        # template at all, so fail clearly instead of returning an empty dataset.
+        if len(dropped) == n_before:
+            raise ValueError(
+                f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}, "
+                f"so there is nothing to train on. The response marker {repr(response_part)} was not "
+                "found in any sample - check that instruction_part and response_part match your chat template."
+            )
         drop_set = set(dropped)
         dataset = dataset.select([i for i in range(n_before) if i not in drop_set])
         n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
                 f"Unsloth: Removed {n_removed} out of {n_before} samples from {dataset_name} "
-                f"where all labels were -100 (no response found after truncation). "
+                f"where all labels were -100 (no response marker found, usually truncation). "
                 f"This prevents NaN loss during training."
             )
         return dataset

@@ -634,6 +634,11 @@ def get_padding_tokens_ids(tokenizer):
         placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
+    # Tokens absent from this tokenizer map to the unk id; do not mask unk from loss
+    # (mirrors the MLX path in mlx/utils.py). pad_token_id is added separately below.
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None:
+        padding_token_ids = [x for x in padding_token_ids if x != unk_id]
     if hasattr(tokenizer, "pad_token_id"):
         padding_token_ids.append(tokenizer.pad_token_id)
 
