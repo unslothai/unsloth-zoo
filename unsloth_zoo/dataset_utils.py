@@ -170,19 +170,24 @@ def get_chat_template_parts(tokenizer):
     from collections import Counter
 
     tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-    if getattr(tok, "chat_template", None) is None:
+    # Render with whichever object has the chat template (some VLM processors keep
+    # it only on the processor) but validate token ids with the inner tokenizer.
+    render_tok = tok if getattr(tok, "chat_template", None) is not None else tokenizer
+    if getattr(render_tok, "chat_template", None) is None:
         raise ValueError("Unsloth: No chat_template to auto-detect from - pass instruction_part and response_part.")
 
     # Sentinels survive Jinja |trim and never collide with real tokens
     U, A = "⁠USERPROBE7q⁠", "⁠ASSTPROBE4z⁠"
-    render = lambda msgs, gen: tok.apply_chat_template(msgs, tokenize = False, add_generation_prompt = gen)
+    render = lambda msgs, gen: render_tok.apply_chat_template(msgs, tokenize = False, add_generation_prompt = gen)
     starts = lambda text, n: [m.start() for m in re.finditer(re.escape(n), text)]
     ends   = lambda text, n: [m.end()   for m in re.finditer(re.escape(n), text)]
     eos = getattr(tok, "eos_token", "") or ""
     bos = getattr(tok, "bos_token", "") or ""
     try:    added = set(tok.get_added_vocab().keys())
     except Exception: added = set()
-    specials = sorted(set(getattr(tok, "all_special_tokens", []) or []) | added, key = len, reverse = True)
+    # Keep only non-empty string tokens: "" would make strip_shared loop forever
+    # and None would break sorting by len.
+    specials = sorted({str(s) for s in (set(getattr(tok, "all_special_tokens", []) or []) | added) if s}, key = len, reverse = True)
 
     def strip_lead(s, *prefixes):
         # Remove any of the given leading strings, repeatedly
@@ -226,7 +231,7 @@ def get_chat_template_parts(tokenizer):
     # Clean assistant header = generation prompt. Diff the tails after the last user
     # turn; shared leading special-tokens are the turn terminator, so drop them.
     end_user = convo[:-1]
-    tail = lambda s: s[s.rfind(U) + len(U):]
+    tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
     asst_header, _ = strip_shared(tail(render(end_user, True)), tail(render(end_user, False)))
 
     if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
@@ -236,13 +241,15 @@ def get_chat_template_parts(tokenizer):
         # Terminator leaked into the gen-diff (Phi-3): strip shared separators
         response_part, instruction_part = strip_shared(asst_header, instr_gap)
     else:
-        # Headerless template (Mistral [INST]/[/INST]): the marker lives in the gap
-        response_part    = strip_lead(resp_gap, eos + "\n", eos, bos)
-        instruction_part = strip_lead(instr_gap, eos + "\n", eos, bos)
+        # Headerless template (Mistral [INST]/[/INST]): strip bos/eos separators here
+        response_part    = strip_lead(resp_gap, " ", "\t", eos + "\n", eos, bos)
+        instruction_part = strip_lead(instr_gap, " ", "\t", eos + "\n", eos, bos)
 
-    # Drop leading bos/eos/space separators and trailing spaces that would merge into the content token
-    instruction_part = strip_lead(instruction_part, " ", "\t", eos + "\n", eos, bos).rstrip(" \t")
-    response_part    = strip_lead(response_part, " ", "\t", eos + "\n", eos, bos).rstrip(" \t")
+    # Only strip whitespace from header markers: do NOT strip bos here, since for some
+    # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
+    # stripping it would leave an unanchored marker that matches inside user content.
+    instruction_part = strip_lead(instruction_part, " ", "\t").rstrip(" \t")
+    response_part    = strip_lead(response_part, " ", "\t").rstrip(" \t")
     if not instruction_part or not response_part:
         raise ValueError("Unsloth: Auto-detection produced an empty marker - pass instruction_part and response_part.")
 
@@ -250,13 +257,13 @@ def get_chat_template_parts(tokenizer):
     # silently train on nothing (role tags that are not atomic tokens, or whose ids shift by
     # context). Some SentencePiece tokenizers need a leading space, so try that variant too.
     probe_ids = tok(full, add_special_tokens = False).input_ids
-    def validate(part):
+    def validate(part, part_name):
         for cand in (part, " " + part):
             core = _find_common_token_ids(cand, tok, True)[0]
             if core and any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
                 return cand
-        raise ValueError("Unsloth: Could not reliably auto-detect masking markers - pass instruction_part and response_part.")
-    return validate(instruction_part), validate(response_part)
+        raise ValueError(f"Unsloth: Could not reliably auto-detect {part_name} (detected {repr(part)}) - pass instruction_part and response_part.")
+    return validate(instruction_part, "instruction_part"), validate(response_part, "response_part")
 pass
 
 
