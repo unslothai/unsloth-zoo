@@ -241,9 +241,13 @@ def get_chat_template_parts(tokenizer):
         # Terminator leaked into the gen-diff (Phi-3): strip shared separators
         response_part, instruction_part = strip_shared(asst_header, instr_gap)
     else:
-        # Headerless template (Mistral [INST]/[/INST]): strip bos/eos separators here
-        response_part    = strip_lead(resp_gap, " ", "\t", eos + "\n", eos, bos)
-        instruction_part = strip_lead(instr_gap, " ", "\t", eos + "\n", eos, bos)
+        # Headerless template (Mistral [INST]/[/INST]): strip bos/eos separators here.
+        # Strip eos alone, never eos+"\n": a turn-delimiting newline stays as the marker
+        # anchor (e.g. "\n### Human:") instead of being glued to eos and dropped, which
+        # left a bare marker that could match inside message content. strip_lead skips
+        # empty prefixes, so an unset eos never strips a bare "\n".
+        response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
+        instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
 
     # Only strip whitespace from header markers: do NOT strip bos here, since for some
     # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
