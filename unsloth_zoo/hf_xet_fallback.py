@@ -990,7 +990,8 @@ def _snapshot_is_acceptable(
     # hand back a config-only snapshot dir that simply lacks the requested file. Globs stay best-effort.
     return (
         not snapshot_has_requested_broken_symlinks(
-            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
+            repo_type = repo_type,
         )
         and requested_named_files_present(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns

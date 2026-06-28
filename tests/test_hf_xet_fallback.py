@@ -1648,6 +1648,58 @@ def test_request_can_include_weights_sentencepiece_glob():
     assert hcs.request_can_include_weights(["model*"], None) is True
 
 
+def test_request_can_include_weights_variant_prefix_glob():
+    """A variant weight prefix glob (["model.fp16*"], ["pytorch_model.fp16*"]) selects a real variant
+    weight (model.fp16.safetensors) even though the pattern ends in the wildcard, not a weight
+    suffix. It must read as weight-including so the fast path does not accept a config-only snapshot
+    without the requested variant weights (Codex #829). A metadata prefix glob stays weightless."""
+    assert hcs.request_can_include_weights(["model.fp16*"], None) is True
+    assert hcs.request_can_include_weights(["pytorch_model.fp16*"], None) is True
+    assert hcs.request_can_include_weights(["model.bf16*"], None) is True
+    # Metadata / non-weight prefix globs stay weightless (no over-reject of a tokenizer-only warm).
+    assert hcs.request_can_include_weights(["tokenizer*"], None) is False
+    assert hcs.request_can_include_weights(["config*"], None) is False
+    assert hcs.request_can_include_weights(["spiece*"], None) is False
+
+
+def test_snapshot_dir_is_complete_diffusion_weights_only_glob(tmp_path):
+    """A weights-only root glob (["*.safetensors"]) on a diffusers repo downloads the component
+    weights (unet/, vae/) but NOT model_index.json, so the pipeline layout must be recognized from
+    the component weights themselves -- otherwise the snapshot is misread as a non-pipeline root
+    load, its subfolder weights dropped, and a complete download reported incomplete (Codex #829).
+    A genuine non-pipeline subfolder-only snapshot (BF16/) is still rejected for a root glob."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"w")
+    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
+    _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
+    # No model_index.json on disk (a *.safetensors warm would not have selected it).
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
+    # A precision-variant subfolder (not a pipeline component) must NOT be mistaken for a pipeline.
+    snap2 = tmp_path / "snap2"
+    (snap2 / "BF16").mkdir(parents = True)
+    (snap2 / "BF16" / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap2, allow_patterns = ["*.safetensors"]) is False
+
+
+def test_snapshot_has_requested_broken_symlinks_dataset_vs_model(tmp_path):
+    """A dangling checkpoint-dir symlink blocks a DATASET snapshot (every requested file matters)
+    but not a MODEL root warm (a root load never reads a checkpoint-dir file), so the checkpoint-dir
+    drop applies only to models (Codex #829)."""
+    snap = tmp_path / "snap"
+    (snap / "checkpoint-10").mkdir(parents = True)
+    (snap / "checkpoint-10" / "data.parquet").symlink_to(tmp_path / "missing")   # dangling
+    assert hcs.snapshot_has_requested_broken_symlinks(snap, repo_type = "model") is False
+    assert hcs.snapshot_has_requested_broken_symlinks(snap, repo_type = "dataset") is True
+    # A dangling ROOT file blocks both (it is a requested interrupted file in either case).
+    snap2 = tmp_path / "snap2"
+    snap2.mkdir()
+    (snap2 / "data.parquet").symlink_to(tmp_path / "missing")
+    assert hcs.snapshot_has_requested_broken_symlinks(snap2, repo_type = "model") is True
+    assert hcs.snapshot_has_requested_broken_symlinks(snap2, repo_type = "dataset") is True
+
+
 def test_request_can_include_weights_chat_template_glob():
     """A chat-template glob (["chat_template*"]) selects only chat_template.json / .jinja and no
     weight, so it reads as WEIGHTLESS. Without a representative in the non-weight probes the glob is

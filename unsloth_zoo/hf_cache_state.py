@@ -457,6 +457,30 @@ def _diffusion_pipeline_complete(snapshot_dir: Path, weight_dirs: set) -> bool:
     return True
 
 
+def _has_pipeline_component_weight(snapshot_dir: Path, entries: list) -> bool:
+    """True if a recognized diffusers component subfolder (``unet/``, ``vae/``, ``text_encoder/``,
+    ...) holds a loadable weight. A weights-only warm (``allow_patterns=["*.safetensors"]``, or an
+    ignore list that drops ``model_index.json``) downloads a diffusers pipeline's component weights
+    but NOT ``model_index.json`` -- so the pipeline layout has to be recognized from the component
+    weights themselves, else the snapshot is misread as a non-pipeline root load and its (legitimate)
+    subfolder weights are dropped. Kept to the known weight-bearing component names so an arbitrary
+    precision/checkpoint subfolder (``BF16/``, ``checkpoint-10/``) is NOT mistaken for a pipeline."""
+    for entry in entries:
+        try:
+            rel = entry.relative_to(snapshot_dir).as_posix()
+        except ValueError:
+            continue
+        parts = rel.split("/")
+        if (
+            len(parts) >= 2
+            and parts[0] in _WEIGHT_BEARING_PIPELINE_DIRS
+            and _is_loadable_weight_file(parts[-1])
+            and _safe_is_file(entry)
+        ):
+            return True
+    return False
+
+
 def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
     """Repo-relative posix paths of every dangling symlink in *snapshot_dir* -- a referenced file
     whose blob is missing or still an ``.incomplete`` partial (an interrupted download). Empty when
@@ -546,18 +570,31 @@ def snapshot_has_requested_broken_symlinks(
     *,
     allow_patterns: "Optional[object]" = None,
     ignore_patterns: "Optional[object]" = None,
+    repo_type: "Optional[str]" = "model",
 ) -> bool:
     """True iff a dangling symlink in *snapshot_dir* is for a file the request actually SELECTS.
 
     A dangling symlink marks an interrupted download, but for a scoped request only one for a
     requested file should reject the snapshot: a dangling root ``model.safetensors`` left by an
     earlier interrupted pull must not fail a weightless ``allow_patterns=["config.json"]`` request
-    whose config is on disk. Mirrors the scoped broken-symlink handling inside
-    ``snapshot_dir_is_complete`` so the weightless / non-model path is scoped the same way."""
+    whose config is on disk.
+
+    For a MODEL repo the scoping mirrors ``snapshot_dir_is_complete``: a root load reads only root
+    files, so a dangling checkpoint-dir / subfolder symlink does not block it. A DATASET (or other
+    non-model) snapshot has no "root load reads only root files" notion -- every dangling symlink
+    for a selected path is an interrupted file that must reject the cache (e.g. a dangling
+    ``checkpoint-10/data.parquet`` in an unpatterned dataset pull), so the checkpoint-dir drop is
+    NOT applied there."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     broken = _broken_symlink_rel_paths(snapshot_dir)
-    return bool(broken and _requested_scope_filter(broken, allow_patterns, ignore_patterns))
+    if not broken:
+        return False
+    if repo_type == "model":
+        requested = _requested_scope_filter(broken, allow_patterns, ignore_patterns)
+    else:
+        requested = _filter_paths(broken, allow_patterns, ignore_patterns)
+    return bool(requested)
 
 
 def snapshot_dir_is_complete(
@@ -610,7 +647,9 @@ def snapshot_dir_is_complete(
     # load never reads. A diffusers pipeline is the exception -- its component weights legitimately
     # live in subfolders (unet/, vae/, text_encoder/), validated by _diffusion_pipeline_complete --
     # so it keeps the (narrower) checkpoint-dir scoping instead.
-    is_pipeline = _safe_is_file(snapshot_dir / "model_index.json")
+    is_pipeline = _safe_is_file(snapshot_dir / "model_index.json") or _has_pipeline_component_weight(
+        snapshot_dir, entries
+    )
     root_weights_only = _targets_root_only(allow_patterns) and not is_pipeline
 
     # A dangling symlink marks an interrupted download, but only one for a file the request
@@ -1018,14 +1057,28 @@ def _weight_self_probe(pattern: str) -> "Optional[str]":
     suffix is not a weight suffix, or when the (concretized) basename is a known trainer /
     optimizer artifact (``optimizer.pt``, ``training_args.bin``, ``rng_state_*.pth``): those
     carry weight suffixes but the snapshot completeness check filters them out as non-weights,
-    so classifying such a request as weight-including would loop the guarded download."""
-    if not pattern.lower().endswith(_WEIGHT_FILE_SUFFIXES):
-        return None
-    concrete = _concretize_glob(pattern)
-    basename = concrete.rsplit("/", 1)[-1]
-    if not _is_loadable_weight_file(basename):
-        return None
-    return concrete
+    so classifying such a request as weight-including would loop the guarded download.
+
+    Also recognizes a trailing-wildcard variant glob whose wildcard would ABSORB the weight suffix
+    (``model.fp16*`` -> ``model.fp16.safetensors``, ``pytorch_model.fp16*`` ->
+    ``pytorch_model.fp16.bin``): such a glob does not literally end in a weight suffix, but it does
+    select a real variant weight, so it must read as weight-including. A clearly non-weight glob
+    (``tokenizer*``, ``config*``, ``spiece*``) is excluded so a metadata-only warm stays weightless."""
+    if pattern.lower().endswith(_WEIGHT_FILE_SUFFIXES):
+        concrete = _concretize_glob(pattern)
+        basename = concrete.rsplit("/", 1)[-1]
+        if not _is_loadable_weight_file(basename):
+            return None
+        return concrete
+    # Trailing-wildcard glob: try each weight suffix in place of the absorbing wildcard.
+    if "/" not in pattern and pattern.endswith(("*", "?")) and not _basename_is_non_weight(pattern):
+        stem = _concretize_glob(pattern.rstrip("*?"))
+        if stem:
+            for suffix in _WEIGHT_FILE_SUFFIXES:
+                candidate = stem + suffix
+                if fnmatch.fnmatchcase(candidate, pattern) and _is_loadable_weight_file(candidate):
+                    return candidate
+    return None
 
 
 def request_can_include_weights(
