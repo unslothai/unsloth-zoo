@@ -52,6 +52,13 @@ IMAGE_TOKENS = [
     "<|END_OF_IMG|>",     # Cohere
     "<|IMG_LINE_BREAK|>", # Cohere
     "<|IMG_PATCH|>",      # Cohere
+    "<img>",              # InternVL / Nemotron Nano Omni (begin image)
+    "</img>",             # InternVL / Nemotron Nano Omni (end image)
+    "<video>",            # Nemotron Nano Omni
+    "<|IMAGE|>",          # Qwen2.5-Omni
+    "<|VIDEO|>",          # Qwen2.5-Omni
+    "<|vision_bos|>",     # Qwen2.5-Omni (begin vision)
+    "<|vision_eos|>",     # Qwen2.5-Omni (end vision)
 ]
 
 # Audio placeholder tokens.
@@ -62,6 +69,12 @@ AUDIO_TOKENS = [
     "<audio_soft_token>", # Gemma 3n
     "<start_of_audio>",   # Gemma 3n (begin audio)
     "<end_of_audio>",     # Gemma 3n (end audio)
+    "<so_embedding>",     # Nemotron Nano Omni (sound)
+    "<so_start>",         # Nemotron Nano Omni (begin sound)
+    "<so_end>",           # Nemotron Nano Omni (end sound)
+    "<|AUDIO|>",          # Qwen2.5-Omni
+    "<|audio_bos|>",      # Qwen2.5-Omni (begin audio)
+    "<|audio_eos|>",      # Qwen2.5-Omni (end audio)
 ]
 
 # Combined list for callers that mask every media placeholder at once.
