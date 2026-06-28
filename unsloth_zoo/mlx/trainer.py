@@ -974,6 +974,35 @@ class MLXTrainer:
             "distributed_is_main_process": self._distributed_is_main_process,
         }
 
+    def _distributed_all_sum(self, value, stream=None):
+        """All-sum a scalar/array on the trainer's distributed group."""
+        world = self._ensure_distributed()
+        if world is None or self._distributed_world_size <= 1:
+            return value
+        return mx.distributed.all_sum(value, group=world, stream=stream)
+
+    def _distributed_sum_gradient_tree(self, grad):
+        """All-sum a gradient tree while preserving MLX's grouped all-reduce."""
+        world = self._ensure_distributed()
+        if world is None or self._distributed_world_size <= 1:
+            return grad
+        averaged = nn.average_gradients(grad, group=world)
+        return tree_map(
+            lambda value: value * mx.array(
+                self._distributed_world_size, dtype=value.dtype,
+            ),
+            averaged,
+        )
+
+    def _distributed_should_stop(self):
+        """Synchronize stop requests so all ranks leave loops together."""
+        local_stop = mx.array(int(bool(self.stop_requested)), dtype=mx.int32)
+        stop_count = self._distributed_all_sum(local_stop, stream=mx.cpu)
+        should_stop = bool(int(stop_count.item()) > 0)
+        if should_stop:
+            self.stop_requested = True
+        return should_stop
+
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
 
@@ -1334,7 +1363,7 @@ class MLXTrainer:
         ntokens = mx.array(0)
 
         for batch_data in eval_batches:
-            if self.stop_requested:
+            if self._distributed_should_stop():
                 break
             if is_vlm:
                 loss, ntoks = loss_fn(self.model, batch_data)
@@ -1362,6 +1391,8 @@ class MLXTrainer:
                 split_losses, split_tokens = self._evaluate_batch_totals(
                     split_batches, loss_fn, is_vlm=is_vlm,
                 )
+                split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
+                split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
                 all_losses += split_losses
                 ntokens += split_tokens
                 mx.eval(all_losses, ntokens)
@@ -1373,12 +1404,14 @@ class MLXTrainer:
                 split_prefix = f"eval_{split_name}"
                 metrics[f"{split_prefix}_loss"] = split_loss
                 metrics[f"{split_prefix}_perplexity"] = split_ppl
-                if self.stop_requested:
+                if self._distributed_should_stop():
                     break
         else:
             all_losses, ntokens = self._evaluate_batch_totals(
                 eval_batches, loss_fn, is_vlm=is_vlm,
             )
+            all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
+            ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
 
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
@@ -1625,6 +1658,12 @@ class MLXTrainer:
         self._ensure_distributed()
         self._setup_report_to_callbacks()
         self._install_neftune()
+        is_main_process = self.is_main_process
+
+        def _main_print(*print_args, **print_kwargs):
+            if is_main_process:
+                print(*print_args, **print_kwargs)
+
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
@@ -1643,7 +1682,7 @@ class MLXTrainer:
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
             _norm_cast_applied = True
             if cast_norm_output:
-                print("Unsloth: Casting MLX norm outputs back to activation dtype.")
+                _main_print("Unsloth: Casting MLX norm outputs back to activation dtype.")
             args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
             model._unsloth_patch_mode = args.patch_mode
 
@@ -1668,7 +1707,7 @@ class MLXTrainer:
                         args, self._compile_decision
                     )
                     for setting, value, reason in self._compile_auto_tune_applied:
-                        print(
+                        _main_print(
                             f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
                             f"({reason})"
                         )
@@ -1688,7 +1727,7 @@ class MLXTrainer:
                     parts.append(
                         f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
                     )
-                print(
+                _main_print(
                     "Unsloth: MLX Metal memory guard enabled "
                     f"({', '.join(parts)})."
                 )
@@ -1696,7 +1735,7 @@ class MLXTrainer:
             # Apply gradient checkpointing if requested
             if args.gradient_checkpointing:
                 apply_gradient_checkpointing(model)
-                print("Unsloth: Using gradient checkpointing to reduce memory.")
+                _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
 
             # Qwen3.5-specific fixes
             config = getattr(model, "_config", {})
@@ -1759,6 +1798,26 @@ class MLXTrainer:
         args = self.args
         model = self.model
         is_vlm = self._is_vlm
+        distributed_world_size = self.distributed_world_size
+        is_main_process = self.is_main_process
+
+        def _main_print(*print_args, **print_kwargs):
+            if is_main_process:
+                print(*print_args, **print_kwargs)
+
+        if is_vlm and distributed_world_size > 1:
+            raise ValueError(
+                "Unsloth MLX: VLM DDP requires VLM batch sharding, which is "
+                "not enabled in this stage. Use a single MLX process for VLM "
+                "training until the VLM DDP stage lands."
+            )
+        if getattr(args, "streaming", False) and distributed_world_size > 1:
+            raise ValueError(
+                "Unsloth MLX: streaming DDP requires distributed streaming "
+                "batch sharding, which is not enabled in this stage. Disable "
+                "streaming or use a single MLX process until the streaming "
+                "DDP stage lands."
+            )
 
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
@@ -1779,22 +1838,28 @@ class MLXTrainer:
                     ignore_token_ids=_vlm_ignore_token_ids,
                 )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                print(f"Unsloth: Using VLM CCE loss ({cce_backend}) for memory-efficient training.")
+                _main_print(
+                    f"Unsloth: Using VLM CCE loss ({cce_backend}) "
+                    "for memory-efficient training."
+                )
             else:
                 loss_fn = make_vlm_baseline_loss_fn(
                     model,
                     assistant_token_id=_atid,
                     ignore_token_ids=_vlm_ignore_token_ids,
                 )
-                print("Unsloth: Using VLM standard cross-entropy loss.")
+                _main_print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                print(f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training.")
+                _main_print(
+                    f"Unsloth: Using CCE loss ({cce_backend}) "
+                    "for memory-efficient training."
+                )
             else:
                 loss_fn = make_baseline_loss_fn()
-                print("Unsloth: Using standard cross-entropy loss.")
+                _main_print("Unsloth: Using standard cross-entropy loss.")
 
         # Prepare data, determine total_steps first. Keep any prebuilt flag
         # from train_on_responses_only; _prepare_data returns self._batches
@@ -1858,7 +1923,7 @@ class MLXTrainer:
                 ts = load_trainer_state(_resume_from)
                 _resume_step = int(ts.get("global_step", 0))
                 self._train_loss_history = list(ts.get("train_loss_history", []))
-                print(
+                _main_print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
                 )
@@ -1876,7 +1941,7 @@ class MLXTrainer:
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
-            print(f"Unsloth: LoRA+ enabled (ratio={lora_plus_ratio}).")
+            _main_print(f"Unsloth: LoRA+ enabled (ratio={lora_plus_ratio}).")
 
         embedding_lr = args.embedding_learning_rate
         main_lr = args.learning_rate
@@ -1884,8 +1949,10 @@ class MLXTrainer:
         use_embedding_lr = embedding_lr > 0 and main_lr > 0
         embedding_lr_ratio = embedding_lr / main_lr if use_embedding_lr else 1.0
         if use_embedding_lr:
-            print(f"Unsloth: Embedding LR = {embedding_lr:.2e} "
-                  f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e}).")
+            _main_print(
+                f"Unsloth: Embedding LR = {embedding_lr:.2e} "
+                f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e})."
+            )
 
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
@@ -1908,7 +1975,7 @@ class MLXTrainer:
             if _raw_mgln is not None and float(_raw_mgln or 0.0) > 0:
                 conflicts.append("max_grad_leaf_norm")
             if conflicts:
-                print(
+                _main_print(
                     "Unsloth: max_grad_value is elementwise and overrides "
                     f"{', '.join(conflicts)}."
                 )
@@ -1916,7 +1983,7 @@ class MLXTrainer:
             max_grad_leaf_norm > 0
             and float(getattr(args, "max_grad_norm", 0.0) or 0.0) > 0
         ):
-            print(
+            _main_print(
                 "Unsloth: max_grad_leaf_norm is enabled; ignoring "
                 "max_grad_norm to avoid double clipping."
             )
@@ -1927,6 +1994,7 @@ class MLXTrainer:
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
             grad_accum == 1 and
+            distributed_world_size <= 1 and
             not _needs_grad_scaling and
             max_grad_norm <= 0 and
             not _clip_grad_value and
@@ -2038,6 +2106,11 @@ class MLXTrainer:
             its norm; non-global modes report after update from Adam state to
             keep the backward graph single-consumer.
             """
+            if distributed_world_size > 1:
+                grad = self._distributed_sum_gradient_tree(grad)
+                toks_f = self._distributed_all_sum(toks_f)
+                if int(toks_f.item()) == 0:
+                    return None
             safe_toks_f = mx.maximum(
                 toks_f, mx.array(1.0, dtype=mx.float32)
             )
@@ -2131,8 +2204,14 @@ class MLXTrainer:
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
+        if _use_compile and distributed_world_size > 1:
+            _main_print(
+                "Unsloth: mx.compile disabled for MLX DDP training; "
+                "using eager mode for distributed collectives."
+            )
+            _use_compile = False
         if _use_compile and max_grad_norm > 0 and grad_accum > 1:
-            print(
+            _main_print(
                 "Unsloth: mx.compile disabled because MLX global norm "
                 "clipping is enabled with gradient accumulation."
             )
@@ -2163,15 +2242,15 @@ class MLXTrainer:
                     f"({_compile_decision.reason})."
                 )
             if not _compile_decision.enabled:
-                print(
+                _main_print(
                     f"Unsloth: mx.compile disabled for VLM arch "
                     f"'{_compile_decision.arch}' during training; using eager mode "
                     f"({_compile_decision.reason})."
                 )
                 if getattr(model, "_unsloth_compile_explain", None):
-                    print("Unsloth: Compile trace summary:")
+                    _main_print("Unsloth: Compile trace summary:")
                     for line in model._unsloth_compile_explain.splitlines():
-                        print(f"  {line}")
+                        _main_print(f"  {line}")
                 _use_compile = False
         if _use_compile:
             _uncompiled_step_fn = step_fn
@@ -2238,8 +2317,10 @@ class MLXTrainer:
                     sum(len(value) for value in eval_batches.values())
                     if isinstance(eval_batches, dict) else len(eval_batches)
                 )
-                print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                      f"({eval_batch_count} eval batches).")
+                _main_print(
+                    f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                    f"({eval_batch_count} eval batches)."
+                )
 
         features = []
         if is_vlm:
@@ -2261,15 +2342,19 @@ class MLXTrainer:
         else:
             features.append(f"opt={args.optim}")
 
-        print(f"Unsloth: Training for {total_steps} steps, "
-              f"BS={args.per_device_train_batch_size}, "
-              f"grad_accum={grad_accum}, "
-              f"seq_len={args.max_seq_length}")
-        print(f"Unsloth: Features: {', '.join(features)}")
+        _main_print(
+            f"Unsloth: Training for {total_steps} steps, "
+            f"BS={args.per_device_train_batch_size}, "
+            f"grad_accum={grad_accum}, "
+            f"seq_len={args.max_seq_length}"
+        )
+        _main_print(f"Unsloth: Features: {', '.join(features)}")
         if _compile_decision is not None and _compile_decision.setting_recommendations:
-            print("Unsloth: Compile recommendations:")
+            _main_print("Unsloth: Compile recommendations:")
             for rec in _compile_decision.setting_recommendations:
-                print(f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}")
+                _main_print(
+                    f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}"
+                )
 
         # Training loop — mlx-lm pattern
         model.train()
@@ -2301,8 +2386,8 @@ class MLXTrainer:
                     ) from None
 
         for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
-            if self.stop_requested:
-                print("Unsloth: Stop requested — ending training early.")
+            if self._distributed_should_stop():
+                _main_print("Unsloth: Stop requested — ending training early.")
                 break
 
             tic = time.perf_counter()
@@ -2338,7 +2423,7 @@ class MLXTrainer:
                             "Unsloth: strict mx.compile was enabled for this VLM "
                             "and runtime fallback is disabled."
                         ) from e
-                    print(
+                    _main_print(
                         "Unsloth: mx.compile failed at runtime; "
                         "falling back to eager mode."
                     )
@@ -2374,12 +2459,14 @@ class MLXTrainer:
                 and not _can_report_optimizer_state_norm()
                 and not _warned_skip_optimizer_state_grad_norm
             ):
-                print(
+                _main_print(
                     "Unsloth: skipping grad norm reporting for this MLX "
                     "optimizer/mode to avoid materializing the gradient graph."
                 )
                 _warned_skip_optimizer_state_grad_norm = True
-            if int(toks.item()) == 0:
+            global_toks = self._distributed_all_sum(toks, stream=mx.cpu)
+            mx.eval(global_toks)
+            if int(global_toks.item()) == 0:
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
                     "tokens after masking/truncation. Increase max_seq_length, "
@@ -2396,8 +2483,14 @@ class MLXTrainer:
 
             # Logging
             if current_step % args.logging_steps == 0 or current_step == total_steps:
-                train_loss = (losses / n_tokens).item()
-                tok_count = n_tokens.item()
+                metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
+                metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
+                mx.eval(metric_losses, metric_tokens)
+                train_loss = (
+                    (metric_losses / metric_tokens).item()
+                    if metric_tokens.item() > 0 else 0.0
+                )
+                tok_count = metric_tokens.item()
                 trained_tokens += tok_count
                 lr_val = optimizer.learning_rate.item()
                 tokens_sec = tok_count / train_time if train_time > 0 else 0
@@ -2426,7 +2519,7 @@ class MLXTrainer:
                     f"Grad: {grad_norm_val:.4f} | "
                     if grad_norm_val is not None else ""
                 )
-                print(
+                _main_print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
                     f"{grad_text}"
@@ -2435,15 +2528,16 @@ class MLXTrainer:
                     f"Peak: {peak_mem:.2f} GB"
                 )
 
-                for cb in self._step_callbacks:
-                    try:
-                        cb(
-                            current_step, total_steps, train_loss, lr_val,
-                            tokens_sec, peak_mem, elapsed_total, trained_tokens,
-                            grad_norm_val,
-                        )
-                    except Exception as e:
-                        print(f"Unsloth: step callback error: {e}")
+                if is_main_process:
+                    for cb in self._step_callbacks:
+                        try:
+                            cb(
+                                current_step, total_steps, train_loss, lr_val,
+                                tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                                grad_norm_val,
+                            )
+                        except Exception as e:
+                            _main_print(f"Unsloth: step callback error: {e}")
 
                 losses = 0
                 n_tokens = 0
@@ -2456,16 +2550,17 @@ class MLXTrainer:
                 val_loss, ppl = self._evaluate(
                     eval_batches, loss_fn, is_vlm=is_vlm)
                 model.train()
-                print(
+                _main_print(
                     f"  Eval  {current_step}/{total_steps} | "
                     f"Val Loss: {val_loss:.4f} | "
                     f"Perplexity: {ppl:.2f}"
                 )
-                for cb in self._eval_callbacks:
-                    try:
-                        cb(current_step, val_loss, ppl)
-                    except Exception as e:
-                        print(f"Unsloth: eval callback error: {e}")
+                if is_main_process:
+                    for cb in self._eval_callbacks:
+                        try:
+                            cb(current_step, val_loss, ppl)
+                        except Exception as e:
+                            _main_print(f"Unsloth: eval callback error: {e}")
 
                 # Best-model tracking + early stopping (Item-5).
                 _track = getattr(args, "load_best_model_at_end", False) or \
@@ -2506,12 +2601,16 @@ class MLXTrainer:
                             self.stop_requested = True
 
             # Checkpointing
-            if args.save_steps > 0 and current_step % args.save_steps == 0:
+            if (
+                is_main_process
+                and args.save_steps > 0
+                and current_step % args.save_steps == 0
+            ):
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
                 try:
                     save_trainable_adapters(model, ckpt_dir)
                 except ValueError as e:
-                    print(f"  Unsloth: skipped checkpoint ({e})")
+                    _main_print(f"  Unsloth: skipped checkpoint ({e})")
                 else:
                     # Also write optimizer + trainer state so resume_from_checkpoint
                     # can restore Adam moments, step counter, and loss history.
@@ -2529,8 +2628,10 @@ class MLXTrainer:
                         )
                         checkpoint_complete = True
                     except Exception as e:
-                        print(f"  Unsloth: checkpoint saved without resume state ({e})")
-                    print(f"  Saved checkpoint to {ckpt_dir}")
+                        _main_print(
+                            f"  Unsloth: checkpoint saved without resume state ({e})"
+                        )
+                    _main_print(f"  Saved checkpoint to {ckpt_dir}")
                     if checkpoint_complete:
                         _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
 
@@ -2540,11 +2641,13 @@ class MLXTrainer:
             if self._train_loss_history else 0.0
         )
 
-        print(f"\nUnsloth: Training complete! "
-              f"Avg loss: {avg_loss:.4f} | "
-              f"Total time: {total_time:.1f}s | "
-              f"Steps: {total_steps} | "
-              f"Tokens: {trained_tokens}")
+        _main_print(
+            f"\nUnsloth: Training complete! "
+            f"Avg loss: {avg_loss:.4f} | "
+            f"Total time: {total_time:.1f}s | "
+            f"Steps: {total_steps} | "
+            f"Tokens: {trained_tokens}"
+        )
 
         # load_best_model_at_end: restore best adapters before the final save.
         if getattr(args, "load_best_model_at_end", False) and self._best_step is not None:
@@ -2558,12 +2661,13 @@ class MLXTrainer:
                     print(f"Unsloth: failed to restore best model ({e}).")
 
         # Honor the documented save_steps=0 contract: save at end of training.
-        try:
-            self.save_model()
-        except ValueError as e:
-            print(f"Unsloth: skipped final save ({e})")
-        else:
-            print(f"Unsloth: Saved final adapters to {args.output_dir}")
+        if is_main_process:
+            try:
+                self.save_model()
+            except ValueError as e:
+                _main_print(f"Unsloth: skipped final save ({e})")
+            else:
+                _main_print(f"Unsloth: Saved final adapters to {args.output_dir}")
 
         return MLXTrainOutput({
             "train_loss": avg_loss,
