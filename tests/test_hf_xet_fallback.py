@@ -1416,9 +1416,13 @@ def test_snapshot_dir_is_complete_missing_shard(tmp_path):
 
 
 def test_snapshot_dir_is_complete_missing_shard_without_index(tmp_path):
-    """A leftover single numbered shard with NO index sidecar (an interrupted multi-shard
-    pull where the index was never cached) must read as incomplete: the shard name itself
-    states the full set, so the missing siblings are detectable without a manifest."""
+    """An interrupted multi-shard pull with NO index sidecar reads as incomplete. While the shards
+    are partial, the numbered shard name itself states the full set, so missing siblings are
+    detectable without a manifest. But even with EVERY shard on disk, a full warm is still
+    incomplete until model.safetensors.index.json is present: transformers' local from_pretrained
+    resolves a directory by probing model.safetensors then model.safetensors.index.json (never by
+    globbing model-*-of-*.safetensors), so a sharded checkpoint without its index raises rather than
+    loads, and the missing index would otherwise be fetched in-process over Xet."""
     snap = tmp_path / "snap"
     snap.mkdir()
     blob = tmp_path / "blob"
@@ -1428,7 +1432,19 @@ def test_snapshot_dir_is_complete_missing_shard_without_index(tmp_path):
     (snap / "model-00002-of-00003.safetensors").symlink_to(blob)
     assert hcs.snapshot_dir_is_complete(snap) is False  # shard 3 still missing
     (snap / "model-00003-of-00003.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap) is True
+    assert hcs.snapshot_dir_is_complete(snap) is False  # all shards present but no index sidecar
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00003.safetensors",
+                    "b": "model-00002-of-00003.safetensors",
+                    "c": "model-00003-of-00003.safetensors",
+                }
+            }
+        )
+    )
+    assert hcs.snapshot_dir_is_complete(snap) is True   # index present -> loadable
 
 
 def test_snapshot_dir_is_complete_ignores_trainer_artifacts(tmp_path):
@@ -1617,6 +1633,61 @@ def test_snapshot_dir_is_complete_diffusion_file_glob_validates_components(tmp_p
     _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
     _make_diffusion_component(snap, blob, "text_encoder", "model.safetensors")
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is True
+
+
+def test_request_can_include_weights_chat_template_glob():
+    """A chat-template glob (["chat_template*"]) selects only chat_template.json / .jinja and no
+    weight, so it reads as WEIGHTLESS. Without a representative in the non-weight probes the glob is
+    misread as a weight directory and a template-only snapshot is wrongly rejected (Codex #829)."""
+    assert hcs.request_can_include_weights(["chat_template*"], None) is False
+    assert hcs.request_can_include_weights(["chat_template.jinja"], None) is False
+    assert hcs.request_can_include_weights(["added_tokens.json"], None) is False
+    # A weight glob is still weight-including.
+    assert hcs.request_can_include_weights(["*.safetensors"], None) is True
+
+
+def test_snapshot_dir_is_complete_root_glob_validates_shard_index(tmp_path):
+    """A root-wide patterned warm (allow_patterns=["*.safetensors", "*.json"], or
+    ignore_patterns=["*.onnx"]) still warms the root model, so a shard index whose shards are not
+    all on disk must reject it -- even for NON-numbered shard names the numbered-shard check cannot
+    catch (Codex #829). The index validation now runs for every _targets_root_only request, not
+    only the unpatterned one."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "foo.safetensors").symlink_to(blob)               # one non-numbered shard present
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "foo.safetensors", "b": "bar.safetensors"}})
+    )
+    globs = ["*.safetensors", "*.json"]
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is False        # bar missing
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is False  # bar missing
+    (snap / "bar.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is True
+
+
+def test_snapshot_dir_is_complete_sharded_glob_requires_index(tmp_path):
+    """A full warm expressed as a weight glob (["*.safetensors"]) over a complete numbered-shard set
+    is still incomplete without the index sidecar (transformers cannot load a local sharded
+    checkpoint without it). A deliberate exact single-shard request is exempt -- it wants only that
+    file, not the whole model."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
+    # An exact single-shard request is satisfied by that shard alone (no index required).
+    assert hcs.snapshot_dir_is_complete(
+        snap, allow_patterns = ["model-00001-of-00002.safetensors"]
+    ) is True
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                   "b": "model-00002-of-00002.safetensors"}})
+    )
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
 
 
 def test_request_can_include_weights_processor_subfolder():

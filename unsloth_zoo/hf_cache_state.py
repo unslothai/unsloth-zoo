@@ -688,11 +688,15 @@ def snapshot_dir_is_complete(
         ):
             return False
 
-    # A full (unpatterned) warm also validates any shard index ships all its shards; a
-    # patterned request may legitimately want only a subset, so the index is not enforced. A
-    # per-checkpoint index (checkpoint-500/model.safetensors.index.json) does not gate a root
-    # warm for the same reason its weights do not, so it is skipped here too.
-    if not has_patterns:
+    # A root-wide warm -- no allow_patterns, a catch-all, OR a no-slash glob such as
+    # ignore_patterns=["*.onnx"] / allow_patterns=["*.safetensors", "*.json"] (all _targets_root_only)
+    # -- validates that every weight-shard index it would read ships all its shards: an index whose
+    # shards (numbered OR arbitrarily named) are not all on disk is an interrupted pull the
+    # in-process load would finish over Xet, which the numbered-shard check alone cannot catch for
+    # non-numbered shard names. A PATH-BEARING (scoped) request may legitimately want only a subset,
+    # so the index is not enforced there. A per-checkpoint index, and -- for a non-pipeline root load
+    # -- any subfolder index, is not what the root load reads, so it is skipped.
+    if _targets_root_only(allow_patterns):
         for index_entry in index_entries:
             try:
                 index_rel = index_entry.relative_to(snapshot_dir).as_posix()
@@ -700,7 +704,37 @@ def snapshot_dir_is_complete(
                 index_rel = index_entry.name
             if _path_under_checkpoint_dir(index_rel):
                 continue
+            if root_weights_only and "/" in index_rel:
+                continue  # a subfolder index a bare root from_pretrained never reads
             if not _weight_shard_index_complete(index_entry):
+                return False
+
+    # A sharded checkpoint is loadable locally ONLY through its index sidecar: transformers'
+    # from_pretrained resolves a local directory by probing model.safetensors then
+    # model.safetensors.index.json (then the .bin pair) -- it never globs model-*-of-*.safetensors --
+    # so a cache holding every numbered shard but missing model.safetensors.index.json raises
+    # "no file named ..." or fetches the index in-process over Xet. For a root-level (non-pipeline)
+    # FULL warm (unpatterned or glob-bearing -- never a deliberate exact single-shard request, which
+    # wants only that file), require the index sidecar of each root-level numbered-shard set.
+    if root_weights_only and (
+        allow_patterns is None or any(_has_glob(p) for p in allow_patterns)
+    ):
+        root_index_names = set()
+        for index_entry in index_entries:
+            try:
+                irel = index_entry.relative_to(snapshot_dir).as_posix()
+            except ValueError:
+                irel = index_entry.name
+            if "/" not in irel:
+                root_index_names.add(irel)
+        for _, rel in weight_entries:
+            if "/" in rel:
+                continue
+            shard_match = _NUMBERED_SHARD_RE.match(rel)
+            if shard_match is None:
+                continue
+            index_name = f"{shard_match.group('prefix')}{shard_match.group('suffix')}.index.json"
+            if index_name not in root_index_names:
                 return False
 
     # A FULL pipeline warm -- no allow_patterns, a pure catch-all ``["*"]``, or a no-slash file glob
@@ -886,6 +920,12 @@ _NON_WEIGHT_PROBE_NAMES = (
     # metadata-only (else the snapshot is wrongly rejected for lacking a weight).
     "processor_config.json",
     "video_preprocessor_config.json",
+    # Chat-template metadata: a template-only warm (allow_patterns=["chat_template*"]) selects these
+    # and no weight, so a representative must be here -- otherwise the glob is misread as a weight
+    # directory and a template-only snapshot is wrongly rejected for lacking a weight.
+    "chat_template.json",
+    "chat_template.jinja",
+    "added_tokens.json",
     "vocab.json",
     "merges.txt",
     "readme.md",
