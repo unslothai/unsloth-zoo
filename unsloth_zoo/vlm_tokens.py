@@ -42,9 +42,9 @@ IMAGE_TOKENS = [
     "[IMG]",              # Mistral
     "[IMG_BREAK]",        # Mistral
     "[IMG_END]",          # Mistral
-    "<image_soft_token>", # Gemma 3
-    "<start_of_image>",   # Gemma 3
-    "<end_of_image>",     # Gemma 3
+    "<image_soft_token>", # Gemma 3 / 3n
+    "<start_of_image>",   # Gemma 3 / 3n
+    "<end_of_image>",     # Gemma 3 / 3n
     "<|image>",           # Gemma 4 (begin image; <|image|> already listed above)
     "<image|>",           # Gemma 4 (end image)
     "<|video|>",          # Gemma 4
@@ -56,9 +56,12 @@ IMAGE_TOKENS = [
 
 # Audio placeholder tokens.
 AUDIO_TOKENS = [
-    "<|audio|>",  # Gemma 4
-    "<|audio>",   # Gemma 4 (begin audio)
-    "<audio|>",   # Gemma 4 (end audio)
+    "<|audio|>",          # Gemma 4
+    "<|audio>",           # Gemma 4 (begin audio)
+    "<audio|>",           # Gemma 4 (end audio)
+    "<audio_soft_token>", # Gemma 3n
+    "<start_of_audio>",   # Gemma 3n (begin audio)
+    "<end_of_audio>",     # Gemma 3n (end audio)
 ]
 
 # Combined list for callers that mask every media placeholder at once.
