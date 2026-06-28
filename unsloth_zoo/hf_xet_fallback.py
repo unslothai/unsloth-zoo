@@ -503,20 +503,43 @@ def _resolve_exception_class(type_name: str) -> "Optional[type]":
     return None
 
 
+def _instantiate_preserving_type(exc_cls: type, message: str) -> "Optional[BaseException]":
+    """Build an *exc_cls* instance carrying *message*, robust to a finicky constructor. Hub error
+    classes (``RepositoryNotFoundError`` ...) subclass ``HfHubHTTPError``, whose ``response`` arg is
+    keyword-only -- and required on some huggingface_hub versions -- so a plain ``exc_cls(message)``
+    can raise ``TypeError``. Try the normal constructors first (best fidelity: they default
+    ``response`` / ``server_message``), then BYPASS ``__init__`` via ``__new__`` so the TYPE and the
+    message survive even when no constructor accepts a lone string. Returns None only if even
+    ``__new__`` fails, so the caller can fall back to ``RuntimeError``."""
+    for build in (
+        lambda: exc_cls(message),
+        lambda: exc_cls(message, response = None),
+    ):
+        try:
+            return build()
+        except Exception:
+            continue
+    try:
+        exc = exc_cls.__new__(exc_cls)
+        BaseException.__init__(exc, message)
+        return exc
+    except Exception:
+        return None
+
+
 def _raise_child_error(message: str) -> None:
     """Re-raise a deterministic child download error, preserving its original exception TYPE when it
     is a known Hub / OS error, so callers that catch ``RepositoryNotFoundError`` / ``GatedRepoError``
     / ``OSError`` (auth prompts, offline handling, disk cleanup) still see those types across the
     spawn-process boundary. The child reports the failure as ``"<ClassName>: <message>"``, so the
-    type is reconstructed from that prefix; anything unrecognized falls back to ``RuntimeError`` (the
-    prior behavior). A class whose constructor rejects a lone string also degrades to RuntimeError."""
+    type is reconstructed from that prefix; anything unrecognized -- or a class that cannot be
+    instantiated at all -- falls back to ``RuntimeError`` (the prior behavior)."""
     type_name = message.split(":", 1)[0].strip() if ":" in message else ""
     exc_cls = _resolve_exception_class(type_name)
     if exc_cls is None:
         raise RuntimeError(message)
-    try:
-        exc = exc_cls(message)
-    except Exception:
+    exc = _instantiate_preserving_type(exc_cls, message)
+    if exc is None:
         raise RuntimeError(message)
     raise exc
 

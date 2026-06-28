@@ -2342,3 +2342,40 @@ def test_resolve_exception_class_maps_known_names():
     cls = xf._resolve_exception_class("RepositoryNotFoundError")
     assert cls is not None and issubclass(cls, BaseException)
     assert xf._resolve_exception_class("NotARealErrorType") is None
+
+
+def test_error_type_preserved_when_constructor_needs_kwarg(monkeypatch):
+    """A Hub error class whose constructor rejects a lone positional string (newer huggingface_hub
+    makes HfHubHTTPError's `response` required / keyword-only) must STILL be re-raised with its type
+    preserved -- via an __init__-bypassing reconstruction -- not silently downgraded to RuntimeError
+    (Codex #829)."""
+    class PickyHubError(Exception):
+        def __init__(self, message, *, response):  # response required + keyword-only
+            super().__init__(message)
+            self.response = response
+
+    monkeypatch.setattr(
+        xf, "_resolve_exception_class",
+        lambda name: PickyHubError if name == "PickyHubError" else None,
+    )
+    fake = _install(monkeypatch, [("error", "PickyHubError: kaboom")])
+    with pytest.raises(PickyHubError, match = "kaboom"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"
+
+
+def test_instantiate_preserving_type_paths():
+    """Direct coverage of the layered reconstruction: a normal constructor is used when it accepts a
+    string; a keyword-only-required constructor falls through to the __new__ bypass; both yield an
+    instance of the requested type carrying the message (Codex #829)."""
+    class Plain(Exception):
+        pass
+
+    class Picky(Exception):
+        def __init__(self, message, *, response):
+            super().__init__(message)
+
+    for cls in (Plain, Picky):
+        exc = xf._instantiate_preserving_type(cls, "the message")
+        assert isinstance(exc, cls)
+        assert "the message" in str(exc)
