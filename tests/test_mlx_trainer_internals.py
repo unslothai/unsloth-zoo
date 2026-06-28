@@ -96,15 +96,9 @@ def test_mlx_trainer_distributed_defaults_world_size_one():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class DummyModel:
-        def trainable_parameters(self):
-            return {}
+        def trainable_parameters(self): return {}
 
-    trainer = MLXTrainer(
-        model=DummyModel(),
-        tokenizer=None,
-        train_dataset=[],
-        args=MLXTrainingConfig(),
-    )
+    trainer = MLXTrainer(DummyModel(), None, [], args=MLXTrainingConfig())
 
     assert trainer._distributed_initialized is False
     assert trainer.distributed_rank == 0
@@ -121,20 +115,15 @@ def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
     import unsloth_zoo.mlx.trainer as trainer_mod
 
     class FakeWorld:
-        def rank(self):
-            return 1
-
-        def size(self):
-            return 2
+        def rank(self): return 1
+        def size(self): return 2
 
     calls = []
-
     def fake_init():
         calls.append("init")
         return FakeWorld()
 
     monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
-
     trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
 
     assert trainer.distributed_world is trainer.distributed_world

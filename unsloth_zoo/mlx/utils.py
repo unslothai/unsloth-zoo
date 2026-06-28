@@ -3206,7 +3206,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
                        num_epochs=None, completion_only_loss=None,
-                       image_size=None):
+                       image_size=None, comm_group=None):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -3220,6 +3220,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     batch_list = []
     seen = 0
     epoch = 0
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     base_seed = _normalize_seed(seed)
     target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
     base_indices = list(range(len(dataset)))
@@ -3277,8 +3278,16 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             seen = 0
             indices = _epoch_indices(epoch)
 
-        bi = indices[seen : seen + batch_size]
+        bi = indices[seen : seen + global_batch_size]
         seen += len(bi)
+        if not bi:
+            break
+        bi = _rank_slice_distributed_batch(
+            bi,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=indices,
+        )
         if not bi:
             break
         batch_dict = _build_response_masked_vlm_batch(
@@ -3318,7 +3327,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   formatting_func=None,
                                   dataset_order="default",
                                   completion_only_loss=None,
-                                  image_size=None):
+                                  image_size=None, comm_group=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -3329,6 +3338,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
     base_seed = _normalize_seed(seed)
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
 
     def _build_batch(items, batch_formatting_func):
         """Build one VLM batch with the selected formatting function."""
@@ -3391,37 +3401,52 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             elif dataset_order in (None, "default"):
                 indices = list(base_indices)
                 batch_indices = [
-                    indices[i : i + batch_size]
-                    for i in range(0, len(indices), batch_size)
+                    indices[i : i + global_batch_size]
+                    for i in range(0, len(indices), global_batch_size)
                 ]
                 # Local RNG keeps order reproducible under `seed`; reseed per epoch.
                 rng = np.random.default_rng(base_seed + epoch)
                 order = rng.permutation(len(batch_indices))
                 for b in order:
-                    yield _build_batch(
-                        [_item(idx) for idx in batch_indices[b]],
-                        batch_formatting_func,
+                    local_indices = _rank_slice_distributed_batch(
+                        batch_indices[b],
+                        batch_size,
+                        comm_group=comm_group,
+                        pad_source=indices,
                     )
+                    if local_indices:
+                        yield _build_batch(
+                            [_item(idx) for idx in local_indices],
+                            batch_formatting_func,
+                        )
                 epoch += 1
                 continue
             else:
                 raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
-            for start in range(0, len(indices), batch_size):
-                yield _build_batch(
-                    [_item(idx) for idx in indices[start : start + batch_size]],
-                    batch_formatting_func,
+            for start in range(0, len(indices), global_batch_size):
+                local_indices = _rank_slice_distributed_batch(
+                    indices[start : start + global_batch_size],
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=indices,
                 )
+                if local_indices:
+                    yield _build_batch(
+                        [_item(idx) for idx in local_indices],
+                        batch_formatting_func,
+                    )
             epoch += 1
     else:
-        # Streaming has no index space; refuse rather than silently misorder.
-        if dataset_order not in (None, "default"):
+        # Streaming has no random-access index space; deterministic stream
+        # order is replayable, but torch_randperm needs sized epochs.
+        if dataset_order == "torch_randperm":
             raise ValueError(
                 "Unsloth MLX VLM: preserve_dataset_order / "
-                f"dataset_order={dataset_order!r} requires a sized "
-                "(`__len__`) dataset. Materialize the dataset (e.g. "
-                "via `dataset.to_iterable_dataset()` -> list) or drop "
-                "the order request."
+                "dataset_order='torch_randperm' requires a sized "
+                "(`__len__`) dataset."
             )
+        if dataset_order not in (None, "default", "sequential"):
+            raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
         def _filter_stream_item(item):
             """Return a formatted trainable streaming row, or None to skip it."""
             if response_mask_fn is None:
@@ -3450,21 +3475,40 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         batch_formatting_func = None if response_mask_fn is not None else formatting_func
         while True:
             pending = []
+            pad_source = []
             yielded = False
             for item in dataset:
                 item = _filter_stream_item(item)
                 if item is None:
                     continue
+                pad_source.append(item)
                 pending.append(item)
-                if len(pending) >= batch_size:
-                    yielded = True
-                    yield _build_batch(pending, batch_formatting_func)
+                if len(pending) >= global_batch_size:
+                    local_items = _rank_slice_distributed_batch(
+                        pending,
+                        batch_size,
+                        comm_group=comm_group,
+                        pad_source=pad_source,
+                    )
+                    if local_items:
+                        yielded = True
+                        yield _build_batch(local_items, batch_formatting_func)
                     pending = []
             if pending:
-                yielded = True
-                yield _build_batch(pending, batch_formatting_func)
+                local_items = _rank_slice_distributed_batch(
+                    pending,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=pad_source,
+                )
+                if local_items:
+                    yielded = True
+                    yield _build_batch(local_items, batch_formatting_func)
             if not yielded:
-                raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+                raise ValueError(
+                    "Unsloth MLX VLM: streaming dataset produced no rows. "
+                    "If resuming, use a replayable iterable rather than a one-shot iterator."
+                )
 
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
@@ -3672,6 +3716,41 @@ def _rank_slice_distributed_batch(
     return items[rank:target_size:world_size]
 
 
+def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
+    """Build a text training batch from tokenized items."""
+    if len(batch_items[0]) == 2:
+        batch, offsets = zip(*batch_items)
+    else:
+        batch = batch_items
+        offsets = [0] * len(batch_items)
+    lengths = [len(ids) for ids in batch]
+    if max(lengths) > max_seq_length:
+        print(
+            f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
+            f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
+            "Consider pre-splitting your data to save memory."
+        )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    pad_id = 0 if pad_id is None else int(pad_id)
+    pad_to = 32
+    max_length = 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to)
+    max_length = min(max_length, max_seq_length)
+    batch_ids = []
+    truncated_lengths = []
+    for ids, length in zip(batch, lengths):
+        truncated_length = min(length, max_seq_length)
+        truncated_lengths.append(truncated_length)
+        batch_ids.append(
+            list(ids)[:truncated_length]
+            + [pad_id] * (max_length - truncated_length)
+        )
+    return (
+        mx.array(np.asarray(batch_ids, dtype=np.int32)),
+        mx.array(np.asarray(list(zip(offsets, truncated_lengths)), dtype=np.int32)),
+        None,
+    )
+
+
 def _create_distributed_text_batches(
     dataset,
     batch_size,
@@ -3713,28 +3792,12 @@ def _create_distributed_text_batches(
             if not local_idx:
                 continue
             batch = [dataset[j] for j in local_idx]
-            if len(batch[0]) == 2:
-                batch, offsets = zip(*batch)
-            else:
-                offsets = [0] * len(batch)
-            lengths = [len(x) for x in batch]
-            if max(lengths) > max_seq_length:
-                print(
-                    f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
-                    f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
-                    "Consider pre-splitting your data to save memory."
-                )
-
-            pad_to = 32
-            max_length_in_batch = 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to)
-            max_length_in_batch = min(max_length_in_batch, max_seq_length)
-            batch_arr = np.zeros((len(batch), max_length_in_batch), np.int32)
-            for j in range(len(batch)):
-                truncated_length = min(lengths[j], max_seq_length)
-                batch_arr[j, :truncated_length] = batch[j][:truncated_length]
-                lengths[j] = truncated_length
             batch_pairs.append(
-                (mx.array(batch_arr), mx.array(list(zip(offsets, lengths))), None)
+                _make_text_batch_from_items(
+                    batch,
+                    tokenizer=None,
+                    max_seq_length=max_seq_length,
+                )
             )
             if num_batches is not None and len(batch_pairs) >= num_batches:
                 return batch_pairs
@@ -3868,11 +3931,143 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     return batch_pairs
 
 
+def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
+                              formatting_func=None, append_eos=True):
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    for item in dataset:
+        if formatting_func is not None:
+            item = formatting_func(item)
+        texts = collect_mlx_texts(
+            tokenizer,
+            item,
+            dataset_text_field=dataset_text_field,
+            is_vlm=False,
+        )
+        for text in texts:
+            ids = encode_mlx_text(tokenizer, text)
+            if eos_id is not None and (not ids or ids[-1] != eos_id):
+                ids = list(ids) + [int(eos_id)]
+            if ids:
+                yield (ids, 0)
+
+
+def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
+                                           max_seq_length, seed=42,
+                                           dataset_text_field="text",
+                                           formatting_func=None,
+                                           dataset_order="default",
+                                           append_eos=True,
+                                           comm_group=None):
+    base_seed = _normalize_seed(seed)
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+
+    def _yield_local_batch(chunk, pad_source):
+        pad_tokenizer = None if dataset_order in (None, "default") else tokenizer
+        local_items = _rank_slice_distributed_batch(
+            chunk,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=pad_source,
+        )
+        if local_items:
+            return _make_text_batch_from_items(
+                local_items,
+                pad_tokenizer,
+                max_seq_length,
+            )
+        return None
+
+    if hasattr(dataset, "__len__"):
+        tokenized = list(_iter_tokenized_text_rows(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+        ))
+        if not tokenized:
+            raise ValueError("Unsloth MLX: streaming dataset produced no text rows.")
+        epoch = 0
+        while True:
+            indices = list(range(len(tokenized)))
+            if dataset_order == "torch_randperm":
+                order = _torch_randperm_order(len(tokenized), base_seed + epoch)
+            elif dataset_order == "sequential":
+                order = indices
+            elif dataset_order in (None, "default"):
+                indices = sorted(indices, key=lambda i: len(tokenized[i][0]))
+                chunks = [
+                    indices[i : i + global_batch_size]
+                    for i in range(0, len(indices), global_batch_size)
+                ]
+                rng = np.random.default_rng(base_seed + epoch)
+                for chunk_idx in rng.permutation(len(chunks)):
+                    batch = _yield_local_batch(
+                        [tokenized[i] for i in chunks[chunk_idx]],
+                        tokenized,
+                    )
+                    if batch is not None:
+                        yield batch
+                epoch += 1
+                continue
+            else:
+                raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+            for start in range(0, len(order), global_batch_size):
+                chunk = order[start : start + global_batch_size]
+                batch = _yield_local_batch(
+                    [tokenized[i] for i in chunk],
+                    tokenized,
+                )
+                if batch is not None:
+                    yield batch
+            epoch += 1
+        return
+
+    if dataset_order == "torch_randperm":
+        raise ValueError(
+            "Unsloth MLX: dataset_order='torch_randperm' requires a sized "
+            "streaming dataset so each epoch can be replayed deterministically."
+        )
+    if dataset_order not in (None, "default", "sequential"):
+        raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+
+    while True:
+        pending = []
+        pad_source = []
+        yielded = False
+        for row in _iter_tokenized_text_rows(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+        ):
+            pending.append(row)
+            pad_source.append(row)
+            if len(pending) >= global_batch_size:
+                batch = _yield_local_batch(pending, pad_source)
+                if batch is not None:
+                    yielded = True
+                    yield batch
+                pending = []
+        if pending:
+            batch = _yield_local_batch(pending, pad_source)
+            if batch is not None:
+                yielded = True
+                yield batch
+        if not yielded:
+            raise ValueError(
+                "Unsloth MLX: streaming dataset produced no text rows. "
+                "If resuming, use a replayable iterable rather than a one-shot iterator."
+            )
+
+
 def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
                              model_name=None, model_type=None,
-                             append_eos=True):
+                             append_eos=True, dataset_order="default",
+                             comm_group=None):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
@@ -3881,24 +4076,51 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     Yields:
         (batch, lengths) tuples — same format as create_batches.
     """
-    from mlx_lm.tuner.trainer import iterate_batches
-
-    ds = _prepare_dataset(
-        dataset, tokenizer, dataset_text_field, formatting_func,
+    normalize_mlx_chat_template(
+        tokenizer,
         chat_template=chat_template,
         model_name=model_name,
         model_type=model_type,
-        append_eos=append_eos,
+        is_vlm=False,
+        strict=False,
     )
 
-    for batch, lengths_info in iterate_batches(
-        ds, batch_size, max_seq_length,
-        loop=True,
-        seed=seed,
+    if (
+        _distributed_rank_size(comm_group)[1] <= 1
+        and dataset_order in (None, "default")
     ):
-        max_length = int(mx.max(lengths_info[:, 1]).item())
-        batch = batch[:, :max_length]
-        yield batch, lengths_info, None
+        from mlx_lm.tuner.trainer import iterate_batches
+
+        ds = _prepare_dataset(
+            dataset, tokenizer, dataset_text_field, formatting_func,
+            chat_template=None,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+        )
+
+        for batch, lengths_info in iterate_batches(
+            ds, batch_size, max_seq_length,
+            loop=True,
+            seed=seed,
+        ):
+            max_length = int(mx.max(lengths_info[:, 1]).item())
+            batch = batch[:, :max_length]
+            yield batch, lengths_info, None
+        return
+
+    yield from _iterate_ordered_text_training_batches(
+        dataset,
+        tokenizer,
+        batch_size,
+        max_seq_length,
+        seed=seed,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+        dataset_order=dataset_order,
+        append_eos=append_eos,
+        comm_group=comm_group,
+    )
 
 
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):

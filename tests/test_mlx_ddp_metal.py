@@ -23,16 +23,34 @@ from mlx.utils import tree_flatten
 from unsloth_zoo import dataset_utils
 import unsloth_zoo.mlx.trainer as trainer_mod
 from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig, _create_labeled_batches, train_on_responses_only
-from unsloth_zoo.mlx.utils import create_batches, create_ordered_batches
+from unsloth_zoo.mlx.utils import create_batches, create_ordered_batches, create_vlm_batches, iterate_training_batches, iterate_vlm_training_batches
 
 class TinyTokenizer:
     pad_token_id = eos_token_id = 2
     def encode(self, text): return [int(part) for part in str(text).split()]
     def __call__(self, text, **_kwargs): return {"input_ids": self.encode(text)}
 
+class TinyProcessor:
+    tokenizer = TinyTokenizer()
+    image_processor = object()
+    def __call__(self, text, **_kwargs):
+        rows = [[int(str(item)), 20, 2] for item in text]
+        return {"input_ids": mx.array(rows, dtype=mx.int32), "attention_mask": mx.ones((len(rows), 3), dtype=mx.int32)}
+
 def keep_all_labels(d): return {"labels": [list(d["input_ids"][0])]}
 def first_token_rows(batches):
     return [[int(row[0]) for row in batch.tolist()] for batch, _, _ in batches]
+def take_stream_rows(iterator, count):
+    rows = []
+    for _ in range(count):
+        item = next(iterator); batch = item["input_ids"] if isinstance(item, dict) else item[0]; rows.append([int(row[0]) for row in batch.tolist()])
+    return rows
+
+class ReplayableStream:
+    def __iter__(self): return ({"text": f"{i} {i + 20} {i + 30}"} for i in range(10, 15))
+
+class ReplayableVLMStream:
+    def __iter__(self): return ({"text": str(i)} for i in range(10, 15))
 
 world = mx.distributed.init()
 trainer = MLXTrainer.__new__(MLXTrainer)
@@ -51,51 +69,49 @@ class TinyLM(nn.Module):
         self.proj = nn.Linear(8, 64, bias=False); self._config = {"model_type": "tiny"}
     def __call__(self, x): return self.proj(self.embed(x))
 
+class TinyVLM(nn.Module):
+    _is_vlm_model = True
+    def __init__(self):
+        super().__init__(); self.embed = nn.Embedding(64, 8)
+        self.proj = nn.Linear(8, 64, bias=False); self._config = {"model_type": "tiny_vlm", "image_token_id": 20}
+    def __call__(self, input_ids, **_kwargs): return self.proj(self.embed(input_ids))
+
 def mark(name):
     def inner(*_args, **_kwargs):
         Path(sys.argv[1], f"{name}_rank{world.rank()}").write_text("1")
     return inner
 
-real_save_trainable_adapters = trainer_mod.save_trainable_adapters
-real_save_optimizer_state = trainer_mod.save_optimizer_state
-real_save_trainer_state = trainer_mod.save_trainer_state
+real_save_trainable_adapters, real_save_optimizer_state, real_save_trainer_state = trainer_mod.save_trainable_adapters, trainer_mod.save_optimizer_state, trainer_mod.save_trainer_state
 trainer_mod.save_trainable_adapters = mark("ckpt_adapter")
 trainer_mod.save_optimizer_state = mark("ckpt_opt")
 trainer_mod.save_trainer_state = mark("ckpt_state")
 mx.random.seed(0)
 train_data = [{"text": f"{i} {i + 1} {i + 2}"} for i in range(10, 18)]
-args = MLXTrainingConfig(
-    per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=3,
-    logging_steps=1, eval_steps=1, save_steps=1, learning_rate=1e-3,
-    max_seq_length=8, output_dir=str(Path(sys.argv[1], "train_out")),
-    use_cce=False, gradient_checkpointing=False,
-    cast_norm_output_to_input_dtype=False, dataset_order="sequential",
-)
+args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=3, logging_steps=1, eval_steps=1, save_steps=1, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "train_out")), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
 loop_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), train_data, eval_dataset=train_data[:4], args=args)
 events = []
 loop_trainer.save_model = mark("final")
 loop_trainer.add_step_callback(lambda *args: events.append(["step", int(args[7])]))
-loop_trainer.add_eval_callback(
-    lambda *_args: (events.append(["eval"]), setattr(loop_trainer, "stop_requested", True))
-)
+loop_trainer.add_eval_callback(lambda *_args: (events.append(["eval"]), setattr(loop_trainer, "stop_requested", True)))
 dataset_utils.train_on_responses_only = lambda *_args, **_kwargs: keep_all_labels
 train_on_responses_only(loop_trainer, instruction_part="user", response_part="assistant")
 response_rows = first_token_rows(loop_trainer._batches)
 result = loop_trainer.train()
 param_sum = mx.sum(loop_trainer.model.embed.weight) + mx.sum(loop_trainer.model.proj.weight)
-trainer_mod.save_trainable_adapters = real_save_trainable_adapters
-trainer_mod.save_optimizer_state = real_save_optimizer_state
-trainer_mod.save_trainer_state = real_save_trainer_state
+mx.random.seed(1)
+stream_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=1, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "stream_train_out")), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
+stream_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), ReplayableStream(), eval_dataset=train_data[:4], args=stream_args)
+stream_events = []
+stream_trainer.save_model = mark("stream_final")
+stream_trainer.add_step_callback(lambda step, *_args: stream_events.append(["step", int(step)]))
+stream_trainer.add_eval_callback(lambda step, loss, _ppl: stream_events.append(["eval", int(step), float(loss)]))
+stream_trainer.train()
+stream_param_sum = mx.sum(stream_trainer.model.embed.weight) + mx.sum(stream_trainer.model.proj.weight)
+trainer_mod.save_trainable_adapters, trainer_mod.save_optimizer_state, trainer_mod.save_trainer_state = real_save_trainable_adapters, real_save_optimizer_state, real_save_trainer_state
 parity_data = [{"text": f"{i} {i + 1} {i + 2}"} for i in range(10, 18)]
 def make_parity_trainer(output_name, seed=123):
     mx.random.seed(seed)
-    parity_args = MLXTrainingConfig(
-        per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=3,
-        logging_steps=1, eval_steps=0, save_steps=2, learning_rate=1e-3,
-        max_seq_length=8, output_dir=str(Path(sys.argv[1], output_name)),
-        use_cce=False, gradient_checkpointing=False,
-        cast_norm_output_to_input_dtype=False, dataset_order="sequential",
-    )
+    parity_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=3, logging_steps=1, eval_steps=0, save_steps=2, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], output_name)), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
     out = MLXTrainer(TinyLM(), TinyTokenizer(), parity_data, args=parity_args)
     out.save_model = mark(f"{output_name}_final")
     return out
@@ -112,17 +128,27 @@ def max_trainable_delta(left, right):
 fresh_trainer = make_parity_trainer("resume_fresh")
 fresh_trainer.train()
 partial_trainer = make_parity_trainer("resume_partial")
-partial_trainer.add_step_callback(
-    lambda step, *_args: setattr(partial_trainer, "stop_requested", step >= 2)
-)
+partial_trainer.add_step_callback(lambda step, *_args: setattr(partial_trainer, "stop_requested", step >= 2))
 partial_trainer.train()
 sync = trainer._distributed_all_sum(mx.array(1, dtype=mx.int32), stream=mx.cpu)
 mx.eval(sync)
 resumed_trainer = make_parity_trainer("resume_resumed", seed=987)
-resumed_trainer.train(
-    resume_from_checkpoint=str(Path(sys.argv[1], "resume_partial", "checkpoint-2"))
-)
+resumed_trainer.train(resume_from_checkpoint=str(Path(sys.argv[1], "resume_partial", "checkpoint-2")))
 resume_param_delta = max_trainable_delta(fresh_trainer, resumed_trainer)
+trainer_mod.save_trainable_adapters = mark("vlm_ckpt_adapter")
+trainer_mod.save_optimizer_state = mark("vlm_ckpt_opt")
+trainer_mod.save_trainer_state = mark("vlm_ckpt_state")
+mx.random.seed(1)
+vlm_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=1, save_steps=1, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "vlm_train_out")), use_cce=False, compile=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
+vlm_processor = TinyProcessor()
+vlm_train_data = [{"text": str(i)} for i in range(10, 18)]
+vlm_trainer = MLXTrainer(TinyVLM(), vlm_processor, vlm_train_data, eval_dataset=vlm_train_data[:4], args=vlm_args, processor=vlm_processor)
+vlm_events = []
+vlm_trainer.save_model = mark("vlm_final")
+vlm_trainer.add_step_callback(lambda step, *_args: vlm_events.append(["step", int(step)]))
+vlm_trainer.add_eval_callback(lambda step, loss, _ppl: vlm_events.append(["eval", int(step), float(loss)]))
+vlm_trainer.train()
+vlm_param_sum = mx.sum(vlm_trainer.model.embed.weight) + mx.sum(vlm_trainer.model.proj.weight)
 ckpt = Path(sys.argv[1], "resume_ckpt"); ckpt.mkdir(exist_ok=True)
 for name in ("adapters.safetensors", "optimizer_state.safetensors", "trainer_state.json"):
     (ckpt / name).write_text("x")
@@ -140,21 +166,23 @@ payload = {
     "param_sum": float(param_sum.item()),
     "loop_main": bool(result["distributed_is_main_process"]),
     "response_rows": response_rows,
+    "stream_events": stream_events,
+    "stream_step": int(stream_trainer._global_step),
+    "stream_param_sum": float(stream_param_sum.item()),
     "fresh_losses": [float(x) for x in fresh_trainer._train_loss_history],
     "resumed_losses": [float(x) for x in resumed_trainer._train_loss_history],
     "resume_param_delta": resume_param_delta,
+    "vlm_events": vlm_events,
+    "vlm_step": int(vlm_trainer._global_step),
+    "vlm_param_sum": float(vlm_param_sum.item()),
     "resume_ok": Path(trainer._validate_distributed_resume_checkpoint(ckpt)).name,
     "resume_mismatch": resume_mismatch,
     "default": first_token_rows(create_batches(data, TinyTokenizer(), seed=1, **common)),
-    "ordered": first_token_rows(
-        create_ordered_batches(data, TinyTokenizer(), dataset_order="sequential", **common)
-    ),
-    "labeled": first_token_rows(
-        _create_labeled_batches(
-            data, TinyTokenizer(), keep_all_labels,
-            dataset_order="sequential", **common,
-        )
-    ),
+    "ordered": first_token_rows(create_ordered_batches(data, TinyTokenizer(), dataset_order="sequential", **common)),
+    "labeled": first_token_rows(_create_labeled_batches(data, TinyTokenizer(), keep_all_labels, dataset_order="sequential", **common)),
+    "stream_text": take_stream_rows(iterate_training_batches(ReplayableStream(), TinyTokenizer(), batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world), 2),
+    "vlm": [[int(row[0]) for row in batch["input_ids"].tolist()] for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 15)], TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world)],
+    "stream_vlm": take_stream_rows(iterate_vlm_training_batches(ReplayableVLMStream(), TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world), 2),
 }
 Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
 """,
@@ -184,14 +212,34 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert [rank["loop_step"] for rank in ranks] == [1, 1]
     assert abs(ranks[0]["param_sum"] - ranks[1]["param_sum"]) < 1e-5
     assert [rank["response_rows"] for rank in ranks] == [[[10], [12], [14], [16]], [[11], [13], [15], [17]]]
+    assert [rank["stream_step"] for rank in ranks] == [1, 1]
+    assert ranks[0]["stream_events"][0] == ["step", 1]
+    assert ranks[0]["stream_events"][1][0:2] == ["eval", 1]
+    assert ranks[0]["stream_events"][1][2] > 0
+    assert ranks[1]["stream_events"] == []
+    assert abs(ranks[0]["stream_param_sum"] - ranks[1]["stream_param_sum"]) < 1e-5
     assert ranks[0]["fresh_losses"] == pytest.approx(ranks[0]["resumed_losses"], abs=1e-6)
     assert ranks[0]["resume_param_delta"] < 1e-5
     assert ranks[1]["resume_param_delta"] < 1e-5
+    assert [rank["vlm_step"] for rank in ranks] == [1, 1]
+    assert ranks[0]["vlm_events"][0] == ["step", 1]
+    assert ranks[0]["vlm_events"][1][0:2] == ["eval", 1]
+    assert ranks[0]["vlm_events"][1][2] > 0
+    assert ranks[1]["vlm_events"] == []
+    assert abs(ranks[0]["vlm_param_sum"] - ranks[1]["vlm_param_sum"]) < 1e-5
     assert [rank["resume_ok"] for rank in ranks] == ["resume_ckpt", "resume_ckpt"]
     assert all("all ranks must either resume" in rank["resume_mismatch"] for rank in ranks)
     for prefix in ("ckpt_adapter", "ckpt_opt", "ckpt_state", "final"):
         assert (tmp_path / f"{prefix}_rank0").exists()
         assert not (tmp_path / f"{prefix}_rank1").exists()
+    for prefix in ("vlm_ckpt_adapter", "vlm_ckpt_opt", "vlm_ckpt_state", "vlm_final"):
+        assert (tmp_path / f"{prefix}_rank0").exists()
+        assert not (tmp_path / f"{prefix}_rank1").exists()
+    assert (tmp_path / "stream_final_rank0").exists()
+    assert not (tmp_path / "stream_final_rank1").exists()
     assert [rank["default"] for rank in ranks] == expected
     assert [rank["ordered"] for rank in ranks] == expected
     assert [rank["labeled"] for rank in ranks] == expected
+    assert [rank["vlm"] for rank in ranks] == expected
+    assert [rank["stream_text"] for rank in ranks] == expected
+    assert [rank["stream_vlm"] for rank in ranks] == expected

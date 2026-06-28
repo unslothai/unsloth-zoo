@@ -1862,20 +1862,6 @@ class MLXTrainer:
             if is_main_process:
                 print(*print_args, **print_kwargs)
 
-        if is_vlm and distributed_world_size > 1:
-            raise ValueError(
-                "Unsloth MLX: VLM DDP requires VLM batch sharding, which is "
-                "not enabled in this stage. Use a single MLX process for VLM "
-                "training until the VLM DDP stage lands."
-            )
-        if getattr(args, "streaming", False) and distributed_world_size > 1:
-            raise ValueError(
-                "Unsloth MLX: streaming DDP requires distributed streaming "
-                "batch sharding, which is not enabled in this stage. Disable "
-                "streaming or use a single MLX process until the streaming "
-                "DDP stage lands."
-            )
-
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
         _vlm_ignore_token_ids = None
@@ -2344,6 +2330,7 @@ class MLXTrainer:
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
                             completion_only_loss=text_completion_only_loss,
+                            comm_group=self.distributed_world,
                         )
                     return create_batches(
                         dataset=eval_dataset,
@@ -2859,6 +2846,7 @@ class MLXTrainer:
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
                     completion_only_loss=text_completion_only_loss,
+                    comm_group=comm_group,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -2876,6 +2864,7 @@ class MLXTrainer:
                     dataset_order=vlm_dataset_order,
                     num_epochs=vlm_num_epochs,
                     completion_only_loss=text_completion_only_loss,
+                    comm_group=comm_group,
                 )
                 if _vlm_mask_fn is not None and batches:
                     _check_vlm_all_masked(batches)
@@ -2883,16 +2872,11 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                # Streaming has no index space; refuse explicit order requests.
-                if (
-                    getattr(args, "preserve_dataset_order", False)
-                    or getattr(args, "dataset_order", "default") != "default"
-                ):
-                    raise ValueError(
-                        "Unsloth MLX: preserve_dataset_order / dataset_order is not "
-                        "supported with streaming=True for text training. Disable "
-                        "streaming or materialize batches."
-                    )
+                text_dataset_order = (
+                    "sequential"
+                    if getattr(args, "preserve_dataset_order", False)
+                    else getattr(args, "dataset_order", "default")
+                )
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -2905,6 +2889,8 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    dataset_order=text_dataset_order,
+                    comm_group=comm_group,
                 )
             else:
                 batch_kwargs = dict(
