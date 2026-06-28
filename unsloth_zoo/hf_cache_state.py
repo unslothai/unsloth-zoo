@@ -394,6 +394,25 @@ def _requested_scope_filter(
     return kept
 
 
+def snapshot_has_requested_broken_symlinks(
+    snapshot_dir: Path,
+    *,
+    allow_patterns: "Optional[object]" = None,
+    ignore_patterns: "Optional[object]" = None,
+) -> bool:
+    """True iff a dangling symlink in *snapshot_dir* is for a file the request actually SELECTS.
+
+    A dangling symlink marks an interrupted download, but for a scoped request only one for a
+    requested file should reject the snapshot: a dangling root ``model.safetensors`` left by an
+    earlier interrupted pull must not fail a weightless ``allow_patterns=["config.json"]`` request
+    whose config is on disk. Mirrors the scoped broken-symlink handling inside
+    ``snapshot_dir_is_complete`` so the weightless / non-model path is scoped the same way."""
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    broken = _broken_symlink_rel_paths(snapshot_dir)
+    return bool(broken and _requested_scope_filter(broken, allow_patterns, ignore_patterns))
+
+
 def snapshot_dir_is_complete(
     snapshot_dir: Path,
     *,
@@ -714,6 +733,11 @@ _NON_WEIGHT_PROBE_NAMES = (
     "special_tokens_map.json",
     "generation_config.json",
     "preprocessor_config.json",
+    # Processor metadata: a processor-only warm (allow_patterns=["processor*"]) selects these and no
+    # weight, so a representative must be here for _basename_is_non_weight to read the glob as
+    # metadata-only (else the snapshot is wrongly rejected for lacking a weight).
+    "processor_config.json",
+    "video_preprocessor_config.json",
     "vocab.json",
     "merges.txt",
     "readme.md",

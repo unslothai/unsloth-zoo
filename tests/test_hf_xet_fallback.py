@@ -2471,3 +2471,36 @@ def test_oserror_errno_preserved(monkeypatch):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert excinfo.value.errno == _errno.ENOSPC
     assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"
+
+
+# --------------------------------------------------------------------------- #
+# Codex round: weightless broken-symlink scoping + processor metadata glob.
+# --------------------------------------------------------------------------- #
+def test_weightless_broken_symlink_scoped_to_request(tmp_path):
+    """A weightless request (allow=['config.json']) must accept a snapshot whose config is present
+    even when an EXCLUDED weight left a dangling symlink from an earlier interrupted pull -- only a
+    dangling REQUESTED file rejects it (Codex #829)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    (snap / "model.safetensors").symlink_to(tmp_path / "missing-blob")  # dangling, NOT requested
+    assert hcs.snapshot_has_requested_broken_symlinks(snap, allow_patterns = ["config.json"]) is False
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["config.json"], ignore_patterns = None
+    ) is True
+    # A dangling REQUESTED file does reject.
+    (snap / "config.json").unlink()
+    (snap / "config.json").symlink_to(tmp_path / "missing-cfg")
+    assert hcs.snapshot_has_requested_broken_symlinks(snap, allow_patterns = ["config.json"]) is True
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["config.json"], ignore_patterns = None
+    ) is False
+
+
+def test_processor_glob_is_weightless():
+    """A processor-only warm (allow=['processor*']) selects processor_config.json and no weight, so
+    it must read as weightless rather than be rejected for lacking weights (Codex #829)."""
+    assert hcs._basename_is_non_weight("processor*") is True
+    assert hcs.request_can_include_weights(allow_patterns = ["processor*"]) is False
+    # control: a real weight glob stays weight-including
+    assert hcs.request_can_include_weights(allow_patterns = ["model*"]) is True

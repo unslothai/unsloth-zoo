@@ -57,6 +57,7 @@ from unsloth_zoo.hf_cache_state import (
     requested_named_files_present,
     snapshot_dir_has_broken_symlinks,
     snapshot_dir_is_complete,
+    snapshot_has_requested_broken_symlinks,
 )
 
 logger = logging.getLogger(__name__)
@@ -972,11 +973,15 @@ def _snapshot_is_acceptable(
         )
     # Weightless / non-model request (a dataset, or a model repo whose patterns drop every weight
     # format, e.g. a tokenizer-only allow list): no weight is expected, so completeness is "no
-    # dangling symlink". But an EXACT-named weightless request (allow_patterns=["tokenizer.json"],
-    # no globs) must still find its named files on disk -- HF can hand back a config-only snapshot
-    # dir that simply does not contain the requested file. A glob-bearing list stays best-effort.
+    # dangling symlink among the REQUESTED files". The broken-symlink check is scoped to the request
+    # (like snapshot_dir_is_complete), so a dangling EXCLUDED weight left by an earlier interrupted
+    # pull does not reject a complete config/tokenizer subset. An EXACT-named weightless request
+    # (allow_patterns=["tokenizer.json"], no globs) must still find its named files on disk -- HF can
+    # hand back a config-only snapshot dir that simply lacks the requested file. Globs stay best-effort.
     return (
-        not snapshot_dir_has_broken_symlinks(snapshot_dir)
+        not snapshot_has_requested_broken_symlinks(
+            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+        )
         and requested_named_files_present(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
         )
