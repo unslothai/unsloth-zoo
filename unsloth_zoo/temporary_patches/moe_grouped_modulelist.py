@@ -183,12 +183,24 @@ def _experts_have_lora(experts, spec) -> bool:
     return False
 
 
+def _expert_compute_dtype(experts, spec):
+    """The dtype the frozen expert matmul runs in: bnb uses the quant compute dtype,
+    a plain frozen Linear uses its weight dtype. Used to keep numerics bnb-identical."""
+    w = getattr(getattr(experts[0], spec[0], None), "weight", None)
+    if HAS_BNB and isinstance(w, Params4bit):
+        return getattr(getattr(w, "quant_state", None), "dtype", torch.bfloat16)
+    return getattr(w, "dtype", torch.bfloat16)
+
+
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
-    # Fall back to the original forward for CPU/offloaded inputs or experts that gained
-    # LoRA after patching (grouped stays on the frozen-expert CUDA path only).
-    if (not hidden_states.is_cuda) or _experts_have_lora(experts, spec):
+    # Fall back to the exact original loop unless this is the frozen-expert CUDA path on a
+    # grouped_mm-supported dtype that matches the experts' compute dtype (so CPU/offload,
+    # LoRA-on-experts, fp32, or a bnb compute_dtype != activation dtype stay bit-identical).
+    if (not hidden_states.is_cuda) or _experts_have_lora(experts, spec) \
+            or hidden_states.dtype not in (torch.bfloat16, torch.float16) \
+            or _expert_compute_dtype(experts, spec) != hidden_states.dtype:
         return self._orig_moe_forward(hidden_states)
     is_3d = hidden_states.dim() == 3
     if is_3d:
@@ -271,7 +283,8 @@ def _block_is_eligible(block):
             if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
                 return None
             is_4bit = HAS_BNB and isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None
-            is_plain_frozen = (not w.requires_grad) and w.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            # fp32 omitted: torch._grouped_mm targets low-precision CUDA inputs.
+            is_plain_frozen = (not w.requires_grad) and w.dtype in (torch.bfloat16, torch.float16)
             if not (is_4bit or is_plain_frozen):
                 return None
     return spec
