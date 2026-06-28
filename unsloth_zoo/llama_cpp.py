@@ -2508,6 +2508,7 @@ def quantize_gguf(
     quantizer_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize"),
     n_threads = None,
     print_output = True,
+    imatrix = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
@@ -2551,6 +2552,10 @@ def quantize_gguf(
             '--token-embedding-type Q4_K '
         )
         quant_type = "q2_k"
+
+    # An imatrix unlocks the IQ low-bit quants; prepend it (before the positional args) and quote.
+    if imatrix is not None and str(imatrix) != "":
+        _extra_flags = f"--imatrix {_quote(imatrix)} " + _extra_flags
 
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
