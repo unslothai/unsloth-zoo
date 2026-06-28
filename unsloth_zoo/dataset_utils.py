@@ -383,10 +383,11 @@ def train_on_responses_only(
         return any(l != -100 for l in labels)
     pass
 
-    def _raise_if_truncated(dataset, dropped):
+    def _diagnose_truncation(dataset, dropped, fatal):
         # When (nearly) the whole dataset is masked away, the usual cause is
         # truncation: max_length cut off the response marker before masking found
-        # it. Explain that instead of failing later with an opaque zero-loss error.
+        # it. Raise when nothing is left to train on, otherwise just warn so the
+        # surviving rows still train (matching the old filter behaviour).
         if getattr(trainer.args, "packing", False): return
         max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", None)
         n_sampled = 0; n_trunc = 0
@@ -403,13 +404,15 @@ def train_on_responses_only(
             if marker_absent or at_max_len: n_trunc += 1
         if n_sampled == 0 or n_trunc / n_sampled < 0.9: return
         ml = max_length if max_length is not None else 1024
-        raise ValueError(
-            "Unsloth: train_on_responses_only masked every label to -100, so the training loss would be 0.\n"
+        message = (
+            "Unsloth: train_on_responses_only masked all/most labels to -100.\n"
             f"The most likely cause is truncation: max_length={ml} cut off the response marker "
             f"{repr(response_part)} before masking could find it.\n"
             "Increase max_length to fit your responses, for example SFTConfig(max_length = max_seq_length).\n"
             "If your sequences are genuinely longer, raise max_seq_length when loading the model."
         )
+        if fatal: raise ValueError(message)
+        print("Unsloth: Warning: " + message)
     pass
 
     def _filter_fully_masked(dataset, dataset_name="dataset"):
@@ -438,8 +441,9 @@ def train_on_responses_only(
         if len(keep) == n_before:
             return dataset  # nothing fully masked
         # Most rows masked away across the WHOLE dataset usually means truncation.
+        # Only fatal when no rows survive; otherwise warn and keep the valid rows.
         if (n_before - len(keep)) / n_before >= 0.9:
-            _raise_if_truncated(dataset, set(range(n_before)) - set(keep))
+            _diagnose_truncation(dataset, set(range(n_before)) - set(keep), fatal = len(keep) == 0)
         dataset = dataset.select(keep)
         n_removed = n_before - len(dataset)
         if n_removed > 0:
@@ -467,14 +471,19 @@ def train_on_responses_only(
     if _is_vision_collator(data_collator):
         if hasattr(data_collator, "train_on_responses_only") and \
             getattr(data_collator, "train_on_responses_only", None) is None:
+            # If the collator's tokenizer already carries the parts, let the nested
+            # call read them; passing them explicitly would hit the "already set" guard.
+            coll_proc = getattr(data_collator, "processor", tokenizer)
+            coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
+            parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
+                dict(instruction_part = instruction_part, response_part = response_part)
             data_collator.train_on_responses_only = train_on_responses_only(
                 None,
-                instruction_part   = instruction_part,
-                response_part      = response_part,
                 force_match        = force_match,
-                tokenizer          = getattr(data_collator, "processor", tokenizer),
+                tokenizer          = coll_proc,
                 return_function    = True,
                 last_response_only = last_response_only,
+                **parts,
             )
             print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
         return trainer
