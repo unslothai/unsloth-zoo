@@ -1690,6 +1690,30 @@ def test_snapshot_dir_is_complete_sharded_glob_requires_index(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
 
 
+def test_snapshot_dir_is_complete_variant_sharded_index(tmp_path):
+    """A variant sharded checkpoint must not be falsely rejected for lacking an index. Transformers'
+    _add_variant names the variant index model.safetensors.index.fp16.json (variant before the
+    trailing .json) and the shards model.fp16-00001-of-00002.safetensors (variant in the regex
+    prefix). The index-sidecar requirement recognizes the variant index, so a complete variant
+    sharded set with its index reads complete, while the same set without ANY index reads
+    incomplete."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "model.fp16-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
+    # Every shard present but no index of any kind -> incomplete.
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    # The variant index (note: token before the trailing .json) makes it loadable.
+    (snap / "model.safetensors.index.fp16.json").write_text(
+        json.dumps({"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                                   "b": "model.fp16-00002-of-00002.safetensors"}})
+    )
+    assert hcs.snapshot_dir_is_complete(snap) is True
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
+
+
 def test_request_can_include_weights_processor_subfolder():
     """A processor / image_processor subfolder ships only *_config.json + vocab files (no weights),
     so a catch-all warm under it (processor/*) reads as WEIGHTLESS. Without this, the synthetic

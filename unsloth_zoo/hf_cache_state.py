@@ -358,6 +358,29 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     return True
 
 
+def _has_root_shard_index(snapshot_dir: Path, entries: list) -> bool:
+    """True if a root-level weight-shard index sidecar is present on disk. Matches the canonical
+    ``model.safetensors.index.json`` / ``pytorch_model.bin.index.json`` AND the variant form
+    ``model.safetensors.index.fp16.json`` -- transformers' ``_add_variant`` inserts the variant
+    token before the trailing ``.json``, so a plain ``*.index.json`` suffix test would miss it and
+    a variant sharded checkpoint (whose shards ARE on disk and whose variant index IS present) would
+    be wrongly judged index-less. A subfolder index does not count -- a bare root load never reads
+    it. *entries* is the already-collected ``rglob`` listing, reused to avoid a second walk."""
+    for entry in entries:
+        name = entry.name
+        if ".index." not in name or not name.endswith(".json"):
+            continue
+        try:
+            rel = entry.relative_to(snapshot_dir).as_posix()
+        except ValueError:
+            rel = name
+        if "/" in rel:
+            continue  # a subfolder index the bare root load never reads
+        if _safe_is_file(entry):
+            return True
+    return False
+
+
 # Diffusers pipeline subfolders that carry loadable WEIGHTS (every other declared component --
 # scheduler, tokenizer, feature_extractor, processor -- is config-only). A weight-bearing
 # component whose subfolder exists but holds no weight is a partially fetched component, so the
@@ -712,30 +735,22 @@ def snapshot_dir_is_complete(
     # A sharded checkpoint is loadable locally ONLY through its index sidecar: transformers'
     # from_pretrained resolves a local directory by probing model.safetensors then
     # model.safetensors.index.json (then the .bin pair) -- it never globs model-*-of-*.safetensors --
-    # so a cache holding every numbered shard but missing model.safetensors.index.json raises
-    # "no file named ..." or fetches the index in-process over Xet. For a root-level (non-pipeline)
-    # FULL warm (unpatterned or glob-bearing -- never a deliberate exact single-shard request, which
-    # wants only that file), require the index sidecar of each root-level numbered-shard set.
+    # so a cache holding every numbered shard but missing the index raises "no file named ..." or
+    # fetches the index in-process over Xet. For a root-level (non-pipeline) FULL warm (unpatterned
+    # or glob-bearing -- never a deliberate exact single-shard request, which wants only that file),
+    # require a root-level shard index when root numbered shards are present. _has_root_shard_index
+    # matches the variant form too (model.safetensors.index.fp16.json), so a variant sharded cache --
+    # whose shards (model.fp16-00001-of-00002.safetensors) carry the variant in the regex prefix --
+    # is not falsely rejected.
     if root_weights_only and (
         allow_patterns is None or any(_has_glob(p) for p in allow_patterns)
     ):
-        root_index_names = set()
-        for index_entry in index_entries:
-            try:
-                irel = index_entry.relative_to(snapshot_dir).as_posix()
-            except ValueError:
-                irel = index_entry.name
-            if "/" not in irel:
-                root_index_names.add(irel)
-        for _, rel in weight_entries:
-            if "/" in rel:
-                continue
-            shard_match = _NUMBERED_SHARD_RE.match(rel)
-            if shard_match is None:
-                continue
-            index_name = f"{shard_match.group('prefix')}{shard_match.group('suffix')}.index.json"
-            if index_name not in root_index_names:
-                return False
+        has_root_numbered_shard = any(
+            "/" not in rel and _NUMBERED_SHARD_RE.match(rel) is not None
+            for _, rel in weight_entries
+        )
+        if has_root_numbered_shard and not _has_root_shard_index(snapshot_dir, entries):
+            return False
 
     # A FULL pipeline warm -- no allow_patterns, a pure catch-all ``["*"]``, or a no-slash file glob
     # (``["*.safetensors", "*.json"]``) that HF's matcher spreads across every nested component --
