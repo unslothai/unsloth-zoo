@@ -38,8 +38,10 @@ Usage mirrors TRL notebooks:
 
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 import concurrent.futures
+import hashlib
 import math
 import os
+from pathlib import Path
 import random
 import time
 
@@ -1003,6 +1005,61 @@ class MLXTrainer:
             self.stop_requested = True
         return should_stop
 
+    def _validate_distributed_resume_checkpoint(self, resume_path):
+        """Ensure DDP ranks agree on a complete resume checkpoint."""
+        world = self._ensure_distributed()
+        if world is None or self._distributed_world_size <= 1:
+            return resume_path
+
+        local_resume = mx.array(int(bool(resume_path)), dtype=mx.int32)
+        resume_count = self._distributed_all_sum(local_resume, stream=mx.cpu)
+        mx.eval(resume_count)
+        if int(resume_count.item()) == 0:
+            return None
+        if int(resume_count.item()) != self._distributed_world_size:
+            raise RuntimeError(
+                "Unsloth MLX DDP: all ranks must either resume from the same "
+                "checkpoint or all start fresh."
+            )
+
+        path = Path(resume_path).expanduser().resolve(strict=False)
+        digest = int.from_bytes(
+            hashlib.blake2b(str(path).encode("utf-8"), digest_size=7).digest(),
+            "little",
+        )
+        local_digest = mx.array(digest, dtype=mx.int64)
+        min_digest = mx.distributed.all_min(
+            local_digest, group=world, stream=mx.cpu,
+        )
+        max_digest = mx.distributed.all_max(
+            local_digest, group=world, stream=mx.cpu,
+        )
+        required = (
+            "adapters.safetensors",
+            "optimizer_state.safetensors",
+            "trainer_state.json",
+        )
+        missing = sum(
+            0 if (path / filename).is_file() else 1
+            for filename in required
+        )
+        missing_total = self._distributed_all_sum(
+            mx.array(missing, dtype=mx.int32), stream=mx.cpu,
+        )
+        mx.eval(min_digest, max_digest, missing_total)
+        if int(min_digest.item()) != int(max_digest.item()):
+            raise RuntimeError(
+                "Unsloth MLX DDP: all ranks must use the same "
+                "resume_from_checkpoint path."
+            )
+        if int(missing_total.item()) > 0:
+            raise RuntimeError(
+                "Unsloth MLX DDP: resume checkpoint is incomplete or not "
+                "visible on every rank. Expected adapters.safetensors, "
+                "optimizer_state.safetensors, and trainer_state.json."
+            )
+        return str(path)
+
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
 
@@ -1908,6 +1965,7 @@ class MLXTrainer:
         # and dataloader fast-forward to the right position.
         _resume_step = 0
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
+        _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
         if _resume_from:
             try:
                 # 1. Load trained adapter weights into the model. The model
