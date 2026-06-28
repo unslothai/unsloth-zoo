@@ -333,7 +333,7 @@ def train_on_responses_only(
     # Spawning workers for a fast op on a small dataset costs more than it saves,
     # and large auto num_proc caused Windows spawn loops (#3211, #3397). Single
     # process small datasets, but keep the non-fork guard and explicit user values.
-    _MIN_ROWS_FOR_MULTIPROC = 50_000
+    _MIN_ROWS_FOR_MULTIPROC = 5_000
     def _effective_num_proc(dataset):
         if num_proc is None or num_proc == 1: return num_proc
         if not _num_proc_was_auto: return num_proc  # honor explicit user value
@@ -383,38 +383,25 @@ def train_on_responses_only(
         return any(l != -100 for l in labels)
     pass
 
-    def _diagnose_truncation(dataset):
-        # The #1 cause of an all -100 dataset is truncation: max_length cut off the
-        # response marker before masking could find it. Detect it and explain the fix
-        # instead of failing later with an opaque zero-loss error.
-        if dataset is None or isinstance(dataset, IterableDataset): return
+    def _raise_if_truncated(dataset, dropped):
+        # When (nearly) the whole dataset is masked away, the usual cause is
+        # truncation: max_length cut off the response marker before masking found
+        # it. Explain that instead of failing later with an opaque zero-loss error.
         if getattr(trainer.args, "packing", False): return
-        try:
-            if len(dataset) == 0: return
-        except TypeError:
-            return
         max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", None)
-        n_checked = 0; n_masked = 0; n_trunc = 0
-        for i, row in enumerate(dataset):
-            if i >= 100: break
-            labels = row.get("labels"); input_ids = row.get("input_ids")
-            if labels is None or input_ids is None: continue
-            if type(labels) is torch_Tensor: labels = labels.tolist()
-            n_checked += 1
-            if any(l != -100 for l in labels): continue  # row has training signal
-            n_masked += 1
-            if type(input_ids) is torch_Tensor: input_ids = input_ids.tolist()
-            # Response marker absent => the assistant turn was truncated away.
+        n_sampled = 0; n_trunc = 0
+        for i in list(dropped)[:100]:
+            input_ids = dataset[int(i)].get("input_ids")
+            if input_ids is None: continue
+            if getattr(input_ids, "tolist", None): input_ids = input_ids.tolist()
+            n_sampled += 1
             marker_absent = not any(
                 input_ids[j : j + len_A_must] == A_must
                 for j in range(len(input_ids) - len_A_must + 1)
             )
             at_max_len = max_length is not None and len(input_ids) >= max_length
             if marker_absent or at_max_len: n_trunc += 1
-        # Only raise when the dataset is overwhelmingly masked (a few bad rows are
-        # just dropped by _filter_fully_masked), and the cause looks like truncation.
-        if n_checked == 0 or n_masked / n_checked < 0.9: return
-        if n_trunc / n_masked < 0.9: return
+        if n_sampled == 0 or n_trunc / n_sampled < 0.9: return
         ml = max_length if max_length is not None else 1024
         raise ValueError(
             "Unsloth: train_on_responses_only masked every label to -100, so the training loss would be 0.\n"
@@ -435,14 +422,24 @@ def train_on_responses_only(
         # masked (the common case removes 0 and skips the rewrite entirely).
         n_before = len(dataset)
         keep = []
-        idx = 0
-        for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
-            for labels in batch["labels"]:
-                if labels is None or any(l != -100 for l in labels):
-                    keep.append(idx)
-                idx += 1
+        try:
+            idx = 0
+            for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
+                for labels in batch["labels"]:
+                    if labels is None:
+                        keep.append(idx)
+                    else:
+                        if getattr(labels, "tolist", None): labels = labels.tolist()
+                        if any(l != -100 for l in labels): keep.append(idx)
+                    idx += 1
+        except Exception:
+            # Datasets with a custom transform may need other columns; fall back.
+            return dataset.filter(_has_valid_labels)
         if len(keep) == n_before:
             return dataset  # nothing fully masked
+        # Most rows masked away across the WHOLE dataset usually means truncation.
+        if (n_before - len(keep)) / n_before >= 0.9:
+            _raise_if_truncated(dataset, set(range(n_before)) - set(keep))
         dataset = dataset.select(keep)
         n_removed = n_before - len(dataset)
         if n_removed > 0:
@@ -454,6 +451,35 @@ def train_on_responses_only(
         return dataset
     pass
 
+    # Vision/processor collators (e.g. UnslothVisionDataCollator) rebuild labels
+    # from the processor at collate time, so dataset-level masking is ignored and
+    # replacing the collator would break image handling. Enable response masking on
+    # the collator itself and skip the text dataset path.
+    def _is_vision_collator(collator):
+        if collator is None: return False
+        if any(b.__name__ == "UnslothVisionDataCollator" for b in type(collator).__mro__): return True
+        processor = getattr(collator, "processor", None)
+        if processor is not None and hasattr(processor, "image_processor"): return True
+        return hasattr(collator, "image_processor")
+    pass
+
+    data_collator = getattr(trainer, "data_collator", None)
+    if _is_vision_collator(data_collator):
+        if hasattr(data_collator, "train_on_responses_only") and \
+            getattr(data_collator, "train_on_responses_only", None) is None:
+            data_collator.train_on_responses_only = train_on_responses_only(
+                None,
+                instruction_part   = instruction_part,
+                response_part      = response_part,
+                force_match        = force_match,
+                tokenizer          = getattr(data_collator, "processor", tokenizer),
+                return_function    = True,
+                last_response_only = last_response_only,
+            )
+            print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
+        return trainer
+    pass
+
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
@@ -462,7 +488,6 @@ def train_on_responses_only(
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
         else:
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.train_dataset))
-        _diagnose_truncation(trainer.train_dataset)
         trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
     pass
 
@@ -477,7 +502,6 @@ def train_on_responses_only(
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
-                _diagnose_truncation(trainer.eval_dataset[key])
                 trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
@@ -487,34 +511,15 @@ def train_on_responses_only(
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
             else:
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.eval_dataset))
-            _diagnose_truncation(trainer.eval_dataset)
             trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
         pass
     pass
 
-    # Edit data collator to DataCollatorForSeq2Seq, but never replace a vision /
-    # processor collator (e.g. UnslothVisionDataCollator) which builds its own
-    # labels and handles image inputs; replacing it would silently break VLMs.
+    # Edit data collator to DataCollatorForSeq2Seq (vision collators were handled
+    # earlier and returned, so trainer.data_collator here is a text collator).
     from transformers import DataCollatorForSeq2Seq
-    def _is_vision_collator(collator):
-        if collator is None: return False
-        if type(collator).__name__ == "UnslothVisionDataCollator": return True
-        processor = getattr(collator, "processor", None)
-        if processor is not None and hasattr(processor, "image_processor"): return True
-        return hasattr(collator, "image_processor")
-    pass
     packing_enabled = getattr(trainer.args, "packing", False)
-    data_collator = getattr(trainer, "data_collator", None)
-    if _is_vision_collator(data_collator):
-        # Keep the vision collator; mask via its own train_on_responses_only instead.
-        if getattr(data_collator, "train_on_responses_only", None) is None:
-            print(
-                f"Unsloth: Keeping your {type(data_collator).__name__} so image handling stays intact.\n"
-                "To mask instruction tokens for vision models, enable it on the collator:\n"
-                "    UnslothVisionDataCollator(model, processor, train_on_responses_only = True,\n"
-                f"        instruction_part = {repr(instruction_part)}, response_part = {repr(response_part)})"
-            )
-    elif (
+    if (
         hasattr(trainer, "data_collator")
         and not isinstance(trainer.data_collator, DataCollatorForSeq2Seq)
         and not packing_enabled

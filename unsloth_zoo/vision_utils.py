@@ -47,6 +47,9 @@ IMAGE_TOKENS = [
     "<image_soft_token>", # Gemma 3
     "<start_of_image>",   # Gemma 3
     "<end_of_image>",     # Gemma 3
+    "<|image>",           # Gemma 4 (begin image; <|image|> already listed above)
+    "<image|>",           # Gemma 4 (end image)
+    "<|video|>",          # Gemma 4
     "<|START_OF_IMG|>",   # Cohere
     "<|END_OF_IMG|>",     # Cohere
     "<|IMG_LINE_BREAK|>", # Cohere
@@ -55,6 +58,8 @@ IMAGE_TOKENS = [
 
 AUDIO_TOKENS = [
     "<|audio|>",  # Gemma 4
+    "<|audio>",   # Gemma 4 (begin audio)
+    "<audio|>",   # Gemma 4 (end audio)
 ]
 
 import torch
