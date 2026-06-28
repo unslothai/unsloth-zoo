@@ -16,6 +16,16 @@ how many bytes are actually on disk (sparse-aware, so a partially written Xet /
 whether an ``.incomplete`` partial is present. The no-progress download watchdog
 is built on exactly these two signals.
 
+The completeness check here is intentionally a CONSERVATIVE fast-path gate, not an
+authoritative snapshot verifier. It returns "complete" only for the unambiguous
+canonical model-cache layouts whose local evidence proves an in-process load will
+not fetch a weight. Everything else (diffusers pipelines, weight variants,
+non-trivial allow/ignore patterns, datasets, any layout needing inference) returns
+"not complete" so the caller runs the authoritative Hugging Face download/resume in
+the watched child. Returning a false "complete" is the only dangerous error (it can
+send an in-process load to fetch a missing weight over un-killable Xet); returning a
+false "not complete" only spawns the cheap watched child, so the gate errs that way.
+
 Only the single active cache root (``huggingface_hub.constants.HF_HUB_CACHE``) is
 scanned here; multi-root / legacy-cache enumeration and transport-marker logic
 are download-manager concerns that live in the consumer, not in this module.
@@ -24,7 +34,6 @@ are download-manager concerns that live in the consumer, not in this module.
 from __future__ import annotations
 
 import fnmatch
-import re
 import sys
 from pathlib import Path
 from typing import Iterator, Optional
@@ -200,6 +209,10 @@ def snapshot_dir_has_broken_symlinks(snapshot_dir: Path) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Weight-file recognition (small helpers the conservative completeness gate needs)
+# ---------------------------------------------------------------------------
+
 # Model weight file extensions. A snapshot with none of these is config/tokenizer
 # only (e.g. a prior AutoConfig fetch), so it is not a warm cache for a weight load.
 _WEIGHT_FILE_SUFFIXES = (
@@ -217,8 +230,7 @@ _WEIGHT_FILE_SUFFIXES = (
 
 # Trainer / optimizer state files carry weight suffixes (.bin / .pt / .pth) but are NOT
 # loadable model weights. A checkpoint dir or a patterned pull can leave only these behind,
-# so they must not satisfy the "snapshot holds its weights" check (which would skip the
-# killable download while from_pretrained still lacks real weights).
+# so they must not count as a model weight on disk.
 _NON_WEIGHT_BASENAMES = frozenset({
     "training_args.bin",
     "optimizer.bin",
@@ -231,11 +243,6 @@ _NON_WEIGHT_BASENAMES = frozenset({
 })
 # Distributed trainer runs shard the RNG state as rng_state_0.pth, rng_state_1.pth, ...
 _NON_WEIGHT_BASENAME_PREFIXES = ("rng_state_",)
-# The stems (basename without the suffix) of the trainer-artifact names above -- optimizer,
-# scheduler, scaler, rng_state, training_args. A trailing-wildcard glob over one of these
-# (``scheduler*``, ``rng_state*``) selects only a trainer artifact, so the synthetic-weight-suffix
-# probe must NOT classify it as weight-including.
-_NON_WEIGHT_STEMS = frozenset(name.rsplit(".", 1)[0] for name in _NON_WEIGHT_BASENAMES)
 
 
 def _is_loadable_weight_file(name: str) -> bool:
@@ -250,87 +257,6 @@ def _is_loadable_weight_file(name: str) -> bool:
         return False
     if any(lowered.startswith(prefix) for prefix in _NON_WEIGHT_BASENAME_PREFIXES):
         return False
-    return True
-
-
-# Numbered shard naming, e.g. ``model-00001-of-00002.safetensors`` or
-# ``pytorch_model-00003-of-00004.bin``: prefix, 1-based index, total, suffix.
-_NUMBERED_SHARD_RE = re.compile(
-    r"^(?P<prefix>.+)-(?P<idx>\d+)-of-(?P<total>\d+)(?P<suffix>\.[^.]+)$"
-)
-
-
-def _filter_paths(
-    paths: list,
-    allow_patterns: "Optional[list]" = None,
-    ignore_patterns: "Optional[list]" = None,
-) -> list:
-    """Filter repo-relative *paths* by Hugging Face allow / ignore patterns, mirroring how
-    ``snapshot_download`` selects files. On any failure, treat all paths as selected so a
-    snapshot that does hold weights is never rejected for an unevaluable filter."""
-    try:
-        from huggingface_hub.utils import filter_repo_objects
-
-        return list(
-            filter_repo_objects(
-                paths, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
-            )
-        )
-    except Exception:
-        return list(paths)
-
-
-def _numbered_shard_set_present(
-    entry: Path,
-    *,
-    snapshot_dir: "Optional[Path]" = None,
-    allow_patterns: "Optional[list]" = None,
-    ignore_patterns: "Optional[list]" = None,
-) -> bool:
-    """For a numbered weight shard (``model-00001-of-00002.safetensors``), True only when
-    every shard in its ``-of-NNNNN`` set that the request selects is present in the same
-    directory.
-
-    A leftover single shard from an interrupted multi-shard download reads as a weight
-    file on its own, so without this an incomplete pull (one shard on disk, the rest
-    never fetched) would short-circuit as a warm cache. This catches that even when the
-    shard *index* sidecar was never cached (so ``_weight_shard_index_complete`` has
-    nothing to check). A non-numbered / single-file weight matches no shard pattern and
-    is trivially satisfied.
-
-    When *allow_patterns* / *ignore_patterns* are given, a sibling shard is required only
-    if the request actually selects it: a deliberate single-shard request
-    (``allow_patterns=["model-00002-of-00005.safetensors"]``) is satisfied by that one shard
-    and must not demand the rest."""
-    match = _NUMBERED_SHARD_RE.match(entry.name)
-    if match is None:
-        return True
-    total_str = match.group("total")
-    try:
-        total = int(total_str)
-    except ValueError:
-        return True
-    if total <= 0:
-        return True
-    prefix = match.group("prefix")
-    suffix = match.group("suffix")
-    width = len(total_str)
-    base = entry.parent
-    scoped = bool(allow_patterns or ignore_patterns) and snapshot_dir is not None
-    for i in range(1, total + 1):
-        shard_path = base / f"{prefix}-{i:0{width}d}-of-{total_str}{suffix}"
-        if scoped:
-            try:
-                rel = shard_path.relative_to(snapshot_dir).as_posix()
-            except ValueError:
-                rel = shard_path.name
-            if not _filter_paths([rel], allow_patterns, ignore_patterns):
-                continue  # this sibling is not part of the request -> do not require it
-        try:
-            if not shard_path.exists():
-                return False
-        except OSError:
-            return False
     return True
 
 
@@ -372,150 +298,56 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     return True
 
 
-def _has_root_shard_index(snapshot_dir: Path, entries: list) -> bool:
-    """True if a root-level weight-shard index sidecar is present on disk. Matches the canonical
-    ``model.safetensors.index.json`` / ``pytorch_model.bin.index.json`` AND the variant form
-    ``model.safetensors.index.fp16.json`` -- transformers' ``_add_variant`` inserts the variant
-    token before the trailing ``.json``, so a plain ``*.index.json`` suffix test would miss it and
-    a variant sharded checkpoint (whose shards ARE on disk and whose variant index IS present) would
-    be wrongly judged index-less. A subfolder index does not count -- a bare root load never reads
-    it. *entries* is the already-collected ``rglob`` listing, reused to avoid a second walk."""
-    for entry in entries:
-        if not _is_weight_shard_index(entry.name):
-            continue
-        try:
-            rel = entry.relative_to(snapshot_dir).as_posix()
-        except ValueError:
-            rel = entry.name
-        if "/" in rel:
-            continue  # a subfolder index the bare root load never reads
-        if _safe_is_file(entry):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# Pattern helpers (kept small: normalization + glob detection + HF filtering)
+# ---------------------------------------------------------------------------
+
+_GLOB_CHARS = ("*", "?", "[")
 
 
-# Diffusers pipeline subfolders that carry loadable WEIGHTS (every other declared component --
-# scheduler, tokenizer, feature_extractor, processor -- is config-only). A weight-bearing
-# component whose subfolder exists but holds no weight is a partially fetched component, so the
-# in-process pipeline load would still fetch the weight in-process over Xet.
-_WEIGHT_BEARING_PIPELINE_DIRS = frozenset({
-    "unet",
-    "transformer",
-    "vae",
-    "vqvae",
-    "movq",
-    "prior",
-    "decoder",
-    "text_encoder",
-    "text_encoder_2",
-    "text_encoder_3",
-    "image_encoder",
-    "safety_checker",
-    "controlnet",
-})
+def _has_glob(text: str) -> bool:
+    # A trailing-slash directory pattern ("unet/", "checkpoint-10/") is NOT an exact filename:
+    # Hugging Face's filter_repo_objects expands it to match everything under that directory (as
+    # if "unet/*"). Treat it as a wildcard so the strict exact-name checks do not look for a
+    # literal "unet/" entry and wrongly reject a fully cached directory / component download.
+    return text.endswith("/") or any(ch in text for ch in _GLOB_CHARS)
 
 
-def _dir_has_any_file(path: Path) -> bool:
-    """True if *path* contains at least one regular file (recursively). A dangling symlink left by
-    an interrupted blob fetch is NOT a regular file (``is_file()`` follows the link and returns
-    False), so a component subfolder that only ever received pointer symlinks reads as having no
-    files -- i.e. as an unfinished component."""
+def _as_pattern_list(patterns: "Optional[object]") -> "Optional[list]":
+    """Normalize an allow / ignore pattern argument to a list. Hugging Face accepts a bare
+    ``str`` as well as a list, and iterating the ``str`` form would walk it character by
+    character (so ``"checkpoint-10/*"`` would never match), misclassifying the request."""
+    if patterns is None:
+        return None
+    if isinstance(patterns, str):
+        return [patterns]
+    return list(patterns)
+
+
+def _filter_paths(
+    paths: list,
+    allow_patterns: "Optional[list]" = None,
+    ignore_patterns: "Optional[list]" = None,
+) -> list:
+    """Filter repo-relative *paths* by Hugging Face allow / ignore patterns, mirroring how
+    ``snapshot_download`` selects files. On any failure, treat all paths as selected so a
+    snapshot that does hold weights is never rejected for an unevaluable filter."""
     try:
-        for entry in path.rglob("*"):
-            if _safe_is_file(entry):
-                return True
-    except OSError:
-        return False
-    return False
+        from huggingface_hub.utils import filter_repo_objects
 
-
-def _diffusion_pipeline_complete(snapshot_dir: Path, weight_dirs: set) -> bool:
-    """True unless a diffusers pipeline snapshot is missing a declared sub-model. A diffusers
-    pipeline lists its components in a root ``model_index.json`` where each non-``_`` key maps to a
-    ``[library, class]`` pair; a warm killed mid-pipeline can leave one component fully cached and
-    another entirely absent, and the in-process pipeline load would then fetch the missing
-    component over unprotected Xet (the silent-hang risk). Require every declared (non-null)
-    component's subfolder to exist with files, and every weight-bearing component
-    (unet / transformer / vae / text_encoder / ...) to carry a weight in *weight_dirs*.
-
-    Returns True (do not block) when there is no readable ``model_index.json`` -- a plain
-    transformers / GGUF snapshot, or a non-diffusion repo -- so only an actual pipeline warm is
-    affected. Intended for a FULL pipeline warm (no allow_patterns); a scoped subfolder request is
-    already validated by its own selection."""
-    import json
-
-    index_path = snapshot_dir / "model_index.json"
-    if not _safe_is_file(index_path):
-        return True  # not a diffusers pipeline (or an older layout) -- nothing pipeline-specific
-    try:
-        with open(index_path, "r", encoding = "utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return True  # unreadable index: defer to the generic checks rather than over-reject
-    if not isinstance(data, dict):
-        return True
-    for key, value in data.items():
-        if isinstance(key, str) and key.startswith("_"):
-            continue  # _class_name / _diffusers_version metadata, not a component
-        if not (isinstance(value, (list, tuple)) and len(value) == 2):
-            continue  # not a [library, class] component spec
-        library, class_name = value
-        if library is None or class_name is None:
-            continue  # an explicitly absent component (e.g. a disabled safety_checker)
-        component_dir = snapshot_dir / key
-        if not _safe_is_dir(component_dir) or not _dir_has_any_file(component_dir):
-            return False  # a declared component's subfolder is missing / empty -- interrupted warm
-        if key in _WEIGHT_BEARING_PIPELINE_DIRS:
-            if key not in weight_dirs:
-                return False  # the component dir exists but carries no weight -- partial component
-            # A SHARDED component is loadable locally only via its in-component index sidecar
-            # (diffusers, like transformers, never globs shard files), so a component holding
-            # numbered shards but no diffusion_pytorch_model.safetensors.index.json is incomplete --
-            # an interrupted warm that dropped the tiny index blob would make the pipeline load fetch
-            # it in-process over unprotected Xet. Mirrors the root transformers index requirement.
-            try:
-                comp_entries = list(component_dir.rglob("*"))
-            except OSError:
-                comp_entries = []
-            has_numbered_shard = any(
-                _NUMBERED_SHARD_RE.match(e.name) is not None
-                and _is_loadable_weight_file(e.name)
-                and _safe_is_file(e)
-                for e in comp_entries
+        return list(
+            filter_repo_objects(
+                paths, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
             )
-            if has_numbered_shard and not _has_root_shard_index(component_dir, comp_entries):
-                return False
-    return True
-
-
-def _has_pipeline_component_weight(snapshot_dir: Path, entries: list) -> bool:
-    """True if a recognized diffusers component subfolder (``unet/``, ``vae/``, ``text_encoder/``,
-    ...) holds a loadable weight. A weights-only warm (``allow_patterns=["*.safetensors"]``, or an
-    ignore list that drops ``model_index.json``) downloads a diffusers pipeline's component weights
-    but NOT ``model_index.json`` -- so the pipeline layout has to be recognized from the component
-    weights themselves, else the snapshot is misread as a non-pipeline root load and its (legitimate)
-    subfolder weights are dropped. Kept to the known weight-bearing component names so an arbitrary
-    precision/checkpoint subfolder (``BF16/``, ``checkpoint-10/``) is NOT mistaken for a pipeline."""
-    for entry in entries:
-        try:
-            rel = entry.relative_to(snapshot_dir).as_posix()
-        except ValueError:
-            continue
-        parts = rel.split("/")
-        if (
-            len(parts) >= 2
-            and parts[0] in _WEIGHT_BEARING_PIPELINE_DIRS
-            and _is_loadable_weight_file(parts[-1])
-            and _safe_is_file(entry)
-        ):
-            return True
-    return False
+        )
+    except Exception:
+        return list(paths)
 
 
 def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
     """Repo-relative posix paths of every dangling symlink in *snapshot_dir* -- a referenced file
     whose blob is missing or still an ``.incomplete`` partial (an interrupted download). Empty when
-    none. Lets a completeness check scope the interrupted-download signal to the files a request
+    none. Lets the broken-symlink check scope the interrupted-download signal to the files a request
     actually selects, rather than rejecting the whole snapshot for a dangle outside the request."""
     out: list = []
     try:
@@ -533,69 +365,6 @@ def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
     return out
 
 
-# Catch-all allow patterns that select the WHOLE repo, exactly like an unpatterned warm. HF's
-# fnmatch ``*`` spans ``/``, so a bare ``*`` (or ``**``) matches every path including checkpoint
-# subdirs -- but a root ``from_pretrained`` still reads ROOT weights, so such a request must be
-# treated like an unpatterned root warm (drop checkpoint-dir paths), not trusted as a deliberate
-# checkpoint selection.
-_CATCHALL_ALLOW_PATTERNS = frozenset({"*", "**"})
-
-
-def _is_pure_catchall(allow_patterns: "Optional[list]") -> bool:
-    """True when *allow_patterns* is a non-empty list whose every entry is a bare catch-all
-    (``*`` / ``**``). Such a list selects the whole repo just like an unpatterned warm, so a root
-    load still reads ROOT weights and a checkpoint-dir-only cache must not satisfy it. A list with
-    any path-bearing or name-specific pattern (``checkpoint-10/*``, ``model.safetensors``) is
-    trusted as-is -- a caller that names a checkpoint path opts back into it."""
-    if not allow_patterns:
-        return False
-    return all(isinstance(p, str) and p.strip() in _CATCHALL_ALLOW_PATTERNS for p in allow_patterns)
-
-
-def _targets_root_only(allow_patterns: "Optional[list]") -> bool:
-    """True when a request reads from the repo ROOT rather than a specific subfolder: there is no
-    ``allow_patterns`` at all, or every allow pattern is a no-slash name / glob (``*``,
-    ``*.safetensors``, ``model*``, ``config.json``). HF's fnmatch ``*`` spans ``/``, so such a glob
-    also matches nested ``subdir/...`` files, but the LOAD a bare ``from_pretrained`` performs reads
-    only root-level files. A path-bearing pattern (``checkpoint-10/*``, ``BF16/*``, ``unet/*``)
-    deliberately targets a subfolder and is trusted as-is."""
-    if allow_patterns is None:
-        return True
-    if not allow_patterns:
-        return False  # allow_patterns=[] selects nothing -- a scoped (empty) request, not a root warm
-    return all(isinstance(p, str) and "/" not in p for p in allow_patterns)
-
-
-def _requested_scope_filter(
-    rels: list,
-    allow_patterns: "Optional[list]",
-    ignore_patterns: "Optional[list]",
-    *,
-    root_weights_only: bool = False,
-) -> list:
-    """The subset of repo-relative *rels* a request selects. Applies the allow / ignore filter, then
-    drops paths a root load never reads:
-
-    * *root_weights_only* (a root-level warm of a NON-pipeline model) drops EVERY subfolder path:
-      a bare ``from_pretrained`` reads only repo-ROOT files, so a weight that lives solely in a
-      subfolder (``BF16/model.safetensors``, ``fp16/``, ``checkpoint-500/``, an ``onnx/`` export) is
-      an alternate the load never reads and must neither satisfy the warm nor (as a dangling
-      symlink) block it.
-    * otherwise, when there is no ``allow_patterns`` (an UNPATTERNED or IGNORE-ONLY request) or the
-      allow list is a pure catch-all (``["*"]``), drop only per-checkpoint-dir paths -- this is the
-      diffusers-pipeline / path-trusting case where genuine component subfolders (``unet/``,
-      ``vae/``) must survive.
-
-    A path-bearing ``allow_patterns`` is otherwise trusted as-is: a caller that names a subfolder
-    path opts back into it."""
-    kept = _filter_paths(list(rels), allow_patterns, ignore_patterns)
-    if root_weights_only:
-        kept = [r for r in kept if "/" not in r]
-    elif allow_patterns is None or _is_pure_catchall(allow_patterns):
-        kept = [r for r in kept if not _path_under_checkpoint_dir(r)]
-    return kept
-
-
 def snapshot_has_requested_broken_symlinks(
     snapshot_dir: Path,
     *,
@@ -608,24 +377,111 @@ def snapshot_has_requested_broken_symlinks(
     A dangling symlink marks an interrupted download, but for a scoped request only one for a
     requested file should reject the snapshot: a dangling root ``model.safetensors`` left by an
     earlier interrupted pull must not fail a weightless ``allow_patterns=["config.json"]`` request
-    whose config is on disk.
-
-    For a MODEL repo the scoping mirrors ``snapshot_dir_is_complete``: a root load reads only root
-    files, so a dangling checkpoint-dir / subfolder symlink does not block it. A DATASET (or other
-    non-model) snapshot has no "root load reads only root files" notion -- every dangling symlink
-    for a selected path is an interrupted file that must reject the cache (e.g. a dangling
-    ``checkpoint-10/data.parquet`` in an unpatterned dataset pull), so the checkpoint-dir drop is
-    NOT applied there."""
+    whose config is on disk. The allow / ignore filter mirrors ``snapshot_download`` selection, so a
+    dangle for an excluded file does not reject the cache. (``repo_type`` is accepted for signature
+    compatibility; the scoping is now purely the allow/ignore filter.)"""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     broken = _broken_symlink_rel_paths(snapshot_dir)
     if not broken:
         return False
-    if repo_type == "model":
-        requested = _requested_scope_filter(broken, allow_patterns, ignore_patterns)
-    else:
-        requested = _filter_paths(broken, allow_patterns, ignore_patterns)
-    return bool(requested)
+    return bool(_filter_paths(broken, allow_patterns, ignore_patterns))
+
+
+# ---------------------------------------------------------------------------
+# The conservative fast-path completeness gate
+# ---------------------------------------------------------------------------
+
+# Canonical root weight filenames an in-process model load reads. Used to prove a warm cache (the
+# file or its shard index is present).
+_CANONICAL_SINGLE_WEIGHTS = ("model.safetensors", "pytorch_model.bin")
+
+
+def _ignore_strips_all_weights(ignore_patterns: "list") -> bool:
+    """True iff the ignore set provably excludes EVERY weight format: for each weight suffix there is
+    a pattern matching a representative filename with that suffix. Only then is an ignore-only request
+    weightless. A partial strip -- only some suffixes, or only the canonical ``model.safetensors`` /
+    ``pytorch_model.bin`` names while a variant (``model.fp16.safetensors``) or an other-format weight
+    (``model.gguf``, a ``*.pt`` checkpoint) survives -- is NOT weightless, so the request reads as
+    weight-bearing (conservative: never under-classify a request that could still pull a weight, which
+    would let the fast path skip the protective child on a config-only cache and hang on Xet)."""
+    for suffix in _WEIGHT_FILE_SUFFIXES:
+        probe = "weight" + suffix
+        if not any(isinstance(p, str) and fnmatch.fnmatchcase(probe, p) for p in ignore_patterns):
+            return False
+    return True
+
+
+def _pattern_can_select_weight(pattern: "object") -> bool:
+    """Whether a single allow pattern could select a model weight file. Conservative: a wildcard
+    basename (``unet/*``, ``adapter_model*``) or a directory pattern (``unet/``) could absorb a
+    weight, as does a basename ending in a weight suffix (``*.safetensors``, ``model.fp16.safetensors``,
+    ``model.gguf``). Only a basename ending in a concrete NON-weight extension (``config.json``,
+    ``*.py``, ``tokenizer.model``, ``additional_chat_templates/*.jinja``) is treated as weightless,
+    so a tokenizer / config allow list keeps its offline short-circuit while a real (sub)weight glob
+    is never under-classified."""
+    if not isinstance(pattern, str):
+        return True  # unknown shape -> conservative
+    if pattern.endswith("/"):
+        return True  # a bare directory pattern expands to everything under it, incl. weights
+    base = pattern.rsplit("/", 1)[-1]
+    if base.endswith(("*", "?")):
+        return True  # a trailing wildcard could absorb a weight suffix
+    return base.endswith(_WEIGHT_FILE_SUFFIXES)
+
+
+def request_can_include_weights(
+    allow_patterns: "Optional[object]" = None, ignore_patterns: "Optional[object]" = None
+) -> bool:
+    """Whether a request restricted by *allow_patterns* / *ignore_patterns* can still include a model
+    weight. Used to pick the weight-requiring vs weightless branch of the acceptance check.
+
+    Conservative by design: when uncertain it returns True (treat the request as weight-bearing), so
+    the acceptance check requires a weight and never short-circuits a config-only cache for a real
+    weight load. It returns False only when the request is clearly weightless (a tokenizer / config
+    allow list that matches no weight name, or an ignore list that drops every weight format), which
+    preserves the offline short-circuit for a genuine tokenizer-only warm."""
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    if allow_patterns is None and ignore_patterns is None:
+        return True
+    if allow_patterns is None:
+        # Ignore-only request: weight-bearing unless the ignore list strips every weight format.
+        return not _ignore_strips_all_weights(ignore_patterns or [])
+    if not allow_patterns:
+        # allow_patterns=[] selects nothing -> no weight (HF filter selects no objects).
+        return False
+    # An allow list includes weights iff SOME pattern could select a weight (wildcard basename,
+    # weight-suffix basename, or a bare directory pattern). A list of only concrete non-weight names
+    # (a tokenizer / config warm) is weightless and keeps its offline short-circuit.
+    return any(_pattern_can_select_weight(pat) for pat in allow_patterns)
+
+
+def _canonical_root_weights_complete(snapshot_dir: Path, entries: list) -> bool:
+    """True iff the snapshot holds a complete canonical ROOT model weight set: a root
+    ``model.safetensors`` / ``pytorch_model.bin`` single file, OR a root weight-shard index whose
+    every listed shard is present. Numbered shard files without a valid index, or weights that live
+    only in a subfolder, do NOT count -- those are deferred to the watched child."""
+    root_files: set = set()
+    root_indices: list = []
+    for entry in entries:
+        try:
+            rel = entry.relative_to(snapshot_dir).as_posix()
+        except ValueError:
+            rel = entry.name
+        if "/" in rel:
+            continue  # a bare from_pretrained reads ROOT files only
+        if _is_weight_shard_index(entry.name):
+            if _safe_is_file(entry):
+                root_indices.append(entry)
+        elif _safe_is_file(entry):
+            root_files.add(entry.name)
+    # Sharded: a canonical root index whose every listed shard is on disk.
+    for index_entry in root_indices:
+        if _weight_shard_index_complete(index_entry):
+            return True
+    # Single-file canonical weight.
+    return any(name in root_files for name in _CANONICAL_SINGLE_WEIGHTS)
 
 
 def snapshot_dir_is_complete(
@@ -635,592 +491,45 @@ def snapshot_dir_is_complete(
     ignore_patterns: "Optional[object]" = None,
     require_named_weights: bool = False,
 ) -> bool:
-    """Best-effort check that a cached snapshot actually holds the requested model weights.
+    """Conservative fast-path gate: True only when *snapshot_dir* is an unambiguously complete
+    canonical ROOT model cache, so an in-process load will not fetch any weight.
 
-    ``snapshot_download(local_files_only=True)`` returns a snapshot dir whenever
-    ``refs/<rev>`` and ``snapshots/<sha>`` exist, even one left by a prior interrupted
-    or patterned download (a config-only snapshot from an ``AutoConfig`` fetch, or a
-    partial shard pull). A dangling-symlink check alone misses those: the missing files
-    were never symlinked, so nothing dangles. Treating such a snapshot as a warm cache
-    skips the killable child and lets the in-process load hit Xet on the absent weights.
+    This is intentionally NOT an authoritative snapshot verifier. It returns True only for:
+      - an UNPATTERNED request (allow_patterns is None; ignore_patterns are fine),
+      - that is not a diffusers pipeline (no root ``model_index.json``),
+      - with no dangling symlink (interrupted blob),
+      - whose canonical root weights are present (single file, or a shard index with every shard).
+    Every other layout -- variants, diffusers, datasets, any allow pattern, sharded weights without
+    an index -- returns False, deferring to the watched ``snapshot_download`` child (the authoritative
+    manifest compare + resume). A false True risks a silent un-killable Xet fetch during the in-process
+    load; a false False only spawns the cheap child. ``require_named_weights`` is accepted for signature
+    compatibility (a named-weight request is non-trivially patterned and so is never fast-pathed here).
 
-    A snapshot is complete only when it has no dangling symlinks, every weight-shard
-    index it ships resolves all its shards on disk, every numbered shard set present has
-    all its members on disk (even with no index sidecar), and it contains at least one
-    weight file. This does NOT assert that every non-weight file is present (no offline
-    manifest exists for that); the killable child completes anything else still missing.
-    The aim is simply to never short-circuit a snapshot whose weights are not on disk.
-
-    When *allow_patterns* / *ignore_patterns* are given, the weight that must be present is
-    one the request actually selects: a request for ``adapter_model.safetensors`` (or a
-    specific checkpoint shard) is satisfied only by that weight on disk, not by some other
-    weight the snapshot happens to also carry. A deliberate single-shard request likewise
-    requires only that shard, not its whole ``-of-NNNNN`` set. With no patterns, any loadable
-    weight does, and every numbered shard set present must be complete.
-
-    *require_named_weights* additionally requires every explicitly named exact weight in
-    *allow_patterns* (e.g. ``["model.safetensors", "adapter_model.safetensors"]``) to be on
-    disk, so a stale cache holding only one of them is not treated as complete. Off by default
-    (used by the pre-download cache probe); a glob still selects a subset freely."""
+    ``ignore_patterns`` need no eligibility gate: the canonical-weight presence check below verifies
+    what the in-process load actually reads (root ``model.safetensors`` / ``pytorch_model.bin`` or a
+    complete shard index) is on disk, so an ignore that dropped some weight format (the common
+    ``*.onnx`` / ``*.gguf`` / ``*.pt`` / ``*.bin`` prefetch ignores, or the subdir ``*/*.safetensors``
+    drops) cannot make an incomplete cache read complete -- the surviving canonical weight is what is
+    checked. This keeps the common warm ``from_pretrained`` cache fast-path eligible."""
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    # 1. Only an UNPATTERNED request is eligible. Any allow list scopes the on-disk set to a subset
+    #    whose relationship to the in-process load is not locally provable -> defer to the child.
+    if allow_patterns is not None:
+        return False
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
         return False
-    allow_patterns = _as_pattern_list(allow_patterns)
-    ignore_patterns = _as_pattern_list(ignore_patterns)
-    # An empty allow list is a real (select-nothing) filter, not "unpatterned": treat any
-    # non-None patterns as a scoped request so allow_patterns=[] does not fall into the full
-    # warmup branch (consistent with request_can_include_weights).
-    has_patterns = allow_patterns is not None or ignore_patterns is not None
-
-    # A root-level warm (no path-bearing allow pattern) of a NON-pipeline model reads only repo-ROOT
-    # files, so a weight under any subfolder (BF16/, fp16/, a checkpoint dir) is an alternate the
-    # load never reads. A diffusers pipeline is the exception -- its component weights legitimately
-    # live in subfolders (unet/, vae/, text_encoder/), validated by _diffusion_pipeline_complete --
-    # so it keeps the (narrower) checkpoint-dir scoping instead.
-    is_pipeline = _safe_is_file(snapshot_dir / "model_index.json") or _has_pipeline_component_weight(
-        snapshot_dir, entries
-    )
-    root_weights_only = _targets_root_only(allow_patterns) and not is_pipeline
-
-    # A dangling symlink marks an interrupted download, but only one for a file the request
-    # actually selects should reject the snapshot. A stale dangling root model.safetensors must
-    # not fail an allow_patterns=["adapter_model.safetensors"] probe whose adapter weight IS on
-    # disk, so scope the broken-symlink check to the requested files (and, for a root warm, drop the
-    # subfolder / checkpoint-dir paths the bare load never reads) -- the same selection
-    # _requested_scope_filter applies to the weights below.
-    broken = _broken_symlink_rel_paths(snapshot_dir)
-    if broken and _requested_scope_filter(
-        broken, allow_patterns, ignore_patterns, root_weights_only = root_weights_only
-    ):
+    # 2. A diffusers pipeline (root model_index.json) needs component-completeness reasoning we do
+    #    not fast-path -> defer to the child.
+    if _safe_is_file(snapshot_dir / "model_index.json"):
         return False
-
-    index_entries: list = []
-    weight_entries: list = []  # (entry, repo-relative path)
-    for entry in entries:
-        name = entry.name
-        if _is_weight_shard_index(name):
-            if _safe_is_file(entry):
-                index_entries.append(entry)
-        elif _is_loadable_weight_file(name) and _safe_is_file(entry):
-            try:
-                rel = entry.relative_to(snapshot_dir).as_posix()
-            except ValueError:
-                rel = name
-            weight_entries.append((entry, rel))
-
-    # The weights the request selects that are present on disk (any present root weight when the
-    # request is unpatterned). The snapshot can carry an unrelated weight while the requested one
-    # is missing, so a patterned request must find one it actually selects. For a root-level warm of
-    # a non-pipeline model, _requested_scope_filter drops EVERY subfolder weight (BF16/, fp16/,
-    # checkpoint-500/, an onnx/ export, left behind by a prior patterned pull): an UNPATTERNED,
-    # IGNORE-ONLY, or no-slash-glob (["*.safetensors"]) root warm is still a bare from_pretrained
-    # reading ROOT weights, so a subfolder-only snapshot must not read as warm.
-    selected = set(_requested_scope_filter(
-        [rel for _, rel in weight_entries], allow_patterns, ignore_patterns,
-        root_weights_only = root_weights_only,
-    ))
-    if not selected:
+    # 3. A dangling symlink = an interrupted blob (missing or still .incomplete) -> not complete.
+    if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False
-
-    # A request that explicitly names exact files needs them on disk before a stale cache is
-    # short-circuited (pre-download) or accepted (post-download) past the guarded download. WHICH
-    # names are required depends on the request shape:
-    #   * Each named NON-WEIGHT file (tokenizer.json, config.json) must be present -- but only for an
-    #     exact-file request (no globs). A glob-bearing list treats aux names as best-effort (an
-    #     optional vocab.txt / spiece.model the repo may lack), so unsloth's glob warms still
-    #     short-circuit on a warm cache rather than re-downloading on every load.
-    #   * Named WEIGHT files are grouped by LOGICAL weight: format / shard variants of the same
-    #     weight share a key, and each group needs at least ONE variant present. So an "either
-    #     format" list (["pytorch_model.bin", "model.safetensors"]) is satisfied by whichever the
-    #     repo actually ships -- never an error-forever on a name that does not exist -- while a
-    #     base + adapter list (["model.safetensors", "adapter_model.safetensors"]) is TWO groups and
-    #     needs both, so a stale cache holding only the base is rejected.
-    # A name the ignore filter drops is not actually requested.
-    if require_named_weights and allow_patterns:
-        exact_only = not any(_has_glob(p) for p in allow_patterns)
-        if exact_only:
-            present = set()
-            for entry in entries:
-                if _safe_is_file(entry):
-                    try:
-                        present.add(entry.relative_to(snapshot_dir).as_posix())
-                    except ValueError:
-                        present.add(entry.name)
-        else:
-            present = set(rel for _, rel in weight_entries)
-        weight_groups: dict = {}
-        for pat in allow_patterns:
-            if _has_glob(pat):
-                continue
-            if ignore_patterns and not _filter_paths([pat], None, ignore_patterns):
-                continue  # a name the ignore filter drops is not actually requested
-            if str(pat).lower().endswith(_WEIGHT_FILE_SUFFIXES):
-                weight_groups.setdefault(_weight_logical_key(pat), []).append(pat)
-            elif exact_only:
-                # A named non-weight (tokenizer.json, config.json) is required as-is. A direct
-                # membership test (not _filter_paths, which fails OPEN by returning all paths on a
-                # filter error) keeps this fail-SAFE: an unevaluable case requires the guarded
-                # download rather than silently accepting a stale cache as warm.
-                if pat not in present:
-                    return False
-        # Each logical weight group needs at least one of its named format / shard variants on disk
-        # (an interrupted shard SET is caught separately by the numbered-shard check below).
-        for names in weight_groups.values():
-            if not any(n in present for n in names):
-                return False
-
-    # Every selected numbered shard needs the sibling shards the request also selects (the
-    # whole set when unpatterned), so an interrupted multi-shard pull is not read as warm.
-    for entry, rel in weight_entries:
-        if rel not in selected:
-            continue
-        if not _numbered_shard_set_present(
-            entry, snapshot_dir = snapshot_dir,
-            allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
-        ):
-            return False
-
-    # A root-wide warm -- no allow_patterns, a catch-all, OR a no-slash glob such as
-    # ignore_patterns=["*.onnx"] / allow_patterns=["*.safetensors", "*.json"] (all _targets_root_only)
-    # -- validates that every weight-shard index it would read ships all its shards: an index whose
-    # shards (numbered OR arbitrarily named) are not all on disk is an interrupted pull the
-    # in-process load would finish over Xet, which the numbered-shard check alone cannot catch for
-    # non-numbered shard names. A PATH-BEARING (scoped) request may legitimately want only a subset,
-    # so the index is not enforced there. A per-checkpoint index, and -- for a non-pipeline root load
-    # -- any subfolder index, is not what the root load reads, so it is skipped.
-    if _targets_root_only(allow_patterns):
-        for index_entry in index_entries:
-            try:
-                index_rel = index_entry.relative_to(snapshot_dir).as_posix()
-            except ValueError:
-                index_rel = index_entry.name
-            if _path_under_checkpoint_dir(index_rel):
-                continue
-            if root_weights_only and "/" in index_rel:
-                continue  # a subfolder index a bare root from_pretrained never reads
-            if not _weight_shard_index_complete(index_entry):
-                return False
-
-    # A sharded checkpoint is loadable locally ONLY through its index sidecar: transformers'
-    # from_pretrained resolves a local directory by probing model.safetensors then
-    # model.safetensors.index.json (then the .bin pair) -- it never globs model-*-of-*.safetensors --
-    # so a cache holding every numbered shard but missing the index raises "no file named ..." or
-    # fetches the index in-process over Xet. For a root-level (non-pipeline) FULL warm (unpatterned
-    # or glob-bearing -- never a deliberate exact single-shard request, which wants only that file),
-    # require a root-level shard index when root numbered shards are present. _has_root_shard_index
-    # matches the variant form too (model.safetensors.index.fp16.json), so a variant sharded cache --
-    # whose shards (model.fp16-00001-of-00002.safetensors) carry the variant in the regex prefix --
-    # is not falsely rejected.
-    if root_weights_only and (
-        allow_patterns is None or any(_has_glob(p) for p in allow_patterns)
-    ):
-        has_root_numbered_shard = any(
-            "/" not in rel and _NUMBERED_SHARD_RE.match(rel) is not None
-            for _, rel in weight_entries
-        )
-        if has_root_numbered_shard and not _has_root_shard_index(snapshot_dir, entries):
-            return False
-
-    # A FULL pipeline warm -- no allow_patterns, a pure catch-all ``["*"]``, or a no-slash file glob
-    # (``["*.safetensors", "*.json"]``) that HF's matcher spreads across every nested component --
-    # must carry every sub-model a diffusers model_index.json declares: a warm killed mid-pipeline
-    # can leave one component cached and another entirely absent, which the in-process pipeline load
-    # would then fetch over unprotected Xet. A scoped (path-bearing) request targets its own subset,
-    # so the whole-pipeline rule does not apply there.
-    if _targets_root_only(allow_patterns):
-        weight_dirs = {rel.split("/", 1)[0] for _, rel in weight_entries if "/" in rel}
-        if not _diffusion_pipeline_complete(snapshot_dir, weight_dirs):
-            return False
-    return True
-
-
-# Representative loadable-weight filenames -- the probe set for "can this request include a
-# weight file". One per recognized format and naming convention (full model, sharded, PEFT
-# adapter, consolidated / original checkpoint, diffusers), so a weight-selecting glob like
-# ``adapter_model.*`` or ``consolidated.*`` matches a probe and is not misread as weightless.
-# The shard *index* sidecars (``*.safetensors.index.json`` / ``*.bin.index.json``) are
-# intentionally absent: they are JSON metadata, not weights, so a metadata-only request such
-# as ``allow_patterns=["*.json"]`` (or ``["*.index.json"]``) must read as weightless.
-_WEIGHT_PROBE_NAMES = (
-    "model.safetensors",
-    "model-00001-of-00002.safetensors",
-    "pytorch_model.bin",
-    "pytorch_model-00001-of-00002.bin",
-    "adapter_model.safetensors",
-    "adapter_model.bin",
-    "consolidated.00.pth",
-    "consolidated.safetensors",
-    "diffusion_pytorch_model.safetensors",
-    "diffusion_pytorch_model.bin",
-    "tf_model.h5",
-    "flax_model.msgpack",
-    "model.gguf",
-    "model.pt",
-    "model.pth",
-    "model.ckpt",
-    "model.onnx",
-    "model.pdparams",
-)
-
-_GLOB_CHARS = ("*", "?", "[")
-
-
-def _has_glob(text: str) -> bool:
-    # A trailing-slash directory pattern ("unet/", "checkpoint-10/") is NOT an exact filename:
-    # Hugging Face's filter_repo_objects expands it to match everything under that directory (as
-    # if "unet/*"). Treat it as a wildcard so the strict exact-name checks do not look for a
-    # literal "unet/" entry and wrongly reject a fully cached directory / component download.
-    return text.endswith("/") or any(ch in text for ch in _GLOB_CHARS)
-
-
-# Weight stems that are format-family variants of the SAME logical weight (Transformers reads one):
-# the PyTorch / TF / Flax / safetensors "model" forms collapse to one key, so an "either format"
-# named request is satisfied by whichever variant the repo actually ships.
-_WEIGHT_FORMAT_FAMILY = {
-    "pytorch_model": "model",
-    "tf_model": "model",
-    "flax_model": "model",
-    "model": "model",
-}
-
-
-def _weight_logical_key(name: str) -> tuple:
-    """A grouping key for a named weight file so format / shard variants of the SAME logical weight
-    share it. Keyed by (directory, normalized stem): the weight suffix and any ``-NNNNN-of-NNNNN``
-    shard suffix are stripped, and the pytorch_model / tf_model / flax_model / model family collapses
-    to ``model``. So ``["pytorch_model.bin", "model.safetensors"]`` is ONE group (either format
-    satisfies it) while ``["model.safetensors", "adapter_model.safetensors"]`` -- or the same stem in
-    two different subdirs -- are separate groups, each independently required."""
-    norm = name.replace("\\", "/")
-    dirname, _, base = norm.rpartition("/")
-    base = base.lower()
-    for suf in _WEIGHT_FILE_SUFFIXES:
-        if base.endswith(suf):
-            base = base[: -len(suf)]
-            break
-    base = re.sub(r"-\d+-of-\d+$", "", base)
-    return (dirname, _WEIGHT_FORMAT_FAMILY.get(base, base))
-
-
-def _as_pattern_list(patterns: "Optional[object]") -> "Optional[list]":
-    """Normalize an allow / ignore pattern argument to a list. Hugging Face accepts a bare
-    ``str`` as well as a list, and iterating the ``str`` form would walk it character by
-    character (so ``"checkpoint-10/*"`` would never match), misclassifying the request."""
-    if patterns is None:
-        return None
-    if isinstance(patterns, str):
-        return [patterns]
-    return list(patterns)
-
-
-# Stems that, by convention, name a per-checkpoint DIRECTORY (whose weights live inside),
-# not a file. Used to disambiguate a dotted no-slash glob like ``checkpoint-v1.*`` (a
-# checkpoint directory, weights nested) from a file glob like ``tokenizer.*`` -- both are
-# structurally ``<stem>.*`` but only the former can include weights.
-_CHECKPOINT_DIR_PREFIXES = (
-    "checkpoint", "ckpt", "epoch", "step", "global_step", "iter", "iteration",
-)
-
-
-def _looks_like_checkpoint_dir(pattern: str) -> bool:
-    lowered = pattern.lower()
-    return any(lowered.startswith(prefix) for prefix in _CHECKPOINT_DIR_PREFIXES)
-
-
-def _path_under_checkpoint_dir(rel: str) -> bool:
-    """True when a repo-relative *rel* lives inside a per-checkpoint directory
-    (``checkpoint-500/model.safetensors``, ``global_step1000/pytorch_model.bin``). Only the
-    PARENT components are checked -- the final component is the filename itself. Used to keep a
-    checkpoint-dir weight from satisfying an unpatterned (root-model) warmup: such a weight is
-    what a prior ``allow_patterns=["checkpoint-500/*"]`` pull leaves behind, not the root weight
-    a bare ``from_pretrained`` reads."""
-    parts = rel.split("/")
-    return any(_looks_like_checkpoint_dir(p) for p in parts[:-1] if p)
-
-
-def _bracket_member(content: str) -> str:
-    """A single character that a glob ``[...]`` class *matches*, for concretizing a bracket
-    expression into a probe that still satisfies the caller's own pattern. ``[0-9]`` -> ``0``,
-    ``[a-z]`` -> ``a``; a negated class (``[!...]`` / ``[^...]``) -> a filler the class does
-    not exclude. Replacing the class with a non-member (a literal ``x`` for ``[0-9]``) would
-    make the probe fail the caller's pattern and misread the request as weightless."""
-    negated = content[:1] in ("!", "^")
-    if not negated:
-        # The first listed item is a member: a literal char, or the low end of a leading range.
-        return content[0] if content else "x"
-    # Negated: pick a filler the class does not exclude (fnmatch mirrors HF's matcher).
-    try:
-        cls = "[" + content + "]"
-        for cand in ("x", "0", "a", "z", "9", "_", "-", "A"):
-            if fnmatch.fnmatch(cand, cls):
-                return cand
-    except Exception:
-        pass
-    return "x"
-
-
-def _concretize_glob(pattern: str) -> str:
-    """Replace glob wildcards in *pattern* with a literal filler so it can stand in as a
-    concrete directory name (e.g. ``checkpoint-*`` -> ``checkpoint-x``). A ``[...]`` class
-    collapses to one member char it actually matches (so the probe still satisfies the
-    pattern). Used to probe weights nested under a no-slash directory glob, since Hugging
-    Face's ``fnmatch`` ``*`` spans ``/``."""
-    out = []
-    i = 0
-    n = len(pattern)
-    while i < n:
-        ch = pattern[i]
-        if ch in ("*", "?"):
-            out.append("x")
-            i += 1
-        elif ch == "[":
-            j = pattern.find("]", i + 1)
-            if j != -1:
-                out.append(_bracket_member(pattern[i + 1 : j]))
-                i = j + 1
-            else:
-                out.append("x")  # unterminated class: treat "[" as a literal filler
-                i += 1
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
-# Representative NON-weight files a catch-all ("*") or a config / tokenizer glob ("*.json")
-# would also match -- used to tell a weight-specific basename (model.*, *.safetensors) from a
-# catch-all when deciding whether a path-qualified request under a plain subfolder targets
-# weights. Not exhaustive; just enough common names to disqualify a non-weight glob.
-_NON_WEIGHT_PROBE_NAMES = (
-    "config.json",
-    "tokenizer.json",
-    "tokenizer.model",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "generation_config.json",
-    "preprocessor_config.json",
-    # Processor metadata: a processor-only warm (allow_patterns=["processor*"]) selects these and no
-    # weight, so a representative must be here for _basename_is_non_weight to read the glob as
-    # metadata-only (else the snapshot is wrongly rejected for lacking a weight).
-    "processor_config.json",
-    "video_preprocessor_config.json",
-    # Chat-template metadata: a template-only warm (allow_patterns=["chat_template*"]) selects these
-    # and no weight, so a representative must be here -- otherwise the glob is misread as a weight
-    # directory and a template-only snapshot is wrongly rejected for lacking a weight.
-    "chat_template.json",
-    "chat_template.jinja",
-    "added_tokens.json",
-    # SentencePiece / slow-tokenizer vocab assets a tokenizer-only warm selects with a no-slash glob
-    # (allow_patterns=["spiece*"], ["sentencepiece*"], ["spm*"]). Without a representative the glob
-    # reads as a weight directory and a tokenizer-only snapshot is wrongly rejected for lacking a
-    # weight. tokenizer.model is already listed above.
-    "spiece.model",
-    "sentencepiece.bpe.model",
-    "spm.model",
-    "source.spm",
-    "target.spm",
-    "bpe.codes",
-    "vocab.bpe",
-    "normalizer.json",
-    "vocab.json",
-    "merges.txt",
-    "readme.md",
-    "training_args.bin",
-    "optimizer.pt",
-)
-
-
-# Subfolders that, by convention, hold only auxiliary / telemetry / config files -- never model
-# weights. A catch-all glob under one of these (tokenizer/*, runs/*, scheduler/*) is read as
-# weightless. Kept deliberately narrow: an unknown subfolder (unet/, transformer/, original/, a
-# new arch's component dir) must stay weight-including, so a weight-bearing dir is never misread
-# as weightless (that would re-open the silent-Xet-hang accept-stale this module exists to
-# prevent). The Diffusers / multimodal preprocessing components listed here (scheduler/,
-# feature_extractor/, processor/, image_processor/, the extra tokenizers) ship only
-# *_config.json / vocab files; the weight-bearing pipeline dirs (unet/, transformer/, vae/,
-# text_encoder*/, image_encoder/, safety_checker/) are deliberately absent so a catch-all under
-# them stays weight-including.
-_NON_WEIGHT_DIR_NAMES = frozenset({
-    "tokenizer", "tokenizer_2", "tokenizer_3", "runs", "run", "logs", "log", "samples", "sample",
-    "tensorboard", "tb", "events", "eval", "evals", "evaluation", "metrics", "wandb", "assets",
-    "images", "media", "scheduler", "feature_extractor", "processor", "image_processor",
-})
-
-
-def _basename_targets_weight(basename: str) -> bool:
-    """True when a path-qualified pattern's basename specifically selects a model weight
-    (``model.*``, ``adapter_model.*``, ``*.safetensors``), so the request is weight-including
-    even under a non-weight parent dir. A catch-all (``*``) matches both weights and non-weights
-    and a non-weight glob (``*.json``) matches no weight, so neither counts."""
-    base = basename.lower()
-    if not any(fnmatch.fnmatchcase(name, base) for name in _WEIGHT_PROBE_NAMES):
-        return False
-    return not any(fnmatch.fnmatchcase(name, base) for name in _NON_WEIGHT_PROBE_NAMES)
-
-
-def _basename_is_non_weight(basename: str) -> bool:
-    """True when a path-qualified pattern's basename clearly selects only non-weight files
-    (``*.json``, ``config.json``, ``tokenizer.*``, ``*.txt``): it matches a known non-weight
-    representative but no weight name. A catch-all (``*``) matches a weight too, so it is NOT
-    clearly non-weight and stays weight-including (the parent dir may hold weights)."""
-    base = basename.lower()
-    if not any(fnmatch.fnmatchcase(name, base) for name in _NON_WEIGHT_PROBE_NAMES):
-        return False
-    return not any(fnmatch.fnmatchcase(name, base) for name in _WEIGHT_PROBE_NAMES)
-
-
-def _parent_is_non_weight_dir(prefix: str) -> bool:
-    """True when *prefix* is a known auxiliary / telemetry dir (tokenizer/, runs/, logs/) and no
-    component looks like a checkpoint / weight dir, so a catch-all glob under it holds no weights.
-    An unknown subfolder returns False (stays weight-including) to avoid accept-stale."""
-    parts = [p.lower() for p in prefix.split("/") if p]
-    if any(_looks_like_checkpoint_dir(p) for p in parts):
-        return False
-    return any(p in _NON_WEIGHT_DIR_NAMES for p in parts)
-
-
-def _weight_self_probe(pattern: str) -> "Optional[str]":
-    """A concretized stand-in for *pattern* when it names a loadable model weight by suffix
-    (``lora_*.safetensors`` -> ``lora_x.safetensors``, ``checkpoint-10/lora_*.bin`` ->
-    ``checkpoint-10/lora_x.bin``, a bare ``model-00002-of-00005.safetensors``), so a custom
-    weight basename that matches no canonical probe is still recognized. Returns None when the
-    suffix is not a weight suffix, or when the (concretized) basename is a known trainer /
-    optimizer artifact (``optimizer.pt``, ``training_args.bin``, ``rng_state_*.pth``): those
-    carry weight suffixes but the snapshot completeness check filters them out as non-weights,
-    so classifying such a request as weight-including would loop the guarded download.
-
-    Also recognizes a trailing-wildcard variant glob whose wildcard would ABSORB the weight suffix
-    (``model.fp16*`` -> ``model.fp16.safetensors``, ``pytorch_model.fp16*`` ->
-    ``pytorch_model.fp16.bin``): such a glob does not literally end in a weight suffix, but it does
-    select a real variant weight, so it must read as weight-including. A clearly non-weight glob
-    (``tokenizer*``, ``config*``, ``spiece*``) is excluded so a metadata-only warm stays weightless."""
-    if pattern.lower().endswith(_WEIGHT_FILE_SUFFIXES):
-        concrete = _concretize_glob(pattern)
-        basename = concrete.rsplit("/", 1)[-1]
-        if not _is_loadable_weight_file(basename):
-            return None
-        return concrete
-    # Trailing-wildcard glob whose wildcard ABSORBS the weight suffix (``model.fp16*`` ->
-    # ``model.fp16.safetensors``, ``unet/diffusion_pytorch_model.fp16*`` -> the same re-rooted under
-    # ``unet/``): try each weight suffix in place of the trailing wildcard. Applies to a path-qualified
-    # basename too, so a subfolder variant-component glob is not misread as weightless.
-    if pattern.endswith(("*", "?")):
-        prefix, _, base = pattern.rpartition("/")
-        if not _basename_is_non_weight(base):
-            stem = _concretize_glob(base.rstrip("*?"))
-            stem_lower = stem.lower()
-            # A stem that is itself a trainer artifact (scheduler*, rng_state*, optimizer*) selects no
-            # weight; a stem already ending in ``.index`` or a weight suffix is an index sidecar /
-            # canonical-probe case the synthetic suffix would only corrupt (model.safetensors.index*,
-            # model.safetensors*). Skip both so the request is not over-classified weight-including.
-            is_artifact_stem = (
-                stem_lower in _NON_WEIGHT_STEMS
-                or stem_lower.startswith(_NON_WEIGHT_BASENAME_PREFIXES)
-            )
-            is_sidecar_stem = stem_lower.endswith(".index") or stem_lower.endswith(_WEIGHT_FILE_SUFFIXES)
-            if stem and not is_artifact_stem and not is_sidecar_stem:
-                for suffix in _WEIGHT_FILE_SUFFIXES:
-                    candidate_base = stem + suffix
-                    if fnmatch.fnmatchcase(candidate_base, base) and _is_loadable_weight_file(candidate_base):
-                        if not prefix:
-                            return candidate_base
-                        concrete_prefix = _concretize_glob(prefix) if _has_glob(prefix) else prefix
-                        return f"{concrete_prefix}/{candidate_base}"
-    return None
-
-
-def request_can_include_weights(
-    allow_patterns: "Optional[list]" = None, ignore_patterns: "Optional[list]" = None
-) -> bool:
-    """Whether a download restricted by *allow_patterns* / *ignore_patterns* can still
-    include a model weight file.
-
-    Used to decide whether snapshot completeness should require weights: a request that
-    filters every weight format out (e.g. ``ignore_patterns`` covering ``*.safetensors``
-    and ``*.bin`` to fetch only config / tokenizer files from a model repo) legitimately
-    yields a weightless snapshot, so requiring a weight there would reject a valid result.
-    An unfiltered request -- or one any weight filename survives -- includes weights.
-
-    Path-qualified requests are handled too: ``allow_patterns`` such as
-    ``["checkpoint-10/*"]`` or ``["models/*.safetensors"]`` probe the canonical weight
-    names re-rooted under that directory, and a bare non-first shard like
-    ``["model-00002-of-00005.safetensors"]`` is probed verbatim, so a request that does
-    target weights inside a subfolder / at a specific shard is not misread as weightless.
-
-    *allow_patterns* / *ignore_patterns* accept the ``str`` or ``list[str]`` forms that
-    Hugging Face itself accepts."""
-    allow_patterns = _as_pattern_list(allow_patterns)
-    ignore_patterns = _as_pattern_list(ignore_patterns)
-    # Only a truly unfiltered request (both None) is an unconditional weight warmup. An empty
-    # allow list is NOT None: Hugging Face's filter_repo_objects treats allow_patterns=[] as
-    # selecting NO objects, so the request is weightless -- collapsing [] with None here would
-    # reject a legitimately empty snapshot and loop the guarded download.
-    if allow_patterns is None and ignore_patterns is None:
-        return True
-    try:
-        from huggingface_hub.utils import filter_repo_objects
-    except Exception:
-        return True  # cannot evaluate the filter -> assume weights are expected
-
-    probes = list(_WEIGHT_PROBE_NAMES)
-    for pat in (allow_patterns or ()):
-        # A concretized stand-in when the pattern itself names a loadable weight by suffix
-        # (lora_*.safetensors, checkpoint-10/lora_*.bin, a bare non-first shard). None for a
-        # non-weight suffix and for a known trainer artifact (optimizer.pt, training_args.bin),
-        # keeping this consistent with the snapshot completeness check.
-        self_probe = _weight_self_probe(pat)
-        if "/" in pat:
-            # Path-qualified: re-root the canonical weight probes under the parent dir
-            # (concretized when the parent is globbed) so the request is checked inside that
-            # directory. Default to re-rooting (weight-including), because an unknown subfolder
-            # (unet/, transformer/, original/, mp_rank_*/) may hold weights and reading it as
-            # weightless would accept a stale config-only cache -> the silent Xet hang. Skip the
-            # re-root only when the request is clearly non-weight: a non-weight basename glob
-            # (*.json, tokenizer.*, *.txt), or a catch-all under a known auxiliary dir
-            # (tokenizer/*, runs/*) that does not itself target a weight. A weight-suffix
-            # basename is still recognized by self_probe below; the final filter applies ignores.
-            prefix, base = pat.rsplit("/", 1)
-            clearly_weightless = _basename_is_non_weight(base) or (
-                _parent_is_non_weight_dir(prefix) and not _basename_targets_weight(base)
-            )
-            if not clearly_weightless:
-                concrete_parent = _concretize_glob(prefix) if _has_glob(prefix) else prefix
-                probes.extend(f"{concrete_parent}/{name}" for name in _WEIGHT_PROBE_NAMES)
-        elif (
-            _has_glob(pat)
-            and ("." not in pat or _looks_like_checkpoint_dir(pat))
-            and not _basename_is_non_weight(pat)
-        ):
-            # A no-slash DIRECTORY glob ("checkpoint-*", "global_step*", the dotted
-            # "checkpoint-v1.*"): HF's fnmatch "*" spans "/", so it matches nested weights like
-            # checkpoint-10/model.safetensors. Probe the canonical weights re-rooted under a
-            # concretized form of the glob. A plain extension file glob ("*.json", "tokenizer.*")
-            # is not a directory glob and stays weightless unless it names a weight (self_probe).
-            # A no-slash glob whose stem is a known metadata family ("tokenizer*", "config*",
-            # "vocab*", "special_tokens*") is a FILE glob, not a directory: _basename_is_non_weight
-            # excludes it so a tokenizer*-only warm that fetched tokenizer.json is not rejected for
-            # lacking a weight ("model*" / "pytorch_model*" stay weight-including -- they match a
-            # weight probe, so _basename_is_non_weight is False for them).
-            concrete = _concretize_glob(pat)
-            probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
-        # A pattern that itself names a loadable weight -- a bare filename, a path-qualified
-        # name, or a weight-suffix glob whose stem matches no canonical probe (lora_*.safetensors,
-        # checkpoint-*/lora_*.bin) -- is recognized via its self-probe. "adapter_model.*" rides
-        # the canonical adapter probe instead, and a trainer artifact yields no self-probe and
-        # stays weightless. Everything is subject to the final ignore_patterns filter below.
-        if self_probe is not None:
-            probes.append(self_probe)
-
-    try:
-        kept = list(
-            filter_repo_objects(
-                probes, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
-            )
-        )
-    except Exception:
-        return True
-    return len(kept) > 0
+    # 4. Canonical root weights present and complete.
+    return _canonical_root_weights_complete(snapshot_dir, entries)
 
 
 def requested_named_files_present(
@@ -1266,6 +575,10 @@ def requested_named_files_present(
             return False
     return True
 
+
+# ---------------------------------------------------------------------------
+# Active-cache enumeration primitives (download-manager / watchdog support)
+# ---------------------------------------------------------------------------
 
 def _iter_snapshot_dirs(repo_dir: Path) -> Iterator[Path]:
     snapshots_dir = repo_dir / "snapshots"

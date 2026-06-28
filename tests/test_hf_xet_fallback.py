@@ -1298,93 +1298,6 @@ def test_snapshot_dir_is_complete_unit(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is True
 
 
-def _make_diffusion_component(snap, blob, name, weight_filename = None):
-    """Create a diffusers pipeline subfolder with a config and (optionally) a weight symlink."""
-    comp = snap / name
-    comp.mkdir()
-    (comp / "config.json").write_text("{}")
-    if weight_filename is not None:
-        (comp / weight_filename).symlink_to(blob)
-    return comp
-
-
-def test_snapshot_dir_is_complete_diffusion_missing_component(tmp_path):
-    """A full pipeline warm killed with one component absent reads as incomplete. model_index.json
-    declares unet / vae / text_encoder; the snapshot warmed unet + vae but never started
-    text_encoder, so the in-process pipeline load would fetch it over unprotected Xet."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"weights")
-    (snap / "model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "StableDiffusionPipeline",
-                "_diffusers_version": "0.30.0",
-                "unet": ["diffusers", "UNet2DConditionModel"],
-                "vae": ["diffusers", "AutoencoderKL"],
-                "text_encoder": ["transformers", "CLIPTextModel"],
-                "scheduler": ["diffusers", "PNDMScheduler"],
-                "safety_checker": [None, None],
-            }
-        )
-    )
-    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
-    _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
-    (snap / "scheduler").mkdir()
-    (snap / "scheduler" / "scheduler_config.json").write_text("{}")
-    # text_encoder subfolder never created -> interrupted pipeline warm
-    assert hcs.snapshot_dir_is_complete(snap) is False
-    # Once the missing component is on disk the pipeline reads complete.
-    _make_diffusion_component(snap, blob, "text_encoder", "model.safetensors")
-    assert hcs.snapshot_dir_is_complete(snap) is True
-
-
-def test_snapshot_dir_is_complete_diffusion_partial_weight_component(tmp_path):
-    """A weight-bearing component whose subfolder holds only a config (no weight) reads as
-    incomplete: the component started but its weight was never fetched."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"weights")
-    (snap / "model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "StableDiffusionPipeline",
-                "unet": ["diffusers", "UNet2DConditionModel"],
-                "vae": ["diffusers", "AutoencoderKL"],
-            }
-        )
-    )
-    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
-    _make_diffusion_component(snap, blob, "vae", weight_filename = None)  # config only, no weight
-    assert hcs.snapshot_dir_is_complete(snap) is False
-    (snap / "vae" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap) is True
-
-
-def test_snapshot_dir_is_complete_diffusion_scoped_request_not_blocked(tmp_path):
-    """A scoped subfolder request (allow_patterns=["unet/*"]) targets its own subset, so the
-    whole-pipeline completeness rule does not apply: a unet-only snapshot reads complete even
-    though the pipeline declares more components."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"weights")
-    (snap / "model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "StableDiffusionPipeline",
-                "unet": ["diffusers", "UNet2DConditionModel"],
-                "vae": ["diffusers", "AutoencoderKL"],
-                "text_encoder": ["transformers", "CLIPTextModel"],
-            }
-        )
-    )
-    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["unet/*"]) is True
-
-
 def test_snapshot_dir_is_complete_broken_symlink(tmp_path):
     """A dangling weight symlink reads as incomplete."""
     snap = tmp_path / "snap"
@@ -1466,332 +1379,6 @@ def test_snapshot_dir_is_complete_ignores_trainer_artifacts(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap) is True   # real weight present
 
 
-def test_snapshot_dir_is_complete_requires_the_requested_weight(tmp_path):
-    """A patterned request is satisfied only by a weight it actually selects: a snapshot that
-    carries some other weight but not the requested one (e.g. adapter / checkpoint) reads as
-    incomplete, so the guarded download still runs."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model.safetensors").symlink_to(blob)            # base weight only
-    # Requesting the adapter weight: the base weight does not satisfy it.
-    assert hcs.snapshot_dir_is_complete(
-        snap, allow_patterns = ["adapter_model.safetensors"]
-    ) is False
-    # No patterns: any loadable weight suffices.
-    assert hcs.snapshot_dir_is_complete(snap) is True
-    # Once the requested adapter weight is present, the request is satisfied.
-    (snap / "adapter_model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(
-        snap, allow_patterns = ["adapter_model.safetensors"]
-    ) is True
-
-
-def test_snapshot_dir_is_complete_requires_requested_subfolder_weight(tmp_path):
-    """A subfolder request is satisfied only by a weight under that subfolder, not by a
-    root-level weight the snapshot also carries."""
-    snap = tmp_path / "snap"
-    (snap / "checkpoint-10").mkdir(parents = True)
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model.safetensors").symlink_to(blob)            # root weight only
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is False
-    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
-
-
-def test_snapshot_dir_is_complete_single_shard_request(tmp_path):
-    """A deliberate single-shard request is satisfied by that one shard; the full -of-NNNNN
-    set is required only for an unpatterned full warm."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model-00002-of-00005.safetensors").symlink_to(blob)
-    # Just the requested shard present -> complete for that request.
-    assert hcs.snapshot_dir_is_complete(
-        snap, allow_patterns = ["model-00002-of-00005.safetensors"]
-    ) is True
-    # An unpatterned full warm requires the whole set -> incomplete (4 shards missing).
-    assert hcs.snapshot_dir_is_complete(snap) is False
-
-
-def test_snapshot_dir_is_complete_checkpoint_only_not_warm_root(tmp_path):
-    """An unpatterned (root-model) warm is not satisfied by a weight that lives only inside a
-    per-checkpoint dir. A cache left by a prior allow_patterns=["checkpoint-10/*"] pull holds
-    checkpoint-10/model.safetensors but no root weight; reading it as a warm root model would let
-    the guarded download be skipped and hand from_pretrained a snapshot whose root weights are
-    missing (Codex #829). A root weight (or a patterned checkpoint request) still completes."""
-    snap = tmp_path / "snap"
-    (snap / "checkpoint-10").mkdir(parents = True)
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)   # checkpoint weight only
-    (snap / "config.json").write_text("{}")
-    # Unpatterned root warm: the checkpoint weight does not count -> incomplete.
-    assert hcs.snapshot_dir_is_complete(snap) is False
-    # A patterned request for that checkpoint IS satisfied by it (not a root warm).
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
-    # Once a root weight is present, the unpatterned warm completes (checkpoint weight ignored).
-    (snap / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap) is True
-    # A DeepSpeed-style global_step dir is treated the same way.
-    snap2 = tmp_path / "snap2"
-    (snap2 / "global_step500").mkdir(parents = True)
-    (snap2 / "global_step500" / "pytorch_model.bin").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap2) is False
-
-
-def test_snapshot_dir_is_complete_catchall_not_warm_root(tmp_path):
-    """A pure catch-all allow list (["*"]) selects the whole repo just like an unpatterned warm, so
-    a root from_pretrained still reads ROOT weights. A checkpoint-only cache (left by a prior
-    allow_patterns=["checkpoint-10/*"] pull) must NOT read as complete for ["*"] -- HF's fnmatch
-    "*" spans "/" and would otherwise count the checkpoint weight as satisfying the catch-all
-    (Codex #829). A path-bearing pattern that names the checkpoint is still trusted."""
-    snap = tmp_path / "snap"
-    (snap / "checkpoint-10").mkdir(parents = True)
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)   # checkpoint weight only
-    (snap / "config.json").write_text("{}")
-    # Catch-all is treated like an unpatterned root warm: the checkpoint weight does not count.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*"]) is False
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["**"]) is False
-    # A path-bearing checkpoint pattern IS satisfied by it (deliberate checkpoint selection).
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
-    # Once a root weight is present, the catch-all completes.
-    (snap / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*"]) is True
-
-
-def test_snapshot_dir_is_complete_root_file_glob_not_checkpoint(tmp_path):
-    """A no-slash root weight glob (["*.safetensors"]) reads from the repo ROOT, but HF's fnmatch
-    "*" spans "/" and also matches checkpoint-10/model.safetensors. A checkpoint-only cache must
-    NOT read as complete for the root safetensors warm (Codex #829) -- the root model.safetensors
-    from_pretrained reads is still missing. A path-bearing pattern naming the checkpoint is
-    trusted."""
-    snap = tmp_path / "snap"
-    (snap / "checkpoint-10").mkdir(parents = True)
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "checkpoint-10" / "model.safetensors").symlink_to(blob)
-    (snap / "config.json").write_text("{}")
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
-    # A path-bearing checkpoint pattern IS satisfied by the checkpoint weight.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["checkpoint-10/*"]) is True
-    # A root weight completes the root glob.
-    (snap / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
-
-
-def test_snapshot_dir_is_complete_root_warm_ignores_subfolder_weight(tmp_path):
-    """A root warm (allow_patterns=None, or a no-slash glob) is not satisfied by a weight that
-    lives only in a NON-checkpoint subfolder such as a precision variant (BF16/, fp16/). A prior
-    allow_patterns=["BF16/*"] pull leaves BF16/model.safetensors but no root weight; a root
-    from_pretrained never reads that subfolder, so the snapshot must read as incomplete (Codex
-    #829). A root weight, or an explicit BF16/ request, still completes."""
-    snap = tmp_path / "snap"
-    (snap / "BF16").mkdir(parents = True)
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "BF16" / "model.safetensors").symlink_to(blob)
-    (snap / "config.json").write_text("{}")
-    # Unpatterned and no-slash-glob root warms both ignore the subfolder weight.
-    assert hcs.snapshot_dir_is_complete(snap) is False
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
-    # An explicit subfolder request IS satisfied by it (deliberate subfolder selection).
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["BF16/*"]) is True
-    # A root weight completes the root warm (the subfolder variant is ignored).
-    (snap / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap) is True
-
-
-def test_snapshot_dir_is_complete_diffusion_file_glob_validates_components(tmp_path):
-    """A full diffusers warm expressed as file globs (["*.safetensors", "*.json"]) still selects
-    nested component files, so the model_index.json component check must run: a stale snapshot with
-    only unet/ but a declared vae / text_encoder reads as incomplete (Codex #829), not accepted as
-    a scoped subset."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"weights")
-    (snap / "model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "StableDiffusionPipeline",
-                "unet": ["diffusers", "UNet2DConditionModel"],
-                "vae": ["diffusers", "AutoencoderKL"],
-                "text_encoder": ["transformers", "CLIPTextModel"],
-            }
-        )
-    )
-    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
-    globs = ["*.safetensors", "*.json"]
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is False
-    # Once the other declared components land, the file-glob warm completes.
-    _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
-    _make_diffusion_component(snap, blob, "text_encoder", "model.safetensors")
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is True
-
-
-def test_request_can_include_weights_sentencepiece_glob():
-    """A SentencePiece / slow-tokenizer vocab glob (["spiece*"], ["sentencepiece*"], ["spm*"])
-    selects only tokenizer assets and no weight, so it reads as WEIGHTLESS. Without a representative
-    the no-slash glob is misread as a weight directory and a tokenizer-only snapshot is wrongly
-    rejected for lacking a weight (Codex #829)."""
-    assert hcs.request_can_include_weights(["spiece*"], None) is False
-    assert hcs.request_can_include_weights(["sentencepiece*"], None) is False
-    assert hcs.request_can_include_weights(["spm*"], None) is False
-    assert hcs.request_can_include_weights(["spiece.model", "tokenizer*"], None) is False
-    # A weight glob is still weight-including (no accept-stale).
-    assert hcs.request_can_include_weights(["model*"], None) is True
-
-
-def test_request_can_include_weights_variant_prefix_glob():
-    """A variant weight prefix glob (["model.fp16*"], ["pytorch_model.fp16*"]) selects a real variant
-    weight (model.fp16.safetensors) even though the pattern ends in the wildcard, not a weight
-    suffix. It must read as weight-including so the fast path does not accept a config-only snapshot
-    without the requested variant weights (Codex #829). A metadata prefix glob stays weightless."""
-    assert hcs.request_can_include_weights(["model.fp16*"], None) is True
-    assert hcs.request_can_include_weights(["pytorch_model.fp16*"], None) is True
-    assert hcs.request_can_include_weights(["model.bf16*"], None) is True
-    # Metadata / non-weight prefix globs stay weightless (no over-reject of a tokenizer-only warm).
-    assert hcs.request_can_include_weights(["tokenizer*"], None) is False
-    assert hcs.request_can_include_weights(["config*"], None) is False
-    assert hcs.request_can_include_weights(["spiece*"], None) is False
-
-
-def test_snapshot_dir_is_complete_diffusion_weights_only_glob(tmp_path):
-    """A weights-only root glob (["*.safetensors"]) on a diffusers repo downloads the component
-    weights (unet/, vae/) but NOT model_index.json, so the pipeline layout must be recognized from
-    the component weights themselves -- otherwise the snapshot is misread as a non-pipeline root
-    load, its subfolder weights dropped, and a complete download reported incomplete (Codex #829).
-    A genuine non-pipeline subfolder-only snapshot (BF16/) is still rejected for a root glob."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"w")
-    _make_diffusion_component(snap, blob, "unet", "diffusion_pytorch_model.safetensors")
-    _make_diffusion_component(snap, blob, "vae", "diffusion_pytorch_model.safetensors")
-    # No model_index.json on disk (a *.safetensors warm would not have selected it).
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
-    # A precision-variant subfolder (not a pipeline component) must NOT be mistaken for a pipeline.
-    snap2 = tmp_path / "snap2"
-    (snap2 / "BF16").mkdir(parents = True)
-    (snap2 / "BF16" / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap2, allow_patterns = ["*.safetensors"]) is False
-
-
-def test_snapshot_has_requested_broken_symlinks_dataset_vs_model(tmp_path):
-    """A dangling checkpoint-dir symlink blocks a DATASET snapshot (every requested file matters)
-    but not a MODEL root warm (a root load never reads a checkpoint-dir file), so the checkpoint-dir
-    drop applies only to models (Codex #829)."""
-    snap = tmp_path / "snap"
-    (snap / "checkpoint-10").mkdir(parents = True)
-    (snap / "checkpoint-10" / "data.parquet").symlink_to(tmp_path / "missing")   # dangling
-    assert hcs.snapshot_has_requested_broken_symlinks(snap, repo_type = "model") is False
-    assert hcs.snapshot_has_requested_broken_symlinks(snap, repo_type = "dataset") is True
-    # A dangling ROOT file blocks both (it is a requested interrupted file in either case).
-    snap2 = tmp_path / "snap2"
-    snap2.mkdir()
-    (snap2 / "data.parquet").symlink_to(tmp_path / "missing")
-    assert hcs.snapshot_has_requested_broken_symlinks(snap2, repo_type = "model") is True
-    assert hcs.snapshot_has_requested_broken_symlinks(snap2, repo_type = "dataset") is True
-
-
-def test_request_can_include_weights_chat_template_glob():
-    """A chat-template glob (["chat_template*"]) selects only chat_template.json / .jinja and no
-    weight, so it reads as WEIGHTLESS. Without a representative in the non-weight probes the glob is
-    misread as a weight directory and a template-only snapshot is wrongly rejected (Codex #829)."""
-    assert hcs.request_can_include_weights(["chat_template*"], None) is False
-    assert hcs.request_can_include_weights(["chat_template.jinja"], None) is False
-    assert hcs.request_can_include_weights(["added_tokens.json"], None) is False
-    # A weight glob is still weight-including.
-    assert hcs.request_can_include_weights(["*.safetensors"], None) is True
-
-
-def test_snapshot_dir_is_complete_root_glob_validates_shard_index(tmp_path):
-    """A root-wide patterned warm (allow_patterns=["*.safetensors", "*.json"], or
-    ignore_patterns=["*.onnx"]) still warms the root model, so a shard index whose shards are not
-    all on disk must reject it -- even for NON-numbered shard names the numbered-shard check cannot
-    catch (Codex #829). The index validation now runs for every _targets_root_only request, not
-    only the unpatterned one."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "foo.safetensors").symlink_to(blob)               # one non-numbered shard present
-    (snap / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"a": "foo.safetensors", "b": "bar.safetensors"}})
-    )
-    globs = ["*.safetensors", "*.json"]
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is False        # bar missing
-    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is False  # bar missing
-    (snap / "bar.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is True
-
-
-def test_snapshot_dir_is_complete_sharded_glob_requires_index(tmp_path):
-    """A full warm expressed as a weight glob (["*.safetensors"]) over a complete numbered-shard set
-    is still incomplete without the index sidecar (transformers cannot load a local sharded
-    checkpoint without it). A deliberate exact single-shard request is exempt -- it wants only that
-    file, not the whole model."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
-    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
-    # An exact single-shard request is satisfied by that shard alone (no index required).
-    assert hcs.snapshot_dir_is_complete(
-        snap, allow_patterns = ["model-00001-of-00002.safetensors"]
-    ) is True
-    (snap / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
-                                   "b": "model-00002-of-00002.safetensors"}})
-    )
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
-
-
-def test_snapshot_dir_is_complete_variant_sharded_index(tmp_path):
-    """A variant sharded checkpoint must not be falsely rejected for lacking an index. Transformers'
-    _add_variant names the variant index model.safetensors.index.fp16.json (variant before the
-    trailing .json) and the shards model.fp16-00001-of-00002.safetensors (variant in the regex
-    prefix). The index-sidecar requirement recognizes the variant index, so a complete variant
-    sharded set with its index reads complete, while the same set without ANY index reads
-    incomplete."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model.fp16-00001-of-00002.safetensors").symlink_to(blob)
-    (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
-    # Every shard present but no index of any kind -> incomplete.
-    assert hcs.snapshot_dir_is_complete(snap) is False
-    # The variant index (note: token before the trailing .json) makes it loadable.
-    (snap / "model.safetensors.index.fp16.json").write_text(
-        json.dumps({"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
-                                   "b": "model.fp16-00002-of-00002.safetensors"}})
-    )
-    assert hcs.snapshot_dir_is_complete(snap) is True
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is True
-
-
-def test_request_can_include_weights_processor_subfolder():
-    """A processor / image_processor subfolder ships only *_config.json + vocab files (no weights),
-    so a catch-all warm under it (processor/*) reads as WEIGHTLESS. Without this, the synthetic
-    processor/model.safetensors weight probe makes the request look weight-bearing and a
-    processor-only snapshot is wrongly rejected for lacking a weight (Codex #829). A weight under
-    the same subfolder is still recognized as weight-including."""
-    assert hcs.request_can_include_weights(["processor/*"], None) is False
-    assert hcs.request_can_include_weights(["image_processor/*"], None) is False
-    assert hcs.request_can_include_weights(["processor/"], None) is False
-    # A weight name under the subfolder still reads as weight-including (no accept-stale).
-    assert hcs.request_can_include_weights(["processor/model.safetensors"], None) is True
-
-
 def test_snapshot_dir_is_complete_checkpoint_index_does_not_gate_root(tmp_path):
     """A per-checkpoint shard index with missing shards must not fail an unpatterned root warm:
     the root weights are what the load reads, so an incomplete checkpoint index is irrelevant to
@@ -1809,66 +1396,6 @@ def test_snapshot_dir_is_complete_checkpoint_index_does_not_gate_root(tmp_path):
     )
     # Root warm is complete: the checkpoint index is skipped, the root weight suffices.
     assert hcs.snapshot_dir_is_complete(snap) is True
-
-
-def test_snapshot_dir_is_complete_requires_each_named_weight(tmp_path):
-    """require_named_weights makes a request naming multiple exact weights (base + adapter) need
-    EACH logical weight on disk -- so a stale snapshot holding only the base is rejected -- while
-    grouping format variants of one logical weight so an "either format" list (pytorch_model.bin +
-    model.safetensors) is satisfied by whichever format the repo actually ships (no error-forever on
-    a name that doesn't exist)."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model.safetensors").symlink_to(blob)            # base only; adapter missing
-    pair = ["model.safetensors", "adapter_model.safetensors"]
-    # base + adapter are two LOGICAL weights -> both required; the adapter is missing -> incomplete.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is False
-    # Lenient (require_named_weights off): a present selected weight suffices.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = False) is True
-    # Either-format list = ONE logical weight: whichever format is present satisfies it, under both
-    # the strict and lenient checks (no spurious failure on the absent format).
-    either = ["pytorch_model.bin", "model.safetensors"]
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = True) is True
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = either, require_named_weights = False) is True
-    # Both present -> the base + adapter request is satisfied.
-    (snap / "adapter_model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is True
-    # A named weight the ignore filter drops is not actually requested, so it is not required.
-    (snap / "adapter_model.safetensors").unlink()
-    assert hcs.snapshot_dir_is_complete(
-        snap, allow_patterns = pair, ignore_patterns = ["adapter_model.safetensors"],
-        require_named_weights = True,
-    ) is True
-    # A glob may legitimately select a subset, so it is never forced to be exhaustive.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"], require_named_weights = True) is True
-
-
-def test_snapshot_dir_is_complete_requires_named_non_weight_exact_only(tmp_path):
-    """An EXACT-file request (no globs) naming a non-weight alongside a weight requires the
-    non-weight on disk too: a stale cache holding only the weight must not short-circuit past the
-    guarded download that should still fetch the explicitly named tokenizer / config (Codex #829).
-    A request containing ANY glob is instead a broad selection where aux files are best-effort, so
-    only its concrete weights are required -- keeping unsloth's glob-bearing adapter / tokenizer
-    warms able to short-circuit on a warm cache rather than re-downloading on every load."""
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    (snap / "model.safetensors").symlink_to(blob)        # weight present; tokenizer.json missing
-    pair = ["model.safetensors", "tokenizer.json"]
-    # Strict (pre-download): the named tokenizer.json is missing -> incomplete -> guarded download.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is False
-    # Lenient (post-download): a present selected weight suffices (no error on a possibly-absent name).
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = False) is True
-    # Once the named non-weight is on disk, strict is satisfied.
-    (snap / "tokenizer.json").write_text("{}")
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = pair, require_named_weights = True) is True
-    # A list containing ANY glob is a broad warm: optional aux names are NOT required, only weights.
-    (snap / "tokenizer.json").unlink()
-    globbed = ["model.safetensors", "tokenizer.json", "modeling_*.py"]
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globbed, require_named_weights = True) is True
 
 
 def test_fast_path_rejects_config_only_snapshot(hf_cache, monkeypatch):
@@ -1904,25 +1431,6 @@ def test_fast_path_requires_each_named_weight(hf_cache, monkeypatch):
         allow_patterns = ["model.safetensors", "adapter_model.safetensors"],
     )
     assert out == "/cache/snap-fresh" and len(fake.calls) == 1
-
-
-def test_fast_path_either_format_not_failed_post_download(hf_cache, monkeypatch):
-    """An "either format" request (pytorch_model.bin + model.safetensors) against a repo that
-    only ships safetensors must not error: the child's safetensors-only snapshot is accepted
-    post-download, since the strict named-weight rule is pre-download only (no spurious
-    incomplete-snapshot failure for a name that does not exist, Codex #829)."""
-    blobs = _blobs_dir(hf_cache, DL_REPO)
-    child = blobs.parent / "snapshots" / "fresh"
-    child.mkdir(parents = True)
-    w = blobs / "w"
-    w.write_bytes(b"x")
-    (child / "model.safetensors").symlink_to(w)          # safetensors only; no pytorch_model.bin
-    fake = _install(monkeypatch, [("ok", str(child))])
-    out = xf.snapshot_download_with_xet_fallback(
-        DL_REPO, token = None, force_download = True,
-        allow_patterns = ["pytorch_model.bin", "model.safetensors"],
-    )
-    assert out == str(child) and len(fake.calls) == 1
 
 
 def test_child_broken_snapshot_retries_over_http(monkeypatch, tmp_path):
@@ -2067,92 +1575,6 @@ def test_request_can_include_weights_path_qualified():
     ) is True
 
 
-def test_request_can_include_weights_no_slash_dir_glob():
-    """A no-slash directory glob (checkpoint-*, global_step*) matches nested weights via HF's
-    fnmatch '*'-spans-'/' rule, so it must read as weight-including; a no-slash file glob with
-    an extension (tokenizer.*, *.json) stays weightless."""
-    assert hcs.request_can_include_weights(["checkpoint-*"], None) is True
-    assert hcs.request_can_include_weights(["epoch-*"], None) is True
-    assert hcs.request_can_include_weights(["global_step*"], None) is True
-    assert hcs.request_can_include_weights(["*"], None) is True
-    # ignore_patterns that drop every weight format still wins over the dir glob.
-    assert hcs.request_can_include_weights(
-        ["checkpoint-*"],
-        ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
-         "*.h5", "*.msgpack", "*.ckpt", "*.onnx", "*.pdparams"],
-    ) is False
-    # File globs with an extension are not directory globs.
-    assert hcs.request_can_include_weights(["tokenizer.*"], None) is False
-    assert hcs.request_can_include_weights(["*.json"], None) is False
-    # A dotted no-slash glob whose stem names a checkpoint DIRECTORY still includes weights.
-    assert hcs.request_can_include_weights(["checkpoint-v1.*"], None) is True
-    assert hcs.request_can_include_weights(["global_step100.*"], None) is True
-
-
-def test_request_can_include_weights_wildcard_parent():
-    """A wildcard parent dir with a weight basename glob (checkpoint-*/adapter_model.*,
-    */model.*) must read as weight-including, and ignore_patterns must still be applied to a
-    wildcard-parent request rather than bypassed by an early return."""
-    assert hcs.request_can_include_weights(["checkpoint-*/adapter_model.*"], None) is True
-    assert hcs.request_can_include_weights(["*/model.*"], None) is True
-    assert hcs.request_can_include_weights(["checkpoint-*/*.safetensors"], None) is True
-    # ignore_patterns applies under a wildcard parent: dropping every weight format -> weightless.
-    assert hcs.request_can_include_weights(
-        ["checkpoint-*/*"],
-        ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
-         "*.h5", "*.msgpack", "*.ckpt", "*.onnx", "*.pdparams"],
-    ) is False
-    # Dropping only some formats leaves the request able to include the others.
-    assert hcs.request_can_include_weights(
-        ["checkpoint-*/*"], ["*.safetensors", "*.bin"]
-    ) is True
-    # A non-weight basename under a wildcard parent stays weightless.
-    assert hcs.request_can_include_weights(["checkpoint-*/tokenizer.json"], None) is False
-
-
-def test_request_can_include_weights_weight_selecting_globs():
-    """Weight-selecting basename globs whose stem is not the canonical 'model' -- PEFT
-    adapters, consolidated / original checkpoints, diffusers -- must read as including
-    weights, so a stale snapshot missing them is not accepted on the weightless path."""
-    assert hcs.request_can_include_weights(["adapter_model.*"], None) is True
-    assert hcs.request_can_include_weights(["adapter_model.safetensors"], None) is True
-    assert hcs.request_can_include_weights(["consolidated.*"], None) is True
-    assert hcs.request_can_include_weights(["consolidated.00.pth"], None) is True
-    assert hcs.request_can_include_weights(["diffusion_pytorch_model.*"], None) is True
-    assert hcs.request_can_include_weights(["adapter*.safetensors"], None) is True
-    # A non-weight basename glob stays weightless.
-    assert hcs.request_can_include_weights(["tokenizer.*"], None) is False
-
-
-def test_request_can_include_weights_custom_weight_suffix_globs():
-    """A no-slash FILE glob whose stem matches no canonical probe but whose suffix is a weight
-    suffix (lora_*.safetensors, *.bin, model-*.safetensors, custom_*.pt) must read as
-    weight-including, so a stale snapshot missing it is not accepted on the weightless path. A
-    non-weight-suffix file glob (*.json) stays weightless, and ignore_patterns still wins."""
-    assert hcs.request_can_include_weights(["lora_*.safetensors"], None) is True
-    assert hcs.request_can_include_weights(["*.bin"], None) is True
-    assert hcs.request_can_include_weights(["model-*.safetensors"], None) is True
-    assert hcs.request_can_include_weights(["my_custom_*.pt"], None) is True
-    assert hcs.request_can_include_weights(["*.json"], None) is False
-    # ignore_patterns dropping that very format wins over the weight-suffix glob.
-    assert hcs.request_can_include_weights(["lora_*.safetensors"], ["*.safetensors"]) is False
-
-
-def test_request_can_include_weights_bracket_globs():
-    """A bracket / range glob (checkpoint-[0-9]/*.safetensors, model-[0-9].safetensors) is
-    concretized to a member the class actually matches, so the weight probe still satisfies the
-    caller's own pattern and the request reads as weight-including, not misclassified
-    weightless."""
-    assert hcs.request_can_include_weights(["checkpoint-[0-9]/*.safetensors"], None) is True
-    assert hcs.request_can_include_weights(["model-[0-9].safetensors"], None) is True
-    assert hcs.request_can_include_weights(["ckpt-[0-9][0-9]/*"], None) is True
-    # The concretizer picks an in-class member, not a literal 'x' that the class would reject.
-    assert hcs._concretize_glob("checkpoint-[0-9]") == "checkpoint-0"
-    assert hcs._concretize_glob("layer_[a-f]") == "layer_a"
-    # A negated class yields a filler the class does not exclude (here a non-digit).
-    assert not hcs._concretize_glob("checkpoint-[!0-9]").endswith(tuple("0123456789"))
-
-
 def test_request_can_include_weights_path_qualified_custom_globs():
     """A path-qualified custom weight glob (checkpoint-10/lora_*.safetensors, with a globbed
     parent too) names a weight whose basename matches no canonical probe; it must read as
@@ -2163,26 +1585,6 @@ def test_request_can_include_weights_path_qualified_custom_globs():
     assert hcs.request_can_include_weights(["checkpoint-10/model-[0-9].safetensors"], None) is True
     # A non-weight basename under a subfolder stays weightless.
     assert hcs.request_can_include_weights(["checkpoint-10/tokenizer.json"], None) is False
-
-
-def test_request_can_include_weights_trainer_artifacts_weightless(tmp_path):
-    """A trainer / optimizer artifact (optimizer.pt, training_args.bin, rng_state_*.pth) carries
-    a weight suffix but is not a loadable weight: request_can_include_weights must read it as
-    weightless, matching snapshot_dir_is_complete -- otherwise a child that fetches exactly that
-    artifact loops as an 'incomplete snapshot' (Codex #829)."""
-    for art in ["optimizer.pt", "training_args.bin", "scheduler.pt", "rng_state_0.pth",
-                "checkpoint-10/optimizer.pt"]:
-        assert hcs.request_can_include_weights([art], None) is False, art
-    # Consistency: a snapshot holding only the requested artifact is acceptable (weightless
-    # path), so the guarded download is not retried into an incomplete-snapshot failure.
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "optimizer.pt").symlink_to(blob)
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["optimizer.pt"], ignore_patterns = None
-    ) is True
 
 
 def test_request_can_include_weights_empty_allow_list(tmp_path):
@@ -2203,153 +1605,6 @@ def test_request_can_include_weights_empty_allow_list(tmp_path):
     (snap / "model.safetensors").symlink_to(blob)
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = []) is False
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = None) is True
-
-
-def test_request_can_include_weights_non_weight_subfolders():
-    """A generic glob under a plain (non-checkpoint) subfolder such as tokenizer/* or runs/*
-    must read as weightless -- the unconditional canonical re-rooting would otherwise add a
-    synthetic tokenizer/model.safetensors probe and misclassify a tokenizer-only download as a
-    model warmup (Codex #829). A checkpoint/weight dir or a weight-targeting basename still
-    includes weights."""
-    assert hcs.request_can_include_weights(["tokenizer/*"], None) is False
-    assert hcs.request_can_include_weights(["runs/*"], None) is False
-    assert hcs.request_can_include_weights(["logs/*.txt"], None) is False
-    # Weight-bearing cases stay weight-including.
-    assert hcs.request_can_include_weights(["checkpoint-10/*"], None) is True
-    assert hcs.request_can_include_weights(["*/model.*"], None) is True
-    assert hcs.request_can_include_weights(["models/*.safetensors"], None) is True
-    # A weight-suffix basename under a plain subfolder is still recognized (self-probe).
-    assert hcs.request_can_include_weights(["tokenizer/*.safetensors"], None) is True
-    # A checkpoint dir nested anywhere in the parent path counts.
-    assert hcs.request_can_include_weights(["runs/checkpoint-5/*"], None) is True
-
-
-def test_request_can_include_weights_weight_bearing_subfolders(tmp_path):
-    """A component / quant subfolder (unet/, transformer/, original/, BF16/, Q8_0/) holds
-    weights, so a bare catch-all under it must stay weight-including -- reading an unknown
-    subfolder as weightless would accept a stale config-only cache and re-open the silent Xet
-    hang. Only KNOWN auxiliary dirs (tokenizer/, runs/) are weightless (Codex #829)."""
-    for d in ["unet/*", "transformer/*", "text_encoder/*", "vae/*", "original/*",
-              "mp_rank_00/*", "BF16/*", "Q8_0/*", "Q4_K_M/*", "unknown_component/*"]:
-        assert hcs.request_can_include_weights([d], None) is True, d
-    # End to end: a stale config-only BF16/ snapshot (weight missing, no dangling symlink) must
-    # NOT be short-circuited as warm -- the guarded download still runs.
-    snap = tmp_path / "snap"
-    (snap / "BF16").mkdir(parents = True)
-    (snap / "BF16" / "config.json").write_text("{}")          # config only, no weight
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["BF16/*"], ignore_patterns = None,
-        require_named_weights = True,
-    ) is False
-    # Once the weight is present, it is acceptable.
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "BF16" / "model.safetensors").symlink_to(blob)
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["BF16/*"], ignore_patterns = None,
-    ) is True
-
-
-def test_request_can_include_weights_diffusers_config_only_components(tmp_path):
-    """The Diffusers pipeline components that ship only *_config.json / vocab files
-    (scheduler/, feature_extractor/, tokenizer_2/, tokenizer_3/) must read as weightless, so a
-    catch-all like scheduler/* is not given synthetic weight probes and a child that correctly
-    fetches only scheduler/scheduler_config.json is not rejected for lacking weights (Codex
-    #829). The weight-bearing pipeline dirs stay weight-including."""
-    for d in ["scheduler/*", "feature_extractor/*", "tokenizer_2/*", "tokenizer_3/*"]:
-        assert hcs.request_can_include_weights([d], None) is False, d
-    # The weight-bearing pipeline components are NOT in the weightless set.
-    for d in ["unet/*", "transformer/*", "vae/*", "text_encoder/*", "text_encoder_2/*",
-              "image_encoder/*", "safety_checker/*"]:
-        assert hcs.request_can_include_weights([d], None) is True, d
-    # End to end: a config-only scheduler/ snapshot is acceptable for a scheduler/* request
-    # (no weight expected there), so the guarded download is not looped on it.
-    snap = tmp_path / "snap"
-    (snap / "scheduler").mkdir(parents = True)
-    (snap / "scheduler" / "scheduler_config.json").write_text("{}")
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["scheduler/*"], ignore_patterns = None,
-        require_named_weights = True,
-    ) is True
-
-
-def test_consumer_pattern_lists_accepted_end_to_end(tmp_path):
-    """Lock the cross-repo contract: the EXACT allow / ignore lists unsloth's
-    maybe_prefetch_hf_snapshot emits must be judged correctly by this module's acceptance, so a
-    future drift between the two repos cannot silently loop the guarded download. These lists
-    mirror unsloth's _ADAPTER_PREFETCH_PATTERNS / _ROOT_AUX_PREFETCH_PATTERNS / _SUBDIR_WEIGHT_
-    IGNORE_PATTERNS; if unsloth changes them, this is where the mismatch surfaces."""
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-
-    # --- adapter_only: allow = adapter files + root aux, ignore = None ---
-    root_aux = [
-        "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json",
-        "tokenizer.model", "special_tokens_map.json", "added_tokens.json", "vocab.json",
-        "vocab.txt", "merges.txt", "spiece.model", "chat_template.jinja", "chat_template.json",
-        "preprocessor_config.json", "processor_config.json", "configuration_*.py", "modeling_*.py",
-        "tokenization_*.py", "processing_*.py", "image_processing_*.py", "feature_extraction_*.py",
-        "video_processing_*.py", "*.tiktoken",
-    ]
-    adapter_allow = ["adapter_config.json", "adapter_model*", *root_aux]
-    assert hcs.request_can_include_weights(adapter_allow, None) is True
-    snap = tmp_path / "adapter"
-    snap.mkdir()
-    (snap / "adapter_config.json").write_text("{}")
-    (snap / "adapter_model.safetensors").symlink_to(blob)
-    (snap / "config.json").write_text("{}")
-    (snap / "tokenizer.json").write_text("{}")
-    # A merged full-model weight the adapter warm never requested is present but irrelevant.
-    (snap / "model.safetensors").symlink_to(blob)
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = adapter_allow, ignore_patterns = None,
-        require_named_weights = True,
-    ) is True
-    # An adapter cache missing its weight (config only) is NOT acceptable -> guarded download.
-    snap_bad = tmp_path / "adapter_bad"
-    snap_bad.mkdir()
-    (snap_bad / "adapter_config.json").write_text("{}")
-    assert xf._snapshot_is_acceptable(
-        snap_bad, repo_type = "model", allow_patterns = adapter_allow, ignore_patterns = None,
-    ) is False
-
-    # --- weights_at_root: allow = None, ignore = static skips + subdir-weight excludes ---
-    root_ignore = ["*.onnx", "onnx/*", "*.gguf", "checkpoint-*/*", "*/*.safetensors", "*/*.bin"]
-    assert hcs.request_can_include_weights(None, root_ignore) is True
-    rsnap = tmp_path / "root"
-    rsnap.mkdir()
-    (rsnap / "config.json").write_text("{}")
-    (rsnap / "model.safetensors").symlink_to(blob)          # root weight present
-    (rsnap / "fp16").mkdir()
-    (rsnap / "fp16" / "model.safetensors").symlink_to(blob)  # subdir weight (unread by root load)
-    assert xf._snapshot_is_acceptable(
-        rsnap, repo_type = "model", allow_patterns = None, ignore_patterns = root_ignore,
-    ) is True
-    # A subdir-only cache (no root weight) is NOT acceptable for a root load.
-    rsnap_bad = tmp_path / "root_bad"
-    (rsnap_bad / "fp16").mkdir(parents = True)
-    (rsnap_bad / "config.json").write_text("{}")
-    (rsnap_bad / "fp16" / "model.safetensors").symlink_to(blob)
-    assert xf._snapshot_is_acceptable(
-        rsnap_bad, repo_type = "model", allow_patterns = None, ignore_patterns = root_ignore,
-    ) is False
-
-
-def test_basename_weight_classification_helpers():
-    """Lock the catch-all-vs-weight distinction the subfolder gating rests on: a weight-stem
-    basename targets a weight, a config / tokenizer glob is clearly non-weight, and a bare
-    catch-all ('*') is NEITHER (so it defaults to weight-including under an unknown dir)."""
-    tw, nw = hcs._basename_targets_weight, hcs._basename_is_non_weight
-    assert tw("model.*") is True and nw("model.*") is False
-    assert tw("*.safetensors") is True and nw("*.safetensors") is False
-    assert tw("adapter_model.*") is True
-    assert tw("*.json") is False and nw("*.json") is True
-    assert tw("tokenizer.*") is False and nw("tokenizer.*") is True
-    assert tw("config.json") is False and nw("config.json") is True
-    # A catch-all matches both a weight and a non-weight representative -> neither classifier.
-    assert tw("*") is False and nw("*") is False
-    # *.bin matches a weight (pytorch_model.bin) AND a non-weight (training_args.bin) -> neither.
-    assert tw("*.bin") is False and nw("*.bin") is False
 
 
 def test_request_can_include_weights_string_form():
@@ -2546,92 +1801,9 @@ def test_run_attempt_terminates_child_if_watchdog_start_raises(monkeypatch):
     assert rec["terminated"] is True  # child reaped despite the watchdog-start failure
 
 
-def test_snapshot_dir_is_complete_tolerates_non_string_shard(tmp_path):
-    """A weight index whose ``weight_map`` carries a non-string value (malformed / arbitrary JSON)
-    must not crash the completeness probe: the bad entry is skipped, the string shards still
-    gate, so a real missing shard is still detected (Codex #829). Uses a non-numbered weight name
-    so only the index path -- not the numbered-shard-name expansion -- is exercised."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "model.safetensors").symlink_to(blob)
-    (snap / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "a": "model.safetensors",
-                    "b": ["not", "a", "string"],  # malformed entry -> skipped, no crash
-                }
-            }
-        )
-    )
-    # The one concrete file it names is present; the malformed entry is ignored, so no crash and
-    # the snapshot reads as complete (only demonstrably-missing string shards reject).
-    assert hcs.snapshot_dir_is_complete(snap) is True
-    # A genuinely missing string shard still gates, with the malformed entry still skipped.
-    (snap / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "a": "model.safetensors",
-                    "b": "absent-extra.safetensors",
-                    "c": {"bad": "object"},
-                }
-            }
-        )
-    )
-    assert hcs.snapshot_dir_is_complete(snap) is False  # 'absent-extra' missing, bad entry skipped
-
-
 # --------------------------------------------------------------------------- #
 # Codex review round: scoped completeness, weightless named files, type preservation.
 # --------------------------------------------------------------------------- #
-def test_snapshot_complete_ignore_only_root_excludes_checkpoint(tmp_path):
-    """An IGNORE-ONLY root warm (no allow_patterns, e.g. ignore=['*.onnx']) is still a bare
-    from_pretrained reading ROOT weights, so a snapshot whose only weight lives in a checkpoint dir
-    must read as INCOMPLETE rather than short-circuit the guarded download (Codex #829)."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "config.json").write_text("{}")
-    (snap / "checkpoint-500").mkdir()
-    (snap / "checkpoint-500" / "model.safetensors").symlink_to(blob)
-    # ignore-only -> has_patterns True but allow_patterns None: checkpoint weight must not satisfy it.
-    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is False
-    # A real root weight makes the same ignore-only request complete.
-    (snap / "model.safetensors").symlink_to(blob)
-    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is True
-
-
-def test_snapshot_complete_ignores_dangling_symlink_outside_request(tmp_path):
-    """A dangling symlink for a file the request does NOT select must not reject the snapshot: an
-    allow_patterns=['adapter_model.safetensors'] probe whose adapter weight is on disk stays complete
-    even with a stale dangling root model.safetensors. A dangle for the REQUESTED file still rejects
-    (Codex #829)."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "adapter_model.safetensors").symlink_to(blob)
-    (snap / "model.safetensors").symlink_to(tmp_path / "missing-blob")  # dangling, NOT requested
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["adapter_model.safetensors"]) is True
-    # When the dangling file IS the requested one, the snapshot is incomplete.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["model.safetensors"]) is False
-
-
-def test_request_can_include_weights_metadata_glob_is_weightless():
-    """A no-slash metadata glob (tokenizer*, config*, vocab*, special_tokens*) is a FILE glob, not a
-    weight-bearing directory glob, so a warm that fetched only tokenizer.json is not rejected for
-    lacking a weight. 'model*' / 'pytorch_model*' / 'checkpoint-*' stay weight-including (Codex #829)."""
-    assert hcs.request_can_include_weights(allow_patterns = ["tokenizer*"]) is False
-    assert hcs.request_can_include_weights(allow_patterns = ["config*"]) is False
-    assert hcs.request_can_include_weights(allow_patterns = ["vocab*"]) is False
-    assert hcs.request_can_include_weights(allow_patterns = ["special_tokens*"]) is False
-    assert hcs.request_can_include_weights(allow_patterns = ["model*"]) is True
-    assert hcs.request_can_include_weights(allow_patterns = ["pytorch_model*"]) is True
-    assert hcs.request_can_include_weights(allow_patterns = ["checkpoint-*"]) is True
 
 
 def test_requested_named_files_present_exact_request(tmp_path):
@@ -2651,21 +1823,6 @@ def test_requested_named_files_present_exact_request(tmp_path):
     # An ignore-filtered name is not actually requested, so its absence does not fail.
     assert hcs.requested_named_files_present(
         snap, allow_patterns = ["tokenizer.json", "absent.json"], ignore_patterns = ["absent.json"]
-    ) is True
-
-
-def test_snapshot_acceptable_weightless_requires_named_file(tmp_path):
-    """End-to-end: _snapshot_is_acceptable for a weightless exact-named request rejects a config-only
-    cache missing the requested tokenizer.json, so the guarded download is not skipped (Codex #829)."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    (snap / "config.json").write_text("{}")
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["tokenizer.json"], ignore_patterns = None
-    ) is False
-    (snap / "tokenizer.json").write_text("{}")
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["tokenizer.json"], ignore_patterns = None
     ) is True
 
 
@@ -2736,75 +1893,6 @@ def test_instantiate_preserving_type_paths():
 # --------------------------------------------------------------------------- #
 # Codex round: dir/ wildcard, logical-weight grouping post-download, errno preservation.
 # --------------------------------------------------------------------------- #
-def test_dir_pattern_treated_as_wildcard(tmp_path):
-    """A trailing-slash directory allow pattern (unet/) is a wildcard -- HF's filter_repo_objects
-    expands it to unet/* -- not an exact filename, so the strict named-file checks must not reject a
-    fully cached component directory by looking for a literal 'unet/' entry (Codex #829)."""
-    assert hcs._has_glob("unet/") is True
-    assert hcs._has_glob("checkpoint-10/") is True
-    assert hcs._has_glob("config.json") is False
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    (snap / "unet").mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"x")
-    (snap / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
-    (snap / "unet" / "config.json").write_text("{}")
-    # A dir/ pattern is best-effort (glob), never an exact-name requirement.
-    assert hcs.requested_named_files_present(snap, allow_patterns = ["unet/"]) is True
-    # The component-dir weight satisfies the request; not rejected for a literal 'unet/'.
-    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["unet/"]) is True
-
-
-def test_weight_logical_key_groups_formats():
-    """Format / shard variants of one logical weight share a key; different stems or subdirs do
-    not, so an either-format list is one group while base + adapter are two (Codex #829)."""
-    k = hcs._weight_logical_key
-    assert k("pytorch_model.bin") == k("model.safetensors")               # either-format -> 1 group
-    assert k("model-00001-of-00002.safetensors") == k("model.safetensors")  # shard -> same group
-    assert k("model.safetensors") != k("adapter_model.safetensors")       # base vs adapter
-    assert k("unet/model.safetensors") != k("vae/model.safetensors")      # different subdirs
-
-
-def test_post_download_rejects_stale_named_weight(hf_cache, monkeypatch):
-    """A finished child snapshot missing an explicitly named LOGICAL weight (base present, adapter
-    missing) is now treated as incomplete post-download and retried over HTTP, instead of being
-    returned with the adapter still missing (Codex #829)."""
-    blobs = _blobs_dir(hf_cache, DL_REPO)
-    base_only = blobs.parent / "snapshots" / "xet"
-    base_only.mkdir(parents = True)
-    w = blobs / "w"
-    w.write_bytes(b"x")
-    (base_only / "model.safetensors").symlink_to(w)        # base only; adapter missing
-    complete = blobs.parent / "snapshots" / "http"
-    complete.mkdir(parents = True)
-    (complete / "model.safetensors").symlink_to(w)
-    (complete / "adapter_model.safetensors").symlink_to(w)
-    fake = _install(monkeypatch, [("ok", str(base_only)), ("ok", str(complete))])
-    out = xf.snapshot_download_with_xet_fallback(
-        DL_REPO, token = None, force_download = True,
-        allow_patterns = ["model.safetensors", "adapter_model.safetensors"],
-    )
-    assert out == str(complete)
-    assert [c.disable_xet for c in fake.calls] == [False, True]  # the stale base-only result retried
-
-
-def test_post_download_either_format_still_accepted(hf_cache, monkeypatch):
-    """An either-format list against a single-format child snapshot stays accepted post-download
-    (the formats group to one logical weight), so require_named_weights does not error-forever on a
-    format the repo never ships (Codex #829)."""
-    blobs = _blobs_dir(hf_cache, DL_REPO)
-    child = blobs.parent / "snapshots" / "only-st"
-    child.mkdir(parents = True)
-    w = blobs / "w"
-    w.write_bytes(b"x")
-    (child / "model.safetensors").symlink_to(w)            # safetensors only; no pytorch_model.bin
-    fake = _install(monkeypatch, [("ok", str(child))])
-    out = xf.snapshot_download_with_xet_fallback(
-        DL_REPO, token = None, force_download = True,
-        allow_patterns = ["pytorch_model.bin", "model.safetensors"],
-    )
-    assert out == str(child) and len(fake.calls) == 1
 
 
 def test_parse_errno():
@@ -2826,113 +1914,8 @@ def test_oserror_errno_preserved(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Codex round: weightless broken-symlink scoping + processor metadata glob.
+# Spawn-safety regressions: failed-spawn queue cleanup + disable-Xet env-race lock.
 # --------------------------------------------------------------------------- #
-def test_weightless_broken_symlink_scoped_to_request(tmp_path):
-    """A weightless request (allow=['config.json']) must accept a snapshot whose config is present
-    even when an EXCLUDED weight left a dangling symlink from an earlier interrupted pull -- only a
-    dangling REQUESTED file rejects it (Codex #829)."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    (snap / "config.json").write_text("{}")
-    (snap / "model.safetensors").symlink_to(tmp_path / "missing-blob")  # dangling, NOT requested
-    assert hcs.snapshot_has_requested_broken_symlinks(snap, allow_patterns = ["config.json"]) is False
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["config.json"], ignore_patterns = None
-    ) is True
-    # A dangling REQUESTED file does reject.
-    (snap / "config.json").unlink()
-    (snap / "config.json").symlink_to(tmp_path / "missing-cfg")
-    assert hcs.snapshot_has_requested_broken_symlinks(snap, allow_patterns = ["config.json"]) is True
-    assert xf._snapshot_is_acceptable(
-        snap, repo_type = "model", allow_patterns = ["config.json"], ignore_patterns = None
-    ) is False
-
-
-def test_processor_glob_is_weightless():
-    """A processor-only warm (allow=['processor*']) selects processor_config.json and no weight, so
-    it must read as weightless rather than be rejected for lacking weights (Codex #829)."""
-    assert hcs._basename_is_non_weight("processor*") is True
-    assert hcs.request_can_include_weights(allow_patterns = ["processor*"]) is False
-    # control: a real weight glob stays weight-including
-    assert hcs.request_can_include_weights(allow_patterns = ["model*"]) is True
-
-
-# ---------------------------------------------------------------------------
-# Regression tests for the 3-reviewer (Opus) review round on #829.
-# Each maps to one accepted finding; the rejected "variant shard after the count"
-# finding is covered (and disproven) by test_snapshot_dir_is_complete_variant_sharded_index.
-# ---------------------------------------------------------------------------
-def test_request_can_include_weights_subfolder_variant_component_glob():
-    """R3-4: a path-qualified variant component glob (["unet/diffusion_pytorch_model.fp16*"],
-    ["text_encoder/model.fp16*"]) selects a real variant weight inside a pipeline subfolder. It does
-    not end in a weight suffix and the re-rooted canonical probes (unet/model.safetensors, ...) do not
-    match the variant name, so without a path-qualified self-probe it would read as WEIGHTLESS and the
-    fast path could accept a config-only component snapshot -> the silent Xet hang (accept-stale). It
-    must read as weight-including. A non-weight subfolder glob (unet/config*) stays weightless."""
-    assert hcs.request_can_include_weights(["unet/diffusion_pytorch_model.fp16*"], None) is True
-    assert hcs.request_can_include_weights(["text_encoder/model.fp16*"], None) is True
-    assert hcs.request_can_include_weights(["transformer/diffusion_pytorch_model.bf16*"], None) is True
-    # A non-weight subfolder glob is not over-classified.
-    assert hcs.request_can_include_weights(["unet/config*"], None) is False
-    assert hcs.request_can_include_weights(["text_encoder/tokenizer*"], None) is False
-    # The self-probe re-roots the synthetic weight under the requested subfolder.
-    assert hcs._weight_self_probe("unet/diffusion_pytorch_model.fp16*") == \
-        "unet/diffusion_pytorch_model.fp16.safetensors"
-
-
-def test_request_can_include_weights_index_glob_weightless_weight_glob_kept():
-    """R3-2: a trailing-wildcard shard-index glob (["model.safetensors.index*"],
-    ["model.bin.index*"]) selects only the index sidecar (no weight), so it reads as WEIGHTLESS -- the
-    synthetic-suffix branch must not turn the .index stem into a fake model.safetensors.index.safetensors
-    weight. A plain weight-stem glob (["model.safetensors*"], ["pytorch_model.bin*"]) still reads as
-    weight-including via the canonical weight probe (no accept-stale)."""
-    assert hcs.request_can_include_weights(["model.safetensors.index*"], None) is False
-    assert hcs.request_can_include_weights(["model.bin.index*"], None) is False
-    assert hcs.request_can_include_weights(["model.safetensors*"], None) is True
-    assert hcs.request_can_include_weights(["pytorch_model.bin*"], None) is True
-
-
-def test_weight_self_probe_artifact_and_sidecar_stems():
-    """R3-3: _weight_self_probe must not synthesize a fake weight for a trailing-wildcard glob whose
-    stem is a trainer artifact (scheduler*, rng_state*, scaler*, optimizer*) or an index / weight
-    sidecar (model.safetensors.index*, model.safetensors*) -- the absorbed-suffix branch would
-    otherwise return scheduler.safetensors / model.safetensors.index.safetensors and make the request
-    require a weight that does not exist (over-reject). A genuine variant weight stem still resolves."""
-    for artifact in ("scheduler*", "rng_state*", "rng_state_*", "scaler*", "optimizer*", "training_args*"):
-        assert hcs._weight_self_probe(artifact) is None, artifact
-    for sidecar in ("model.safetensors.index*", "model.bin.index*", "model.safetensors*",
-                    "pytorch_model.bin*"):
-        assert hcs._weight_self_probe(sidecar) is None, sidecar
-    # A real variant weight stem still resolves to its concrete weight name (the suffix loop tries
-    # .safetensors first, so a stem that admits either suffix resolves to the safetensors form).
-    assert hcs._weight_self_probe("model.fp16*") == "model.fp16.safetensors"
-    assert hcs._weight_self_probe("pytorch_model.fp16*") == "pytorch_model.fp16.safetensors"
-
-
-def test_snapshot_dir_is_complete_diffusion_sharded_component_requires_index(tmp_path):
-    """R1: a diffusers pipeline whose weight-bearing component (transformer/, unet/) holds a complete
-    NUMBERED-shard set but no index sidecar is INCOMPLETE -- transformers cannot load a local sharded
-    component without its index, so reporting complete would warm a cache the in-process load then
-    re-fetches (the silent Xet hang). Adding the component index makes it complete."""
-    snap = tmp_path / "snap"
-    snap.mkdir()
-    blob = tmp_path / "blob"
-    blob.write_bytes(b"w")
-    (snap / "model_index.json").write_text(
-        json.dumps({"_class_name": "FluxPipeline",
-                    "transformer": ["diffusers", "FluxTransformer2DModel"]})
-    )
-    comp = _make_diffusion_component(snap, blob, "transformer")
-    (comp / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob)
-    (comp / "diffusion_pytorch_model-00002-of-00002.safetensors").symlink_to(blob)
-    # Complete shard set, NO index -> incomplete.
-    assert hcs.snapshot_dir_is_complete(snap) is False
-    (comp / "diffusion_pytorch_model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
-                                   "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}})
-    )
-    assert hcs.snapshot_dir_is_complete(snap) is True
 
 
 def test_failed_spawn_closes_result_queue(monkeypatch):
@@ -3018,3 +2001,196 @@ def test_disable_xet_read_under_spawn_lock(monkeypatch):
     )
     assert out == "/tmp/warm"
     assert seen.get("held") is True
+
+
+# --------------------------------------------------------------------------- #
+# Conservative fast-path gate + pre/post-download acceptance split (PR #829 trim).
+# The completeness gate is intentionally narrow: it fast-paths ONLY the unambiguous
+# canonical model cache, deferring everything else to the watched snapshot_download
+# child. The pre-download (skip the child?) and post-download (accept the result?)
+# checks are deliberately asymmetric -- strict pre, lenient post.
+# --------------------------------------------------------------------------- #
+def _mk_snapshot(tmp_path, name):
+    blob = tmp_path / "_blob"
+    if not blob.exists():
+        blob.write_bytes(b"w")
+    snap = tmp_path / name
+    snap.mkdir()
+    return snap, blob
+
+
+def test_gate_fast_paths_canonical_single_file(tmp_path):
+    """A complete, unpatterned single-file model cache is fast-path eligible (skip the child)."""
+    snap, blob = _mk_snapshot(tmp_path, "single")
+    (snap / "model.safetensors").symlink_to(blob)
+    (snap / "config.json").write_text("{}")
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_gate_fast_paths_canonical_sharded_with_index(tmp_path):
+    """A complete sharded model with its index sidecar is fast-path eligible; without the index, or
+    with a listed shard missing, it is not (transformers cannot load a local sharded checkpoint
+    without a complete index)."""
+    snap, blob = _mk_snapshot(tmp_path, "shard")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is False          # numbered shards, no index
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                   "b": "model-00002-of-00002.safetensors"}}))
+    assert hcs.snapshot_dir_is_complete(snap) is True
+    snap2, _ = _mk_snapshot(tmp_path, "shard2")
+    (snap2 / "model-00001-of-00002.safetensors").symlink_to(blob)  # shard 2 absent
+    (snap2 / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                   "b": "model-00002-of-00002.safetensors"}}))
+    assert hcs.snapshot_dir_is_complete(snap2) is False
+
+
+def test_gate_rejects_config_only(tmp_path):
+    snap, _ = _mk_snapshot(tmp_path, "cfg")
+    (snap / "config.json").write_text("{}")
+    assert hcs.snapshot_dir_is_complete(snap) is False
+
+
+def test_gate_rejects_diffusers_marker(tmp_path):
+    """A diffusers pipeline (root model_index.json) is never fast-pathed -> defer to the child,
+    even when a root-level weight happens to be present."""
+    snap, blob = _mk_snapshot(tmp_path, "diff")
+    (snap / "model_index.json").write_text("{}")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is False
+
+
+def test_gate_rejects_any_allow_pattern(tmp_path):
+    """Any allow_patterns makes the request non-trivial -> defer to the child (no fast-path)."""
+    snap, blob = _mk_snapshot(tmp_path, "pat")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["*.safetensors"]) is False
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["model.safetensors"]) is False
+
+
+def test_gate_eligible_under_ignore_patterns(tmp_path):
+    """allow=None with ANY ignore patterns stays fast-path eligible: the canonical-weight presence
+    check verifies the surviving root weight is on disk, so ignores that drop other formats cannot
+    make an incomplete cache read complete. This covers the common bare from_pretrained warm, whose
+    real ignore list mixes root-level format excludes (*.onnx, *.gguf, *.pt, *.bin) with subdir
+    (*/*.safetensors) drops."""
+    snap, blob = _mk_snapshot(tmp_path, "ign")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*/*.safetensors", "*/*.bin"]) is True
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is True
+    # The actual unsloth bare-from_pretrained combined ignore list (root-level format excludes +
+    # subdir-weight drops) -- the warm root model.safetensors must still fast-path.
+    unsloth_ignore = [
+        "*.onnx", "*.h5", "*.msgpack", "*.tflite", "*.mlmodel", "*.gguf", "*.pt", "*.pth",
+        "*.ckpt", "optimizer.*", "scheduler.*", "rng_state*", "trainer_state.json",
+        "events.out.tfevents*", "*.bin",
+        "*/*.safetensors", "*/*.bin", "*/*.h5", "*/*.msgpack", "*/*.pt", "*/*.pth",
+    ]
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = unsloth_ignore) is True
+
+
+def test_gate_rejects_broken_symlink(tmp_path):
+    snap, _ = _mk_snapshot(tmp_path, "broken")
+    (snap / "model.safetensors").symlink_to(tmp_path / "_missing")
+    assert hcs.snapshot_dir_is_complete(snap) is False
+
+
+def test_request_can_include_weights_trim_semantics():
+    r = hcs.request_can_include_weights
+    assert r(None, None) is True                              # bare unpatterned
+    assert r(None, ["*/*.safetensors", "*/*.bin"]) is True    # subdir ignore (common bare)
+    assert r(["*.safetensors"], None) is True                 # weight glob
+    assert r(["model.fp16.safetensors"], None) is True        # variant exact weight
+    assert r(["unet/*"], None) is True                        # subfolder weight glob
+    assert r(["model.gguf"], None) is True                    # gguf is a weight
+    assert r(["config.json", "tokenizer.json", "*.py"], None) is False  # tokenizer-only
+    assert r(["adapter_model*", "adapter_config.json"], None) is True   # adapter
+    assert r([], None) is False                               # empty allow selects nothing
+
+
+def test_request_can_include_weights_partial_ignore_strip_is_weight_bearing():
+    """An ignore-only request is weightless ONLY when it strips EVERY weight format. A partial strip
+    -- only the canonical model.safetensors/pytorch_model.bin names while a variant survives, or only
+    some suffixes while a .pt / .gguf weight survives -- must read as weight-bearing, so the fast path
+    requires a real weight and never skips the protective child on a config-only cache (the Xet hang)."""
+    r = hcs.request_can_include_weights
+    assert r(None, ["model.safetensors", "pytorch_model.bin"]) is True  # variant / other-format survives
+    assert r(None, ["*.safetensors", "*.bin"]) is True                  # .pt / .gguf / .pth / ... survive
+    # Only stripping EVERY weight format is weightless.
+    all_formats = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf", "*.ckpt",
+                   "*.onnx", "*.msgpack", "*.h5", "*.pdparams"]
+    assert r(None, all_formats) is False
+
+
+def test_pre_download_skips_complete_model(tmp_path):
+    snap, blob = _mk_snapshot(tmp_path, "m")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
+    """The pre/post asymmetry: a diffusers warm is NOT fast-pathed (spawn the child), but the same
+    complete diffusers result IS accepted post-download (it has component weights), so a good
+    download is never re-looped into a stall error."""
+    snap, blob = _mk_snapshot(tmp_path, "diff")
+    (snap / "model_index.json").write_text("{}")
+    comp = snap / "unet"
+    comp.mkdir()
+    (comp / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_rejects_config_only_model(tmp_path):
+    """A model warm that came back with NO weight (HF handed back a stale config-only snapshot) is
+    rejected post-download and retried over HTTP."""
+    snap, _ = _mk_snapshot(tmp_path, "cfg")
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_post_download_accepts_dataset_without_weight(tmp_path):
+    snap, blob = _mk_snapshot(tmp_path, "ds")
+    (snap / "data.parquet").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "dataset", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_accepts_either_format_single_present(tmp_path):
+    """An either-format named request (['pytorch_model.bin','model.safetensors']) against a repo that
+    ships only safetensors: the finished download has a weight, so it is accepted -- not re-looped
+    for the absent .bin the repo simply does not publish."""
+    snap, blob = _mk_snapshot(tmp_path, "either")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model",
+        allow_patterns = ["pytorch_model.bin", "model.safetensors"], ignore_patterns = None) is True
+
+
+def test_pre_download_skips_intact_tokenizer_only(tmp_path):
+    """A tokenizer-only (weightless) warm short-circuits offline: an intact requested subset is
+    enough, no weight required."""
+    snap, _ = _mk_snapshot(tmp_path, "tok")
+    (snap / "tokenizer.json").write_text("{}")
+    (snap / "config.json").write_text("{}")
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model",
+        allow_patterns = ["tokenizer.json", "config.json"], ignore_patterns = None) is True
+
+
+def test_pre_download_partial_ignore_does_not_skip_config_only(tmp_path):
+    """Over-accept guard (safety reviewer finding): an ignore-only request stripping only SOME weight
+    formats (ignore=['*.safetensors','*.bin']) on a config-only cache must NOT skip the child -- a
+    repo whose surviving weight is e.g. model.gguf / model.fp16.safetensors / a .pt checkpoint would
+    otherwise be fetched in-process over un-killable Xet (the hang)."""
+    snap, _ = _mk_snapshot(tmp_path, "cfgign")
+    (snap / "config.json").write_text("{}")
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None,
+        ignore_patterns = ["*.safetensors", "*.bin"]) is False
