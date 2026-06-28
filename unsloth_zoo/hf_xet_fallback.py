@@ -788,6 +788,16 @@ def _run_download_attempt(
         child_env["HF_HUB_DISABLE_XET"] = "1"
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     with _SPAWN_ENV_LOCK:
+        # Cache huggingface_hub's transport constants in the PARENT from the REAL environment NOW,
+        # before the child-only env (HF_HUB_DISABLE_XET=1) is briefly set below. Hub reads
+        # HF_HUB_DISABLE_XET into a module constant at import time; without this, a concurrent thread
+        # doing its FIRST `import huggingface_hub` inside the spawn window could cache the child-only
+        # disabled-Xet value in the parent and silently route later in-process downloads over HTTP.
+        # Once imported it is a no-op, so a concurrent import in the window then re-reads nothing.
+        try:
+            import huggingface_hub.constants  # noqa: F401
+        except Exception:
+            pass
         saved_env = {k: os.environ.get(k) for k in child_env}
         # multiprocessing 'spawn' reconstructs __main__ in the child from
         # __main__.__file__. If that is a pseudo-path ('<stdin>', a notebook) the

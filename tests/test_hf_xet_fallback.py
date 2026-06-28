@@ -1635,6 +1635,19 @@ def test_snapshot_dir_is_complete_diffusion_file_glob_validates_components(tmp_p
     assert hcs.snapshot_dir_is_complete(snap, allow_patterns = globs) is True
 
 
+def test_request_can_include_weights_sentencepiece_glob():
+    """A SentencePiece / slow-tokenizer vocab glob (["spiece*"], ["sentencepiece*"], ["spm*"])
+    selects only tokenizer assets and no weight, so it reads as WEIGHTLESS. Without a representative
+    the no-slash glob is misread as a weight directory and a tokenizer-only snapshot is wrongly
+    rejected for lacking a weight (Codex #829)."""
+    assert hcs.request_can_include_weights(["spiece*"], None) is False
+    assert hcs.request_can_include_weights(["sentencepiece*"], None) is False
+    assert hcs.request_can_include_weights(["spm*"], None) is False
+    assert hcs.request_can_include_weights(["spiece.model", "tokenizer*"], None) is False
+    # A weight glob is still weight-including (no accept-stale).
+    assert hcs.request_can_include_weights(["model*"], None) is True
+
+
 def test_request_can_include_weights_chat_template_glob():
     """A chat-template glob (["chat_template*"]) selects only chat_template.json / .jinja and no
     weight, so it reads as WEIGHTLESS. Without a representative in the non-weight probes the glob is

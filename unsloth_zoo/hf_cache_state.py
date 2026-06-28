@@ -941,6 +941,18 @@ _NON_WEIGHT_PROBE_NAMES = (
     "chat_template.json",
     "chat_template.jinja",
     "added_tokens.json",
+    # SentencePiece / slow-tokenizer vocab assets a tokenizer-only warm selects with a no-slash glob
+    # (allow_patterns=["spiece*"], ["sentencepiece*"], ["spm*"]). Without a representative the glob
+    # reads as a weight directory and a tokenizer-only snapshot is wrongly rejected for lacking a
+    # weight. tokenizer.model is already listed above.
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "spm.model",
+    "source.spm",
+    "target.spm",
+    "bpe.codes",
+    "vocab.bpe",
+    "normalizer.json",
     "vocab.json",
     "merges.txt",
     "readme.md",
