@@ -39,8 +39,17 @@ def _load(name: str, filename: str):
     return module
 
 
-# A package placeholder so ``from unsloth_zoo.hf_cache_state import ...`` inside
-# hf_xet_fallback resolves to the file we load below, not the installed package.
+# A package placeholder so ``from unsloth_zoo.hf_cache_state import ...`` inside hf_xet_fallback
+# resolves to the file we load below, not the installed package. RESTORE sys.modules afterwards:
+# leaving the placeholder (and the two submodule entries _load installs) in sys.modules would shadow
+# the REAL unsloth_zoo for the rest of the pytest process -- its __init__ never runs -- so a later
+# test importing unsloth_zoo (e.g. unsloth_zoo.FORCE_FLOAT32) would fail. The two loaded modules keep
+# their own bound references (their intra-package import resolved during exec), so they work after
+# the placeholder is removed (Codex #829).
+_saved_modules = {
+    name: sys.modules.get(name)
+    for name in ("unsloth_zoo", "unsloth_zoo.hf_cache_state", "unsloth_zoo.hf_xet_fallback")
+}
 if "unsloth_zoo" not in sys.modules:
     _pkg = _types.ModuleType("unsloth_zoo")
     _pkg.__path__ = [str(_ZOO_DIR)]
@@ -48,6 +57,12 @@ if "unsloth_zoo" not in sys.modules:
 
 hcs = _load("unsloth_zoo.hf_cache_state", "hf_cache_state.py")
 xf = _load("unsloth_zoo.hf_xet_fallback", "hf_xet_fallback.py")
+
+for _name, _mod in _saved_modules.items():
+    if _mod is None:
+        sys.modules.pop(_name, None)
+    else:
+        sys.modules[_name] = _mod
 
 # Real prep impl, captured before the autouse fixture stubs the module attribute.
 _REAL_DEFAULT_PREPARE = xf._default_prepare_for_http
@@ -754,7 +769,12 @@ def test_snapshot_cancel_honored_even_when_cached(monkeypatch, tmp_path):
 
 def test_nonstall_error_propagates_without_fallback(monkeypatch):
     fake = _install(monkeypatch, [("error", "RepositoryNotFoundError: 404 not found")])
-    with pytest.raises(RuntimeError, match = "RepositoryNotFoundError"):
+    # A deterministic Hub error is re-raised with its ORIGINAL type preserved across the spawn
+    # boundary (not flattened to a bare RuntimeError), so a caller's typed except clause still
+    # matches (Codex #829). The parent reconstructs the class from the child's "<Name>: ..." prefix.
+    expected_cls = xf._resolve_exception_class("RepositoryNotFoundError")
+    assert expected_cls is not None and expected_cls is not RuntimeError
+    with pytest.raises(expected_cls, match = "RepositoryNotFoundError"):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert len(fake.calls) == 1, "deterministic error must not trigger an HTTP fallback"
     assert fake.calls[0].disable_xet is False
@@ -2210,3 +2230,115 @@ def test_snapshot_dir_is_complete_tolerates_non_string_shard(tmp_path):
         )
     )
     assert hcs.snapshot_dir_is_complete(snap) is False  # 'absent-extra' missing, bad entry skipped
+
+
+# --------------------------------------------------------------------------- #
+# Codex review round: scoped completeness, weightless named files, type preservation.
+# --------------------------------------------------------------------------- #
+def test_snapshot_complete_ignore_only_root_excludes_checkpoint(tmp_path):
+    """An IGNORE-ONLY root warm (no allow_patterns, e.g. ignore=['*.onnx']) is still a bare
+    from_pretrained reading ROOT weights, so a snapshot whose only weight lives in a checkpoint dir
+    must read as INCOMPLETE rather than short-circuit the guarded download (Codex #829)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "config.json").write_text("{}")
+    (snap / "checkpoint-500").mkdir()
+    (snap / "checkpoint-500" / "model.safetensors").symlink_to(blob)
+    # ignore-only -> has_patterns True but allow_patterns None: checkpoint weight must not satisfy it.
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is False
+    # A real root weight makes the same ignore-only request complete.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.onnx"]) is True
+
+
+def test_snapshot_complete_ignores_dangling_symlink_outside_request(tmp_path):
+    """A dangling symlink for a file the request does NOT select must not reject the snapshot: an
+    allow_patterns=['adapter_model.safetensors'] probe whose adapter weight is on disk stays complete
+    even with a stale dangling root model.safetensors. A dangle for the REQUESTED file still rejects
+    (Codex #829)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"x")
+    (snap / "adapter_model.safetensors").symlink_to(blob)
+    (snap / "model.safetensors").symlink_to(tmp_path / "missing-blob")  # dangling, NOT requested
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["adapter_model.safetensors"]) is True
+    # When the dangling file IS the requested one, the snapshot is incomplete.
+    assert hcs.snapshot_dir_is_complete(snap, allow_patterns = ["model.safetensors"]) is False
+
+
+def test_request_can_include_weights_metadata_glob_is_weightless():
+    """A no-slash metadata glob (tokenizer*, config*, vocab*, special_tokens*) is a FILE glob, not a
+    weight-bearing directory glob, so a warm that fetched only tokenizer.json is not rejected for
+    lacking a weight. 'model*' / 'pytorch_model*' / 'checkpoint-*' stay weight-including (Codex #829)."""
+    assert hcs.request_can_include_weights(allow_patterns = ["tokenizer*"]) is False
+    assert hcs.request_can_include_weights(allow_patterns = ["config*"]) is False
+    assert hcs.request_can_include_weights(allow_patterns = ["vocab*"]) is False
+    assert hcs.request_can_include_weights(allow_patterns = ["special_tokens*"]) is False
+    assert hcs.request_can_include_weights(allow_patterns = ["model*"]) is True
+    assert hcs.request_can_include_weights(allow_patterns = ["pytorch_model*"]) is True
+    assert hcs.request_can_include_weights(allow_patterns = ["checkpoint-*"]) is True
+
+
+def test_requested_named_files_present_exact_request(tmp_path):
+    """An EXACT-named weightless request (allow=['tokenizer.json'], no glob) requires its named file
+    on disk; a config-only snapshot must not pass. A glob list or no allow_patterns is best-effort
+    (Codex #829)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    assert hcs.requested_named_files_present(snap, allow_patterns = ["tokenizer.json"]) is False
+    (snap / "tokenizer.json").write_text("{}")
+    assert hcs.requested_named_files_present(snap, allow_patterns = ["tokenizer.json"]) is True
+    # A glob list is best-effort: a missing optional file does not fail it.
+    assert hcs.requested_named_files_present(snap, allow_patterns = ["tokenizer*", "vocab.txt"]) is True
+    # No allow_patterns -> trivially satisfied.
+    assert hcs.requested_named_files_present(snap) is True
+    # An ignore-filtered name is not actually requested, so its absence does not fail.
+    assert hcs.requested_named_files_present(
+        snap, allow_patterns = ["tokenizer.json", "absent.json"], ignore_patterns = ["absent.json"]
+    ) is True
+
+
+def test_snapshot_acceptable_weightless_requires_named_file(tmp_path):
+    """End-to-end: _snapshot_is_acceptable for a weightless exact-named request rejects a config-only
+    cache missing the requested tokenizer.json, so the guarded download is not skipped (Codex #829)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["tokenizer.json"], ignore_patterns = None
+    ) is False
+    (snap / "tokenizer.json").write_text("{}")
+    assert xf._snapshot_is_acceptable(
+        snap, repo_type = "model", allow_patterns = ["tokenizer.json"], ignore_patterns = None
+    ) is True
+
+
+def test_deterministic_oserror_type_preserved(monkeypatch):
+    """A deterministic disk-full OSError is re-raised as OSError (not flattened to RuntimeError), so a
+    caller's `except OSError` cleanup still runs across the spawn boundary (Codex #829)."""
+    fake = _install(monkeypatch, [("error", "OSError: [Errno 28] No space left on device")])
+    with pytest.raises(OSError, match = "No space left"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"
+
+
+def test_unknown_error_falls_back_to_runtimeerror(monkeypatch):
+    """An unrecognized error class name still surfaces (as RuntimeError, the prior behavior) without
+    a transport fallback -- only KNOWN deterministic Hub / OS types are reconstructed (Codex #829)."""
+    fake = _install(monkeypatch, [("error", "SomeWeirdError: kaboom")])
+    with pytest.raises(RuntimeError, match = "kaboom"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert len(fake.calls) == 1
+
+
+def test_resolve_exception_class_maps_known_names():
+    """The reconstruction map resolves the documented deterministic Hub error names + OSError, and
+    returns None (-> RuntimeError) for an unknown name (Codex #829)."""
+    assert xf._resolve_exception_class("OSError") is OSError
+    cls = xf._resolve_exception_class("RepositoryNotFoundError")
+    assert cls is not None and issubclass(cls, BaseException)
+    assert xf._resolve_exception_class("NotARealErrorType") is None

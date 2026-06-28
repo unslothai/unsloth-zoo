@@ -54,6 +54,7 @@ from unsloth_zoo.hf_cache_state import (
     hf_cache_root,
     iter_active_repo_cache_dirs,
     request_can_include_weights,
+    requested_named_files_present,
     snapshot_dir_has_broken_symlinks,
     snapshot_dir_is_complete,
 )
@@ -482,6 +483,44 @@ _TRANSIENT_ERROR_HINTS = (
 )
 
 
+def _resolve_exception_class(type_name: str) -> "Optional[type]":
+    """Map a deterministic Hub / OS error class NAME (as captured in the child) back to its class,
+    so the parent can re-raise the original type rather than a generic RuntimeError. Best-effort: an
+    unknown name returns None. Imports are local so the helper stays import-light when no error
+    occurs and never hard-depends on a specific huggingface_hub layout."""
+    if type_name == "OSError":
+        return OSError
+    if type_name not in _DETERMINISTIC_ERROR_NAMES:
+        return None
+    for module_name in ("huggingface_hub.errors", "huggingface_hub.utils"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        cls = getattr(module, type_name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            return cls
+    return None
+
+
+def _raise_child_error(message: str) -> None:
+    """Re-raise a deterministic child download error, preserving its original exception TYPE when it
+    is a known Hub / OS error, so callers that catch ``RepositoryNotFoundError`` / ``GatedRepoError``
+    / ``OSError`` (auth prompts, offline handling, disk cleanup) still see those types across the
+    spawn-process boundary. The child reports the failure as ``"<ClassName>: <message>"``, so the
+    type is reconstructed from that prefix; anything unrecognized falls back to ``RuntimeError`` (the
+    prior behavior). A class whose constructor rejects a lone string also degrades to RuntimeError."""
+    type_name = message.split(":", 1)[0].strip() if ":" in message else ""
+    exc_cls = _resolve_exception_class(type_name)
+    if exc_cls is None:
+        raise RuntimeError(message)
+    try:
+        exc = exc_cls(message)
+    except Exception:
+        raise RuntimeError(message)
+    raise exc
+
+
 def _is_retryable_download_error(exc: BaseException) -> bool:
     """True when a captured download exception looks like a transient transport failure (an
     ``hf_xet`` / CAS error, connection reset, timeout, HTTP 5xx / 429) that the OTHER transport
@@ -886,7 +925,17 @@ def _snapshot_is_acceptable(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
             require_named_weights = require_named_weights,
         )
-    return not snapshot_dir_has_broken_symlinks(snapshot_dir)
+    # Weightless / non-model request (a dataset, or a model repo whose patterns drop every weight
+    # format, e.g. a tokenizer-only allow list): no weight is expected, so completeness is "no
+    # dangling symlink". But an EXACT-named weightless request (allow_patterns=["tokenizer.json"],
+    # no globs) must still find its named files on disk -- HF can hand back a config-only snapshot
+    # dir that simply does not contain the requested file. A glob-bearing list stays best-effort.
+    return (
+        not snapshot_dir_has_broken_symlinks(snapshot_dir)
+        and requested_named_files_present(
+            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+        )
+    )
 
 
 def _snapshot_payload_incomplete(
@@ -1007,8 +1056,11 @@ def _download_with_xet_fallback(
             raise RuntimeError("Cancelled")
         if kind_result == "error":
             # Deterministic failure (a captured Hub exception: auth, not-found, gated, disk
-            # full): the other transport would fail identically, so do not retry.
-            raise RuntimeError(payload)
+            # full): the other transport would fail identically, so do not retry. Re-raise
+            # preserving the original exception type (RepositoryNotFoundError / GatedRepoError /
+            # OSError ...) where known, so callers' typed except clauses still match across the
+            # spawn boundary; unknown errors fall back to RuntimeError.
+            _raise_child_error(payload)
         if kind_result == "retryable_error":
             # A transient transport failure (hf_xet CAS timeout, 5xx, connection reset) rather
             # than a deterministic Hub error: disabling Xet and retrying over HTTP may recover,

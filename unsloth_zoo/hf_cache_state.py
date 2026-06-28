@@ -358,6 +358,42 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     return True
 
 
+def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
+    """Repo-relative posix paths of every dangling symlink in *snapshot_dir* -- a referenced file
+    whose blob is missing or still an ``.incomplete`` partial (an interrupted download). Empty when
+    none. Lets a completeness check scope the interrupted-download signal to the files a request
+    actually selects, rather than rejecting the whole snapshot for a dangle outside the request."""
+    out: list = []
+    try:
+        for entry in snapshot_dir.rglob("*"):
+            try:
+                if entry.is_symlink() and not entry.exists():
+                    try:
+                        out.append(entry.relative_to(snapshot_dir).as_posix())
+                    except ValueError:
+                        out.append(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        return out
+    return out
+
+
+def _requested_scope_filter(
+    rels: list, allow_patterns: "Optional[list]", ignore_patterns: "Optional[list]"
+) -> list:
+    """The subset of repo-relative *rels* a request selects. Applies the allow / ignore filter, and
+    when there is no ``allow_patterns`` (an UNPATTERNED or IGNORE-ONLY request -- a bare
+    ``from_pretrained`` that reads ROOT weights) also drops per-checkpoint-dir paths the root load
+    never reads, so a checkpoint-dir file neither satisfies the warm nor (as a dangling symlink)
+    blocks it. An explicit ``allow_patterns`` is trusted as-is: a caller that names a checkpoint
+    path opts back into it."""
+    kept = _filter_paths(list(rels), allow_patterns, ignore_patterns)
+    if allow_patterns is None:
+        kept = [r for r in kept if not _path_under_checkpoint_dir(r)]
+    return kept
+
+
 def snapshot_dir_is_complete(
     snapshot_dir: Path,
     *,
@@ -392,8 +428,6 @@ def snapshot_dir_is_complete(
     *allow_patterns* (e.g. ``["model.safetensors", "adapter_model.safetensors"]``) to be on
     disk, so a stale cache holding only one of them is not treated as complete. Off by default
     (used by the pre-download cache probe); a glob still selects a subset freely."""
-    if snapshot_dir_has_broken_symlinks(snapshot_dir):
-        return False
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
@@ -404,6 +438,16 @@ def snapshot_dir_is_complete(
     # non-None patterns as a scoped request so allow_patterns=[] does not fall into the full
     # warmup branch (consistent with request_can_include_weights).
     has_patterns = allow_patterns is not None or ignore_patterns is not None
+
+    # A dangling symlink marks an interrupted download, but only one for a file the request
+    # actually selects should reject the snapshot. A stale dangling root model.safetensors must
+    # not fail an allow_patterns=["adapter_model.safetensors"] probe whose adapter weight IS on
+    # disk, so scope the broken-symlink check to the requested files (and, for a root warm with no
+    # allow_patterns, drop checkpoint-dir paths the bare load never reads) -- the same selection
+    # _requested_scope_filter applies to the weights below.
+    broken = _broken_symlink_rel_paths(snapshot_dir)
+    if broken and _requested_scope_filter(broken, allow_patterns, ignore_patterns):
+        return False
 
     index_entries: list = []
     weight_entries: list = []  # (entry, repo-relative path)
@@ -419,18 +463,14 @@ def snapshot_dir_is_complete(
                 rel = name
             weight_entries.append((entry, rel))
 
-    # The weights the request selects that are present on disk (any present weight when the
-    # request is unpatterned). The snapshot can carry an unrelated weight while the requested
-    # one is missing, so a patterned request must find one it actually selects.
-    if has_patterns:
-        selected = set(_filter_paths([rel for _, rel in weight_entries], allow_patterns, ignore_patterns))
-    else:
-        # Unpatterned warm = a bare from_pretrained, which reads ROOT model weights. A weight that
-        # lives only inside a per-checkpoint dir (checkpoint-500/model.safetensors, left behind by
-        # a prior allow_patterns=["checkpoint-500/*"] pull) is not a root weight, so it must not
-        # make a checkpoint-only snapshot read as a warm root model -- that would let the guarded
-        # download be skipped and hand from_pretrained a snapshot whose root weights are missing.
-        selected = {rel for _, rel in weight_entries if not _path_under_checkpoint_dir(rel)}
+    # The weights the request selects that are present on disk (any present root weight when the
+    # request is unpatterned). The snapshot can carry an unrelated weight while the requested one
+    # is missing, so a patterned request must find one it actually selects. _requested_scope_filter
+    # also excludes per-checkpoint-dir weights (checkpoint-500/model.safetensors, left behind by a
+    # prior allow_patterns=["checkpoint-500/*"] pull) whenever there is no allow_patterns -- an
+    # UNPATTERNED *or* IGNORE-ONLY root warm (e.g. ignore_patterns=["*.onnx"]) is still a bare
+    # from_pretrained reading ROOT weights, so a checkpoint-only snapshot must not read as warm.
+    selected = set(_requested_scope_filter([rel for _, rel in weight_entries], allow_patterns, ignore_patterns))
     if not selected:
         return False
 
@@ -766,12 +806,21 @@ def request_can_include_weights(
             if not clearly_weightless:
                 concrete_parent = _concretize_glob(prefix) if _has_glob(prefix) else prefix
                 probes.extend(f"{concrete_parent}/{name}" for name in _WEIGHT_PROBE_NAMES)
-        elif _has_glob(pat) and ("." not in pat or _looks_like_checkpoint_dir(pat)):
+        elif (
+            _has_glob(pat)
+            and ("." not in pat or _looks_like_checkpoint_dir(pat))
+            and not _basename_is_non_weight(pat)
+        ):
             # A no-slash DIRECTORY glob ("checkpoint-*", "global_step*", the dotted
             # "checkpoint-v1.*"): HF's fnmatch "*" spans "/", so it matches nested weights like
             # checkpoint-10/model.safetensors. Probe the canonical weights re-rooted under a
             # concretized form of the glob. A plain extension file glob ("*.json", "tokenizer.*")
             # is not a directory glob and stays weightless unless it names a weight (self_probe).
+            # A no-slash glob whose stem is a known metadata family ("tokenizer*", "config*",
+            # "vocab*", "special_tokens*") is a FILE glob, not a directory: _basename_is_non_weight
+            # excludes it so a tokenizer*-only warm that fetched tokenizer.json is not rejected for
+            # lacking a weight ("model*" / "pytorch_model*" stay weight-including -- they match a
+            # weight probe, so _basename_is_non_weight is False for them).
             concrete = _concretize_glob(pat)
             probes.extend(f"{concrete}/{name}" for name in _WEIGHT_PROBE_NAMES)
         # A pattern that itself names a loadable weight -- a bare filename, a path-qualified
@@ -791,6 +840,50 @@ def request_can_include_weights(
     except Exception:
         return True
     return len(kept) > 0
+
+
+def requested_named_files_present(
+    snapshot_dir: Path,
+    *,
+    allow_patterns: "Optional[object]" = None,
+    ignore_patterns: "Optional[object]" = None,
+) -> bool:
+    """For a request that names EXACT files (every ``allow_patterns`` entry is glob-free), True only
+    when each named file the ignore filter keeps is on disk.
+
+    ``snapshot_download(local_files_only=True)`` returns a snapshot dir whenever the revision folder
+    exists -- even a config-only one left by a prior ``AutoConfig`` fetch -- so for a weightless
+    request like ``allow_patterns=["tokenizer.json"]`` a dangling-symlink check alone would accept a
+    cache that does not actually contain the requested file. This makes that request require its
+    named file before the snapshot is treated as warm.
+
+    A request with ANY glob, or with no ``allow_patterns``, is a best-effort "warm what matches" and
+    cannot be turned into an exact manifest (an optional ``vocab.txt`` the repo may simply lack would
+    wrongly fail it), so it is trivially satisfied here -- the weight-bearing requests are gated by
+    ``snapshot_dir_is_complete`` instead."""
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    if not allow_patterns or any(_has_glob(p) for p in allow_patterns):
+        return True
+    try:
+        entries = list(snapshot_dir.rglob("*"))
+    except OSError:
+        return True  # cannot enumerate -> do not reject on an unreadable dir
+    present = set()
+    for entry in entries:
+        if _safe_is_file(entry):
+            try:
+                present.add(entry.relative_to(snapshot_dir).as_posix())
+            except ValueError:
+                present.add(entry.name)
+    for pat in allow_patterns:
+        # A named file the ignore filter drops is not actually requested. _filter_paths fails OPEN
+        # (returns all on error), so an unevaluable filter keeps the strict presence check.
+        if ignore_patterns and not _filter_paths([pat], None, ignore_patterns):
+            continue
+        if pat not in present:
+            return False
+    return True
 
 
 def _iter_snapshot_dirs(repo_dir: Path) -> Iterator[Path]:
