@@ -151,6 +151,65 @@ def _manual_grouped_mm(
     return inputs.new_empty((0, weight.shape[-1]))
 
 
+# Optional recompute-in-backward for the frozen base expert GEMM. With
+# UNSLOTH_MOE_RECOMPUTE=1 the dequantized bf16 expert stack is rebuilt from the 4-bit
+# Params4bit in backward (for dX only; the base is frozen and LoRA is a separate additive
+# grouped_mm) instead of being pinned on the tape. Output is unchanged; off by default the
+# call below is the prior eager path.
+
+
+def _moe_recompute_enabled(source) -> bool:
+    if os.environ.get("UNSLOTH_MOE_RECOMPUTE", "0") != "1":
+        return False
+    try:
+        if not _should_use_separated_lora():          # merged LoRA folds the delta into base
+            return False
+        if not _check_torch_grouped_mm_supported():
+            return False
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
+            if getattr(param, "quant_state", None) is None:
+                return False
+            return not param.requires_grad
+        if isinstance(param, torch.Tensor):
+            return (not param.requires_grad) and param.dtype in (
+                torch.bfloat16, torch.float16, torch.float32,
+            )
+    except Exception:
+        return False
+    return False
+
+
+class _GroupedMMRecompute(torch.autograd.Function):
+    """grouped_mm(inputs, W) for a frozen W from weight_provider(). Saves only
+    (inputs, offsets) + the provider, not the dense W; rebuilds W in backward for dX."""
+
+    @staticmethod
+    def forward(ctx, inputs, offsets, weight_provider):
+        ctx.weight_provider = weight_provider
+        ctx.save_for_backward(inputs, offsets)
+        with torch.no_grad():
+            out = _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, offsets = ctx.saved_tensors
+        with torch.no_grad():
+            weight_t = ctx.weight_provider().transpose(-2, -1).contiguous()
+            grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
+        return grad_input, None, None
+
+
+def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
+    """recompute -> rebuild W in backward; else the prior eager grouped_mm."""
+    if recompute:
+        return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
+    return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+
+
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
@@ -1052,12 +1111,16 @@ def forward_native_grouped_mm(
         )
 
     if hasattr(self, "gate_up_proj"):
-        gate_up_base = _get_base_weight(self.gate_up_proj)
         model_type = getattr(self, "_unsloth_model_type", None)
+        _gate_up_src = self.gate_up_proj
 
-        # grouped_mm backward needs contiguous weights; preprocess may return a transposed view.
-        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
-        mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
+        # Provider re-derives the base weight on demand so Fix 3 can recompute it in
+        # backward instead of pinning it (grouped_mm needs contiguous weights).
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim):
+            return preprocess_weight(_get_base_weight(_src), "gate_up", _h, _mt)
+        mm1_out = _base_grouped_mm(
+            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
+        )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -1185,10 +1248,13 @@ def forward_native_grouped_mm(
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if hasattr(self, "down_proj"):
-        down_base = _get_base_weight(self.down_proj)
         model_type = getattr(self, "_unsloth_model_type", None)
-        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
-        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
+        _down_src = self.down_proj
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim):
+            return preprocess_weight(_get_base_weight(_src), "down", _h, _mt)
+        mm2_out = _base_grouped_mm(
+            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
+        )
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora

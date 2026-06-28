@@ -141,6 +141,17 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
+    # Fix 3: defer dequant into forward_native_grouped_mm's providers (recomputed in
+    # backward) instead of pre-dequantizing the full bf16 stack and pinning it.
+    if (
+        os.environ.get("UNSLOTH_MOE_RECOMPUTE", "0") == "1"
+        and select_moe_backend() == "grouped_mm"
+        and _is_bnb4bit_param(self.gate_up_proj)
+        and _is_bnb4bit_param(self.down_proj)
+    ):
+        _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
+        return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
+
     gate_up_weight = _dequantize_bnb4bit_expert_weights(self.gate_up_proj, target_dtype)
     down_weight = _dequantize_bnb4bit_expert_weights(self.down_proj, target_dtype)
     if gate_up_weight is None or down_weight is None:
