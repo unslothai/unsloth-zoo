@@ -40,12 +40,10 @@ def _load(name: str, filename: str):
 
 
 # A package placeholder so ``from unsloth_zoo.hf_cache_state import ...`` inside hf_xet_fallback
-# resolves to the file we load below, not the installed package. RESTORE sys.modules afterwards:
-# leaving the placeholder (and the two submodule entries _load installs) in sys.modules would shadow
-# the REAL unsloth_zoo for the rest of the pytest process -- its __init__ never runs -- so a later
-# test importing unsloth_zoo (e.g. unsloth_zoo.FORCE_FLOAT32) would fail. The two loaded modules keep
-# their own bound references (their intra-package import resolved during exec), so they work after
-# the placeholder is removed (Codex #829).
+# resolves to the file we load below, not the installed package. RESTORE sys.modules afterwards: a
+# leftover placeholder would shadow the REAL unsloth_zoo (its __init__ never runs) and fail a later
+# test that imports it. The two loaded modules keep their own bound references, so they work after
+# the placeholder is removed.
 _saved_modules = {
     name: sys.modules.get(name)
     for name in ("unsloth_zoo", "unsloth_zoo.hf_cache_state", "unsloth_zoo.hf_xet_fallback")
@@ -472,9 +470,9 @@ def test_prepare_for_http_clears_broken_snapshot_symlink(tmp_path):
 
 
 def test_prepare_for_http_spares_concurrent_sibling_active_symlink(tmp_path):
-    """Round-2 F1: HTTP prep must NOT delete a concurrent sibling download's dangling snapshot
-    symlink while that sibling is still writing the target blob (a fresh .incomplete partner exists).
-    Our own stale interrupted link (no .incomplete partner) is still cleared in the same sweep."""
+    """HTTP prep must NOT delete a concurrent sibling's dangling snapshot symlink while that sibling is
+    still writing the target blob (a fresh .incomplete partner exists). Our own stale interrupted link
+    (no .incomplete partner) is still cleared in the same sweep."""
     repo = "ztest/concurrent"
     repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
     blobs = repo_dir / "blobs"
@@ -2338,9 +2336,8 @@ def test_hfvalidationerror_type_preserved_across_spawn():
 
 
 def test_weight_pattern_selector_handles_globs(tmp_path):
-    """Round-2 F1(round1)/F3/F6: the weight-pattern selector reads tokenizer / config / json globs as
-    weightless (keeps their offline short-circuit) while classifying every standard weight name and
-    single-char (?) / class ([]) globs as weight-bearing."""
+    """The weight-pattern selector reads tokenizer / config / json globs as weightless (keeps their
+    offline short-circuit) but classifies standard weight names and ? / [] globs as weight-bearing."""
     weightless = ["tokenizer*", "*.json", "config.json", "tokenizer.model", "*.txt"]
     weighty = [
         "model.safetensors", "*.safetensors", "model.?afetensors", "model.[sp]afetensors",
@@ -2353,9 +2350,8 @@ def test_weight_pattern_selector_handles_globs(tmp_path):
 
 
 def test_post_download_rejects_config_only_for_explicit_weight_pattern(tmp_path):
-    """Round-2 F3: an explicit weight request (allow=['model.safetensors']) that came back with only
-    config.json is a stale config-only snapshot and must be rejected (retry over HTTP), NOT accepted.
-    A genuinely weightless patterned request stays accepted (test_post_download_accepts_weightless...)."""
+    """An explicit weight request (allow=['model.safetensors']) returning only config.json is a stale
+    config-only snapshot: reject and retry over HTTP. A weightless patterned request stays accepted."""
     snap, _ = _mk_snapshot(tmp_path, "patcfg")
     (snap / "config.json").write_text("{}")
     assert xf._download_result_usable(
@@ -2366,10 +2362,9 @@ def test_post_download_rejects_config_only_for_explicit_weight_pattern(tmp_path)
 
 
 def test_post_download_rejects_incomplete_canonical_root_shards(tmp_path):
-    """Round-2 F2: an interrupted canonical sharded warm (a loose model-00001-of-00002.safetensors
-    with no index / missing sibling) has a loadable weight file but a default load cannot read it and
-    would fetch the rest over un-killable Xet, so it is rejected post-download. A complete sharded set
-    is accepted; a variant-only shard layout is not force-failed (it simply has no canonical shard)."""
+    """An interrupted canonical sharded warm (loose model-00001-of-00002.safetensors, no index) has a
+    loadable file but a default load cannot read it and would fetch the rest over un-killable Xet, so
+    it is rejected. A complete sharded set is accepted; a variant-only shard layout is not force-failed."""
     snap, blob = _mk_snapshot(tmp_path, "incshard")
     (snap / "config.json").write_text("{}")
     (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
@@ -2391,8 +2386,8 @@ def test_post_download_rejects_incomplete_canonical_root_shards(tmp_path):
 
 
 def test_local_token_not_found_error_type_preserved():
-    """Round-2 F4: a missing required token fails identically over either transport, so
-    LocalTokenNotFoundError is deterministic and its type is reconstructed across the spawn boundary."""
+    """A missing required token fails identically over either transport, so LocalTokenNotFoundError is
+    deterministic and its type is reconstructed across the spawn boundary."""
     assert "LocalTokenNotFoundError" in xf._DETERMINISTIC_ERROR_NAMES
     cls = xf._resolve_exception_class("LocalTokenNotFoundError")
     assert cls is not None and issubclass(cls, BaseException)
@@ -2401,9 +2396,8 @@ def test_local_token_not_found_error_type_preserved():
 
 
 def test_metadata_directory_pattern_is_weightless(tmp_path):
-    """Round-3 A: a trailing-slash metadata directory pattern (allow=['tokenizer/']) reads weightless
-    so a complete tokenizer-only download is accepted, not looped into a DownloadStallError. A
-    component / checkpoint directory pattern stays conservatively weight-bearing."""
+    """A trailing-slash metadata dir pattern (allow=['tokenizer/']) reads weightless, so a complete
+    tokenizer-only download is accepted. Component / checkpoint dir patterns stay weight-bearing."""
     assert hcs.request_can_include_weights(["tokenizer/"], None) is False
     assert hcs.request_can_include_weights(["processor/"], None) is False
     assert hcs.request_can_include_weights(["unet/"], None) is True
@@ -2416,9 +2410,9 @@ def test_metadata_directory_pattern_is_weightless(tmp_path):
 
 
 def test_post_download_rejects_checkpoint_only_root_model(tmp_path):
-    """Round-3 B (over-accept): a stale snapshot whose only weight is under checkpoint-7/ is rejected
-    for an unpatterned root warm -- a default from_pretrained ignores checkpoint-*/ and would fetch the
-    missing root weights over un-killable Xet. The same checkpoint is accepted when explicitly scoped."""
+    """A stale snapshot whose only weight is under checkpoint-7/ is rejected for an unpatterned root
+    warm -- a default from_pretrained ignores checkpoint-*/ and would fetch the missing root weights
+    over un-killable Xet. The same checkpoint is accepted when explicitly scoped."""
     snap, blob = _mk_snapshot(tmp_path, "ckonly")
     (snap / "config.json").write_text("{}")
     (snap / "checkpoint-7").mkdir()
@@ -2437,9 +2431,8 @@ def test_post_download_rejects_checkpoint_only_root_model(tmp_path):
 
 
 def test_post_download_validates_weightless_named_subset(tmp_path):
-    """Round-3 C: an exact weightless request (allow=['tokenizer.json'], or a dataset file) that came
-    back as a stale config-only snapshot missing the named file is rejected and retried. A glob allow
-    list stays lenient (cannot be turned into an exact manifest)."""
+    """An exact weightless request (allow=['tokenizer.json'], or a dataset file) returning a stale
+    snapshot missing the named file is rejected and retried. A glob allow list stays lenient."""
     snap, _ = _mk_snapshot(tmp_path, "noname")
     (snap / "config.json").write_text("{}")
     assert xf._download_result_usable(
@@ -2455,10 +2448,10 @@ def test_post_download_validates_weightless_named_subset(tmp_path):
 
 
 def test_post_download_rejects_missing_exact_weight_request(tmp_path):
-    """Round-3 F2: an exact weight request whose file is missing is rejected even when a different
-    weight is present -- allow=['adapter_model.safetensors'] is NOT satisfied by a stale base
-    model.safetensors, and ['model.safetensors','adapter_model.safetensors'] needs both. The classic
-    either-format ['model.safetensors','pytorch_model.bin'] pair stays satisfied by one (equivalence)."""
+    """An exact weight request whose file is missing is rejected even when a different weight is present:
+    allow=['adapter_model.safetensors'] is NOT satisfied by a stale base model.safetensors, and
+    ['model.safetensors','adapter_model.safetensors'] needs both. The either-format
+    ['model.safetensors','pytorch_model.bin'] pair stays satisfied by one (equivalence)."""
     base, blob = _mk_snapshot(tmp_path, "baseonly")
     (base / "model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
@@ -2478,9 +2471,8 @@ def test_post_download_rejects_missing_exact_weight_request(tmp_path):
 
 
 def test_dataset_unpatterned_or_glob_partial_does_not_skip_child(tmp_path):
-    """Round-3 F3: a dataset/space snapshot whose completeness cannot be proven from local files
-    (allow=None or a glob) must defer to the watched child -- a partial cache must not be returned as
-    complete. An intact exact-named subset still short-circuits."""
+    """A dataset/space snapshot whose completeness cannot be proven from local files (allow=None or a
+    glob) must defer to the watched child. An intact exact-named subset still short-circuits."""
     snap, _ = _mk_snapshot(tmp_path, "dspart")
     (snap / "README.md").write_text("partial")
     assert xf._cache_can_skip_download(
@@ -2492,9 +2484,9 @@ def test_dataset_unpatterned_or_glob_partial_does_not_skip_child(tmp_path):
 
 
 def test_http_prep_scopes_blob_cleanup_to_owned_partials(tmp_path):
-    """Round-3 F1: HTTP prep must purge only the stalled child's OWN partials, never a concurrent
-    same-repo sibling's blob (multi-rank). With ownership known, a sibling's aged partial and its
-    dangling link are spared; with ownership unknown (None), the coarser mtime guard purges both."""
+    """HTTP prep must purge only the stalled child's OWN partials, never a concurrent same-repo
+    sibling's blob (multi-rank). With ownership known, a sibling's aged partial and dangling link are
+    spared; with ownership unknown (None), the coarser mtime guard purges both."""
     repo = "ztest/concurrent-blobs"
     repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
     blobs = repo_dir / "blobs"
