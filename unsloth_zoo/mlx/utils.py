@@ -521,7 +521,7 @@ def make_baseline_loss_fn():
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = nn.losses.cross_entropy(logits, targets) * mask
             ntoks = mask.sum()
-            ce = ce.astype(mx.float32).sum() / ntoks
+            ce = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
@@ -3605,7 +3605,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
                    model_name=None, model_type=None, append_eos=True,
-                   comm_group=None):
+                   comm_group=None, distributed_pad_mode="cycle"):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -3642,6 +3642,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             num_batches=num_batches,
             seed=seed,
             comm_group=comm_group,
+            distributed_pad_mode=distributed_pad_mode,
         )
     else:
         batch_pairs = []
@@ -3689,11 +3690,13 @@ def _rank_slice_distributed_batch(
     local_batch_size,
     comm_group=None,
     pad_source=None,
+    pad_mode="cycle",
 ):
     """Return this rank's local slice from one global DDP micro-batch.
 
-    Tail global batches are padded by cycling valid items so every rank executes
-    the same number of micro-batches and collectives stay aligned.
+    Tail global batches are padded so every rank executes the same number of
+    micro-batches and collectives stay aligned. Training uses ``cycle`` to keep
+    full batches; eval can use ``empty`` so padded rows do not contribute tokens.
     """
     rank, world_size = _distributed_rank_size(comm_group)
     items = list(items)
@@ -3703,27 +3706,51 @@ def _rank_slice_distributed_batch(
     target_size = int(local_batch_size) * world_size
     if target_size <= 0:
         raise ValueError("local_batch_size must be positive for distributed batching.")
+    if pad_mode not in ("cycle", "empty"):
+        raise ValueError(f"Unsupported distributed pad mode: {pad_mode!r}.")
     if len(items) > target_size:
         items = items[:target_size]
     if len(items) < target_size:
-        source = list(pad_source) if pad_source is not None else list(items)
-        if not source:
+        if not items:
             return []
-        pad_pos = 0
-        while len(items) < target_size:
-            items.append(source[pad_pos % len(source)])
-            pad_pos += 1
+        if pad_mode == "empty":
+            items.extend([None] * (target_size - len(items)))
+        else:
+            source = list(pad_source) if pad_source is not None else list(items)
+            if not source:
+                return []
+            pad_pos = 0
+            while len(items) < target_size:
+                items.append(source[pad_pos % len(source)])
+                pad_pos += 1
     return items[rank:target_size:world_size]
 
 
 def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
     """Build a text training batch from tokenized items."""
-    if len(batch_items[0]) == 2:
-        batch, offsets = zip(*batch_items)
-    else:
-        batch = batch_items
-        offsets = [0] * len(batch_items)
-    lengths = [len(ids) for ids in batch]
+    valid_items = [item for item in batch_items if item is not None]
+    with_offsets = bool(
+        valid_items
+        and isinstance(valid_items[0], tuple)
+        and len(valid_items[0]) == 2
+    )
+    batch = []
+    offsets = []
+    lengths = []
+    for item in batch_items:
+        if item is None:
+            batch.append([])
+            offsets.append(0)
+            lengths.append(0)
+        elif with_offsets:
+            ids, offset = item
+            batch.append(ids)
+            offsets.append(offset)
+            lengths.append(len(ids))
+        else:
+            batch.append(item)
+            offsets.append(0)
+            lengths.append(len(item))
     if max(lengths) > max_seq_length:
         print(
             f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
@@ -3733,7 +3760,7 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
     pad_to = 32
-    max_length = 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to)
+    max_length = max(2, 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to))
     max_length = min(max_length, max_seq_length)
     batch_ids = []
     truncated_lengths = []
@@ -3759,6 +3786,7 @@ def _create_distributed_text_batches(
     num_batches=None,
     seed=42,
     comm_group=None,
+    distributed_pad_mode="cycle",
 ):
     """Distributed variant of mlx-lm's length-sorted text batch iterator."""
     from mlx_lm.tuner.datasets import CacheDataset
@@ -3788,10 +3816,11 @@ def _create_distributed_text_batches(
                 batch_size,
                 comm_group=comm_group,
                 pad_source=idx,
+                pad_mode=distributed_pad_mode,
             )
             if not local_idx:
                 continue
-            batch = [dataset[j] for j in local_idx]
+            batch = [None if j is None else dataset[j] for j in local_idx]
             batch_pairs.append(
                 _make_text_batch_from_items(
                     batch,

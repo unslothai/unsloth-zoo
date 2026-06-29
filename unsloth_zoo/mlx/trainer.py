@@ -2461,6 +2461,8 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
+                        comm_group=self.distributed_world,
+                        distributed_pad_mode="empty",
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -3196,7 +3198,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
-                            comm_group=None):
+                            comm_group=None, distributed_pad_mode="cycle"):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -3335,10 +3337,12 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 batch_size,
                 comm_group=comm_group,
                 pad_source=epoch_items,
+                pad_mode=distributed_pad_mode,
             )
             if not batch_items:
                 continue
-            max_len = max(len(ids) for ids, _ in batch_items)
+            valid_items = [item for item in batch_items if item is not None]
+            max_len = max((len(ids) for ids, _ in valid_items), default=2)
             # +1 for autoregressive shift (mlx-lm iterate_batches parity).
             padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
             padded_len = min(padded_len, max_seq_length)
@@ -3346,7 +3350,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             batch_ids = []
             batch_labels = []
             batch_lengths = []
-            for ids, lbls in batch_items:
+            for item in batch_items:
+                if item is None:
+                    batch_ids.append([0] * padded_len)
+                    batch_labels.append([-100] * padded_len)
+                    batch_lengths.append([0, 0])
+                    continue
+                ids, lbls = item
                 L = min(len(ids), padded_len)
                 pad_len = padded_len - L
                 batch_ids.append(ids[:L] + [0] * pad_len)
@@ -3635,8 +3645,12 @@ def train_on_responses_only(
                     ),
                     append_eos=bool(getattr(args, "append_eos", True)),
                     dataset_order=getattr(args, "dataset_order", "default"),
-                    preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                    preserve_dataset_order=bool(
+                        getattr(args, "preserve_dataset_order", False)
+                    ),
                     return_dataset=True,
+                    comm_group=comm_group,
+                    distributed_pad_mode="empty",
                 )
                 return batches, response_masked_dataset
 

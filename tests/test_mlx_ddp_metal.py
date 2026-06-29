@@ -23,7 +23,7 @@ from mlx.utils import tree_flatten
 from unsloth_zoo import dataset_utils
 import unsloth_zoo.mlx.trainer as trainer_mod
 from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig, _create_labeled_batches, train_on_responses_only
-from unsloth_zoo.mlx.utils import create_batches, create_ordered_batches, create_vlm_batches, iterate_training_batches, iterate_vlm_training_batches
+from unsloth_zoo.mlx.utils import create_batches, create_ordered_batches, create_vlm_batches, iterate_training_batches, iterate_vlm_training_batches, make_baseline_loss_fn
 
 class TinyTokenizer:
     pad_token_id = eos_token_id = 2
@@ -51,6 +51,16 @@ def take_stream_rows(iterator, count):
     for _ in range(count):
         item = next(iterator); batch = item["input_ids"] if isinstance(item, dict) else item[0]; rows.append([int(row[0]) for row in batch.tolist()])
     return rows
+def eval_loss_for_batches(model, batches):
+    loss_fn = make_baseline_loss_fn()
+    all_losses = mx.array(0.0)
+    ntokens = mx.array(0)
+    for batch, lengths, labels in batches:
+        loss, ntoks = loss_fn(model, batch, lengths, labels)
+        all_losses += loss * ntoks
+        ntokens += ntoks
+    mx.eval(all_losses, ntokens)
+    return float((all_losses / ntokens).item())
 
 class ReplayableStream:
     def __iter__(self): return ({"text": f"{i} {i + 20} {i + 30}"} for i in range(10, 15))
@@ -73,7 +83,17 @@ class TinyLM(nn.Module):
     def __init__(self):
         super().__init__(); self.embed = nn.Embedding(64, 8)
         self.proj = nn.Linear(8, 64, bias=False); self._config = {"model_type": "tiny"}
-    def __call__(self, x): return self.proj(self.embed(x))
+        self._record_eval_rows = False; self.eval_first_tokens = []
+    def train(self, mode=True):
+        self._record_eval_rows = not bool(mode)
+        return super().train(mode)
+    def eval(self):
+        self._record_eval_rows = True
+        return super().eval()
+    def __call__(self, x):
+        if self._record_eval_rows:
+            self.eval_first_tokens.extend([int(row[0]) for row in x.tolist()])
+        return self.proj(self.embed(x))
 
 class BrokenTinyLM(TinyLM):
     def __call__(self, x):
@@ -99,7 +119,7 @@ trainer_mod.save_trainer_state = mark("ckpt_state")
 mx.random.seed(0)
 train_data = [{"text": f"{i} {i + 1} {i + 2}"} for i in range(10, 18)]
 args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=3, logging_steps=1, eval_steps=1, save_steps=1, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "train_out")), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-loop_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), train_data, eval_dataset=train_data[:4], args=args)
+loop_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), train_data, eval_dataset=train_data[:3], args=args)
 events = []
 loop_trainer.save_model = mark("final")
 loop_trainer.add_step_callback(lambda *args: events.append(["step", int(args[7])]))
@@ -109,15 +129,17 @@ train_on_responses_only(loop_trainer, instruction_part="user", response_part="as
 response_rows = first_token_rows(loop_trainer._batches)
 result = loop_trainer.train()
 param_sum = mx.sum(loop_trainer.model.embed.weight) + mx.sum(loop_trainer.model.proj.weight)
+loop_eval_reference_loss = eval_loss_for_batches(loop_trainer.model, _create_labeled_batches(train_data[:3], TinyTokenizer(), keep_all_labels, batch_size=1, max_seq_length=8, seed=args.seed, dataset_order="sequential"))
 mx.random.seed(1)
 stream_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=1, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "stream_train_out")), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
-stream_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), ReplayableStream(), eval_dataset=train_data[:4], args=stream_args)
+stream_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), ReplayableStream(), eval_dataset=train_data[:3], args=stream_args)
 stream_events = []
 stream_trainer.save_model = mark("stream_final")
 stream_trainer.add_step_callback(lambda step, *_args: stream_events.append(["step", int(step)]))
 stream_trainer.add_eval_callback(lambda step, loss, _ppl: stream_events.append(["eval", int(step), float(loss)]))
 stream_result = stream_trainer.train()
 stream_param_sum = mx.sum(stream_trainer.model.embed.weight) + mx.sum(stream_trainer.model.proj.weight)
+stream_eval_reference_loss = eval_loss_for_batches(stream_trainer.model, create_batches(train_data[:3], TinyTokenizer(), batch_size=1, max_seq_length=8, seed=stream_args.seed))
 trainer_mod.save_trainable_adapters, trainer_mod.save_optimizer_state, trainer_mod.save_trainer_state = real_save_trainable_adapters, real_save_optimizer_state, real_save_trainer_state
 parity_data = [{"text": f"{i} {i + 1} {i + 2}"} for i in range(10, 18)]
 def make_parity_trainer(output_name, seed=123):
@@ -289,6 +311,9 @@ payload = {
     "loop_step": int(loop_trainer._global_step),
     "loop_compile_enabled": bool(result["compile_enabled"]),
     "loop_compile_scope": result["compile_scope"],
+    "loop_text_eval_rows": list(loop_trainer.model.eval_first_tokens),
+    "loop_eval_loss": float(loop_trainer._last_eval_metrics["eval_loss"]),
+    "loop_eval_reference_loss": loop_eval_reference_loss,
     "param_sum": float(param_sum.item()),
     "loop_main": bool(result["distributed_is_main_process"]),
     "response_rows": response_rows,
@@ -296,6 +321,9 @@ payload = {
     "stream_step": int(stream_trainer._global_step),
     "stream_compile_enabled": bool(stream_result["compile_enabled"]),
     "stream_compile_scope": stream_result["compile_scope"],
+    "stream_text_eval_rows": list(stream_trainer.model.eval_first_tokens),
+    "stream_eval_loss": float(stream_trainer._last_eval_metrics["eval_loss"]),
+    "stream_eval_reference_loss": stream_eval_reference_loss,
     "stream_param_sum": float(stream_param_sum.item()),
     "ddp_eager_losses": [float(x) for x in ddp_eager_trainer._train_loss_history],
     "ddp_compile_losses": [float(x) for x in ddp_compile_trainer._train_loss_history],
@@ -363,11 +391,19 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert [rank["loop_step"] for rank in ranks] == [1, 1]
     assert [rank["loop_compile_enabled"] for rank in ranks] == [True, True]
     assert [rank["loop_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert [rank["loop_text_eval_rows"] for rank in ranks] == [[10, 12], [11, 0]]
+    assert ranks[0]["loop_eval_loss"] == pytest.approx(ranks[1]["loop_eval_loss"], abs=1e-6)
+    assert ranks[0]["loop_eval_loss"] == pytest.approx(ranks[0]["loop_eval_reference_loss"], abs=1e-6)
+    assert ranks[1]["loop_eval_loss"] == pytest.approx(ranks[1]["loop_eval_reference_loss"], abs=1e-6)
     assert abs(ranks[0]["param_sum"] - ranks[1]["param_sum"]) < 1e-5
     assert [rank["response_rows"] for rank in ranks] == [[[10], [12], [14], [16]], [[11], [13], [15], [17]]]
     assert [rank["stream_step"] for rank in ranks] == [1, 1]
     assert [rank["stream_compile_enabled"] for rank in ranks] == [True, True]
     assert [rank["stream_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert [rank["stream_text_eval_rows"] for rank in ranks] == [[10, 12], [11, 0]]
+    assert ranks[0]["stream_eval_loss"] == pytest.approx(ranks[1]["stream_eval_loss"], abs=1e-6)
+    assert ranks[0]["stream_eval_loss"] == pytest.approx(ranks[0]["stream_eval_reference_loss"], abs=1e-6)
+    assert ranks[1]["stream_eval_loss"] == pytest.approx(ranks[1]["stream_eval_reference_loss"], abs=1e-6)
     assert ranks[0]["stream_events"][0] == ["step", 1]
     assert ranks[0]["stream_events"][1][0:2] == ["eval", 1]
     assert ranks[0]["stream_events"][1][2] > 0
