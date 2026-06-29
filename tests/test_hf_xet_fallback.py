@@ -2409,6 +2409,42 @@ def test_metadata_directory_pattern_is_weightless(tmp_path):
         snap, repo_type = "model", allow_patterns = ["tokenizer/"], ignore_patterns = None) is True
 
 
+def test_metadata_directory_glob_is_weightless(tmp_path):
+    """A metadata-dir GLOB (allow=['tokenizer/*'], 'processor/*.json') reads weightless like its
+    trailing-slash form, so a complete tokenizer-only download is accepted instead of looped into a
+    DownloadStallError. A component / checkpoint dir glob stays weight-bearing."""
+    assert hcs.request_can_include_weights(["tokenizer/*"], None) is False
+    assert hcs.request_can_include_weights(["tokenizer/*.json"], None) is False
+    assert hcs.request_can_include_weights(["processor/*"], None) is False
+    assert hcs.request_can_include_weights(["unet/*"], None) is True
+    assert hcs.request_can_include_weights(["checkpoint-10/*"], None) is True
+    snap, _ = _mk_snapshot(tmp_path, "tokglob")
+    (snap / "tokenizer").mkdir()
+    (snap / "tokenizer" / "tokenizer.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["tokenizer/*"], ignore_patterns = None) is True
+
+
+def test_allow_star_with_all_weights_ignored_is_weightless(tmp_path):
+    """A root-reachable allow that the ignore filter strips of every weight (allow=['*'] +
+    ignore=[every weight suffix]) reads weightless, so a complete config-only download is accepted, not
+    looped into a DownloadStallError. A subdir-scoped allow stays weight-bearing, and an allow whose
+    weights survive the ignore stays weight-bearing."""
+    all_weight_ignores = [
+        "*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
+        "*.ckpt", "*.onnx", "*.msgpack", "*.h5", "*.pdparams",
+    ]
+    assert hcs.request_can_include_weights(["*"], all_weight_ignores) is False
+    assert hcs.request_can_include_weights(["*"], None) is True
+    assert hcs.request_can_include_weights(["unet/*"], all_weight_ignores) is True
+    assert hcs.request_can_include_weights(["*.safetensors"], ["*.bin"]) is True
+    snap, _ = _mk_snapshot(tmp_path, "cfgonly")
+    (snap / "config.json").write_text("{}")
+    (snap / "tokenizer.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["*"], ignore_patterns = all_weight_ignores) is True
+
+
 def test_post_download_rejects_checkpoint_only_root_model(tmp_path):
     """A stale snapshot whose only weight is under checkpoint-7/ is rejected for an unpatterned root
     warm -- a default from_pretrained ignores checkpoint-*/ and would fetch the missing root weights

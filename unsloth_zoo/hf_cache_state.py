@@ -418,6 +418,12 @@ def _pattern_can_select_weight(pattern: "object") -> bool:
     if pattern.endswith("/"):
         dir_name = pattern.rstrip("/").rsplit("/", 1)[-1].lower()
         return dir_name not in _NON_WEIGHT_DIRS
+    # A pattern scoped under a metadata dir ("tokenizer/*", "processor/*.json") is weightless like the
+    # "tokenizer/" form, instead of letting a "*" basename match a weight probe.
+    if "/" in pattern:
+        parent = pattern.rsplit("/", 1)[0].rstrip("/").rsplit("/", 1)[-1].lower()
+        if parent in _NON_WEIGHT_DIRS:
+            return False
     base = pattern.rsplit("/", 1)[-1]
     if base.endswith(_WEIGHT_FILE_SUFFIXES):
         return True
@@ -431,8 +437,8 @@ def request_can_include_weights(
 ) -> bool:
     """Whether a request restricted by *allow_patterns* / *ignore_patterns* can still include a weight.
     Conservative: True when uncertain, so the acceptance check requires a weight; False only for a
-    clearly weightless request (a tokenizer / config allow list, or an ignore list dropping every
-    weight format), which preserves the offline short-circuit for a tokenizer-only warm."""
+    clearly weightless request (a tokenizer / config allow list, an ignore list dropping every weight
+    format, or an allow + ignore pair that strips them all), preserving the tokenizer-only short-circuit."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     if allow_patterns is None and ignore_patterns is None:
@@ -441,7 +447,15 @@ def request_can_include_weights(
         return not _ignore_strips_all_weights(ignore_patterns or [])
     if not allow_patterns:
         return False  # allow=[] selects nothing
-    return any(_pattern_can_select_weight(pat) for pat in allow_patterns)
+    if not any(_pattern_can_select_weight(pat) for pat in allow_patterns):
+        return False
+    # A root-reachable allow (no required subdir) can still be left weightless by the ignore filter
+    # (allow=["*"] + ignore=[every weight suffix]). Apply HF's allow-then-ignore semantics to the weight
+    # probes; a subdir-scoped allow stays weight-bearing (its required dir is absent from the root probes).
+    if ignore_patterns and all(isinstance(p, str) and "/" not in p for p in allow_patterns):
+        if not _filter_paths(list(_WEIGHT_PATTERN_PROBES), allow_patterns, ignore_patterns):
+            return False
+    return True
 
 
 def _canonical_root_weights_complete(
