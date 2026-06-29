@@ -2072,6 +2072,26 @@ def test_gate_fast_paths_canonical_sharded_with_index(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap2) is False
 
 
+def test_gate_rejects_sharded_adapter_only_root_cache(tmp_path):
+    """A complete sharded ADAPTER at the root (adapter_model.safetensors.index.json + its shards) is
+    NOT a canonical base model: only model/pytorch_model index names gate the fast path. A base+adapter
+    repo whose cache holds only the adapter must defer to the child, else a default from_pretrained
+    base load fetches the missing base weights over un-killable Xet."""
+    assert hcs._is_canonical_weight_shard_index("adapter_model.safetensors.index.json") is False
+    assert hcs._is_canonical_weight_shard_index("model.safetensors.index.json") is True
+    assert hcs._is_canonical_weight_shard_index("pytorch_model.bin.index.json") is True
+    snap, blob = _mk_snapshot(tmp_path, "adapteronly")
+    (snap / "config.json").write_text("{}")
+    (snap / "adapter_model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "adapter_model-00002-of-00002.safetensors").symlink_to(blob)
+    (snap / "adapter_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "adapter_model-00001-of-00002.safetensors",
+                                   "b": "adapter_model-00002-of-00002.safetensors"}}))
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
 def test_gate_rejects_config_only(tmp_path):
     snap, _ = _mk_snapshot(tmp_path, "cfg")
     (snap / "config.json").write_text("{}")

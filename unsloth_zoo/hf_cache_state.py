@@ -236,10 +236,11 @@ def _is_weight_shard_index(name: str) -> bool:
 
 def _is_canonical_weight_shard_index(name: str) -> bool:
     """True only for the CANONICAL (non-variant) index a default load probes
-    (``model.safetensors.index.json`` / ``pytorch_model.bin.index.json``). A variant
-    (``...index.fp16.json``) is rejected: the wrapper takes no variant param, so a variant-only cache
-    must not satisfy the canonical fast path (its canonical weights are still missing)."""
-    return name.endswith(".safetensors.index.json") or name.endswith(".bin.index.json")
+    (``model.safetensors.index.json`` / ``pytorch_model.bin.index.json``). Exact names only: an
+    ``adapter_model.safetensors.index.json`` (or a variant ``...index.fp16.json``) is rejected, so a
+    sharded-adapter-only / variant-only cache does not satisfy the canonical fast path (its base
+    canonical weights are still missing -> the load would fetch them over un-killable Xet)."""
+    return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
 def _weight_shard_index_complete(index_path: Path) -> bool:
