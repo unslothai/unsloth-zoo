@@ -34,6 +34,7 @@ are download-manager concerns that live in the consumer, not in this module.
 from __future__ import annotations
 
 import fnmatch
+import re
 import sys
 from pathlib import Path
 from typing import Iterator, Optional
@@ -269,6 +270,17 @@ def _is_weight_shard_index(name: str) -> bool:
     return name.endswith(".json") and (".safetensors.index." in name or ".bin.index." in name)
 
 
+def _is_canonical_weight_shard_index(name: str) -> bool:
+    """True only for the CANONICAL (non-variant) shard index a default in-process load probes:
+    ``model.safetensors.index.json`` / ``pytorch_model.bin.index.json`` (any stem). A variant form
+    such as ``model.safetensors.index.fp16.json`` ends in ``.index.fp16.json`` and is rejected: the
+    fallback wrapper takes no variant parameter, so a default ``from_pretrained`` reads the canonical
+    index, and a variant-only cache must NOT satisfy the canonical fast path (its canonical weights
+    are still missing -- skipping the child there would reintroduce the unprotected in-process fetch
+    this gate prevents)."""
+    return name.endswith(".safetensors.index.json") or name.endswith(".bin.index.json")
+
+
 def _weight_shard_index_complete(index_path: Path) -> bool:
     """True only if every shard a HF weight index (``model.safetensors.index.json`` /
     ``pytorch_model.bin.index.json``) lists is present next to the index.
@@ -420,22 +432,58 @@ def _ignore_strips_all_weights(ignore_patterns: "list") -> bool:
     return True
 
 
+# Representative weight filenames a glob allow pattern is probed against (via fnmatch). A glob that
+# matches one of these can select a weight; one that matches none (``tokenizer*``, ``*.json``) is
+# weightless. Covers the canonical / variant / sharded / adapter / diffusers / mistral-consolidated
+# and the non-safetensors weight formats so a real weight glob is never under-classified.
+_WEIGHT_PATTERN_PROBES = (
+    "model.safetensors",
+    "model.fp16.safetensors",
+    "model-00001-of-00002.safetensors",
+    "pytorch_model.bin",
+    "pytorch_model-00001-of-00002.bin",
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "consolidated.safetensors",
+    "consolidated.00.pth",
+    "diffusion_pytorch_model.safetensors",
+    "model.gguf",
+    "model.pt",
+    "model.pth",
+    "model.h5",
+    "model.msgpack",
+    "tf_model.h5",
+    "flax_model.msgpack",
+)
+
+
 def _pattern_can_select_weight(pattern: "object") -> bool:
-    """Whether a single allow pattern could select a model weight file. Conservative: a wildcard
-    basename (``unet/*``, ``adapter_model*``) or a directory pattern (``unet/``) could absorb a
-    weight, as does a basename ending in a weight suffix (``*.safetensors``, ``model.fp16.safetensors``,
-    ``model.gguf``). Only a basename ending in a concrete NON-weight extension (``config.json``,
-    ``*.py``, ``tokenizer.model``, ``additional_chat_templates/*.jinja``) is treated as weightless,
-    so a tokenizer / config allow list keeps its offline short-circuit while a real (sub)weight glob
-    is never under-classified."""
+    """Whether a single allow pattern could select a model weight file.
+
+    - a non-string (unknown shape) -> conservative True;
+    - a bare directory pattern (``unet/``) -> True (expands to everything under it, incl. weights);
+    - a basename ending in a weight suffix (``*.safetensors``, ``model.gguf``) -> True;
+    - a glob basename (``model.?afetensors``, ``model.[sp]afetensors``, ``*``) -> True iff it matches a
+      representative weight name in ``_WEIGHT_PATTERN_PROBES`` -- so ``tokenizer*`` / ``*.json`` read
+      weightless and keep their offline short-circuit, while ``model.?afetensors`` / ``unet/*`` are
+      weight-bearing;
+    - a concrete non-weight name (``config.json``, ``tokenizer.model``) -> False.
+
+    A glob is matched on its basename so ``checkpoint-*/model.?afetensors`` is still recognized. Both
+    directions are bounded: a false weight-bearing only makes the pre-download gate spawn the cheap
+    child; a false weightless is avoided for every standard weight name by the probe set."""
     if not isinstance(pattern, str):
         return True  # unknown shape -> conservative
     if pattern.endswith("/"):
         return True  # a bare directory pattern expands to everything under it, incl. weights
     base = pattern.rsplit("/", 1)[-1]
-    if base.endswith(("*", "?")):
-        return True  # a trailing wildcard could absorb a weight suffix
-    return base.endswith(_WEIGHT_FILE_SUFFIXES)
+    if base.endswith(_WEIGHT_FILE_SUFFIXES):
+        return True  # a concrete or wildcard-stem weight suffix
+    if any(ch in base for ch in _GLOB_CHARS):
+        # A glob basename selects a weight only if it can actually match a weight filename. This keeps
+        # tokenizer / config globs weightless while catching single-char (?) and class ([]) globs.
+        return any(fnmatch.fnmatchcase(probe, base) for probe in _WEIGHT_PATTERN_PROBES)
+    return False
 
 
 def request_can_include_weights(
@@ -489,7 +537,9 @@ def _canonical_root_weights_complete(
             rel = entry.name
         if "/" in rel:
             continue  # a bare from_pretrained reads ROOT files only
-        if _is_weight_shard_index(entry.name):
+        # Only the CANONICAL (non-variant) index counts here: a default load probes
+        # model.safetensors.index.json, not a variant like model.safetensors.index.fp16.json.
+        if _is_canonical_weight_shard_index(entry.name):
             if _safe_is_file(entry):
                 root_indices.append(entry)
         elif _safe_is_file(entry):
@@ -565,6 +615,34 @@ def snapshot_dir_is_complete(
     # 4. Canonical root weights present and complete (a weight whose format the request ignores
     #    does not count -- see _canonical_root_weights_complete).
     return _canonical_root_weights_complete(snapshot_dir, entries, ignore_patterns)
+
+
+# A canonical numbered weight shard at the snapshot root: the shard index sits IMMEDIATELY before the
+# extension (no variant token), so ``model-00001-of-00002.safetensors`` matches but the variant
+# ``model-00001-of-00002.fp16.safetensors`` does NOT.
+_CANONICAL_ROOT_SHARD_RE = re.compile(
+    r"^(?:model|pytorch_model)-\d{5}-of-\d{5}\.(?:safetensors|bin)$"
+)
+
+
+def _has_incomplete_canonical_root_shards(snapshot_dir: Path) -> bool:
+    """True when the snapshot root holds canonical numbered weight shards
+    (``model-00001-of-00002.safetensors`` / ``pytorch_model-...bin``) but is NOT a complete canonical
+    model -- the shard index is missing or a listed shard is absent.
+
+    Such a loose-shard layout is a stale / interrupted download: a default in-process load cannot read
+    bare numbered shards without their index and would fetch the rest over un-killable Xet, so the
+    post-download acceptance check rejects it and retries over HTTP. Variant shards
+    (``model-...fp16.safetensors``) are intentionally excluded -- they never satisfy a default load, so
+    a variant-only repo must not be force-failed here (it simply defers, like any non-canonical warm)."""
+    try:
+        names = [entry.name for entry in snapshot_dir.iterdir()]
+    except OSError:
+        return False
+    if not any(_CANONICAL_ROOT_SHARD_RE.match(name) for name in names):
+        return False
+    # Canonical shards exist but no complete single-file / indexed canonical set covers them.
+    return not snapshot_dir_is_complete(snapshot_dir)
 
 
 def requested_named_files_present(

@@ -52,6 +52,7 @@ from unsloth_zoo.hf_cache_state import (
     _is_loadable_weight_file,
     blob_bytes_present,
     has_active_incomplete_blobs,
+    _has_incomplete_canonical_root_shards,
     hf_cache_root,
     iter_active_repo_cache_dirs,
     request_can_include_weights,
@@ -173,6 +174,29 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
+def _broken_link_has_active_partner(link: Path, *, active_grace: float) -> bool:
+    """True if a dangling snapshot symlink should be SPARED from the HTTP-prep purge because a
+    concurrent sibling download (a different process pulling the same repo into the same cache, common
+    in multi-rank training) is still writing the blob it points at.
+
+    The reliable discriminator is a FRESH ``.incomplete`` partner of the link's target blob (mirroring
+    the active-grace guard the ``.incomplete`` blob purge already uses), NOT the link's own mtime: our
+    OWN killed child's link is freshly created too, but by this point its ``.incomplete`` has been
+    static for the full stall timeout and is purged first, so the target has no partner and the link is
+    correctly cleared -- while a sibling mid-download still has a growing ``.incomplete`` partner, so
+    its link is spared."""
+    try:
+        target = Path(os.readlink(link))
+        if not target.is_absolute():
+            target = link.parent / target
+        incomplete_partner = target.with_name(target.name + INCOMPLETE_SUFFIX)
+        if incomplete_partner.is_file():
+            return time.time() - incomplete_partner.stat().st_mtime < active_grace
+    except OSError:
+        return False
+    return False
+
+
 def _default_prepare_for_http(
     repo_type: str,
     repo_id: str,
@@ -228,6 +252,11 @@ def _default_prepare_for_http(
                 try:
                     for link in snapshot.rglob("*"):
                         if link.is_symlink() and not link.exists():
+                            # Spare a concurrent sibling's active dangling link (its target blob still
+                            # has a fresh .incomplete partner); only purge our own stale
+                            # interrupted-download links so the HTTP retry reads clean.
+                            if _broken_link_has_active_partner(link, active_grace = active_grace):
+                                continue
                             try:
                                 link.unlink()
                             except OSError:
@@ -471,11 +500,24 @@ _DETERMINISTIC_ERROR_NAMES = frozenset({
     "GatedRepoError",
     "DisabledRepoError",
     "LocalEntryNotFoundError",
+    # A required token that is absent locally fails identically over either transport (it never
+    # reaches the network), so surface it deterministically with its real type.
+    "LocalTokenNotFoundError",
     "BadRequestError",
     # A malformed repo id / revision fails identically over either transport (it never reaches the
     # network), so surface it with its real type instead of a generic RuntimeError or a pointless
     # HTTP retry.
     "HFValidationError",
+})
+# Names whose TYPE should be reconstructed across the spawn boundary but which must NOT join the
+# retry-deterministic shortcut above. ``HfHubHTTPError`` is the base of both the deterministic 4xx
+# (401 / 403 / 404 / 416) and the transient 5xx / 429 errors, so the retry decision for it must stay
+# status-code driven (``_is_retryable_download_error`` falls through to the status check). But once an
+# error has been classified deterministic and surfaced as ``"HfHubHTTPError: <msg>"``, the parent
+# should still re-raise the original type so a caller's ``except HfHubHTTPError`` (auth / quota /
+# permission handling) keeps working instead of seeing a generic ``RuntimeError``.
+_TYPE_PRESERVE_ONLY_NAMES = frozenset({
+    "HfHubHTTPError",
 })
 # Substrings that mark a transient transport failure (hf_xet / CAS error, timeout, reset,
 # HTTP 5xx / 429) that disabling Xet and retrying over HTTP may recover.
@@ -495,7 +537,7 @@ def _resolve_exception_class(type_name: str) -> "Optional[type]":
     occurs and never hard-depends on a specific huggingface_hub layout."""
     if type_name == "OSError":
         return OSError
-    if type_name not in _DETERMINISTIC_ERROR_NAMES:
+    if type_name not in _DETERMINISTIC_ERROR_NAMES and type_name not in _TYPE_PRESERVE_ONLY_NAMES:
         return None
     for module_name in ("huggingface_hub.errors", "huggingface_hub.utils"):
         try:
@@ -1040,22 +1082,28 @@ def _download_result_usable(
     file simply absent from the repo is not treated as missing -- so a good download is never failed
     and re-looped into a ``DownloadStallError``.
 
-    The no-weight rejection is scoped to an UNPATTERNED model request (``allow_patterns is None``),
-    which is the only shape that should always yield a weight. A patterned request is trusted: the
-    caller scoped it, so a weightless result is taken as intended (e.g. ``allow_patterns=['tokenizer*']``
-    legitimately returns no weight) rather than failed into a spurious ``DownloadStallError``."""
+    The no-weight rejection fires whenever the request can include weights (``request_can_include_weights``):
+    an unpatterned model warm, or an explicit weight request (``allow_patterns=['model.safetensors']``)
+    that came back with no weight, is a stale config-only snapshot and is retried. A genuinely weightless
+    request (``allow_patterns=['tokenizer*']`` / ``['*.json']``) reads weightless there, so its valid
+    no-weight result is accepted rather than failed.
+
+    It also rejects an interrupted CANONICAL sharded warm (loose ``model-00001-of-00002.safetensors``
+    without its index or a sibling shard) for an unpatterned request: that layout has a loadable weight
+    file but a default load still cannot read it and would fetch the rest over un-killable Xet."""
     if snapshot_has_requested_broken_symlinks(
         snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         repo_type = repo_type,
     ):
         return False
-    if (
-        repo_type in (None, "model")
-        and allow_patterns is None
-        and request_can_include_weights(allow_patterns, ignore_patterns)
-        and not _has_any_weight(snapshot_dir)
-    ):
-        return False
+    if repo_type in (None, "model"):
+        if (
+            request_can_include_weights(allow_patterns, ignore_patterns)
+            and not _has_any_weight(snapshot_dir)
+        ):
+            return False
+        if allow_patterns is None and _has_incomplete_canonical_root_shards(snapshot_dir):
+            return False
     return True
 
 

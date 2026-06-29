@@ -471,6 +471,33 @@ def test_prepare_for_http_clears_broken_snapshot_symlink(tmp_path):
     assert xf.get_hf_download_state([repo], cache_dir = str(tmp_path)) == (0, False)
 
 
+def test_prepare_for_http_spares_concurrent_sibling_active_symlink(tmp_path):
+    """Round-2 F1: HTTP prep must NOT delete a concurrent sibling download's dangling snapshot
+    symlink while that sibling is still writing the target blob (a fresh .incomplete partner exists).
+    Our own stale interrupted link (no .incomplete partner) is still cleared in the same sweep."""
+    repo = "ztest/concurrent"
+    repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
+    blobs = repo_dir / "blobs"
+    snap = repo_dir / "snapshots" / "sha"
+    blobs.mkdir(parents = True)
+    snap.mkdir(parents = True)
+
+    # Sibling mid-download: a dangling link to a blob whose .incomplete partner is being written now.
+    active_partner = blobs / "activehash.incomplete"
+    active_partner.write_bytes(b"active")
+    sibling_link = snap / "active.safetensors"
+    sibling_link.symlink_to(blobs / "activehash")
+
+    # Our own stale interrupted link: target blob has no .incomplete partner.
+    stale_link = snap / "stale.safetensors"
+    stale_link.symlink_to(blobs / "stalehash")
+
+    _REAL_DEFAULT_PREPARE("model", repo, cache_dir = str(tmp_path), active_grace = 180)
+
+    assert sibling_link.is_symlink(), "active sibling's dangling symlink must be preserved"
+    assert not stale_link.is_symlink(), "our own stale dangling symlink must still be cleared"
+
+
 def test_snapshot_dir_has_broken_symlinks_unit(tmp_path):
     """The new per-snapshot primitive flags a dangling link and is clean otherwise."""
     snap = tmp_path / "snapshots" / "sha"
@@ -2261,6 +2288,43 @@ def test_post_download_accepts_weightless_patterned_result(tmp_path):
         cfg, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
 
+def test_gate_rejects_variant_only_shard_index(tmp_path):
+    """codex :269 (over-accept): a variant-only shard index (model.safetensors.index.fp16.json) must
+    NOT satisfy the canonical allow=None fast path -- the fallback wrapper takes no variant param, so
+    a default load probes the canonical index whose weights are absent. Only a canonical
+    (non-variant) index counts; the variant layout defers to the watched child."""
+    snap, blob = _mk_snapshot(tmp_path, "variant")
+    (snap / "config.json").write_text("{}")
+    (snap / "model-00001-of-00001.fp16.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.fp16.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00001.fp16.safetensors"}}))
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    # The canonical index for the same model still fast-paths.
+    (snap / "model-00001-of-00001.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00001.safetensors"}}))
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
+def test_generic_hub_http_error_type_preserved_but_status_drives_retry():
+    """codex :499: a deterministic 4xx surfaced as a bare HfHubHTTPError keeps its TYPE across the
+    spawn boundary (so `except HfHubHTTPError` still works) WITHOUT joining the retry-deterministic
+    name shortcut -- a transient 5xx bare HfHubHTTPError must still retry over HTTP via its status
+    code."""
+    assert "HfHubHTTPError" not in xf._DETERMINISTIC_ERROR_NAMES   # status-driven, not name-driven
+    cls = xf._resolve_exception_class("HfHubHTTPError")
+    assert cls is not None and issubclass(cls, BaseException)
+
+    class _Resp:
+        def __init__(self, code): self.status_code = code
+    e503 = xf._instantiate_preserving_type(cls, "HfHubHTTPError: 503 service unavailable")
+    e503.response = _Resp(503)
+    assert xf._is_retryable_download_error(e503) is True           # 5xx still retryable
+    e403 = xf._instantiate_preserving_type(cls, "HfHubHTTPError: 403 forbidden")
+    e403.response = _Resp(403)
+    assert xf._is_retryable_download_error(e403) is False          # 4xx deterministic
+
+
 def test_hfvalidationerror_type_preserved_across_spawn():
     """Finding 4: a malformed repo id fails identically over either transport, so HFValidationError is
     deterministic (not retried) and its TYPE is reconstructed across the spawn boundary instead of
@@ -2271,3 +2335,66 @@ def test_hfvalidationerror_type_preserved_across_spawn():
     inst = xf._instantiate_preserving_type(cls, "HFValidationError: bad repo id")
     assert type(inst).__name__ == "HFValidationError"
     assert xf._is_retryable_download_error(inst) is False
+
+
+def test_weight_pattern_selector_handles_globs(tmp_path):
+    """Round-2 F1(round1)/F3/F6: the weight-pattern selector reads tokenizer / config / json globs as
+    weightless (keeps their offline short-circuit) while classifying every standard weight name and
+    single-char (?) / class ([]) globs as weight-bearing."""
+    weightless = ["tokenizer*", "*.json", "config.json", "tokenizer.model", "*.txt"]
+    weighty = [
+        "model.safetensors", "*.safetensors", "model.?afetensors", "model.[sp]afetensors",
+        "checkpoint-*/model.?afetensors", "unet/*", "adapter_model*", "consolidated*", "model.gguf",
+    ]
+    for pat in weightless:
+        assert hcs.request_can_include_weights([pat], None) is False, pat
+    for pat in weighty:
+        assert hcs.request_can_include_weights([pat], None) is True, pat
+
+
+def test_post_download_rejects_config_only_for_explicit_weight_pattern(tmp_path):
+    """Round-2 F3: an explicit weight request (allow=['model.safetensors']) that came back with only
+    config.json is a stale config-only snapshot and must be rejected (retry over HTTP), NOT accepted.
+    A genuinely weightless patterned request stays accepted (test_post_download_accepts_weightless...)."""
+    snap, _ = _mk_snapshot(tmp_path, "patcfg")
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["model.safetensors"], ignore_patterns = None) is False
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["adapter_model.safetensors"],
+        ignore_patterns = None) is False
+
+
+def test_post_download_rejects_incomplete_canonical_root_shards(tmp_path):
+    """Round-2 F2: an interrupted canonical sharded warm (a loose model-00001-of-00002.safetensors
+    with no index / missing sibling) has a loadable weight file but a default load cannot read it and
+    would fetch the rest over un-killable Xet, so it is rejected post-download. A complete sharded set
+    is accepted; a variant-only shard layout is not force-failed (it simply has no canonical shard)."""
+    snap, blob = _mk_snapshot(tmp_path, "incshard")
+    (snap / "config.json").write_text("{}")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # Complete the set with its index -> accepted.
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                   "b": "model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # A variant-only shard layout has no canonical shard -> not force-failed here.
+    vsnap, vblob = _mk_snapshot(tmp_path, "vshard")
+    (vsnap / "config.json").write_text("{}")
+    (vsnap / "model-00001-of-00001.fp16.safetensors").symlink_to(vblob)
+    assert xf._download_result_usable(
+        vsnap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_local_token_not_found_error_type_preserved():
+    """Round-2 F4: a missing required token fails identically over either transport, so
+    LocalTokenNotFoundError is deterministic and its type is reconstructed across the spawn boundary."""
+    assert "LocalTokenNotFoundError" in xf._DETERMINISTIC_ERROR_NAMES
+    cls = xf._resolve_exception_class("LocalTokenNotFoundError")
+    assert cls is not None and issubclass(cls, BaseException)
+    assert xf._is_retryable_download_error(
+        xf._instantiate_preserving_type(cls, "LocalTokenNotFoundError: token required")) is False
