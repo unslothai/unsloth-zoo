@@ -456,6 +456,21 @@ _WEIGHT_PATTERN_PROBES = (
     "flax_model.msgpack",
 )
 
+# Snapshot subdirectories that hold only metadata / config (never a loadable model weight), so a
+# trailing-slash directory pattern scoped to one of them (``allow_patterns=['tokenizer/']``) is
+# weightless. Any OTHER directory pattern stays conservatively weight-bearing: a component dir
+# (``unet/``, ``vae/``) or a training-checkpoint dir (``checkpoint-10/``) can hold a weight, so the
+# fast path must not skip the child on it.
+_NON_WEIGHT_DIRS = frozenset({
+    "tokenizer",
+    "processor",
+    "preprocessor",
+    "feature_extractor",
+    "image_processor",
+    "video_processor",
+    "scheduler",
+})
+
 
 def _pattern_can_select_weight(pattern: "object") -> bool:
     """Whether a single allow pattern could select a model weight file.
@@ -475,7 +490,10 @@ def _pattern_can_select_weight(pattern: "object") -> bool:
     if not isinstance(pattern, str):
         return True  # unknown shape -> conservative
     if pattern.endswith("/"):
-        return True  # a bare directory pattern expands to everything under it, incl. weights
+        # A bare directory pattern expands to everything under it. A known metadata dir holds no
+        # weight (so it stays weightless and keeps its offline short-circuit); any other dir could.
+        dir_name = pattern.rstrip("/").rsplit("/", 1)[-1].lower()
+        return dir_name not in _NON_WEIGHT_DIRS
     base = pattern.rsplit("/", 1)[-1]
     if base.endswith(_WEIGHT_FILE_SUFFIXES):
         return True  # a concrete or wildcard-stem weight suffix

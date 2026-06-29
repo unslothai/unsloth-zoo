@@ -49,10 +49,13 @@ from typing import Any, Callable, Optional
 
 from unsloth_zoo.hf_cache_state import (
     INCOMPLETE_SUFFIX,
+    _as_pattern_list,
+    _filter_paths,
+    _has_glob,
+    _has_incomplete_canonical_root_shards,
     _is_loadable_weight_file,
     blob_bytes_present,
     has_active_incomplete_blobs,
-    _has_incomplete_canonical_root_shards,
     hf_cache_root,
     iter_active_repo_cache_dirs,
     request_can_include_weights,
@@ -197,12 +200,22 @@ def _broken_link_has_active_partner(link: Path, *, active_grace: float) -> bool:
     return False
 
 
+def _link_incomplete_partner_name(link: Path) -> Optional[str]:
+    """The ``<hash>.incomplete`` basename for a dangling snapshot symlink's target blob, or None."""
+    try:
+        target = Path(os.readlink(link))
+        return target.name + INCOMPLETE_SUFFIX
+    except OSError:
+        return None
+
+
 def _default_prepare_for_http(
     repo_type: str,
     repo_id: str,
     *,
     cache_dir: Optional[str] = None,
     active_grace: float = DEFAULT_STALL_TIMEOUT,
+    owned_incomplete_blobs: Optional[set] = None,
 ) -> None:
     """Generic 'make the partial safe for an HTTP resume': delete the repo's active
     ``*.incomplete`` blobs (an HTTP resume over a sparse Xet/hf_transfer partial
@@ -213,6 +226,12 @@ def _default_prepare_for_http(
 
     ``iter_active_repo_cache_dirs`` is case-collision safe, so this destructive
     purge only touches an exact-case (or single unambiguous) repo cache dir.
+
+    When *owned_incomplete_blobs* is given (the ``.incomplete`` basenames the stalled child actually
+    held open, captured before it was killed), the purge is SCOPED to those blobs: a concurrent
+    same-repo sibling download (common in multi-rank training) writing a DIFFERENT blob is never
+    touched, even if its partial has aged past *active_grace*. When it is None (ownership could not be
+    determined), the coarser ``active_grace`` mtime guard alone is used, as before.
     """
     try:
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
@@ -220,6 +239,10 @@ def _default_prepare_for_http(
             if blobs_dir.is_dir():
                 for blob in blobs_dir.iterdir():
                     if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
+                        # Scope to the stalled child's own partials when known: never delete a
+                        # sibling's blob, even an aged one.
+                        if owned_incomplete_blobs is not None and blob.name not in owned_incomplete_blobs:
+                            continue
                         try:
                             # Do not unlink a partial another concurrent download is
                             # still actively writing: on POSIX that lets the sibling keep
@@ -252,6 +275,12 @@ def _default_prepare_for_http(
                 try:
                     for link in snapshot.rglob("*"):
                         if link.is_symlink() and not link.exists():
+                            # Scope to our own partials when known: a link to a sibling's blob is left
+                            # alone (it is the sibling's snapshot reference, not our stale state).
+                            if owned_incomplete_blobs is not None and (
+                                _link_incomplete_partner_name(link) not in owned_incomplete_blobs
+                            ):
+                                continue
                             # Spare a concurrent sibling's active dangling link (its target blob still
                             # has a fresh .incomplete partner); only purge our own stale
                             # interrupted-download links so the HTTP retry reads clean.
@@ -958,6 +987,18 @@ def _run_download_attempt(
                     break
                 except queue.Empty:
                     pass
+                # Capture the partials THIS child owns BEFORE killing it, so the HTTP-prep purge can
+                # scope its blob/symlink cleanup to them and never delete a concurrent sibling's
+                # partial. Prefer the precise per-pid open-fd set; fall back to the partials that
+                # appeared since this child spawned (kind=="file" tracks a baseline) when the child
+                # cannot be inspected. None -> prep keeps its coarser mtime-only guard.
+                owned = _child_open_incomplete_blobs(proc.pid) if proc.pid else None
+                if owned is None and baseline_partials is not None:
+                    current = set(
+                        _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
+                    )
+                    owned = current - baseline_partials
+                params["_owned_incomplete_blobs"] = owned
                 _terminate_process_group(proc, grace_period)
                 return ("stall", None)
             try:
@@ -1048,6 +1089,119 @@ def _has_any_weight(snapshot_dir: Path) -> bool:
     return False
 
 
+def _root_has_loadable_weight(snapshot_dir: Path) -> bool:
+    """True if a loadable weight sits at the snapshot ROOT (where a default ``from_pretrained`` reads
+    it). Unlike ``_has_any_weight`` this ignores subfolders, so a stale training-checkpoint-only
+    snapshot (weights only under ``checkpoint-7/``) is not mistaken for a usable root model."""
+    try:
+        for entry in snapshot_dir.iterdir():
+            if _is_loadable_weight_file(entry.name):
+                try:
+                    if entry.is_file():
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    return False
+
+
+def _root_model_has_weight(snapshot_dir: Path) -> bool:
+    """Whether an UNPATTERNED model warm holds a weight a default load will actually read: a ROOT
+    weight, or -- for a diffusers pipeline (root ``model_index.json``) -- a component-subfolder weight.
+
+    A bare ``from_pretrained`` reads root weights and ignores arbitrary subfolders (``checkpoint-*/`` ...),
+    so counting any subtree weight (as ``_has_any_weight`` does) would accept a stale checkpoint-only
+    snapshot and then fetch the missing root weights over un-killable Xet. Diffusers is the one layout
+    whose weights legitimately live in subfolders, and its ``model_index.json`` marker gates that."""
+    try:
+        is_diffusers = (snapshot_dir / "model_index.json").is_file()
+    except OSError:
+        is_diffusers = False
+    if is_diffusers:
+        return _has_any_weight(snapshot_dir)
+    return _root_has_loadable_weight(snapshot_dir)
+
+
+# Exact weight filenames that are interchangeable: a request naming several of the same logical
+# weight (the classic ``["pytorch_model.bin", "model.safetensors"]`` either-format pair) is satisfied
+# by ANY one of them, while distinct logical weights (a base ``model.safetensors`` AND an
+# ``adapter_model.safetensors``) must each be present.
+_EQUIVALENT_EXACT_WEIGHT_NAMES = {
+    "model.safetensors": "root_model",
+    "pytorch_model.bin": "root_model",
+    "adapter_model.safetensors": "adapter_model",
+    "adapter_model.bin": "adapter_model",
+}
+
+
+def _requested_exact_files_present_grouped(
+    snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any,
+) -> bool:
+    """True unless an EXACT-named requested file is missing. A request that names several
+    interchangeable weights (``["pytorch_model.bin", "model.safetensors"]``) is satisfied by any one
+    of them; distinct logical files (a base weight AND an adapter, or a tokenizer file) must each be
+    present. A request with ANY glob, or no allow list, is a best-effort warm and is trivially
+    satisfied here -- the weight-presence checks below cover those."""
+    allow = _as_pattern_list(allow_patterns)
+    ignore = _as_pattern_list(ignore_patterns)
+    if not allow or any(not isinstance(p, str) or _has_glob(p) for p in allow):
+        return True
+    requested = _filter_paths(allow, None, ignore)
+    if not requested:
+        return True  # the ignore filter dropped every named file -> nothing to require
+    try:
+        present = {
+            entry.relative_to(snapshot_dir).as_posix()
+            for entry in snapshot_dir.rglob("*")
+            if entry.is_file()
+        }
+    except OSError:
+        return True  # cannot enumerate -> do not reject on an unreadable dir
+    groups: "dict[tuple[str, str], list[str]]" = {}
+    for rel in requested:
+        parent, base = rel.rsplit("/", 1) if "/" in rel else ("", rel)
+        logical = _EQUIVALENT_EXACT_WEIGHT_NAMES.get(base, base)
+        groups.setdefault((parent, logical), []).append(rel)
+    return all(
+        any(candidate in present for candidate in candidates) for candidates in groups.values()
+    )
+
+
+def _has_selected_weight(
+    snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any,
+) -> bool:
+    """True if at least one loadable weight the request actually SELECTS is present. Unlike
+    ``_has_any_weight`` this applies the allow / ignore filter, so a patterned request
+    (``["*.safetensors"]``, ``["unet/*"]``) is not satisfied by an out-of-scope weight (a stale
+    ``.bin`` left behind, a checkpoint subfolder the request did not ask for)."""
+    weights: list = []
+    try:
+        for entry in snapshot_dir.rglob("*"):
+            if not _is_loadable_weight_file(entry.name):
+                continue
+            try:
+                if entry.is_file():
+                    weights.append(entry.relative_to(snapshot_dir).as_posix())
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return False
+    return bool(_filter_paths(weights, allow_patterns, ignore_patterns))
+
+
+def _patterns_are_exact_names(patterns: Any) -> bool:
+    """True only for a non-empty allow list of EXACT filenames (no ``None``, no glob, no trailing-slash
+    directory pattern). Only such a request can be proven complete from local files alone; ``None`` or a
+    glob needs the Hub manifest, so it must defer to the watched child."""
+    patterns = _as_pattern_list(patterns)
+    if patterns is None:
+        return False
+    if not patterns:
+        return True  # selects nothing -> trivially satisfied, nothing to fetch
+    return all(isinstance(p, str) and not _has_glob(p) for p in patterns)
+
+
 def _cache_can_skip_download(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
 ) -> bool:
@@ -1058,12 +1212,20 @@ def _cache_can_skip_download(
     (``snapshot_dir_is_complete``) may skip the child; anything uncertain (diffusers, variants,
     non-trivial patterns, sharded-without-index) returns False -> spawn the child. A false True here
     would let the in-process load fetch a missing weight over un-killable Xet (the hang). A weightless
-    / non-model request has no weight to hang on, so an intact requested subset is enough -- this
-    preserves the offline short-circuit for a tokenizer-only / dataset warm."""
+    model request (a tokenizer / config / metadata-dir allow list) or a non-model (dataset / space)
+    request has no weight to hang on, but its completeness is only locally provable when it names
+    EXACT files: an unpatterned or glob request cannot be proven complete without the Hub manifest, so
+    it defers to the watched child rather than hand back a partial cache. An exact-named subset that is
+    intact still short-circuits (preserving the offline tokenizer-only / named-file warm)."""
     if repo_type in (None, "model") and request_can_include_weights(allow_patterns, ignore_patterns):
         return snapshot_dir_is_complete(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         )
+    # Weightless model / non-model request: skip only when it names exact files whose subset is intact.
+    # A None / glob request (e.g. a whole-dataset ``allow_patterns=None``) cannot be proven complete
+    # from local files alone, so defer to the child for the authoritative manifest compare + resume.
+    if not _patterns_are_exact_names(allow_patterns):
+        return False
     return _intact_subset(
         snapshot_dir, repo_type = repo_type, allow_patterns = allow_patterns,
         ignore_patterns = ignore_patterns,
@@ -1078,31 +1240,41 @@ def _download_result_usable(
     unless there is POSITIVE evidence of a silent-Xet partial: a dangling REQUESTED symlink (a blob
     that is missing or still ``.incomplete``), or a weight-bearing model warm that came back with NO
     weight at all (HF handed back a stale config-only snapshot on an offline / timed-out request).
-    LENIENT otherwise -- a finished diffusers / variant / either-format download passes, and a named
-    file simply absent from the repo is not treated as missing -- so a good download is never failed
-    and re-looped into a ``DownloadStallError``.
+    LENIENT otherwise -- a finished diffusers / variant / either-format download passes, and an
+    OPTIONAL file simply absent from the repo is not treated as missing -- so a good download is never
+    failed and re-looped into a ``DownloadStallError``.
 
-    The no-weight rejection fires whenever the request can include weights (``request_can_include_weights``):
-    an unpatterned model warm, or an explicit weight request (``allow_patterns=['model.safetensors']``)
-    that came back with no weight, is a stale config-only snapshot and is retried. A genuinely weightless
-    request (``allow_patterns=['tokenizer*']`` / ``['*.json']``) reads weightless there, so its valid
-    no-weight result is accepted rather than failed.
-
-    It also rejects an interrupted CANONICAL sharded warm (loose ``model-00001-of-00002.safetensors``
-    without its index or a sibling shard) for an unpatterned request: that layout has a loadable weight
-    file but a default load still cannot read it and would fetch the rest over un-killable Xet."""
+    Positive-breakage checks:
+    - Any dangling REQUESTED symlink (a missing / still-``.incomplete`` blob).
+    - Every EXACT-named requested file present (grouped by weight equivalence, so the either-format
+      ``["pytorch_model.bin", "model.safetensors"]`` pair needs only one, but a base weight AND an
+      ``adapter_model.safetensors``, or a ``["tokenizer.json"]`` config request, must each be present).
+      A glob allow list cannot be turned into an exact manifest, so it stays lenient there.
+    - A weight-bearing MODEL request that came back with no usable weight. For an UNPATTERNED warm the
+      weight must be ROOT-readable (or a diffusers component) -- a stale ``checkpoint-7/``-only snapshot
+      does not count, since a default load ignores it -- and an interrupted CANONICAL sharded warm
+      (loose ``model-00001-of-00002.safetensors`` with no index) is rejected. A patterned weight request
+      must have a weight WITHIN its requested scope (not a stale out-of-scope ``.bin`` / checkpoint)."""
     if snapshot_has_requested_broken_symlinks(
         snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         repo_type = repo_type,
     ):
         return False
-    if repo_type in (None, "model"):
-        if (
-            request_can_include_weights(allow_patterns, ignore_patterns)
-            and not _has_any_weight(snapshot_dir)
+    if not _requested_exact_files_present_grouped(
+        snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+    ):
+        return False
+    if repo_type in (None, "model") and request_can_include_weights(allow_patterns, ignore_patterns):
+        if allow_patterns is None:
+            # Default root load: a root (or diffusers-component) weight, sharded set complete.
+            if not _root_model_has_weight(snapshot_dir):
+                return False
+            if _has_incomplete_canonical_root_shards(snapshot_dir):
+                return False
+        elif not _has_selected_weight(
+            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
         ):
-            return False
-        if allow_patterns is None and _has_incomplete_canonical_root_shards(snapshot_dir):
+            # Patterned weight request: a weight WITHIN the requested scope must be present.
             return False
     return True
 
@@ -1166,10 +1338,14 @@ def _download_with_xet_fallback(
             # over a sparse Xet/hf_transfer partial silently corrupts the blob.
             # The generic purge is cache_dir-aware; an injected (Studio) hook owns
             # its own cache accounting and keeps the (repo_type, repo_id) signature.
+            # The previous attempt's stall recorded the partials its child owned (if it could).
+            # Scope the cleanup to them so a concurrent same-repo sibling's partial is never purged.
+            owned_incomplete = params.pop("_owned_incomplete_blobs", None)
             try:
                 if prepare_for_http_fn is None:
                     _default_prepare_for_http(
-                        repo_type, repo_id, cache_dir = cache_dir, active_grace = stall_timeout
+                        repo_type, repo_id, cache_dir = cache_dir, active_grace = stall_timeout,
+                        owned_incomplete_blobs = owned_incomplete,
                     )
                 else:
                     prepare_for_http_fn(repo_type, repo_id)
