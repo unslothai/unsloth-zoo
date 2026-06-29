@@ -2203,22 +2203,15 @@ class MLXTrainer:
             _restore_trainable_storage_dtypes()
             return grad_norm
 
-        # Unified step for VLM (dict batch) and text (tuple batch) training.
-        def step_fn(batch_data, prev_state, do_update):
+        def _loss_and_grad(batch_data):
             if isinstance(batch_data, dict):
-                (lvalue, toks), grad = loss_and_grad_fn(model, batch_data)
-            else:
-                (lvalue, toks), grad = loss_and_grad_fn(model, batch_data[0], batch_data[1], batch_data[2])
+                return loss_and_grad_fn(model, batch_data)
+            return loss_and_grad_fn(
+                model, batch_data[0], batch_data[1], batch_data[2]
+            )
 
-            if _direct_single_step_update:
-                grad_norm = _apply_update_direct(grad)
-                return lvalue, toks, None, grad_norm
-
-            toks_f = toks.astype(mx.float32)
-            grad_norm = mx.array(0.0, dtype=mx.float32)
-
-            # Scale-and-accumulate per micro-batch, casting the scalar to each
-            # leaf's dtype so bf16/fp16 grad trees avoid fp32 promotion.
+        def _accumulate_weighted_grad(grad, toks_f, prev_state):
+            """Accumulate token-weighted grads without distributed collectives."""
             if prev_state is not None:
                 prev_grad, prev_toks = prev_state
                 # stop_gradient: accumulated grads are state, not something to
@@ -2236,6 +2229,30 @@ class MLXTrainer:
                     lambda g: g * toks_f.astype(g.dtype),
                     grad,
                 )
+            return grad, toks_f
+
+        def _local_grad_step(batch_data, prev_state):
+            """Local loss/grad accumulation step, safe to compile under DDP."""
+            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            toks_f = toks.astype(mx.float32)
+            grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
+            # The accumulated gradient is carried as state across Python loop
+            # iterations or reduced eagerly outside mx.compile in DDP mode.
+            grad = tree_map(mx.stop_gradient, grad)
+            toks_f = mx.stop_gradient(toks_f)
+            return lvalue, toks, (grad, toks_f)
+
+        # Unified step for VLM (dict batch) and text (tuple batch) training.
+        def step_fn(batch_data, prev_state, do_update):
+            (lvalue, toks), grad = _loss_and_grad(batch_data)
+
+            if _direct_single_step_update:
+                grad_norm = _apply_update_direct(grad)
+                return lvalue, toks, None, grad_norm
+
+            toks_f = toks.astype(mx.float32)
+            grad_norm = mx.array(0.0, dtype=mx.float32)
+            grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
 
             if do_update:
                 grad_norm = _apply_update(grad, toks_f)
@@ -2248,13 +2265,13 @@ class MLXTrainer:
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
-        if _use_compile and distributed_world_size > 1:
-            _main_print(
-                "Unsloth: mx.compile disabled for MLX DDP training; "
-                "using eager mode for distributed collectives."
-            )
-            _use_compile = False
-        if _use_compile and max_grad_norm > 0 and grad_accum > 1:
+        _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
+        if (
+            _use_compile
+            and not _ddp_compile_local_grad
+            and max_grad_norm > 0
+            and grad_accum > 1
+        ):
             _main_print(
                 "Unsloth: mx.compile disabled because MLX global norm "
                 "clipping is enabled with gradient accumulation."
@@ -2296,9 +2313,105 @@ class MLXTrainer:
                     for line in model._unsloth_compile_explain.splitlines():
                         _main_print(f"  {line}")
                 _use_compile = False
+        _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
+        _compile_scope = "none"
+        _compile_state = state
+        class _DDPCompiledLocalGradError(RuntimeError):
+            """Marks failures from the compiled DDP local-gradient graph."""
+
+        def _is_compile_exception(exc):
+            msg = str(exc).lower()
+            return (
+                "compile" in msg
+                or "primitive" in msg
+                or "trace" in msg
+            )
+
         if _use_compile:
             _uncompiled_step_fn = step_fn
-            step_fn = mx.compile(step_fn, inputs=state, outputs=state)
+            if _ddp_compile_local_grad:
+                _compile_state = [model.state, mx.random.state]
+                _main_print(
+                    "Unsloth: mx.compile enabled for MLX DDP local "
+                    "loss/gradient accumulation; distributed collectives "
+                    "remain eager."
+                )
+                try:
+                    _compiled_local_grad_step = mx.compile(
+                        _local_grad_step,
+                        inputs=_compile_state,
+                        outputs=_compile_state,
+                    )
+                except (ValueError, RuntimeError, TypeError) as e:
+                    fallback_allowed = (
+                        _compile_decision.fallback_allowed
+                        if _compile_decision is not None
+                        else compile_policy.mode != "strict"
+                    )
+                    if not fallback_allowed:
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile was enabled "
+                            "and runtime fallback is disabled."
+                        ) from e
+                    _main_print(
+                        "Unsloth: mx.compile failed during setup; "
+                        "falling back to eager mode."
+                    )
+                    _use_compile = False
+                    _compile_scope = "fallback_eager"
+                    step_fn = _uncompiled_step_fn
+                    _ddp_compile_local_grad = False
+                    _compiled_local_grad_step = None
+
+                def _ddp_compiled_step_fn(batch_data, prev_state, do_update):
+                    try:
+                        lvalue, toks, local_state = _compiled_local_grad_step(
+                            batch_data, prev_state,
+                        )
+                        mx.eval(
+                            _compile_state,
+                            lvalue,
+                            toks,
+                            local_state[0],
+                            local_state[1],
+                        )
+                    except (ValueError, RuntimeError, TypeError) as e:
+                        if _is_compile_exception(e):
+                            raise _DDPCompiledLocalGradError(str(e)) from e
+                        raise
+                    grad_norm = None
+                    if do_update:
+                        grad, toks_f = local_state
+                        grad_norm = _apply_update(grad, toks_f)
+                        local_state = None
+                    return lvalue, toks, local_state, grad_norm
+
+                if _use_compile:
+                    step_fn = _ddp_compiled_step_fn
+                    _compile_scope = "ddp_local_grad"
+            else:
+                try:
+                    step_fn = mx.compile(step_fn, inputs=state, outputs=state)
+                except (ValueError, RuntimeError, TypeError) as e:
+                    fallback_allowed = (
+                        _compile_decision.fallback_allowed
+                        if _compile_decision is not None
+                        else compile_policy.mode != "strict"
+                    )
+                    if not fallback_allowed:
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile was enabled "
+                            "and runtime fallback is disabled."
+                        ) from e
+                    _main_print(
+                        "Unsloth: mx.compile failed during setup; "
+                        "falling back to eager mode."
+                    )
+                    step_fn = _uncompiled_step_fn
+                    _use_compile = False
+                    _compile_scope = "fallback_eager"
+                else:
+                    _compile_scope = "full_step"
 
         # Prepare eval batches
         eval_batches = None
@@ -2375,7 +2488,11 @@ class MLXTrainer:
         if args.gradient_checkpointing:
             features.append("GC")
         if _use_compile:
-            features.append("compile")
+            features.append(
+                "compile"
+                if _compile_scope == "full_step"
+                else f"compile={_compile_scope}"
+            )
         elif _compile_decision is not None:
             features.append(f"compile={_compile_decision.support_state}")
         if use_lora_plus:
@@ -2454,18 +2571,24 @@ class MLXTrainer:
                 lvalue, toks, grad_accum_state, grad_norm = step_fn(
                     batch_data, grad_accum_state, do_update,
                 )
-            except (ValueError, RuntimeError) as e:
-                _msg = str(e).lower()
-                _is_compile_failure = _use_compile and (
-                    "compile" in _msg
-                    or "primitive" in _msg
-                    or "trace" in _msg
-                    or "eval" in _msg
+            except (ValueError, RuntimeError, TypeError) as e:
+                if isinstance(e, _DDPCompiledLocalGradError):
+                    _is_compile_failure = _use_compile
+                else:
+                    _is_compile_failure = (
+                        _use_compile
+                        and not _ddp_compile_local_grad
+                        and _is_compile_exception(e)
                 )
                 if _is_compile_failure:
-                    if _compile_decision is not None and not _compile_decision.fallback_allowed:
+                    fallback_allowed = (
+                        _compile_decision.fallback_allowed
+                        if _compile_decision is not None
+                        else compile_policy.mode != "strict"
+                    )
+                    if not fallback_allowed:
                         raise RuntimeError(
-                            "Unsloth: strict mx.compile was enabled for this VLM "
+                            "Unsloth: strict mx.compile was enabled "
                             "and runtime fallback is disabled."
                         ) from e
                     _main_print(
@@ -2474,6 +2597,7 @@ class MLXTrainer:
                     )
                     step_fn = _uncompiled_step_fn
                     _use_compile = False
+                    _compile_scope = "fallback_eager"
                     state = [model.state, optimizer.state, mx.random.state]
                     lvalue, toks, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
@@ -2733,6 +2857,7 @@ class MLXTrainer:
             "compile_policy_mode": (
                 _compile_decision.policy_mode if _compile_decision is not None else compile_policy.mode
             ),
+            "compile_scope": _compile_scope,
             "patch_mode": getattr(self.args, "patch_mode", "patched"),
             "compile_trace": (
                 asdict(self._compile_trace)

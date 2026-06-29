@@ -34,8 +34,14 @@ class TinyProcessor:
     tokenizer = TinyTokenizer()
     image_processor = object()
     def __call__(self, text, **_kwargs):
-        rows = [[int(str(item)), 20, 2] for item in text]
-        return {"input_ids": mx.array(rows, dtype=mx.int32), "attention_mask": mx.ones((len(rows), 3), dtype=mx.int32)}
+        raw_rows = []
+        for item in text:
+            value = int(str(item))
+            raw_rows.append([value, 20, 2] if value % 2 else [value, 20, value + 1, 2])
+        width = max(len(row) for row in raw_rows)
+        rows = [row + [2] * (width - len(row)) for row in raw_rows]
+        masks = [[1] * len(row) + [0] * (width - len(row)) for row in raw_rows]
+        return {"input_ids": mx.array(rows, dtype=mx.int32), "attention_mask": mx.array(masks, dtype=mx.int32)}
 
 def keep_all_labels(d): return {"labels": [list(d["input_ids"][0])]}
 def first_token_rows(batches):
@@ -69,8 +75,13 @@ class TinyLM(nn.Module):
         self.proj = nn.Linear(8, 64, bias=False); self._config = {"model_type": "tiny"}
     def __call__(self, x): return self.proj(self.embed(x))
 
+class BrokenTinyLM(TinyLM):
+    def __call__(self, x):
+        raise RuntimeError("eval side failure from model")
+
 class TinyVLM(nn.Module):
     _is_vlm_model = True
+    __module__ = "mlx_vlm.models.qwen2_vl.fake"
     def __init__(self):
         super().__init__(); self.embed = nn.Embedding(64, 8)
         self.proj = nn.Linear(8, 64, bias=False); self._config = {"model_type": "tiny_vlm", "image_token_id": 20}
@@ -105,7 +116,7 @@ stream_events = []
 stream_trainer.save_model = mark("stream_final")
 stream_trainer.add_step_callback(lambda step, *_args: stream_events.append(["step", int(step)]))
 stream_trainer.add_eval_callback(lambda step, loss, _ppl: stream_events.append(["eval", int(step), float(loss)]))
-stream_trainer.train()
+stream_result = stream_trainer.train()
 stream_param_sum = mx.sum(stream_trainer.model.embed.weight) + mx.sum(stream_trainer.model.proj.weight)
 trainer_mod.save_trainable_adapters, trainer_mod.save_optimizer_state, trainer_mod.save_trainer_state = real_save_trainable_adapters, real_save_optimizer_state, real_save_trainer_state
 parity_data = [{"text": f"{i} {i + 1} {i + 2}"} for i in range(10, 18)]
@@ -125,6 +136,106 @@ def max_trainable_delta(left, right):
         delta = mx.maximum(delta, leaf_delta)
     mx.eval(delta)
     return float(delta.item())
+parity_lengths_data = [
+    {"text": "10 11 12 13 14"},
+    {"text": "15 16 17"},
+    {"text": "18 19 20 21"},
+    {"text": "22 23"},
+    {"text": "24 25 26 27 28"},
+    {"text": "29 30 31"},
+    {"text": "32 33 34 35"},
+    {"text": "36 37"},
+]
+def make_ddp_compile_parity_trainer(output_name, compile_enabled):
+    mx.random.seed(456)
+    parity_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=3, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_grad_norm=1.0, max_seq_length=8, output_dir=str(Path(sys.argv[1], output_name)), use_cce=False, compile=compile_enabled, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+    out = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=parity_args)
+    out.save_model = mark(f"{output_name}_final")
+    return out
+ddp_eager_trainer = make_ddp_compile_parity_trainer("ddp_parity_eager", False)
+ddp_eager_result = ddp_eager_trainer.train()
+sync = trainer._distributed_all_sum(mx.array(1, dtype=mx.int32), stream=mx.cpu)
+mx.eval(sync)
+ddp_compile_trainer = make_ddp_compile_parity_trainer("ddp_parity_compile", True)
+ddp_compile_result = ddp_compile_trainer.train()
+ddp_compile_param_delta = max_trainable_delta(ddp_eager_trainer, ddp_compile_trainer)
+def strict_compile_failure_message():
+    real_compile = mx.compile
+    def failing_compile(_fn, *_args, **_kwargs):
+        def fail(*_call_args, **_call_kwargs):
+            raise RuntimeError("forced compile failure")
+        return fail
+    mx.compile = failing_compile
+    try:
+        mx.random.seed(789)
+        strict_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "strict_compile_failure")), use_cce=False, compile=True, compile_mode="strict", gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+        strict_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=strict_args)
+        strict_trainer.save_model = mark("strict_compile_failure_final")
+        strict_trainer.train()
+    except RuntimeError as exc:
+        return str(exc)
+    finally:
+        mx.compile = real_compile
+    return ""
+strict_error = strict_compile_failure_message()
+def strict_compile_setup_failure_message():
+    real_compile = mx.compile
+    def failing_compile(_fn, *_args, **_kwargs):
+        raise TypeError("forced setup failure")
+    mx.compile = failing_compile
+    try:
+        mx.random.seed(7891)
+        strict_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "strict_compile_setup_failure")), use_cce=False, compile=True, compile_mode="strict", gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+        strict_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=strict_args)
+        strict_trainer.save_model = mark("strict_compile_setup_failure_final")
+        strict_trainer.train()
+    except RuntimeError as exc:
+        return str(exc)
+    finally:
+        mx.compile = real_compile
+    return ""
+strict_setup_error = strict_compile_setup_failure_message()
+def best_effort_compile_failure_result():
+    real_compile = mx.compile
+    def failing_compile(_fn, *_args, **_kwargs):
+        def fail(*_call_args, **_call_kwargs):
+            raise RuntimeError("forced compile failure")
+        return fail
+    mx.compile = failing_compile
+    try:
+        mx.random.seed(790)
+        fallback_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "best_effort_compile_failure")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+        fallback_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=fallback_args)
+        fallback_trainer.save_model = mark("best_effort_compile_failure_final")
+        return fallback_trainer.train()
+    finally:
+        mx.compile = real_compile
+best_effort_fallback_result = best_effort_compile_failure_result()
+def best_effort_compile_setup_failure_result():
+    real_compile = mx.compile
+    def failing_compile(_fn, *_args, **_kwargs):
+        raise TypeError("forced setup failure")
+    mx.compile = failing_compile
+    try:
+        mx.random.seed(791)
+        fallback_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "best_effort_compile_setup_failure")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+        fallback_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=fallback_args)
+        fallback_trainer.save_model = mark("best_effort_compile_setup_failure_final")
+        return fallback_trainer.train()
+    finally:
+        mx.compile = real_compile
+best_effort_setup_fallback_result = best_effort_compile_setup_failure_result()
+def non_compile_runtime_error_message():
+    mx.random.seed(792)
+    error_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "non_compile_runtime_error")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+    error_trainer = MLXTrainer(BrokenTinyLM(), TinyTokenizer(), parity_lengths_data, args=error_args)
+    error_trainer.save_model = mark("non_compile_runtime_error_final")
+    try:
+        error_trainer.train()
+    except RuntimeError as exc:
+        return str(exc)
+    return ""
+non_compile_error = non_compile_runtime_error_message()
 fresh_trainer = make_parity_trainer("resume_fresh")
 fresh_trainer.train()
 partial_trainer = make_parity_trainer("resume_partial")
@@ -139,16 +250,29 @@ trainer_mod.save_trainable_adapters = mark("vlm_ckpt_adapter")
 trainer_mod.save_optimizer_state = mark("vlm_ckpt_opt")
 trainer_mod.save_trainer_state = mark("vlm_ckpt_state")
 mx.random.seed(1)
-vlm_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=1, save_steps=1, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "vlm_train_out")), use_cce=False, compile=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
+vlm_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=1, save_steps=1, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "vlm_train_out")), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
 vlm_processor = TinyProcessor()
-vlm_train_data = [{"text": str(i)} for i in range(10, 18)]
+vlm_train_data = [{"text": str(i)} for i in (10, 13, 11, 12, 14, 17, 15, 16)]
 vlm_trainer = MLXTrainer(TinyVLM(), vlm_processor, vlm_train_data, eval_dataset=vlm_train_data[:4], args=vlm_args, processor=vlm_processor)
 vlm_events = []
 vlm_trainer.save_model = mark("vlm_final")
 vlm_trainer.add_step_callback(lambda step, *_args: vlm_events.append(["step", int(step)]))
 vlm_trainer.add_eval_callback(lambda step, loss, _ppl: vlm_events.append(["eval", int(step), float(loss)]))
-vlm_trainer.train()
+vlm_result = vlm_trainer.train()
 vlm_param_sum = mx.sum(vlm_trainer.model.embed.weight) + mx.sum(vlm_trainer.model.proj.weight)
+def make_vlm_compile_parity_trainer(output_name, compile_enabled):
+    mx.random.seed(2)
+    parity_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=2, max_steps=2, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_grad_norm=1.0, max_seq_length=8, output_dir=str(Path(sys.argv[1], output_name)), use_cce=False, compile=compile_enabled, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
+    out = MLXTrainer(TinyVLM(), vlm_processor, vlm_train_data, args=parity_args, processor=vlm_processor)
+    out.save_model = mark(f"{output_name}_final")
+    return out
+vlm_eager_parity_trainer = make_vlm_compile_parity_trainer("vlm_parity_eager", False)
+vlm_eager_parity_result = vlm_eager_parity_trainer.train()
+sync = trainer._distributed_all_sum(mx.array(1, dtype=mx.int32), stream=mx.cpu)
+mx.eval(sync)
+vlm_compile_parity_trainer = make_vlm_compile_parity_trainer("vlm_parity_compile", True)
+vlm_compile_parity_result = vlm_compile_parity_trainer.train()
+vlm_compile_param_delta = max_trainable_delta(vlm_eager_parity_trainer, vlm_compile_parity_trainer)
 ckpt = Path(sys.argv[1], "resume_ckpt"); ckpt.mkdir(exist_ok=True)
 for name in ("adapters.safetensors", "optimizer_state.safetensors", "trainer_state.json"):
     (ckpt / name).write_text("x")
@@ -163,18 +287,45 @@ payload = {
     "synced_stop": bool(synced_stop),
     "loop_events": events,
     "loop_step": int(loop_trainer._global_step),
+    "loop_compile_enabled": bool(result["compile_enabled"]),
+    "loop_compile_scope": result["compile_scope"],
     "param_sum": float(param_sum.item()),
     "loop_main": bool(result["distributed_is_main_process"]),
     "response_rows": response_rows,
     "stream_events": stream_events,
     "stream_step": int(stream_trainer._global_step),
+    "stream_compile_enabled": bool(stream_result["compile_enabled"]),
+    "stream_compile_scope": stream_result["compile_scope"],
     "stream_param_sum": float(stream_param_sum.item()),
+    "ddp_eager_losses": [float(x) for x in ddp_eager_trainer._train_loss_history],
+    "ddp_compile_losses": [float(x) for x in ddp_compile_trainer._train_loss_history],
+    "ddp_compile_param_delta": ddp_compile_param_delta,
+    "ddp_compile_enabled": bool(ddp_compile_result["compile_enabled"]),
+    "ddp_compile_scope": ddp_compile_result["compile_scope"],
+    "ddp_eager_tokens": int(ddp_eager_result["trained_tokens"]),
+    "ddp_compile_tokens": int(ddp_compile_result["trained_tokens"]),
+    "strict_error": strict_error,
+    "strict_setup_error": strict_setup_error,
+    "best_effort_compile_enabled": bool(best_effort_fallback_result["compile_enabled"]),
+    "best_effort_compile_scope": best_effort_fallback_result["compile_scope"],
+    "best_effort_setup_compile_enabled": bool(best_effort_setup_fallback_result["compile_enabled"]),
+    "best_effort_setup_compile_scope": best_effort_setup_fallback_result["compile_scope"],
+    "non_compile_error": non_compile_error,
     "fresh_losses": [float(x) for x in fresh_trainer._train_loss_history],
     "resumed_losses": [float(x) for x in resumed_trainer._train_loss_history],
     "resume_param_delta": resume_param_delta,
     "vlm_events": vlm_events,
     "vlm_step": int(vlm_trainer._global_step),
+    "vlm_compile_enabled": bool(vlm_result["compile_enabled"]),
+    "vlm_compile_scope": vlm_result["compile_scope"],
     "vlm_param_sum": float(vlm_param_sum.item()),
+    "vlm_eager_parity_losses": [float(x) for x in vlm_eager_parity_trainer._train_loss_history],
+    "vlm_compile_parity_losses": [float(x) for x in vlm_compile_parity_trainer._train_loss_history],
+    "vlm_compile_param_delta": vlm_compile_param_delta,
+    "vlm_compile_parity_enabled": bool(vlm_compile_parity_result["compile_enabled"]),
+    "vlm_compile_parity_scope": vlm_compile_parity_result["compile_scope"],
+    "vlm_eager_parity_tokens": int(vlm_eager_parity_result["trained_tokens"]),
+    "vlm_compile_parity_tokens": int(vlm_compile_parity_result["trained_tokens"]),
     "resume_ok": Path(trainer._validate_distributed_resume_checkpoint(ckpt)).name,
     "resume_mismatch": resume_mismatch,
     "default": first_token_rows(create_batches(data, TinyTokenizer(), seed=1, **common)),
@@ -210,18 +361,46 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert [rank["loop_main"] for rank in ranks] == [True, False]
     assert [rank["loop_events"] for rank in ranks] == [[["step", 12], ["eval"]], []]
     assert [rank["loop_step"] for rank in ranks] == [1, 1]
+    assert [rank["loop_compile_enabled"] for rank in ranks] == [True, True]
+    assert [rank["loop_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
     assert abs(ranks[0]["param_sum"] - ranks[1]["param_sum"]) < 1e-5
     assert [rank["response_rows"] for rank in ranks] == [[[10], [12], [14], [16]], [[11], [13], [15], [17]]]
     assert [rank["stream_step"] for rank in ranks] == [1, 1]
+    assert [rank["stream_compile_enabled"] for rank in ranks] == [True, True]
+    assert [rank["stream_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
     assert ranks[0]["stream_events"][0] == ["step", 1]
     assert ranks[0]["stream_events"][1][0:2] == ["eval", 1]
     assert ranks[0]["stream_events"][1][2] > 0
     assert ranks[1]["stream_events"] == []
     assert abs(ranks[0]["stream_param_sum"] - ranks[1]["stream_param_sum"]) < 1e-5
+    assert ranks[0]["ddp_compile_losses"] == pytest.approx(ranks[0]["ddp_eager_losses"], abs=1e-6)
+    assert ranks[1]["ddp_compile_losses"] == pytest.approx(ranks[1]["ddp_eager_losses"], abs=1e-6)
+    assert ranks[0]["ddp_compile_param_delta"] < 1e-5
+    assert ranks[1]["ddp_compile_param_delta"] < 1e-5
+    assert [rank["ddp_compile_enabled"] for rank in ranks] == [True, True]
+    assert [rank["ddp_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert [rank["ddp_eager_tokens"] for rank in ranks] == [rank["ddp_compile_tokens"] for rank in ranks]
+    assert all("runtime fallback is disabled" in rank["strict_error"] for rank in ranks)
+    assert all("runtime fallback is disabled" in rank["strict_setup_error"] for rank in ranks)
+    assert [rank["best_effort_compile_enabled"] for rank in ranks] == [False, False]
+    assert [rank["best_effort_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
+    assert [rank["best_effort_setup_compile_enabled"] for rank in ranks] == [False, False]
+    assert [rank["best_effort_setup_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
+    assert all("eval side failure from model" in rank["non_compile_error"] for rank in ranks)
+    assert all("runtime fallback is disabled" not in rank["non_compile_error"] for rank in ranks)
     assert ranks[0]["fresh_losses"] == pytest.approx(ranks[0]["resumed_losses"], abs=1e-6)
     assert ranks[0]["resume_param_delta"] < 1e-5
     assert ranks[1]["resume_param_delta"] < 1e-5
     assert [rank["vlm_step"] for rank in ranks] == [1, 1]
+    assert [rank["vlm_compile_enabled"] for rank in ranks] == [True, True]
+    assert [rank["vlm_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert ranks[0]["vlm_compile_parity_losses"] == pytest.approx(ranks[0]["vlm_eager_parity_losses"], abs=1e-6)
+    assert ranks[1]["vlm_compile_parity_losses"] == pytest.approx(ranks[1]["vlm_eager_parity_losses"], abs=1e-6)
+    assert ranks[0]["vlm_compile_param_delta"] < 1e-5
+    assert ranks[1]["vlm_compile_param_delta"] < 1e-5
+    assert [rank["vlm_compile_parity_enabled"] for rank in ranks] == [True, True]
+    assert [rank["vlm_compile_parity_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert [rank["vlm_eager_parity_tokens"] for rank in ranks] == [rank["vlm_compile_parity_tokens"] for rank in ranks]
     assert ranks[0]["vlm_events"][0] == ["step", 1]
     assert ranks[0]["vlm_events"][1][0:2] == ["eval", 1]
     assert ranks[0]["vlm_events"][1][2] > 0
