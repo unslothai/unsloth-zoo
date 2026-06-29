@@ -43,6 +43,7 @@ import math
 import os
 from pathlib import Path
 import random
+import socket
 import time
 
 import mlx.core as mx
@@ -899,6 +900,8 @@ class MLXTrainer:
         self._tokens_per_second_history = []
         self._peak_memory_history = []
         self._step_times = []
+        self._local_token_count_history = []
+        self._global_token_count_history = []
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
@@ -974,6 +977,144 @@ class MLXTrainer:
             "distributed_world_size": self._distributed_world_size,
             "distributed_rank": self._distributed_rank,
             "distributed_is_main_process": self._distributed_is_main_process,
+        }
+
+    def _distributed_rank_vector(self, value, *, as_int=False):
+        """Collect one scalar per rank into a rank-indexed list."""
+        world = self._ensure_distributed()
+        if as_int:
+            local_value = int(value)
+            dtype = mx.int64
+        else:
+            local_value = float(value)
+            dtype = mx.float32
+        if world is None or self._distributed_world_size <= 1:
+            return [local_value]
+        values = [0 for _ in range(self._distributed_world_size)]
+        values[self._distributed_rank] = local_value
+        gathered = self._distributed_all_sum(
+            mx.array(values, dtype=dtype), stream=mx.cpu,
+        )
+        mx.eval(gathered)
+        if as_int:
+            return [int(item) for item in gathered.tolist()]
+        return [float(item) for item in gathered.tolist()]
+
+    def _distributed_rank_history(self, values, *, as_int=False):
+        """Collect a scalar history from every rank without string/object gather."""
+        world = self._ensure_distributed()
+        values = list(values or [])
+        lengths = self._distributed_rank_vector(len(values), as_int=True)
+        max_len = max(lengths) if lengths else len(values)
+        sentinel = -1 if as_int else -1.0
+        if world is None or self._distributed_world_size <= 1:
+            history = [[int(value) if as_int else float(value)] for value in values]
+            return {
+                "lengths": lengths,
+                "values": history,
+            }
+
+        padded = [
+            values[index] if index < len(values) else sentinel
+            for index in range(max_len)
+        ]
+        empty = [0 for _ in range(max_len)]
+        rank_rows = [
+            padded if rank == self._distributed_rank else empty
+            for rank in range(self._distributed_world_size)
+        ]
+        dtype = mx.int64 if as_int else mx.float32
+        gathered = self._distributed_all_sum(
+            mx.array(rank_rows, dtype=dtype), stream=mx.cpu,
+        )
+        mx.eval(gathered)
+        per_rank = gathered.tolist()
+        history = [
+            [
+                None if per_rank[rank][index] == sentinel else per_rank[rank][index]
+                for rank in range(self._distributed_world_size)
+            ]
+            for index in range(max_len)
+        ]
+        return {
+            "lengths": lengths,
+            "values": history,
+        }
+
+    def _distributed_training_diagnostics(
+        self,
+        *,
+        total_time,
+        trained_tokens,
+        compile_scope,
+        compile_fallback_reason,
+    ):
+        """Return DDP diagnostics after training while all ranks are still live."""
+        self._ensure_distributed()
+        hostname = socket.gethostname()
+        host_digest = int.from_bytes(
+            hashlib.blake2b(hostname.encode("utf-8"), digest_size=7).digest(),
+            "little",
+        )
+        host_digests = self._distributed_rank_vector(host_digest, as_int=True)
+        pids = self._distributed_rank_vector(os.getpid(), as_int=True)
+        peak_memory = mx.get_peak_memory() / 1e9
+        per_rank_peak_memory = self._distributed_rank_vector(peak_memory)
+        per_rank_runtime = self._distributed_rank_vector(total_time)
+        per_rank_tokens = self._distributed_rank_vector(
+            trained_tokens, as_int=True,
+        )
+        host_rank_map = [
+            {
+                "rank": rank,
+                "host_digest": digest,
+                "hostname": hostname if digest == host_digest else None,
+                "pid": pids[rank] if rank < len(pids) else None,
+                "is_local_host": digest == host_digest,
+            }
+            for rank, digest in enumerate(host_digests)
+        ]
+        return {
+            "distributed_local_hostname": hostname,
+            "distributed_host_rank_map": host_rank_map,
+            "distributed_train_runtime_per_rank": per_rank_runtime,
+            "distributed_train_runtime_max": max(per_rank_runtime),
+            "distributed_train_runtime_min": min(per_rank_runtime),
+            "distributed_trained_tokens_per_rank": per_rank_tokens,
+            "distributed_global_token_count_history": [
+                int(value) for value in getattr(
+                    self, "_global_token_count_history", []
+                )
+            ],
+            "distributed_per_rank_token_count_history": (
+                self._distributed_rank_history(
+                    getattr(self, "_local_token_count_history", []),
+                    as_int=True,
+                )
+            ),
+            "distributed_tokens_per_second_history": [
+                float(value) for value in getattr(
+                    self, "_tokens_per_second_history", []
+                )
+            ],
+            "distributed_per_rank_tokens_per_second_history": (
+                self._distributed_rank_history(
+                    getattr(self, "_tokens_per_second_history", []),
+                )
+            ),
+            "distributed_step_time_history": [
+                float(value) for value in getattr(self, "_step_times", [])
+            ],
+            "distributed_per_rank_step_time_history": (
+                self._distributed_rank_history(
+                    getattr(self, "_step_times", []),
+                )
+            ),
+            "distributed_peak_memory_gb": max(per_rank_peak_memory),
+            "distributed_peak_memory_gb_per_rank": per_rank_peak_memory,
+            "eval_metrics": dict(getattr(self, "_last_eval_metrics", {})),
+            "compile_fallback": compile_scope == "fallback_eager",
+            "compile_fallback_reason": compile_fallback_reason or "",
         }
 
     def _distributed_all_sum(self, value, stream=None):
@@ -2347,6 +2488,7 @@ class MLXTrainer:
                 _use_compile = False
         _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
         _compile_scope = "none"
+        _compile_fallback_reason = None
         _compile_state = state
         class _DDPCompiledLocalGradError(RuntimeError):
             """Marks failures from the compiled DDP local-gradient graph."""
@@ -2413,6 +2555,7 @@ class MLXTrainer:
                     )
                     _use_compile = False
                     _compile_scope = "fallback_eager"
+                    _compile_fallback_reason = "setup_error"
                     step_fn = _uncompiled_step_fn
                     _ddp_compile_local_grad = False
                     _compiled_local_grad_step = None
@@ -2451,6 +2594,7 @@ class MLXTrainer:
                     step_fn = _uncompiled_step_fn
                     _use_compile = False
                     _compile_scope = "fallback_eager"
+                    _compile_fallback_reason = "setup_error"
                 else:
                     _compile_scope = "full_step"
 
@@ -2596,6 +2740,7 @@ class MLXTrainer:
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""
             nonlocal step_fn, _use_compile, _compile_scope, _ddp_compile_local_grad, state
+            nonlocal _compile_fallback_reason
 
             def _eval_local_result(step_result):
                 lvalue, toks, local_state, _grad_norm = step_result
@@ -2650,6 +2795,7 @@ class MLXTrainer:
                 step_fn = _ddp_eager_local_step_fn
                 _use_compile = False
                 _compile_scope = "fallback_eager"
+                _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
                 state = [model.state, optimizer.state, mx.random.state]
                 local_error = None
@@ -2728,6 +2874,7 @@ class MLXTrainer:
                         step_fn = _uncompiled_step_fn
                         _use_compile = False
                         _compile_scope = "fallback_eager"
+                        _compile_fallback_reason = "runtime_error"
                         state = [model.state, optimizer.state, mx.random.state]
                         lvalue, toks, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
@@ -2789,7 +2936,8 @@ class MLXTrainer:
                     (metric_losses / metric_tokens).item()
                     if metric_tokens.item() > 0 else 0.0
                 )
-                tok_count = metric_tokens.item()
+                local_tok_count = int(n_tokens.item())
+                tok_count = int(metric_tokens.item())
                 trained_tokens += tok_count
                 lr_val = optimizer.learning_rate.item()
                 tokens_sec = tok_count / train_time if train_time > 0 else 0
@@ -2805,6 +2953,8 @@ class MLXTrainer:
                 self._tokens_per_second_history.append(tokens_sec)
                 self._peak_memory_history.append(peak_mem)
                 self._step_times.append(train_time / steps if steps > 0 else 0)
+                self._local_token_count_history.append(local_tok_count)
+                self._global_token_count_history.append(tok_count)
 
                 # Benchmark hook: reset peak memory after warmup
                 reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
@@ -2954,10 +3104,19 @@ class MLXTrainer:
             if os.path.exists(_best_path):
                 try:
                     model.load_weights(_best_path, strict=False)
-                    print(f"Unsloth: Restored best model from step {self._best_step} "
-                          f"({args.metric_for_best_model}={self._best_metric:.4f}).")
+                    _main_print(
+                        f"Unsloth: Restored best model from step {self._best_step} "
+                        f"({args.metric_for_best_model}={self._best_metric:.4f})."
+                    )
                 except Exception as e:
-                    print(f"Unsloth: failed to restore best model ({e}).")
+                    _main_print(f"Unsloth: failed to restore best model ({e}).")
+
+        distributed_diagnostics = self._distributed_training_diagnostics(
+            total_time=total_time,
+            trained_tokens=trained_tokens,
+            compile_scope=_compile_scope,
+            compile_fallback_reason=_compile_fallback_reason,
+        )
 
         # Honor the documented save_steps=0 contract: save at end of training.
         if is_main_process:
@@ -3005,6 +3164,7 @@ class MLXTrainer:
             "base_quantized_source": getattr(
                 self.model, "_unsloth_quantized_source", None,
             ),
+            **distributed_diagnostics,
             **self._distributed_result_fields(),
         })
 

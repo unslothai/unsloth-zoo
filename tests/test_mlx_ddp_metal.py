@@ -105,11 +105,6 @@ class BrokenTinyLM(TinyLM):
     def __call__(self, x):
         raise RuntimeError("eval side failure from model")
 
-class StochasticTinyLM(TinyLM):
-    def __call__(self, x):
-        out = super().__call__(x)
-        return out + mx.random.uniform(shape=out.shape, low=-0.01, high=0.01)
-
 class TinyVLM(nn.Module):
     _is_vlm_model = True
     __module__ = "mlx_vlm.models.qwen2_vl.fake"
@@ -211,23 +206,6 @@ def strict_compile_failure_message():
         mx.compile = real_compile
     return ""
 strict_error = strict_compile_failure_message()
-def strict_compile_setup_failure_message():
-    real_compile = mx.compile
-    def failing_compile(_fn, *_args, **_kwargs):
-        raise TypeError("forced setup failure")
-    mx.compile = failing_compile
-    try:
-        mx.random.seed(7891)
-        strict_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "strict_compile_setup_failure")), use_cce=False, compile=True, compile_mode="strict", gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-        strict_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=strict_args)
-        strict_trainer.save_model = mark("strict_compile_setup_failure_final")
-        strict_trainer.train()
-    except RuntimeError as exc:
-        return str(exc)
-    finally:
-        mx.compile = real_compile
-    return ""
-strict_setup_error = strict_compile_setup_failure_message()
 def best_effort_compile_failure_result():
     real_compile = mx.compile
     def failing_compile(_fn, *_args, **_kwargs):
@@ -244,109 +222,6 @@ def best_effort_compile_failure_result():
     finally:
         mx.compile = real_compile
 best_effort_fallback_result = best_effort_compile_failure_result()
-def best_effort_compile_setup_failure_result():
-    real_compile = mx.compile
-    def failing_compile(_fn, *_args, **_kwargs):
-        raise TypeError("forced setup failure")
-    mx.compile = failing_compile
-    try:
-        mx.random.seed(791)
-        fallback_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "best_effort_compile_setup_failure")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-        fallback_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=fallback_args)
-        fallback_trainer.save_model = mark("best_effort_compile_setup_failure_final")
-        return fallback_trainer.train()
-    finally:
-        mx.compile = real_compile
-best_effort_setup_fallback_result = best_effort_compile_setup_failure_result()
-def asymmetric_compile_failure_result():
-    real_compile = mx.compile
-    def failing_compile(fn, *args, **kwargs):
-        compiled = real_compile(fn, *args, **kwargs)
-        def fail_on_rank0(*call_args, **call_kwargs):
-            if int(world.rank()) == 0:
-                raise RuntimeError("forced compile failure on rank0")
-            return compiled(*call_args, **call_kwargs)
-        return fail_on_rank0
-    mx.compile = failing_compile
-    try:
-        mx.random.seed(7921)
-        fallback_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "asymmetric_compile_failure")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-        fallback_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=fallback_args)
-        fallback_trainer.save_model = mark("asymmetric_compile_failure_final")
-        return fallback_trainer.train()
-    finally:
-        mx.compile = real_compile
-asymmetric_fallback_result = asymmetric_compile_failure_result()
-def asymmetric_compile_setup_failure_result():
-    real_compile = mx.compile
-    def failing_compile(fn, *args, **kwargs):
-        if int(world.rank()) == 0:
-            raise AssertionError("forced setup failure on rank0")
-        return real_compile(fn, *args, **kwargs)
-    mx.compile = failing_compile
-    try:
-        mx.random.seed(7922)
-        fallback_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "asymmetric_compile_setup_failure")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-        fallback_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=fallback_args)
-        fallback_trainer.save_model = mark("asymmetric_compile_setup_failure_final")
-        return fallback_trainer.train()
-    finally:
-        mx.compile = real_compile
-asymmetric_setup_fallback_result = asymmetric_compile_setup_failure_result()
-def stochastic_asymmetric_compile_fallback_parity():
-    def make_trainer(output_name, compile_enabled):
-        mx.random.seed(795)
-        parity_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=2, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], output_name)), use_cce=False, compile=compile_enabled, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-        out = MLXTrainer(StochasticTinyLM(), TinyTokenizer(), parity_lengths_data, args=parity_args)
-        out.save_model = mark(f"{output_name}_final")
-        return out
-    eager = make_trainer("stochastic_asymmetric_eager", False)
-    eager_result = eager.train()
-    sync = trainer._distributed_all_sum(mx.array(1, dtype=mx.int32), stream=mx.cpu)
-    mx.eval(sync)
-    real_compile = mx.compile
-    def failing_compile(fn, *args, **kwargs):
-        compiled = real_compile(fn, *args, **kwargs)
-        def fail_on_rank0(*call_args, **call_kwargs):
-            if int(world.rank()) == 0:
-                raise RuntimeError("forced stochastic compile failure on rank0")
-            return compiled(*call_args, **call_kwargs)
-        return fail_on_rank0
-    mx.compile = failing_compile
-    try:
-        fallback = make_trainer("stochastic_asymmetric_fallback", True)
-        fallback_result = fallback.train()
-    finally:
-        mx.compile = real_compile
-    return {
-        "eager_losses": [float(x) for x in eager._train_loss_history],
-        "fallback_losses": [float(x) for x in fallback._train_loss_history],
-        "param_delta": max_trainable_delta(eager, fallback),
-        "fallback_compile_enabled": bool(fallback_result["compile_enabled"]),
-        "fallback_compile_scope": fallback_result["compile_scope"],
-        "eager_tokens": int(eager_result["trained_tokens"]),
-        "fallback_tokens": int(fallback_result["trained_tokens"]),
-    }
-stochastic_fallback_parity = stochastic_asymmetric_compile_fallback_parity()
-def asymmetric_strict_compile_setup_failure_message():
-    real_compile = mx.compile
-    def failing_compile(fn, *args, **kwargs):
-        if int(world.rank()) == 0:
-            raise AssertionError("forced strict setup failure on rank0")
-        return real_compile(fn, *args, **kwargs)
-    mx.compile = failing_compile
-    try:
-        mx.random.seed(7923)
-        strict_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "asymmetric_strict_compile_setup_failure")), use_cce=False, compile=True, compile_mode="strict", gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
-        strict_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), parity_lengths_data, args=strict_args)
-        strict_trainer.save_model = mark("asymmetric_strict_compile_setup_failure_final")
-        strict_trainer.train()
-    except RuntimeError as exc:
-        return str(exc)
-    finally:
-        mx.compile = real_compile
-    return ""
-asymmetric_strict_setup_error = asymmetric_strict_compile_setup_failure_message()
 def non_compile_runtime_error_message():
     mx.random.seed(792)
     error_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "non_compile_runtime_error")), use_cce=False, compile=True, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential")
@@ -434,9 +309,13 @@ payload = {
     "loop_step": int(loop_trainer._global_step),
     "loop_compile_enabled": bool(result["compile_enabled"]),
     "loop_compile_scope": result["compile_scope"],
+    "loop_compile_fallback": bool(result["compile_fallback"]),
+    "loop_compile_fallback_reason": result["compile_fallback_reason"],
     "loop_text_eval_rows": list(loop_trainer.model.eval_first_tokens),
+    "loop_eval_metrics": result["eval_metrics"],
     "loop_eval_loss": float(loop_trainer._last_eval_metrics["eval_loss"]),
     "loop_eval_reference_loss": loop_eval_reference_loss,
+    "loop_host_rank_map": result["distributed_host_rank_map"],
     "param_sum": float(param_sum.item()),
     "loop_main": bool(result["distributed_is_main_process"]),
     "response_rows": response_rows,
@@ -456,17 +335,10 @@ payload = {
     "ddp_eager_tokens": int(ddp_eager_result["trained_tokens"]),
     "ddp_compile_tokens": int(ddp_compile_result["trained_tokens"]),
     "strict_error": strict_error,
-    "strict_setup_error": strict_setup_error,
     "best_effort_compile_enabled": bool(best_effort_fallback_result["compile_enabled"]),
     "best_effort_compile_scope": best_effort_fallback_result["compile_scope"],
-    "best_effort_setup_compile_enabled": bool(best_effort_setup_fallback_result["compile_enabled"]),
-    "best_effort_setup_compile_scope": best_effort_setup_fallback_result["compile_scope"],
-    "asymmetric_compile_enabled": bool(asymmetric_fallback_result["compile_enabled"]),
-    "asymmetric_compile_scope": asymmetric_fallback_result["compile_scope"],
-    "asymmetric_setup_compile_enabled": bool(asymmetric_setup_fallback_result["compile_enabled"]),
-    "asymmetric_setup_compile_scope": asymmetric_setup_fallback_result["compile_scope"],
-    "stochastic_fallback_parity": stochastic_fallback_parity,
-    "asymmetric_strict_setup_error": asymmetric_strict_setup_error,
+    "best_effort_compile_fallback": bool(best_effort_fallback_result["compile_fallback"]),
+    "best_effort_compile_fallback_reason": best_effort_fallback_result["compile_fallback_reason"],
     "non_compile_error": non_compile_error,
     "asymmetric_data_error": asymmetric_data_error,
     "zero_token_error": zero_token_error,
@@ -522,10 +394,17 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert [rank["loop_step"] for rank in ranks] == [1, 1]
     assert [rank["loop_compile_enabled"] for rank in ranks] == [True, True]
     assert [rank["loop_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert [rank["loop_compile_fallback"] for rank in ranks] == [False, False]
+    assert [rank["loop_compile_fallback_reason"] for rank in ranks] == ["", ""]
     assert [rank["loop_text_eval_rows"] for rank in ranks] == [[10, 12], [11, 0]]
+    assert ranks[0]["loop_eval_metrics"]["eval_loss"] == pytest.approx(ranks[0]["loop_eval_loss"], abs=1e-6)
+    assert ranks[1]["loop_eval_metrics"]["eval_loss"] == pytest.approx(ranks[1]["loop_eval_loss"], abs=1e-6)
     assert ranks[0]["loop_eval_loss"] == pytest.approx(ranks[1]["loop_eval_loss"], abs=1e-6)
     assert ranks[0]["loop_eval_loss"] == pytest.approx(ranks[0]["loop_eval_reference_loss"], abs=1e-6)
     assert ranks[1]["loop_eval_loss"] == pytest.approx(ranks[1]["loop_eval_reference_loss"], abs=1e-6)
+    assert ranks[0]["loop_host_rank_map"] == ranks[1]["loop_host_rank_map"]
+    assert [entry["rank"] for entry in ranks[0]["loop_host_rank_map"]] == [0, 1]
+    assert all(entry["hostname"] for entry in ranks[0]["loop_host_rank_map"])
     assert abs(ranks[0]["param_sum"] - ranks[1]["param_sum"]) < 1e-5
     assert [rank["response_rows"] for rank in ranks] == [[[10], [12], [14], [16]], [[11], [13], [15], [17]]]
     assert [rank["stream_step"] for rank in ranks] == [1, 1]
@@ -548,23 +427,10 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert [rank["ddp_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
     assert [rank["ddp_eager_tokens"] for rank in ranks] == [rank["ddp_compile_tokens"] for rank in ranks]
     assert all("runtime fallback is disabled" in rank["strict_error"] for rank in ranks)
-    assert all("runtime fallback is disabled" in rank["strict_setup_error"] for rank in ranks)
     assert [rank["best_effort_compile_enabled"] for rank in ranks] == [False, False]
     assert [rank["best_effort_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
-    assert [rank["best_effort_setup_compile_enabled"] for rank in ranks] == [False, False]
-    assert [rank["best_effort_setup_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
-    assert [rank["asymmetric_compile_enabled"] for rank in ranks] == [False, False]
-    assert [rank["asymmetric_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
-    assert [rank["asymmetric_setup_compile_enabled"] for rank in ranks] == [False, False]
-    assert [rank["asymmetric_setup_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
-    assert [rank["stochastic_fallback_parity"]["fallback_compile_enabled"] for rank in ranks] == [False, False]
-    assert [rank["stochastic_fallback_parity"]["fallback_compile_scope"] for rank in ranks] == ["fallback_eager", "fallback_eager"]
-    for rank in ranks:
-        assert rank["stochastic_fallback_parity"]["fallback_losses"] == pytest.approx(rank["stochastic_fallback_parity"]["eager_losses"], abs=1e-6)
-        assert rank["stochastic_fallback_parity"]["param_delta"] < 1e-5
-        assert rank["stochastic_fallback_parity"]["fallback_tokens"] == rank["stochastic_fallback_parity"]["eager_tokens"]
-    assert all("runtime fallback is disabled" in rank["asymmetric_strict_setup_error"] for rank in ranks)
-    assert "peer rank" in ranks[1]["asymmetric_strict_setup_error"]
+    assert [rank["best_effort_compile_fallback"] for rank in ranks] == [True, True]
+    assert [rank["best_effort_compile_fallback_reason"] for rank in ranks] == ["runtime_error", "runtime_error"]
     assert all("eval side failure from model" in rank["non_compile_error"] for rank in ranks)
     assert all("runtime fallback is disabled" not in rank["non_compile_error"] for rank in ranks)
     assert all("fetching training batch" in rank["asymmetric_data_error"] for rank in ranks)

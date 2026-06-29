@@ -32,6 +32,10 @@ import torch
 def _install_shim():
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
+    import sys
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
 
 
 # ---------------------------------------------------------------------------
