@@ -2544,7 +2544,8 @@ def quantize_gguf(
     # override doesn't leak into other tensors containing "ffn_down".
     _display_quant_type = quant_type
     _extra_flags = ""
-    if str(quant_type).strip().lower() == "q2_k_l":
+    _is_q2_k_l_preset = str(quant_type).strip().lower() == "q2_k_l"
+    if _is_q2_k_l_preset:
         _extra_flags = (
             '--tensor-type "\\.ffn_down_exps=Q3_K" '
             '--tensor-type "\\.ffn_down=Q3_K" '
@@ -2566,7 +2567,7 @@ def quantize_gguf(
 
     if print_output:
         print(f"Unsloth: Quantizing to {_display_quant_type}...")
-        if _extra_flags:
+        if _is_q2_k_l_preset:
             print(
                 "Unsloth: Expanding Q2_K_L preset "
                 "(q2_k base, .ffn_down_exps=Q3_K + .ffn_down=Q3_K, "

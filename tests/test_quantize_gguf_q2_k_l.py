@@ -341,3 +341,27 @@ def test_imatrix_windows_quotes_metacharacters(tmp_path, monkeypatch):
 
     cmd = captured["cmd"]
     assert f'--imatrix "{imat}"' in cmd, f"imatrix path must be double-quoted on Windows: {cmd!r}"
+
+
+def test_imatrix_quant_does_not_log_q2_k_l_preset(tmp_path, capsys, monkeypatch):
+    """An imatrix makes _extra_flags non-empty; the preset log must still be gated on q2_k_l only."""
+
+    llama_cpp = _load_llama_cpp_module()
+    _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    imat = tmp_path / "imatrix.dat"
+    imat.write_bytes(b"\x00")
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="iq2_xxs",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=True,
+        imatrix=str(imat),
+    )
+
+    out = capsys.readouterr().out
+    assert "Quantizing to iq2_xxs" in out, out
+    assert "Expanding Q2_K_L preset" not in out, f"imatrix quant must not claim Q2_K_L expansion: {out!r}"
