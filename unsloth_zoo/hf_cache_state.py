@@ -270,26 +270,34 @@ def _is_weight_shard_index(name: str) -> bool:
 
 
 def _weight_shard_index_complete(index_path: Path) -> bool:
-    """True if every shard a HF weight index (``model.safetensors.index.json`` /
-    ``pytorch_model.bin.index.json``) lists is present next to the index. An unreadable
-    or non-sharded index is treated as satisfied (nothing extra to verify), so this only
-    ever rejects an index whose shards are demonstrably missing on disk."""
+    """True only if every shard a HF weight index (``model.safetensors.index.json`` /
+    ``pytorch_model.bin.index.json``) lists is present next to the index.
+
+    Fail-CLOSED: an unreadable / truncated index, a non-dict payload, a missing or non-dict
+    ``weight_map``, or an empty shard set all return False. This function feeds the fast-path
+    completeness gate, where a malformed index proves nothing -- treating it as complete would let
+    the in-process load skip the protective child and then fail (or fetch over Xet) on a truncated
+    index, so the safe direction is to defer such an index to the watched ``snapshot_download``
+    child. Only an index whose every listed shard is demonstrably on disk returns True."""
     import json
 
     try:
         with open(index_path, "r", encoding = "utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return True
+        return False
     weight_map = data.get("weight_map") if isinstance(data, dict) else None
     if not isinstance(weight_map, dict):
-        return True
+        return False
     # weight_map values are filenames relative to the index file's own directory. They come from
     # arbitrary JSON: a non-string (e.g. list/dict) value is both unhashable -- so it would break
     # set() -- and invalid for ``base / shard``, so filter to strings BEFORE de-duplicating rather
-    # than crash (consistent with the fail-open parse handling above).
+    # than crash.
+    shards = {s for s in weight_map.values() if isinstance(s, str)}
+    if not shards:
+        return False  # an empty / all-non-string weight_map cannot prove a complete shard set
     base = index_path.parent
-    for shard in {s for s in weight_map.values() if isinstance(s, str)}:
+    for shard in shards:
         try:
             if not (base / shard).exists():
                 return False
@@ -457,11 +465,21 @@ def request_can_include_weights(
     return any(_pattern_can_select_weight(pat) for pat in allow_patterns)
 
 
-def _canonical_root_weights_complete(snapshot_dir: Path, entries: list) -> bool:
+def _canonical_root_weights_complete(
+    snapshot_dir: Path, entries: list, ignore_patterns: "Optional[list]" = None
+) -> bool:
     """True iff the snapshot holds a complete canonical ROOT model weight set: a root
     ``model.safetensors`` / ``pytorch_model.bin`` single file, OR a root weight-shard index whose
     every listed shard is present. Numbered shard files without a valid index, or weights that live
-    only in a subfolder, do NOT count -- those are deferred to the watched child."""
+    only in a subfolder, do NOT count -- those are deferred to the watched child.
+
+    A root weight (or weight-shard index) whose FORMAT the request's ignore filter drops does NOT
+    count: a stale ``pytorch_model.bin`` under ``ignore=['*.bin']`` is not proof that the
+    safetensors weights an in-process load (e.g. ``use_safetensors=True``) will actually read are on
+    disk, so it must not let the fast path skip the protective child and then hang fetching the real
+    weight over Xet. The surviving-format check uses a representative weight name per format, so a
+    ``*.bin`` ignore also discards a ``pytorch_model.bin.index.json`` (whose ``.json`` sidecar name
+    would otherwise slip past the filter)."""
     root_files: set = set()
     root_indices: list = []
     for entry in entries:
@@ -476,12 +494,28 @@ def _canonical_root_weights_complete(snapshot_dir: Path, entries: list) -> bool:
                 root_indices.append(entry)
         elif _safe_is_file(entry):
             root_files.add(entry.name)
-    # Sharded: a canonical root index whose every listed shard is on disk.
-    for index_entry in root_indices:
-        if _weight_shard_index_complete(index_entry):
+
+    def _format_kept(weight_name: str) -> bool:
+        # The weight format an in-process load reads from *weight_name* must survive the request's
+        # ignore filter; otherwise the file is a stale artifact for an excluded format and proves
+        # nothing about what the load will fetch.
+        if not ignore_patterns:
             return True
-    # Single-file canonical weight.
-    return any(name in root_files for name in _CANONICAL_SINGLE_WEIGHTS)
+        return bool(_filter_paths([weight_name], None, ignore_patterns))
+
+    # Sharded: a canonical root index whose format is kept and whose every listed shard is on disk.
+    for index_entry in root_indices:
+        fmt_probe = (
+            "model.safetensors"
+            if ".safetensors.index." in index_entry.name
+            else "pytorch_model.bin"
+        )
+        if _format_kept(fmt_probe) and _weight_shard_index_complete(index_entry):
+            return True
+    # Single-file canonical weight (the file itself must survive the ignore filter).
+    return any(
+        name in root_files and _format_kept(name) for name in _CANONICAL_SINGLE_WEIGHTS
+    )
 
 
 def snapshot_dir_is_complete(
@@ -528,8 +562,9 @@ def snapshot_dir_is_complete(
     # 3. A dangling symlink = an interrupted blob (missing or still .incomplete) -> not complete.
     if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False
-    # 4. Canonical root weights present and complete.
-    return _canonical_root_weights_complete(snapshot_dir, entries)
+    # 4. Canonical root weights present and complete (a weight whose format the request ignores
+    #    does not count -- see _canonical_root_weights_complete).
+    return _canonical_root_weights_complete(snapshot_dir, entries, ignore_patterns)
 
 
 def requested_named_files_present(

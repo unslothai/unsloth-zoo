@@ -472,6 +472,10 @@ _DETERMINISTIC_ERROR_NAMES = frozenset({
     "DisabledRepoError",
     "LocalEntryNotFoundError",
     "BadRequestError",
+    # A malformed repo id / revision fails identically over either transport (it never reaches the
+    # network), so surface it with its real type instead of a generic RuntimeError or a pointless
+    # HTTP retry.
+    "HFValidationError",
 })
 # Substrings that mark a transient transport failure (hf_xet / CAS error, timeout, reset,
 # HTTP 5xx / 429) that disabling Xet and retrying over HTTP may recover.
@@ -662,6 +666,7 @@ def _download_child_entry(
     # Test-only fault injection (never set in production): stall the Xet attempt
     # so the watchdog + HTTP fallback can be exercised against a real repo.
     if not disable_xet and os.environ.get("UNSLOTH_HF_XET_FORCE_STALL") == "1":
+        _stall_fh = None
         try:
             from huggingface_hub.constants import HF_HUB_CACHE
 
@@ -673,8 +678,15 @@ def _download_child_entry(
             repo_dir_name = f"{repo_type or 'model'}s--" + repo_id.replace("/", "--")
             blobs = os.path.join(cache_root, repo_dir_name, "blobs")
             os.makedirs(blobs, exist_ok = True)
-            with open(os.path.join(blobs, "xet-force-stall.incomplete"), "wb") as fh:
-                fh.write(b"\0" * 4096)
+            # Hold the fake partial OPEN for the whole stall. The snapshot watchdog finds it by
+            # filename (has_active_incomplete_blobs), but the single-file watchdog
+            # (watch_new_partials_only) counts ONLY partials this child PID holds open via
+            # _child_open_incomplete_blobs -- a closed file there is ignored and the stall never
+            # trips. Keeping the fd open lets BOTH modes see it. The handle is bound to a local so
+            # it stays open across the sleep below.
+            _stall_fh = open(os.path.join(blobs, "xet-force-stall.incomplete"), "wb")
+            _stall_fh.write(b"\0" * 4096)
+            _stall_fh.flush()
         except OSError:
             pass
         while True:
@@ -1026,7 +1038,12 @@ def _download_result_usable(
     weight at all (HF handed back a stale config-only snapshot on an offline / timed-out request).
     LENIENT otherwise -- a finished diffusers / variant / either-format download passes, and a named
     file simply absent from the repo is not treated as missing -- so a good download is never failed
-    and re-looped into a ``DownloadStallError``."""
+    and re-looped into a ``DownloadStallError``.
+
+    The no-weight rejection is scoped to an UNPATTERNED model request (``allow_patterns is None``),
+    which is the only shape that should always yield a weight. A patterned request is trusted: the
+    caller scoped it, so a weightless result is taken as intended (e.g. ``allow_patterns=['tokenizer*']``
+    legitimately returns no weight) rather than failed into a spurious ``DownloadStallError``."""
     if snapshot_has_requested_broken_symlinks(
         snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         repo_type = repo_type,
@@ -1034,6 +1051,7 @@ def _download_result_usable(
         return False
     if (
         repo_type in (None, "model")
+        and allow_patterns is None
         and request_can_include_weights(allow_patterns, ignore_patterns)
         and not _has_any_weight(snapshot_dir)
     ):

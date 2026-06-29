@@ -2194,3 +2194,80 @@ def test_pre_download_partial_ignore_does_not_skip_config_only(tmp_path):
     assert xf._cache_can_skip_download(
         snap, repo_type = "model", allow_patterns = None,
         ignore_patterns = ["*.safetensors", "*.bin"]) is False
+
+
+# ---------------------------------------------------------------------------
+# Review-round regression guards (10-reviewer findings)
+# ---------------------------------------------------------------------------
+
+def test_gate_rejects_malformed_shard_index(tmp_path):
+    """Finding 2 (over-accept): a truncated / non-dict / empty weight-shard index must NOT read as
+    complete. _weight_shard_index_complete is fail-CLOSED so the fast path defers a malformed index
+    to the watched child rather than skipping it and failing the in-process load on the bad index."""
+    snap, blob = _mk_snapshot(tmp_path, "malidx")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text("{not valid json")
+    assert hcs.snapshot_dir_is_complete(snap) is False
+    # Empty weight_map proves nothing.
+    snap2, blob2 = _mk_snapshot(tmp_path, "emptyidx")
+    (snap2 / "model-00001-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
+    assert hcs.snapshot_dir_is_complete(snap2) is False
+    # weight_map present but not a dict.
+    snap3, blob3 = _mk_snapshot(tmp_path, "listidx")
+    (snap3 / "model.safetensors.index.json").write_text(json.dumps({"weight_map": ["a", "b"]}))
+    assert hcs._weight_shard_index_complete(snap3 / "model.safetensors.index.json") is False
+
+
+def test_gate_ignored_canonical_weight_does_not_prove_complete(tmp_path):
+    """Finding 3 (over-accept): a stale canonical weight whose FORMAT the request ignores must not
+    count as proof of completeness. ignore=['*.bin'] with only a pytorch_model.bin on disk (no
+    safetensors) defers to the child, so a use_safetensors load cannot silently fetch over Xet."""
+    snap, blob = _mk_snapshot(tmp_path, "ignbin")
+    (snap / "config.json").write_text("{}")
+    (snap / "pytorch_model.bin").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.bin"]) is False
+    # Without the ignore, the present .bin is what a default load reads -> complete.
+    assert hcs.snapshot_dir_is_complete(snap) is True
+    # A .bin shard index is also discarded when *.bin is ignored (its .json sidecar would slip the
+    # raw name filter, but the format probe catches it).
+    snap2, blob2 = _mk_snapshot(tmp_path, "ignbinshard")
+    (snap2 / "pytorch_model-00001-of-00001.bin").symlink_to(blob2)
+    (snap2 / "pytorch_model.bin.index.json").write_text(
+        json.dumps({"weight_map": {"a": "pytorch_model-00001-of-00001.bin"}}))
+    assert hcs.snapshot_dir_is_complete(snap2, ignore_patterns = ["*.bin"]) is False
+    assert hcs.snapshot_dir_is_complete(snap2) is True
+    # A safetensors warm survives an *.bin ignore (the common bare from_pretrained case).
+    snap3, blob3 = _mk_snapshot(tmp_path, "stignbin")
+    (snap3 / "config.json").write_text("{}")
+    (snap3 / "model.safetensors").symlink_to(blob3)
+    assert hcs.snapshot_dir_is_complete(snap3, ignore_patterns = ["*.bin"]) is True
+
+
+def test_post_download_accepts_weightless_patterned_result(tmp_path):
+    """Finding 1 (over-reject): a genuinely weightless PATTERNED result (e.g. allow=['tokenizer*'])
+    must be accepted post-download -- the caller scoped it, so 'no weight' is intended, not a stale
+    config-only snapshot. Rejecting it would loop into a spurious DownloadStallError on a good
+    download. The no-weight rejection stays in force for an UNPATTERNED model warm."""
+    snap, _ = _mk_snapshot(tmp_path, "tokglob")
+    (snap / "tokenizer.json").write_text("{}")
+    (snap / "tokenizer_config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["tokenizer*"], ignore_patterns = None) is True
+    # An unpatterned model warm with no weight is still rejected (stale config-only snapshot).
+    cfg, _ = _mk_snapshot(tmp_path, "cfgonly")
+    (cfg / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        cfg, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_hfvalidationerror_type_preserved_across_spawn():
+    """Finding 4: a malformed repo id fails identically over either transport, so HFValidationError is
+    deterministic (not retried) and its TYPE is reconstructed across the spawn boundary instead of
+    degrading to a generic RuntimeError."""
+    assert "HFValidationError" in xf._DETERMINISTIC_ERROR_NAMES
+    cls = xf._resolve_exception_class("HFValidationError")
+    assert cls is not None and issubclass(cls, BaseException)
+    inst = xf._instantiate_preserving_type(cls, "HFValidationError: bad repo id")
+    assert type(inst).__name__ == "HFValidationError"
+    assert xf._is_retryable_download_error(inst) is False
