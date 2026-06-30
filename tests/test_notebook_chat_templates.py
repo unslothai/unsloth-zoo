@@ -7,13 +7,17 @@ plain multi-turn conversation AND a reasoning conversation (final assistant turn
 carries "<think>...</think>answer"). The reasoning probe is what catches markers
 that bake in an injected empty think block and so miss the trained turn.
 
+The model list is discovered dynamically from a notebooks checkout (git clone, or
+UNSLOTH_NOTEBOOKS_DIR), so a newly added notebook is picked up automatically; the
+pinned notebook_models.json is unioned in as a fallback so coverage never shrinks.
+
 This is a network/integration test and is OFF by default. Enable it with
     UNSLOTH_TEST_NOTEBOOK_MODELS=1 pytest tests/test_notebook_chat_templates.py
 Tokenizers are fetched config-only and cached; set UNSLOTH_NOTEBOOK_TOK_CACHE to
 reuse an existing cache directory. Models that 404/gate/need a newer transformers,
 or whose template legitimately has no atomic role markers, are skipped, not failed.
 """
-import os, sys, json, tempfile
+import os, sys, json, re, glob, tempfile, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # import the in-tree unsloth_zoo
@@ -22,6 +26,65 @@ from unsloth_zoo.dataset_utils import get_chat_template_parts, train_on_response
 ENABLED = os.environ.get("UNSLOTH_TEST_NOTEBOOK_MODELS", "") not in ("", "0", "false")
 CACHE = os.environ.get("UNSLOTH_NOTEBOOK_TOK_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_nb_tok"))
 ALLOW_PATTERNS = ["*.json", "*.model", "tokenizer*", "merges*", "vocab*", "*.jinja", "*.txt"]
+NOTEBOOKS_REPO = "https://github.com/unslothai/notebooks"
+
+# Dynamically discover every model named in the notebooks so a newly added notebook
+# is covered automatically. A few hard cases (templated names, non-conversational
+# repos) are intentionally dropped.
+_MODEL_RE = re.compile(r"""(?:model_name\s*=\s*|from_pretrained\(\s*)["']([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)["']""")
+_SUFFIX = ["-unsloth-bnb-4bit", "-bnb-4bit", "-unsloth", "-FP8-Block", "-FP8", "-BF16", "-GGUF"]
+_DROP = ("embedding", "minilm", "mpnet", "bge-", "modernbert", "whisper", "outetts", "llasa",
+         "spark-tts", "csm-", "orpheus", "ocr", "latex", "radiology", "diffusion", "gte-",
+         "ultrafeedback", "gsm8k", "multilingual-thinking", "openmathreasoning", "mobile-actions",
+         "instruction_following", "/repo", "all-minilm", "functiongemma", "snac")
+
+
+def _norm(rid):
+    for s in _SUFFIX:
+        if rid.endswith(s): rid = rid[:-len(s)]
+    return rid
+
+
+def _scan_notebooks(root):
+    out = set()
+    files = glob.glob(os.path.join(root, "nb", "*.ipynb")) or \
+        glob.glob(os.path.join(root, "**", "*.ipynb"), recursive=True)
+    for f in files:
+        try:
+            nb = json.load(open(f))
+        except Exception:
+            continue
+        src = "\n".join("".join(c.get("source", [])) for c in nb.get("cells", []) if c.get("cell_type") == "code")
+        for m in _MODEL_RE.findall(src):
+            n = _norm(m)
+            if "/" not in n or n.startswith("./"):
+                continue
+            if any(s in n.lower() for s in _DROP):
+                continue
+            out.add(n)
+    return out
+
+
+def _models():
+    """Dynamically extract model names from a notebooks checkout; union with the
+    pinned fixture so coverage never shrinks and new notebooks are auto-covered."""
+    fixture = set(json.load(open(os.path.join(HERE, "notebook_models.json"))))
+    discovered = set()
+    env_dir = os.environ.get("UNSLOTH_NOTEBOOKS_DIR")
+    if env_dir and os.path.isdir(env_dir):
+        discovered = _scan_notebooks(env_dir)
+    elif ENABLED:
+        clone = os.path.join(CACHE, "notebooks_repo")
+        if not os.path.isdir(os.path.join(clone, ".git")):
+            try:
+                subprocess.run(["git", "clone", "--depth", "1", NOTEBOOKS_REPO, clone],
+                               check=True, capture_output=True)
+            except Exception:
+                clone = None
+        if clone and os.path.isdir(clone):
+            discovered = _scan_notebooks(clone)
+    return sorted(fixture | discovered)
+
 
 USERS = ["Zebra question alpha", "Quokka inquiry bravo"]
 ASSTS = ["Penguin answer delta", "Dolphin reply echo"]
@@ -30,10 +93,6 @@ PLAIN = [{"role": "user", "content": USERS[0]}, {"role": "assistant", "content":
 # Reasoning probe: the final assistant turn carries a think block + answer.
 REASON = [{"role": "user", "content": "Reason user one"},
           {"role": "assistant", "content": "<think>HIDDENREASON</think>VISIBLEANSWER"}]
-
-
-def _models():
-    return json.load(open(os.path.join(HERE, "notebook_models.json")))
 
 
 def _download(repo):
