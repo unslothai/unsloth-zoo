@@ -542,13 +542,17 @@ def _load_mlx_lm_distributed(
 
                 local_files = set()
                 for key, _value in tree_flatten(model.parameters()):
-                    file_name = weight_index.get(key)
-                    if file_name is None:
-                        raise ValueError(
-                            "Unsloth: MLX pipeline distributed loading is only "
-                            "supported for converted MLX models with indexed weights."
-                        )
-                    local_files.add(file_name)
+                    for indexed_key in _mlx_pipeline_index_keys_for_parameter(
+                        key,
+                        weight_index,
+                    ):
+                        file_name = weight_index.get(indexed_key)
+                        if file_name is None:
+                            raise ValueError(
+                                "Unsloth: MLX pipeline distributed loading is only "
+                                "supported for converted MLX models with indexed weights."
+                            )
+                        local_files.add(file_name)
 
         if mode == "pipeline":
             _download(model_name, revision=revision, allow_patterns=sorted(local_files))
@@ -620,6 +624,17 @@ def _resolve_distributed_runtime_quantization(
         "sharding is unsupported; use an mlx-community *-4bit/*-8bit "
         "repo or load without quantized load flags."
     )
+
+
+def _mlx_pipeline_index_keys_for_parameter(key, weight_index):
+    yield key
+    if not key.endswith(".weight"):
+        return
+    prefix = key[:-len(".weight")]
+    for suffix in (".scales", ".biases", ".bias"):
+        sibling = f"{prefix}{suffix}"
+        if sibling in weight_index:
+            yield sibling
 
 
 def _load_mlx_vlm_with_extra_weight_filter(
