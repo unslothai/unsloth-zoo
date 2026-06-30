@@ -1048,13 +1048,20 @@ def grpo_accumulated_loss(
                         _pack_ok = True
                         _pack_use = True
                     else:
-                        unwrapped_model._unsloth_seq_packing_grad_unsafe_T = (
-                            _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
-                        )
                         _pack_use = False
-                        if _pack_ok is None and _pack_T <= _pack_maxseg + 8:
-                            # failed at a small T (no LongRoPE story) -> backend ignores packing.
+                        if _pack_diff >= 1.5:
+                            # large mismatch = cross-sample contamination: this model's attention does
+                            # not honor the block-diagonal packed mask (seen on some MoE / custom-
+                            # attention models), so disable packing entirely and stop paying the
+                            # verification cost on later batches.
                             unwrapped_model._unsloth_seq_packing_grad_ok = False
+                        else:
+                            # moderate mismatch -> more likely a length-boundary effect (e.g. a
+                            # LongRoPE short/long cache switch): mark this length region unsafe but keep
+                            # packing available for smaller shapes.
+                            unwrapped_model._unsloth_seq_packing_grad_unsafe_T = (
+                                _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
+                            )
                         if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
                             print(f"[Unsloth] GRPO seq-packing (grad) fell back at T={_pack_T} (diff={_pack_diff:.3f})", flush = True)
         except Exception as _pack_err:
