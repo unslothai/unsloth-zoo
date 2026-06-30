@@ -2540,6 +2540,17 @@ def _flatten_mlx_chat_template_ids(value):
     return list(value)
 
 
+def _flatten_mlx_chat_template_field(value, field_name):
+    """Flatten one field from tokenizer chat-template output."""
+    if isinstance(value, Mapping):
+        value = value[field_name]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if len(value) > 0 and isinstance(value[0], list):
+        value = value[0]
+    return list(value)
+
+
 def _apply_mlx_chat_template_ids(tokenizer, messages, **kwargs):
     """Tokenize messages through apply_chat_template with a HF-compatible fallback."""
     try:
@@ -2553,6 +2564,93 @@ def _apply_mlx_chat_template_ids(tokenizer, messages, **kwargs):
         )
 
 
+def _apply_mlx_chat_template_dict(tokenizer, messages, **kwargs):
+    """Tokenize messages through apply_chat_template and preserve returned masks."""
+    try:
+        value = tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        if kwargs.get("return_assistant_tokens_mask"):
+            raise
+        kwargs.pop("return_assistant_tokens_mask", None)
+        kwargs.pop("return_dict", None)
+        value = tokenizer.apply_chat_template(messages, **kwargs)
+    if isinstance(value, Mapping):
+        return value
+    return {"input_ids": value}
+
+
+def _apply_mlx_text_label_masks(input_ids, *, completion_mask=None, assistant_mask=None):
+    """Build labels from input_ids, applying completion then assistant masks."""
+    labels = list(input_ids)
+    if completion_mask is not None:
+        labels = [
+            int(label) if int(mask) != 0 else -100
+            for label, mask in zip(labels, completion_mask)
+        ]
+    if assistant_mask is not None:
+        labels = [
+            int(label) if int(mask) != 0 else -100
+            for label, mask in zip(labels, assistant_mask)
+        ]
+    return labels
+
+
+def _validate_mlx_assistant_mask(input_ids, assistant_mask, *, source):
+    """Validate one assistant mask and mirror TRL's no-assistant-token error."""
+    if len(assistant_mask) != len(input_ids):
+        raise ValueError(
+            f"Unsloth MLX: {source} assistant_masks must match input_ids length."
+        )
+    if not any(int(mask) == 1 for mask in assistant_mask):
+        raise RuntimeError(
+            "You're using `assistant_only_loss=True`, but at least one example has "
+            "no assistant tokens. This usually means the tokenizer's chat template "
+            "doesn't generate assistant masks — it may be missing the "
+            "`{% generation %}` keyword. Please check the template and ensure "
+            "it's correctly configured to support assistant masking."
+        )
+
+
+def _is_mlx_sft_conversational_value(value):
+    """Return True for ChatML values accepted by SFT assistant-only loss."""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and isinstance(value[0], Mapping)
+        and "role" in value[0]
+        and "content" in value[0]
+    )
+
+
+def _is_mlx_sft_conversational_row(item):
+    """Return whether one row can support SFT assistant-only loss."""
+    if _is_mlx_sft_conversational_value(item):
+        return True
+    if not isinstance(item, Mapping):
+        return False
+    if "prompt" in item or "completion" in item:
+        return (
+            _is_mlx_sft_conversational_value(item.get("prompt"))
+            and _is_mlx_sft_conversational_value(item.get("completion"))
+        )
+    for key in ("prompt", "chosen", "rejected", "completion", "messages"):
+        if _is_mlx_sft_conversational_value(item.get(key)):
+            return True
+    return False
+
+
+def _validate_mlx_text_assistant_only_dataset(dataset):
+    """Reject first-sample non-conversational datasets like SFTTrainer."""
+    for item in dataset:
+        if not _is_mlx_sft_conversational_row(item):
+            raise ValueError(
+                "You set `assistant_only_loss=True`, but the dataset is not "
+                "conversational. This option is only supported for "
+                "conversational datasets."
+            )
+        return
+
+
 def _tokenize_mlx_conversational_prompt_completion(
     tokenizer,
     prompt,
@@ -2560,6 +2658,8 @@ def _tokenize_mlx_conversational_prompt_completion(
     *,
     tools=None,
     chat_template_kwargs=None,
+    assistant_only_loss=False,
+    completion_only_loss=None,
 ):
     """Tokenize conversational prompt/completion rows using TRL's split."""
     prompt_messages = _normalize_mlx_messages(prompt, is_vlm=False)
@@ -2573,23 +2673,48 @@ def _tokenize_mlx_conversational_prompt_completion(
         tools=tools,
         **template_kwargs,
     )
-    input_ids = _apply_mlx_chat_template_ids(
+    prompt_completion_processed = _apply_mlx_chat_template_dict(
         tokenizer,
         prompt_messages + completion_messages,
         tokenize=True,
         return_dict=True,
+        return_assistant_tokens_mask=bool(assistant_only_loss),
         tools=tools,
         **template_kwargs,
     )
+    input_ids = _flatten_mlx_chat_template_field(
+        prompt_completion_processed, "input_ids"
+    )
+    assistant_mask = None
+    if "assistant_masks" in prompt_completion_processed:
+        assistant_mask = _flatten_mlx_chat_template_field(
+            prompt_completion_processed, "assistant_masks"
+        )
+        _validate_mlx_assistant_mask(
+            input_ids, assistant_mask, source="conversational"
+        )
+    elif assistant_only_loss:
+        _validate_mlx_assistant_mask(
+            input_ids, [0] * len(input_ids), source="conversational"
+        )
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
         prompt_ids,
         input_ids,
         append_eos=False,
+        completion_only_loss=completion_only_loss,
+        assistant_mask=assistant_mask,
     )
 
 
-def _tokenize_mlx_prompt_completion(tokenizer, prompt, completion, *, append_eos=True):
+def _tokenize_mlx_prompt_completion(
+    tokenizer,
+    prompt,
+    completion,
+    *,
+    append_eos=True,
+    completion_only_loss=None,
+):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
     prompt_ids = list(encode_mlx_text(tokenizer, prompt))
     input_ids = list(encode_mlx_text(tokenizer, prompt + completion))
@@ -2598,10 +2723,19 @@ def _tokenize_mlx_prompt_completion(tokenizer, prompt, completion, *, append_eos
         prompt_ids,
         input_ids,
         append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
     )
 
 
-def _mask_mlx_prompt_completion_labels(tokenizer, prompt_ids, input_ids, *, append_eos=True):
+def _mask_mlx_prompt_completion_labels(
+    tokenizer,
+    prompt_ids,
+    input_ids,
+    *,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_mask=None,
+):
     """Build labels by masking the prompt prefix from prompt/completion ids."""
     if input_ids[:len(prompt_ids)] != prompt_ids:
         warnings.warn(
@@ -2613,8 +2747,17 @@ def _mask_mlx_prompt_completion_labels(tokenizer, prompt_ids, input_ids, *, appe
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
     if eos_id is not None and (not input_ids or input_ids[-1] != eos_id):
         input_ids.append(int(eos_id))
-    labels = list(input_ids)
-    labels[:min(len(prompt_ids), len(labels))] = [-100] * min(len(prompt_ids), len(labels))
+        if assistant_mask is not None:
+            assistant_mask.append(0)
+    completion_mask = None
+    if completion_only_loss is not False:
+        completion_mask = [0] * min(len(prompt_ids), len(input_ids))
+        completion_mask.extend([1] * (len(input_ids) - len(completion_mask)))
+    labels = _apply_mlx_text_label_masks(
+        input_ids,
+        completion_mask=completion_mask,
+        assistant_mask=assistant_mask,
+    )
     return input_ids, labels
 
 
@@ -2624,6 +2767,8 @@ def _tokenize_mlx_prompt_completion_row(
     *,
     dataset_text_field="text",
     append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
 ):
     """Tokenize one text prompt/completion row, including conversational rows."""
     if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
@@ -2637,6 +2782,8 @@ def _tokenize_mlx_prompt_completion_row(
             completion,
             tools=item.get("tools"),
             chat_template_kwargs=item.get("chat_template_kwargs"),
+            assistant_only_loss=assistant_only_loss,
+            completion_only_loss=completion_only_loss,
         )
     pair = _render_mlx_prompt_completion_texts(
         tokenizer,
@@ -2651,7 +2798,46 @@ def _tokenize_mlx_prompt_completion_row(
         pair[0],
         pair[1],
         append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
     )
+
+
+def _tokenize_mlx_assistant_messages_row(tokenizer, item):
+    """Tokenize one conversational row with chat-template assistant masks."""
+    messages = (
+        item if _looks_like_mlx_chat_messages(item)
+        else _select_mlx_messages_or_raw(item)
+    )
+    if messages is item and not _looks_like_mlx_chat_messages(messages):
+        return None
+    messages = _normalize_mlx_messages(messages, is_vlm=False)
+    if isinstance(messages, str):
+        return None
+    template_kwargs = (
+        dict(item.get("chat_template_kwargs", {}))
+        if isinstance(item, Mapping) else {}
+    )
+    processed = _apply_mlx_chat_template_dict(
+        tokenizer,
+        messages,
+        return_dict=True,
+        tokenize=True,
+        return_assistant_tokens_mask=True,
+        tools=item.get("tools") if isinstance(item, Mapping) else None,
+        **template_kwargs,
+    )
+    input_ids = _flatten_mlx_chat_template_field(processed, "input_ids")
+    assistant_mask = None
+    if "assistant_masks" in processed:
+        assistant_mask = _flatten_mlx_chat_template_field(processed, "assistant_masks")
+        _validate_mlx_assistant_mask(input_ids, assistant_mask, source="text")
+    else:
+        _validate_mlx_assistant_mask(input_ids, [0] * len(input_ids), source="text")
+    labels = (
+        _apply_mlx_text_label_masks(input_ids, assistant_mask=assistant_mask)
+        if assistant_mask is not None else None
+    )
+    return input_ids, labels
 
 
 def _prepare_labeled_text_dataset(
@@ -2660,8 +2846,10 @@ def _prepare_labeled_text_dataset(
     dataset_text_field="text",
     formatting_func=None,
     append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
 ):
-    """Materialize prompt/completion rows into token ids plus completion labels."""
+    """Materialize text rows that need explicit labels into token ids."""
     formatted = []
     for item in dataset:
         source = formatting_func(item) if formatting_func is not None else item
@@ -2674,7 +2862,17 @@ def _prepare_labeled_text_dataset(
                 row,
                 dataset_text_field=dataset_text_field,
                 append_eos=append_eos,
+                completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
             )
+            if tokenized is None and assistant_only_loss:
+                tokenized = _tokenize_mlx_assistant_messages_row(tokenizer, row)
+            if tokenized is None and assistant_only_loss:
+                raise ValueError(
+                    "You set `assistant_only_loss=True`, but the dataset is not "
+                    "conversational. This option is only supported for "
+                    "conversational datasets."
+                )
             if tokenized is not None and tokenized[0]:
                 formatted.append(tokenized)
     return formatted
@@ -2706,7 +2904,12 @@ def _resolve_mlx_pretokenized_completion_only_loss(dataset, completion_only_loss
     return False
 
 
-def _tokenize_mlx_pretokenized_row(item, *, completion_only_loss=None):
+def _tokenize_mlx_pretokenized_row(
+    item,
+    *,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+):
     """Read input_ids plus optional labels/completion_mask from one text row."""
     if not isinstance(item, Mapping) or "input_ids" not in item:
         return None
@@ -2735,6 +2938,29 @@ def _tokenize_mlx_pretokenized_row(item, *, completion_only_loss=None):
             for label, mask in zip(labels, completion_mask)
         ]
 
+    assistant_masks = item.get("assistant_masks")
+    if assistant_only_loss and assistant_masks is None:
+        raise ValueError(
+            "Unsloth MLX: pretokenized assistant_only_loss=True rows must "
+            "include 'assistant_masks'."
+        )
+
+    # Match TRL's collator: pretokenized assistant_masks are labels metadata.
+    if assistant_masks is not None:
+        assistant_mask = _coerce_mlx_token_list(
+            assistant_masks, "assistant_masks"
+        )
+        if len(assistant_mask) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX: pretokenized 'assistant_masks' must match "
+                "'input_ids' length."
+            )
+        labels = labels if labels is not None else list(input_ids)
+        labels = _apply_mlx_text_label_masks(
+            labels,
+            assistant_mask=assistant_mask,
+        )
+
     return input_ids, labels
 
 
@@ -2742,6 +2968,7 @@ def _prepare_pretokenized_text_dataset(
     dataset,
     *,
     completion_only_loss=None,
+    assistant_only_loss=False,
 ):
     """Materialize pretokenized text rows and report whether input_ids appeared."""
     completion_only_loss = _resolve_mlx_pretokenized_completion_only_loss(
@@ -2760,6 +2987,7 @@ def _prepare_pretokenized_text_dataset(
             tokenized = _tokenize_mlx_pretokenized_row(
                 row,
                 completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
             )
             if tokenized is not None:
                 saw_pretokenized = True
@@ -3962,7 +4190,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
                    model_name=None, model_type=None, append_eos=True,
-                   completion_only_loss=None):
+                   completion_only_loss=None, assistant_only_loss=False):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -3984,6 +4212,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
         completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
     )
     if saw_pretokenized:
         return _create_tokenized_text_batches(
@@ -3994,8 +4223,10 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             seed=seed,
             pad_id=_mlx_text_pad_id(tokenizer),
         )
+    if assistant_only_loss:
+        _validate_mlx_text_assistant_only_dataset(dataset)
 
-    if completion_only_loss is not False:
+    if completion_only_loss is not False or assistant_only_loss:
         normalize_mlx_chat_template(
             tokenizer,
             chat_template=chat_template,
@@ -4010,6 +4241,8 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
             append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
         )
         if tokenized:
             return _create_labeled_text_batches(
@@ -4018,6 +4251,12 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                 max_seq_length,
                 num_batches=num_batches,
                 seed=seed,
+                pad_id=_mlx_text_pad_id(tokenizer),
+            )
+        if assistant_only_loss:
+            raise ValueError(
+                "Unsloth MLX: assistant_only_loss=True produced no "
+                "assistant-labeled text rows."
             )
 
     ds = _prepare_dataset(
@@ -4066,7 +4305,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
                            num_epochs=None, append_eos=True,
-                           completion_only_loss=None):
+                           completion_only_loss=None, assistant_only_loss=False):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
@@ -4079,6 +4318,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     tokenized_pairs, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
         completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
     )
     if saw_pretokenized:
         for ids, labels in tokenized_pairs:
@@ -4087,8 +4327,10 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             if len(ids) >= 2:
                 tokenized.append((ids, labels))
         labeled = True
+    elif assistant_only_loss:
+        _validate_mlx_text_assistant_only_dataset(dataset)
 
-    if not labeled and completion_only_loss is not False:
+    if not labeled and (completion_only_loss is not False or assistant_only_loss):
         normalize_mlx_chat_template(
             tokenizer,
             chat_template=chat_template,
@@ -4103,6 +4345,8 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
             append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
         ):
             ids = list(ids)[:max_seq_length]
             labels = list(labels)[:max_seq_length]
@@ -4206,7 +4450,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
                              model_name=None, model_type=None,
-                             append_eos=True, completion_only_loss=None):
+                             append_eos=True, completion_only_loss=None,
+                             assistant_only_loss=False):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
@@ -4222,6 +4467,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
         completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
     )
     if saw_pretokenized:
         yield from _iterate_tokenized_text_batches(
@@ -4233,8 +4479,10 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             pad_id=_mlx_text_pad_id(tokenizer),
         )
         return
+    if assistant_only_loss:
+        _validate_mlx_text_assistant_only_dataset(dataset)
 
-    if completion_only_loss is not False:
+    if completion_only_loss is not False or assistant_only_loss:
         normalize_mlx_chat_template(
             tokenizer,
             chat_template=chat_template,
@@ -4249,6 +4497,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
             append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
         )
         if tokenized:
             yield from _iterate_labeled_text_batches(
@@ -4257,8 +4507,14 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                 max_seq_length,
                 seed=seed,
                 loop=True,
+                pad_id=_mlx_text_pad_id(tokenizer),
             )
             return
+        if assistant_only_loss:
+            raise ValueError(
+                "Unsloth MLX: assistant_only_loss=True produced no "
+                "assistant-labeled text rows."
+            )
         if completion_only_loss is True:
             raise ValueError(
                 "Unsloth MLX: text completion_only_loss=True requires "

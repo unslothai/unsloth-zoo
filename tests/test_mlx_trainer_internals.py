@@ -64,6 +64,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "dataset_order",
         "preserve_dataset_order",
         "completion_only_loss",
+        "assistant_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
 
@@ -71,6 +72,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
 def test_mlx_training_config_exposes_completion_only_loss():
     from unsloth_zoo.mlx.trainer import (
         MLXTrainingConfig,
+        _text_assistant_only_loss_arg,
         _text_completion_only_loss_arg,
     )
 
@@ -83,6 +85,10 @@ def test_mlx_training_config_exposes_completion_only_loss():
     assert _text_completion_only_loss_arg(
         MLXTrainingConfig(train_on_completions=True)
     ) is True
+    assert _text_assistant_only_loss_arg(
+        MLXTrainingConfig(assistant_only_loss=True)
+    ) is True
+    assert _text_assistant_only_loss_arg(MLXTrainingConfig()) is False
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
@@ -422,6 +428,152 @@ def test_text_conversational_prompt_completion_uses_generation_boundary():
     assert labels.tolist() == [[-100, -100, -100, -100, -100, -100, 3, 4]]
 
 
+class _AssistantMaskTokenizer:
+    chat_template = "{{ messages }}"
+    eos_token_id = None
+    pad_token_id = 7
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        return_dict=False,
+        return_assistant_tokens_mask=False,
+        tools=None,
+        add_generation_prompt=False,
+        **_kwargs,
+    ):
+        ids = []
+        masks = []
+        if tools:
+            ids.append(30)
+            masks.append(0)
+        for message in messages:
+            is_assistant = message["role"] == "assistant"
+            ids.append(20 if is_assistant else 10)
+            masks.append(0)
+            ids.extend(int(part) for part in message["content"].split())
+            masks.extend([1 if is_assistant else 0] * len(message["content"].split()))
+        output = {"input_ids": ids}
+        if return_assistant_tokens_mask:
+            output["assistant_masks"] = masks
+        return output if return_dict else ids
+
+
+class _NoAssistantMaskTokenizer(_AssistantMaskTokenizer):
+    def apply_chat_template(self, *args, **kwargs):
+        kwargs["return_assistant_tokens_mask"] = False
+        return super().apply_chat_template(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "extra_kwargs"),
+    [
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2 3"},
+                    ],
+                }
+            ],
+            {},
+        ),
+        (
+            [
+                {
+                    "prompt": [{"role": "user", "content": "1"}],
+                    "completion": [{"role": "assistant", "content": "2 3"}],
+                }
+            ],
+            {"append_eos": False},
+        ),
+    ],
+)
+def test_text_assistant_only_loss_masks_non_assistant_tokens(dataset, extra_kwargs):
+    from unsloth_zoo.mlx.utils import create_batches
+
+    batch, _, labels = create_batches(
+        dataset=dataset,
+        tokenizer=_AssistantMaskTokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        assistant_only_loss=True,
+        completion_only_loss=False,
+        **extra_kwargs,
+    )[0]
+
+    assert batch.tolist() == [[10, 1, 20, 2, 3]]
+    assert labels.tolist() == [[-100, -100, -100, 2, 3]]
+
+
+@pytest.mark.parametrize(
+    ("dataset", "tokenizer", "match"),
+    [
+        ([{"prompt": "Question: ", "completion": "Answer"}], _AssistantMaskTokenizer(), "not conversational"),
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                },
+                {"text": "plain text"},
+            ],
+            _AssistantMaskTokenizer(),
+            "not conversational",
+        ),
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                }
+            ],
+            _NoAssistantMaskTokenizer(),
+            "no assistant tokens",
+        ),
+        ([{"input_ids": [1, 2, 3]}], types.SimpleNamespace(), "assistant_masks"),
+    ],
+)
+def test_text_assistant_only_loss_rejects_unsupported_inputs(dataset, tokenizer, match):
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        create_batches(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            batch_size=1,
+            max_seq_length=8,
+            assistant_only_loss=True,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_assistant_masks_build_labels():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    _, _, labels = create_batches(
+        dataset=[
+            {
+                "input_ids": [1, 2, 3, 4],
+                "assistant_masks": [0, 1, 0, 1],
+            }
+        ],
+        tokenizer=types.SimpleNamespace(),
+        batch_size=1,
+        max_seq_length=8,
+        assistant_only_loss=True,
+        completion_only_loss=False,
+    )[0]
+
+    assert labels.tolist() == [[-100, 2, -100, 4]]
+
+
 def test_text_completion_probe_keeps_one_shot_iterables_reusable():
     from unsloth_zoo.mlx.utils import _ensure_reiterable_text_dataset
     def rows():
@@ -562,11 +714,13 @@ def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeyp
     MLXTrainer, trainer = _make_mlx_text_trainer(
         max_steps=1,
         completion_only_loss=True,
+        assistant_only_loss=True,
     )
     batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
 
     assert batches == [("batch", "lengths", "labels")]
     assert received["completion_only_loss"] is True
+    assert received["assistant_only_loss"] is True
 
 
 def test_text_prepare_data_ordered_batches_emit_completion_only_labels():

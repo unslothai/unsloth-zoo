@@ -145,6 +145,11 @@ def _text_completion_only_loss_arg(args):
     return None
 
 
+def _text_assistant_only_loss_arg(args):
+    """Resolve SFT-compatible assistant-only loss setting."""
+    return bool(getattr(args, "assistant_only_loss", False))
+
+
 def _normalize_mlx_optimizer_name(name):
     opt_name = str(name or "adamw").strip().lower()
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
@@ -533,6 +538,7 @@ class MLXTrainingConfig:
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
     completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
+    assistant_only_loss: bool = False  # Mask non-assistant tokens with chat-template assistant masks
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
 
@@ -1618,6 +1624,7 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        text_assistant_only_loss = _text_assistant_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
@@ -1658,6 +1665,7 @@ class MLXTrainer:
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
                         completion_only_loss=text_completion_only_loss,
+                        assistant_only_loss=text_assistant_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2048,6 +2056,7 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
         if is_vlm:
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -2123,6 +2132,7 @@ class MLXTrainer:
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
                     completion_only_loss=text_completion_only_loss,
+                    assistant_only_loss=text_assistant_only_loss,
                 )
             else:
                 batch_kwargs = dict(
@@ -2138,6 +2148,7 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    assistant_only_loss=text_assistant_only_loss,
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)
