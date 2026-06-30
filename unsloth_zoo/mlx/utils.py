@@ -3206,7 +3206,8 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
                        num_epochs=None, completion_only_loss=None,
-                       image_size=None, comm_group=None):
+                       image_size=None, comm_group=None,
+                       distributed_pad_mode="cycle"):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -3264,8 +3265,8 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
         if dataset_order in (None, "default") and (
             num_batches is not None or epoch_idx > 0
         ):
-            np.random.seed(base_seed + epoch_idx)
-            np.random.shuffle(indices)
+            rng = np.random.RandomState(base_seed + epoch_idx)
+            rng.shuffle(indices)
         return indices
 
     indices = _epoch_indices(epoch)
@@ -3278,20 +3279,32 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             seen = 0
             indices = _epoch_indices(epoch)
 
-        bi = indices[seen : seen + global_batch_size]
-        seen += len(bi)
-        if not bi:
+        global_indices = indices[seen : seen + global_batch_size]
+        seen += len(global_indices)
+        if not global_indices:
             break
         bi = _rank_slice_distributed_batch(
-            bi,
+            global_indices,
             batch_size,
             comm_group=comm_group,
             pad_source=indices,
+            pad_mode=distributed_pad_mode,
         )
         if not bi:
             break
+        empty_rows = [idx is None for idx in bi]
+        if any(empty_rows):
+            pad_idx = next((idx for idx in bi if idx is not None), None)
+            if pad_idx is None:
+                pad_idx = global_indices[0]
+            batch_items = [
+                _item(pad_idx if idx is None else idx)
+                for idx in bi
+            ]
+        else:
+            batch_items = [_item(idx) for idx in bi]
         batch_dict = _build_response_masked_vlm_batch(
-            [_item(idx) for idx in bi],
+            batch_items,
             processor,
             config,
             max_seq_length,
@@ -3301,6 +3314,10 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
         )
+        if any(empty_rows):
+            batch_dict = _mask_empty_vlm_padding_rows(
+                batch_dict, empty_rows, processor=processor,
+            )
         batch_list.append(batch_dict)
 
     if total_removed > 0:
@@ -3475,20 +3492,18 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         batch_formatting_func = None if response_mask_fn is not None else formatting_func
         while True:
             pending = []
-            pad_source = []
             yielded = False
             for item in dataset:
                 item = _filter_stream_item(item)
                 if item is None:
                     continue
-                pad_source.append(item)
                 pending.append(item)
                 if len(pending) >= global_batch_size:
                     local_items = _rank_slice_distributed_batch(
                         pending,
                         batch_size,
                         comm_group=comm_group,
-                        pad_source=pad_source,
+                        pad_source=pending,
                     )
                     if local_items:
                         yielded = True
@@ -3499,7 +3514,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     pending,
                     batch_size,
                     comm_group=comm_group,
-                    pad_source=pad_source,
+                    pad_source=pending,
                 )
                 if local_items:
                     yielded = True
@@ -3643,6 +3658,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             seed=seed,
             comm_group=comm_group,
             distributed_pad_mode=distributed_pad_mode,
+            tokenizer=tokenizer,
         )
     else:
         batch_pairs = []
@@ -3778,6 +3794,32 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
     )
 
 
+def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
+    """Mask synthetic VLM eval padding rows so they do not affect metrics."""
+    if not any(empty_rows):
+        return batch_dict
+    row_mask = np.asarray(empty_rows, dtype=bool)
+    pad_id = _vlm_pad_token_id(processor)
+    for key, fill_value in (
+        ("input_ids", pad_id),
+        ("attention_mask", 0),
+        ("labels", -100),
+    ):
+        value = batch_dict.get(key)
+        if value is None or not hasattr(value, "shape"):
+            continue
+        if int(value.shape[0]) != int(row_mask.shape[0]):
+            continue
+        dtype = np.int64 if key == "labels" else np.int32
+        arr = np.asarray(
+            value.tolist() if hasattr(value, "tolist") else value,
+            dtype=dtype,
+        )
+        arr[row_mask] = fill_value
+        batch_dict[key] = mx.array(arr)
+    return batch_dict
+
+
 def _create_distributed_text_batches(
     dataset,
     batch_size,
@@ -3787,6 +3829,7 @@ def _create_distributed_text_batches(
     seed=42,
     comm_group=None,
     distributed_pad_mode="cycle",
+    tokenizer=None,
 ):
     """Distributed variant of mlx-lm's length-sorted text batch iterator."""
     from mlx_lm.tuner.datasets import CacheDataset
@@ -3804,12 +3847,11 @@ def _create_distributed_text_batches(
         idx[i : i + global_batch_size]
         for i in range(0, len(idx), global_batch_size)
     ]
-    if seed:
-        np.random.seed(seed)
+    rng = np.random.RandomState(_normalize_seed(seed))
 
     batch_pairs = []
     while True:
-        indices = np.random.permutation(len(batch_idx))
+        indices = rng.permutation(len(batch_idx))
         for i in indices:
             local_idx = _rank_slice_distributed_batch(
                 batch_idx[i],
@@ -3824,7 +3866,7 @@ def _create_distributed_text_batches(
             batch_pairs.append(
                 _make_text_batch_from_items(
                     batch,
-                    tokenizer=None,
+                    tokenizer=tokenizer,
                     max_seq_length=max_seq_length,
                 )
             )
@@ -3991,7 +4033,6 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
 
     def _yield_local_batch(chunk, pad_source):
-        pad_tokenizer = None if dataset_order in (None, "default") else tokenizer
         local_items = _rank_slice_distributed_batch(
             chunk,
             batch_size,
@@ -4001,7 +4042,7 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
         if local_items:
             return _make_text_batch_from_items(
                 local_items,
-                pad_tokenizer,
+                tokenizer,
                 max_seq_length,
             )
         return None
@@ -4062,7 +4103,6 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
 
     while True:
         pending = []
-        pad_source = []
         yielded = False
         for row in _iter_tokenized_text_rows(
             dataset,
@@ -4072,15 +4112,14 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
             append_eos=append_eos,
         ):
             pending.append(row)
-            pad_source.append(row)
             if len(pending) >= global_batch_size:
-                batch = _yield_local_batch(pending, pad_source)
+                batch = _yield_local_batch(pending, pending)
                 if batch is not None:
                     yielded = True
                     yield batch
                 pending = []
         if pending:
-            batch = _yield_local_batch(pending, pad_source)
+            batch = _yield_local_batch(pending, pending)
             if batch is not None:
                 yielded = True
                 yield batch

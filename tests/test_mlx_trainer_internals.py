@@ -30,12 +30,31 @@ import torch
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
-    from mlx_simulation import simulate_mlx_on_torch
-    simulate_mlx_on_torch()
     import sys
+    shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+    real_mlx_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+    }
+    from mlx_simulation import simulate_mlx_on_torch
+    from mlx_simulation.mlx_stub import _MLXFinder
+    simulate_mlx_on_torch()
     for name in list(sys.modules):
         if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
             sys.modules.pop(name, None)
+    yield
+    for name in list(sys.modules):
+        if (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        ):
+            sys.modules.pop(name, None)
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path
+        if not isinstance(finder, _MLXFinder)
+    ]
+    sys.modules.update(real_mlx_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +159,36 @@ def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
         "distributed_rank": 1,
         "distributed_is_main_process": False,
     }
+
+
+def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
+    import numpy as np
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    dataset = [([5], 0), ([6, 7, 8], 0)]
+    np.random.seed(123)
+    expected = np.random.random(3)
+    np.random.seed(123)
+
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert np.random.random(3) == pytest.approx(expected)
+    rows = batches[0][0].tolist()
+    assert rows[0][1:] == [99] * (len(rows[0]) - 1)
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])

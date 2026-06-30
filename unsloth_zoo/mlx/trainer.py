@@ -1200,13 +1200,7 @@ class MLXTrainer:
             hashlib.blake2b(str(path).encode("utf-8"), digest_size=7).digest(),
             "little",
         )
-        local_digest = mx.array(digest, dtype=mx.int64)
-        min_digest = mx.distributed.all_min(
-            local_digest, group=world, stream=mx.cpu,
-        )
-        max_digest = mx.distributed.all_max(
-            local_digest, group=world, stream=mx.cpu,
-        )
+        digests = self._distributed_rank_vector(digest, as_int=True)
         required = (
             "adapters.safetensors",
             "optimizer_state.safetensors",
@@ -1219,8 +1213,8 @@ class MLXTrainer:
         missing_total = self._distributed_all_sum(
             mx.array(missing, dtype=mx.int32), stream=mx.cpu,
         )
-        mx.eval(min_digest, max_digest, missing_total)
-        if int(min_digest.item()) != int(max_digest.item()):
+        mx.eval(missing_total)
+        if any(int(item) != digest for item in digests):
             raise RuntimeError(
                 "Unsloth MLX DDP: all ranks must use the same "
                 "resume_from_checkpoint path."
@@ -1591,18 +1585,26 @@ class MLXTrainer:
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        failed = False
+        error = None
 
-        for batch_data in eval_batches:
-            if self._distributed_should_stop():
-                break
-            if is_vlm:
-                loss, ntoks = loss_fn(self.model, batch_data)
-            else:
-                batch, lengths, labels = batch_data
-                loss, ntoks = loss_fn(self.model, batch, lengths, labels)
-            all_losses += loss * ntoks
-            ntokens += ntoks
-            mx.eval(all_losses, ntokens)
+        try:
+            for batch_data in eval_batches:
+                if self._distributed_should_stop():
+                    break
+                if is_vlm:
+                    loss, ntoks = loss_fn(self.model, batch_data)
+                else:
+                    batch, lengths, labels = batch_data
+                    loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                all_losses += loss * ntoks
+                ntokens += ntoks
+                mx.eval(all_losses, ntokens)
+        except Exception as exc:
+            failed = True
+            error = exc
+
+        self._raise_distributed_failure(failed, "evaluation", error)
 
         return all_losses, ntokens
 
@@ -2632,6 +2634,7 @@ class MLXTrainer:
                             formatting_func=self.formatting_func,
                             completion_only_loss=text_completion_only_loss,
                             comm_group=self.distributed_world,
+                            distributed_pad_mode="empty",
                         )
                     return create_batches(
                         dataset=eval_dataset,
@@ -3050,39 +3053,57 @@ class MLXTrainer:
                             self.stop_requested = True
 
             # Checkpointing
-            if (
-                is_main_process
-                and args.save_steps > 0
+            checkpoint_due = (
+                args.save_steps > 0
                 and current_step % args.save_steps == 0
-            ):
-                ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                try:
-                    save_trainable_adapters(model, ckpt_dir)
-                except ValueError as e:
-                    _main_print(f"  Unsloth: skipped checkpoint ({e})")
-                else:
-                    # Also write optimizer + trainer state so resume_from_checkpoint
-                    # can restore Adam moments, step counter, and loss history.
-                    # Adapter save was successful -- treat the extra writes as
-                    # best-effort: log on failure but don't undo the adapter save.
-                    checkpoint_complete = False
+            )
+            if checkpoint_due:
+                checkpoint_error = None
+                if is_main_process:
+                    ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
                     try:
-                        save_optimizer_state(optimizer, ckpt_dir)
-                        save_trainer_state(
-                            {
-                                "global_step": current_step,
-                                "train_loss_history": list(self._train_loss_history),
-                            },
-                            ckpt_dir,
-                        )
-                        checkpoint_complete = True
+                        try:
+                            save_trainable_adapters(model, ckpt_dir)
+                        except ValueError as e:
+                            _main_print(f"  Unsloth: skipped checkpoint ({e})")
+                        else:
+                            # Also write optimizer + trainer state so
+                            # resume_from_checkpoint can restore Adam moments,
+                            # step counter, and loss history. Adapter save was
+                            # successful -- treat the extra writes as
+                            # best-effort: log on failure but don't undo the
+                            # adapter save.
+                            checkpoint_complete = False
+                            try:
+                                save_optimizer_state(optimizer, ckpt_dir)
+                                save_trainer_state(
+                                    {
+                                        "global_step": current_step,
+                                        "train_loss_history": list(
+                                            self._train_loss_history
+                                        ),
+                                    },
+                                    ckpt_dir,
+                                )
+                                checkpoint_complete = True
+                            except Exception as e:
+                                _main_print(
+                                    "  Unsloth: checkpoint saved without "
+                                    f"resume state ({e})"
+                                )
+                            _main_print(f"  Saved checkpoint to {ckpt_dir}")
+                            if checkpoint_complete:
+                                _prune_stale_checkpoints(
+                                    args.output_dir,
+                                    args.save_total_limit,
+                                )
                     except Exception as e:
-                        _main_print(
-                            f"  Unsloth: checkpoint saved without resume state ({e})"
-                        )
-                    _main_print(f"  Saved checkpoint to {ckpt_dir}")
-                    if checkpoint_complete:
-                        _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
+                        checkpoint_error = e
+                self._raise_distributed_failure(
+                    checkpoint_error is not None,
+                    "checkpoint save",
+                    checkpoint_error,
+                )
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
@@ -3119,13 +3140,21 @@ class MLXTrainer:
         )
 
         # Honor the documented save_steps=0 contract: save at end of training.
+        final_save_error = None
         if is_main_process:
             try:
                 self.save_model()
             except ValueError as e:
                 _main_print(f"Unsloth: skipped final save ({e})")
+            except Exception as e:
+                final_save_error = e
             else:
                 _main_print(f"Unsloth: Saved final adapters to {args.output_dir}")
+        self._raise_distributed_failure(
+            final_save_error is not None,
+            "final save",
+            final_save_error,
+        )
 
         return MLXTrainOutput({
             "train_loss": avg_loss,
@@ -3494,7 +3523,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     Returns:
         List of (batch, lengths, labels) tuples where:
-        - batch: mx.array (BS, padded_len) — input_ids padded with 0
+        - batch: mx.array (BS, padded_len) — input_ids padded with pad_token_id
         - lengths: mx.array of shape (BS, 2) holding [1, actual_len]
           per sequence. Right-half-open `[start, end)` matching the
           exclusive-end loss masks in `utils.py:360`, `:393`, `:429`,
@@ -3510,6 +3539,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         is_vlm=False,
         strict=False,
     )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    pad_id = 0 if pad_id is None else int(pad_id)
 
     # 1. Gather all text strings (serial, fast)
     all_texts = []
@@ -3640,14 +3671,14 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             batch_lengths = []
             for item in batch_items:
                 if item is None:
-                    batch_ids.append([0] * padded_len)
+                    batch_ids.append([pad_id] * padded_len)
                     batch_labels.append([-100] * padded_len)
                     batch_lengths.append([0, 0])
                     continue
                 ids, lbls = item
                 L = min(len(ids), padded_len)
                 pad_len = padded_len - L
-                batch_ids.append(ids[:L] + [0] * pad_len)
+                batch_ids.append(ids[:L] + [pad_id] * pad_len)
                 batch_labels.append(lbls[:L] + [-100] * pad_len)
                 # [start, end) matches loss masks in utils.py:360/:393/:429/:439.
                 batch_lengths.append([1, L])
