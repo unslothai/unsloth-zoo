@@ -365,3 +365,49 @@ def test_imatrix_quant_does_not_log_q2_k_l_preset(tmp_path, capsys, monkeypatch)
     out = capsys.readouterr().out
     assert "Quantizing to iq2_xxs" in out, out
     assert "Expanding Q2_K_L preset" not in out, f"imatrix quant must not claim Q2_K_L expansion: {out!r}"
+
+
+def test_imatrix_non_path_value_raises_cleanly(monkeypatch):
+    """A non-path value such as True must raise a clear error, not let os.path.exists() treat the
+    bool as file descriptor 1 and silently emit --imatrix "True"."""
+
+    llama_cpp = _load_llama_cpp_module()
+    _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+    try:
+        llama_cpp.quantize_gguf(
+            input_gguf="/tmp/in.gguf",
+            output_gguf="/tmp/out.gguf",
+            quant_type="iq2_xxs",
+            quantizer_location="/usr/bin/llama-quantize",
+            n_threads=4,
+            print_output=False,
+            imatrix=True,
+        )
+    except FileNotFoundError as exc:
+        assert "True" in str(exc), f"error should name the bogus value: {exc}"
+    else:
+        raise AssertionError("expected FileNotFoundError for a non-path imatrix value")
+
+
+def test_imatrix_path_is_stripped(tmp_path, monkeypatch):
+    """A space-padded imatrix path is trimmed before the existence check and quoting."""
+
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    imat = tmp_path / "imatrix.dat"
+    imat.write_bytes(b"\x00")
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="iq2_xxs",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=False,
+        imatrix=f"  {imat}  ",
+    )
+    cmd = captured["cmd"]
+    assert f"--imatrix {imat}" in cmd or f'--imatrix "{imat}"' in cmd, cmd
+    assert f"  {imat}  " not in cmd, f"padding must be stripped: {cmd!r}"

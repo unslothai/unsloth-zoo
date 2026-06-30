@@ -2556,6 +2556,9 @@ def quantize_gguf(
 
     # An imatrix unlocks the IQ low-bit quants; prepend it (before positional args) and quote.
     if imatrix is not None and str(imatrix).strip() != "":
+        # Normalize to a clean string first: os.path.exists(True) would treat a bool as a file
+        # descriptor, and a space-padded path must be trimmed before the existence check / quoting.
+        imatrix = str(imatrix).strip()
         if not os.path.exists(imatrix):
             raise FileNotFoundError(f"Unsloth: imatrix file `{imatrix}` does not exist.")
         _extra_flags = f"--imatrix {_quote(imatrix)} " + _extra_flags
