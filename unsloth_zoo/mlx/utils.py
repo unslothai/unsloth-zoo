@@ -2687,11 +2687,11 @@ def _ensure_reiterable_text_dataset(dataset):
     return list(dataset)
 
 
-def _create_labeled_text_batch(batch_items, max_seq_length):
+def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
     """Pad token ids and labels for one labeled MLX text batch."""
     lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
     max_length = max(lengths)
-    batch_ids = np.zeros((len(batch_items), max_length), dtype=np.int32)
+    batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
     batch_labels = np.full((len(batch_items), max_length), -100, dtype=np.int64)
     for row_idx, (ids, labels) in enumerate(batch_items):
         length = lengths[row_idx]
@@ -3891,27 +3891,53 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True):
+                           num_epochs=None, append_eos=True,
+                           completion_only_loss=None):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
     """
 
-    ds = _prepare_dataset(
-        dataset, tokenizer, dataset_text_field, formatting_func,
-        chat_template=chat_template,
-        model_name=model_name,
-        model_type=model_type,
-        append_eos=append_eos,
-    )
-
+    labeled = False
     tokenized = []
-    for row in ds:
-        ids = row[0] if isinstance(row, (tuple, list)) else row
-        ids = list(ids)[:max_seq_length]
-        if len(ids) >= 2:
-            tokenized.append(ids)
+    if completion_only_loss is not False:
+        dataset = _ensure_reiterable_text_dataset(dataset)
+        normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        for ids, labels in _prepare_labeled_text_dataset(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+        ):
+            ids = list(ids)[:max_seq_length]
+            labels = list(labels)[:max_seq_length]
+            if len(ids) >= 2:
+                tokenized.append((ids, labels))
+        labeled = bool(tokenized)
+
+    if not labeled:
+        ds = _prepare_dataset(
+            dataset, tokenizer, dataset_text_field, formatting_func,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+        )
+
+        for row in ds:
+            ids = row[0] if isinstance(row, (tuple, list)) else row
+            ids = list(ids)[:max_seq_length]
+            if len(ids) >= 2:
+                tokenized.append(ids)
 
     if not tokenized:
         raise ValueError(
@@ -3960,19 +3986,24 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             seen = target_items
         batch_items = [tokenized[i] for i in chunk]
 
-        max_length = max(len(ids) for ids in batch_items)
+        max_length = max(len(item[0] if labeled else item) for item in batch_items)
         # mlx-lm iterate_batches pad convention; raw 0 only if no pad_token_id.
         _pad_id = getattr(tokenizer, "pad_token_id", None)
         if _pad_id is None:
             _pad_id = 0
         _pad_id = int(_pad_id)
-        batch_ids = []
-        lengths = []
-        for ids in batch_items:
-            length = len(ids)
-            batch_ids.append(ids + [_pad_id] * (max_length - length))
-            lengths.append([0, length])
-        batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
+        if labeled:
+            batch_pairs.append(
+                _create_labeled_text_batch(batch_items, max_seq_length, pad_id=_pad_id)
+            )
+        else:
+            batch_ids = []
+            lengths = []
+            for ids in batch_items:
+                length = len(ids)
+                batch_ids.append(ids + [_pad_id] * (max_length - length))
+                lengths.append([0, length])
+            batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
 
         if num_batches is None and target_items is not None and seen >= target_items:
             break
@@ -3980,6 +4011,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     mx.eval(
         [b for b, lengths, _ in batch_pairs]
         + [lengths for _, lengths, _ in batch_pairs]
+        + [labels for _, _, labels in batch_pairs if labels is not None]
     )
     return batch_pairs
 

@@ -453,12 +453,37 @@ def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeyp
     assert received["completion_only_loss"] is True
 
 
-@pytest.mark.parametrize("config", [{"dataset_order": "sequential"}, {"streaming": True}])
-def test_text_completion_only_loss_rejects_unsupported_text_batch_modes(config):
+def test_text_prepare_data_ordered_batches_emit_completion_only_labels():
     MLXTrainer, trainer = _make_mlx_text_trainer(
         max_steps=1,
         completion_only_loss=True,
-        **config,
+        dataset_order="sequential",
+        per_device_train_batch_size=2,
+    )
+    trainer.tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        pad_token_id=7,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+    trainer.train_dataset = [
+        {"prompt": "1", "completion": " 2"},
+        {"prompt": "3", "completion": " 4 5"},
+    ]
+    batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    batch, _, labels = batches[0]
+    assert batch.tolist() == [[1, 2, 7], [3, 4, 5]]
+    assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+
+def test_text_completion_only_loss_rejects_streaming_batches():
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        streaming=True,
     )
 
     with pytest.raises(ValueError, match="completion_only_loss"):

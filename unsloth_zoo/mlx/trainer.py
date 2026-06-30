@@ -2148,12 +2148,6 @@ class MLXTrainer:
                     getattr(args, "preserve_dataset_order", False)
                     or getattr(args, "dataset_order", "default") != "default"
                 ):
-                    if text_completion_only_loss is not False:
-                        raise ValueError(
-                            "Unsloth MLX: text completion_only_loss is not supported "
-                            "with preserve_dataset_order / dataset_order yet. Use the "
-                            "default dataset order or set completion_only_loss=False."
-                        )
                     text_dataset_order = (
                         "sequential"
                         if getattr(args, "preserve_dataset_order", False)
@@ -2167,6 +2161,7 @@ class MLXTrainer:
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
                         self._prepared_batches_include_epochs = True
+                    batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = create_ordered_batches(**batch_kwargs)
                 else:
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
