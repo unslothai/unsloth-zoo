@@ -557,34 +557,37 @@ def _load_mlx_lm_distributed(
         if mode == "pipeline":
             _download(model_name, revision=revision, allow_patterns=sorted(local_files))
             final_model_path = _mlx_lm_snapshot_view(model_path, weight_files=local_files)
+            cleanup_final_model_path = True
         else:
             _download(model_name, revision=revision)
             final_model_path = model_path
+            cleanup_final_model_path = False
 
-        tokenizer = load_tokenizer(
-            final_model_path,
-            tokenizer_config,
-            eos_token_ids=config.get("eos_token_id", None),
-        )
-        model, _config = load_model(
-            final_model_path,
-            lazy=True,
-            strict=False,
-            model_config=model_config,
-        )
-        _apply_mlx_distributed_sharding(
-            model,
-            pipeline_group=pipeline_group,
-            tensor_group=tensor_group,
-            model_name=model_name,
-        )
-        mx.eval(model.parameters())
+        try:
+            tokenizer = load_tokenizer(
+                final_model_path,
+                tokenizer_config,
+                eos_token_ids=config.get("eos_token_id", None),
+            )
+            model, _config = load_model(
+                final_model_path,
+                lazy=True,
+                strict=False,
+                model_config=model_config,
+            )
+            _apply_mlx_distributed_sharding(
+                model,
+                pipeline_group=pipeline_group,
+                tensor_group=tensor_group,
+                model_name=model_name,
+            )
+            mx.eval(model.parameters())
 
-        if pipeline_group is not None or tensor_group is not None:
-            mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
-
-        if mode == "pipeline":
-            model._unsloth_mlx_distributed_snapshot_view = str(final_model_path)
+            if pipeline_group is not None or tensor_group is not None:
+                mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+        finally:
+            if cleanup_final_model_path:
+                shutil.rmtree(final_model_path, ignore_errors=True)
 
     if want_config:
         return model, tokenizer, config
@@ -3947,6 +3950,7 @@ class FastMLXModel:
             quantize_modules=quantize_modules,
             force_requantize=force_requantize,
         )
+        distributed_requested = _mlx_distributed_requested(pipeline_group, tensor_group)
 
         # Seed mlx random state so construction-time randomness (e.g. runtime
         # quant layer init) is reproducible.
@@ -3959,7 +3963,7 @@ class FastMLXModel:
         try:
             with _temporary_hf_token_env(token):
                 config_allow_patterns = None
-                if _mlx_distributed_requested(pipeline_group, tensor_group):
+                if distributed_requested:
                     config_allow_patterns = _mlx_lm_metadata_allow_patterns()
                 local_path = str(
                     _download(
@@ -3969,6 +3973,8 @@ class FastMLXModel:
                     )
                 )
         except Exception:
+            if distributed_requested:
+                raise
             local_path = None
 
         config_data = {}
