@@ -258,23 +258,30 @@ def get_chat_template_parts(tokenizer):
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
 
-    # A reasoning template may inject an empty paired tag into the generation prompt
-    # (e.g. "<|im_start|>assistant\n<think></think>"). If a real assistant turn that
-    # carries reasoning renders "<think>...</think>" instead, that tag is not part of
-    # the turn and a marker holding it would miss the trained turn. Do not assume this:
-    # re-probe with a reasoning-filled turn of the same tag and drop it only when the
-    # tag is confirmed to be scaffolding (gone from in front of the content). Templates
-    # that always emit the empty tag keep it. Dropping only shortens the marker to the
-    # assistant header, so it can never unmask user content.
-    mt = re.search(r"<([^\s/>]+)>\s*</\1>\s*$", response_part)
-    if mt:
+    # A reasoning template may inject thinking-block scaffolding into the generation
+    # prompt that is NOT present (in that exact form) once a real assistant turn carries
+    # reasoning. Two shapes are seen:
+    #   paired empty tag - "<|im_start|>assistant\n<think></think>" (Qwen3-Thinking)
+    #   lone close tag   - "<|assistant|></think>"                  (GLM-4.x)
+    # In both, a real reasoning turn renders "<think>...</think>answer", so the scaffold
+    # no longer sits right after the header and a marker holding it would miss the turn.
+    # Do not assume this: re-probe with a reasoning-filled turn and drop the scaffold
+    # only when it is confirmed gone from right after the header. Templates that always
+    # emit it keep it. Dropping only shortens the marker to the assistant header, so it
+    # can never unmask user content.
+    mt = re.search(r"<([^\s/>]+)>\s*</\1>\s*$", response_part) or \
+         re.search(r"</([^\s/>]+)>\s*$", response_part)
+    if mt and mt.start() > 0:
         tag = mt.group(1)
-        empty = f"<{tag}></{tag}>"
+        scaffold = response_part[mt.start():]
+        header = response_part[:mt.start()]
         try:
             filled = render([{"role": "user", "content": wrap(U)},
                              {"role": "assistant", "content": wrap(f"<{tag}>rZ9</{tag}>{A}")}], False)
-            if not filled[:filled.rfind(A)].rstrip().endswith(empty):
-                response_part = response_part[:mt.start()]
+            pos = filled.rfind(header)
+            after = filled[pos + len(header):] if pos != -1 else ""
+            if pos != -1 and not after.startswith(scaffold):
+                response_part = header
         except Exception:
             pass
 
