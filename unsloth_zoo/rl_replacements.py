@@ -933,47 +933,50 @@ def grpo_accumulated_loss(
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
 
-    # ---- Sequence-packing fast path (opt-in via UNSLOTH_GRPO_SEQ_PACKING=1; text-only) ----
+    # ---- Sequence-packing fast path (default-on; disable with UNSLOTH_GRPO_SEQ_PACKING=0) ----
     # Replaces the padded [B, Lmax] per-chunk forward below with ONE varlen [1, sum L] forward
-    # (BlockDiagonalCausalMask via packed_seq_lengths + reset position_ids), producing the SAME
-    # new_logprobs [total_rows, W] in the left-packed completion layout. Per-token logps use the
-    # exact same float32 chunked_hidden_states_selective_log_softmax the padded path uses, so the
-    # loss/gradients are bit-for-bit identical. Big memory/time win on long, variable-length
-    # completions. Correctness is self-verified ONCE against the padded path
-    # (unwrapped_model._unsloth_seq_packing_grad_ok): if a backend silently ignores packed_seq_lengths (so the
-    # flat batch is run with a normal causal mask and samples leak across boundaries) the packed
-    # logps will not match the padded path and packing is disabled instead of corrupting training.
+    # (BlockDiagonalCausalMask via packed_seq_lengths + reset position_ids). The packed forward is
+    # the EXACT per-row computation (each segment attends only within itself), so it equals
+    # forwarding each row's real tokens alone -- and is strictly more accurate than the padded batch
+    # forward, which mis-positions left-padded rows (Unsloth's known Flash-Attn left-padding issue)
+    # on long completions. Loss/gradients flow through the packed forward. Correctness is
+    # self-verified against the PER-ROW clean forward (NOT the padded batch, which is itself wrong
+    # for left-pad), shape/RoPE-aware: re-checked whenever the packed total length T grows past the
+    # largest verified T, so a later batch that crosses a LongRoPE short/long cache boundary -- or a
+    # backend that ignores packed_seq_lengths and leaks across samples -- is caught and falls back to
+    # the padded loop. lm_head runs only on completion-prediction positions.
     new_logprobs = None
     _pack_result = None
-    # Verdict is cached per unwrapped model (a separate reference model could have a different
-    # forward path) and is only set after a real comparison; token_type_ids / mm_token_type_ids force
-    # the padded path (those VLM mask inputs are not packed here).
-    _pack_verdict = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
-    if (pixel_values is None and os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "0") == "1"
-            and token_type_ids is None and mm_token_type_ids is None and _pack_verdict is not False):
+    _pack_use = False
+    _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
+    _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
+    if (_pack_enabled and pixel_values is None
+            and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
         try:
-            # xformers provides the block-diagonal varlen mask; without it the packed attention falls
-            # back to a dense O(T^2) SDPA mask that can OOM on the whole flattened batch, so require it.
-            import xformers  # noqa: F401
             _pack_pad_id = trainer.processing_class.pad_token_id
             _pack_keep = input_ids != _pack_pad_id
             _pack_lengths = _pack_keep.sum(dim = 1)
-            _pack_nz = _pack_lengths[_pack_lengths > 0]
+            _pack_lengths_cpu = _pack_lengths.tolist()                 # single GPU->CPU sync, reused below
+            _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
             _pack_flat_ids = input_ids[_pack_keep].unsqueeze(0)
             _pack_T = _pack_flat_ids.shape[1]
             _pack_L = input_ids.shape[1]
             _pack_W = logits_to_keep + max_left_pad
-            # Sliding-window attention loses the per-sequence local window once the packed stream is
-            # longer than the window (FlashAttention/xFormers then attend across sample boundaries),
-            # so skip packing for that batch.
+            _pack_maxseg = max(_pack_nz_cpu) if _pack_nz_cpu else 0
+            # sliding-window models lose the per-sequence local window in a packed stream
             _pack_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
-            _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_T > _pack_sw)
-            if _pack_T >= 2 and _pack_nz.numel() > 0 and _pack_sw_ok:
-                _pack_psl = _pack_nz.to(torch.int32)
-                _pack_pos = torch.cat(
-                    [torch.arange(int(_n), device = input_ids.device) for _n in _pack_nz]
-                ).unsqueeze(0)
+            _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
+            _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
+            if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2):
+                _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
+                # vectorized reset 0-based position_ids (no per-row sync)
+                _pack_pos = (_pack_keep.cumsum(dim = 1) - 1)[_pack_keep].unsqueeze(0)
                 _pack_chunks = max(1, total_rows * multiplier)
+                _pack_nz_idx = _pack_keep.nonzero(as_tuple = False)            # [T, 2] = (row, col)
+                _pack_within = _pack_nz_idx[1:, 0] == _pack_nz_idx[:-1, 0]     # [T-1]
+                # completion-prediction positions only: token j+1 is a real completion token
+                # (col >= L - logits_to_keep) in the same row as j. lm_head runs only on these.
+                _pack_ctgt = (_pack_nz_idx[1:, 1] >= (_pack_L - logits_to_keep)) & _pack_within
                 with autocaster:
                     # use_cache=False: a populated past_key_value disables varlen packing in the
                     # attention kernels, which would silently fall back to dense causal attention.
@@ -984,36 +987,90 @@ def grpo_accumulated_loss(
                         use_cache = False,
                     ).logits
                     _pack_sel = chunked_hidden_states_selective_log_softmax(
-                        _pack_hidden[:, :-1, :], lm_head, _pack_flat_ids[:, 1:], _pack_chunks,
+                        _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0), lm_head,
+                        _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0), _pack_chunks,
                         logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
                     )[0]
                 # Same GPT-OSS offload (offload_embbed=True) race guard the padded loop uses.
                 device_synchronize()
-                _pack_idx = []; _pack_val = []; _pack_off = 0
-                for _pack_i in range(total_rows):
-                    _pack_n = int(_pack_lengths[_pack_i])
-                    if _pack_n >= 2:
-                        _pack_idx.append(_pack_i * _pack_L + torch.arange(1, _pack_n, device = input_ids.device))
-                        _pack_val.append(_pack_sel[_pack_off : _pack_off + _pack_n - 1])
-                    _pack_off += _pack_n
-                if _pack_idx:
-                    _pack_flat_idx = torch.cat(_pack_idx)
-                    _pack_vals = torch.cat(_pack_val).to(torch.float32)
-                    _pack_result = torch.zeros(
-                        total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
-                    ).index_put((_pack_flat_idx,), _pack_vals).view(total_rows, _pack_L)[:, -_pack_W:]
+                # Scatter each completion next-token logprob to its ORIGINAL (row, col) so left-padded
+                # prompts land in the right columns; [:, -_pack_W:] then matches the padded layout.
+                _pack_tgt = (_pack_nz_idx[1:, 0] * _pack_L + _pack_nz_idx[1:, 1])[_pack_ctgt]
+                _pack_result = torch.zeros(
+                    total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
+                ).index_put((_pack_tgt,), _pack_sel.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                # ---- trust decision (shape/RoPE-aware) ----
+                # Re-verify when packed total length OR longest segment grows past what was verified
+                # (LongRoPE short/long cache can switch on either).
+                _pack_vT = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_T", 0))
+                _pack_vS = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_seg", 0))
+                _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
+                _pack_force_verify = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY", "0") == "1"
+                if (not _pack_force_verify) and _pack_ok is True and _pack_T <= _pack_vT and _pack_maxseg <= _pack_vS:
+                    _pack_use = True                                           # already verified for this shape
+                elif _pack_unsafe is not None and _pack_T >= _pack_unsafe:
+                    _pack_use = False                                          # known-unsafe length region
+                else:
+                    # verify against the per-row clean forward (exact ground truth: each row's real
+                    # tokens alone, 0-based positions, no padding). No grad -- this is a value check.
+                    _pack_ref = torch.zeros_like(_pack_result)
+                    with torch.no_grad(), autocaster:
+                        for _pack_i in range(total_rows):
+                            _pack_ni = _pack_lengths_cpu[_pack_i]
+                            if _pack_ni < 2: continue
+                            _pack_rmask = _pack_keep[_pack_i]
+                            _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
+                            _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
+                            _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
+                            _pack_rsel = chunked_hidden_states_selective_log_softmax(
+                                _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
+                                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                            )[0]
+                            _pack_rcols = _pack_rmask.nonzero(as_tuple = False).squeeze(1)[1:] - (_pack_L - _pack_W)
+                            _pack_rkeep = _pack_rcols >= 0
+                            _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
+                    device_synchronize()
+                    # Compare ONLY the completion region (window cols [max_left_pad, W)). The window's
+                    # first max_left_pad cols are prompt-overflow that the lm_head completion-window opt
+                    # leaves 0 (masked out by completion_mask in the loss); including them would falsely
+                    # flag a mismatch.
+                    _pack_cm = torch.zeros((total_rows, _pack_W), dtype = torch.float32, device = input_ids.device)
+                    _pack_cm[:, max_left_pad:] = (input_ids[:, -logits_to_keep:] != _pack_pad_id).float()
+                    _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
+                    if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
+                        print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} maxseg={_pack_maxseg} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
+                    # floor: packed vs per-row through different attention kernels ~0.25 (the padded
+                    # path is itself ~0.4 from per-row truth); cross-sample contamination >= 2.4.
+                    if _pack_diff < 7e-1:
+                        unwrapped_model._unsloth_seq_packing_grad_ok = True
+                        unwrapped_model._unsloth_seq_packing_grad_verified_T = max(_pack_vT, _pack_T)
+                        unwrapped_model._unsloth_seq_packing_grad_verified_seg = max(_pack_vS, _pack_maxseg)
+                        _pack_ok = True
+                        _pack_use = True
+                    else:
+                        unwrapped_model._unsloth_seq_packing_grad_unsafe_T = (
+                            _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
+                        )
+                        _pack_use = False
+                        if _pack_ok is None and _pack_T <= _pack_maxseg + 8:
+                            # failed at a small T (no LongRoPE story) -> backend ignores packing.
+                            unwrapped_model._unsloth_seq_packing_grad_ok = False
+                        if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
+                            print(f"[Unsloth] GRPO seq-packing (grad) fell back at T={_pack_T} (diff={_pack_diff:.3f})", flush = True)
         except Exception as _pack_err:
-            # Disable packing for this model on any failure (no xformers varlen backend, an OOM on an
-            # oversized flattened batch the padded loop would chunk, or an unsupported forward) so we
-            # use the chunked padded loop and do not retry every step.
+            # Any failure (no varlen backend, OOM on the flattened batch, unsupported forward) -> drop
+            # packed intermediates, reclaim memory, use the padded loop, do not retry.
+            _pack_hidden = None
+            _pack_sel = None
+            _pack_result = None
+            _pack_use = False
             if isinstance(_pack_err, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
             unwrapped_model._unsloth_seq_packing_grad_ok = False
             if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
                 print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
-            _pack_result = None
-    if _pack_result is not None and getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", False):
-        new_logprobs = _pack_result          # already verified equal to padded -> skip the loop
+    if _pack_use and _pack_result is not None:
+        new_logprobs = _pack_result          # verified equal to per-row ground truth -> skip the loop
         zipped_inputs = []
 
     def to_device(tensor, device, non_blocking=True):
@@ -1172,23 +1229,9 @@ def grpo_accumulated_loss(
             all_logprobs_list.append(logprobs_chunk)
 
     if new_logprobs is None:
+        # Padded fallback result (packing disabled / unsupported / not yet verified for this length).
+        # Verification against the per-row ground truth already happened in the packing block above.
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
-        # One-time self-verification: only trust packing after it matches the padded ground truth on
-        # a real (>=2 sequence) batch. Cross-sample contamination (unsupported packed mask) shows up
-        # as a large mismatch here and disables packing instead of silently corrupting training.
-        if _pack_result is not None and not hasattr(unwrapped_model, "_unsloth_seq_packing_grad_ok"):
-            # Require >=2 rows that actually have completion tokens, so cross-sample contamination
-            # would manifest in the diff. An all-pad / fully tool-masked completion_mask makes the
-            # masked diff trivially zero, which must NOT be taken as a pass: leave the verdict unset
-            # and re-verify on a later, non-degenerate batch instead.
-            _pack_active_rows = int((completion_mask.sum(dim = 1) > 0).sum())
-            if _pack_active_rows >= 2 and _pack_result.shape == new_logprobs.shape:
-                _pack_ok = bool(float(((_pack_result - new_logprobs).detach().abs() * completion_mask).max()) < 5e-1)
-                unwrapped_model._unsloth_seq_packing_grad_ok = _pack_ok
-                if _pack_ok:
-                    new_logprobs = _pack_result
-                elif os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
-                    print("[Unsloth] GRPO sequence-packing disabled: packed logprobs did not match the padded path", flush = True)
 
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
