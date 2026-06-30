@@ -4002,22 +4002,12 @@ class FastMLXModel:
                         pipeline_group,
                         tensor_group,
                     )
-                    if active_pipeline_group is not None:
+                    if active_pipeline_group is not None or active_tensor_group is not None:
                         raise ValueError(
-                            "Unsloth: MLX pipeline distributed loading for LoRA "
-                            "adapter repos is not supported yet. Use tensor "
-                            "parallelism for this adapter or merge/export it "
-                            "before pipeline distributed inference."
+                            "Unsloth: MLX distributed loading for LoRA adapter "
+                            "repos is not supported yet. Merge/export the adapter "
+                            "into an MLX model before distributed inference."
                         )
-                    if _mlx_distributed_requested(pipeline_group, tensor_group):
-                        with _temporary_hf_token_env(token):
-                            local_path = str(
-                                _download(
-                                    model_name,
-                                    revision=revision,
-                                    allow_patterns=_mlx_lm_adapter_allow_patterns(),
-                                )
-                            )
                     adapter_quant_policy = adapter_cfg.get("base_quantization_policy") or {}
                     adapter_quant_map = (
                         adapter_cfg.get("base_resolved_quantization_map")
