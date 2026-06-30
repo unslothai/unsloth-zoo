@@ -2680,6 +2680,106 @@ def _prepare_labeled_text_dataset(
     return formatted
 
 
+def _coerce_mlx_token_list(value, field_name):
+    """Convert one token-id field from a pretokenized row to a Python list."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Unsloth MLX: pretokenized '{field_name}' must be a sequence.")
+    if value and isinstance(value[0], (list, tuple)):
+        raise ValueError(f"Unsloth MLX: pretokenized '{field_name}' must be one sequence.")
+    return [int(token) for token in value]
+
+
+def _mlx_text_pad_id(tokenizer):
+    """Return the tokenizer pad id used by TRL's text data collator."""
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return int(pad_id) if pad_id is not None else 0
+
+
+def _resolve_mlx_pretokenized_completion_only_loss(dataset, completion_only_loss):
+    """Resolve SFTTrainer's default loss mode from the first raw text row."""
+    if completion_only_loss is not None:
+        return completion_only_loss
+    for item in dataset:
+        return isinstance(item, Mapping) and "prompt" in item and "completion" in item
+    return False
+
+
+def _tokenize_mlx_pretokenized_row(item, *, completion_only_loss=None):
+    """Read input_ids plus optional labels/completion_mask from one text row."""
+    if not isinstance(item, Mapping) or "input_ids" not in item:
+        return None
+
+    input_ids = _coerce_mlx_token_list(item["input_ids"], "input_ids")
+    labels = None
+    if item.get("labels") is not None:
+        labels = _coerce_mlx_token_list(item["labels"], "labels")
+        if len(labels) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX: pretokenized 'labels' must match 'input_ids' length."
+            )
+
+    if completion_only_loss is True and item.get("completion_mask") is not None:
+        completion_mask = _coerce_mlx_token_list(
+            item["completion_mask"], "completion_mask"
+        )
+        if len(completion_mask) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX: pretokenized 'completion_mask' must match "
+                "'input_ids' length."
+            )
+        labels = labels if labels is not None else list(input_ids)
+        labels = [
+            int(label) if int(mask) != 0 else -100
+            for label, mask in zip(labels, completion_mask)
+        ]
+
+    return input_ids, labels
+
+
+def _prepare_pretokenized_text_dataset(
+    dataset,
+    *,
+    completion_only_loss=None,
+):
+    """Materialize pretokenized text rows without re-tokenizing input_ids."""
+    completion_only_loss = _resolve_mlx_pretokenized_completion_only_loss(
+        dataset,
+        completion_only_loss,
+    )
+    formatted = []
+    saw_pretokenized = False
+    saw_other = False
+    for item in dataset:
+        sources = item if (
+            isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
+        ) else [item]
+        for row in sources:
+            tokenized = _tokenize_mlx_pretokenized_row(
+                row,
+                completion_only_loss=completion_only_loss,
+            )
+            if tokenized is not None and tokenized[0]:
+                saw_pretokenized = True
+                formatted.append(tokenized)
+            else:
+                saw_other = True
+    if saw_pretokenized and saw_other:
+        raise ValueError(
+            "Unsloth MLX: pretokenized text datasets with 'input_ids' cannot "
+            "be mixed with rows that need text formatting/tokenization."
+        )
+    if formatted:
+        has_labels = formatted[0][1] is not None
+        if any((labels is not None) != has_labels for _ids, labels in formatted):
+            raise ValueError(
+                "Unsloth MLX: pretokenized rows with labels/completion_mask "
+                "must not be mixed with rows that do not provide labels."
+            )
+    return formatted
+
+
 def _ensure_reiterable_text_dataset(dataset):
     """Materialize one-shot text iterables before probing for labeled rows."""
     if hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
@@ -2687,29 +2787,46 @@ def _ensure_reiterable_text_dataset(dataset):
     return list(dataset)
 
 
-def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
-    """Pad token ids and labels for one labeled MLX text batch."""
+def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
+    """Pad pretokenized ids plus optional labels for one MLX text batch."""
     lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
     max_length = max(lengths)
     batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
-    batch_labels = np.full((len(batch_items), max_length), -100, dtype=np.int64)
+    has_labels = batch_items[0][1] is not None
+    if any((labels is not None) != has_labels for _ids, labels in batch_items):
+        raise ValueError(
+            "Unsloth MLX: pretokenized rows with labels/completion_mask must "
+            "not be batched with rows that do not provide labels."
+        )
+    batch_labels = (
+        np.full((len(batch_items), max_length), -100, dtype=np.int64)
+        if has_labels else None
+    )
     for row_idx, (ids, labels) in enumerate(batch_items):
         length = lengths[row_idx]
         batch_ids[row_idx, :length] = ids[:length]
-        batch_labels[row_idx, :length] = labels[:length]
+        if batch_labels is not None:
+            batch_labels[row_idx, :length] = labels[:length]
     lengths_info = [[0, length] for length in lengths]
-    return mx.array(batch_ids), mx.array(lengths_info), mx.array(batch_labels)
+    labels_array = mx.array(batch_labels) if batch_labels is not None else None
+    return mx.array(batch_ids), mx.array(lengths_info), labels_array
 
 
-def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
-                                 num_batches=None, seed=42):
-    """Batch labeled text rows with mlx-lm's default sorting and shuffle contract."""
-    batch_iter = _iterate_labeled_text_batches(
+def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
+    """Pad token ids and labels for one labeled MLX text batch."""
+    return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
+
+
+def _create_tokenized_text_batches(tokenized, batch_size, max_seq_length,
+                                   num_batches=None, seed=42, pad_id=0):
+    """Batch pretokenized text rows with mlx-lm's sorting and shuffle contract."""
+    batch_iter = _iterate_tokenized_text_batches(
         tokenized,
         batch_size,
         max_seq_length,
         seed=seed,
         loop=(num_batches is not None),
+        pad_id=pad_id,
     )
     batch_pairs = []
     for batch_pair in batch_iter:
@@ -2720,14 +2837,27 @@ def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
     mx.eval(
         [b for b, lengths, labels in batch_pairs]
         + [lengths for _, lengths, labels in batch_pairs]
-        + [labels for _, lengths, labels in batch_pairs]
+        + [labels for _, lengths, labels in batch_pairs if labels is not None]
     )
     return batch_pairs
 
 
-def _iterate_labeled_text_batches(tokenized, batch_size, max_seq_length,
-                                  seed=42, loop=False):
-    """Yield labeled text batches with the same grouping used by materialization."""
+def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                 num_batches=None, seed=42, pad_id=0):
+    """Batch labeled text rows with mlx-lm's default sorting and shuffle contract."""
+    return _create_tokenized_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        pad_id=pad_id,
+    )
+
+
+def _iterate_tokenized_text_batches(tokenized, batch_size, max_seq_length,
+                                    seed=42, loop=False, pad_id=0):
+    """Yield pretokenized text batches with the same grouping used by materialization."""
     if len(tokenized) < batch_size:
         raise ValueError(
             f"Dataset must have at least batch_size={batch_size}"
@@ -2745,9 +2875,24 @@ def _iterate_labeled_text_batches(tokenized, batch_size, max_seq_length,
     while True:
         for batch_group_idx in np.random.permutation(len(batch_idx)):
             batch_items = [tokenized[i] for i in batch_idx[batch_group_idx]]
-            yield _create_labeled_text_batch(batch_items, max_seq_length)
+            yield _create_tokenized_text_batch(
+                batch_items, max_seq_length, pad_id=pad_id
+            )
         if not loop:
             break
+
+
+def _iterate_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                  seed=42, loop=False, pad_id=0):
+    """Yield labeled text batches with the same grouping used by materialization."""
+    yield from _iterate_tokenized_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        seed=seed,
+        loop=loop,
+        pad_id=pad_id,
+    )
 
 
 def _resize_vlm_images(images, image_size):
@@ -3832,8 +3977,22 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
+    dataset = _ensure_reiterable_text_dataset(dataset)
+    tokenized = _prepare_pretokenized_text_dataset(
+        dataset,
+        completion_only_loss=completion_only_loss,
+    )
+    if tokenized:
+        return _create_tokenized_text_batches(
+            tokenized,
+            batch_size,
+            max_seq_length,
+            num_batches=num_batches,
+            seed=seed,
+            pad_id=_mlx_text_pad_id(tokenizer),
+        )
+
     if completion_only_loss is not False:
-        dataset = _ensure_reiterable_text_dataset(dataset)
         normalize_mlx_chat_template(
             tokenizer,
             chat_template=chat_template,
@@ -3913,8 +4072,20 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
 
     labeled = False
     tokenized = []
+    dataset = _ensure_reiterable_text_dataset(dataset)
+    tokenized_pairs = _prepare_pretokenized_text_dataset(
+        dataset,
+        completion_only_loss=completion_only_loss,
+    )
+    if tokenized_pairs:
+        for ids, labels in tokenized_pairs:
+            ids = list(ids)[:max_seq_length]
+            labels = list(labels)[:max_seq_length] if labels is not None else None
+            if len(ids) >= 2:
+                tokenized.append((ids, labels))
+        labeled = True
+
     if completion_only_loss is not False:
-        dataset = _ensure_reiterable_text_dataset(dataset)
         normalize_mlx_chat_template(
             tokenizer,
             chat_template=chat_template,
@@ -3923,18 +4094,19 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             is_vlm=False,
             strict=False,
         )
-        for ids, labels in _prepare_labeled_text_dataset(
-            dataset,
-            tokenizer,
-            dataset_text_field=dataset_text_field,
-            formatting_func=formatting_func,
-            append_eos=append_eos,
-        ):
-            ids = list(ids)[:max_seq_length]
-            labels = list(labels)[:max_seq_length]
-            if len(ids) >= 2:
-                tokenized.append((ids, labels))
-        labeled = bool(tokenized)
+        if not labeled:
+            for ids, labels in _prepare_labeled_text_dataset(
+                dataset,
+                tokenizer,
+                dataset_text_field=dataset_text_field,
+                formatting_func=formatting_func,
+                append_eos=append_eos,
+            ):
+                ids = list(ids)[:max_seq_length]
+                labels = list(labels)[:max_seq_length]
+                if len(ids) >= 2:
+                    tokenized.append((ids, labels))
+            labeled = bool(tokenized)
 
     if not labeled:
         ds = _prepare_dataset(
@@ -4044,8 +4216,23 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
+    dataset = _ensure_reiterable_text_dataset(dataset)
+    tokenized = _prepare_pretokenized_text_dataset(
+        dataset,
+        completion_only_loss=completion_only_loss,
+    )
+    if tokenized:
+        yield from _iterate_tokenized_text_batches(
+            tokenized,
+            batch_size,
+            max_seq_length,
+            seed=seed,
+            loop=True,
+            pad_id=_mlx_text_pad_id(tokenizer),
+        )
+        return
+
     if completion_only_loss is not False:
-        dataset = _ensure_reiterable_text_dataset(dataset)
         normalize_mlx_chat_template(
             tokenizer,
             chat_template=chat_template,

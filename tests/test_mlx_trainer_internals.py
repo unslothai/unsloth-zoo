@@ -432,6 +432,122 @@ def test_text_completion_probe_keeps_one_shot_iterables_reusable():
     assert list(dataset) == [{"text": "1 2"}]
 
 
+def test_text_pretokenized_create_batches_preserves_input_ids():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    def formatting_func(_item):
+        raise AssertionError("formatting_func should be ignored for input_ids rows")
+
+    tokenizer = types.SimpleNamespace(
+        pad_token_id=9,
+        encode=lambda *_args, **_kwargs: pytest.fail("should not tokenize input_ids")
+    )
+
+    batch, lengths, labels = create_batches(
+        dataset=[
+            {"input_ids": [1, 2, 3]},
+            {"input_ids": [4, 5]},
+        ],
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=8,
+        completion_only_loss=False,
+        formatting_func=formatting_func,
+    )[0]
+
+    assert batch.tolist() == [[4, 5, 9], [1, 2, 3]]
+    assert lengths.tolist() == [[0, 2], [0, 3]]
+    assert labels is None
+
+
+def test_text_pretokenized_rejects_mixed_raw_rows():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises(ValueError, match="cannot be mixed"):
+        create_batches(
+            dataset=[
+                {"input_ids": [1, 2, 3]},
+                {"text": "4 5 6"},
+            ],
+            tokenizer=types.SimpleNamespace(),
+            batch_size=1,
+            max_seq_length=8,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_rejects_mixed_label_presence():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises(ValueError, match="must not be mixed"):
+        create_batches(
+            dataset=[
+                {"input_ids": [1, 2, 3]},
+                {"input_ids": [4, 5, 6], "labels": [-100, 5, 6]},
+            ],
+            tokenizer=types.SimpleNamespace(),
+            batch_size=2,
+            max_seq_length=8,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_completion_mask_requires_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    tokenizer = types.SimpleNamespace()
+    kwargs = dict(tokenizer=tokenizer, batch_size=1, max_seq_length=8)
+    row = {
+        "input_ids": [1, 2, 3, 4],
+        "labels": [11, 12, 13, 14],
+        "completion_mask": [0, 1, 0, 1],
+    }
+
+    _, _, default_labels = create_batches(dataset=[row], **kwargs)[0]
+    batch, _, masked_labels = create_batches(
+        dataset=[row],
+        completion_only_loss=True,
+        **kwargs,
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3, 4]]
+    assert default_labels.tolist() == [[11, 12, 13, 14]]
+    assert masked_labels.tolist() == [[-100, 12, -100, 14]]
+
+
+def test_text_pretokenized_ordered_and_streaming_batches_emit_labels():
+    from unsloth_zoo.mlx.utils import create_ordered_batches, iterate_training_batches
+
+    tokenizer = types.SimpleNamespace(pad_token_id=7)
+    dataset = [
+        {"input_ids": [1, 2], "labels": [-100, 2]},
+        {"input_ids": [3, 4, 5], "labels": [-100, 4, 5]},
+    ]
+
+    batches = [
+        create_ordered_batches(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            batch_size=2,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0],
+        next(
+            iterate_training_batches(
+                dataset=dataset,
+                tokenizer=tokenizer,
+                batch_size=2,
+                max_seq_length=8,
+                seed=0,
+            )
+        ),
+    ]
+
+    for batch, _, labels in batches:
+        assert batch.tolist() == [[1, 2, 7], [3, 4, 5]]
+        assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+
 def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeypatch):
     from unsloth_zoo.mlx import trainer as mlx_trainer
 
