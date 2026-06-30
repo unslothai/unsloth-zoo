@@ -3846,6 +3846,32 @@ def _remap_unsloth_bnb_hub_id_for_mlx(model_name, revision):
     return model_name, revision, None
 
 
+def _coerce_list_extra_special_tokens():
+    # why: the MLX path skips unsloth's TEMPORARY_PATCHES. Old transformers crash
+    # on a list extra_special_tokens; v5 accepts it, so only coerce on failure.
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception:
+        return
+    init = PreTrainedTokenizerBase.__init__
+    if getattr(init, "_unsloth_extra_special_tokens_patched", False):
+        return
+
+    def patched_init(*args, **kwargs):
+        if not isinstance(kwargs.get("extra_special_tokens"), list):
+            return init(*args, **kwargs)
+        try:
+            return init(*args, **kwargs)
+        except AttributeError as e:
+            if "keys" not in str(e):
+                raise
+            kwargs["extra_special_tokens"] = {}
+            return init(*args, **kwargs)
+
+    patched_init._unsloth_extra_special_tokens_patched = True
+    PreTrainedTokenizerBase.__init__ = patched_init
+
+
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
 
@@ -3904,6 +3930,8 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
         """
+        _coerce_list_extra_special_tokens()
+
         model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
             model_name, revision
         )
