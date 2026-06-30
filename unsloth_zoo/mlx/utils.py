@@ -35,6 +35,8 @@ import sys
 import shutil
 import tempfile
 import threading
+import warnings
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -2488,6 +2490,254 @@ def collect_mlx_texts(target, item, *, dataset_text_field="text", is_vlm=False):
     return [text] if text else []
 
 
+def _render_mlx_prompt_completion_texts(
+    target,
+    item,
+    *,
+    dataset_text_field="text",
+    is_vlm=False,
+):
+    """Render prompt and completion parts separately for text label masking."""
+    if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
+        return None
+    prompt = render_mlx_chat_example(
+        target,
+        item.get("prompt"),
+        dataset_text_field=dataset_text_field,
+        is_vlm=is_vlm,
+    )
+    completion = render_mlx_chat_example(
+        target,
+        item.get("completion"),
+        dataset_text_field=dataset_text_field,
+        is_vlm=is_vlm,
+    )
+    if prompt is None and completion is None:
+        return None
+    return prompt or "", completion or ""
+
+
+def _looks_like_mlx_chat_value(value):
+    """Return True for one chat message or a list of chat messages."""
+    return (
+        _looks_like_mlx_chat_messages(value)
+        or (
+            isinstance(value, dict)
+            and "role" in value
+            and "content" in value
+        )
+    )
+
+
+def _flatten_mlx_chat_template_ids(value):
+    """Flatten tokenizer chat-template output to a single token-id list."""
+    if isinstance(value, Mapping):
+        value = value["input_ids"]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if len(value) > 0 and isinstance(value[0], list):
+        value = value[0]
+    return list(value)
+
+
+def _apply_mlx_chat_template_ids(tokenizer, messages, **kwargs):
+    """Tokenize messages through apply_chat_template with a HF-compatible fallback."""
+    try:
+        return _flatten_mlx_chat_template_ids(
+            tokenizer.apply_chat_template(messages, **kwargs)
+        )
+    except TypeError:
+        kwargs.pop("return_dict", None)
+        return _flatten_mlx_chat_template_ids(
+            tokenizer.apply_chat_template(messages, **kwargs)
+        )
+
+
+def _tokenize_mlx_conversational_prompt_completion(
+    tokenizer,
+    prompt,
+    completion,
+    *,
+    tools=None,
+    chat_template_kwargs=None,
+):
+    """Tokenize conversational prompt/completion rows using TRL's split."""
+    prompt_messages = _normalize_mlx_messages(prompt, is_vlm=False)
+    completion_messages = _normalize_mlx_messages(completion, is_vlm=False)
+    template_kwargs = dict(chat_template_kwargs or {})
+    prompt_ids = _apply_mlx_chat_template_ids(
+        tokenizer,
+        prompt_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        tools=tools,
+        **template_kwargs,
+    )
+    input_ids = _apply_mlx_chat_template_ids(
+        tokenizer,
+        prompt_messages + completion_messages,
+        tokenize=True,
+        return_dict=True,
+        tools=tools,
+        **template_kwargs,
+    )
+    return _mask_mlx_prompt_completion_labels(
+        tokenizer,
+        prompt_ids,
+        input_ids,
+        append_eos=False,
+    )
+
+
+def _tokenize_mlx_prompt_completion(tokenizer, prompt, completion, *, append_eos=True):
+    """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
+    prompt_ids = list(encode_mlx_text(tokenizer, prompt))
+    input_ids = list(encode_mlx_text(tokenizer, prompt + completion))
+    return _mask_mlx_prompt_completion_labels(
+        tokenizer,
+        prompt_ids,
+        input_ids,
+        append_eos=append_eos,
+    )
+
+
+def _mask_mlx_prompt_completion_labels(tokenizer, prompt_ids, input_ids, *, append_eos=True):
+    """Build labels by masking the prompt prefix from prompt/completion ids."""
+    if input_ids[:len(prompt_ids)] != prompt_ids:
+        warnings.warn(
+            "Mismatch between tokenized prompt and tokenized prompt+completion; "
+            "completion_only_loss masking will use the prompt token length.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    if eos_id is not None and (not input_ids or input_ids[-1] != eos_id):
+        input_ids.append(int(eos_id))
+    labels = list(input_ids)
+    labels[:min(len(prompt_ids), len(labels))] = [-100] * min(len(prompt_ids), len(labels))
+    return input_ids, labels
+
+
+def _tokenize_mlx_prompt_completion_row(
+    tokenizer,
+    item,
+    *,
+    dataset_text_field="text",
+    append_eos=True,
+):
+    """Tokenize one text prompt/completion row, including conversational rows."""
+    if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
+        return None
+    prompt = item.get("prompt")
+    completion = item.get("completion")
+    if _looks_like_mlx_chat_value(prompt) and _looks_like_mlx_chat_value(completion):
+        return _tokenize_mlx_conversational_prompt_completion(
+            tokenizer,
+            prompt,
+            completion,
+            tools=item.get("tools"),
+            chat_template_kwargs=item.get("chat_template_kwargs"),
+        )
+    pair = _render_mlx_prompt_completion_texts(
+        tokenizer,
+        item,
+        dataset_text_field=dataset_text_field,
+        is_vlm=False,
+    )
+    if pair is None:
+        return None
+    return _tokenize_mlx_prompt_completion(
+        tokenizer,
+        pair[0],
+        pair[1],
+        append_eos=append_eos,
+    )
+
+
+def _prepare_labeled_text_dataset(
+    dataset,
+    tokenizer,
+    dataset_text_field="text",
+    formatting_func=None,
+    append_eos=True,
+):
+    """Materialize prompt/completion rows into token ids plus completion labels."""
+    formatted = []
+    for item in dataset:
+        source = formatting_func(item) if formatting_func is not None else item
+        sources = source if (
+            isinstance(source, list) and not _looks_like_mlx_chat_messages(source)
+        ) else [source]
+        for row in sources:
+            tokenized = _tokenize_mlx_prompt_completion_row(
+                tokenizer,
+                row,
+                dataset_text_field=dataset_text_field,
+                append_eos=append_eos,
+            )
+            if tokenized is not None and tokenized[0]:
+                formatted.append(tokenized)
+    return formatted
+
+
+def _ensure_reiterable_text_dataset(dataset):
+    """Materialize one-shot text iterables before probing for labeled rows."""
+    if hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
+        return dataset
+    return list(dataset)
+
+
+def _create_labeled_text_batch(batch_items, max_seq_length):
+    """Pad token ids and labels for one labeled MLX text batch."""
+    lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
+    max_length = max(lengths)
+    batch_ids = np.zeros((len(batch_items), max_length), dtype=np.int32)
+    batch_labels = np.full((len(batch_items), max_length), -100, dtype=np.int64)
+    for row_idx, (ids, labels) in enumerate(batch_items):
+        length = lengths[row_idx]
+        batch_ids[row_idx, :length] = ids[:length]
+        batch_labels[row_idx, :length] = labels[:length]
+    lengths_info = [[0, length] for length in lengths]
+    return mx.array(batch_ids), mx.array(lengths_info), mx.array(batch_labels)
+
+
+def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                 num_batches=None, seed=42):
+    """Batch labeled text rows with mlx-lm's default sorting and shuffle contract."""
+    if len(tokenized) < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size}"
+            f" examples but only has {len(tokenized)}."
+        )
+
+    idx = sorted(range(len(tokenized)), key=lambda i: len(tokenized[i][0]))
+    batch_idx = [
+        idx[i : i + batch_size]
+        for i in range(0, len(idx) - batch_size + 1, batch_size)
+    ]
+    if seed:
+        np.random.seed(seed)
+
+    batch_pairs = []
+    while num_batches is None or len(batch_pairs) < num_batches:
+        for batch_group_idx in np.random.permutation(len(batch_idx)):
+            batch_items = [tokenized[i] for i in batch_idx[batch_group_idx]]
+            batch_pairs.append(
+                _create_labeled_text_batch(batch_items, max_seq_length)
+            )
+            if num_batches is not None and len(batch_pairs) >= num_batches:
+                break
+        if num_batches is None:
+            break
+
+    mx.eval(
+        [b for b, lengths, labels in batch_pairs]
+        + [lengths for _, lengths, labels in batch_pairs]
+        + [labels for _, lengths, labels in batch_pairs]
+    )
+    return batch_pairs
+
+
 def _resize_vlm_images(images, image_size):
     from PIL import Image
 
@@ -3551,7 +3801,8 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None, append_eos=True):
+                   model_name=None, model_type=None, append_eos=True,
+                   completion_only_loss=None):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -3568,6 +3819,32 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         with [offset, length] per sequence (from iterate_batches).
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    if completion_only_loss is not False:
+        dataset = _ensure_reiterable_text_dataset(dataset)
+        normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        tokenized = _prepare_labeled_text_dataset(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+        )
+        if tokenized:
+            return _create_labeled_text_batches(
+                tokenized,
+                batch_size,
+                max_seq_length,
+                num_batches=num_batches,
+                seed=seed,
+            )
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,

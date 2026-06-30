@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import types
 
 import pytest
 import torch
@@ -334,6 +335,136 @@ def test_encode_mlx_text_keeps_raw_text_bos_when_template_has_bos():
     assert tokenizer.add_special_tokens_seen == [True, False]
 
 
+def _make_mlx_text_trainer(**config_kwargs):
+    """Build the smallest MLXTrainer shell needed for data-routing tests."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    class Tokenizer:
+        chat_template = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2]
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(**config_kwargs)
+    trainer.model = types.SimpleNamespace(_config={})
+    trainer.tokenizer = Tokenizer()
+    trainer.train_dataset = []
+    trainer.formatting_func = None
+    trainer._batches = None
+    return MLXTrainer, trainer
+
+
+def test_text_prompt_completion_create_batches_masks_prompt_labels_and_eos():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=99,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+
+    batch, _, labels = create_batches(
+        dataset=[{"prompt": "1 2", "completion": " 3 4"}],
+        tokenizer=tokenizer,
+        batch_size=1,
+        max_seq_length=8,
+        seed=0,
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3, 4, 99]]
+    assert labels.tolist() == [[-100, -100, 3, 4, 99]]
+
+
+def test_text_conversational_prompt_completion_uses_generation_boundary():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class BatchEncoding(dict): pass
+
+    class Tokenizer:
+        chat_template = "{{ messages }}"
+        eos_token_id = 99
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            return_dict=False,
+            tools=None,
+            extra_token=0,
+        ):
+            ids = ([30] if tools else []) + ([extra_token] if extra_token else [])
+            for message in messages:
+                ids.append(10 if message["role"] == "user" else 20)
+                ids.extend(int(part) for part in message["content"].split())
+            if add_generation_prompt:
+                ids.append(20)
+            return BatchEncoding(input_ids=ids) if return_dict else ids
+
+    batch, _, labels = create_batches(
+        dataset=[
+            {
+                "prompt": [{"role": "user", "content": "1 2"}],
+                "completion": [{"role": "assistant", "content": "3 4"}],
+                "tools": [{"type": "function"}],
+                "chat_template_kwargs": {"extra_token": 5},
+            }
+        ],
+        tokenizer=Tokenizer(),
+        batch_size=1,
+        max_seq_length=10,
+        seed=0,
+        append_eos=False,
+    )[0]
+
+    assert batch.tolist() == [[30, 5, 10, 1, 2, 20, 3, 4]]
+    assert labels.tolist() == [[-100, -100, -100, -100, -100, -100, 3, 4]]
+
+
+def test_text_completion_probe_keeps_one_shot_iterables_reusable():
+    from unsloth_zoo.mlx.utils import _ensure_reiterable_text_dataset
+    def rows():
+        yield {"text": "1 2"}
+
+    dataset = _ensure_reiterable_text_dataset(rows())
+    assert list(dataset) == [{"text": "1 2"}]
+    assert list(dataset) == [{"text": "1 2"}]
+
+
+def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeypatch):
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+
+    received = {}
+
+    def fake_create_batches(**kwargs):
+        received.update(kwargs)
+        return [("batch", "lengths", "labels")]
+
+    monkeypatch.setattr(mlx_trainer, "create_batches", fake_create_batches)
+
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+    )
+    batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches == [("batch", "lengths", "labels")]
+    assert received["completion_only_loss"] is True
+
+
+@pytest.mark.parametrize("config", [{"dataset_order": "sequential"}, {"streaming": True}])
+def test_text_completion_only_loss_rejects_unsupported_text_batch_modes(config):
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        **config,
+    )
+
+    with pytest.raises(ValueError, match="completion_only_loss"):
+        MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+
 def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
@@ -393,7 +524,11 @@ def test_vlm_eval_batches_define_completion_only_loss_before_use():
     source = inspect.getsource(MLXTrainer._train_inner)
     definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
     eval_use = source.index("completion_only_loss=text_completion_only_loss")
+    text_eval_start = source.index("return create_batches(")
+    text_eval_end = source.index("if isinstance(self.eval_dataset, dict)")
+    text_eval_block = source[text_eval_start:text_eval_end]
     assert definition < eval_use
+    assert "completion_only_loss=text_completion_only_loss" in text_eval_block
 
 
 def test_evaluate_dict_eval_datasets_records_split_metrics():

@@ -1657,6 +1657,7 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
+                        completion_only_loss=text_completion_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2099,6 +2100,12 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
+                if text_completion_only_loss is not False:
+                    raise ValueError(
+                        "Unsloth MLX: text completion_only_loss is not supported "
+                        "with streaming=True yet. Disable streaming or set "
+                        "completion_only_loss=False."
+                    )
                 # Streaming has no index space; refuse explicit order requests.
                 if (
                     getattr(args, "preserve_dataset_order", False)
@@ -2141,6 +2148,12 @@ class MLXTrainer:
                     getattr(args, "preserve_dataset_order", False)
                     or getattr(args, "dataset_order", "default") != "default"
                 ):
+                    if text_completion_only_loss is not False:
+                        raise ValueError(
+                            "Unsloth MLX: text completion_only_loss is not supported "
+                            "with preserve_dataset_order / dataset_order yet. Use the "
+                            "default dataset order or set completion_only_loss=False."
+                        )
                     text_dataset_order = (
                         "sequential"
                         if getattr(args, "preserve_dataset_order", False)
@@ -2156,6 +2169,7 @@ class MLXTrainer:
                         self._prepared_batches_include_epochs = True
                     batches = create_ordered_batches(**batch_kwargs)
                 else:
+                    batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = create_batches(**batch_kwargs)
                 return batches, None
 
