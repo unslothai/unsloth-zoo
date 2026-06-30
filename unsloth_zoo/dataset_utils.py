@@ -220,11 +220,20 @@ def get_chat_template_parts(tokenizer):
             if nxt: out.append(full[e : min(nxt)])
         return Counter(out).most_common(1)[0][0] if out else ""
 
-    # Render a 3-turn probe; read markers off the gaps between content blocks
-    convo = [{"role": "user", "content": U}, {"role": "assistant", "content": A}] * 3
-    full = render(convo, False)
-    if not starts(full, U) or not starts(full, A):
+    # Render a 3-turn probe; read markers off the gaps between content blocks. Some
+    # VLM processor templates require structured content blocks instead of a plain
+    # string, so probe both and keep whichever renders our sentinels.
+    def _convo(wrap):
+        return [{"role": "user", "content": wrap(U)}, {"role": "assistant", "content": wrap(A)}] * 3
+    wrap, full = None, ""
+    for _w in (lambda s: s, lambda s: [{"type": "text", "text": s}]):
+        try: rendered = render(_convo(_w), False)
+        except Exception: continue
+        if starts(rendered, U) and starts(rendered, A):
+            wrap, full = _w, rendered; break
+    if wrap is None:
         raise ValueError("Unsloth: Could not auto-detect chat template structure - pass instruction_part and response_part.")
+    convo = _convo(wrap)
     instr_gap = gap_mode(ends(full, A), starts(full, U))
     resp_gap  = gap_mode(ends(full, U), starts(full, A))
 
@@ -262,8 +271,8 @@ def get_chat_template_parts(tokenizer):
         tag = mt.group(1)
         empty = f"<{tag}></{tag}>"
         try:
-            filled = render([{"role": "user", "content": U},
-                             {"role": "assistant", "content": f"<{tag}>rZ9</{tag}>{A}"}], False)
+            filled = render([{"role": "user", "content": wrap(U)},
+                             {"role": "assistant", "content": wrap(f"<{tag}>rZ9</{tag}>{A}")}], False)
             if not filled[:filled.rfind(A)].rstrip().endswith(empty):
                 response_part = response_part[:mt.start()]
         except Exception:
