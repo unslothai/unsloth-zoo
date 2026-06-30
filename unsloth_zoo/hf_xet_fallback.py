@@ -321,7 +321,8 @@ def get_hf_download_state(
 ) -> Optional[tuple[int, bool]]:
     """Return ``(total_on_disk_bytes, has_incomplete)`` for the HF cache being written (sparse-aware,
     so a partial Xet / ``hf_transfer`` blob is not read as full progress). Scans *cache_dir* or the
-    active ``HF_HUB_CACHE``. ``None`` -> unmeasurable, so callers skip stall logic this tick."""
+    active ``HF_HUB_CACHE``. A missing / empty cache reads as ``(0, False)``; ``None`` is returned only
+    on a probe exception (unmeasurable -> callers skip stall logic this tick)."""
     try:
         if hf_cache_root(cache_dir = cache_dir) is None:
             return (0, False)
