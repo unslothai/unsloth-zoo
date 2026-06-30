@@ -25,12 +25,14 @@ import importlib
 import inspect
 import math
 import os
+import shutil
 import tempfile
 import types
 import warnings
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
+from pathlib import Path
 
 from .compile import (
     explain_compile_support,
@@ -398,6 +400,226 @@ def _load_mlx_lm_with_strict_fallback(
     if want_config:
         return model, tokenizer, config
     return model, tokenizer
+
+
+def _mlx_lm_metadata_allow_patterns():
+    return [
+        "*.json",
+        "*.py",
+        "tokenizer.model",
+        "*.tiktoken",
+        "tiktoken.model",
+        "*.txt",
+        "*.jsonl",
+        "*.jinja",
+    ]
+
+
+def _mlx_lm_snapshot_view(model_path, *, weight_files=()):
+    src_root = Path(model_path).resolve()
+    dst_root = Path(tempfile.mkdtemp(prefix="unsloth_mlx_dist_view_"))
+    allowed_weights = {str(file) for file in (weight_files or ())}
+    for root, dirs, files in os.walk(src_root):
+        rel_root = os.path.relpath(root, src_root)
+        dst_dir = dst_root if rel_root == "." else dst_root / rel_root
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for directory in dirs:
+            (dst_dir / directory).mkdir(exist_ok=True)
+        for name in files:
+            rel_file = name if rel_root == "." else os.path.join(rel_root, name)
+            is_weight = name.endswith(".safetensors")
+            if (
+                is_weight
+                and rel_file not in allowed_weights
+                and name not in allowed_weights
+            ):
+                continue
+            src = os.path.join(root, name)
+            dst = dst_dir / name
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+    return dst_root
+
+
+@contextmanager
+def _temporary_mlx_lm_snapshot_view(model_path, *, weight_files=()):
+    view_path = _mlx_lm_snapshot_view(model_path, weight_files=weight_files)
+    try:
+        yield view_path
+    finally:
+        shutil.rmtree(view_path, ignore_errors=True)
+
+
+def _load_mlx_lm_distributed(
+    model_name,
+    model_type,
+    mlx_load_kwargs,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    hf_token=None,
+):
+    """Load text models following mlx-lm's sharded_load ordering.
+
+    Pipeline placement must happen before downloading/loading local weight
+    shards; post-load sharding defeats the memory behavior of pipeline
+    parallelism.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import _download, load_model, load_tokenizer
+
+    pipeline_group, tensor_group = _mlx_active_distributed_groups(
+        pipeline_group,
+        tensor_group,
+    )
+    tokenizer_config = mlx_load_kwargs.get("tokenizer_config") or {}
+    model_config = mlx_load_kwargs.get("model_config") or {}
+    revision = mlx_load_kwargs.get("revision")
+    want_config = mlx_load_kwargs.get("return_config", False)
+
+    with _temporary_hf_token_env(hf_token):
+        model_path = _download(
+            model_name,
+            revision=revision,
+            allow_patterns=_mlx_lm_metadata_allow_patterns(),
+        )
+        with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
+            model, config = load_model(
+                metadata_model_path,
+                lazy=True,
+                strict=False,
+                model_config=model_config,
+            )
+
+            mode = _mlx_distributed_sharding_mode(
+                model,
+                pipeline_group=pipeline_group,
+                tensor_group=tensor_group,
+                model_name=model_name,
+            )
+            if mode == "tensor":
+                tensor_load_kwargs = dict(mlx_load_kwargs)
+                tensor_load_kwargs["lazy"] = True
+                tensor_load_kwargs["return_config"] = True
+                model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
+                    model_name,
+                    model_type,
+                    None,
+                    tensor_load_kwargs,
+                    hf_token=hf_token,
+                )
+                _apply_mlx_distributed_sharding(
+                    model,
+                    tensor_group=tensor_group,
+                    model_name=model_name,
+                )
+                mx.eval(model.parameters())
+                mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+                if want_config:
+                    return model, tokenizer, config
+                return model, tokenizer
+
+            if mode == "pipeline":
+                _apply_mlx_distributed_sharding(
+                    model,
+                    pipeline_group=pipeline_group,
+                    model_name=model_name,
+                )
+                try:
+                    with open(
+                        metadata_model_path / "model.safetensors.index.json",
+                        "r",
+                    ) as file:
+                        weight_index = json.load(file)["weight_map"]
+                except FileNotFoundError as error:
+                    raise ValueError(
+                        "Unsloth: MLX pipeline distributed loading requires a "
+                        "converted MLX checkpoint with model.safetensors.index.json."
+                    ) from error
+
+                local_files = set()
+                for key, _value in tree_flatten(model.parameters()):
+                    file_name = weight_index.get(key)
+                    if file_name is None:
+                        raise ValueError(
+                            "Unsloth: MLX pipeline distributed loading is only "
+                            "supported for converted MLX models with indexed weights."
+                        )
+                    local_files.add(file_name)
+
+        if mode == "pipeline":
+            _download(model_name, revision=revision, allow_patterns=sorted(local_files))
+            final_model_path = _mlx_lm_snapshot_view(model_path, weight_files=local_files)
+        else:
+            _download(model_name, revision=revision)
+            final_model_path = model_path
+
+        tokenizer = load_tokenizer(
+            final_model_path,
+            tokenizer_config,
+            eos_token_ids=config.get("eos_token_id", None),
+        )
+        model, _config = load_model(
+            final_model_path,
+            lazy=True,
+            strict=False,
+            model_config=model_config,
+        )
+        _apply_mlx_distributed_sharding(
+            model,
+            pipeline_group=pipeline_group,
+            tensor_group=tensor_group,
+            model_name=model_name,
+        )
+        mx.eval(model.parameters())
+
+        if pipeline_group is not None or tensor_group is not None:
+            mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+
+        if mode == "pipeline":
+            model._unsloth_mlx_distributed_snapshot_view = str(final_model_path)
+
+    if want_config:
+        return model, tokenizer, config
+    return model, tokenizer
+
+
+def _resolve_distributed_runtime_quantization(
+    model_name,
+    quantization_spec,
+    *,
+    distributed_requested,
+    want_runtime_quant,
+):
+    if not distributed_requested or not want_runtime_quant:
+        return quantization_spec, want_runtime_quant
+    if quantization_spec.source == "load_in_4bit":
+        warnings.warn(
+            "Unsloth: distributed MLX inference does not support runtime "
+            f"quantization for '{model_name}'. Loading the full-precision MLX "
+            "checkpoint instead of applying the default load_in_4bit=True. "
+            "Use a pre-quantized MLX repo for distributed quantized inference.",
+            stacklevel=3,
+        )
+        return (
+            _MLXQuantizationSpec(
+                enabled=False,
+                source="distributed_full_precision",
+                quantize_modules=quantization_spec.quantize_modules,
+                has_callable_predicate=quantization_spec.has_callable_predicate,
+                force_requantize=quantization_spec.force_requantize,
+            ),
+            False,
+        )
+    raise ValueError(
+        "Unsloth: distributed MLX inference requires a pre-quantized "
+        "or full-precision MLX repo. Runtime MLX quantization while "
+        "sharding is unsupported; use an mlx-community *-4bit/*-8bit "
+        "repo or load without quantized load flags."
+    )
 
 
 def _load_mlx_vlm_with_extra_weight_filter(
@@ -2789,6 +3011,107 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
     return model, updated_config
 
 
+def _mlx_distributed_rank_size(group=None):
+    """Return ``(rank, world_size)`` for an optional MLX distributed group."""
+    if group is None:
+        return 0, 1
+    rank = int(group.rank())
+    world_size = int(group.size())
+    if world_size < 1:
+        raise ValueError(f"Invalid MLX distributed world_size={world_size}.")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Invalid MLX distributed rank={rank} for world_size={world_size}."
+        )
+    return rank, world_size
+
+
+def _mlx_distributed_group_size(group):
+    return _mlx_distributed_rank_size(group)[1]
+
+
+def _mlx_group_is_distributed(group) -> bool:
+    size = _mlx_distributed_group_size(group)
+    return group is not None and size != 1
+
+
+def _mlx_active_distributed_groups(pipeline_group=None, tensor_group=None):
+    active_pipeline = pipeline_group if _mlx_group_is_distributed(pipeline_group) else None
+    active_tensor = tensor_group if _mlx_group_is_distributed(tensor_group) else None
+    if active_pipeline is not None and active_tensor is not None:
+        raise ValueError(
+            "Unsloth: MLX distributed loading accepts only one parallel mode. "
+            "Pass either pipeline_group or tensor_group, not both."
+        )
+    return active_pipeline, active_tensor
+
+
+def _mlx_distributed_requested(pipeline_group=None, tensor_group=None) -> bool:
+    return any(
+        _mlx_group_is_distributed(group)
+        for group in (pipeline_group, tensor_group)
+    )
+
+
+def _mlx_distributed_sharding_mode(
+    model,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    model_name="model",
+):
+    pipeline_group, tensor_group = _mlx_active_distributed_groups(
+        pipeline_group,
+        tensor_group,
+    )
+    if pipeline_group is None and tensor_group is None:
+        return None
+
+    has_pipelining = hasattr(getattr(model, "model", None), "pipeline")
+    has_tensor_parallel = hasattr(model, "shard")
+
+    if tensor_group is not None:
+        if has_tensor_parallel:
+            return "tensor"
+        else:
+            raise ValueError(
+                f"Unsloth: '{model_name}' does not support MLX tensor "
+                "parallelism. The model must expose shard(group)."
+            )
+    else:
+        if has_pipelining:
+            return "pipeline"
+        else:
+            raise ValueError(
+                f"Unsloth: '{model_name}' does not support MLX pipeline "
+                "parallelism. The model must expose model.pipeline(group)."
+            )
+
+
+def _apply_mlx_distributed_sharding(
+    model,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    model_name="model",
+):
+    mode = _mlx_distributed_sharding_mode(
+        model,
+        pipeline_group=pipeline_group,
+        tensor_group=tensor_group,
+        model_name=model_name,
+    )
+    if mode is None:
+        return None
+
+    if mode == "tensor":
+        model.shard(tensor_group)
+    else:
+        model.model.pipeline(pipeline_group)
+    model._unsloth_mlx_distributed_parallel_mode = mode
+    return mode
+
+
 def _content_has_structured_multimodal_markers(content):
     """Return True when content already contains explicit image/audio/video items."""
     if isinstance(content, list):
@@ -3468,6 +3791,8 @@ class FastMLXModel:
         revision=None,
         random_state=3407,
         float32_mixed_precision=None,
+        pipeline_group=None,
+        tensor_group=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -3492,8 +3817,13 @@ class FastMLXModel:
                 None  — auto-detect from config (default)
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
+            pipeline_group: Optional MLX distributed group for pipeline
+                parallel text-model inference.
+            tensor_group: Optional MLX distributed group for tensor parallel
+                text-model inference.
         """
         _coerce_list_extra_special_tokens()
+        _mlx_active_distributed_groups(pipeline_group, tensor_group)
 
         if full_finetuning and (
             load_in_4bit or load_in_8bit or load_in_fp8
@@ -3613,7 +3943,16 @@ class FastMLXModel:
         local_path = None
         try:
             with _temporary_hf_token_env(token):
-                local_path = str(_download(model_name, revision=revision))
+                config_allow_patterns = None
+                if _mlx_distributed_requested(pipeline_group, tensor_group):
+                    config_allow_patterns = _mlx_lm_metadata_allow_patterns()
+                local_path = str(
+                    _download(
+                        model_name,
+                        revision=revision,
+                        allow_patterns=config_allow_patterns,
+                    )
+                )
         except Exception:
             local_path = None
 
@@ -3659,6 +3998,26 @@ class FastMLXModel:
                 base_model_id = adapter_cfg.get("base_model_name_or_path", "")
                 if base_model_id:
                     print(f"Unsloth: Detected LoRA adapter, loading base model '{base_model_id}'...")
+                    active_pipeline_group, active_tensor_group = _mlx_active_distributed_groups(
+                        pipeline_group,
+                        tensor_group,
+                    )
+                    if active_pipeline_group is not None:
+                        raise ValueError(
+                            "Unsloth: MLX pipeline distributed loading for LoRA "
+                            "adapter repos is not supported yet. Use tensor "
+                            "parallelism for this adapter or merge/export it "
+                            "before pipeline distributed inference."
+                        )
+                    if _mlx_distributed_requested(pipeline_group, tensor_group):
+                        with _temporary_hf_token_env(token):
+                            local_path = str(
+                                _download(
+                                    model_name,
+                                    revision=revision,
+                                    allow_patterns=_mlx_lm_adapter_allow_patterns(),
+                                )
+                            )
                     adapter_quant_policy = adapter_cfg.get("base_quantization_policy") or {}
                     adapter_quant_map = (
                         adapter_cfg.get("base_resolved_quantization_map")
@@ -3763,6 +4122,8 @@ class FastMLXModel:
                         revision=adapter_base_revision,
                         random_state=random_state,
                         float32_mixed_precision=float32_mixed_precision,
+                        pipeline_group=pipeline_group,
+                        tensor_group=tensor_group,
                         **(
                             {"mlx_quantization_config": adapter_mlx_quant_config}
                             if adapter_mlx_quant_config is not None
@@ -3911,7 +4272,16 @@ class FastMLXModel:
                     processor = getattr(model, "_processor", None)
 
                     with _temporary_hf_token_env(token):
-                        base_local = str(_download(base_model_id, revision=adapter_base_revision))
+                        base_allow_patterns = None
+                        if _mlx_distributed_requested(pipeline_group, tensor_group):
+                            base_allow_patterns = _mlx_lm_metadata_allow_patterns()
+                        base_local = str(
+                            _download(
+                                base_model_id,
+                                revision=adapter_base_revision,
+                                allow_patterns=base_allow_patterns,
+                            )
+                        )
                     base_config_path = os.path.join(base_local, "config.json")
                     if os.path.exists(base_config_path):
                         with open(base_config_path, "r") as f:
@@ -3997,6 +4367,12 @@ class FastMLXModel:
             extra_kwargs["trust_remote_code"] = True
 
         if is_vlm:
+            if _mlx_distributed_requested(pipeline_group, tensor_group):
+                raise ValueError(
+                    "Unsloth: distributed MLX inference for VLM models is not "
+                    "supported yet. Use a text-only mlx-lm model or run this "
+                    "VLM without mlx.launch."
+                )
             # VLM path via mlx-vlm
             try:
                 from mlx_vlm import load as vlm_load
@@ -4022,6 +4398,13 @@ class FastMLXModel:
                 config_data, quantization_spec, model_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
+            if _mlx_distributed_requested(pipeline_group, tensor_group) and want_runtime_quant:
+                raise ValueError(
+                    "Unsloth: distributed MLX inference requires a pre-quantized "
+                    "or full-precision MLX repo. Runtime MLX quantization while "
+                    "sharding is unsupported; use an mlx-community *-4bit/*-8bit "
+                    "repo or load without quantized load flags."
+                )
 
             if quantization_spec.enabled and quant_state == "compatible":
                 warnings.warn(
@@ -4149,6 +4532,12 @@ class FastMLXModel:
                 config_data, quantization_spec, model_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
+            quantization_spec, want_runtime_quant = _resolve_distributed_runtime_quantization(
+                model_name,
+                quantization_spec,
+                distributed_requested=distributed_requested,
+                want_runtime_quant=want_runtime_quant,
+            )
 
             if want_runtime_quant:
                 print(
@@ -4172,13 +4561,24 @@ class FastMLXModel:
             )
             if target_dtype is not None or want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
-            model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
-                model_name,
-                model_type,
-                mlx_load,
-                mlx_load_kwargs,
-                hf_token=token,
-            )
+            if _mlx_distributed_requested(pipeline_group, tensor_group):
+                mlx_load_kwargs["lazy"] = True
+                model, tokenizer, config = _load_mlx_lm_distributed(
+                    model_name,
+                    model_type,
+                    mlx_load_kwargs,
+                    pipeline_group=pipeline_group,
+                    tensor_group=tensor_group,
+                    hf_token=token,
+                )
+            else:
+                model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
+                    model_name,
+                    model_type,
+                    mlx_load,
+                    mlx_load_kwargs,
+                    hf_token=token,
+                )
 
             if want_runtime_quant:
                 model, config = _apply_mlx_quantization(
