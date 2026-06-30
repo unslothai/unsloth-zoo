@@ -2100,12 +2100,6 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                if text_completion_only_loss is not False:
-                    raise ValueError(
-                        "Unsloth MLX: text completion_only_loss is not supported "
-                        "with streaming=True yet. Disable streaming or set "
-                        "completion_only_loss=False."
-                    )
                 # Streaming has no index space; refuse explicit order requests.
                 if (
                     getattr(args, "preserve_dataset_order", False)
@@ -2128,6 +2122,7 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=text_completion_only_loss,
                 )
             else:
                 batch_kwargs = dict(

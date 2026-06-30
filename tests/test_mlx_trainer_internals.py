@@ -479,15 +479,35 @@ def test_text_prepare_data_ordered_batches_emit_completion_only_labels():
     assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
 
 
-def test_text_completion_only_loss_rejects_streaming_batches():
+def test_text_prepare_data_streaming_batches_emit_completion_only_labels():
     MLXTrainer, trainer = _make_mlx_text_trainer(
         max_steps=1,
         completion_only_loss=True,
         streaming=True,
+        per_device_train_batch_size=2,
     )
+    trainer.tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+    trainer.train_dataset = [
+        {"prompt": "1", "completion": " 2"},
+        {"prompt": "3", "completion": " 4 5"},
+    ]
 
-    with pytest.raises(ValueError, match="completion_only_loss"):
-        MLXTrainer._prepare_data(trainer, is_vlm=False)
+    batches, batch_iter = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches is None
+    batch, _, labels = next(batch_iter)
+    assert batch.tolist() == [[1, 2, 0], [3, 4, 5]]
+    assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+    trainer.train_dataset = [{"text": "1 2"}, {"text": "3 4"}]
+    with pytest.raises(ValueError, match="completion_only_loss=True"):
+        next(MLXTrainer._prepare_data(trainer, is_vlm=False)[1])
 
 
 def test_mlx_text_loss_masks_exclude_position_at_sequence_length():

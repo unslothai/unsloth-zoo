@@ -2704,6 +2704,30 @@ def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
 def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
                                  num_batches=None, seed=42):
     """Batch labeled text rows with mlx-lm's default sorting and shuffle contract."""
+    batch_iter = _iterate_labeled_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        seed=seed,
+        loop=(num_batches is not None),
+    )
+    batch_pairs = []
+    for batch_pair in batch_iter:
+        batch_pairs.append(batch_pair)
+        if num_batches is not None and len(batch_pairs) >= num_batches:
+            break
+
+    mx.eval(
+        [b for b, lengths, labels in batch_pairs]
+        + [lengths for _, lengths, labels in batch_pairs]
+        + [labels for _, lengths, labels in batch_pairs]
+    )
+    return batch_pairs
+
+
+def _iterate_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                  seed=42, loop=False):
+    """Yield labeled text batches with the same grouping used by materialization."""
     if len(tokenized) < batch_size:
         raise ValueError(
             f"Dataset must have at least batch_size={batch_size}"
@@ -2718,24 +2742,12 @@ def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
     if seed:
         np.random.seed(seed)
 
-    batch_pairs = []
-    while num_batches is None or len(batch_pairs) < num_batches:
+    while True:
         for batch_group_idx in np.random.permutation(len(batch_idx)):
             batch_items = [tokenized[i] for i in batch_idx[batch_group_idx]]
-            batch_pairs.append(
-                _create_labeled_text_batch(batch_items, max_seq_length)
-            )
-            if num_batches is not None and len(batch_pairs) >= num_batches:
-                break
-        if num_batches is None:
+            yield _create_labeled_text_batch(batch_items, max_seq_length)
+        if not loop:
             break
-
-    mx.eval(
-        [b for b, lengths, labels in batch_pairs]
-        + [lengths for _, lengths, labels in batch_pairs]
-        + [labels for _, lengths, labels in batch_pairs]
-    )
-    return batch_pairs
 
 
 def _resize_vlm_images(images, image_size):
@@ -4020,16 +4032,49 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
                              model_name=None, model_type=None,
-                             append_eos=True):
+                             append_eos=True, completion_only_loss=None):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
     materializing all batches in memory at once. Useful for large datasets.
 
     Yields:
-        (batch, lengths) tuples — same format as create_batches.
+        (batch, lengths, labels) tuples — same format as create_batches.
+        ``labels`` is ``None`` unless text prompt/completion masking is active.
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    if completion_only_loss is not False:
+        dataset = _ensure_reiterable_text_dataset(dataset)
+        normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        tokenized = _prepare_labeled_text_dataset(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+        )
+        if tokenized:
+            yield from _iterate_labeled_text_batches(
+                tokenized,
+                batch_size,
+                max_seq_length,
+                seed=seed,
+                loop=True,
+            )
+            return
+        if completion_only_loss is True:
+            raise ValueError(
+                "Unsloth MLX: text completion_only_loss=True requires "
+                "prompt/completion rows for streaming text training."
+            )
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
