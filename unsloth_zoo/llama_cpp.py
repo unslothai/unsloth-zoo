@@ -2276,10 +2276,17 @@ def convert_to_gguf(
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
 
-    # Strip MTP / nextn config keys so the downstream convert_hf_to_gguf.py
-    # doesn't inflate block_count / inject nextn_predict_layers.
+    # Preserve MTP / nextn config so the downstream convert_hf_to_gguf.py keeps
+    # the extra nextn block (block_count += mtp_num_hidden_layers) and emits the
+    # nextn tensors (blk.N.nextn.*). gguf-py has full nextn support, so the
+    # leftover `mtp.*` weights remap cleanly via _Qwen35MtpMixin instead of being
+    # forced into a phantom out-of-range layer. Stripping mtp_num_hidden_layers
+    # shrank block_count to num_hidden_layers, so `mtp.fc` -> `model.layers.<N>.eh_proj`
+    # pointed at a layer index that no longer existed, raising
+    # "Can not map tensor ...eh_proj" for Qwen3.5/3.6 MTP checkpoints.
+    # Only strip Unsloth's internal marker, never the real MTP config.
     _changed = False
-    for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
+    for _key in ("unsloth_fixed_mtp",):
         if config_file.pop(_key, None) is not None:
             _changed = True
         _tc = config_file.get("text_config")
