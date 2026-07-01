@@ -46,9 +46,15 @@ USER_TXT, ASST_TXT = "ZEBRAQUESTION", "PENGUINANSWER"
 
 
 def _fetch(repo):
-    from huggingface_hub import snapshot_download
     path = os.path.join(CACHE, repo.replace("/", "__"))
-    if not (os.path.isdir(path) and any(f.startswith("tokenizer") for f in os.listdir(path))):
+    cached = os.path.isdir(path) and any(f.startswith("tokenizer") for f in os.listdir(path))
+    if not cached:
+        # Downloads are opt-in. Without UNSLOTH_TEST_VLM_COLLATOR an uncached repo is
+        # skipped (raise -> _check returns SKIP), never fetched, even when CACHE already
+        # exists from a prior partial run - so the sweep stays truly off by default.
+        if not ENABLED:
+            raise RuntimeError(f"{repo} not cached; set UNSLOTH_TEST_VLM_COLLATOR=1 to download")
+        from huggingface_hub import snapshot_download
         snapshot_download(repo, local_dir=path, allow_patterns=ALLOW, token=os.environ.get("HF_TOKEN"))
     return path
 

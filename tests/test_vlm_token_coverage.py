@@ -7,9 +7,25 @@ mask them. This is fast and offline; it catches a token being dropped from the l
 or a new family being added without its tokens. The live per-model id check lives in
 the network sweep (test_notebook_chat_templates.py / manual), this pins the strings.
 """
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from unsloth_zoo.vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS, VLM_PLACEHOLDER_TOKENS
+import os, sys, importlib.util
+
+# Load unsloth_zoo/vlm_tokens.py by file path instead of `from unsloth_zoo.vlm_tokens
+# import ...`. Importing the submodule runs unsloth_zoo/__init__.py, which raises
+# ImportError ("Please install Unsloth ...") when the separate `unsloth` package is not
+# installed, breaking pytest collection on offline CI. vlm_tokens.py is pure data with no
+# imports, so loading it in isolation keeps this offline test hermetic and always runnable.
+def _load_vlm_tokens():
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "unsloth_zoo", "vlm_tokens.py")
+    spec = importlib.util.spec_from_file_location("unsloth_zoo_vlm_tokens_isolated", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_vt = _load_vlm_tokens()
+IMAGE_TOKENS, AUDIO_TOKENS, VLM_PLACEHOLDER_TOKENS = (
+    _vt.IMAGE_TOKENS, _vt.AUDIO_TOKENS, _vt.VLM_PLACEHOLDER_TOKENS,
+)
 
 COVERED = set(IMAGE_TOKENS) | set(AUDIO_TOKENS)
 

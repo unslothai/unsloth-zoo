@@ -453,8 +453,13 @@ def train_on_responses_only(
                 f"so there is nothing to train on. The response marker {repr(response_part)} was not "
                 "found in any sample - check that instruction_part and response_part match your chat template."
             )
-        drop_set = set(dropped)
-        dataset = dataset.select([i for i in range(n_before) if i not in drop_set])
+        # Drop the fully masked rows with an Arrow-native mask (filter) rather than
+        # select(keep_indices): materializing every surviving index would allocate one
+        # Python int per kept row, which can be many GB on a very large corpus that has
+        # only a few bad rows. _has_valid_labels is the exact inverse of `dropped`, so
+        # the survivors are identical. The healthy common case already returned above,
+        # so filter only runs when there is genuinely something to remove.
+        dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
         n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
