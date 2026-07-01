@@ -998,28 +998,77 @@ def _has_any_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
     return bool(_filter_paths(rels, None, ignore_patterns))
 
 
+# A VARIANT of a canonical root weight: the variant token sits between the base and the extension /
+# shard suffix (model.fp16.safetensors, pytorch_model.fp16-00001-of-00002.bin). A DEFAULT (no-variant)
+# load reads the canonical model.safetensors / pytorch_model.bin, NOT these, so a variant-only cache
+# must not satisfy a default load's presence check (else the load fetches the absent canonical weight
+# over un-killable Xet). Canonical names (model.safetensors, model-00001-of-00002.safetensors -- a dash,
+# not a dotted token) and non-canonical bases (consolidated.*, tf_model.h5) are deliberately NOT matched.
+_CANONICAL_BASE_VARIANT_RE = re.compile(
+    r"^(?:model|pytorch_model)\.[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
+)
+
+# A training-checkpoint subdir (checkpoint-500/, checkpoint_7/): its weights are never read as diffusers
+# pipeline COMPONENTS, so they must not mask missing unet/vae/text-encoder weights.
+_CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
+
+
+def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
+    """True if a diffusers pipeline COMPONENT weight (a loadable weight in a component SUBFOLDER: unet/,
+    vae/, text_encoder/, ...) that the ignore filter keeps is present. Excludes ROOT-level weights (an
+    adapter / merged file a ``DiffusionPipeline`` does not read as a component) and training-checkpoint
+    subtrees (checkpoint-N/), so a stale partial holding only those does not mask the missing component
+    weights the pipeline reads -- which the in-process load would then fetch over un-killable Xet. Stays
+    lenient on WHICH components are required (a pipeline's components can be optional): it only tells a
+    real component warm from a checkpoint-only / config-only stale snapshot."""
+    rels: list = []
+    try:
+        for entry in snapshot_dir.rglob("*"):
+            if not _is_loadable_weight_file(entry.name):
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                rel = entry.relative_to(snapshot_dir).as_posix()
+            except (OSError, ValueError):
+                continue
+            parts = rel.split("/")
+            if len(parts) < 2:
+                continue  # a ROOT-level weight is not a pipeline component
+            if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
+                continue  # under a training-checkpoint subtree, not a component
+            rels.append(rel)
+    except OSError:
+        return False
+    return bool(_filter_paths(rels, None, ignore_patterns))
+
+
 def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
-    """Whether an UNPATTERNED model warm holds a weight a default load reads: a ROOT weight, or -- for a
-    diffusers pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any subtree
-    weight (as ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then fetch
-    the root weights over un-killable Xet; diffusers is the one layout whose weights live in subfolders.
-    The request's ignore filter is applied to the ROOT weights, so an offline-fallback partial holding
-    only the format the load will NOT read (an ignored ``*.bin`` when safetensors was requested) does not
-    count as a usable weight -- the incomplete result is retried over HTTP instead of loaded in-process."""
+    """Whether an UNPATTERNED model warm holds a weight a default load reads: a canonical ROOT weight, or
+    -- for a diffusers pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any
+    subtree weight (as ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then
+    fetch the root weights over un-killable Xet; diffusers is the one layout whose weights live in
+    subfolders. A VARIANT-named root weight (``model.fp16.safetensors``) is excluded: a default load does
+    not read it, so a variant-only cache is retried over HTTP rather than loaded. The request's ignore
+    filter is applied to the ROOT weights, so an offline-fallback partial holding only the format the load
+    will NOT read (an ignored ``*.bin`` when safetensors was requested) does not count as a usable weight."""
     try:
         is_diffusers = (snapshot_dir / "model_index.json").is_file()
     except OSError:
         is_diffusers = False
     if is_diffusers:
-        return _has_any_weight(snapshot_dir, ignore_patterns = ignore_patterns)
+        return _has_diffusers_component_weight(snapshot_dir, ignore_patterns = ignore_patterns)
     rels: list = []
     try:
         for entry in snapshot_dir.iterdir():
-            if not _is_loadable_weight_file(entry.name):
+            name = entry.name
+            if not _is_loadable_weight_file(name):
                 continue
+            if _CANONICAL_BASE_VARIANT_RE.match(name):
+                continue  # a variant of a canonical weight is not read by a default (no-variant) load
             try:
                 if entry.is_file():
-                    rels.append(entry.name)
+                    rels.append(name)
             except OSError:
                 continue
     except OSError:
@@ -1056,14 +1105,27 @@ def _root_has_variant_weight(
     return bool(_filter_paths(rels, None, ignore_patterns))
 
 
-# Interchangeable exact weight names: the either-format ``["pytorch_model.bin", "model.safetensors"]``
-# pair is satisfied by ANY one, while distinct logical weights (base AND adapter) must each be present.
-_EQUIVALENT_EXACT_WEIGHT_NAMES = {
-    "model.safetensors": "root_model",
-    "pytorch_model.bin": "root_model",
-    "adapter_model.safetensors": "adapter_model",
-    "adapter_model.bin": "adapter_model",
-}
+# Interchangeable exact weight names collapse to one equivalence group: the either-format pair
+# ``["pytorch_model.bin", "model.safetensors"]`` is satisfied by ANY one -- and so is the variant pair
+# ``["model.fp16.safetensors", "pytorch_model.fp16.bin"]`` (HF allow patterns are ALTERNATIVES over the
+# repo, so a repo publishing only one format is complete). Distinct logical weights (base AND adapter, a
+# different variant token) stay separate groups (each required).
+_EITHER_FORMAT_WEIGHT_RE = re.compile(
+    r"^(model|pytorch_model|adapter_model)(?:\.([^.]+))?\.(?:safetensors|bin)$"
+)
+
+
+def _exact_weight_logical(base: str) -> Any:
+    """Equivalence key for an EXACT-named weight so the either-format alternatives share a group:
+    ``model.safetensors`` / ``pytorch_model.bin`` -> ``("root_model", None)``; the same variant token in
+    both formats shares ``("root_model", "<variant>")``; ``adapter_model.*`` -> ``("adapter_model", ...)``.
+    A non-weight (or sharded) name maps to itself, so each distinct file is still required."""
+    m = _EITHER_FORMAT_WEIGHT_RE.match(base)
+    if m is None:
+        return base
+    stem, variant = m.group(1), m.group(2)
+    logical = "adapter_model" if stem == "adapter_model" else "root_model"
+    return (logical, variant)
 
 
 def _requested_exact_files_present_grouped(
@@ -1087,10 +1149,10 @@ def _requested_exact_files_present_grouped(
         }
     except OSError:
         return True  # cannot enumerate -> do not reject on an unreadable dir
-    groups: "dict[tuple[str, str], list[str]]" = {}
+    groups: "dict[tuple[str, Any], list[str]]" = {}
     for rel in requested:
         parent, base = rel.rsplit("/", 1) if "/" in rel else ("", rel)
-        logical = _EQUIVALENT_EXACT_WEIGHT_NAMES.get(base, base)
+        logical = _exact_weight_logical(base)
         groups.setdefault((parent, logical), []).append(rel)
     return all(
         any(candidate in present for candidate in candidates) for candidates in groups.values()

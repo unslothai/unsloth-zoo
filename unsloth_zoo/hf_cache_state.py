@@ -458,11 +458,20 @@ def request_can_include_weights(
         return False  # allow=[] selects nothing
     if not any(_pattern_can_select_weight(pat) for pat in allow_patterns):
         return False
-    # A root-reachable allow (no required subdir) can still be left weightless by the ignore filter
-    # (allow=["*"] + ignore=[every weight suffix]). Apply HF's allow-then-ignore semantics to the weight
-    # probes; a subdir-scoped allow stays weight-bearing (its required dir is absent from the root probes).
-    if ignore_patterns and all(isinstance(p, str) and "/" not in p for p in allow_patterns):
-        if not _filter_paths(list(_WEIGHT_PATTERN_PROBES), allow_patterns, ignore_patterns):
+    # An allow that can reach a weight can still be left weightless by the ignore filter: allow=["*"] +
+    # ignore=[every weight suffix], OR a subdir warm allow=["unet/*"] that ignores every weight suffix to
+    # fetch only that subdir's metadata / configs. Apply HF's allow-then-ignore semantics to representative
+    # weight probes at the ROOT and UNDER each subdir-scoped allow, so a genuinely weightless request is not
+    # required to hold a weight (which would false-reject a complete metadata-only subset after both
+    # transports). A subdir allow that keeps its weight suffixes still matches a subdir probe and stays
+    # weight-bearing.
+    if ignore_patterns:
+        probes = list(_WEIGHT_PATTERN_PROBES)
+        for pat in allow_patterns:
+            if isinstance(pat, str) and "/" in pat:
+                head = pat.rsplit("/", 1)[0]
+                probes.extend(f"{head}/{name}" for name in _WEIGHT_PATTERN_PROBES)
+        if not _filter_paths(probes, allow_patterns, ignore_patterns):
             return False
     return True
 

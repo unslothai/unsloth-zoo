@@ -2980,17 +2980,21 @@ def test_metadata_directory_glob_is_weightless(tmp_path):
 
 
 def test_allow_star_with_all_weights_ignored_is_weightless(tmp_path):
-    """A root-reachable allow that the ignore filter strips of every weight (allow=['*'] +
-    ignore=[every weight suffix]) reads weightless, so a complete config-only download is accepted, not
-    looped into a DownloadStallError. A subdir-scoped allow stays weight-bearing, and an allow whose
-    weights survive the ignore stays weight-bearing."""
+    """An allow that the ignore filter strips of every weight reads weightless, so a complete config-only
+    download is accepted, not looped into a DownloadStallError. This holds for a ROOT allow (allow=['*'])
+    AND a subdir-scoped allow (allow=['unet/*']) -- a subdir warm that ignores every weight suffix selects
+    only that subdir's metadata (Codex #829). A subdir allow whose weight suffixes SURVIVE the ignore
+    stays weight-bearing, as does a root allow whose weights survive."""
     all_weight_ignores = [
         "*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
         "*.ckpt", "*.onnx", "*.msgpack", "*.h5", "*.pdparams",
     ]
     assert hcs.request_can_include_weights(["*"], all_weight_ignores) is False
     assert hcs.request_can_include_weights(["*"], None) is True
-    assert hcs.request_can_include_weights(["unet/*"], all_weight_ignores) is True
+    # A subdir allow that ignores every weight suffix is weightless too (only unet/ metadata selected)...
+    assert hcs.request_can_include_weights(["unet/*"], all_weight_ignores) is False
+    # ...but one whose weight suffixes survive the ignore stays weight-bearing.
+    assert hcs.request_can_include_weights(["unet/*"], ["*.bin"]) is True
     assert hcs.request_can_include_weights(["*.safetensors"], ["*.bin"]) is True
     snap, _ = _mk_snapshot(tmp_path, "cfgonly")
     (snap / "config.json").write_text("{}")
@@ -3018,6 +3022,73 @@ def test_post_download_rejects_checkpoint_only_root_model(tmp_path):
     (dsnap / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(dblob)
     assert xf._download_result_usable(
         dsnap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # A diffusers snapshot whose ONLY weight is under checkpoint-N/ (a training artifact, not a pipeline
+    # component) is rejected: DiffusionPipeline reads component subfolders (unet/vae/...), so the load
+    # would fetch the missing components over Xet (Codex #829).
+    dck, dckb = _mk_snapshot(tmp_path, "diff_ckpt")
+    (dck / "model_index.json").write_text("{}")
+    (dck / "checkpoint-7").mkdir()
+    (dck / "checkpoint-7" / "diffusion_pytorch_model.safetensors").symlink_to(dckb)
+    assert xf._download_result_usable(
+        dck, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_post_download_rejects_variant_only_root_for_default_load(tmp_path):
+    """A DEFAULT (no-variant) load reads the canonical model.safetensors / pytorch_model.bin, NOT a
+    variant-named model.fp16.safetensors. A stale snapshot holding only the variant weight must be
+    rejected, else the in-process default load fetches the absent canonical weight over un-killable Xet
+    (Codex #829). A single-file or sharded variant name is excluded; canonical names still pass."""
+    snap, blob = _mk_snapshot(tmp_path, "var_only")
+    (snap / "model.fp16.safetensors").symlink_to(blob)          # variant-named only
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # A sharded variant name is likewise not a default weight.
+    snap_sh, blob_sh = _mk_snapshot(tmp_path, "var_only_sharded")
+    (snap_sh / "model.fp16-00001-of-00002.safetensors").symlink_to(blob_sh)
+    (snap_sh / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap_sh, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # The canonical weight present -> accepted (no false-reject), even beside the variant.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # A variant load (variant='fp16') DOES read the variant weight -> accepted.
+    assert xf._download_result_usable(
+        snap_sh, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False  # sharded variant with no index is still an incomplete set
+    snap_v, blob_v = _mk_snapshot(tmp_path, "var_single")
+    (snap_v / "model.fp16.safetensors").symlink_to(blob_v)
+    (snap_v / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap_v, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
+def test_post_download_variant_either_format_exact_alternatives(tmp_path):
+    """An exact request listing both variant formats (allow=['model.fp16.safetensors',
+    'pytorch_model.fp16.bin']) is an ALTERNATIVE over the repo, like the canonical either-format pair:
+    a repo publishing only the safetensors variant is complete and must not be failed into a
+    DownloadStallError (Codex #829). A distinct-variant / base+adapter request still requires each."""
+    snap, blob = _mk_snapshot(tmp_path, "var_either")
+    (snap / "model.fp16.safetensors").symlink_to(blob)  # only the safetensors variant present
+    assert xf._download_result_usable(
+        snap, repo_type = "model",
+        allow_patterns = ["model.fp16.safetensors", "pytorch_model.fp16.bin"],
+        ignore_patterns = None, variant = "fp16") is True
+    # The canonical either-format pair keeps working (regression).
+    snap_c, blob_c = _mk_snapshot(tmp_path, "canon_either")
+    (snap_c / "pytorch_model.bin").symlink_to(blob_c)
+    assert xf._download_result_usable(
+        snap_c, repo_type = "model",
+        allow_patterns = ["model.safetensors", "pytorch_model.bin"], ignore_patterns = None) is True
+    # Base AND adapter are distinct groups: the adapter present but base absent -> rejected.
+    snap_d, blob_d = _mk_snapshot(tmp_path, "base_and_adapter")
+    (snap_d / "adapter_model.safetensors").symlink_to(blob_d)
+    assert xf._download_result_usable(
+        snap_d, repo_type = "model",
+        allow_patterns = ["model.safetensors", "adapter_model.safetensors"],
+        ignore_patterns = None) is False
 
 
 def test_post_download_validates_weightless_named_subset(tmp_path):
