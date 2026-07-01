@@ -98,6 +98,32 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     return functions
 
 
+def _fix_double_bos_and_pad(
+    text_inputs, bos_token_id, pad_token_id, image_token_id,
+    return_mm_token_type_ids, padding, padding_side, return_tensors,
+):
+    # Gemma3 adds a BOS in the chat template and another in the tokenizer; strip the duplicate on
+    # every row, add mm token type ids, then pad each field to the batch max so ragged rows stack.
+    double_bos = [bos_token_id, bos_token_id]
+    strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
+    text_inputs["input_ids"] = [x[1:] if strip[i] else x for i, x in enumerate(text_inputs["input_ids"])]
+    if "attention_mask" in text_inputs:
+        text_inputs["attention_mask"] = [a[1:] if strip[i] else a for i, a in enumerate(text_inputs["attention_mask"])]
+    if return_mm_token_type_ids:
+        text_inputs["token_type_ids"] = [[int(y == image_token_id) for y in x] for x in text_inputs["input_ids"]]
+    if padding and return_tensors is not None:
+        max_len = max((len(x) for x in text_inputs["input_ids"]), default = 0)
+        pad_id = pad_token_id or 0
+        def pad_seq(seq, fill):
+            delta = max_len - len(seq)
+            if delta <= 0: return list(seq)
+            return ([fill]*delta + list(seq)) if padding_side == "left" else (list(seq) + [fill]*delta)
+        for key, fill in (("input_ids", pad_id), ("attention_mask", 0), ("token_type_ids", 0)):
+            if key in text_inputs: text_inputs[key] = [pad_seq(x, fill) for x in text_inputs[key]]
+    return text_inputs
+pass
+
+
 def patch_Gemma3Processor():
     import re
     try:
@@ -199,23 +225,15 @@ def patch_Gemma3Processor():
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
+        # Tokenize unpadded so the double-BOS strip cannot desync row lengths, then pad afterwards.
+        padding = output_kwargs["text_kwargs"].pop("padding", False)
+        padding_side = output_kwargs["text_kwargs"].pop("padding_side", None) or \
+            getattr(self.tokenizer, "padding_side", "left")
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
-        # Fix double BOS tokens
-        double_bos_token_id = [self.tokenizer.bos_token_id]*2
-        input_ids = text_inputs["input_ids"]
-        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
-
-        # Add token type ids manually, as tokenizer can't do arbitrary position token types
-        # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
-        if return_mm_token_type_ids:
-            input_ids = text_inputs["input_ids"]
-            image_token_id = self.image_token_id
-            mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
-            # array_ids = np.array(text_inputs["input_ids"])
-            # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
-            # mm_token_type_ids[array_ids == self.image_token_id] = 1
-            # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
-            text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
+        text_inputs = _fix_double_bos_and_pad(
+            text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
+            self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
+        )
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
 
