@@ -122,16 +122,31 @@ def _grouped_mm_with_backward_fix(
 ) -> torch.Tensor:
     """Grouped matmul via torch._grouped_mm with contiguous inputs.
 
-    Some low-rank LoRA weights are contiguous but still have row strides below
-    the kernel alignment requirement, so keep a narrow fallback for those cases.
+    The weight is passed AS-IS first. torch._grouped_mm accepts a transposed
+    (non-contiguous) view as long as one matmul dim is unit-stride. The base expert
+    stacks are stored (E, 2I, H) / (E, H, I) and preprocess_weight transposes them into
+    grouped layout, producing exactly such a view for the frozen base. Forcing
+    weight.contiguous() here materialised a full copy of that frozen stack (e.g. ~805 MB
+    for gate_up on Qwen3-30B) on every step; profiling attributed ~57% of MoE GPU time to
+    these copies. We only fall back to a contiguous copy (and then the per-group matmul)
+    when the kernel actually rejects the strides, which is the narrow case of some low-rank
+    LoRA weights whose row strides are below the 16-byte alignment requirement.
+
+    Bit-exact vs the previous always-contiguous path in forward and backward, for frozen
+    and trainable weights (torch._grouped_mm produces identical results for a contiguous
+    tensor and its equivalent view).
     """
     inputs = inputs.contiguous()
+    try:
+        return torch._grouped_mm(inputs, weight, offs=offsets)
+    except RuntimeError as exc:
+        if "strides should be multiple of 16 bytes" not in str(exc):
+            raise
     weight = weight.contiguous()
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
-        message = str(exc)
-        if "strides should be multiple of 16 bytes" not in message:
+        if "strides should be multiple of 16 bytes" not in str(exc):
             raise
         return _manual_grouped_mm(inputs, weight, offsets)
 
