@@ -719,6 +719,13 @@ def _raise_chat_template_error(error, processor, model = None):
     raise RuntimeError(error) from error
 
 
+# Per-instance state for the batched chat-template fast path in __call__.
+# UNKNOWN: not yet probed; ON: batched render verified byte-identical to the
+# per-example loop for this processor; OFF: batched render unavailable/divergent,
+# always use the per-example loop.
+_BATCH_TEMPLATE_UNKNOWN, _BATCH_TEMPLATE_ON, _BATCH_TEMPLATE_OFF = 0, 1, 2
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -728,6 +735,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "_batch_template",
     )
 
     def __init__(
@@ -767,6 +775,7 @@ class UnslothVisionDataCollator:
         self.completion_only_loss = completion_only_loss
         self.pad_to_multiple_of = pad_to_multiple_of
         self.snap_to_patch_size = snap_to_patch_size
+        self._batch_template = _BATCH_TEMPLATE_UNKNOWN
         try:
             self.patch_size = model.config.vision_config.patch_size
         except Exception:
@@ -901,11 +910,16 @@ class UnslothVisionDataCollator:
         if "prompt" in examples[0] and "completion" in examples[0]:
             return self._collate_prompt_completion(examples)
 
-        texts  = []
         images = []
         videos = []
         audios = []
         video_kwargs = {'fps': []}
+
+        # Normalize every example once, then render the whole batch's chat templates in
+        # a single apply_chat_template call (falling back to per-example rendering when
+        # the processor does not support it); media extraction below reuses the same
+        # normalized messages, so the processor sees identical inputs.
+        normalized = []
         for example in examples:
             messages = self._select_messages_or_raw(example)
 
@@ -918,13 +932,11 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
+            normalized.append(messages)
 
-            message = self.processor.apply_chat_template(
-                messages,
-                tokenize = False,
-                add_generation_prompt = False,
-            )
-            texts.append(message)
+        texts = self._render_texts(normalized)
+
+        for example, messages in zip(examples, normalized):
             # Dataset with 2 columns messages / images
             image, video, video_kwarg = self._extract_images_videos_for_example(example, messages)
             image = self._resize_images_inplace(image)
@@ -990,6 +1002,47 @@ class UnslothVisionDataCollator:
         if self.train_on_responses_only:
             batch["labels"] = self.train_on_responses_only(batch)["labels"]
         return batch
+
+    def _apply_template_each(self, normalized):
+        return [
+            self.processor.apply_chat_template(
+                messages, tokenize = False, add_generation_prompt = False,
+            )
+            for messages in normalized
+        ]
+
+    def _render_texts(self, normalized):
+        # Render the whole batch's chat templates. The fast path issues a single
+        # apply_chat_template call over the list of conversations; because a processor
+        # is free to not support batched rendering (or to render it differently), the
+        # batched output is trusted only after it is verified byte-identical to the
+        # per-example loop on the first batch, and that decision is cached per instance.
+        # Any exception, wrong shape, or mismatch permanently falls back to the loop, so
+        # the returned texts are always identical to the original per-example behavior.
+        if self._batch_template == _BATCH_TEMPLATE_OFF:
+            return self._apply_template_each(normalized)
+
+        try:
+            batched = self.processor.apply_chat_template(
+                normalized, tokenize = False, add_generation_prompt = False,
+            )
+        except Exception:
+            batched = None
+
+        if not (isinstance(batched, (list, tuple)) and len(batched) == len(normalized)):
+            self._batch_template = _BATCH_TEMPLATE_OFF
+            return self._apply_template_each(normalized)
+
+        batched = list(batched)
+        if self._batch_template == _BATCH_TEMPLATE_ON:
+            return batched
+
+        # First time: only adopt the batched path if it matches the per-example loop exactly.
+        per_example = self._apply_template_each(normalized)
+        self._batch_template = (
+            _BATCH_TEMPLATE_ON if batched == per_example else _BATCH_TEMPLATE_OFF
+        )
+        return per_example
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:
