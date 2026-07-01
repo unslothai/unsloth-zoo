@@ -265,6 +265,11 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
         return False
     base = index_path.parent
     for shard in shards:
+        # A well-formed HF index lists a relative shard basename. Reject an absolute / parent-escaping
+        # value (a malformed or crafted index) rather than let ``base / shard`` resolve to an unrelated
+        # existing file OUTSIDE the snapshot and read as "present".
+        if shard.startswith(("/", "\\")) or ".." in shard.replace("\\", "/").split("/"):
+            return False
         try:
             if not (base / shard).exists():
                 return False
@@ -543,18 +548,44 @@ _CANONICAL_ROOT_SHARD_RE = re.compile(
 )
 
 
-def _has_incomplete_canonical_root_shards(snapshot_dir: Path) -> bool:
+def _has_incomplete_canonical_root_shards(
+    snapshot_dir: Path, *, ignore_patterns: "Optional[object]" = None
+) -> bool:
     """True when the root holds canonical numbered shards but is NOT a complete canonical model (index
-    missing or a shard absent) -- a stale interrupted download a default load cannot read, so the
-    post-download check rejects it and retries over HTTP. Variant shards are excluded, so a
-    variant-only repo is not force-failed here."""
+    missing or a shard absent) for the format the request READS -- a stale interrupted download a
+    default load cannot read, so the post-download check rejects it and retries over HTTP. The request's
+    ignore filter is applied, so a complete safetensors set does not mask an incomplete ``.bin`` set the
+    load reads under ``ignore=['*.safetensors']``. Variant shards are excluded (their names carry a
+    ``.<variant>-`` infix), so a variant-only repo is not force-failed here."""
     try:
         names = [entry.name for entry in snapshot_dir.iterdir()]
     except OSError:
         return False
     if not any(_CANONICAL_ROOT_SHARD_RE.match(name) for name in names):
         return False
-    return not snapshot_dir_is_complete(snapshot_dir)
+    return not snapshot_dir_is_complete(snapshot_dir, ignore_patterns = ignore_patterns)
+
+
+def _has_incomplete_variant_root_shards(snapshot_dir: Path, variant: str) -> bool:
+    """True when the root holds a VARIANT weight shard index whose set is incomplete (a listed shard
+    missing). Positive-evidence ONLY: a single-file variant (no index) or a complete variant shard set
+    returns False, so a complete or single-file variant download is never rejected. transformers writes
+    the variant index with the variant token before ``.json`` (``model.safetensors.index.<variant>.json``
+    / ``pytorch_model.bin.index.<variant>.json``), so it carries both the shard-index marker and the
+    ``.<variant>.`` infix."""
+    infix = f".{variant}."
+    try:
+        entries = list(snapshot_dir.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        name = entry.name
+        # _is_weight_shard_index matches canonical AND variant indices; the infix restricts to the
+        # requested variant (the canonical index has no ".<variant>." token).
+        if infix in name and _is_weight_shard_index(name):
+            if _safe_is_file(entry) and not _weight_shard_index_complete(entry):
+                return True
+    return False
 
 
 def requested_named_files_present(

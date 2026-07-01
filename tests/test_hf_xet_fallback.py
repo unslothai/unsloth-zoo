@@ -1979,20 +1979,30 @@ def test_oserror_subclass_errno_preserved(monkeypatch):
     assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"
 
 
-def test_raise_child_error_sets_errno_via_attribute():
-    """_raise_child_error preserves errno on an OSError subclass even when its __init__ takes a single
-    positional (like hf_hub's LocalEntryNotFoundError), where the (errno, strerror) constructor Gemini
-    proposed would raise TypeError."""
-    class _SingleArgOSError(OSError):
-        def __init__(self, message):  # rejects the two-arg (errno, strerror) form
+def test_raise_child_error_errno_only_for_builtin_oserror():
+    """errno is preserved only for a BUILTIN OSError type (a real OS errno), set via attribute so it
+    survives a builtin whose __init__ rejects the (errno, strerror) form. A NON-builtin OSError subclass
+    -- an HF HTTP error subclasses OSError via requests -> IOError -- with a bracketed [Errno N] in its
+    message must NOT get a spurious errno (#829 re-review)."""
+    # Builtin OSError subclass -> errno preserved.
+    with pytest.raises(FileNotFoundError) as excinfo:
+        xf._raise_child_error("FileNotFoundError: [Errno 2] No such file or directory")
+    assert excinfo.value.errno == 2
+
+    # A non-builtin OSError subclass (simulating HfHubHTTPError) whose message merely contains a
+    # bracketed [Errno N] must NOT have it mistaken for a real OS errno.
+    class _FakeHubHTTPError(OSError):
+        def __init__(self, message):  # single-arg, like hf_hub's error types
             super().__init__(message)
 
     orig = xf._resolve_exception_class
     try:
-        xf._resolve_exception_class = lambda name: _SingleArgOSError if name == "LocalEntryNotFoundError" else orig(name)
-        with pytest.raises(_SingleArgOSError) as excinfo:
-            xf._raise_child_error("LocalEntryNotFoundError: [Errno 2] No such file or directory")
-        assert excinfo.value.errno == 2
+        xf._resolve_exception_class = (
+            lambda name: _FakeHubHTTPError if name == "HfHubHTTPError" else orig(name)
+        )
+        with pytest.raises(_FakeHubHTTPError) as excinfo2:
+            xf._raise_child_error("HfHubHTTPError: 500 Server Error [Errno 111] for url https://x")
+        assert excinfo2.value.errno is None
     finally:
         xf._resolve_exception_class = orig
 
@@ -2359,6 +2369,89 @@ def test_post_download_rejects_incomplete_sharded_glob(tmp_path):
     (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None) is True
+
+
+def test_post_download_accepts_patterned_with_coresident_partial_canonical_shards(tmp_path):
+    """A COMPLETE patterned download (adapter / gguf / subfolder) whose selected weight the load reads is
+    present must be ACCEPTED even when an UNRELATED partial canonical base shard set is co-resident at
+    root (a leftover from a prior interrupted base pull). The canonical-shard gate is request-agnostic;
+    scoping it to requests that actually select canonical root shards avoids failing a working download
+    into a DownloadStallError (#829 re-review)."""
+    def _partial_base_shards(snap, blob):
+        (snap / "model-00001-of-00002.safetensors").symlink_to(blob)             # shard 1 present
+        (snap / "model-00002-of-00002.safetensors").symlink_to(snap / "MISSING")  # dangling shard 2
+        (snap / "model.safetensors.index.json").write_text(json.dumps(
+            {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                            "b": "model-00002-of-00002.safetensors"}}))
+    # Adapter request completes; co-resident partial base shards must not force-reject it.
+    snap, blob = _mk_snapshot(tmp_path, "adapter_coresident")
+    (snap / "adapter_model.safetensors").symlink_to(blob)
+    (snap / "adapter_config.json").write_text("{}")
+    _partial_base_shards(snap, blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model",
+        allow_patterns = ["adapter_model.safetensors", "adapter_config.json", "*.json"],
+        ignore_patterns = None) is True
+    # gguf request completes; same co-resident partial base shards.
+    snap2, blob2 = _mk_snapshot(tmp_path, "gguf_coresident")
+    (snap2 / "model.Q4_K_M.gguf").symlink_to(blob2)
+    (snap2 / "config.json").write_text("{}")
+    _partial_base_shards(snap2, blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model",
+        allow_patterns = ["model.Q4_K_M.gguf", "config.json", "*.json"],
+        ignore_patterns = None) is True
+    # A globbed weight request that DOES select canonical root shards still gets the completeness gate.
+    snap3, blob3 = _mk_snapshot(tmp_path, "glob_still_gated")
+    _partial_base_shards(snap3, blob3)
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None) is False
+
+
+def test_post_download_rejects_incomplete_ignored_format_shards(tmp_path):
+    """An unpatterned load that ignores safetensors (so it reads .bin) whose returned partial has a
+    COMPLETE safetensors shard set but an INCOMPLETE .bin set must be rejected -- the shard gate applies
+    the ignore filter, so the complete safetensors does not mask the incomplete .bin the load actually
+    reads (else the in-process load finishes the missing .bin shard over Xet) (#829 re-review)."""
+    snap, blob = _mk_snapshot(tmp_path, "ignored_format_shards")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    (snap / "pytorch_model-00001-of-00002.bin").symlink_to(blob)  # bin shard 1 only, no index/shard 2
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None,
+        ignore_patterns = ["*.safetensors"]) is False
+    # Ignoring the .bin instead (load reads the complete safetensors) -> accepted.
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
+
+
+def test_post_download_rejects_incomplete_variant_shards(tmp_path):
+    """An unpatterned variant load whose returned partial has a variant shard INDEX but is missing a
+    listed variant shard must be rejected, else the in-process load finishes the missing variant shard
+    over Xet (#829 re-review). Positive-evidence only: a COMPLETE variant shard set and a SINGLE-FILE
+    variant are both accepted (a complete variant download is never false-rejected)."""
+    snap, blob = _mk_snapshot(tmp_path, "variant_incomplete")
+    (snap / "model.fp16-00001-of-00002.safetensors").symlink_to(blob)  # shard 1; shard 2 absent
+    (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    # The missing variant shard present -> complete set -> accepted (no false-reject).
+    (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    # A single-file variant (no index) is accepted.
+    snap2, blob2 = _mk_snapshot(tmp_path, "variant_single")
+    (snap2 / "model.fp16.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
 
 
 def test_post_download_accepts_dataset_without_weight(tmp_path):

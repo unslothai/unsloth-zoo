@@ -47,6 +47,7 @@ from unsloth_zoo.hf_cache_state import (
     _filter_paths,
     _has_glob,
     _has_incomplete_canonical_root_shards,
+    _has_incomplete_variant_root_shards,
     _is_loadable_weight_file,
     blob_bytes_present,
     has_active_incomplete_blobs,
@@ -548,6 +549,17 @@ def _parse_errno(message: str) -> "Optional[int]":
         return None
 
 
+def _is_builtin_oserror(exc: BaseException) -> bool:
+    """True iff *exc*'s type is a BUILTIN ``OSError`` (or subclass): a genuine OS-level error whose
+    ``[Errno N]`` is a real errno. Excludes HF/requests HTTP errors, which subclass ``OSError`` via
+    ``requests -> IOError`` yet carry no OS errno, so a bracketed ``[Errno N]`` in their message is not
+    mistaken for one."""
+    if not isinstance(exc, OSError):
+        return False
+    builtin = getattr(builtins, type(exc).__name__, None)
+    return isinstance(builtin, type) and issubclass(builtin, OSError) and isinstance(exc, builtin)
+
+
 def _raise_child_error(message: str) -> None:
     """Re-raise a deterministic child error preserving its original TYPE when it is a known Hub / OS
     error, so callers catching ``RepositoryNotFoundError`` / ``GatedRepoError`` / ``OSError`` still
@@ -560,13 +572,15 @@ def _raise_child_error(message: str) -> None:
     exc = _instantiate_preserving_type(exc_cls, message)
     if exc is None:
         raise RuntimeError(message)
-    if isinstance(exc, OSError) and getattr(exc, "errno", None) is None:
+    if _is_builtin_oserror(exc) and getattr(exc, "errno", None) is None:
         # Preserve errno (ENOSPC / EDQUOT ...) across the spawn boundary so a caller's `except OSError`
-        # cleanup can still branch on exc.errno -- for EVERY OSError subclass (PermissionError,
-        # FileNotFoundError, hf_hub's LocalEntryNotFoundError ...), not just exact OSError. Set it as an
-        # attribute rather than via the (errno, strerror) constructor: a subclass with a single-arg
-        # __init__ (LocalEntryNotFoundError) rejects the two-arg form, and this keeps the message clean
-        # (no doubled "[Errno N]" prefix).
+        # cleanup can still branch on exc.errno -- for EVERY builtin OSError subclass (PermissionError,
+        # FileNotFoundError, ...), not just exact OSError. Restricted to BUILTIN OSError types: an HF
+        # HTTP error (HfHubHTTPError / RepositoryNotFoundError ...) is ALSO an OSError subclass (via
+        # requests -> IOError), and a bracketed "[Errno N]" in its message must not be mistaken for a
+        # real OS errno. Set it as an attribute rather than via the (errno, strerror) constructor: a
+        # subclass with a single-arg __init__ (hf_hub's LocalEntryNotFoundError) rejects the two-arg
+        # form, and this keeps the message clean (no doubled "[Errno N]" prefix).
         errno_val = _parse_errno(message)
         if errno_val is not None:
             try:
@@ -1132,6 +1146,16 @@ def _patterns_are_exact_names(patterns: Any) -> bool:
     return all(isinstance(p, str) and not _has_glob(p) for p in patterns)
 
 
+def _request_selects_canonical_root_shards(allow_patterns: Any, ignore_patterns: Any) -> bool:
+    """Whether the request's allow / ignore filter keeps a canonical ROOT shard name. When False, an
+    incomplete canonical root shard set is OUT of the request's scope -- a co-resident leftover from a
+    prior interrupted base pull that a patterned load (adapter / gguf / subfolder) never reads -- so the
+    canonical-shard-completeness gate must NOT reject on it, else a genuinely complete patterned download
+    is failed into a DownloadStallError."""
+    probes = ["model-00001-of-00002.safetensors", "pytorch_model-00001-of-00002.bin"]
+    return bool(_filter_paths(probes, allow_patterns, ignore_patterns))
+
+
 def _cache_can_skip_download(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
     variant: Optional[str] = None,
@@ -1197,36 +1221,44 @@ def _download_result_usable(
     if repo_type in (None, "model") and request_can_include_weights(allow_patterns, ignore_patterns):
         if allow_patterns is None and variant:
             # Variant root load: a partial that kept only the canonical weight would leave the load to
-            # fetch the requested variant over un-killable Xet -> require a variant-named root weight.
+            # fetch the requested variant over un-killable Xet -> require a variant-named root weight,
+            # and reject an incomplete variant shard set (index present, a listed variant shard missing).
             if not _root_has_variant_weight(snapshot_dir, variant):
+                return False
+            if _has_incomplete_variant_root_shards(snapshot_dir, variant):
                 return False
         elif allow_patterns is None:
             # Default root load: a root (or diffusers-component) weight the load reads (ignore filter
-            # applied), sharded set complete.
+            # applied), with the canonical shard set complete for the format the load READS (ignore
+            # filter applied, so a complete safetensors set does not mask an incomplete ``.bin`` the load
+            # reads under ignore=['*.safetensors']).
             if not _root_model_has_weight(snapshot_dir, ignore_patterns = ignore_patterns):
                 return False
-            if _has_incomplete_canonical_root_shards(snapshot_dir):
+            if _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns):
                 return False
         elif variant:
-            # Patterned variant load (e.g. subfolder= + variant=): a selected weight is not enough --
-            # a partial that kept only the canonical weight in scope would leave the load to fetch the
-            # requested variant over un-killable Xet. Require a selected weight carrying the variant.
+            # Patterned variant load (e.g. subfolder= + variant=): require a SELECTED weight carrying the
+            # variant -- a partial that kept only the canonical weight in scope would leave the load to
+            # fetch the requested variant over un-killable Xet. The canonical-root-shard gate does NOT
+            # apply here: the load reads variant weights, and any co-resident canonical root shard set is
+            # out of scope (checking it would false-reject a complete variant download).
             if not _has_selected_variant_weight(
                 snapshot_dir, allow_patterns = allow_patterns,
                 ignore_patterns = ignore_patterns, variant = variant,
             ):
                 return False
-            if _has_incomplete_canonical_root_shards(snapshot_dir):
-                return False
         else:
-            # Patterned weight request: a selected weight must be present AND a selected canonical shard
-            # set must be complete (a lone ``model-00001-of-0000N`` without its index / remaining shards
-            # is a partial the in-process load would finish over Xet).
+            # Patterned weight request: a selected weight must be present AND -- only when the request
+            # SELECTS canonical root shards (a globbed weight request, not an adapter / gguf / subfolder
+            # request whose co-resident canonical shards it never reads) -- that shard set must be
+            # complete (a lone ``model-00001-of-0000N`` without its index / remaining shards is a partial
+            # the in-process load would finish over Xet).
             if not _has_selected_weight(
                 snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
             ):
                 return False
-            if _has_incomplete_canonical_root_shards(snapshot_dir):
+            if _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) \
+                    and _has_incomplete_canonical_root_shards(snapshot_dir):
                 return False
     return True
 
