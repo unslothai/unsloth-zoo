@@ -259,10 +259,13 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     weight_map = data.get("weight_map") if isinstance(data, dict) else None
     if not isinstance(weight_map, dict):
         return False
-    # A non-string value is unhashable (breaks set()) and invalid for ``base / shard``; filter first.
-    shards = {s for s in weight_map.values() if isinstance(s, str)}
-    if not shards:
+    values = list(weight_map.values())
+    # A non-string shard value is a malformed index transformers cannot load; fail CLOSED (defer to the
+    # watched child) rather than silently dropping the bad entry and reading the remaining shards as a
+    # complete set.
+    if not values or not all(isinstance(s, str) for s in values):
         return False
+    shards = set(values)
     base = index_path.parent
     for shard in shards:
         # A well-formed HF index lists a relative shard basename. Reject an absolute / parent-escaping
@@ -496,14 +499,22 @@ def _canonical_root_weights_complete(
             return True
         return bool(_filter_paths([weight_name], None, ignore_patterns))
 
+    incomplete_preferred_index = False
     for index_entry in root_indices:
-        fmt_probe = (
-            "model.safetensors"
-            if ".safetensors.index." in index_entry.name
-            else "pytorch_model.bin"
-        )
-        if _format_kept(fmt_probe) and _weight_shard_index_complete(index_entry):
+        is_safetensors = ".safetensors.index." in index_entry.name
+        fmt_probe = "model.safetensors" if is_safetensors else "pytorch_model.bin"
+        if not _format_kept(fmt_probe):
+            continue  # this format is ignored -> the load will not read it
+        if _weight_shard_index_complete(index_entry):
             return True
+        if is_safetensors:
+            # transformers probes the safetensors index BEFORE the .bin, so a present-but-incomplete
+            # safetensors index means the load prefers (and fetches) safetensors -- a complete .bin must
+            # NOT mask it. Treat it as breakage (defer to the watched child) unless safetensors is
+            # explicitly ignored (handled by _format_kept above).
+            incomplete_preferred_index = True
+    if incomplete_preferred_index:
+        return False
     return any(
         name in root_files and _format_kept(name) for name in _CANONICAL_SINGLE_WEIGHTS
     )

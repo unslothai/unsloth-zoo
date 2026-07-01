@@ -2141,6 +2141,37 @@ def test_gate_fast_paths_canonical_sharded_with_index(tmp_path):
     assert hcs.snapshot_dir_is_complete(snap2) is False
 
 
+def test_shard_index_with_non_string_value_is_incomplete(tmp_path):
+    """A malformed shard index mapping a tensor to a non-string value (e.g. null) is NOT complete even
+    when the remaining string-mapped shard is present -- transformers cannot load it, so fail closed and
+    defer to the watched child rather than silently dropping the bad entry (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "badindex")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors", "b": None}}))
+    assert hcs._weight_shard_index_complete(snap / "model.safetensors.index.json") is False
+    assert hcs.snapshot_dir_is_complete(snap) is False
+
+
+def test_gate_defers_incomplete_preferred_index_masked_by_complete_bin(tmp_path):
+    """A present-but-incomplete safetensors index must not be masked by a complete pytorch_model.bin:
+    transformers probes the safetensors index BEFORE the bin, so the load would fetch the missing
+    safetensors shards over un-killable Xet. The gate defers unless safetensors is explicitly ignored
+    (then the load reads the bin) (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "prefidx")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)  # ST shard 2 absent -> incomplete index
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                   "b": "model-00002-of-00002.safetensors"}}))
+    (snap / "pytorch_model.bin").symlink_to(blob)  # complete bin co-resident
+    assert hcs.snapshot_dir_is_complete(snap) is False  # load prefers the incomplete safetensors
+    # safetensors explicitly ignored -> the load reads the complete bin -> eligible.
+    assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.safetensors"]) is True
+    # A COMPLETE safetensors index alongside the bin is eligible.
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    assert hcs.snapshot_dir_is_complete(snap) is True
+
+
 def test_gate_rejects_sharded_adapter_only_root_cache(tmp_path):
     """A complete sharded ADAPTER at the root (adapter_model.safetensors.index.json + its shards) is
     NOT a canonical base model: only model/pytorch_model index names gate the fast path. A base+adapter
@@ -2483,6 +2514,26 @@ def test_post_download_accepts_exact_named_shard_subset(tmp_path):
     assert xf._download_result_usable(
         snap2, repo_type = "model",
         allow_patterns = ["model-00001-of-00002.safetensors"], ignore_patterns = None) is False
+
+
+def test_post_download_rejects_patterned_incomplete_variant_shards(tmp_path):
+    """A GLOBBED variant request (allow=['*.safetensors'] + variant='fp16') whose partial kept only a
+    lone root variant shard without its index / remaining shards must be rejected too -- the
+    variant-shard completeness check applies to the patterned variant branch, not only allow=None (Codex
+    #829). A complete root variant shard set in scope is accepted (no false-reject)."""
+    snap, blob = _mk_snapshot(tmp_path, "pat_var_incomplete")
+    (snap / "model.fp16-00001-of-00002.safetensors").symlink_to(blob)  # lone shard, no index
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None,
+        variant = "fp16") is False
+    # Complete variant shard set -> accepted.
+    (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None,
+        variant = "fp16") is True
 
 
 def test_post_download_accepts_dataset_without_weight(tmp_path):

@@ -1237,15 +1237,20 @@ def _download_result_usable(
             if _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns):
                 return False
         elif variant:
-            # Patterned variant load (e.g. subfolder= + variant=): require a SELECTED weight carrying the
-            # variant -- a partial that kept only the canonical weight in scope would leave the load to
-            # fetch the requested variant over un-killable Xet. The canonical-root-shard gate does NOT
-            # apply here: the load reads variant weights, and any co-resident canonical root shard set is
-            # out of scope (checking it would false-reject a complete variant download).
+            # Patterned variant load (e.g. allow=['*.safetensors'] or subfolder= with variant=): require
+            # a SELECTED weight carrying the variant -- a partial that kept only the canonical weight in
+            # scope would leave the load to fetch the requested variant over un-killable Xet. Also reject
+            # an incomplete ROOT variant shard set (a lone shard with no index / a missing shard), same as
+            # the unpatterned variant branch. The CANONICAL-root-shard gate does not apply (the load reads
+            # variant weights; a co-resident canonical shard set is out of scope). A variant shard set in
+            # a subfolder is not root-checked, but a root-only check never false-rejects a complete
+            # download.
             if not _has_selected_variant_weight(
                 snapshot_dir, allow_patterns = allow_patterns,
                 ignore_patterns = ignore_patterns, variant = variant,
             ):
+                return False
+            if _has_incomplete_variant_root_shards(snapshot_dir, variant):
                 return False
         else:
             # Patterned weight request: a selected weight must be present AND -- only for a GLOBBED
