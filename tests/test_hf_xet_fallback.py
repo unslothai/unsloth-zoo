@@ -3033,6 +3033,52 @@ def test_post_download_rejects_checkpoint_only_root_model(tmp_path):
         dck, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
 
+def test_post_download_rejects_adapter_only_for_default_load(tmp_path):
+    """A DEFAULT (unpatterned) model warm reads the base model.safetensors / pytorch_model.bin, not a PEFT
+    adapter. A stale snapshot holding only adapter_model.safetensors must be rejected, else the in-process
+    base load fetches the absent base weight over un-killable Xet (Codex #829). An adapter-scoped request
+    (allow=['adapter_model*']) is unaffected: it reads the adapter and still accepts it."""
+    snap, blob = _mk_snapshot(tmp_path, "adapter_only_default")
+    (snap / "adapter_model.safetensors").symlink_to(blob)
+    (snap / "adapter_config.json").write_text("{}")
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # An ADAPTER load (patterned) reads the adapter and accepts it (no regression to the PEFT path).
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
+        ignore_patterns = None) is True
+    # The base weight present -> the default warm accepts (no false-reject), even beside the adapter.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_variant_root_check_ignores_adapter_index(tmp_path):
+    """An unpatterned variant load reads the ROOT model variant, not a PEFT adapter. A complete
+    model.fp16.safetensors co-resident with a STALE, incomplete adapter_model.safetensors.index.fp16.json
+    must still be accepted -- the root variant-shard check is restricted to model / pytorch_model variant
+    names, so the adapter index's incompleteness does not force a spurious DownloadStallError (Codex #829).
+    A genuinely incomplete ROOT model variant index is still rejected."""
+    snap, blob = _mk_snapshot(tmp_path, "var_adapter_idx")
+    (snap / "model.fp16.safetensors").symlink_to(blob)  # complete root model variant (the read weight)
+    (snap / "adapter_model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "adapter_model.fp16-00001-of-00002.safetensors",
+                        "b": "adapter_model.fp16-00002-of-00002.safetensors"}}))  # stale, shards absent
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    # An incomplete ROOT model variant index is still caught (the restriction did not disable the check).
+    snap2, blob2 = _mk_snapshot(tmp_path, "var_root_idx_incomplete")
+    (snap2 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
+    (snap2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)  # shard 2 absent
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+
 def test_post_download_rejects_variant_only_root_for_default_load(tmp_path):
     """A DEFAULT (no-variant) load reads the canonical model.safetensors / pytorch_model.bin, NOT a
     variant-named model.fp16.safetensors. A stale snapshot holding only the variant weight must be

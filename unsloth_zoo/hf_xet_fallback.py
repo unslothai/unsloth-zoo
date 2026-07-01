@@ -1048,10 +1048,12 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
     -- for a diffusers pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any
     subtree weight (as ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then
     fetch the root weights over un-killable Xet; diffusers is the one layout whose weights live in
-    subfolders. A VARIANT-named root weight (``model.fp16.safetensors``) is excluded: a default load does
-    not read it, so a variant-only cache is retried over HTTP rather than loaded. The request's ignore
-    filter is applied to the ROOT weights, so an offline-fallback partial holding only the format the load
-    will NOT read (an ignored ``*.bin`` when safetensors was requested) does not count as a usable weight."""
+    subfolders. A VARIANT-named root weight (``model.fp16.safetensors``) and a PEFT adapter
+    (``adapter_model.*``) are excluded: a default base-model load reads neither, so a cache holding only
+    those is retried over HTTP rather than loaded (its base ``model.safetensors`` / ``pytorch_model.bin``
+    is still missing). The request's ignore filter is applied to the ROOT weights, so an offline-fallback
+    partial holding only the format the load will NOT read (an ignored ``*.bin`` under a safetensors
+    request) does not count as a usable weight."""
     try:
         is_diffusers = (snapshot_dir / "model_index.json").is_file()
     except OSError:
@@ -1064,6 +1066,8 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
             name = entry.name
             if not _is_loadable_weight_file(name):
                 continue
+            if name.startswith("adapter_"):
+                continue  # a PEFT adapter (adapter_model.*) is not read by a default base-model load
             if _CANONICAL_BASE_VARIANT_RE.match(name):
                 continue  # a variant of a canonical weight is not read by a default (no-variant) load
             try:

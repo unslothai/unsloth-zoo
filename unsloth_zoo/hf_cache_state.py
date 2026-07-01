@@ -607,7 +607,9 @@ def _has_incomplete_variant_root_shards(
     format, and safetensors is treated as read BEFORE bin (transformers' probe order): a present-but-
     incomplete variant safetensors index is breakage even with a complete variant bin. Positive-evidence:
     a single-file variant or a complete variant shard set returns False, so a complete or single-file
-    variant download is never rejected."""
+    variant download is never rejected. Only the ROOT ``model`` / ``pytorch_model`` variant weight is
+    considered: a co-resident stale ``adapter_model`` variant index / shard set (which a default variant
+    model load does not read) must not force-fail a complete model variant."""
     dot_infix = f".{variant}."     # variant index (model.safetensors.index.<variant>.json) or single file
     dash_infix = f".{variant}-"    # a sharded variant weight (model.<variant>-00001-of-00002.safetensors)
     ignore_patterns = _as_pattern_list(ignore_patterns)
@@ -629,9 +631,10 @@ def _has_incomplete_variant_root_shards(
     has_single_st = False
     for entry in entries:
         name = entry.name
-        # _is_weight_shard_index matches canonical AND variant indices; the dot infix restricts to the
-        # requested variant (the canonical index has no ".<variant>." token).
-        if dot_infix in name and _is_weight_shard_index(name):
+        # Restrict to the ROOT model index (model.safetensors.index.<variant>.json /
+        # pytorch_model.bin.index.<variant>.json); an adapter_model / other non-model variant index the
+        # default load does not read is skipped so its incompleteness cannot force-fail the model variant.
+        if dot_infix in name and _ROOT_MODEL_SHARD_INDEX_RE.match(name):
             is_safetensors = ".safetensors.index." in name
             fmt_probe = (
                 f"model.{variant}.safetensors" if is_safetensors else f"pytorch_model.{variant}.bin"
@@ -643,15 +646,15 @@ def _has_incomplete_variant_root_shards(
                 st_index_incomplete = incomplete
             else:
                 bin_index_incomplete = incomplete
-        elif dash_infix in name and _is_loadable_weight_file(name):
+        elif dash_infix in name and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
             if _safe_is_file(entry) and _format_kept(name):
                 if name.endswith(".safetensors"):
                     has_st_shard = True
                 else:
                     has_bin_shard = True
-        elif dot_infix in name and _is_loadable_weight_file(name):
-            # a single-file variant weight; only a safetensors single-file matters for precedence (a
-            # single-file bin variant is complete and handled by the fall-through ``return False``).
+        elif dot_infix in name and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
+            # a single-file ROOT model variant weight; only a safetensors single-file matters for
+            # precedence (a single-file bin variant is complete and handled by the fall-through).
             if name.endswith(".safetensors") and _safe_is_file(entry) and _format_kept(name):
                 has_single_st = True
     # transformers reads safetensors before bin: judge the safetensors variant first, and fall to bin
@@ -675,6 +678,13 @@ _VARIANT_SHARD_INDEX_RE = re.compile(r"\.(?:safetensors|bin)\.index\.([^.]+)\.js
 # model.safetensors.index.json, pytorch_model.bin.index.json, and their variant forms.
 _ROOT_MODEL_SHARD_INDEX_RE = re.compile(
     r"^(?:model\.safetensors|pytorch_model\.bin)\.index(?:\.[^.]+)?\.json$"
+)
+
+# A ROOT model VARIANT weight (single or sharded): the variant token sits between the model / pytorch_model
+# base and the extension / shard suffix (model.fp16.safetensors, pytorch_model.fp16-00001-of-00002.bin).
+# Excludes a PEFT adapter (adapter_model.<variant>.*) the default variant model load does not read.
+_ROOT_MODEL_VARIANT_WEIGHT_RE = re.compile(
+    r"^(?:model|pytorch_model)\.[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
 
 
