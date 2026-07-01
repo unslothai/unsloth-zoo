@@ -79,13 +79,6 @@ from .utils import (
     remove_gradient_checkpointing,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
-    _has_mlx_norm_selected_floating_parameter,
-    _has_mlx_floating_parameter,
-    _has_mlx_parameterized_non_norm_children,
-    is_mlx_norm_parameter_path,
-    is_mlx_norm_module_path,
-    is_mlx_norm_output_cast_candidate,
-    mlx_norm_input_dtype,
     iter_mlx_norm_output_cast_classes,
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
@@ -272,18 +265,7 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
-_NORM_OUTPUT_CAST_BASE_CLASSES = tuple(
-    cls for cls in (getattr(nn, "RMSNorm", None), getattr(nn, "LayerNorm", None))
-    if isinstance(cls, type)
-)
 _part_is_norm = _mlx_norm_path_part_is_norm
-_is_norm_parameter_path = is_mlx_norm_parameter_path
-_is_norm_module_path = is_mlx_norm_module_path
-_has_norm_selected_floating_parameter = _has_mlx_norm_selected_floating_parameter
-_has_floating_parameter = _has_mlx_floating_parameter
-_has_parameterized_non_norm_children = _has_mlx_parameterized_non_norm_children
-_is_norm_output_cast_candidate = is_mlx_norm_output_cast_candidate
-_norm_output_cast_input_dtype = mlx_norm_input_dtype
 _iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
 _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
 
@@ -1045,12 +1027,10 @@ class MLXTrainer:
         except Exception:
             pass
         # Patch INSIDE try/finally so any raise during setup still restores globals.
-        _norm_cast_applied = False
         try:
             from .loader import _keep_norm_parameters_float32
             _keep_norm_parameters_float32(model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
-            _norm_cast_applied = True
             if cast_norm_output:
                 print("Unsloth: Casting MLX norm outputs back to activation dtype.")
             args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
@@ -1134,13 +1114,12 @@ class MLXTrainer:
                 self._restore_memory_limits()
             except Exception:
                 pass
-            if _norm_cast_applied:
-                # Restore the process-global norm class patch state that
-                # existed before this trainer run.
-                try:
-                    restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
-                except Exception:
-                    pass
+            # Restore the process-global norm class patch state that existed
+            # before this trainer run, even if setup failed mid-patch.
+            try:
+                restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
+            except Exception:
+                pass
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile

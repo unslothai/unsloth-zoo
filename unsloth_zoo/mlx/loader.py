@@ -140,20 +140,15 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     mx.eval(model.parameters())
 
 
-def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = False) -> None:
+def _keep_norm_parameters_float32(model) -> None:
     """Prepare MLX training by keeping normalization parameters in fp32."""
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
-    from .utils import (
-        is_mlx_norm_parameter_path,
-        set_mlx_norm_output_cast_to_input_dtype,
-    )
+    from .utils import is_mlx_norm_parameter_path
 
     try:
         parameters = model.parameters()
     except AttributeError:
-        if cast_outputs_to_input_dtype:
-            set_mlx_norm_output_cast_to_input_dtype(True, model)
         return
 
     needs_cast = False
@@ -166,8 +161,6 @@ def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = 
             needs_cast = True
             break
     if not needs_cast:
-        if cast_outputs_to_input_dtype:
-            set_mlx_norm_output_cast_to_input_dtype(True, model)
         return
 
     model.update(tree_map_with_path(
@@ -177,8 +170,6 @@ def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = 
         parameters,
     ))
     mx.eval(model.parameters())
-    if cast_outputs_to_input_dtype:
-        set_mlx_norm_output_cast_to_input_dtype(True, model)
 
 
 def _seed_mlx_random_state(random_state):

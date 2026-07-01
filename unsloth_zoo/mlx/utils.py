@@ -334,16 +334,6 @@ def restore_mlx_norm_output_cast_state(snapshot) -> None:
             patched_classes.discard(norm_cls)
 
 
-def restore_mlx_norm_output_cast_patched_classes(norm_classes) -> None:
-    desired = {
-        norm_cls for norm_cls in norm_classes
-        if isinstance(norm_cls, type)
-    }
-    patched = set(mlx_norm_output_cast_patched_classes())
-    _set_mlx_norm_output_cast_classes(False, patched - desired)
-    _set_mlx_norm_output_cast_classes(True, desired - patched)
-
-
 def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
     """Control whether MLX norm outputs are cast back to activation dtype.
 
