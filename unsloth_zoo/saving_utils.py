@@ -1649,12 +1649,13 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
     per expert (see moe_utils.py _canonical_lora_weights_for_grouped_mm), so a plain reshape
     recovers the per-expert blocks the loop sliced.
 
-    On CUDA this batches every expert into a single bmm (no Python loop, faster for many experts);
-    on CPU it keeps the loop, where the batched matmul is not a win. The batched path computes the
-    same per-expert delta = B_e @ A_e and the same `merged[e] += alpha * delta` as the loop (a
-    plain bmm + add_, NOT a fused baddbmm, so the rounding matches the loop exactly), so the result
-    is bitwise-identical to the loop in fp32/bf16/fp16. The merge callers run this in fp32."""
-    if merged.device.type == "cuda":
+    On an accelerator (CUDA / XPU / MPS) this batches every expert into a single bmm (no Python
+    loop, faster for many experts); on CPU it keeps the loop, where the batched matmul is not a
+    win. The batched path computes the same per-expert delta = B_e @ A_e and the same
+    `merged[e] += alpha * delta` as the loop (a plain bmm + add_, NOT a fused baddbmm, so the
+    rounding matches the loop exactly), so the result is bitwise-identical to the loop in
+    fp32/bf16/fp16. The merge callers run this in fp32."""
+    if merged.device.type != "cpu":
         # (E, dim_B, rank) @ (E, rank, dim_A) -> (E, dim_B, dim_A) = per-expert delta.
         B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
         A_exp = lora_A_dev.reshape(num_experts, rank, dim_A).contiguous()
@@ -1664,9 +1665,7 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
             delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
-            merged[expert_idx] = merged[expert_idx].add(
-                delta.T if use_transpose else delta, alpha=alpha
-            )
+            merged[expert_idx].add_(delta.T if use_transpose else delta, alpha=alpha)
     return merged
 pass
 
