@@ -140,40 +140,38 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
     mx.eval(model.parameters())
 
 
-def _is_norm_parameter_path(path) -> bool:
-    """Return whether a parameter path belongs to a normalization module."""
-    parts = str(path).lower().split(".")
-    # "norm" matches RMSNorm/LayerNorm; ln_* covers GPT-2/GPT-OSS.
-    return any(
-        "norm" in part or part.startswith("ln_") or part == "ln_f"
-        for part in parts[:-1]
-    )
-
-
-def _keep_norm_parameters_float32(model) -> None:
+def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = False) -> None:
     """Keep LM/VLM normalization parameters in fp32 across FT/LoRA/QLoRA."""
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
+    from .utils import (
+        is_mlx_norm_parameter_path,
+        set_mlx_norm_output_cast_to_input_dtype,
+    )
 
     needs_cast = False
     for k, v in tree_flatten(model.parameters()):
         if (
-            _is_norm_parameter_path(k)
+            is_mlx_norm_parameter_path(k)
             and mx.issubdtype(v.dtype, mx.floating)
             and v.dtype != mx.float32
         ):
             needs_cast = True
             break
     if not needs_cast:
+        if cast_outputs_to_input_dtype:
+            set_mlx_norm_output_cast_to_input_dtype(True, model)
         return
 
     model.update(tree_map_with_path(
         lambda k, v: v.astype(mx.float32)
-        if _is_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
+        if is_mlx_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
         else v,
         model.parameters(),
     ))
     mx.eval(model.parameters())
+    if cast_outputs_to_input_dtype:
+        set_mlx_norm_output_cast_to_input_dtype(True, model)
 
 
 def _seed_mlx_random_state(random_state):
@@ -3944,7 +3942,7 @@ class FastMLXModel:
                         model._unsloth_quantized_source = adapter_cfg.get(
                             "base_quantized_source"
                         )
-                    _keep_norm_parameters_float32(model)
+                    _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
@@ -4084,7 +4082,8 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            _keep_norm_parameters_float32(model)
+            _fix_gemma3_text_rmsnorm_fp32(model)
+            _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)
 
             from .utils import (
                 normalize_mlx_chat_template,
@@ -4107,7 +4106,6 @@ class FastMLXModel:
             model._is_vlm_model = True
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
-            _fix_gemma3_text_rmsnorm_fp32(model)
             _fix_gemma3_vision_post_layernorm_eps(model)
             _fix_gemma3_vision_attention_fp32_sdpa(model)
             _fix_gemma3_vision_encoder_fp32_layernorm(model)
@@ -4204,7 +4202,7 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            _keep_norm_parameters_float32(model)
+            _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)
             from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(
