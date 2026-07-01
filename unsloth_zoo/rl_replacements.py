@@ -967,8 +967,10 @@ def grpo_accumulated_loss(
                 _pack_chunks = max(1, total_rows * multiplier)
                 _pack_nz_idx = _pack_keep.nonzero(as_tuple = False)            # [T, 2] = (row, col)
                 _pack_within = _pack_nz_idx[1:, 0] == _pack_nz_idx[:-1, 0]     # [T-1]
-                # completion-prediction positions only (col >= L - logits_to_keep, same row)
-                _pack_ctgt = (_pack_nz_idx[1:, 1] >= (_pack_L - logits_to_keep)) & _pack_within
+                # completion start is per-row after left-packing: (L - logits_to_keep) minus that
+                # row's left-pad (matches create_completion_attention_mask exactly)
+                _pack_cstart = (_pack_L - logits_to_keep) - left_pad_tokens_per_prompt  # [rows]
+                _pack_ctgt = (_pack_nz_idx[1:, 1] >= _pack_cstart[_pack_nz_idx[1:, 0]]) & _pack_within
                 with autocaster:
                     # use_cache=False: a KV cache silently disables varlen packing
                     _pack_hidden = unwrapped_model(
@@ -1018,10 +1020,12 @@ def grpo_accumulated_loss(
                             _pack_rkeep = _pack_rcols >= 0
                             _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
                     device_synchronize()
-                    # compare only the completion region; the first max_left_pad window cols are
-                    # prompt-overflow the lm_head opt leaves 0
-                    _pack_cm = torch.zeros((total_rows, _pack_W), dtype = torch.float32, device = input_ids.device)
-                    _pack_cm[:, max_left_pad:] = (input_ids[:, -logits_to_keep:] != _pack_pad_id).float()
+                    # compare over the exact loss-mask region (per-row completion, non-pad)
+                    _pack_wc = torch.arange(_pack_W, device = input_ids.device)
+                    _pack_cm = (
+                        (_pack_wc.unsqueeze(0) >= (max_left_pad - left_pad_tokens_per_prompt).unsqueeze(1))
+                        & (input_ids[:, -_pack_W:] != _pack_pad_id)
+                    ).float()
                     _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
                     if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
                         print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} maxseg={_pack_maxseg} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
