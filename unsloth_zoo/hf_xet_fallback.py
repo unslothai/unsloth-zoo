@@ -557,16 +557,22 @@ def _raise_child_error(message: str) -> None:
     exc_cls = _resolve_exception_class(type_name)
     if exc_cls is None:
         raise RuntimeError(message)
-    if exc_cls is OSError:
-        # Preserve errno (ENOSPC / EDQUOT ...) so a caller's `except OSError` cleanup can still
-        # branch on exc.errno; OSError(message) alone would leave errno = None.
-        errno_val = _parse_errno(message)
-        if errno_val is not None:
-            raise OSError(errno_val, message)
-        raise OSError(message)
     exc = _instantiate_preserving_type(exc_cls, message)
     if exc is None:
         raise RuntimeError(message)
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) is None:
+        # Preserve errno (ENOSPC / EDQUOT ...) across the spawn boundary so a caller's `except OSError`
+        # cleanup can still branch on exc.errno -- for EVERY OSError subclass (PermissionError,
+        # FileNotFoundError, hf_hub's LocalEntryNotFoundError ...), not just exact OSError. Set it as an
+        # attribute rather than via the (errno, strerror) constructor: a subclass with a single-arg
+        # __init__ (LocalEntryNotFoundError) rejects the two-arg form, and this keeps the message clean
+        # (no doubled "[Errno N]" prefix).
+        errno_val = _parse_errno(message)
+        if errno_val is not None:
+            try:
+                exc.errno = errno_val
+            except Exception:
+                pass
     raise exc
 
 
@@ -723,7 +729,11 @@ def _terminate_process_group(proc: "mp.process.BaseProcess", grace_period: float
     # into an unrelated group -- killpg(pid) would then signal the WRONG group. hf_xet 1.5.x spawns no
     # helpers, so a reaped leader leaves nothing to clean up.
     if proc.is_alive():
-        _signal_group(getattr(signal, "SIGKILL", signal.SIGTERM))
+        # Match _signal_group's own SIGKILL sentinel (-9) so the force-kill branch (proc.kill()) is
+        # taken on Windows, where signal.SIGKILL is undefined. Functionally moot there (multiprocessing
+        # maps proc.kill() == proc.terminate() == TerminateProcess, a hard kill either way), but keeps
+        # the call site and the check consistent.
+        _signal_group(getattr(signal, "SIGKILL", -9))
         proc.join(timeout = 5.0)
 
 

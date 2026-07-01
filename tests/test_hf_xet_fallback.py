@@ -1964,6 +1964,39 @@ def test_oserror_errno_preserved(monkeypatch):
     assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"
 
 
+def test_oserror_subclass_errno_preserved(monkeypatch):
+    """An OSError SUBCLASS (PermissionError from an unwritable cache) keeps BOTH its type AND its errno
+    across the spawn boundary, so a caller branching on exc.errno still matches (Gemini #829). Errno is
+    set as an attribute, so it survives even for a subclass whose constructor rejects (errno, strerror);
+    the message is not double-prefixed with the errno."""
+    import errno as _errno
+
+    fake = _install(monkeypatch, [("error", "PermissionError: [Errno 13] Permission denied")])
+    with pytest.raises(PermissionError) as excinfo:
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert excinfo.value.errno == _errno.EACCES
+    assert "[Errno 13] [Errno 13]" not in str(excinfo.value)
+    assert len(fake.calls) == 1, "a deterministic error must not trigger an HTTP fallback"
+
+
+def test_raise_child_error_sets_errno_via_attribute():
+    """_raise_child_error preserves errno on an OSError subclass even when its __init__ takes a single
+    positional (like hf_hub's LocalEntryNotFoundError), where the (errno, strerror) constructor Gemini
+    proposed would raise TypeError."""
+    class _SingleArgOSError(OSError):
+        def __init__(self, message):  # rejects the two-arg (errno, strerror) form
+            super().__init__(message)
+
+    orig = xf._resolve_exception_class
+    try:
+        xf._resolve_exception_class = lambda name: _SingleArgOSError if name == "LocalEntryNotFoundError" else orig(name)
+        with pytest.raises(_SingleArgOSError) as excinfo:
+            xf._raise_child_error("LocalEntryNotFoundError: [Errno 2] No such file or directory")
+        assert excinfo.value.errno == 2
+    finally:
+        xf._resolve_exception_class = orig
+
+
 # --------------------------------------------------------------------------- #
 # Spawn-safety regressions: failed-spawn queue cleanup + disable-Xet env-race lock.
 # --------------------------------------------------------------------------- #
