@@ -279,8 +279,9 @@ def test_norm_output_cast_does_not_double_patch_inherited_norm_call():
 
     try:
         trainer_mod._set_norm_output_cast_to_input_dtype(True, model)
-        assert nn.RMSNorm in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
-        assert CustomRMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+        patched_classes = utils_mod.mlx_norm_output_cast_patched_classes()
+        assert nn.RMSNorm in patched_classes
+        assert CustomRMSNorm not in patched_classes
         assert model.input_layernorm(x).dtype == x.dtype
 
         state = utils_mod.snapshot_mlx_norm_output_cast_state(
@@ -292,8 +293,9 @@ def test_norm_output_cast_does_not_double_patch_inherited_norm_call():
     finally:
         trainer_mod._set_norm_output_cast_to_input_dtype(False)
 
-    assert nn.RMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
-    assert CustomRMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+    patched_classes = utils_mod.mlx_norm_output_cast_patched_classes()
+    assert nn.RMSNorm not in patched_classes
+    assert CustomRMSNorm not in patched_classes
     assert not getattr(
         CustomRMSNorm.__call__,
         "_unsloth_norm_output_cast_wrapper",

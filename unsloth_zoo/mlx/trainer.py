@@ -78,7 +78,6 @@ from .utils import (
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
-    _MLX_NORM_OUTPUT_CAST_PATCHED_CLASSES,
     _mlx_norm_path_part_is_norm,
     _has_mlx_norm_selected_floating_parameter,
     _has_mlx_floating_parameter,
@@ -273,7 +272,6 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
-_NORM_OUTPUT_CAST_PATCHED_CLASSES = _MLX_NORM_OUTPUT_CAST_PATCHED_CLASSES
 _NORM_OUTPUT_CAST_BASE_CLASSES = tuple(
     cls for cls in (getattr(nn, "RMSNorm", None), getattr(nn, "LayerNorm", None))
     if isinstance(cls, type)
