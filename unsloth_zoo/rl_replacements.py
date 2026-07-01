@@ -1020,11 +1020,10 @@ def grpo_accumulated_loss(
                             _pack_rkeep = _pack_rcols >= 0
                             _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
                     device_synchronize()
-                    # compare over the exact loss-mask region (per-row completion, non-pad)
-                    _pack_wc = torch.arange(_pack_W, device = input_ids.device)
-                    _pack_cm = (
-                        (_pack_wc.unsqueeze(0) >= (max_left_pad - left_pad_tokens_per_prompt).unsqueeze(1))
-                        & (input_ids[:, -_pack_W:] != _pack_pad_id)
+                    # compare over the exact loss-mask region (same mask the loss uses; pure
+                    # create_completion_attention_mask, before any tool_mask is applied)
+                    _pack_cm = create_completion_attention_mask(
+                        input_ids[:, -_pack_W:], left_pad_tokens_per_prompt, max_left_pad, _pack_pad_id
                     ).float()
                     _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
                     if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
