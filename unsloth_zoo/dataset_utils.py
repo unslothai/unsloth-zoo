@@ -316,7 +316,8 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     import multiprocessing as _mp
-    if num_proc is None or type(num_proc) is not int:
+    _num_proc_was_auto = num_proc is None or type(num_proc) is not int
+    if _num_proc_was_auto:
         if _mp.get_start_method() != 'fork':
             num_proc = None
         else:
@@ -328,6 +329,19 @@ def train_on_responses_only(
                 num_proc = 1
             else:
                 num_proc = min(num_proc, int(memory_gb_left))
+
+    # Single-process small datasets (workers cost more than they save, and large auto
+    # num_proc caused Windows spawn loops #3211/#3397); keep explicit user values.
+    _MIN_ROWS_FOR_MULTIPROC = 5_000
+    def _effective_num_proc(dataset):
+        if num_proc is None or num_proc == 1: return num_proc
+        if not _num_proc_was_auto: return num_proc  # honor explicit user value
+        try:
+            if len(dataset) < _MIN_ROWS_FOR_MULTIPROC: return None
+        except TypeError:
+            return None  # unknown length (e.g. IterableDataset)
+        return num_proc
+    pass
 
     # transformers 5.0+ VLMs skip dataset prep in SFTTrainer.__init__
     # (skip_prepare_dataset=True when _is_vlm), so tokenize before masking.
@@ -348,7 +362,7 @@ def train_on_responses_only(
         def _tokenize_fn(examples):
             texts = examples.get(text_field) or examples.get("text", [])
             return _tok(texts, truncation=True, max_length=max_length, padding=False)
-        _map_kwargs = {"batched": True, "num_proc": num_proc}
+        _map_kwargs = {"batched": True, "num_proc": _effective_num_proc(dataset)}
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
         import warnings as _w
@@ -368,20 +382,132 @@ def train_on_responses_only(
         return any(l != -100 for l in labels)
     pass
 
+    def _diagnose_truncation(dataset, dropped, fatal):
+        # When (nearly) the whole dataset is masked away, the usual cause is
+        # truncation: max_length cut off the response marker before masking found
+        # it. Raise when nothing is left to train on, otherwise just warn so the
+        # surviving rows still train (matching the old filter behaviour).
+        if getattr(trainer.args, "packing", False): return
+        max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", None)
+        # Truncation evidence is a row sitting at the length cap (max_length cut its
+        # tail, including the response marker). Without a known cap, or for short rows,
+        # a fully masked row is a wrong template / response_part, not truncation, so we
+        # keep the generic error instead of telling users to raise max_length.
+        if max_length is None: return
+        n_sampled = 0; n_trunc = 0
+        for i in dropped[:100]:
+            input_ids = dataset[int(i)].get("input_ids")
+            if input_ids is None: continue
+            if getattr(input_ids, "tolist", None): input_ids = input_ids.tolist()
+            n_sampled += 1
+            if len(input_ids) >= max_length: n_trunc += 1
+        if n_sampled == 0 or n_trunc / n_sampled < 0.9: return
+        ml = max_length
+        message = (
+            "Unsloth: train_on_responses_only masked all/most labels to -100.\n"
+            f"The most likely cause is truncation: max_length={ml} cut off the response marker "
+            f"{repr(response_part)} before masking could find it.\n"
+            "Increase max_length to fit your responses, for example SFTConfig(max_length = max_seq_length).\n"
+            "If your sequences are genuinely longer, raise max_seq_length when loading the model."
+        )
+        if fatal: raise ValueError(message)
+        print("Unsloth: Warning: " + message)
+    pass
+
     def _filter_fully_masked(dataset, dataset_name="dataset"):
         if isinstance(dataset, IterableDataset):
             return dataset  # Cannot filter IterableDataset efficiently
+        if "labels" not in dataset.column_names:
+            return dataset
+        # filter rewrites the whole Arrow table even when it drops nothing, so scan the
+        # labels column cheaply first; the common case (0 fully masked) returns as-is.
         n_before = len(dataset)
-        dataset = dataset.filter(_has_valid_labels, num_proc=num_proc)
-        n_after = len(dataset)
-        n_removed = n_before - n_after
+        # Track only the fully masked rows, so a huge clean corpus builds no per-row list.
+        dropped = []
+        try:
+            idx = 0
+            for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
+                for labels in batch["labels"]:
+                    if labels is not None:
+                        if getattr(labels, "tolist", None): labels = labels.tolist()
+                        if not any(l != -100 for l in labels): dropped.append(idx)
+                    idx += 1
+        except Exception:
+            # Datasets with a custom transform may need other columns; fall back.
+            return dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        if not dropped:
+            return dataset  # nothing fully masked
+        # Most rows masked away across the WHOLE dataset usually means truncation.
+        # Only fatal when no rows survive; otherwise warn and keep the valid rows.
+        if len(dropped) / n_before >= 0.9:
+            _diagnose_truncation(dataset, dropped, fatal = len(dropped) == n_before)
+        # Everything masked and not from truncation: the markers do not match the
+        # template at all, so fail clearly instead of returning an empty dataset.
+        if len(dropped) == n_before:
+            raise ValueError(
+                f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}, "
+                f"so there is nothing to train on. The response marker {repr(response_part)} was not "
+                "found in any sample - check that instruction_part and response_part match your chat template."
+            )
+        # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
+        # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
+        # exact inverse of `dropped`, so survivors are identical.
+        dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
                 f"Unsloth: Removed {n_removed} out of {n_before} samples from {dataset_name} "
-                f"where all labels were -100 (no response found after truncation). "
+                f"where all labels were -100 (no response marker found, usually truncation). "
                 f"This prevents NaN loss during training."
             )
         return dataset
+    pass
+
+    # Vision/processor collators (e.g. UnslothVisionDataCollator) rebuild labels
+    # from the processor at collate time, so dataset-level masking is ignored and
+    # replacing the collator would break image handling. Enable response masking on
+    # the collator itself and skip the text dataset path.
+    def _is_vision_collator(collator):
+        if collator is None: return False
+        if any(b.__name__ == "UnslothVisionDataCollator" for b in type(collator).__mro__): return True
+        # A vision collator may hold the processor under .processor or the common .tokenizer field
+        # (e.g. DataCollatorForSeq2Seq(tokenizer=processor)); either exposing image_processor marks it.
+        for attr in ("processor", "tokenizer"):
+            obj = getattr(collator, attr, None)
+            if obj is not None and hasattr(obj, "image_processor"): return True
+        return hasattr(collator, "image_processor")
+    pass
+
+    data_collator = getattr(trainer, "data_collator", None)
+    if _is_vision_collator(data_collator):
+        masking = getattr(data_collator, "train_on_responses_only", None)
+        if callable(masking):
+            return trainer  # collator already masks responses; nothing to do
+        is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
+        if not is_unsloth:
+            # A processor-style collator we cannot reliably configure: do not return as
+            # if masking were applied (it would leave responses unmasked silently).
+            raise ValueError(
+                "Unsloth: Detected a vision data collator that does not support response-only "
+                "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+                "instruction_part = ..., response_part = ...) so masking runs at collate time."
+            )
+        # If the collator's tokenizer already carries the parts, let the nested call
+        # read them; passing them explicitly would hit the "already set" guard.
+        coll_proc = getattr(data_collator, "processor", tokenizer)
+        coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
+        parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
+            dict(instruction_part = instruction_part, response_part = response_part)
+        data_collator.train_on_responses_only = train_on_responses_only(
+            None,
+            force_match        = force_match,
+            tokenizer          = coll_proc,
+            return_function    = True,
+            last_response_only = last_response_only,
+            **parts,
+        )
+        print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
+        return trainer
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -391,7 +517,7 @@ def train_on_responses_only(
         if isinstance(trainer.train_dataset, IterableDataset):
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
         else:
-            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.train_dataset))
         trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
     pass
 
@@ -405,7 +531,7 @@ def train_on_responses_only(
                 if isinstance(value, IterableDataset):
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
                 trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
@@ -414,12 +540,13 @@ def train_on_responses_only(
             if isinstance(trainer.eval_dataset, IterableDataset):
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
             else:
-                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.eval_dataset))
             trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
         pass
     pass
 
-    # Edit data collator as well if not DataCollatorForSeq2Seq
+    # Edit data collator to DataCollatorForSeq2Seq (vision collators were handled
+    # earlier and returned, so trainer.data_collator here is a text collator).
     from transformers import DataCollatorForSeq2Seq
     packing_enabled = getattr(trainer.args, "packing", False)
     if (
