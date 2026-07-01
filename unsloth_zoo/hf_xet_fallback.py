@@ -968,34 +968,57 @@ def _has_any_weight(snapshot_dir: Path) -> bool:
     return False
 
 
-def _root_has_loadable_weight(snapshot_dir: Path) -> bool:
-    """True if a loadable weight sits at the snapshot ROOT (where a default load reads it). Ignores
-    subfolders, so a stale ``checkpoint-7/``-only snapshot is not mistaken for a usable root model."""
-    try:
-        for entry in snapshot_dir.iterdir():
-            if _is_loadable_weight_file(entry.name):
-                try:
-                    if entry.is_file():
-                        return True
-                except OSError:
-                    continue
-    except OSError:
-        return False
-    return False
-
-
-def _root_model_has_weight(snapshot_dir: Path) -> bool:
+def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
     """Whether an UNPATTERNED model warm holds a weight a default load reads: a ROOT weight, or -- for a
     diffusers pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any subtree
     weight (as ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then fetch
-    the root weights over un-killable Xet; diffusers is the one layout whose weights live in subfolders."""
+    the root weights over un-killable Xet; diffusers is the one layout whose weights live in subfolders.
+    The request's ignore filter is applied to the ROOT weights, so an offline-fallback partial holding
+    only the format the load will NOT read (an ignored ``*.bin`` when safetensors was requested) does not
+    count as a usable weight -- the incomplete result is retried over HTTP instead of loaded in-process."""
     try:
         is_diffusers = (snapshot_dir / "model_index.json").is_file()
     except OSError:
         is_diffusers = False
     if is_diffusers:
         return _has_any_weight(snapshot_dir)
-    return _root_has_loadable_weight(snapshot_dir)
+    rels: list = []
+    try:
+        for entry in snapshot_dir.iterdir():
+            if not _is_loadable_weight_file(entry.name):
+                continue
+            try:
+                if entry.is_file():
+                    rels.append(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return bool(_filter_paths(rels, None, ignore_patterns))
+
+
+def _root_has_variant_weight(snapshot_dir: Path, variant: str) -> bool:
+    """True if a ROOT weight carrying the requested *variant* token is present. transformers inserts the
+    variant before the extension (a ``.<variant>.`` infix: ``model.fp16.safetensors``) or before a shard
+    suffix (a ``.<variant>-`` infix: ``model.fp16-00001-of-00002.safetensors``), so an offline-fallback
+    partial that kept only the canonical weight does not satisfy a variant request."""
+    infix_dot = f".{variant}."
+    infix_dash = f".{variant}-"
+    try:
+        for entry in snapshot_dir.iterdir():
+            name = entry.name
+            if not _is_loadable_weight_file(name):
+                continue
+            if infix_dot not in name and infix_dash not in name:
+                continue
+            try:
+                if entry.is_file():
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
 
 
 # Interchangeable exact weight names: the either-format ``["pytorch_model.bin", "model.safetensors"]``
@@ -1106,19 +1129,23 @@ def _cache_can_skip_download(
 
 def _download_result_usable(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
+    variant: Optional[str] = None,
 ) -> bool:
     """POST-download: whether the child's result is usable, or should be retried over HTTP.
     snapshot_download already did the authoritative manifest compare, so accept unless there is
-    POSITIVE breakage evidence; LENIENT otherwise (a finished diffusers / variant / either-format
-    download passes, an optional missing file is not treated as broken) so a good download is never
-    looped into a ``DownloadStallError``. Breakage checks:
+    POSITIVE breakage evidence; LENIENT otherwise (a finished diffusers / either-format download passes,
+    an optional missing file is not treated as broken) so a good download is never looped into a
+    ``DownloadStallError``. A transient connection error during the child's metadata call makes
+    ``snapshot_download`` silently return an existing (stale / partial) cache instead of fetching, so
+    the checks below apply the request's filters to the weight the load will actually read. Breakage:
 
     - A dangling REQUESTED symlink (a missing / still-``.incomplete`` blob).
     - A missing EXACT-named requested file (grouped by weight equivalence: the either-format pair needs
       one; base AND adapter, or a ``["tokenizer.json"]`` request, each). Globs stay lenient.
-    - A weight-bearing MODEL request with no usable weight. UNPATTERNED -> the weight must be
-      ROOT-readable (or a diffusers component; a stale ``checkpoint-7/``-only snapshot does not count)
-      and a loose canonical-sharded warm (no index) is rejected. Patterned -> a weight WITHIN scope."""
+    - A weight-bearing MODEL request with no usable weight. A variant load needs a variant-named ROOT
+      weight (the canonical weight a partial kept does not satisfy it). UNPATTERNED -> a ROOT-readable
+      weight the load reads (ignore filter applied; a stale ``checkpoint-7/``-only snapshot does not
+      count) with a complete canonical shard set. Patterned -> a weight WITHIN scope, shard set complete."""
     if snapshot_has_requested_broken_symlinks(
         snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         repo_type = repo_type,
@@ -1129,22 +1156,34 @@ def _download_result_usable(
     ):
         return False
     if repo_type in (None, "model") and request_can_include_weights(allow_patterns, ignore_patterns):
-        if allow_patterns is None:
-            # Default root load: a root (or diffusers-component) weight, sharded set complete.
-            if not _root_model_has_weight(snapshot_dir):
+        if allow_patterns is None and variant:
+            # Variant root load: a partial that kept only the canonical weight would leave the load to
+            # fetch the requested variant over un-killable Xet -> require a variant-named root weight.
+            if not _root_has_variant_weight(snapshot_dir, variant):
+                return False
+        elif allow_patterns is None:
+            # Default root load: a root (or diffusers-component) weight the load reads (ignore filter
+            # applied), sharded set complete.
+            if not _root_model_has_weight(snapshot_dir, ignore_patterns = ignore_patterns):
                 return False
             if _has_incomplete_canonical_root_shards(snapshot_dir):
                 return False
-        elif not _has_selected_weight(
-            snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
-        ):
-            # Patterned weight request: a weight WITHIN the requested scope must be present.
-            return False
+        else:
+            # Patterned weight request: a selected weight must be present AND a selected canonical shard
+            # set must be complete (a lone ``model-00001-of-0000N`` without its index / remaining shards
+            # is a partial the in-process load would finish over Xet).
+            if not _has_selected_weight(
+                snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+            ):
+                return False
+            if _has_incomplete_canonical_root_shards(snapshot_dir):
+                return False
     return True
 
 
 def _snapshot_payload_incomplete(
-    payload: Any, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any
+    payload: Any, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
+    variant: Optional[str] = None,
 ) -> bool:
     """True when a snapshot download returned a real directory not usable for the request (see
     ``_download_result_usable``). Guarded to an existing dir, so a mocked / non-path payload (tests) is
@@ -1160,7 +1199,7 @@ def _snapshot_payload_incomplete(
         return False
     return not _download_result_usable(
         path, repo_type = repo_type, allow_patterns = allow_patterns,
-        ignore_patterns = ignore_patterns,
+        ignore_patterns = ignore_patterns, variant = variant,
     )
 
 
@@ -1178,6 +1217,7 @@ def _download_with_xet_fallback(
     grace_period: float,
     on_status: Optional[Callable[[str], None]],
     prepare_for_http_fn: Optional[Callable[[str, str], None]],
+    variant: Optional[str] = None,
 ) -> str:
     """Shared 2-attempt loop: Xet primary, HTTP on a stall. Returns the local path."""
     if cancel_event is not None and cancel_event.is_set():
@@ -1238,6 +1278,7 @@ def _download_with_xet_fallback(
                 repo_type = repo_type,
                 allow_patterns = params.get("allow_patterns"),
                 ignore_patterns = params.get("ignore_patterns"),
+                variant = variant,
             ):
                 # HF can hand back an existing incomplete snapshot dir (offline / timed-out request)
                 # instead of fetching the missing files. Never load that in-process: retry over HTTP,
@@ -1495,4 +1536,5 @@ def snapshot_download_with_xet_fallback(
         grace_period = grace_period,
         on_status = on_status,
         prepare_for_http_fn = prepare_for_http_fn,
+        variant = variant,
     )

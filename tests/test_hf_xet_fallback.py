@@ -2240,6 +2240,59 @@ def test_post_download_rejects_config_only_model(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
 
+def test_post_download_rejects_ignored_only_format(tmp_path):
+    """snapshot_download silently returns a stale cache on a transient metadata error. A safetensors
+    load (ignore=['*.bin']) whose returned partial kept only the ignored pytorch_model.bin -- not the
+    requested model.safetensors -- must be rejected (the weight check applies the ignore filter) and
+    retried over HTTP, not loaded in-process (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "ignfmt")
+    (snap / "pytorch_model.bin").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is False
+    # The requested safetensors present -> accepted.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
+
+
+def test_post_download_rejects_canonical_only_for_variant(tmp_path):
+    """A variant load (variant='fp16') whose returned partial kept only the canonical model.safetensors
+    -- not model.fp16.safetensors -- must be rejected and retried, else the in-process load fetches the
+    missing variant over un-killable Xet (Codex #829). A present variant weight (single or sharded
+    infix) is accepted."""
+    snap, blob = _mk_snapshot(tmp_path, "varpost")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    (snap / "model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    snap2, blob2 = _mk_snapshot(tmp_path, "varshard")
+    (snap2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
+def test_post_download_rejects_incomplete_sharded_glob(tmp_path):
+    """A globbed weight request (allow=['*.safetensors']) whose returned partial has a canonical shard
+    index but is missing a shard must be rejected -- globs get the same shard-completeness check as the
+    unpatterned root path -- so the load does not finish the missing shard over Xet (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "shardglob")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                   "b": "model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None) is False
+    # The missing shard present -> complete -> accepted.
+    (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None) is True
+
+
 def test_post_download_accepts_dataset_without_weight(tmp_path):
     snap, blob = _mk_snapshot(tmp_path, "ds")
     (snap / "data.parquet").symlink_to(blob)
