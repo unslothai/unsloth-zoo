@@ -895,7 +895,10 @@ class MLXTrainer:
             "_unsloth_mlx_warmup_steps_explicit",
             warmup_steps != default_warmup_steps,
         )
-        if steps_explicit:
+        # HF get_warmup_steps parity: a zero warmup_steps never overrides a positive
+        # warmup_ratio. warmup_steps == 0 means "use the ratio" even when explicitly
+        # set, so only a positive explicit step count wins over the ratio.
+        if steps_explicit and warmup_steps > 0:
             return max(0, warmup_steps)
 
         resolved = math.ceil(max(0.0, warmup_ratio) * max(0, int(total_steps)))

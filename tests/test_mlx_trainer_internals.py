@@ -165,6 +165,17 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     )
     assert clamped_trainer._resolve_warmup_steps(total_steps=8) == 8
 
+    # Explicit warmup_steps=0 must not disable a positive warmup_ratio (HF parity):
+    # a zero step count means "use the ratio", not "no warmup".
+    zero_steps_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    zero_steps_ratio_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_steps=0,
+        warmup_ratio=0.1,
+    )
+    assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
 
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig

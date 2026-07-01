@@ -4199,7 +4199,13 @@ class FastMLXModel:
                                     "Use the saved base quantization policy or retrain "
                                     "the adapter for the requested base quantization."
                                 )
-                    elif _adapter_base_bnb is not None:
+                    # A bnb-4bit base always needs MLX 4-bit quantization. Force it
+                    # whenever the metadata branch above did not yield a usable MLX
+                    # config -- no metadata at all, or only a CUDA/bitsandbytes
+                    # base_quantization_config with no MLX map -- so we never reload a
+                    # full-precision base for a 4-bit-trained adapter. A usable MLX map
+                    # already set adapter_mlx_quant_config, so this leaves it intact.
+                    if _adapter_base_bnb is not None and adapter_mlx_quant_config is None:
                         adapter_mlx_quant_config = {
                             "bits": 4,
                             "group_size": _MLX_QUANT_MODE_DEFAULTS["affine"][0],
@@ -4387,8 +4393,16 @@ class FastMLXModel:
                     model._src_path = base_local
                     model._unsloth_base_revision = adapter_base_revision
                     model._unsloth_base_commit_hash = (
-                        adapter_cfg.get("base_model_commit_hash")
-                        or _infer_snapshot_commit(base_local)
+                        # A bnb-4bit base was remapped to its full-precision repo; the
+                        # adapter's recorded base_model_commit_hash is the bnb repo's
+                        # commit and need not exist in the base repo, so infer from the
+                        # downloaded base snapshot to avoid writing an unresolvable rev.
+                        _infer_snapshot_commit(base_local)
+                        if _adapter_base_bnb is not None
+                        else (
+                            adapter_cfg.get("base_model_commit_hash")
+                            or _infer_snapshot_commit(base_local)
+                        )
                     )
                     model._is_vlm_model = is_vlm_model
                     if processor is not None:
