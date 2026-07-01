@@ -1083,6 +1083,34 @@ def _has_selected_weight(
     return bool(_filter_paths(weights, allow_patterns, ignore_patterns))
 
 
+def _has_selected_variant_weight(
+    snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any, variant: str,
+) -> bool:
+    """True if a SELECTED loadable weight carrying the *variant* token is present. Combines the request's
+    allow / ignore scope (as ``_has_selected_weight``) with the variant infix check (as
+    ``_root_has_variant_weight``): a patterned variant load (e.g. ``subfolder=`` + ``variant=``) whose
+    offline-fallback partial kept only the canonical weight in scope is retried over HTTP rather than
+    loaded, else the in-process load fetches ``model.<variant>.safetensors`` over un-killable Xet."""
+    infix_dot = f".{variant}."
+    infix_dash = f".{variant}-"
+    weights: list = []
+    try:
+        for entry in snapshot_dir.rglob("*"):
+            name = entry.name
+            if not _is_loadable_weight_file(name):
+                continue
+            if infix_dot not in name and infix_dash not in name:
+                continue
+            try:
+                if entry.is_file():
+                    weights.append(entry.relative_to(snapshot_dir).as_posix())
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return False
+    return bool(_filter_paths(weights, allow_patterns, ignore_patterns))
+
+
 def _patterns_are_exact_names(patterns: Any) -> bool:
     """True only for a non-empty allow list of EXACT filenames (no ``None`` / glob / trailing-slash
     dir). Only such a request is locally provable complete; ``None`` / a glob needs the Hub manifest."""
@@ -1142,10 +1170,11 @@ def _download_result_usable(
     - A dangling REQUESTED symlink (a missing / still-``.incomplete`` blob).
     - A missing EXACT-named requested file (grouped by weight equivalence: the either-format pair needs
       one; base AND adapter, or a ``["tokenizer.json"]`` request, each). Globs stay lenient.
-    - A weight-bearing MODEL request with no usable weight. A variant load needs a variant-named ROOT
-      weight (the canonical weight a partial kept does not satisfy it). UNPATTERNED -> a ROOT-readable
-      weight the load reads (ignore filter applied; a stale ``checkpoint-7/``-only snapshot does not
-      count) with a complete canonical shard set. Patterned -> a weight WITHIN scope, shard set complete."""
+    - A weight-bearing MODEL request with no usable weight. A variant load needs a variant-named weight
+      (the canonical weight a partial kept does not satisfy it): a ROOT one when UNPATTERNED, else one
+      WITHIN scope. UNPATTERNED non-variant -> a ROOT-readable weight the load reads (ignore filter
+      applied; a stale ``checkpoint-7/``-only snapshot does not count) with a complete canonical shard
+      set. Patterned non-variant -> a weight WITHIN scope, shard set complete."""
     if snapshot_has_requested_broken_symlinks(
         snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         repo_type = repo_type,
@@ -1165,6 +1194,17 @@ def _download_result_usable(
             # Default root load: a root (or diffusers-component) weight the load reads (ignore filter
             # applied), sharded set complete.
             if not _root_model_has_weight(snapshot_dir, ignore_patterns = ignore_patterns):
+                return False
+            if _has_incomplete_canonical_root_shards(snapshot_dir):
+                return False
+        elif variant:
+            # Patterned variant load (e.g. subfolder= + variant=): a selected weight is not enough --
+            # a partial that kept only the canonical weight in scope would leave the load to fetch the
+            # requested variant over un-killable Xet. Require a selected weight carrying the variant.
+            if not _has_selected_variant_weight(
+                snapshot_dir, allow_patterns = allow_patterns,
+                ignore_patterns = ignore_patterns, variant = variant,
+            ):
                 return False
             if _has_incomplete_canonical_root_shards(snapshot_dir):
                 return False

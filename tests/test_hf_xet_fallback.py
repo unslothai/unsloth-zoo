@@ -2276,6 +2276,41 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
         variant = "fp16") is True
 
 
+def test_post_download_rejects_patterned_canonical_only_for_variant(tmp_path):
+    """A PATTERNED variant load (subfolder= + variant=, so allow=['weights/*']) whose returned partial
+    kept only the canonical weight in scope must be rejected -- the variant check applies to the
+    patterned branch too, not only allow=None (Codex #829). A present in-scope variant weight is
+    accepted, and a complete variant download is never false-rejected."""
+    snap, blob = _mk_snapshot(tmp_path, "subvar")
+    sub = snap / "weights"
+    sub.mkdir()
+    (sub / "model.safetensors").symlink_to(blob)  # canonical only, no variant
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
+        variant = "fp16") is False
+    # The in-scope variant weight present -> complete -> accepted (no false-reject).
+    (sub / "model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
+        variant = "fp16") is True
+    # A sharded in-scope variant weight (dash infix) is likewise accepted.
+    snap2, blob2 = _mk_snapshot(tmp_path, "subvarshard")
+    sub2 = snap2 / "weights"
+    sub2.mkdir()
+    (sub2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
+        variant = "fp16") is True
+    # An out-of-scope variant weight does NOT satisfy an in-scope variant request.
+    snap3, blob3 = _mk_snapshot(tmp_path, "subvaroos")
+    (snap3 / "model.fp16.safetensors").symlink_to(blob3)  # at root, but request scopes to weights/
+    (snap3 / "weights").mkdir()
+    (snap3 / "weights" / "model.safetensors").symlink_to(blob3)
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
+        variant = "fp16") is False
+
+
 def test_post_download_rejects_incomplete_sharded_glob(tmp_path):
     """A globbed weight request (allow=['*.safetensors']) whose returned partial has a canonical shard
     index but is missing a shard must be rejected -- globs get the same shard-completeness check as the
