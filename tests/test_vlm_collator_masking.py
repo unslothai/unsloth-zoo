@@ -20,10 +20,8 @@ import os, sys, types, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-# NOTE: unsloth_zoo is imported lazily inside _check (not at module top). Importing it
-# runs unsloth_zoo/__init__.py, which raises ImportError when the separate `unsloth`
-# package is absent; at module scope that would break pytest collection before the
-# "OFF by default" skip gate in test_vlm_collator_masking() can run.
+# unsloth_zoo is imported lazily inside _check: at module scope its __init__ raises
+# ImportError without the `unsloth` package, breaking collection before the skip gate runs.
 
 ENABLED = os.environ.get("UNSLOTH_TEST_VLM_COLLATOR", "") not in ("", "0", "false")
 CACHE = os.environ.get("UNSLOTH_VLM_PROC_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_vlm_proc"))
@@ -49,9 +47,8 @@ def _fetch(repo):
     path = os.path.join(CACHE, repo.replace("/", "__"))
     cached = os.path.isdir(path) and any(f.startswith("tokenizer") for f in os.listdir(path))
     if not cached:
-        # Downloads are opt-in. Without UNSLOTH_TEST_VLM_COLLATOR an uncached repo is
-        # skipped (raise -> _check returns SKIP), never fetched, even when CACHE already
-        # exists from a prior partial run - so the sweep stays truly off by default.
+        # Downloads are opt-in: without the flag an uncached repo raises (-> _check SKIP)
+        # instead of fetching, even if CACHE exists from a prior partial run.
         if not ENABLED:
             raise RuntimeError(f"{repo} not cached; set UNSLOTH_TEST_VLM_COLLATOR=1 to download")
         from huggingface_hub import snapshot_download

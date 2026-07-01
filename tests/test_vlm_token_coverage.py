@@ -9,11 +9,9 @@ the network sweep (test_notebook_chat_templates.py / manual), this pins the stri
 """
 import os, sys, importlib.util
 
-# Load unsloth_zoo/vlm_tokens.py by file path instead of `from unsloth_zoo.vlm_tokens
-# import ...`. Importing the submodule runs unsloth_zoo/__init__.py, which raises
-# ImportError ("Please install Unsloth ...") when the separate `unsloth` package is not
-# installed, breaking pytest collection on offline CI. vlm_tokens.py is pure data with no
-# imports, so loading it in isolation keeps this offline test hermetic and always runnable.
+# Load vlm_tokens.py by file path, not `from unsloth_zoo.vlm_tokens import ...`: the latter
+# runs unsloth_zoo/__init__ (ImportError without the `unsloth` package) and breaks collection.
+# vlm_tokens.py is pure data, so loading it in isolation keeps this test hermetic.
 def _load_vlm_tokens():
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "unsloth_zoo", "vlm_tokens.py")

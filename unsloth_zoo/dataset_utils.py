@@ -330,9 +330,8 @@ def train_on_responses_only(
             else:
                 num_proc = min(num_proc, int(memory_gb_left))
 
-    # Spawning workers for a fast op on a small dataset costs more than it saves,
-    # and large auto num_proc caused Windows spawn loops (#3211, #3397). Single
-    # process small datasets, but keep the non-fork guard and explicit user values.
+    # Single-process small datasets (workers cost more than they save, and large auto
+    # num_proc caused Windows spawn loops #3211/#3397); keep explicit user values.
     _MIN_ROWS_FOR_MULTIPROC = 5_000
     def _effective_num_proc(dataset):
         if num_proc is None or num_proc == 1: return num_proc
@@ -420,13 +419,10 @@ def train_on_responses_only(
             return dataset  # Cannot filter IterableDataset efficiently
         if "labels" not in dataset.column_names:
             return dataset
-        # dataset.filter rewrites the whole Arrow table even when it drops nothing,
-        # so scan the labels column cheaply and only select when a row is fully
-        # masked (the common case removes 0 and skips the rewrite entirely).
+        # filter rewrites the whole Arrow table even when it drops nothing, so scan the
+        # labels column cheaply first; the common case (0 fully masked) returns as-is.
         n_before = len(dataset)
-        # Track only the fully masked rows. The common healthy case collects an empty
-        # list and returns without ever building a per-row keep list, so a huge clean
-        # corpus does not pay one Python int per surviving row.
+        # Track only the fully masked rows, so a huge clean corpus builds no per-row list.
         dropped = []
         try:
             idx = 0
@@ -453,12 +449,9 @@ def train_on_responses_only(
                 f"so there is nothing to train on. The response marker {repr(response_part)} was not "
                 "found in any sample - check that instruction_part and response_part match your chat template."
             )
-        # Drop the fully masked rows with an Arrow-native mask (filter) rather than
-        # select(keep_indices): materializing every surviving index would allocate one
-        # Python int per kept row, which can be many GB on a very large corpus that has
-        # only a few bad rows. _has_valid_labels is the exact inverse of `dropped`, so
-        # the survivors are identical. The healthy common case already returned above,
-        # so filter only runs when there is genuinely something to remove.
+        # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
+        # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
+        # exact inverse of `dropped`, so survivors are identical.
         dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
         n_removed = n_before - len(dataset)
         if n_removed > 0:
