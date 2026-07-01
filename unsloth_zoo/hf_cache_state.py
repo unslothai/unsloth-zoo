@@ -508,25 +508,23 @@ def _canonical_root_weights_complete(
             return True
         return bool(_filter_paths([weight_name], None, ignore_patterns))
 
-    incomplete_preferred_index = False
-    for index_entry in root_indices:
-        is_safetensors = ".safetensors.index." in index_entry.name
-        fmt_probe = "model.safetensors" if is_safetensors else "pytorch_model.bin"
-        if not _format_kept(fmt_probe):
-            continue  # this format is ignored -> the load will not read it
-        if _weight_shard_index_complete(index_entry):
-            return True
-        if is_safetensors:
-            # transformers probes the safetensors index BEFORE the .bin, so a present-but-incomplete
-            # safetensors index means the load prefers (and fetches) safetensors -- a complete .bin must
-            # NOT mask it. Treat it as breakage (defer to the watched child) unless safetensors is
-            # explicitly ignored (handled by _format_kept above).
-            incomplete_preferred_index = True
-    if incomplete_preferred_index:
-        return False
-    return any(
-        name in root_files and _format_kept(name) for name in _CANONICAL_SINGLE_WEIGHTS
-    )
+    st_index = next((e for e in root_indices if ".safetensors.index." in e.name), None)
+    bin_index = next((e for e in root_indices if ".bin.index." in e.name), None)
+    # transformers' local weight-file precedence, mirrored exactly: a single model.safetensors is probed
+    # BEFORE the safetensors index, safetensors before the .bin single, and the .bin single before the
+    # .bin index. So a complete single weight is never masked by a co-resident stale index, and an
+    # incomplete PREFERRED (safetensors) index is breakage a complete .bin must not mask (transformers
+    # takes the safetensors-index branch and does not fall back to .bin). A format the ignore filter
+    # drops is skipped so the next format the load actually reads is judged.
+    if "model.safetensors" in root_files and _format_kept("model.safetensors"):
+        return True
+    if st_index is not None and _format_kept("model.safetensors"):
+        return _weight_shard_index_complete(st_index)
+    if "pytorch_model.bin" in root_files and _format_kept("pytorch_model.bin"):
+        return True
+    if bin_index is not None and _format_kept("pytorch_model.bin"):
+        return _weight_shard_index_complete(bin_index)
+    return False
 
 
 def snapshot_dir_is_complete(
@@ -789,6 +787,31 @@ def _selected_shard_index_incomplete(
 _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
 
 
+def _diffusers_declared_components(snapshot_dir: Path) -> "Optional[set]":
+    """The component subfolder names a diffusers ``model_index.json`` declares (top-level keys mapping to
+    a ``[library, class]`` list; ``_``-prefixed metadata keys excluded). None when the file is absent /
+    unreadable / malformed, so the caller falls back to treating every subfolder as a component (fail
+    OPEN, preserving hang protection). Scopes the component shard check to what the pipeline actually
+    reads, so a co-resident stale UNDECLARED subtree (a leftover adapter / controlnet dir the
+    ``DiffusionPipeline`` load never reads) cannot force-fail a complete pipeline download."""
+    import json
+
+    try:
+        with open(snapshot_dir / "model_index.json", "r", encoding = "utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    components = {
+        key for key, value in data.items()
+        if not key.startswith("_") and isinstance(value, (list, tuple))
+    }
+    # A real pipeline always declares components; an empty / all-metadata model_index.json is degenerate
+    # or malformed -> fail OPEN (None) so the caller checks every subfolder, preserving hang protection.
+    return components or None
+
+
 def _diffusers_component_shards_incomplete(
     snapshot_dir: Path, *, variant: "Optional[str]" = None,
     ignore_patterns: "Optional[object]" = None,
@@ -797,14 +820,16 @@ def _diffusers_component_shards_incomplete(
     weight-shard INDEX of the read variant that lists a shard that is absent (or the index is malformed)
     -- an interrupted component pull the in-process pipeline load would finish over un-killable Xet.
 
-    Scoped so a complete pipeline is never false-rejected: a ROOT index (owned by the canonical / variant
-    root-model checks) and a training-checkpoint subtree (checkpoint-N/, never read as a pipeline
-    component) are skipped, and the request's ignore filter selects the read format. Per directory,
+    Scoped so a complete pipeline is never false-rejected: the check is limited to the components
+    ``model_index.json`` declares (a stale UNDECLARED subtree the pipeline load never reads is skipped),
+    a ROOT index (owned by the canonical / variant root-model checks) and a training-checkpoint subtree
+    (checkpoint-N/) are skipped, and the request's ignore filter selects the read format. Per directory,
     safetensors is read before bin, so only the preferred format's set must be complete. A plain load
     reads canonical component indices (token None); a variant load reads variant ones. Positive-evidence:
     a single-file component or a complete component shard set is not flagged, so a complete download passes."""
     want_variant = variant or None
     ignore_patterns = _as_pattern_list(ignore_patterns)
+    declared = _diffusers_declared_components(snapshot_dir)
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
@@ -823,6 +848,8 @@ def _diffusers_component_shards_incomplete(
         parts = rel.split("/")
         if len(parts) < 2:
             continue  # a ROOT index -- owned by the canonical / variant root-model checks
+        if declared is not None and parts[0] not in declared:
+            continue  # an UNDECLARED subtree the DiffusionPipeline load does not read
         if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
             continue  # a training-checkpoint subtree, not a pipeline component
         dir_rel = rel.rsplit("/", 1)[0]

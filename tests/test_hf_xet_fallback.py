@@ -2784,6 +2784,77 @@ def test_post_download_rejects_incomplete_diffusers_component_shards_unpatterned
         variant = "fp16") is True
 
 
+def test_post_download_single_safetensors_beats_stale_index(tmp_path):
+    """transformers probes single model.safetensors BEFORE model.safetensors.index.json, so a complete
+    single weight co-resident with a STALE incomplete index is usable and must not be looped into a
+    DownloadStallError (Codex #829). A stale index with NO single weight is still breakage."""
+    snap, blob = _mk_snapshot(tmp_path, "single_beats_index")
+    (snap / "config.json").write_text("{}")
+    (snap / "model.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))  # shards absent
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    assert hcs.snapshot_dir_is_complete(snap) is True  # the PRE gate agrees (offline warm short-circuit)
+    # No single weight, only the stale index -> the sharded-safetensors load would fetch missing shards.
+    snap2, _ = _mk_snapshot(tmp_path, "stale_index_only")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_post_download_rejects_noncanonical_root_weight_for_default_load(tmp_path):
+    """A DEFAULT load probes only the canonical model.safetensors / pytorch_model.bin (single or numbered
+    shard). A stale cache holding only a NON-canonical root weight (consolidated.safetensors) must be
+    rejected, else the default load fetches the absent canonical weight over un-killable Xet (Codex #829).
+    The canonical weight present -> accepted."""
+    snap, blob = _mk_snapshot(tmp_path, "noncanonical")
+    (snap / "config.json").write_text("{}")
+    (snap / "consolidated.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_diffusers_component_check_scoped_to_declared_components(tmp_path):
+    """The component shard check is scoped to the components model_index.json declares. A complete
+    pipeline (declared unet+vae present) co-resident with a STALE UNDECLARED subtree (a leftover
+    controlnet/ with an incomplete shard index the DiffusionPipeline load never reads) must still be
+    accepted (Codex #829); an incomplete DECLARED component is still rejected (hang protection kept)."""
+    snap, blob = _mk_snapshot(tmp_path, "declared_scope")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "StableDiffusionPipeline",
+         "unet": ["diffusers", "UNet2DConditionModel"], "vae": ["diffusers", "AutoencoderKL"]}))
+    for comp in ("unet", "vae"):
+        (snap / comp).mkdir()
+        (snap / comp / "config.json").write_text("{}")
+        (snap / comp / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    (snap / "controlnet").mkdir()  # UNDECLARED leftover
+    (snap / "controlnet" / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))
+    (snap / "controlnet" / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # An incomplete DECLARED component (unet index missing a shard) is still caught.
+    snap2, blob2 = _mk_snapshot(tmp_path, "declared_incomplete")
+    (snap2 / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
+    (snap2 / "unet").mkdir()
+    (snap2 / "unet" / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))
+    (snap2 / "unet" / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
 def test_selected_readable_weight_complete_entry_point(tmp_path):
     """The weight-bearing acceptance check funnels through one helper enforcing two invariants:
     (A) a readable weight is present (ignore + scope applied), (B) its in-scope shard set is complete.
@@ -3009,7 +3080,8 @@ def test_post_download_rejects_config_only_for_explicit_weight_pattern(tmp_path)
 def test_post_download_rejects_incomplete_canonical_root_shards(tmp_path):
     """An interrupted canonical sharded warm (loose model-00001-of-00002.safetensors, no index) has a
     loadable file but a default load cannot read it and would fetch the rest over un-killable Xet, so
-    it is rejected. A complete sharded set is accepted; a variant-only shard layout is not force-failed."""
+    it is rejected. A complete sharded set is accepted; a variant-only shard layout does not satisfy a
+    default (no-variant) load, which reads only canonical names."""
     snap, blob = _mk_snapshot(tmp_path, "incshard")
     (snap / "config.json").write_text("{}")
     (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
@@ -3022,12 +3094,13 @@ def test_post_download_rejects_incomplete_canonical_root_shards(tmp_path):
                                    "b": "model-00002-of-00002.safetensors"}}))
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
-    # A variant-only shard layout has no canonical shard -> not force-failed here.
+    # A variant-named shard is NOT a canonical weight a default load reads, so a variant-only cache is
+    # rejected (the default load would fetch the absent canonical model.safetensors over Xet).
     vsnap, vblob = _mk_snapshot(tmp_path, "vshard")
     (vsnap / "config.json").write_text("{}")
     (vsnap / "model-00001-of-00001.fp16.safetensors").symlink_to(vblob)
     assert xf._download_result_usable(
-        vsnap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+        vsnap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
 
 def test_local_token_not_found_error_type_preserved():

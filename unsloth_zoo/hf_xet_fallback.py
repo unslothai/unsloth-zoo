@@ -1008,14 +1008,14 @@ def _is_default_load_weight_file(name: str) -> bool:
     return _is_loadable_weight_file(name) and name.endswith((".safetensors", ".bin"))
 
 
-# A VARIANT of a canonical root weight: the variant token sits between the base and the extension /
-# shard suffix (model.fp16.safetensors, pytorch_model.fp16-00001-of-00002.bin). A DEFAULT (no-variant)
-# load reads the canonical model.safetensors / pytorch_model.bin, NOT these, so a variant-only cache
-# must not satisfy a default load's presence check (else the load fetches the absent canonical weight
-# over un-killable Xet). Canonical names (model.safetensors, model-00001-of-00002.safetensors -- a dash,
-# not a dotted token) and non-canonical bases (consolidated.*, tf_model.h5) are deliberately NOT matched.
-_CANONICAL_BASE_VARIANT_RE = re.compile(
-    r"^(?:model|pytorch_model)\.[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
+# The CANONICAL root model weight a DEFAULT (no-variant) load reads: model.safetensors /
+# pytorch_model.bin as a single file, or a numbered shard (model-00001-of-00002.safetensors -- a dash,
+# not a dotted variant token). A PEFT adapter (adapter_model.*), a variant (model.fp16.safetensors), a
+# gguf, and a non-canonical root weight (consolidated.safetensors, tf_model.h5) are NOT matched: a
+# default from_pretrained probes only these canonical names, so a cache holding only something else does
+# not satisfy the load, which would then fetch the missing canonical weight over un-killable Xet.
+_CANONICAL_ROOT_MODEL_WEIGHT_RE = re.compile(
+    r"^(?:model|pytorch_model)(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
 
 # A training-checkpoint subdir (checkpoint-500/, checkpoint_7/): its weights are never read as diffusers
@@ -1054,16 +1054,18 @@ def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any 
 
 
 def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
-    """Whether an UNPATTERNED model warm holds a weight a default load reads: a canonical ROOT weight, or
-    -- for a diffusers pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any
-    subtree weight (as ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then
-    fetch the root weights over un-killable Xet; diffusers is the one layout whose weights live in
-    subfolders. A VARIANT-named root weight (``model.fp16.safetensors``) and a PEFT adapter
-    (``adapter_model.*``) are excluded: a default base-model load reads neither, so a cache holding only
-    those is retried over HTTP rather than loaded (its base ``model.safetensors`` / ``pytorch_model.bin``
-    is still missing). The request's ignore filter is applied to the ROOT weights, so an offline-fallback
-    partial holding only the format the load will NOT read (an ignored ``*.bin`` under a safetensors
-    request) does not count as a usable weight."""
+    """Whether an UNPATTERNED model warm holds a weight a default load reads: a CANONICAL ROOT weight
+    (``model.safetensors`` / ``pytorch_model.bin``, single or numbered shard), or -- for a diffusers
+    pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any subtree weight (as
+    ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then fetch the root
+    weights over un-killable Xet; diffusers is the one layout whose weights live in subfolders. Only the
+    canonical names are counted (``_CANONICAL_ROOT_MODEL_WEIGHT_RE``): a VARIANT-named root weight
+    (``model.fp16.safetensors``), a PEFT adapter (``adapter_model.*``), a gguf, and a NON-canonical root
+    weight (``consolidated.safetensors``) are excluded, since a default from_pretrained probes only the
+    canonical names, so a cache holding only something else is retried over HTTP rather than loaded (its
+    canonical weight is still missing). The request's ignore filter is applied to the ROOT weights, so an
+    offline-fallback partial holding only the format the load will NOT read (an ignored ``*.bin`` under a
+    safetensors request) does not count as a usable weight."""
     try:
         is_diffusers = (snapshot_dir / "model_index.json").is_file()
     except OSError:
@@ -1074,12 +1076,9 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
-            if not _is_default_load_weight_file(name):
-                continue  # a default load reads safetensors / bin, not gguf / pt / ...
-            if name.startswith("adapter_"):
-                continue  # a PEFT adapter (adapter_model.*) is not read by a default base-model load
-            if _CANONICAL_BASE_VARIANT_RE.match(name):
-                continue  # a variant of a canonical weight is not read by a default (no-variant) load
+            if not _CANONICAL_ROOT_MODEL_WEIGHT_RE.match(name):
+                continue  # only a canonical model.safetensors / pytorch_model.bin (single or shard) is
+                # read by a default load -- an adapter, variant, gguf, or consolidated.* is not
             try:
                 if entry.is_file():
                     rels.append(name)
