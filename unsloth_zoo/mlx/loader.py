@@ -141,7 +141,7 @@ def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
 
 
 def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = False) -> None:
-    """Keep LM/VLM normalization parameters in fp32 across FT/LoRA/QLoRA."""
+    """Prepare MLX training by keeping normalization parameters in fp32."""
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
     from .utils import (
@@ -149,8 +149,15 @@ def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = 
         set_mlx_norm_output_cast_to_input_dtype,
     )
 
+    try:
+        parameters = model.parameters()
+    except AttributeError:
+        if cast_outputs_to_input_dtype:
+            set_mlx_norm_output_cast_to_input_dtype(True, model)
+        return
+
     needs_cast = False
-    for k, v in tree_flatten(model.parameters()):
+    for k, v in tree_flatten(parameters):
         if (
             is_mlx_norm_parameter_path(k)
             and mx.issubdtype(v.dtype, mx.floating)
@@ -167,7 +174,7 @@ def _keep_norm_parameters_float32(model, *, cast_outputs_to_input_dtype: bool = 
         lambda k, v: v.astype(mx.float32)
         if is_mlx_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
         else v,
-        model.parameters(),
+        parameters,
     ))
     mx.eval(model.parameters())
     if cast_outputs_to_input_dtype:
@@ -3942,7 +3949,6 @@ class FastMLXModel:
                         model._unsloth_quantized_source = adapter_cfg.get(
                             "base_quantized_source"
                         )
-                    _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)
                     _patch_mlx_saving(model, tokenizer)
                     return model, tokenizer
             except Exception as e:
@@ -4083,7 +4089,6 @@ class FastMLXModel:
                 import mlx.core as mx
                 mx.eval(model.parameters())
             _fix_gemma3_text_rmsnorm_fp32(model)
-            _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)
 
             from .utils import (
                 normalize_mlx_chat_template,
@@ -4202,7 +4207,6 @@ class FastMLXModel:
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
-            _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)
             from .utils import normalize_mlx_chat_template
 
             tokenizer = normalize_mlx_chat_template(

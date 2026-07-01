@@ -336,11 +336,10 @@ def restore_mlx_norm_output_cast_patched_classes(norm_classes) -> None:
 def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
     """Control whether MLX norm outputs are cast back to activation dtype.
 
-    Norm parameters can stay in fp32 for stability, but letting fp32 norm
-    outputs flow through the rest of the graph promotes downstream
-    intermediates and materially increases inference and LoRA/QLoRA memory.
-    Casting the result back matches PyTorch autocast behavior more closely:
-    fp32 norm math, bf16/fp16 downstream activations.
+    MLX training can keep norm parameters in fp32 for stability, but letting
+    fp32 norm outputs flow through the rest of the graph promotes downstream
+    intermediates and materially increases LoRA/QLoRA memory. Casting the
+    result back keeps bf16/fp16 downstream activations.
     """
     try:
         from . import compile as _mlx_compile

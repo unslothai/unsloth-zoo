@@ -706,11 +706,11 @@ def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32(monkeypatch):
     assert "return y.astype(orig_dtype)" in source
     assert "_unsloth_fp32_rmsnorm_patched" in source
     from_pretrained_source = inspect.getsource(loader.FastMLXModel.from_pretrained)
-    assert (
-        "_fix_gemma3_text_rmsnorm_fp32(model)\n"
-        "            _keep_norm_parameters_float32(model, cast_outputs_to_input_dtype=True)"
-        in from_pretrained_source
-    )
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    trainer_source = inspect.getsource(MLXTrainer.train)
+    assert "_fix_gemma3_text_rmsnorm_fp32(model)" in from_pretrained_source
+    assert "_keep_norm_parameters_float32(model" not in from_pretrained_source
+    assert "_keep_norm_parameters_float32(model)" in trainer_source
     assert from_pretrained_source.count("_fix_gemma3_text_rmsnorm_fp32(model)") == 1
 
     class FakeRMSNorm:

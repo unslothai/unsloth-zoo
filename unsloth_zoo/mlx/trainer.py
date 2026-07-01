@@ -1049,6 +1049,8 @@ class MLXTrainer:
         # Patch INSIDE try/finally so any raise during setup still restores globals.
         _norm_cast_applied = False
         try:
+            from .loader import _keep_norm_parameters_float32
+            _keep_norm_parameters_float32(model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
             _norm_cast_applied = True
             if cast_norm_output:
