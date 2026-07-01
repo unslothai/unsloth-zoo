@@ -49,6 +49,7 @@ from unsloth_zoo.hf_cache_state import (
     _has_incomplete_canonical_root_shards,
     _has_incomplete_variant_root_shards,
     _is_loadable_weight_file,
+    _selected_shard_index_incomplete,
     blob_bytes_present,
     has_active_incomplete_blobs,
     hf_cache_root,
@@ -1254,6 +1255,10 @@ def _readable_shard_set_incomplete(
       request does not root-check.
     - plain: the canonical-root-shard check applies for an UNPATTERNED request, or a GLOBBED request that
       selects canonical root shards; an exact-named subset or an out-of-scope request does not.
+    - non-root: a PATTERNED request additionally checks any SELECTED shard index the root-model checks do
+      not cover (a sharded adapter under ``['adapter_model*']``, a component subfolder) via
+      ``_selected_shard_index_incomplete``. An UNPATTERNED request reads only the root model weight, so it
+      does not; an exact-named subset defers to the exact-file presence check.
 
     The ignore filter is threaded through so completeness is judged for the FORMAT the load reads (a
     complete safetensors set does not mask an incomplete ``.bin`` under ``ignore=['*.safetensors']``)."""
@@ -1261,19 +1266,30 @@ def _readable_shard_set_incomplete(
         if allow_patterns is None or _request_selects_root_variant_weight(
             allow_patterns, ignore_patterns, variant
         ):
-            return _has_incomplete_variant_root_shards(snapshot_dir, variant)
+            if _has_incomplete_variant_root_shards(
+                snapshot_dir, variant, ignore_patterns = ignore_patterns
+            ):
+                return True
+        if allow_patterns is not None and _selected_shard_index_incomplete(
+            snapshot_dir, allow_patterns = allow_patterns,
+            ignore_patterns = ignore_patterns, variant = variant,
+        ):
+            return True
         return False
     if allow_patterns is None:
         return _has_incomplete_canonical_root_shards(
             snapshot_dir, ignore_patterns = ignore_patterns
         )
-    if not _patterns_are_exact_names(allow_patterns) and _request_selects_canonical_root_shards(
-        allow_patterns, ignore_patterns
+    if _patterns_are_exact_names(allow_patterns):
+        return False  # an exact-named subset defers to the exact-file presence check
+    if _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) and (
+        _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns)
     ):
-        return _has_incomplete_canonical_root_shards(
-            snapshot_dir, ignore_patterns = ignore_patterns
-        )
-    return False
+        return True
+    return _selected_shard_index_incomplete(
+        snapshot_dir, allow_patterns = allow_patterns,
+        ignore_patterns = ignore_patterns, variant = None,
+    )
 
 
 def _selected_readable_weight_complete(

@@ -2619,6 +2619,80 @@ def test_post_download_root_variant_weight_honors_ignore(tmp_path):
         variant = "fp16") is True
 
 
+def test_post_download_variant_shard_check_honors_ignore(tmp_path):
+    """A variant load that ignores .bin must judge the variant shard set for the READ format only: a
+    complete model.fp16.safetensors co-resident with a stale IGNORED model.fp16-00001-of-00002.bin shard
+    (no index) is accepted, not force-rejected -- the variant shard-completeness check applies the ignore
+    filter, so a satisfied variant download is not failed into a DownloadStallError (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "var_shard_ignore")
+    (snap / "model.fp16.safetensors").symlink_to(blob)                 # complete, the read format
+    (snap / "model.fp16-00001-of-00002.bin").symlink_to(blob)         # stale ignored .bin shard, no index
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"],
+        variant = "fp16") is True
+    # Without the ignore the lone .bin variant shard IS an incomplete set (no index) -> rejected.
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True  # the complete safetensors variant is preferred and read
+
+
+def test_post_download_rejects_variant_index_only_masked_by_bin(tmp_path):
+    """A VARIANT safetensors index present with NONE of its shards (an index-only partial), co-resident
+    with a complete variant pytorch_model.fp16.bin, must be rejected: transformers probes the variant
+    safetensors index before the variant bin, so the load would fetch the missing variant shards over Xet
+    (the variant analog of the canonical index-only case) (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "var_index_only")
+    (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
+    (snap / "pytorch_model.fp16.bin").symlink_to(blob)  # complete bin, no ST variant shards at all
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    # The variant safetensors explicitly ignored -> load reads the complete variant bin -> usable.
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.safetensors"],
+        variant = "fp16") is True
+
+
+def test_post_download_rejects_incomplete_sharded_adapter(tmp_path):
+    """A PEFT adapter load (allow=['adapter_config.json', 'adapter_model*']) whose partial kept a sharded
+    adapter INDEX but is missing a listed adapter shard must be rejected, else the in-process load
+    finishes the missing adapter shard over Xet. The canonical/variant ROOT-model checks do not cover a
+    non-model 'adapter_model' index, so the selected-index check catches it (Codex #829). A complete
+    adapter shard set in scope is accepted (no false-reject)."""
+    snap, blob = _mk_snapshot(tmp_path, "adapter_incomplete")
+    (snap / "adapter_config.json").write_text("{}")
+    (snap / "adapter_model-00001-of-00002.safetensors").symlink_to(blob)  # shard 1; shard 2 absent
+    (snap / "adapter_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "adapter_model-00001-of-00002.safetensors",
+                        "b": "adapter_model-00002-of-00002.safetensors"}}))
+    allow = ["adapter_config.json", "adapter_model*"]
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = allow, ignore_patterns = None) is False
+    # The missing adapter shard present -> complete set -> accepted (no false-reject).
+    (snap / "adapter_model-00002-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = allow, ignore_patterns = None) is True
+
+
+def test_post_download_rejects_incomplete_component_subfolder_shards(tmp_path):
+    """A subfolder-scoped request (allow=['unet/*']) whose selected component has a shard INDEX missing a
+    listed shard must be rejected -- the selected-index check covers component subfolders the root-model
+    checks do not (Codex #829). A complete component shard set in scope is accepted."""
+    snap, blob = _mk_snapshot(tmp_path, "component_incomplete")
+    (snap / "unet").mkdir()
+    (snap / "unet" / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "unet" / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is False
+    (snap / "unet" / "diffusion_pytorch_model-00002-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
+
+
 def test_selected_readable_weight_complete_entry_point(tmp_path):
     """The weight-bearing acceptance check funnels through one helper enforcing two invariants:
     (A) a readable weight is present (ignore + scope applied), (B) its in-scope shard set is complete.

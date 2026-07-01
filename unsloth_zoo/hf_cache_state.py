@@ -584,32 +584,185 @@ def _has_incomplete_canonical_root_shards(
     return not snapshot_dir_is_complete(snapshot_dir, ignore_patterns = ignore_patterns)
 
 
-def _has_incomplete_variant_root_shards(snapshot_dir: Path, variant: str) -> bool:
-    """True when the root holds a VARIANT weight SHARD (a ``.<variant>-NNNNN-of-...`` file) that is NOT
-    backed by a COMPLETE variant shard index -- the index is missing, or one of its listed shards is
-    absent. Positive-evidence ONLY: a single-file variant (no shard files) or a complete variant shard
-    set returns False, so a complete or single-file variant download is never rejected. transformers
-    writes a sharded variant weight with a ``.<variant>-`` infix and its index as
-    ``model.safetensors.index.<variant>.json`` (a ``.<variant>.`` infix before ``.json``)."""
-    dot_infix = f".{variant}."     # the variant shard index: model.safetensors.index.<variant>.json
-    dash_infix = f".{variant}-"    # a sharded variant weight: model.<variant>-00001-of-00002.safetensors
+def _has_incomplete_variant_root_shards(
+    snapshot_dir: Path, variant: str, *, ignore_patterns: "Optional[object]" = None
+) -> bool:
+    """True when the ROOT variant weight the load READS is an incomplete sharded set. transformers writes
+    a sharded variant weight with a ``.<variant>-`` shard infix and its index as
+    ``model.safetensors.index.<variant>.json`` (a ``.<variant>.`` infix before ``.json``); a single-file
+    variant is ``model.<variant>.safetensors``. Incomplete means: a present variant shard INDEX whose
+    listed shards are not all present (an index-only partial with no shard files counts), OR variant shard
+    FILES with no complete index.
+
+    The request's ignore filter is applied so a variant weight in an ignored format is not the read
+    format, and safetensors is treated as read BEFORE bin (transformers' probe order): a present-but-
+    incomplete variant safetensors index is breakage even with a complete variant bin. Positive-evidence:
+    a single-file variant or a complete variant shard set returns False, so a complete or single-file
+    variant download is never rejected."""
+    dot_infix = f".{variant}."     # variant index (model.safetensors.index.<variant>.json) or single file
+    dash_infix = f".{variant}-"    # a sharded variant weight (model.<variant>-00001-of-00002.safetensors)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+
+    def _format_kept(weight_name: str) -> bool:
+        # The format a load reads from *weight_name* must survive the ignore filter, else the file is a
+        # stale artifact for an excluded format the load does not read.
+        if not ignore_patterns:
+            return True
+        return bool(_filter_paths([weight_name], None, ignore_patterns))
+
     try:
         entries = list(snapshot_dir.iterdir())
     except OSError:
         return False
-    has_variant_shard = False
-    has_complete_variant_index = False
+    st_index_incomplete = None   # tri-state: None absent, else present & (in)complete
+    bin_index_incomplete = None
+    has_st_shard = has_bin_shard = False
+    has_single_st = False
     for entry in entries:
         name = entry.name
         # _is_weight_shard_index matches canonical AND variant indices; the dot infix restricts to the
         # requested variant (the canonical index has no ".<variant>." token).
         if dot_infix in name and _is_weight_shard_index(name):
-            if _safe_is_file(entry) and _weight_shard_index_complete(entry):
-                has_complete_variant_index = True
+            is_safetensors = ".safetensors.index." in name
+            fmt_probe = (
+                f"model.{variant}.safetensors" if is_safetensors else f"pytorch_model.{variant}.bin"
+            )
+            if not _format_kept(fmt_probe):
+                continue  # this format is ignored -> the load does not read it
+            incomplete = not (_safe_is_file(entry) and _weight_shard_index_complete(entry))
+            if is_safetensors:
+                st_index_incomplete = incomplete
+            else:
+                bin_index_incomplete = incomplete
         elif dash_infix in name and _is_loadable_weight_file(name):
-            if _safe_is_file(entry):
-                has_variant_shard = True
-    return has_variant_shard and not has_complete_variant_index
+            if _safe_is_file(entry) and _format_kept(name):
+                if name.endswith(".safetensors"):
+                    has_st_shard = True
+                else:
+                    has_bin_shard = True
+        elif dot_infix in name and _is_loadable_weight_file(name):
+            # a single-file variant weight; only a safetensors single-file matters for precedence (a
+            # single-file bin variant is complete and handled by the fall-through ``return False``).
+            if name.endswith(".safetensors") and _safe_is_file(entry) and _format_kept(name):
+                has_single_st = True
+    # transformers reads safetensors before bin: judge the safetensors variant first, and fall to bin
+    # only when no safetensors variant is present in any form.
+    if st_index_incomplete is not None:
+        return st_index_incomplete
+    if has_st_shard:
+        return True   # variant safetensors shard files with no index -> incomplete
+    if has_single_st:
+        return False  # a complete single-file safetensors variant
+    if bin_index_incomplete is not None:
+        return bin_index_incomplete
+    if has_bin_shard:
+        return True   # variant bin shard files with no index -> incomplete
+    return False
+
+
+_VARIANT_SHARD_INDEX_RE = re.compile(r"\.(?:safetensors|bin)\.index\.([^.]+)\.json$")
+
+# The ROOT canonical / variant MODEL shard index (owned by the canonical / variant root checks):
+# model.safetensors.index.json, pytorch_model.bin.index.json, and their variant forms.
+_ROOT_MODEL_SHARD_INDEX_RE = re.compile(
+    r"^(?:model\.safetensors|pytorch_model\.bin)\.index(?:\.[^.]+)?\.json$"
+)
+
+
+def _index_variant_token(name: str) -> "Optional[str]":
+    """The variant token of a weight-shard INDEX basename, or None for the canonical (non-variant) form.
+    ``model.safetensors.index.json`` -> None; ``model.safetensors.index.fp16.json`` -> ``"fp16"``. Lets
+    the selected-index check read only the indices a load reads (a variant load reads variant indices, a
+    plain load reads canonical ones)."""
+    if name.endswith(".safetensors.index.json") or name.endswith(".bin.index.json"):
+        return None
+    m = _VARIANT_SHARD_INDEX_RE.search(name)
+    return m.group(1) if m else None
+
+
+def _index_shard_rel_paths(index_path: Path, dir_rel: str) -> "Optional[list]":
+    """The snapshot-relative posix paths of the shards a weight index lists, or None if the index is
+    unreadable / malformed -- mirrors the fail-CLOSED rules of ``_weight_shard_index_complete`` (a
+    non-dict payload or ``weight_map``, an empty shard set, or a non-string / absolute / parent-escaping
+    shard value all return None). *dir_rel* is the index's snapshot-relative directory ("" at root), so a
+    listed basename is joined back to a full repo-relative path for the request filter."""
+    import json
+
+    try:
+        with open(index_path, "r", encoding = "utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    weight_map = data.get("weight_map") if isinstance(data, dict) else None
+    if not isinstance(weight_map, dict):
+        return None
+    values = list(weight_map.values())
+    if not values or not all(isinstance(s, str) for s in values):
+        return None
+    prefix = f"{dir_rel}/" if dir_rel else ""
+    out: list = []
+    for shard in set(values):
+        if shard.startswith(("/", "\\")) or ".." in shard.replace("\\", "/").split("/"):
+            return None
+        out.append(f"{prefix}{shard}")
+    return out
+
+
+def _selected_shard_index_incomplete(
+    snapshot_dir: Path, *, allow_patterns: "Optional[object]", ignore_patterns: "Optional[object]",
+    variant: "Optional[str]",
+) -> bool:
+    """True when a weight-shard INDEX the in-process load READS -- a sharded ADAPTER or a component
+    SUBFOLDER set that the canonical / variant ROOT-model checks do not cover -- lists a shard that is
+    absent (or the index is malformed). Scoped to the request so a complete download is never
+    false-rejected:
+
+    - variant: a variant load reads only variant indices (token == variant); a plain load reads only
+      canonical (token is None) indices.
+    - allow / ignore: an index is read only when its listed shards survive the request filter.
+    - precedence: within a directory transformers reads safetensors before bin, so when both a
+      safetensors and a bin index are selected only the safetensors set's completeness is required.
+
+    The ROOT canonical / variant MODEL index is skipped -- ``_has_incomplete_canonical_root_shards`` /
+    ``_has_incomplete_variant_root_shards`` own it (with their own precedence handling)."""
+    allow_patterns = _as_pattern_list(allow_patterns)
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    want_variant = variant or None
+    try:
+        entries = list(snapshot_dir.rglob("*"))
+    except OSError:
+        return False
+    per_dir: dict = {}  # dir_rel -> {"safetensors": [shard_rels, ...], "bin": [...]}
+    for entry in entries:
+        name = entry.name
+        if not _is_weight_shard_index(name) or not _safe_is_file(entry):
+            continue
+        if _index_variant_token(name) != want_variant:
+            continue  # a wrong-variant index the load does not read
+        try:
+            rel = entry.relative_to(snapshot_dir).as_posix()
+        except ValueError:
+            continue
+        dir_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if dir_rel == "" and _ROOT_MODEL_SHARD_INDEX_RE.match(name):
+            continue  # the ROOT model index -- owned by the canonical / variant root checks
+        shard_rels = _index_shard_rel_paths(entry, dir_rel)
+        if shard_rels is None:
+            return True  # a malformed / non-string index -> defer to the watched child
+        if not _filter_paths(shard_rels, allow_patterns, ignore_patterns):
+            continue  # the load does not read this set (out of scope / ignored format)
+        fmt = "safetensors" if ".safetensors.index." in name else "bin"
+        per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
+    for by_fmt in per_dir.values():
+        # safetensors read before bin: require only the preferred format present in this directory.
+        for shard_rels in by_fmt.get("safetensors") or by_fmt.get("bin") or []:
+            for shard in shard_rels:
+                try:
+                    if not (snapshot_dir / shard).exists():
+                        return True
+                except OSError:
+                    return True
+    return False
 
 
 def requested_named_files_present(
