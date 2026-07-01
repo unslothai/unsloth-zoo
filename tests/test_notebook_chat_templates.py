@@ -21,9 +21,17 @@ import os, sys, json, re, glob, tempfile, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # import the in-tree unsloth_zoo
-from unsloth_zoo.dataset_utils import get_chat_template_parts, train_on_responses_only
+# unsloth_zoo is imported lazily (inside _check / _content_leak_free), not at module
+# scope: importing it runs unsloth_zoo/__init__.py, which raises ImportError when the
+# separate `unsloth` package is absent, and that would break pytest collection.
 
 ENABLED = os.environ.get("UNSLOTH_TEST_NOTEBOOK_MODELS", "") not in ("", "0", "false")
+
+# Notebook models are expected to auto-detect, so a ValueError from get_chat_template_parts
+# is a regression and FAILS the sweep. The only sanctioned exceptions are templates that
+# genuinely have no atomic role markers (e.g. zephyr-sft's multi-piece <|assistant|>); list
+# them here (substring match) so a real detection regression can never hide as a SKIP.
+KNOWN_NON_ATOMIC = ("zephyr-sft",)
 CACHE = os.environ.get("UNSLOTH_NOTEBOOK_TOK_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_nb_tok"))
 ALLOW_PATTERNS = ["*.json", "*.model", "tokenizer*", "merges*", "vocab*", "*.jinja", "*.txt"]
 NOTEBOOKS_REPO = "https://github.com/unslothai/notebooks"
@@ -107,6 +115,7 @@ def _download(repo):
 def _content_leak_free(t, ins, res, convo, asst_texts, user_texts):
     """True iff every assistant-content token present is trained and no user-content
     token is trained. Content pieces the template drops are ignored."""
+    from unsloth_zoo.dataset_utils import train_on_responses_only
     text = t.apply_chat_template(convo, tokenize=False, add_generation_prompt=False)
     enc = t(text, add_special_tokens=False, return_offsets_mapping=True)
     ids, offs = enc["input_ids"], enc["offset_mapping"]
@@ -132,6 +141,7 @@ def _content_leak_free(t, ins, res, convo, asst_texts, user_texts):
 
 def _check(repo):
     from transformers import AutoTokenizer
+    from unsloth_zoo.dataset_utils import get_chat_template_parts
     try:
         path = _download(repo)
     except Exception as e:
@@ -145,8 +155,12 @@ def _check(repo):
         return "SKIP", "no chat_template"
     try:
         ins, res = get_chat_template_parts(tok)
-    except ValueError:
-        return "SKIP", "safe-raise (no atomic markers)"
+    except ValueError as e:
+        # A model shipped in a notebook is expected to auto-detect. Only allowlisted
+        # non-atomic templates may safe-raise; anything else is a real regression.
+        if any(k in repo.lower() for k in KNOWN_NON_ATOMIC):
+            return "SKIP", "known non-atomic template (allowlisted)"
+        return "FAIL", f"auto-detect raised ValueError for a supported model: {str(e)[:80]}"
     try:
         for convo in (PLAIN, REASON):
             asst = ASSTS if convo is PLAIN else ["HIDDENREASON", "VISIBLEANSWER"]
@@ -176,6 +190,10 @@ def test_notebook_chat_templates():
     import pytest
     if not ENABLED and not os.path.isdir(CACHE):
         pytest.skip("set UNSLOTH_TEST_NOTEBOOK_MODELS=1 (network) to run the notebook model sweep")
+    try:
+        import unsloth_zoo.dataset_utils  # noqa: F401  (import here so collection never needs it)
+    except ImportError as e:
+        pytest.skip(f"unsloth_zoo unavailable: {e}")
     results, summary = run()
     print("SUMMARY:", summary)
     checked = summary.get("PASS", 0) + summary.get("FAIL", 0)

@@ -14,27 +14,45 @@ reasoning-filled turn and shortens the marker to the bare assistant header ONLY 
 scaffold is confirmed generation-only; a template that always emits it keeps it. Dropping
 only shortens to the header, so it can never unmask user content.
 
-Self-contained: builds synthetic templates on a tiny tokenizer with the relevant special
-tokens added. Skips (not fails) if no tokenizer can be constructed offline.
+Self-contained and hermetic: builds synthetic templates on a tiny tokenizer that is
+already cached locally. Skips (not fails) when no tokenizer can be constructed offline
+or when the `unsloth`/`unsloth_zoo` package is not importable, so a default pytest run
+never reaches the network and never breaks collection.
 """
-import os
 import pytest
 
-from unsloth_zoo.dataset_utils import get_chat_template_parts, train_on_responses_only
+# NOTE: unsloth_zoo is imported lazily in _setup(), not at module scope. Importing it
+# runs unsloth_zoo/__init__.py, which raises ImportError when the separate `unsloth`
+# package is absent; at module scope that would break pytest collection before the skip.
 
 
 def _tokenizer():
     from transformers import AutoTokenizer
     # Small, ungated tokenizers commonly cached in CI; first that loads wins.
+    # local_files_only keeps this hermetic: an uncached tokenizer raises immediately
+    # (no download / network timeout) and we fall through to the next / to a skip.
     for repo in ("hf-internal-testing/llama-tokenizer", "Qwen/Qwen2.5-0.5B-Instruct"):
         try:
-            tok = AutoTokenizer.from_pretrained(repo)
+            tok = AutoTokenizer.from_pretrained(repo, local_files_only=True)
         except Exception:
             continue
         tok.add_special_tokens({"additional_special_tokens": [
             "<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>", "<think>", "</think>"]})
         return tok
     return None
+
+
+def _setup():
+    """Load an offline tokenizer plus the zoo helpers, skipping (not failing) if either
+    the tokenizer cache or the unsloth_zoo package (needs `unsloth`) is unavailable."""
+    tok = _tokenizer()
+    if tok is None:
+        pytest.skip("no tokenizer cached offline")
+    try:
+        from unsloth_zoo.dataset_utils import get_chat_template_parts, train_on_responses_only
+    except ImportError as e:
+        pytest.skip(f"unsloth_zoo unavailable: {e}")
+    return tok, get_chat_template_parts, train_on_responses_only
 
 
 # History turns carry an empty <think></think>; the final turn keeps real reasoning; the
@@ -86,12 +104,11 @@ PLAIN_MSGS = [
 ]
 
 
-def _trained(tok, ins, res, msgs):
+def _trained(tok, ins, res, msgs, tor):
     text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     ids, offs = enc["input_ids"], enc["offset_mapping"]
-    fn = train_on_responses_only(None, instruction_part=ins, response_part=res,
-                                 tokenizer=tok, return_function=True)
+    fn = tor(None, instruction_part=ins, response_part=res, tokenizer=tok, return_function=True)
     labels = fn({"input_ids": [ids]})["labels"][0]
     un = set(i for i in range(len(ids)) if labels[i] != -100)
 
@@ -102,38 +119,32 @@ def _trained(tok, ins, res, msgs):
 
 
 def test_paired_empty_think_stripped_to_header():
-    tok = _tokenizer()
-    if tok is None:
-        pytest.skip("no tokenizer available offline")
+    tok, get_chat_template_parts, train_on_responses_only = _setup()
     tok.chat_template = PAIRED
     ins, res = get_chat_template_parts(tok)
     assert "<think></think>" not in res, res
     assert res.strip().endswith("assistant"), res
-    tr = _trained(tok, ins, res, REASON_MSGS)
+    tr = _trained(tok, ins, res, REASON_MSGS, train_on_responses_only)
     assert tr("REASONTWO") and tr("ANSWERTWO") and tr("ANSWERONE")
     assert not tr("Q1 alpha") and not tr("Q2 bravo")
 
 
 def test_lone_close_think_stripped_to_header():
-    tok = _tokenizer()
-    if tok is None:
-        pytest.skip("no tokenizer available offline")
+    tok, get_chat_template_parts, train_on_responses_only = _setup()
     tok.chat_template = GLM
     ins, res = get_chat_template_parts(tok)
     assert res == "<|assistant|>", res
-    tr = _trained(tok, ins, res, REASON_MSGS)
+    tr = _trained(tok, ins, res, REASON_MSGS, train_on_responses_only)
     assert tr("REASONTWO") and tr("ANSWERTWO") and tr("ANSWERONE")
     assert not tr("Q1 alpha") and not tr("Q2 bravo")
 
 
 def test_always_empty_think_is_kept():
-    tok = _tokenizer()
-    if tok is None:
-        pytest.skip("no tokenizer available offline")
+    tok, get_chat_template_parts, train_on_responses_only = _setup()
     tok.chat_template = ALWAYS
     ins, res = get_chat_template_parts(tok)
     assert "<think></think>" in res, res
-    tr = _trained(tok, ins, res, PLAIN_MSGS)
+    tr = _trained(tok, ins, res, PLAIN_MSGS, train_on_responses_only)
     assert tr("ANSWERONE") and tr("ANSWERTWO")
     assert not tr("Q1 alpha") and not tr("Q2 bravo")
 
