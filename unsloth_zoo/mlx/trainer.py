@@ -135,6 +135,98 @@ def _resolve_response_mask_tokenizer(tokenizer):
     return tokenizer
 
 
+def _looks_like_processor(obj):
+    """Duck-type a VLM processor: it wraps an inner tokenizer and renders chat."""
+    return obj is not None and (
+        hasattr(obj, "image_processor")
+        or (hasattr(obj, "tokenizer") and hasattr(obj, "apply_chat_template"))
+    )
+
+
+def _processor_ready_for_detect(obj):
+    """Whether a processor can drive marker auto-detection: it renders a chat
+    template and exposes a callable inner HF tokenizer for token matching."""
+    if not _looks_like_processor(obj):
+        return False
+    inner = getattr(obj, "tokenizer", None)
+    if not _is_hf_tokenizer(inner):
+        return False
+    return (
+        getattr(obj, "chat_template", None) is not None
+        or getattr(inner, "chat_template", None) is not None
+    )
+
+
+def _model_type_of(trainer):
+    """Best-effort model_type from the wrapped MLX model config (dict or None)."""
+    config = getattr(getattr(trainer, "model", None), "_config", None)
+    return config.get("model_type") if isinstance(config, dict) else None
+
+
+def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
+    """Pick the object train_on_responses_only should auto-detect markers from.
+
+    Auto-detection reads (instruction_part, response_part) from a rendered chat
+    template, which needs care on MLX for two reasons:
+      1. VLM chat templates usually live on the processor, not the inner
+         tokenizer, so detection must see the processor. The HF helper unwraps it
+         to the inner tokenizer for token matching on its own; handing it the
+         pre-unwrapped inner tokenizer makes auto-detect raise "No chat_template".
+      2. A configured chat_template override (MLXTrainingConfig.chat_template /
+         vlm_chat_template) is only applied later during batch creation, so apply
+         it here first, otherwise markers are detected from the wrong template and
+         will not match the rendered batches.
+
+    Returns an object usable as the HF helper's tokenizer= argument, falling back
+    to the resolved callable tokenizer when no processor/override applies.
+    """
+    args = getattr(trainer, "args", None)
+    model = getattr(trainer, "model", None)
+    model_name = getattr(model, "_hf_repo", None)
+    model_type = _model_type_of(trainer)
+
+    if bool(getattr(trainer, "_is_vlm", False)):
+        processor = getattr(trainer, "processor", None)
+        if processor is None and _looks_like_processor(source):
+            processor = source
+        if processor is None:
+            processor = getattr(model, "_processor", None)
+        if processor is not None:
+            try:
+                processor = normalize_vlm_processor_chat_template(
+                    processor,
+                    chat_template=getattr(args, "vlm_chat_template", None),
+                    model_name=model_name,
+                    model_type=model_type,
+                    strict=False,
+                )
+            except Exception:
+                pass
+            if _processor_ready_for_detect(processor):
+                return processor
+        return resolved_tokenizer
+
+    # Text: apply the configured chat_template override before detecting, so the
+    # markers come from the same template the batches will be rendered with.
+    if args is not None and getattr(args, "chat_template", None) is not None:
+        try:
+            return normalize_mlx_chat_template(
+                resolved_tokenizer,
+                chat_template=args.chat_template,
+                model_name=model_name,
+                model_type=model_type,
+                is_vlm=False,
+                strict=False,
+            )
+        except Exception:
+            pass
+    # Even without a trainer (return_function with an explicit processor), prefer a
+    # processor that carries the template so VLM auto-detect can still read it.
+    if _processor_ready_for_detect(source):
+        return source
+    return resolved_tokenizer
+
+
 def _text_completion_only_loss_arg(args):
     """Resolve SFT-compatible completion-only loss defaults."""
     value = getattr(args, "completion_only_loss", None)
@@ -2593,16 +2685,28 @@ def train_on_responses_only(
     )
 
     # Resolve tokenizer: kwarg > trainer.tokenizer
-    _tokenizer = tokenizer
-    if _tokenizer is None and trainer is not None:
-        _tokenizer = trainer.tokenizer
-    if _tokenizer is None:
+    _source = tokenizer
+    if _source is None and trainer is not None:
+        _source = trainer.tokenizer
+    if _source is None:
         raise ValueError(
             "Unsloth: A tokenizer must be provided either via the `tokenizer` "
             "kwarg or via trainer.tokenizer."
         )
 
-    _tokenizer = _resolve_response_mask_tokenizer(_tokenizer)
+    # Callable HF tokenizer for token matching and text batch encoding.
+    _tokenizer = _resolve_response_mask_tokenizer(_source)
+
+    # When markers are omitted we auto-detect them from a chat template. Prefer the
+    # VLM processor for that detection (its template is not on the inner tokenizer)
+    # and apply any configured chat_template override first, so detection reads the
+    # same template the batches are rendered with. Explicit markers need no template.
+    if instruction_part is None and response_part is None:
+        _detect_source = _resolve_autodetect_template_source(
+            trainer, _source, _tokenizer,
+        )
+    else:
+        _detect_source = _tokenizer
 
     # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
@@ -2610,7 +2714,7 @@ def train_on_responses_only(
         instruction_part=instruction_part,
         response_part=response_part,
         force_match=force_match,
-        tokenizer=_tokenizer,
+        tokenizer=_detect_source,
         return_function=True,
         last_response_only=last_response_only,
     )
