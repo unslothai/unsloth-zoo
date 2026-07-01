@@ -2396,6 +2396,22 @@ def test_hfvalidationerror_type_preserved_across_spawn():
     assert xf._is_retryable_download_error(inst) is False
 
 
+def test_oserror_subclass_type_preserved_across_spawn():
+    """A deterministic builtin OSError subclass (PermissionError from an unwritable cache,
+    FileNotFoundError, ...) keeps its TYPE across the spawn boundary so a caller's `except OSError` /
+    `except PermissionError` still fires instead of seeing a generic RuntimeError. Non-OSError builtins
+    are not spuriously resolved (they fall through to the Hub-name lookup / None)."""
+    for name in ("PermissionError", "FileNotFoundError", "IsADirectoryError", "NotADirectoryError"):
+        cls = xf._resolve_exception_class(name)
+        assert cls is not None and issubclass(cls, OSError) and cls.__name__ == name
+    # A deterministic PermissionError is reconstructed as a real PermissionError and not retried.
+    perm = xf._instantiate_preserving_type(xf._resolve_exception_class("PermissionError"), "denied")
+    assert isinstance(perm, PermissionError)
+    assert xf._is_retryable_download_error(perm) is False
+    # An unrelated builtin (not an OSError subclass, not a Hub error name) is not resolved here.
+    assert xf._resolve_exception_class("ValueError") is None
+
+
 def test_weight_pattern_selector_handles_globs(tmp_path):
     """The weight-pattern selector reads tokenizer / config / json globs as weightless (keeps their
     offline short-circuit) but classifies standard weight names and ? / [] globs as weight-bearing."""

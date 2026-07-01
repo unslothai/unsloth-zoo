@@ -26,6 +26,7 @@ The spawn child sets ``UNSLOTH_ZOO_DISABLE_GPU_INIT=1`` before importing the pac
 
 from __future__ import annotations
 
+import builtins
 import errno
 import importlib.util
 import multiprocessing as mp
@@ -493,6 +494,13 @@ def _resolve_exception_class(type_name: str) -> "Optional[type]":
     occurs and never hard-depends on a specific huggingface_hub layout."""
     if type_name == "OSError":
         return OSError
+    # Preserve builtin OSError subclasses (PermissionError, FileNotFoundError, ...): these are
+    # deterministic filesystem failures (e.g. an unwritable custom cache) the child cannot retry away,
+    # so a caller's `except OSError` / `except PermissionError` must still fire rather than see the
+    # generic RuntimeError the resolver would otherwise fall through to.
+    builtin_cls = getattr(builtins, type_name, None)
+    if isinstance(builtin_cls, type) and issubclass(builtin_cls, OSError):
+        return builtin_cls
     if type_name not in _DETERMINISTIC_ERROR_NAMES and type_name not in _TYPE_PRESERVE_ONLY_NAMES:
         return None
     for module_name in ("huggingface_hub.errors", "huggingface_hub.utils"):
