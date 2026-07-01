@@ -2473,9 +2473,15 @@ class MLXGRPOTrainer(MLXTrainer):
         N = args.num_generations
         sampler = make_sampler(temp=getattr(args, "temperature", 1.0))
         prompts = self._grpo_prompts()
+        # Full dataset rows, in the same order as prompts, so reward_kwargs can
+        # pass through each row's other columns (e.g. 'answer'). prompt and
+        # example are indexed by the SAME cycled index below to stay aligned.
+        examples = list(self.train_dataset)
         idx = 0
         while True:
-            prompt = prompts[idx % len(prompts)]
+            j = idx % len(prompts)
+            prompt = prompts[j]
+            example = examples[j]
             idx += 1
             rendered = self._grpo_render_prompt(prompt, hf)
             pids = hf.encode(rendered)
@@ -2484,10 +2490,23 @@ class MLXGRPOTrainer(MLXTrainer):
                 max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
             )
             comps = resp.texts
-            # rewards: sum across reward functions (TRL-style)
+            # rewards: sum across reward functions (TRL-style). Pass through the
+            # dataset row's other columns as kwargs (repeated per generation to
+            # align row-for-row with completions), mirroring
+            # GRPOTrainer._calculate_rewards. 'prompt'/'completion'/
+            # 'completion_ids' are excluded exactly as TRL does. completion_ids
+            # and trainer_state are not yet available on the MLX path (mlx_lm
+            # batch_generate does not surface generated token IDs, and there is
+            # no transformers TrainerState here) and are left as follow-up
+            # rather than faked.
+            reward_kwargs = {
+                k: [example[k]] * N
+                for k in example
+                if k not in ("prompt", "completion", "completion_ids")
+            }
             total = [0.0] * N
             for rf in self.reward_funcs:
-                vals = rf(completions=comps, prompts=[prompt] * N)
+                vals = rf(completions=comps, prompts=[prompt] * N, **reward_kwargs)
                 for i, v in enumerate(vals):
                     total[i] += float(v)
             rewards = mx.array(total)
