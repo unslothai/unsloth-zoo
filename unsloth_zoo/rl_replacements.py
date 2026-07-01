@@ -26,7 +26,7 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from .temporary_patches.common import torch_compile_options, UNSLOTH_ENABLE_LOGGING
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
@@ -1026,7 +1026,7 @@ def grpo_accumulated_loss(
                         input_ids[:, -_pack_W:], left_pad_tokens_per_prompt, max_left_pad, _pack_pad_id
                     ).float()
                     _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
-                    if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
+                    if UNSLOTH_ENABLE_LOGGING:
                         print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} maxseg={_pack_maxseg} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
                     # floor ~0.25 through different kernels; cross-sample contamination is >= 2.4
                     if _pack_diff < 7e-1:
@@ -1047,7 +1047,7 @@ def grpo_accumulated_loss(
                             unwrapped_model._unsloth_seq_packing_grad_unsafe_T = (
                                 _pack_T if _pack_unsafe is None else min(_pack_unsafe, _pack_T)
                             )
-                        if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
+                        if UNSLOTH_ENABLE_LOGGING:
                             print(f"[Unsloth] GRPO seq-packing (grad) fell back at T={_pack_T} (diff={_pack_diff:.3f})", flush = True)
         except Exception as _pack_err:
             # any failure -> drop intermediates, use the padded loop, do not retry
@@ -1058,7 +1058,7 @@ def grpo_accumulated_loss(
             if isinstance(_pack_err, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
             unwrapped_model._unsloth_seq_packing_grad_ok = False
-            if os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_DEBUG", "0") == "1":
+            if UNSLOTH_ENABLE_LOGGING:
                 print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
     if _pack_use and _pack_result is not None:
         new_logprobs = _pack_result          # verified -> skip the loop
