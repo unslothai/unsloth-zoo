@@ -29,6 +29,7 @@ import shutil
 import tempfile
 import types
 import warnings
+import weakref
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
@@ -311,23 +312,7 @@ def _deepseek_ocr_config_model_type(config_data):
     return None
 
 
-def _materialize_mlx_vlm_config_override(local_path, config_data):
-    """Return a load path whose config routes known repos to the right mlx-vlm class."""
-    if not local_path:
-        return local_path, config_data
-    corrected_model_type = _deepseek_ocr_config_model_type(config_data)
-    if (
-        corrected_model_type is None
-        or config_data.get("model_type") == corrected_model_type
-    ):
-        return local_path, config_data
-
-    patched_config = dict(config_data)
-    patched_config["model_type"] = corrected_model_type
-    # mlx-vlm supplies the model/processor implementation locally. Keeping the
-    # Torch remote-code auto_map here makes AutoProcessor import incompatible
-    # DeepSeek OCR Torch modules during MLX loads.
-    patched_config.pop("auto_map", None)
+def _materialize_mlx_vlm_config_data(local_path, config_data):
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
     for name in os.listdir(local_path):
         src = os.path.join(local_path, name)
@@ -339,11 +324,53 @@ def _materialize_mlx_vlm_config_override(local_path, config_data):
         except FileExistsError:
             pass
     with open(os.path.join(override_dir, "config.json"), "w") as f:
-        json.dump(patched_config, f, indent=2)
+        json.dump(config_data, f, indent=2)
+    return override_dir
+
+
+def _mlx_vlm_config_override_data(config_data):
+    corrected_model_type = _deepseek_ocr_config_model_type(config_data)
+    if (
+        corrected_model_type is None
+        or config_data.get("model_type") == corrected_model_type
+    ):
+        return None
+
+    patched_config = dict(config_data)
+    patched_config["model_type"] = corrected_model_type
+    # mlx-vlm supplies the model/processor implementation locally. Keeping the
+    # Torch remote-code auto_map here makes AutoProcessor import incompatible
+    # DeepSeek OCR Torch modules during MLX loads.
+    patched_config.pop("auto_map", None)
     print(
         "Unsloth: Routing DeepSeek OCR checkpoint through "
         f"mlx-vlm model_type={corrected_model_type!r}."
     )
+    return patched_config
+
+
+def _keep_mlx_vlm_config_view_alive(model, override_dir):
+    override_dir = str(override_dir)
+    paths = list(getattr(model, "_unsloth_mlx_config_view_paths", ()))
+    paths.append(override_dir)
+    model._unsloth_mlx_config_view_paths = paths
+    try:
+        finalizers = list(getattr(model, "_unsloth_mlx_config_view_finalizers", ()))
+        finalizers.append(weakref.finalize(model, shutil.rmtree, override_dir, ignore_errors=True))
+        model._unsloth_mlx_config_view_finalizers = finalizers
+    except TypeError:
+        pass
+
+
+def _materialize_mlx_vlm_config_override(local_path, config_data):
+    """Return a load path whose config routes known repos to the right mlx-vlm class."""
+    if not local_path:
+        return local_path, config_data
+    patched_config = _mlx_vlm_config_override_data(config_data)
+    if patched_config is None:
+        return local_path, config_data
+
+    override_dir = _materialize_mlx_vlm_config_data(local_path, patched_config)
     return override_dir, patched_config
 
 
@@ -688,6 +715,81 @@ def _load_mlx_vlm_with_extra_weight_filter(
                     return vlm_load(model_name, **vlm_kwargs)
             finally:
                 nn.Module.load_weights = original_load_weights
+
+
+def _load_mlx_vlm_distributed(
+    model_name,
+    model_type,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    hf_token=None,
+    revision=None,
+    config_override_data=None,
+):
+    pipeline_group, tensor_group = _mlx_active_distributed_groups(
+        pipeline_group,
+        tensor_group,
+    )
+    mode = "tensor" if tensor_group is not None else "pipeline"
+    model_label = f"'{model_name}'"
+    if model_type:
+        model_label = f"{model_label} (model_type={model_type!r})"
+
+    try:
+        from mlx_vlm.utils import get_model_path, sharded_load
+    except ImportError as error:
+        raise ImportError(
+            "Unsloth: distributed MLX VLM inference requires mlx-vlm with "
+            "sharded_load support. Install or upgrade mlx-vlm on Apple Silicon."
+        ) from error
+
+    try:
+        with _temporary_hf_token_env(hf_token):
+            load_target = get_model_path(model_name, revision=revision)
+            if config_override_data is not None:
+                load_target = _materialize_mlx_vlm_config_data(
+                    str(load_target),
+                    config_override_data,
+                )
+                try:
+                    model, processor = sharded_load(
+                        load_target,
+                        tensor_group=tensor_group,
+                        pipeline_group=pipeline_group,
+                    )
+                except Exception:
+                    shutil.rmtree(load_target, ignore_errors=True)
+                    raise
+                _keep_mlx_vlm_config_view_alive(model, load_target)
+                return model, processor
+            return sharded_load(
+                load_target,
+                tensor_group=tensor_group,
+                pipeline_group=pipeline_group,
+            )
+    except ValueError as error:
+        message = str(error)
+        lower_message = message.lower()
+        support_error = (
+            "does not support" in lower_message
+            or "not supported" in lower_message
+            or "unsupported model type" in lower_message
+        )
+        if not support_error:
+            raise
+        raise ValueError(
+            f"Unsloth: {model_label} does not support MLX {mode} parallel "
+            f"VLM inference through mlx-vlm. {message}"
+        ) from error
+    except TypeError as error:
+        message = str(error)
+        if "tensor_group" not in message and "pipeline_group" not in message:
+            raise
+        raise ImportError(
+            "Unsloth: distributed MLX VLM inference requires a newer mlx-vlm "
+            "with sharded_load(repo, tensor_group=..., pipeline_group=...) support."
+        ) from error
 
 
 def _read_json_file(path):
@@ -3960,6 +4062,7 @@ class FastMLXModel:
         # clear local_path: LoRA-adapter dirs have adapter_config.json but no
         # config.json, and the adapter branch needs local_path.
         local_path = None
+        vlm_config_override_data = None
         try:
             with _temporary_hf_token_env(token):
                 config_allow_patterns = None
@@ -3986,10 +4089,20 @@ class FastMLXModel:
                         config_data = json.load(f)
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
-            local_path, config_data = _materialize_mlx_vlm_config_override(
-                local_path,
-                config_data,
-            )
+            original_local_path = local_path
+            original_config_data = dict(config_data)
+            if distributed_requested:
+                patched_config_data = _mlx_vlm_config_override_data(config_data)
+                if patched_config_data is not None:
+                    config_data = patched_config_data
+                    vlm_config_override_data = dict(config_data)
+            else:
+                local_path, config_data = _materialize_mlx_vlm_config_override(
+                    local_path,
+                    config_data,
+                )
+                if local_path != original_local_path or config_data != original_config_data:
+                    vlm_config_override_data = dict(config_data)
 
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
         # aren't trainable (our CCE backward zeros the quantized weight grad),
@@ -4378,12 +4491,6 @@ class FastMLXModel:
             extra_kwargs["trust_remote_code"] = True
 
         if is_vlm:
-            if _mlx_distributed_requested(pipeline_group, tensor_group):
-                raise ValueError(
-                    "Unsloth: distributed MLX inference for VLM models is not "
-                    "supported yet. Use a text-only mlx-lm model or run this "
-                    "VLM without mlx.launch."
-                )
             # VLM path via mlx-vlm
             try:
                 from mlx_vlm import load as vlm_load
@@ -4409,13 +4516,12 @@ class FastMLXModel:
                 config_data, quantization_spec, model_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
-            if _mlx_distributed_requested(pipeline_group, tensor_group) and want_runtime_quant:
-                raise ValueError(
-                    "Unsloth: distributed MLX inference requires a pre-quantized "
-                    "or full-precision MLX repo. Runtime MLX quantization while "
-                    "sharding is unsupported; use an mlx-community *-4bit/*-8bit "
-                    "repo or load without quantized load flags."
-                )
+            quantization_spec, want_runtime_quant = _resolve_distributed_runtime_quantization(
+                model_name,
+                quantization_spec,
+                distributed_requested=distributed_requested,
+                want_runtime_quant=want_runtime_quant,
+            )
 
             if quantization_spec.enabled and quant_state == "compatible":
                 warnings.warn(
@@ -4445,6 +4551,28 @@ class FastMLXModel:
                 )
                 model._config = vlm_cfg
                 mx.eval(model.parameters())
+            elif distributed_requested:
+                if text_only is False and not _is_vlm(config_data):
+                    raise ValueError(
+                        "Unsloth: distributed MLX VLM inference requires a "
+                        f"supported mlx-vlm architecture. '{model_name}' does "
+                        f"not appear to be a VLM (model_type={model_type!r})."
+                    )
+                active_pipeline_group, active_tensor_group = _mlx_active_distributed_groups(
+                    pipeline_group,
+                    tensor_group,
+                )
+                mode = "tensor" if active_tensor_group is not None else "pipeline"
+                print(f"Unsloth: Loading {model_name} via mlx-vlm (distributed {mode} VLM)...")
+                model, processor = _load_mlx_vlm_distributed(
+                    model_name,
+                    model_type,
+                    pipeline_group=active_pipeline_group,
+                    tensor_group=active_tensor_group,
+                    hf_token=token,
+                    revision=revision,
+                    config_override_data=vlm_config_override_data,
+                )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
                 # Lazy-load when converting dtype so weights materialize once.
