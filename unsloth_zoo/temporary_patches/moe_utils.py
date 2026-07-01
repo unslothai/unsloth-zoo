@@ -199,7 +199,8 @@ def _moe_recompute_enabled(source) -> bool:
 
 class _GroupedMMRecompute(torch.autograd.Function):
     """grouped_mm(inputs, W) for a frozen W from weight_provider(). Saves only
-    (inputs, offsets) + the provider, not the dense W; rebuilds W in backward for dX."""
+    offsets + the provider (inputs is unused for the frozen-base dX, and the dense W is
+    rebuilt in backward rather than pinned)."""
 
     @staticmethod
     def forward(ctx, inputs, offsets, weight_provider):
