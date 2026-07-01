@@ -395,7 +395,7 @@ def train_on_responses_only(
         # keep the generic error instead of telling users to raise max_length.
         if max_length is None: return
         n_sampled = 0; n_trunc = 0
-        for i in list(dropped)[:100]:
+        for i in dropped[:100]:
             input_ids = dataset[int(i)].get("input_ids")
             if input_ids is None: continue
             if getattr(input_ids, "tolist", None): input_ids = input_ids.tolist()

@@ -86,10 +86,13 @@ def _content_exact(collator, proc):
 
 
 def _check(repo, ins, res):
-    from transformers import AutoProcessor, AutoConfig
-    from unsloth_zoo.vision_utils import UnslothVisionDataCollator
-    from unsloth_zoo.dataset_utils import train_on_responses_only
+    # Import inside the try so a zoo-only CI without the `unsloth` package (whose absence makes
+    # unsloth_zoo/__init__ raise ImportError) turns into a SKIP, not a hard error, when run() is
+    # reached via an existing cache dir with the env flag unset.
     try:
+        from transformers import AutoProcessor, AutoConfig
+        from unsloth_zoo.vision_utils import UnslothVisionDataCollator
+        from unsloth_zoo.dataset_utils import train_on_responses_only
         path = _fetch(repo)
         proc = AutoProcessor.from_pretrained(path)
         model = _mock_model(AutoConfig.from_pretrained(path))
