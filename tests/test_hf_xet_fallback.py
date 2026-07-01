@@ -2312,8 +2312,14 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
+    # A COMPLETE sharded variant set (shards + index) is accepted; an incomplete one is retried
+    # (covered by test_post_download_rejects_incomplete_variant_shards).
     snap2, blob2 = _mk_snapshot(tmp_path, "varshard")
     (snap2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "model.fp16-00002-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
@@ -2441,6 +2447,12 @@ def test_post_download_rejects_incomplete_variant_shards(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is False
+    # A lone variant shard with NO index (a partial that never fetched the index) is also incomplete.
+    snap_noidx, blob_ni = _mk_snapshot(tmp_path, "variant_no_index")
+    (snap_noidx / "model.fp16-00001-of-00002.safetensors").symlink_to(blob_ni)
+    assert xf._download_result_usable(
+        snap_noidx, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
     # The missing variant shard present -> complete set -> accepted (no false-reject).
     (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
@@ -2452,6 +2464,25 @@ def test_post_download_rejects_incomplete_variant_shards(tmp_path):
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
+
+
+def test_post_download_accepts_exact_named_shard_subset(tmp_path):
+    """A caller naming an EXACT shard file (allow=['model-00001-of-00002.safetensors']) asked for
+    precisely that file; once it is present the result is accepted, even though its sibling shard / index
+    is absent -- the whole-checkpoint completeness gate applies only to GLOBBED weight warms, not an
+    exact-named subset (else a satisfied request is failed into a DownloadStallError) (#829 re-review).
+    A named shard that is ABSENT is still rejected by the exact-files check."""
+    snap, blob = _mk_snapshot(tmp_path, "exact_shard_present")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model",
+        allow_patterns = ["model-00001-of-00002.safetensors"], ignore_patterns = None) is True
+    # The exact-named shard absent -> rejected (nothing to load).
+    snap2, _ = _mk_snapshot(tmp_path, "exact_shard_absent")
+    (snap2 / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap2, repo_type = "model",
+        allow_patterns = ["model-00001-of-00002.safetensors"], ignore_patterns = None) is False
 
 
 def test_post_download_accepts_dataset_without_weight(tmp_path):

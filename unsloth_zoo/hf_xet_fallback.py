@@ -1248,16 +1248,18 @@ def _download_result_usable(
             ):
                 return False
         else:
-            # Patterned weight request: a selected weight must be present AND -- only when the request
-            # SELECTS canonical root shards (a globbed weight request, not an adapter / gguf / subfolder
-            # request whose co-resident canonical shards it never reads) -- that shard set must be
-            # complete (a lone ``model-00001-of-0000N`` without its index / remaining shards is a partial
-            # the in-process load would finish over Xet).
+            # Patterned weight request: a selected weight must be present AND -- only for a GLOBBED
+            # request that SELECTS canonical root shards (so a later load expects the whole sharded
+            # checkpoint), not an adapter / gguf / subfolder request whose co-resident canonical shards
+            # it never reads, and not an EXACT-named request that asked for precisely those files -- the
+            # canonical shard set must be complete (a lone ``model-00001-of-0000N`` without its index /
+            # remaining shards is a partial the in-process load would finish over Xet).
             if not _has_selected_weight(
                 snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
             ):
                 return False
-            if _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) \
+            if not _patterns_are_exact_names(allow_patterns) \
+                    and _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) \
                     and _has_incomplete_canonical_root_shards(snapshot_dir):
                 return False
     return True

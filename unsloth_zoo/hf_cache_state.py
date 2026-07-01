@@ -567,25 +567,31 @@ def _has_incomplete_canonical_root_shards(
 
 
 def _has_incomplete_variant_root_shards(snapshot_dir: Path, variant: str) -> bool:
-    """True when the root holds a VARIANT weight shard index whose set is incomplete (a listed shard
-    missing). Positive-evidence ONLY: a single-file variant (no index) or a complete variant shard set
-    returns False, so a complete or single-file variant download is never rejected. transformers writes
-    the variant index with the variant token before ``.json`` (``model.safetensors.index.<variant>.json``
-    / ``pytorch_model.bin.index.<variant>.json``), so it carries both the shard-index marker and the
-    ``.<variant>.`` infix."""
-    infix = f".{variant}."
+    """True when the root holds a VARIANT weight SHARD (a ``.<variant>-NNNNN-of-...`` file) that is NOT
+    backed by a COMPLETE variant shard index -- the index is missing, or one of its listed shards is
+    absent. Positive-evidence ONLY: a single-file variant (no shard files) or a complete variant shard
+    set returns False, so a complete or single-file variant download is never rejected. transformers
+    writes a sharded variant weight with a ``.<variant>-`` infix and its index as
+    ``model.safetensors.index.<variant>.json`` (a ``.<variant>.`` infix before ``.json``)."""
+    dot_infix = f".{variant}."     # the variant shard index: model.safetensors.index.<variant>.json
+    dash_infix = f".{variant}-"    # a sharded variant weight: model.<variant>-00001-of-00002.safetensors
     try:
         entries = list(snapshot_dir.iterdir())
     except OSError:
         return False
+    has_variant_shard = False
+    has_complete_variant_index = False
     for entry in entries:
         name = entry.name
-        # _is_weight_shard_index matches canonical AND variant indices; the infix restricts to the
+        # _is_weight_shard_index matches canonical AND variant indices; the dot infix restricts to the
         # requested variant (the canonical index has no ".<variant>." token).
-        if infix in name and _is_weight_shard_index(name):
-            if _safe_is_file(entry) and not _weight_shard_index_complete(entry):
-                return True
-    return False
+        if dot_infix in name and _is_weight_shard_index(name):
+            if _safe_is_file(entry) and _weight_shard_index_complete(entry):
+                has_complete_variant_index = True
+        elif dash_infix in name and _is_loadable_weight_file(name):
+            if _safe_is_file(entry):
+                has_variant_shard = True
+    return has_variant_shard and not has_complete_variant_index
 
 
 def requested_named_files_present(
