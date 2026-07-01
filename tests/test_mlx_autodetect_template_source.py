@@ -60,6 +60,14 @@ def _new_tok():
     return None
 
 
+def _new_tok_with(template):
+    tok = _new_tok(); tok.chat_template = template; return tok
+
+
+def _new_tok_none():
+    tok = _new_tok(); tok.chat_template = None; return tok
+
+
 def _load():
     """Import the MLX trainer + shared auto-detect helper, skipping if unavailable."""
     if _new_tok() is None:
@@ -155,6 +163,22 @@ def test_vlm_processor_only_template_is_used_for_detection():
     # And the full wrapper builds a mask function without raising.
     fn = T.train_on_responses_only(tr, return_function=True)
     assert callable(fn)
+
+
+def test_vlm_explicit_processor_override_wins_over_trainer_processor():
+    """An explicit tokenizer=/processor override must drive detection over
+    trainer.processor, matching the wrapper's kwarg precedence."""
+    T, get_parts = _load()
+
+    # trainer.processor renders ChatML; the caller overrides with an INST processor.
+    trainer_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(CHATML))
+    override_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(INST))
+    tr = _Trainer(trainer_proc, _Args(), is_vlm=True, processor=trainer_proc)
+
+    resolved = T._resolve_response_mask_tokenizer(override_proc)
+    detect = T._resolve_autodetect_template_source(tr, override_proc, resolved)
+    assert detect is override_proc
+    assert get_parts(detect) == get_parts(override_proc)  # INST markers, not ChatML
 
 
 def test_explicit_markers_bypass_template_resolution():

@@ -186,9 +186,12 @@ def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
     model_type = _model_type_of(trainer)
 
     if bool(getattr(trainer, "_is_vlm", False)):
-        processor = getattr(trainer, "processor", None)
-        if processor is None and _looks_like_processor(source):
-            processor = source
+        # Honor the wrapper's tokenizer= precedence: source already resolves the
+        # explicit override over trainer.tokenizer, so prefer it when it is a
+        # processor before falling back to trainer.processor / model._processor.
+        processor = source if _looks_like_processor(source) else None
+        if processor is None:
+            processor = getattr(trainer, "processor", None)
         if processor is None:
             processor = getattr(model, "_processor", None)
         if processor is not None:
