@@ -520,24 +520,30 @@ def make_orpo_loss_fn(beta=0.1):
 
     Expects ``batch`` shape (2B, L) where rows [0:B] are chosen and rows [B:2B]
     are rejected, paired by index (produced by ``create_preference_batches``).
-    ``lengths`` is (2B, 2) with per-row [response_start, seq_end); only response
-    tokens are scored (the prompt is masked).
+    ``lengths`` is (2B, 2) with per-row [response_start, seq_end). The odds-ratio
+    term scores response tokens only; the SFT/NLL term (TRL chosen_nll_loss) is
+    computed over the full prompt+response span (all non-pad chosen tokens).
     """
     def loss_fn(model, batch, lengths, labels=None):
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
+        ce_tok = nn.losses.cross_entropy(logits, targets)
         mask = mx.logical_and(
             steps >= lengths[:, 0:1], steps < lengths[:, 1:]
         ).astype(mx.float32)
-        logp_tok = -nn.losses.cross_entropy(logits, targets) * mask
+        logp_tok = -ce_tok * mask
         ntok_row = mask.sum(axis=1)
         logp = logp_tok.sum(axis=1) / mx.maximum(ntok_row, mx.array(1.0))
         B = batch.shape[0] // 2
         logp_c, logp_r = logp[:B], logp[B:]
-        # SFT term: NLL on chosen (length-normalized).
-        sft = -mx.mean(logp_c)
+        # SFT term: TRL chosen_nll_loss. Pooled token-mean cross-entropy over the
+        # full prompt+response span (all non-pad chosen tokens), matching TRL's
+        # nn.CrossEntropyLoss default reduction. This is NOT the response-only,
+        # length-normalized logp used for the odds-ratio term below.
+        nll_mask = (steps < lengths[:, 1:]).astype(mx.float32)[:B]
+        sft = (ce_tok[:B] * nll_mask).sum() / mx.maximum(nll_mask.sum(), mx.array(1.0))
         # Odds-ratio term. log(p/(1-p)) per side; 1-exp(logp) stabilized.
         val_c = mx.maximum(-mx.expm1(logp_c), mx.array(1e-12, logp_c.dtype))
         val_r = mx.maximum(-mx.expm1(logp_r), mx.array(1e-12, logp_r.dtype))
