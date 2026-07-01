@@ -1123,8 +1123,13 @@ class UnslothVisionDataCollator:
         audio_tokens = list(AUDIO_TOKENS)
         if getattr(tok, "audio_token", None) is not None:
             audio_tokens.append(tok.audio_token)
+        # Audio strings absent from this tokenizer map to the unk id (matching
+        # get_padding_tokens_ids); excluding it keeps a truncated unk text token from being
+        # miscounted as an audio token and tripping the alignment check below.
+        unk_id = getattr(tok, "unk_token_id", None)
         audio_ids = torch.tensor(
-            [i for i in tok.convert_tokens_to_ids(audio_tokens) if isinstance(i, int) and i >= 0],
+            [i for i in tok.convert_tokens_to_ids(audio_tokens)
+             if isinstance(i, int) and i >= 0 and i != unk_id],
             device=batch["input_ids"].device,
         )
         n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())

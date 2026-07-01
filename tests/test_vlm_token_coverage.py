@@ -35,7 +35,7 @@ EXPECTED = {
     "Qwen2.5-Omni": ["<|IMAGE|>", "<|VIDEO|>", "<|AUDIO|>", "<|vision_bos|>", "<|vision_eos|>",
                      "<|vision_pad|>", "<|audio_bos|>", "<|audio_eos|>"],
     "PaliGemma / Llava / InternVL": ["<image>"],
-    "InternVL / Nemotron Nano Omni (image)": ["<img>", "</img>", "<video>"],
+    "InternVL / Nemotron Nano Omni (image)": ["<img>", "</img>", "<IMG_CONTEXT>", "<video>"],
     "Nemotron Nano Omni (sound)": ["<so_embedding>", "<so_start>", "<so_end>"],
     "Pixtral / Mistral": ["[IMG]", "[IMG_BREAK]", "[IMG_END]"],
     "Gemma 3 / 3n (image)": ["<image_soft_token>", "<start_of_image>", "<end_of_image>"],

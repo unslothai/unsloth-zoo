@@ -54,6 +54,7 @@ IMAGE_TOKENS = [
     "<|IMG_PATCH|>",      # Cohere
     "<img>",              # InternVL / Nemotron Nano Omni (begin image)
     "</img>",             # InternVL / Nemotron Nano Omni (end image)
+    "<IMG_CONTEXT>",      # InternVL (repeated image-context token expanded between <img>...</img>)
     "<video>",            # Nemotron Nano Omni
     "<|IMAGE|>",          # Qwen2.5-Omni
     "<|VIDEO|>",          # Qwen2.5-Omni

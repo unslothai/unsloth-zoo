@@ -470,8 +470,11 @@ def train_on_responses_only(
     def _is_vision_collator(collator):
         if collator is None: return False
         if any(b.__name__ == "UnslothVisionDataCollator" for b in type(collator).__mro__): return True
-        processor = getattr(collator, "processor", None)
-        if processor is not None and hasattr(processor, "image_processor"): return True
+        # A vision collator may hold the processor under .processor or the common .tokenizer field
+        # (e.g. DataCollatorForSeq2Seq(tokenizer=processor)); either exposing image_processor marks it.
+        for attr in ("processor", "tokenizer"):
+            obj = getattr(collator, attr, None)
+            if obj is not None and hasattr(obj, "image_processor"): return True
         return hasattr(collator, "image_processor")
     pass
 
