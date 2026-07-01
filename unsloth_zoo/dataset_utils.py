@@ -16,6 +16,7 @@
 
 __all__ = [
     "train_on_responses_only",
+    "get_chat_template_parts",
     "sft_prepare_dataset",
     "standardize_data_formats",
     "patch_torchcodec_audio_decoder",
@@ -161,6 +162,158 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 pass
 
 
+def get_chat_template_parts(tokenizer):
+    """Auto-detect (instruction_part, response_part) from the tokenizer's chat
+    template, so train_on_responses_only needs no manual markers."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    import re
+    from collections import Counter
+
+    tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+    # Render with the processor's template when it has one (that is what VLM batching renders
+    # through, and it can differ from the inner tokenizer's text template); validate token ids
+    # with the inner tokenizer. Fall back to the inner template for plain / processor-less cases.
+    render_tok = tokenizer if getattr(tokenizer, "chat_template", None) is not None else tok
+    if getattr(render_tok, "chat_template", None) is None:
+        raise ValueError("Unsloth: No chat_template to auto-detect from - pass instruction_part and response_part.")
+
+    # Sentinels survive Jinja |trim and never collide with real tokens
+    U, A = "⁠USERPROBE7q⁠", "⁠ASSTPROBE4z⁠"
+    render = lambda msgs, gen: render_tok.apply_chat_template(msgs, tokenize = False, add_generation_prompt = gen)
+    starts = lambda text, n: [m.start() for m in re.finditer(re.escape(n), text)]
+    ends   = lambda text, n: [m.end()   for m in re.finditer(re.escape(n), text)]
+    eos = getattr(tok, "eos_token", "") or ""
+    bos = getattr(tok, "bos_token", "") or ""
+    try:    added = set(tok.get_added_vocab().keys())
+    except Exception: added = set()
+    # Keep only non-empty string tokens: "" would make strip_shared loop forever
+    # and None would break sorting by len.
+    specials = sorted({str(s) for s in (set(getattr(tok, "all_special_tokens", []) or []) | added) if s}, key = len, reverse = True)
+
+    def strip_lead(s, *prefixes):
+        # Remove any of the given leading strings, repeatedly
+        changed = True
+        while changed:
+            changed = False
+            for p in prefixes:
+                if p and s.startswith(p): s, changed = s[len(p):], True
+        return s
+
+    def strip_shared(a, b):
+        # Drop leading special-tokens/whitespace common to both until roles differ
+        while True:
+            wa, wb = re.match(r"\s+", a), re.match(r"\s+", b)
+            if wa and wb and wa.group() == wb.group():
+                a, b = a[wa.end():], b[wb.end():]
+                continue
+            t = next((s for s in specials if a.startswith(s)), None)
+            if t and b.startswith(t):
+                a, b = a[len(t):], b[len(t):]
+                continue
+            break
+        return a, b
+
+    def gap_mode(from_ends, to_starts):
+        # Most common text between adjacent content blocks
+        out = []
+        for e in from_ends:
+            nxt = [s for s in to_starts if s >= e]
+            if nxt: out.append(full[e : min(nxt)])
+        return Counter(out).most_common(1)[0][0] if out else ""
+
+    # Render a 3-turn probe; read markers off the gaps between content blocks. VLM processors
+    # differ on content shape: some want plain strings, some structured parts, and some want the
+    # user as parts but the assistant collapsed to a string. Probe those shapes (per-role) and
+    # keep whichever renders our sentinels, matching what VLM batching would render.
+    _str, _lst = (lambda s: s), (lambda s: [{"type": "text", "text": s}])
+    def _convo(uwrap, awrap):
+        return [{"role": "user", "content": uwrap(U)}, {"role": "assistant", "content": awrap(A)}] * 3
+    uwrap, awrap, full = None, None, ""
+    for _uw, _aw in ((_str, _str), (_lst, _lst), (_lst, _str)):
+        try: rendered = render(_convo(_uw, _aw), False)
+        except Exception: continue
+        if starts(rendered, U) and starts(rendered, A):
+            uwrap, awrap, full = _uw, _aw, rendered; break
+    if uwrap is None:
+        raise ValueError("Unsloth: Could not auto-detect chat template structure - pass instruction_part and response_part.")
+    convo = _convo(uwrap, awrap)
+    instr_gap = gap_mode(ends(full, A), starts(full, U))
+    resp_gap  = gap_mode(ends(full, U), starts(full, A))
+
+    # Clean assistant header = generation prompt. Diff the tails after the last user
+    # turn; shared leading special-tokens are the turn terminator, so drop them.
+    # A headerless template (e.g. Mistral [INST]) leaves add_generation_prompt a no-op, so the
+    # two renders match and there is no header: force it empty to reach the headerless fallback
+    # (otherwise the shared tail like [/INST] is mistaken for a header and pulls eos into the marker).
+    end_user = convo[:-1]
+    tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
+    _gen_on, _gen_off = render(end_user, True), render(end_user, False)
+    asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
+
+    if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
+        # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
+        response_part, instruction_part = asst_header, strip_lead(instr_gap, resp_gap[:-len(asst_header)])
+    elif asst_header and asst_header == resp_gap:
+        # Terminator leaked into the gen-diff (Phi-3): strip shared separators, then strip the
+        # assistant turn terminator (eos/bos) off the instruction marker so a non-final assistant
+        # turn's eos stays trainable, matching explicit markers.
+        response_part, instruction_part = strip_shared(asst_header, instr_gap)
+        instruction_part = strip_lead(instruction_part, " ", "\t", eos, bos)
+    else:
+        # Headerless template (Mistral [INST]/[/INST]): strip bos/eos separators here.
+        # Strip eos alone, never eos+"\n": a turn-delimiting newline stays as the marker
+        # anchor (e.g. "\n### Human:") instead of being glued to eos and dropped, which
+        # left a bare marker that could match inside message content. strip_lead skips
+        # empty prefixes, so an unset eos never strips a bare "\n".
+        response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
+        instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
+
+    # Reasoning templates inject thinking-block scaffolding into the generation prompt
+    # that a real assistant turn ("<think>...</think>answer") does not carry right after
+    # the header, so a marker holding it would miss the turn. Two shapes:
+    #   paired empty tag - "<|im_start|>assistant\n<think></think>" (Qwen3-Thinking)
+    #   lone close tag   - "<|assistant|></think>"                  (GLM-4.x)
+    # Re-probe with a reasoning-filled turn and drop the scaffold only when confirmed gone
+    # (templates that always emit it keep it). Dropping only shortens the marker to the
+    # assistant header, so it can never unmask user content.
+    mt = re.search(r"<([^\s/>]+)>\s*</\1>\s*$", response_part) or \
+         re.search(r"</([^\s/>]+)>\s*$", response_part)
+    if mt and mt.start() > 0:
+        tag = mt.group(1)
+        scaffold = response_part[mt.start():]
+        header = response_part[:mt.start()]
+        try:
+            filled = render([{"role": "user", "content": uwrap(U)},
+                             {"role": "assistant", "content": awrap(f"<{tag}>rZ9</{tag}>{A}")}], False)
+            pos = filled.rfind(header)
+            after = filled[pos + len(header):] if pos != -1 else ""
+            if pos != -1 and not after.startswith(scaffold):
+                response_part = header
+        except Exception:
+            pass
+
+    # Only strip whitespace from header markers: do NOT strip bos here, since for some
+    # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
+    # stripping it would leave an unanchored marker that matches inside user content.
+    instruction_part = strip_lead(instruction_part, " ", "\t").rstrip(" \t")
+    response_part    = strip_lead(response_part, " ", "\t").rstrip(" \t")
+    if not instruction_part or not response_part:
+        raise ValueError("Unsloth: Auto-detection produced an empty marker - pass instruction_part and response_part.")
+
+    # Each marker must tokenize to a core present in a tokenized probe, else masking would
+    # silently train on nothing (role tags that are not atomic tokens, or whose ids shift by
+    # context). Some SentencePiece tokenizers need a leading space, so try that variant too.
+    probe_ids = tok(full, add_special_tokens = False).input_ids
+    def validate(part, part_name):
+        for cand in (part, " " + part):
+            core = _find_common_token_ids(cand, tok, True)[0]
+            if core and any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
+                return cand
+        raise ValueError(f"Unsloth: Could not reliably auto-detect {part_name} (detected {repr(part)}) - pass instruction_part and response_part.")
+    return validate(instruction_part, "instruction_part"), validate(response_part, "response_part")
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -180,14 +333,21 @@ def train_on_responses_only(
     # All Unsloth Zoo code licensed under LGPLv3
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    # Keep the original object (may be a VLM processor) so auto-detect can read a
+    # chat template that lives only on the processor; the matcher uses the inner one.
+    processor = tokenizer
     # Get non vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
-        
-        if instruction_part is None or response_part is None:
-            raise ValueError("Unsloth: instruction_part and response_part must be given!")
+
+        if instruction_part is None and response_part is None:
+            # Neither given: auto-detect both from the chat template
+            instruction_part, response_part = get_chat_template_parts(processor)
+            print(f"Unsloth: Auto-detected instruction_part = {repr(instruction_part)} and response_part = {repr(response_part)}")
+        elif instruction_part is None or response_part is None:
+            raise ValueError("Unsloth: Give both instruction_part and response_part, or neither to auto-detect!")
         pass
     elif (instruction_part is not None or response_part is not None) and \
         (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):

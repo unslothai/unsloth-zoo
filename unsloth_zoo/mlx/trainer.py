@@ -135,6 +135,110 @@ def _resolve_response_mask_tokenizer(tokenizer):
     return tokenizer
 
 
+def _looks_like_processor(obj):
+    return obj is not None and (
+        hasattr(obj, "image_processor")
+        or (hasattr(obj, "tokenizer") and hasattr(obj, "apply_chat_template"))
+    )
+
+
+def _processor_ready_for_detect(obj):
+    """Processor can drive detection: renders a template and has a callable inner tokenizer."""
+    if not _looks_like_processor(obj):
+        return False
+    inner = getattr(obj, "tokenizer", None)
+    if not _is_hf_tokenizer(inner):
+        return False
+    return (
+        getattr(obj, "chat_template", None) is not None
+        or getattr(inner, "chat_template", None) is not None
+    )
+
+
+def _model_type_of(trainer):
+    config = getattr(getattr(trainer, "model", None), "_config", None)
+    return config.get("model_type") if isinstance(config, dict) else None
+
+
+def _clear_cached_marker_attrs(obj):
+    """Drop Unsloth's cached instruction/response markers (on obj and its inner tokenizer)
+    so a chat_template override forces re-detection instead of masking with markers from the
+    old template."""
+    for target in (obj, getattr(obj, "tokenizer", None)):
+        if target is None:
+            continue
+        for attr in ("_unsloth_input_part", "_unsloth_output_part"):
+            if hasattr(target, attr):
+                try: delattr(target, attr)
+                except Exception: pass
+    return obj
+
+
+def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer, return_function=False):
+    """Object to auto-detect (instruction_part, response_part) from.
+
+    VLM templates live on the processor, so detection must see it (the HF helper unwraps to the
+    inner tokenizer for matching). Detection must use the processor that will actually render the
+    masked batches: when return_function=False the trainer renders them via _resolve_vlm_processor
+    (trainer.processor / trainer.tokenizer / model._processor), so a tokenizer= override is not
+    used by batching and must not drive detection; when return_function=True the caller applies the
+    returned mask, so the explicit override is preferred. A configured chat_template override is
+    applied (and any markers cached from a prior template dropped first) so detection matches the
+    rendered batches. Falls back to resolved_tokenizer when no processor/override applies.
+    """
+    args = getattr(trainer, "args", None)
+    model = getattr(trainer, "model", None)
+    model_name = getattr(model, "_hf_repo", None)
+    model_type = _model_type_of(trainer)
+
+    if bool(getattr(trainer, "_is_vlm", False)):
+        override = source if _looks_like_processor(source) else None
+        trainer_tok = getattr(trainer, "tokenizer", None)
+        # Mirror _resolve_vlm_processor's resolution (what batching renders through).
+        batching = (
+            getattr(trainer, "processor", None)
+            or (trainer_tok if _looks_like_processor(trainer_tok) else None)
+            or getattr(model, "_processor", None)
+        )
+        processor = (override or batching) if return_function else (batching or override)
+        if processor is not None:
+            try:
+                if getattr(args, "vlm_chat_template", None) is not None:
+                    _clear_cached_marker_attrs(processor)
+                processor = normalize_vlm_processor_chat_template(
+                    processor,
+                    chat_template=getattr(args, "vlm_chat_template", None),
+                    model_name=model_name,
+                    model_type=model_type,
+                    strict=False,
+                )
+            except Exception:
+                pass
+            if _processor_ready_for_detect(processor):
+                return processor
+        return resolved_tokenizer
+
+    # Text: apply the chat_template override before detecting so markers match batches. Clear stale
+    # markers BEFORE normalize: a raw Jinja override supplies none (so the HF helper re-detects),
+    # while an Unsloth template name/tuple sets fresh correct markers that must be preserved.
+    if args is not None and getattr(args, "chat_template", None) is not None:
+        try:
+            _clear_cached_marker_attrs(resolved_tokenizer)
+            return normalize_mlx_chat_template(
+                resolved_tokenizer,
+                chat_template=args.chat_template,
+                model_name=model_name,
+                model_type=model_type,
+                is_vlm=False,
+                strict=False,
+            )
+        except Exception:
+            pass
+    if _processor_ready_for_detect(source):
+        return source
+    return resolved_tokenizer
+
+
 def _text_completion_only_loss_arg(args):
     """Resolve SFT-compatible completion-only loss defaults."""
     value = getattr(args, "completion_only_loss", None)
@@ -2593,16 +2697,25 @@ def train_on_responses_only(
     )
 
     # Resolve tokenizer: kwarg > trainer.tokenizer
-    _tokenizer = tokenizer
-    if _tokenizer is None and trainer is not None:
-        _tokenizer = trainer.tokenizer
-    if _tokenizer is None:
+    _source = tokenizer
+    if _source is None and trainer is not None:
+        _source = trainer.tokenizer
+    if _source is None:
         raise ValueError(
             "Unsloth: A tokenizer must be provided either via the `tokenizer` "
             "kwarg or via trainer.tokenizer."
         )
 
-    _tokenizer = _resolve_response_mask_tokenizer(_tokenizer)
+    # Callable HF tokenizer for token matching and text batch encoding.
+    _tokenizer = _resolve_response_mask_tokenizer(_source)
+
+    # Omitted markers -> auto-detect from the right chat template (see helper).
+    if instruction_part is None and response_part is None:
+        _detect_source = _resolve_autodetect_template_source(
+            trainer, _source, _tokenizer, return_function=return_function,
+        )
+    else:
+        _detect_source = _tokenizer
 
     # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
@@ -2610,7 +2723,7 @@ def train_on_responses_only(
         instruction_part=instruction_part,
         response_part=response_part,
         force_match=force_match,
-        tokenizer=_tokenizer,
+        tokenizer=_detect_source,
         return_function=True,
         last_response_only=last_response_only,
     )
