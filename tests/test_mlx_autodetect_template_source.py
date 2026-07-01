@@ -1,24 +1,9 @@
-"""MLX train_on_responses_only must auto-detect markers from the RIGHT template.
+"""_resolve_autodetect_template_source must auto-detect markers from the right template:
+the VLM processor (whose template the inner tokenizer lacks) and after any configured
+chat_template override, so markers match the rendered batches.
 
-The MLX wrapper (unsloth_zoo/mlx/trainer.py) resolves trainer.tokenizer to a
-callable HF tokenizer before handing it to the shared auto-detect helper. Two
-MLX-specific hazards follow, both fixed by _resolve_autodetect_template_source:
-
-  1. VLM processor-only templates. Many VLM processors keep the chat template on
-     the processor, not the inner tokenizer. Unwrapping to the inner tokenizer
-     first makes auto-detect raise "No chat_template" even though the processor
-     could render. Detection must see the processor; the HF helper unwraps to the
-     inner tokenizer for token matching on its own.
-
-  2. Configured chat_template override. MLXTrainingConfig.chat_template is only
-     applied later during batch creation, so auto-detecting from trainer.tokenizer
-     first reads the OLD template. Markers must be detected from the override, or
-     they will not match the batches the trainer renders with it.
-
-Hermetic: builds synthetic templates on a tiny tokenizer already cached locally
-and runs under the mlx-on-torch simulation shim. Skips (never fails) when no
-tokenizer is cached offline or when unsloth_zoo is not importable, so a default
-pytest run never reaches the network and never breaks collection.
+Hermetic: synthetic templates on a tiny offline tokenizer, under the mlx-on-torch shim;
+skips (never fails) when the tokenizer cache or unsloth_zoo is unavailable.
 """
 import pytest
 
@@ -101,11 +86,10 @@ class _Trainer:
 
 
 class _ProcessorOnly:
-    """VLM processor whose chat template lives ONLY on the processor: the inner
-    tokenizer has no template, and apply_chat_template renders via the processor's."""
+    """VLM processor whose chat template lives only on the processor (inner tokenizer has none)."""
     def __init__(self, inner_tok, render_tok):
-        self.tokenizer = inner_tok        # inner: chat_template is None
-        self.image_processor = object()   # marks this as a VLM processor
+        self.tokenizer = inner_tok
+        self.image_processor = object()
         self.chat_template = render_tok.chat_template
         self._render_tok = render_tok
 

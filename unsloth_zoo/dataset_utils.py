@@ -258,17 +258,14 @@ def get_chat_template_parts(tokenizer):
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
 
-    # A reasoning template may inject thinking-block scaffolding into the generation
-    # prompt that is NOT present (in that exact form) once a real assistant turn carries
-    # reasoning. Two shapes are seen:
+    # Reasoning templates inject thinking-block scaffolding into the generation prompt
+    # that a real assistant turn ("<think>...</think>answer") does not carry right after
+    # the header, so a marker holding it would miss the turn. Two shapes:
     #   paired empty tag - "<|im_start|>assistant\n<think></think>" (Qwen3-Thinking)
     #   lone close tag   - "<|assistant|></think>"                  (GLM-4.x)
-    # In both, a real reasoning turn renders "<think>...</think>answer", so the scaffold
-    # no longer sits right after the header and a marker holding it would miss the turn.
-    # Do not assume this: re-probe with a reasoning-filled turn and drop the scaffold
-    # only when it is confirmed gone from right after the header. Templates that always
-    # emit it keep it. Dropping only shortens the marker to the assistant header, so it
-    # can never unmask user content.
+    # Re-probe with a reasoning-filled turn and drop the scaffold only when confirmed gone
+    # (templates that always emit it keep it). Dropping only shortens the marker to the
+    # assistant header, so it can never unmask user content.
     mt = re.search(r"<([^\s/>]+)>\s*</\1>\s*$", response_part) or \
          re.search(r"</([^\s/>]+)>\s*$", response_part)
     if mt and mt.start() > 0:
