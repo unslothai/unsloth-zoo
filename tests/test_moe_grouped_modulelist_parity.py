@@ -8,6 +8,7 @@ grouped_moe_forward matches a plain per-expert reference loop, in the default, c
 recompute modes, plus forward+backward. Runs anywhere torch._grouped_mm is supported
 (H100+/B200); otherwise skipped.
 """
+import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +16,9 @@ import pytest
 
 from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     grouped_moe_forward,
+    enable_grouped_moe,
+    disable_grouped_moe,
+    wrap_loader_for_grouped_moe,
     _block_is_eligible,
     _grouped_mm_supported,
     _route_softmax_topk,
@@ -136,6 +140,65 @@ def test_eligibility_and_shared_expert_bail():
 
     unknown = _make_block("SomeUnknownMoeBlock", spec, 64, 128, 4, 2, True)
     assert _block_is_eligible(unknown) is None, "unknown block type must not be patched"
+
+
+def _eligible_block(cls_name, spec):
+    """A block with a real bound forward (the reference loop) and no patch attrs set,
+    so enable_grouped_moe/disable_grouped_moe drive the whole lifecycle themselves."""
+    hidden, inter, E, top_k = 64, 128, 4, 2
+    blk = type(cls_name, (nn.Module,), {})()
+    blk.experts = nn.ModuleList(
+        [_make_expert(hidden, inter, spec[0], spec[1], spec[2]) for _ in range(E)]
+    )
+    blk.gate = nn.Linear(hidden, E, bias=False).to(DEV, DTYPE)
+    blk.num_experts = E
+    blk.top_k = top_k
+    blk.norm_topk_prob = True
+    blk.eval()
+    blk.forward = types.MethodType(
+        lambda self, hs, _s=spec: _reference_forward(self, hs, _s)[0], blk
+    )
+    return blk
+
+
+def test_enable_disable_roundtrip():
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+    model = nn.Module()
+    model.layers = nn.ModuleList(
+        [_eligible_block("Qwen3MoeSparseMoeBlock", spec) for _ in range(2)]
+    )
+    x = torch.randn(1, 48, 64, device=DEV, dtype=DTYPE)
+    blk0 = model.layers[0]
+    expected = _reference_forward(blk0, x, spec)[0]
+
+    n = enable_grouped_moe(model, verbose=False)
+    assert n == 2, f"expected 2 patched blocks, got {n}"
+    assert blk0.forward.__func__ is grouped_moe_forward, "forward not swapped to grouped path"
+    out, _ = blk0.forward(x)  # patched path returns (final, router_logits)
+    assert _rel_l2(out, expected) < 1e-2
+
+    m = disable_grouped_moe(model)
+    assert m == 2, f"expected 2 restored blocks, got {m}"
+    assert getattr(blk0, "_unsloth_moe_spec", None) is None, "patch attrs not cleaned up"
+    assert blk0.forward.__func__ is not grouped_moe_forward, "original forward not restored"
+    assert _rel_l2(blk0.forward(x), expected) < 1e-2  # restored path returns the bare tensor
+
+
+def test_wrap_loader_idempotent_and_enables():
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+
+    def fake_from_pretrained(*args, **kwargs):
+        model = nn.Module()
+        model.layers = nn.ModuleList([_eligible_block("Qwen3MoeSparseMoeBlock", spec)])
+        return model, "tokenizer"
+
+    wrapped = wrap_loader_for_grouped_moe(fake_from_pretrained)
+    assert wrapped is not fake_from_pretrained, "loader was not wrapped"
+    assert wrap_loader_for_grouped_moe(wrapped) is wrapped, "double-wrapping must be a no-op"
+
+    model, tok = wrapped()
+    assert tok == "tokenizer", "wrapper must pass the loader's return value through unchanged"
+    assert model.layers[0].forward.__func__ is grouped_moe_forward, "grouped MoE not enabled on return"
 
 
 if __name__ == "__main__":
