@@ -2373,14 +2373,25 @@ def test_post_download_rejects_patterned_canonical_only_for_variant(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
         variant = "fp16") is True
-    # A sharded in-scope variant weight (dash infix) is likewise accepted.
+    # A COMPLETE sharded in-scope variant weight (dash infix + its variant index) is accepted.
     snap2, blob2 = _mk_snapshot(tmp_path, "subvarshard")
     sub2 = snap2 / "weights"
     sub2.mkdir()
     (sub2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)
+    (sub2 / "model.fp16-00002-of-00002.safetensors").symlink_to(blob2)
+    (sub2 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
         variant = "fp16") is True
+    # A LONE variant shard with no index is an incomplete set the load cannot enumerate -> rejected.
+    snap2b, blob2b = _mk_snapshot(tmp_path, "subvarshard_lone")
+    (snap2b / "weights").mkdir()
+    (snap2b / "weights" / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2b)
+    assert xf._download_result_usable(
+        snap2b, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
+        variant = "fp16") is False
     # An out-of-scope variant weight does NOT satisfy an in-scope variant request.
     snap3, blob3 = _mk_snapshot(tmp_path, "subvaroos")
     (snap3 / "model.fp16.safetensors").symlink_to(blob3)  # at root, but request scopes to weights/
@@ -2853,6 +2864,81 @@ def test_diffusers_component_check_scoped_to_declared_components(tmp_path):
     (snap2 / "unet" / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob2)
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_post_download_variant_presence_requires_canonical_name(tmp_path):
+    """The unpatterned variant presence check counts only a CANONICAL model variant name a default
+    variant load reads (model.<variant>.safetensors, model.<variant>-NNNNN-of-NNNNN.safetensors). A
+    non-canonical sidecar (consolidated.fp16.safetensors) or a non-transformers dot-infix shard name
+    (model-00001-of-00001.fp16.safetensors) must NOT satisfy the request, else the load fetches the
+    absent model.fp16.safetensors over un-killable Xet (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "var_noncanonical")
+    (snap / "config.json").write_text("{}")
+    (snap / "consolidated.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    snap_dot, blob_dot = _mk_snapshot(tmp_path, "var_dotinfix")
+    (snap_dot / "config.json").write_text("{}")
+    (snap_dot / "model-00001-of-00001.fp16.safetensors").symlink_to(blob_dot)  # not a name tf reads
+    assert xf._download_result_usable(
+        snap_dot, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    # The canonical single variant weight -> accepted.
+    (snap / "model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
+def test_post_download_rejects_selected_shard_without_index(tmp_path):
+    """A SELECTED non-root numbered shard with NO index of the read format is an incomplete set the load
+    cannot enumerate (it needs the index to list the shards), so it is rejected and retried over HTTP,
+    else the adapter / component load fetches the index and remaining shards over un-killable Xet
+    (Codex #829). A complete indexed set is accepted."""
+    # A sharded ADAPTER with a lone shard and no index.
+    snap, blob = _mk_snapshot(tmp_path, "adapter_lone_shard")
+    (snap / "config.json").write_text("{}")
+    (snap / "adapter_config.json").write_text("{}")
+    (snap / "adapter_model-00001-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
+        ignore_patterns = None) is False
+    # Complete it with the second shard + index -> accepted.
+    (snap / "adapter_model-00002-of-00002.safetensors").symlink_to(blob)
+    (snap / "adapter_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "adapter_model-00001-of-00002.safetensors",
+                        "b": "adapter_model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
+        ignore_patterns = None) is True
+    # A component subfolder lone shard (allow=['unet/*']) is likewise rejected.
+    snap2, blob2 = _mk_snapshot(tmp_path, "unet_lone_shard")
+    (snap2 / "unet").mkdir()
+    (snap2 / "unet" / "config.json").write_text("{}")
+    (snap2 / "unet" / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is False
+
+
+def test_post_download_diffusers_presence_scoped_to_declared(tmp_path):
+    """An UNPATTERNED diffusers pipeline warm counts a component weight as proof only for a DECLARED
+    component. A stale cache holding only an UNDECLARED leftover (controlnet/ not in model_index.json)
+    must be rejected, else the pipeline fetches the declared unet/vae weights in-process over Xet
+    (Codex #829). The declared components present -> accepted."""
+    snap, blob = _mk_snapshot(tmp_path, "diffusers_undeclared_only")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "U"], "vae": ["diffusers", "V"]}))
+    (snap / "controlnet").mkdir()  # UNDECLARED
+    (snap / "controlnet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # The declared components present -> accepted.
+    for comp in ("unet", "vae"):
+        (snap / comp).mkdir()
+        (snap / comp / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
 def test_selected_readable_weight_complete_entry_point(tmp_path):

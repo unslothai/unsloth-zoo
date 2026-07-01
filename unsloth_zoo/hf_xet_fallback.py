@@ -43,8 +43,10 @@ from typing import Any, Callable, Optional
 
 from unsloth_zoo.hf_cache_state import (
     INCOMPLETE_SUFFIX,
+    _ROOT_MODEL_VARIANT_WEIGHT_RE,
     _as_pattern_list,
     _diffusers_component_shards_incomplete,
+    _diffusers_declared_components,
     _filter_paths,
     _has_glob,
     _has_incomplete_canonical_root_shards,
@@ -1024,13 +1026,17 @@ _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
 
 
 def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
-    """True if a diffusers pipeline COMPONENT weight (a loadable weight in a component SUBFOLDER: unet/,
-    vae/, text_encoder/, ...) that the ignore filter keeps is present. Excludes ROOT-level weights (an
-    adapter / merged file a ``DiffusionPipeline`` does not read as a component) and training-checkpoint
-    subtrees (checkpoint-N/), so a stale partial holding only those does not mask the missing component
-    weights the pipeline reads -- which the in-process load would then fetch over un-killable Xet. Stays
-    lenient on WHICH components are required (a pipeline's components can be optional): it only tells a
-    real component warm from a checkpoint-only / config-only stale snapshot."""
+    """True if a DECLARED diffusers pipeline COMPONENT weight (a loadable weight in a component SUBFOLDER
+    the ``model_index.json`` declares: unet/, vae/, text_encoder/, ...) that the ignore filter keeps is
+    present. Scoped to declared components, so a stale partial holding only an UNDECLARED leftover subtree
+    (a controlnet/ dir not in ``model_index.json``) does not read as proof the pipeline is warm while the
+    declared unet / vae weights are still missing -- which the in-process load would then fetch over
+    un-killable Xet. Also excludes ROOT-level weights (an adapter / merged file a ``DiffusionPipeline``
+    does not read as a component) and training-checkpoint subtrees (checkpoint-N/). A malformed / empty
+    ``model_index.json`` fails OPEN (any component subfolder counts). Stays lenient on WHICH declared
+    components are required (a pipeline's components can be optional): it only tells a real component warm
+    from an undeclared-leftover / checkpoint-only / config-only stale snapshot."""
+    declared = _diffusers_declared_components(snapshot_dir)
     rels: list = []
     try:
         for entry in snapshot_dir.rglob("*"):
@@ -1045,6 +1051,8 @@ def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any 
             parts = rel.split("/")
             if len(parts) < 2:
                 continue  # a ROOT-level weight is not a pipeline component
+            if declared is not None and parts[0] not in declared:
+                continue  # an UNDECLARED subtree the DiffusionPipeline load does not read
             if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
                 continue  # under a training-checkpoint subtree, not a component
             rels.append(rel)
@@ -1092,24 +1100,26 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
 def _root_has_variant_weight(
     snapshot_dir: Path, variant: str, *, ignore_patterns: Any = None
 ) -> bool:
-    """True if a ROOT weight carrying the requested *variant* token, and kept by the ignore filter, is
-    present. transformers inserts the variant before the extension (a ``.<variant>.`` infix:
-    ``model.fp16.safetensors``) or before a shard suffix (a ``.<variant>-`` infix:
-    ``model.fp16-00001-of-00002.safetensors``), so an offline-fallback partial that kept only the
-    canonical weight does not satisfy a variant request. The ignore filter is applied so a partial
-    holding only the ignored format (``model.fp16.bin`` under ``ignore=['*.bin']``) does not count."""
+    """True if a CANONICAL ROOT model weight carrying the requested *variant* token, kept by the ignore
+    filter, is present. transformers writes the variant on the model base then shards it, so the names it
+    reads are ``model.<variant>.safetensors`` (single) and ``model.<variant>-00001-of-00002.safetensors``
+    (a ``.<variant>-`` shard infix) -- matched by ``_ROOT_MODEL_VARIANT_WEIGHT_RE`` plus the specific
+    variant infix. A non-canonical base (``consolidated.<variant>.safetensors``), a PEFT adapter, or a
+    non-``model`` variant name a default variant load never reads is excluded, so a cache holding only
+    those is retried over HTTP rather than loaded (its ``model.<variant>.*`` weight is still missing). The
+    ignore filter is applied so a partial holding only the ignored format (``model.fp16.bin`` under
+    ``ignore=['*.bin']``) does not count."""
     infix_dot = f".{variant}."
     infix_dash = f".{variant}-"
     rels: list = []
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
-            if not _is_default_load_weight_file(name):
-                continue  # a default variant load reads safetensors / bin, not gguf / pt / ...
-            if name.startswith("adapter_"):
-                continue  # a PEFT adapter variant is not read by a default base-model variant load
             if infix_dot not in name and infix_dash not in name:
-                continue
+                continue  # not the requested variant token
+            if not _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
+                continue  # only a canonical model / pytorch_model variant weight is read by a default
+                # variant load -- an adapter, a consolidated.* sidecar, or a gguf is not
             try:
                 if entry.is_file():
                     rels.append(name)

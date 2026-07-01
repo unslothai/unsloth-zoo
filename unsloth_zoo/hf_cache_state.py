@@ -740,36 +740,64 @@ def _selected_shard_index_incomplete(
     - precedence: within a directory transformers reads safetensors before bin, so when both a
       safetensors and a bin index are selected only the safetensors set's completeness is required.
 
-    The ROOT canonical / variant MODEL index is skipped -- ``_has_incomplete_canonical_root_shards`` /
+    Also rejects a SELECTED numbered shard FILE (adapter_model-00001-of-00002.safetensors,
+    unet/diffusion_pytorch_model-00001-of-00002.safetensors) whose directory has NO index of the read
+    format: the load enumerates a sharded weight through its index, so a shard set without one is
+    incomplete and would fetch the index and remaining shards over Xet.
+
+    The ROOT canonical / variant MODEL shard set is skipped -- ``_has_incomplete_canonical_root_shards`` /
     ``_has_incomplete_variant_root_shards`` own it (with their own precedence handling)."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     want_variant = variant or None
+    if want_variant is None:
+        shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
+    else:
+        v = re.escape(want_variant)
+        shard_file_re = re.compile(rf"^[^.]+\.{v}-\d{{5}}-of-\d{{5}}\.(?:safetensors|bin)$")
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
         return False
-    per_dir: dict = {}  # dir_rel -> {"safetensors": [shard_rels, ...], "bin": [...]}
+    per_dir: dict = {}       # dir_rel -> {"safetensors": [shard_rels, ...], "bin": [...]} (from indices)
+    index_fmts: dict = {}    # dir_rel -> {fmt} an index of the read variant is present (non-root-model)
+    shard_fmts: dict = {}    # dir_rel -> {fmt} a SELECTED numbered shard file is present (non-root-model)
     for entry in entries:
         name = entry.name
-        if not _is_weight_shard_index(name) or not _safe_is_file(entry):
+        if not _safe_is_file(entry):
             continue
-        if _index_variant_token(name) != want_variant:
-            continue  # a wrong-variant index the load does not read
         try:
             rel = entry.relative_to(snapshot_dir).as_posix()
         except ValueError:
             continue
         dir_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-        if dir_rel == "" and _ROOT_MODEL_SHARD_INDEX_RE.match(name):
-            continue  # the ROOT model index -- owned by the canonical / variant root checks
-        shard_rels = _index_shard_rel_paths(entry, dir_rel)
-        if shard_rels is None:
-            return True  # a malformed / non-string index -> defer to the watched child
-        if not _filter_paths(shard_rels, allow_patterns, ignore_patterns):
-            continue  # the load does not read this set (out of scope / ignored format)
-        fmt = "safetensors" if ".safetensors.index." in name else "bin"
-        per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
+        if _is_weight_shard_index(name):
+            if _index_variant_token(name) != want_variant:
+                continue  # a wrong-variant index the load does not read
+            if dir_rel == "" and _ROOT_MODEL_SHARD_INDEX_RE.match(name):
+                continue  # the ROOT model index -- owned by the canonical / variant root checks
+            fmt = "safetensors" if ".safetensors.index." in name else "bin"
+            index_fmts.setdefault(dir_rel, set()).add(fmt)
+            shard_rels = _index_shard_rel_paths(entry, dir_rel)
+            if shard_rels is None:
+                return True  # a malformed / non-string index -> defer to the watched child
+            if not _filter_paths(shard_rels, allow_patterns, ignore_patterns):
+                continue  # the load does not read this set (out of scope / ignored format)
+            per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
+        elif shard_file_re.match(name):
+            # a numbered weight shard FILE of the read variant. Skip the ROOT model shard set (owned by
+            # the canonical / variant root-shard checks) and any training-checkpoint subtree.
+            if dir_rel == "" and (
+                (want_variant is None and _CANONICAL_ROOT_SHARD_RE.match(name))
+                or (want_variant is not None and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name))
+            ):
+                continue
+            if any(_CHECKPOINT_DIR_RE.match(p) for p in rel.split("/")[:-1]):
+                continue
+            if not _filter_paths([rel], allow_patterns, ignore_patterns):
+                continue  # the load does not read this shard (out of scope / ignored format)
+            fmt = "safetensors" if name.endswith(".safetensors") else "bin"
+            shard_fmts.setdefault(dir_rel, set()).add(fmt)
     for by_fmt in per_dir.values():
         # safetensors read before bin: require only the preferred format present in this directory.
         for shard_rels in by_fmt.get("safetensors") or by_fmt.get("bin") or []:
@@ -779,6 +807,12 @@ def _selected_shard_index_incomplete(
                         return True
                 except OSError:
                     return True
+    for dir_rel, fmts in shard_fmts.items():
+        # a numbered shard of the read (preferred) format with NO index in its directory: the load cannot
+        # enumerate the set and would fetch the index + remaining shards over Xet.
+        preferred = "safetensors" if "safetensors" in fmts else "bin"
+        if preferred not in index_fmts.get(dir_rel, set()):
+            return True
     return False
 
 
@@ -825,41 +859,55 @@ def _diffusers_component_shards_incomplete(
     a ROOT index (owned by the canonical / variant root-model checks) and a training-checkpoint subtree
     (checkpoint-N/) are skipped, and the request's ignore filter selects the read format. Per directory,
     safetensors is read before bin, so only the preferred format's set must be complete. A plain load
-    reads canonical component indices (token None); a variant load reads variant ones. Positive-evidence:
-    a single-file component or a complete component shard set is not flagged, so a complete download passes."""
+    reads canonical component indices (token None); a variant load reads variant ones. Also rejects a
+    component holding a numbered shard FILE with NO index of the read format (the pipeline cannot
+    enumerate the set and would fetch the index + remaining shards over Xet). Positive-evidence: a
+    single-file component or a complete component shard set is not flagged, so a complete download passes."""
     want_variant = variant or None
     ignore_patterns = _as_pattern_list(ignore_patterns)
     declared = _diffusers_declared_components(snapshot_dir)
+    if want_variant is None:
+        shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
+    else:
+        v = re.escape(want_variant)
+        shard_file_re = re.compile(rf"^[^.]+\.{v}-\d{{5}}-of-\d{{5}}\.(?:safetensors|bin)$")
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
         return False
     per_dir: dict = {}
+    index_fmts: dict = {}   # component dir_rel -> {fmt} an index of the read variant is present
+    shard_fmts: dict = {}   # component dir_rel -> {fmt} a numbered shard file (ignore-kept) is present
     for entry in entries:
         name = entry.name
-        if not _is_weight_shard_index(name) or not _safe_is_file(entry):
+        if not _safe_is_file(entry):
             continue
-        if _index_variant_token(name) != want_variant:
-            continue  # a wrong-variant index the load does not read
         try:
             rel = entry.relative_to(snapshot_dir).as_posix()
         except ValueError:
             continue
         parts = rel.split("/")
         if len(parts) < 2:
-            continue  # a ROOT index -- owned by the canonical / variant root-model checks
+            continue  # a ROOT file -- owned by the canonical / variant root-model checks
         if declared is not None and parts[0] not in declared:
             continue  # an UNDECLARED subtree the DiffusionPipeline load does not read
         if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
             continue  # a training-checkpoint subtree, not a pipeline component
         dir_rel = rel.rsplit("/", 1)[0]
-        shard_rels = _index_shard_rel_paths(entry, dir_rel)
-        if shard_rels is None:
-            return True  # a malformed / non-string index -> defer to the watched child
-        if not _filter_paths(shard_rels, None, ignore_patterns):
-            continue  # the load does not read this set (ignored format)
-        fmt = "safetensors" if ".safetensors.index." in name else "bin"
-        per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
+        if _is_weight_shard_index(name):
+            if _index_variant_token(name) != want_variant:
+                continue  # a wrong-variant index the load does not read
+            fmt = "safetensors" if ".safetensors.index." in name else "bin"
+            index_fmts.setdefault(dir_rel, set()).add(fmt)
+            shard_rels = _index_shard_rel_paths(entry, dir_rel)
+            if shard_rels is None:
+                return True  # a malformed / non-string index -> defer to the watched child
+            if not _filter_paths(shard_rels, None, ignore_patterns):
+                continue  # the load does not read this set (ignored format)
+            per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
+        elif shard_file_re.match(name) and _filter_paths([rel], None, ignore_patterns):
+            fmt = "safetensors" if name.endswith(".safetensors") else "bin"
+            shard_fmts.setdefault(dir_rel, set()).add(fmt)
     for by_fmt in per_dir.values():
         for shard_rels in by_fmt.get("safetensors") or by_fmt.get("bin") or []:
             for shard in shard_rels:
@@ -868,6 +916,10 @@ def _diffusers_component_shards_incomplete(
                         return True
                 except OSError:
                     return True
+    for dir_rel, fmts in shard_fmts.items():
+        preferred = "safetensors" if "safetensors" in fmts else "bin"
+        if preferred not in index_fmts.get(dir_rel, set()):
+            return True  # a component numbered shard with no index of the read format
     return False
 
 
