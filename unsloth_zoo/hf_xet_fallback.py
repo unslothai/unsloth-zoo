@@ -976,20 +976,25 @@ def _intact_subset(
     )
 
 
-def _has_any_weight(snapshot_dir: Path) -> bool:
-    """True if the snapshot holds at least one loadable weight anywhere (root or subfolder). Lenient:
-    it only tells a real model warm from a config-only stale snapshot, without classifying layout."""
+def _has_any_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
+    """True if the snapshot holds at least one loadable weight anywhere (root or subfolder) that the
+    request's ignore filter keeps. Lenient: it only tells a real model warm from a config-only stale
+    snapshot, without classifying layout. The ignore filter matters for diffusers, whose component
+    weights live in subfolders -- a partial holding only the ignored format (``unet/*.bin`` under
+    ``ignore=['*.bin']``) is not a usable weight for a safetensors load."""
+    rels: list = []
     try:
         for entry in snapshot_dir.rglob("*"):
-            if _is_loadable_weight_file(entry.name):
-                try:
-                    if entry.is_file():
-                        return True
-                except OSError:
-                    continue
+            if not _is_loadable_weight_file(entry.name):
+                continue
+            try:
+                if entry.is_file():
+                    rels.append(entry.relative_to(snapshot_dir).as_posix())
+            except (OSError, ValueError):
+                continue
     except OSError:
         return False
-    return False
+    return bool(_filter_paths(rels, None, ignore_patterns))
 
 
 def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
@@ -1005,7 +1010,7 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
     except OSError:
         is_diffusers = False
     if is_diffusers:
-        return _has_any_weight(snapshot_dir)
+        return _has_any_weight(snapshot_dir, ignore_patterns = ignore_patterns)
     rels: list = []
     try:
         for entry in snapshot_dir.iterdir():
@@ -1021,13 +1026,18 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
     return bool(_filter_paths(rels, None, ignore_patterns))
 
 
-def _root_has_variant_weight(snapshot_dir: Path, variant: str) -> bool:
-    """True if a ROOT weight carrying the requested *variant* token is present. transformers inserts the
-    variant before the extension (a ``.<variant>.`` infix: ``model.fp16.safetensors``) or before a shard
-    suffix (a ``.<variant>-`` infix: ``model.fp16-00001-of-00002.safetensors``), so an offline-fallback
-    partial that kept only the canonical weight does not satisfy a variant request."""
+def _root_has_variant_weight(
+    snapshot_dir: Path, variant: str, *, ignore_patterns: Any = None
+) -> bool:
+    """True if a ROOT weight carrying the requested *variant* token, and kept by the ignore filter, is
+    present. transformers inserts the variant before the extension (a ``.<variant>.`` infix:
+    ``model.fp16.safetensors``) or before a shard suffix (a ``.<variant>-`` infix:
+    ``model.fp16-00001-of-00002.safetensors``), so an offline-fallback partial that kept only the
+    canonical weight does not satisfy a variant request. The ignore filter is applied so a partial
+    holding only the ignored format (``model.fp16.bin`` under ``ignore=['*.bin']``) does not count."""
     infix_dot = f".{variant}."
     infix_dash = f".{variant}-"
+    rels: list = []
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
@@ -1037,12 +1047,12 @@ def _root_has_variant_weight(snapshot_dir: Path, variant: str) -> bool:
                 continue
             try:
                 if entry.is_file():
-                    return True
+                    rels.append(name)
             except OSError:
                 continue
     except OSError:
         return False
-    return False
+    return bool(_filter_paths(rels, None, ignore_patterns))
 
 
 # Interchangeable exact weight names: the either-format ``["pytorch_model.bin", "model.safetensors"]``
@@ -1156,6 +1166,20 @@ def _request_selects_canonical_root_shards(allow_patterns: Any, ignore_patterns:
     return bool(_filter_paths(probes, allow_patterns, ignore_patterns))
 
 
+def _request_selects_root_variant_weight(
+    allow_patterns: Any, ignore_patterns: Any, variant: str,
+) -> bool:
+    """Whether the request's allow / ignore filter keeps a ROOT variant weight name. When False, a stale
+    incomplete root variant shard set is OUT of the request's scope (e.g. a subfolder request
+    ``allow=['unet/*']`` whose variant weights live under ``unet/``), so the ROOT variant-shard gate must
+    not reject on it, else a complete in-scope variant download is failed."""
+    probes = [
+        f"model.{variant}.safetensors", f"model.{variant}-00001-of-00002.safetensors",
+        f"pytorch_model.{variant}.bin", f"pytorch_model.{variant}-00001-of-00002.bin",
+    ]
+    return bool(_filter_paths(probes, allow_patterns, ignore_patterns))
+
+
 def _cache_can_skip_download(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
     variant: Optional[str] = None,
@@ -1223,7 +1247,9 @@ def _download_result_usable(
             # Variant root load: a partial that kept only the canonical weight would leave the load to
             # fetch the requested variant over un-killable Xet -> require a variant-named root weight,
             # and reject an incomplete variant shard set (index present, a listed variant shard missing).
-            if not _root_has_variant_weight(snapshot_dir, variant):
+            if not _root_has_variant_weight(
+                snapshot_dir, variant, ignore_patterns = ignore_patterns
+            ):
                 return False
             if _has_incomplete_variant_root_shards(snapshot_dir, variant):
                 return False
@@ -1243,14 +1269,17 @@ def _download_result_usable(
             # an incomplete ROOT variant shard set (a lone shard with no index / a missing shard), same as
             # the unpatterned variant branch. The CANONICAL-root-shard gate does not apply (the load reads
             # variant weights; a co-resident canonical shard set is out of scope). A variant shard set in
-            # a subfolder is not root-checked, but a root-only check never false-rejects a complete
-            # download.
+            # a subfolder is not root-checked. The ROOT variant-shard check applies only when the request
+            # SELECTS a root variant weight (a globbed allow like ['*.safetensors']); for a subfolder
+            # request (allow=['unet/*']) a stale root variant shard is out of scope and must not
+            # false-reject a complete in-scope download.
             if not _has_selected_variant_weight(
                 snapshot_dir, allow_patterns = allow_patterns,
                 ignore_patterns = ignore_patterns, variant = variant,
             ):
                 return False
-            if _has_incomplete_variant_root_shards(snapshot_dir, variant):
+            if _request_selects_root_variant_weight(allow_patterns, ignore_patterns, variant) \
+                    and _has_incomplete_variant_root_shards(snapshot_dir, variant):
                 return False
         else:
             # Patterned weight request: a selected weight must be present AND -- only for a GLOBBED
@@ -1265,7 +1294,8 @@ def _download_result_usable(
                 return False
             if not _patterns_are_exact_names(allow_patterns) \
                     and _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) \
-                    and _has_incomplete_canonical_root_shards(snapshot_dir):
+                    and _has_incomplete_canonical_root_shards(
+                        snapshot_dir, ignore_patterns = ignore_patterns):
                 return False
     return True
 

@@ -2536,6 +2536,89 @@ def test_post_download_rejects_patterned_incomplete_variant_shards(tmp_path):
         variant = "fp16") is True
 
 
+def test_post_download_applies_ignore_to_diffusers_components(tmp_path):
+    """An unpatterned diffusers warm that ignores a format must not be satisfied by a component weight in
+    that ignored format: only unet/*.bin present under ignore=['*.bin'] (safetensors requested) is
+    rejected, else the load fetches the missing safetensors components over Xet (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "diff_ignore")
+    (snap / "model_index.json").write_text("{}")
+    (snap / "unet").mkdir()
+    (snap / "unet" / "diffusion_pytorch_model.bin").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is False
+    # The safetensors component present -> usable.
+    (snap / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
+
+
+def test_post_download_rejects_index_only_sharded_masked_by_bin(tmp_path):
+    """A safetensors index present with NONE of its shards (an index-only partial), co-resident with a
+    complete pytorch_model.bin, must be rejected: transformers probes the safetensors index before the
+    bin, so the load would fetch the missing shards over Xet (Codex #829). The shard-completeness gate
+    fires on a present index even before any shard file exists."""
+    snap, blob = _mk_snapshot(tmp_path, "index_only")
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    (snap / "pytorch_model.bin").symlink_to(blob)  # complete bin, no ST shards at all
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # safetensors explicitly ignored -> load reads the complete bin -> usable.
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.safetensors"]) is True
+
+
+def test_post_download_patterned_shard_check_honors_ignore(tmp_path):
+    """A patterned request that ignores safetensors (allow=['*'], ignore=['*.safetensors']) selects the
+    complete .bin; a co-resident incomplete safetensors shard set must NOT force-reject it -- the
+    patterned shard-completeness check applies the ignore filter, so a satisfied request is not failed
+    into a DownloadStallError (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "pat_ignore")
+    (snap / "model-00001-of-00002.safetensors").symlink_to(blob)  # incomplete ST (shard 2 absent)
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    (snap / "pytorch_model.bin").symlink_to(blob)  # complete bin, the selected format
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["*"], ignore_patterns = ["*.safetensors"]) is True
+
+
+def test_post_download_variant_root_shard_check_scoped_to_selection(tmp_path):
+    """A subfolder variant request (allow=['unet/*'] + variant) whose selected weight is complete must be
+    accepted even when a stale ROOT variant shard (out of scope) is co-resident -- the root variant-shard
+    check applies only when the request selects a root variant weight (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "var_scope")
+    (snap / "unet").mkdir()
+    (snap / "unet" / "model.fp16.safetensors").symlink_to(blob)  # complete in-scope variant
+    (snap / "model.fp16-00001-of-00002.safetensors").symlink_to(blob)  # stale ROOT variant shard, oos
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None,
+        variant = "fp16") is True
+    # A GLOBBED root variant request DOES get the root variant-shard check.
+    snap2, blob2 = _mk_snapshot(tmp_path, "var_scope_glob")
+    (snap2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)  # lone root variant shard
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None,
+        variant = "fp16") is False
+
+
+def test_post_download_root_variant_weight_honors_ignore(tmp_path):
+    """An unpatterned variant load that ignores .bin must not be satisfied by a variant .bin: only
+    model.fp16.bin present under ignore=['*.bin'] is rejected, else the load fetches
+    model.fp16.safetensors over Xet (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "var_ignore")
+    (snap / "model.fp16.bin").symlink_to(blob)  # only the ignored-format variant
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"],
+        variant = "fp16") is False
+    # The safetensors variant present -> usable.
+    (snap / "model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"],
+        variant = "fp16") is True
+
+
 def test_post_download_accepts_dataset_without_weight(tmp_path):
     snap, blob = _mk_snapshot(tmp_path, "ds")
     (snap / "data.parquet").symlink_to(blob)

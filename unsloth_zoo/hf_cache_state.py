@@ -572,7 +572,14 @@ def _has_incomplete_canonical_root_shards(
         names = [entry.name for entry in snapshot_dir.iterdir()]
     except OSError:
         return False
-    if not any(_CANONICAL_ROOT_SHARD_RE.match(name) for name in names):
+    # Canonical shard evidence = a numbered shard FILE, or a canonical shard INDEX. An index-only
+    # partial (index present, no shards yet) is still an incomplete sharded checkpoint the load would
+    # finish over Xet, so it must be caught here even before any shard file exists.
+    has_shard_evidence = (
+        any(_CANONICAL_ROOT_SHARD_RE.match(name) for name in names)
+        or any(_is_canonical_weight_shard_index(name) for name in names)
+    )
+    if not has_shard_evidence:
         return False
     return not snapshot_dir_is_complete(snapshot_dir, ignore_patterns = ignore_patterns)
 
