@@ -2693,6 +2693,97 @@ def test_post_download_rejects_incomplete_component_subfolder_shards(tmp_path):
         snap, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
 
 
+def test_post_download_rejects_gguf_only_default_load(tmp_path):
+    """A DEFAULT (unpatterned) transformers warm reads model.safetensors / pytorch_model.bin, not a GGUF
+    file (only a GGUF-specific request does). A stale snapshot holding only model.Q4_K_M.gguf must be
+    rejected, else the in-process default load fetches the absent safetensors / bin over un-killable Xet
+    (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "gguf_only")
+    (snap / "model.Q4_K_M.gguf").symlink_to(blob)
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # The safetensors weight present -> the default warm accepts (no false-reject), even beside the gguf.
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_rejects_adapter_variant_for_default_variant_load(tmp_path):
+    """An unpatterned variant warm reads the ROOT model variant (model.fp16.safetensors), not a PEFT
+    adapter variant. A stale snapshot holding only adapter_model.fp16.safetensors must be rejected, else
+    the in-process base-model variant load fetches the absent model.fp16.safetensors over un-killable Xet
+    (Codex #829). The base model variant present -> accepted (no false-reject)."""
+    snap, blob = _mk_snapshot(tmp_path, "adapter_variant_only")
+    (snap / "adapter_model.fp16.safetensors").symlink_to(blob)
+    (snap / "adapter_config.json").write_text("{}")
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    (snap / "model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
+def test_post_download_accepts_complete_diffusers_variant(tmp_path):
+    """A diffusers pipeline variant warm's weights are COMPONENT-scoped (unet/....fp16.safetensors), not
+    root model.<variant>.* files. A complete diffusers variant download must be accepted -- the root-only
+    variant presence check would false-reject it into a spurious DownloadStallError (Codex #829). A
+    pipeline holding only the NON-variant component weight does not satisfy a variant load."""
+    snap, blob = _mk_snapshot(tmp_path, "diffusers_variant")
+    (snap / "model_index.json").write_text("{}")
+    (snap / "unet").mkdir()
+    (snap / "unet" / "config.json").write_text("{}")
+    (snap / "unet" / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    snap2, blob2 = _mk_snapshot(tmp_path, "diffusers_variant_missing")
+    (snap2 / "model_index.json").write_text("{}")
+    (snap2 / "unet").mkdir()
+    (snap2 / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob2)  # non-variant only
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+
+def test_post_download_rejects_incomplete_diffusers_component_shards_unpatterned(tmp_path):
+    """An UNPATTERNED diffusers pipeline warm reads component subfolders (unet/, vae/, ...). A component
+    shard INDEX listing a shard that is absent -- which the canonical ROOT-shard check does not cover --
+    must be rejected, else the in-process pipeline load fetches the missing shard over un-killable Xet
+    (Codex #829). Both the plain and the variant component index are covered; a complete set is accepted."""
+    snap, blob = _mk_snapshot(tmp_path, "diffusers_comp_incomplete")
+    (snap / "model_index.json").write_text("{}")
+    (snap / "unet").mkdir()
+    (snap / "unet" / "config.json").write_text("{}")
+    (snap / "unet" / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob)
+    (snap / "unet" / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    (snap / "unet" / "diffusion_pytorch_model-00002-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # The same for a VARIANT component index (variant='fp16', unpatterned).
+    snapv, blobv = _mk_snapshot(tmp_path, "diffusers_comp_variant_incomplete")
+    (snapv / "model_index.json").write_text("{}")
+    (snapv / "unet").mkdir()
+    (snapv / "unet" / "diffusion_pytorch_model.fp16-00001-of-00002.safetensors").symlink_to(blobv)
+    (snapv / "unet" / "diffusion_pytorch_model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model.fp16-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model.fp16-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snapv, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    (snapv / "unet" / "diffusion_pytorch_model.fp16-00002-of-00002.safetensors").symlink_to(blobv)
+    assert xf._download_result_usable(
+        snapv, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
 def test_selected_readable_weight_complete_entry_point(tmp_path):
     """The weight-bearing acceptance check funnels through one helper enforcing two invariants:
     (A) a readable weight is present (ignore + scope applied), (B) its in-scope shard set is complete.

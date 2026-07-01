@@ -784,6 +784,66 @@ def _selected_shard_index_incomplete(
     return False
 
 
+# A training-checkpoint subdir (checkpoint-500/, checkpoint_7/): its weights are never read as diffusers
+# pipeline COMPONENTS, so an incomplete shard index under it must not force-fail a complete pipeline.
+_CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
+
+
+def _diffusers_component_shards_incomplete(
+    snapshot_dir: Path, *, variant: "Optional[str]" = None,
+    ignore_patterns: "Optional[object]" = None,
+) -> bool:
+    """True when a diffusers pipeline COMPONENT subfolder (unet/, vae/, text_encoder/, ...) holds a
+    weight-shard INDEX of the read variant that lists a shard that is absent (or the index is malformed)
+    -- an interrupted component pull the in-process pipeline load would finish over un-killable Xet.
+
+    Scoped so a complete pipeline is never false-rejected: a ROOT index (owned by the canonical / variant
+    root-model checks) and a training-checkpoint subtree (checkpoint-N/, never read as a pipeline
+    component) are skipped, and the request's ignore filter selects the read format. Per directory,
+    safetensors is read before bin, so only the preferred format's set must be complete. A plain load
+    reads canonical component indices (token None); a variant load reads variant ones. Positive-evidence:
+    a single-file component or a complete component shard set is not flagged, so a complete download passes."""
+    want_variant = variant or None
+    ignore_patterns = _as_pattern_list(ignore_patterns)
+    try:
+        entries = list(snapshot_dir.rglob("*"))
+    except OSError:
+        return False
+    per_dir: dict = {}
+    for entry in entries:
+        name = entry.name
+        if not _is_weight_shard_index(name) or not _safe_is_file(entry):
+            continue
+        if _index_variant_token(name) != want_variant:
+            continue  # a wrong-variant index the load does not read
+        try:
+            rel = entry.relative_to(snapshot_dir).as_posix()
+        except ValueError:
+            continue
+        parts = rel.split("/")
+        if len(parts) < 2:
+            continue  # a ROOT index -- owned by the canonical / variant root-model checks
+        if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
+            continue  # a training-checkpoint subtree, not a pipeline component
+        dir_rel = rel.rsplit("/", 1)[0]
+        shard_rels = _index_shard_rel_paths(entry, dir_rel)
+        if shard_rels is None:
+            return True  # a malformed / non-string index -> defer to the watched child
+        if not _filter_paths(shard_rels, None, ignore_patterns):
+            continue  # the load does not read this set (ignored format)
+        fmt = "safetensors" if ".safetensors.index." in name else "bin"
+        per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
+    for by_fmt in per_dir.values():
+        for shard_rels in by_fmt.get("safetensors") or by_fmt.get("bin") or []:
+            for shard in shard_rels:
+                try:
+                    if not (snapshot_dir / shard).exists():
+                        return True
+                except OSError:
+                    return True
+    return False
+
+
 def requested_named_files_present(
     snapshot_dir: Path,
     *,

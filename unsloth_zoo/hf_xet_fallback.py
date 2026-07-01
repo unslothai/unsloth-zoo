@@ -44,6 +44,7 @@ from typing import Any, Callable, Optional
 from unsloth_zoo.hf_cache_state import (
     INCOMPLETE_SUFFIX,
     _as_pattern_list,
+    _diffusers_component_shards_incomplete,
     _filter_paths,
     _has_glob,
     _has_incomplete_canonical_root_shards,
@@ -998,6 +999,15 @@ def _has_any_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
     return bool(_filter_paths(rels, None, ignore_patterns))
 
 
+def _is_default_load_weight_file(name: str) -> bool:
+    """A weight in a format a DEFAULT ``from_pretrained`` reads: safetensors or bin only. Excludes gguf /
+    pt / pth / onnx / msgpack / ... -- a default (non-format-specific) transformers / diffusers load does
+    not read those, so a stale cache holding only e.g. ``model.Q4_K_M.gguf`` does not satisfy the load,
+    which would then fetch the missing ``model.safetensors`` / ``pytorch_model.bin`` over un-killable Xet.
+    Trainer / optimizer state (``optimizer.bin``, ...) is excluded by ``_is_loadable_weight_file``."""
+    return _is_loadable_weight_file(name) and name.endswith((".safetensors", ".bin"))
+
+
 # A VARIANT of a canonical root weight: the variant token sits between the base and the extension /
 # shard suffix (model.fp16.safetensors, pytorch_model.fp16-00001-of-00002.bin). A DEFAULT (no-variant)
 # load reads the canonical model.safetensors / pytorch_model.bin, NOT these, so a variant-only cache
@@ -1024,7 +1034,7 @@ def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any 
     rels: list = []
     try:
         for entry in snapshot_dir.rglob("*"):
-            if not _is_loadable_weight_file(entry.name):
+            if not _is_default_load_weight_file(entry.name):
                 continue
             try:
                 if not entry.is_file():
@@ -1064,8 +1074,8 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
-            if not _is_loadable_weight_file(name):
-                continue
+            if not _is_default_load_weight_file(name):
+                continue  # a default load reads safetensors / bin, not gguf / pt / ...
             if name.startswith("adapter_"):
                 continue  # a PEFT adapter (adapter_model.*) is not read by a default base-model load
             if _CANONICAL_BASE_VARIANT_RE.match(name):
@@ -1095,8 +1105,10 @@ def _root_has_variant_weight(
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
-            if not _is_loadable_weight_file(name):
-                continue
+            if not _is_default_load_weight_file(name):
+                continue  # a default variant load reads safetensors / bin, not gguf / pt / ...
+            if name.startswith("adapter_"):
+                continue  # a PEFT adapter variant is not read by a default base-model variant load
             if infix_dot not in name and infix_dash not in name:
                 continue
             try:
@@ -1107,6 +1119,60 @@ def _root_has_variant_weight(
     except OSError:
         return False
     return bool(_filter_paths(rels, None, ignore_patterns))
+
+
+def _has_diffusers_component_variant_weight(
+    snapshot_dir: Path, variant: str, *, ignore_patterns: Any = None
+) -> bool:
+    """Variant analog of ``_has_diffusers_component_weight``: True if a diffusers pipeline COMPONENT
+    subfolder (unet/, vae/, text_encoder/, ...) holds a weight carrying the requested *variant* token
+    (``unet/diffusion_pytorch_model.fp16.safetensors``). A variant pipeline warm's weights are
+    component-scoped, not root ``model.<variant>.*`` files, so a root-only variant check would
+    false-reject a complete diffusers variant download into a ``DownloadStallError``. Excludes ROOT-level
+    and training-checkpoint weights (as the plain component check does) and reads only safetensors / bin."""
+    infix_dot = f".{variant}."
+    infix_dash = f".{variant}-"
+    rels: list = []
+    try:
+        for entry in snapshot_dir.rglob("*"):
+            name = entry.name
+            if not _is_default_load_weight_file(name):
+                continue
+            if infix_dot not in name and infix_dash not in name:
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                rel = entry.relative_to(snapshot_dir).as_posix()
+            except (OSError, ValueError):
+                continue
+            parts = rel.split("/")
+            if len(parts) < 2:
+                continue  # a ROOT-level variant weight is not a pipeline component
+            if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
+                continue  # under a training-checkpoint subtree, not a component
+            rels.append(rel)
+    except OSError:
+        return False
+    return bool(_filter_paths(rels, None, ignore_patterns))
+
+
+def _root_model_has_variant_weight(
+    snapshot_dir: Path, variant: str, *, ignore_patterns: Any = None
+) -> bool:
+    """Whether an UNPATTERNED variant warm holds a variant weight a default load reads: a ROOT variant
+    weight, or -- for a diffusers pipeline (root ``model_index.json``) -- a component-subfolder variant
+    weight. Variant analog of ``_root_model_has_weight``: a diffusers variant's weights live in component
+    subfolders, not root ``model.<variant>.*`` files, so the root-only check would false-reject them."""
+    try:
+        is_diffusers = (snapshot_dir / "model_index.json").is_file()
+    except OSError:
+        is_diffusers = False
+    if is_diffusers:
+        return _has_diffusers_component_variant_weight(
+            snapshot_dir, variant, ignore_patterns = ignore_patterns
+        )
+    return _root_has_variant_weight(snapshot_dir, variant, ignore_patterns = ignore_patterns)
 
 
 # Interchangeable exact weight names collapse to one equivalence group: the either-format pair
@@ -1295,7 +1361,9 @@ def _has_readable_weight(
     so the incomplete result is retried over HTTP rather than loaded in-process."""
     if variant:
         if allow_patterns is None:
-            return _root_has_variant_weight(snapshot_dir, variant, ignore_patterns = ignore_patterns)
+            return _root_model_has_variant_weight(
+                snapshot_dir, variant, ignore_patterns = ignore_patterns
+            )
         return _has_selected_variant_weight(
             snapshot_dir, allow_patterns = allow_patterns,
             ignore_patterns = ignore_patterns, variant = variant,
@@ -1323,11 +1391,18 @@ def _readable_shard_set_incomplete(
       selects canonical root shards; an exact-named subset or an out-of-scope request does not.
     - non-root: a PATTERNED request additionally checks any SELECTED shard index the root-model checks do
       not cover (a sharded adapter under ``['adapter_model*']``, a component subfolder) via
-      ``_selected_shard_index_incomplete``. An UNPATTERNED request reads only the root model weight, so it
-      does not; an exact-named subset defers to the exact-file presence check.
+      ``_selected_shard_index_incomplete``; an exact-named subset defers to the exact-file presence check.
+    - diffusers: an UNPATTERNED plain / variant warm of a pipeline (root ``model_index.json``) reads
+      COMPONENT subfolders (unet/, vae/, ...), so a component shard index missing a shard -- which the
+      root-model checks do not cover -- is caught via ``_diffusers_component_shards_incomplete``. A
+      non-diffusers unpatterned request reads only the root model weight, so it does not sub-check.
 
     The ignore filter is threaded through so completeness is judged for the FORMAT the load reads (a
     complete safetensors set does not mask an incomplete ``.bin`` under ``ignore=['*.safetensors']``)."""
+    try:
+        is_diffusers = (snapshot_dir / "model_index.json").is_file()
+    except OSError:
+        is_diffusers = False
     if variant:
         if allow_patterns is None or _request_selects_root_variant_weight(
             allow_patterns, ignore_patterns, variant
@@ -1336,16 +1411,31 @@ def _readable_shard_set_incomplete(
                 snapshot_dir, variant, ignore_patterns = ignore_patterns
             ):
                 return True
-        if allow_patterns is not None and _selected_shard_index_incomplete(
-            snapshot_dir, allow_patterns = allow_patterns,
-            ignore_patterns = ignore_patterns, variant = variant,
+        if allow_patterns is not None:
+            if _selected_shard_index_incomplete(
+                snapshot_dir, allow_patterns = allow_patterns,
+                ignore_patterns = ignore_patterns, variant = variant,
+            ):
+                return True
+        elif is_diffusers and _diffusers_component_shards_incomplete(
+            snapshot_dir, variant = variant, ignore_patterns = ignore_patterns
         ):
+            # an UNPATTERNED variant diffusers warm: a component subfolder's variant shard index is
+            # incomplete (the root variant check above only covers root model.<variant> shards).
             return True
         return False
     if allow_patterns is None:
-        return _has_incomplete_canonical_root_shards(
+        if _has_incomplete_canonical_root_shards(
             snapshot_dir, ignore_patterns = ignore_patterns
-        )
+        ):
+            return True
+        if is_diffusers and _diffusers_component_shards_incomplete(
+            snapshot_dir, variant = None, ignore_patterns = ignore_patterns
+        ):
+            # an UNPATTERNED plain diffusers warm reads component subfolders (unet/, vae/, ...); a
+            # component shard index missing a shard is not covered by the canonical ROOT-shard check.
+            return True
+        return False
     if _patterns_are_exact_names(allow_patterns):
         return False  # an exact-named subset defers to the exact-file presence check
     if _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) and (
