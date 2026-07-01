@@ -18,6 +18,7 @@ from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     grouped_moe_forward,
     enable_grouped_moe,
     disable_grouped_moe,
+    auto_enable_grouped_moe,
     wrap_loader_for_grouped_moe,
     _block_is_eligible,
     _expert_compute_dtype,
@@ -201,6 +202,31 @@ def test_wrap_loader_idempotent_and_enables():
     model, tok = wrapped()
     assert tok == "tokenizer", "wrapper must pass the loader's return value through unchanged"
     assert model.layers[0].forward.__func__ is grouped_moe_forward, "grouped MoE not enabled on return"
+
+
+def test_auto_enable_reevaluates_after_adapter_attaches():
+    """The loader re-runs auto_enable_grouped_moe after attaching a PEFT adapter, so a block
+    whose experts gained LoRA must be restored to the original loop, while a frozen
+    (attention-only) block stays on the grouped path. This is what makes wrapping the
+    from_pretrained leaf safe for the adapter-loading path."""
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+    model = nn.Module()
+    model.layers = nn.ModuleList(
+        [_eligible_block("Qwen3MoeSparseMoeBlock", spec) for _ in range(2)]
+    )
+    frozen_blk, lora_blk = model.layers[0], model.layers[1]
+
+    assert enable_grouped_moe(model, verbose=False) == 2
+    assert frozen_blk.forward.__func__ is grouped_moe_forward
+    assert lora_blk.forward.__func__ is grouped_moe_forward
+
+    # Simulate an expert-targeting adapter attaching to the second block only.
+    getattr(lora_blk.experts[0], spec[0]).lora_A = nn.Identity()
+
+    auto_enable_grouped_moe(model)  # exactly what loader.py calls after patch_peft_model
+    assert lora_blk.forward.__func__ is not grouped_moe_forward, "expert-LoRA block must be restored"
+    assert getattr(lora_blk, "_unsloth_moe_spec", None) is None, "restored block must be cleaned up"
+    assert frozen_blk.forward.__func__ is grouped_moe_forward, "frozen block must stay on grouped path"
 
 
 def test_expert_compute_dtype_prefers_linear4bit_compute_dtype():
