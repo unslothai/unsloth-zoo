@@ -126,6 +126,11 @@ def _route_softmax_topk(self, router_logits, top_k):
 _BLOCK_SPECS = {
     "Qwen3MoeSparseMoeBlock": ("gate_proj", "up_proj", "down_proj", _route_softmax_topk),
     "MixtralSparseMoeBlock":  ("w1",        "w3",      "w2",        _route_softmax_topk),
+    # OLMoE has the identical routed structure to Qwen3-MoE (gate/up/down SwiGLU experts,
+    # softmax(fp32) -> top_k -> optional renorm via norm_topk_prob) and no shared expert, so
+    # the same spec/router applies. Verified against the reference loop in
+    # tests/test_moe_grouped_modulelist_parity.py.
+    "OlmoeSparseMoeBlock":    ("gate_proj", "up_proj", "down_proj", _route_softmax_topk),
 }
 
 
