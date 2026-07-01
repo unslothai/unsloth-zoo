@@ -1065,6 +1065,7 @@ def _patterns_are_exact_names(patterns: Any) -> bool:
 
 def _cache_can_skip_download(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
+    variant: Optional[str] = None,
 ) -> bool:
     """PRE-download: whether a cached snapshot is complete enough to skip the protective child.
 
@@ -1076,6 +1077,12 @@ def _cache_can_skip_download(
     defers to the child rather than hand back a partial cache. An intact exact-named subset still
     short-circuits (offline tokenizer-only / named-file warm)."""
     if repo_type in (None, "model") and request_can_include_weights(allow_patterns, ignore_patterns):
+        # A variant load reads variant-named weights (model.<variant>.safetensors) that the canonical
+        # gate does not check: a cache holding only the canonical weight reads as complete, so the
+        # in-process load would fetch the variant over un-killable Xet. Defer to the child (it warms
+        # the variant too).
+        if variant:
+            return False
         return snapshot_dir_is_complete(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         )
@@ -1388,6 +1395,7 @@ def snapshot_download_with_xet_fallback(
     ignore_patterns: Optional[Any] = None,
     force_download: bool = False,
     local_files_only: bool = False,
+    variant: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
     stall_timeout: float = DEFAULT_STALL_TIMEOUT,
     interval: float = DEFAULT_HEARTBEAT_INTERVAL,
@@ -1402,7 +1410,8 @@ def snapshot_download_with_xet_fallback(
     model load (which then hits a warm cache and cannot hang on a native Xet thread). A fully cached
     repo short-circuits in-process via ``local_files_only`` with no child. ``force_download=True``
     re-fetches in the killable child even if cached; ``local_files_only=True`` resolves from cache
-    in-process with no child (HF offline semantics).
+    in-process with no child (HF offline semantics). ``variant`` (e.g. "fp16") forces the child even
+    on a warm canonical cache, since the canonical gate cannot prove the variant-named weights present.
     """
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Expand ~ as huggingface_hub does, so the probe and the child resolve to the same cache location.
@@ -1451,6 +1460,7 @@ def snapshot_download_with_xet_fallback(
                 repo_type = repo_type,
                 allow_patterns = allow_patterns,
                 ignore_patterns = ignore_patterns,
+                variant = variant,
             ):
                 return cached_dir
             logger.debug("Cached snapshot for %s is incomplete; downloading.", repo_id)

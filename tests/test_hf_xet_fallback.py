@@ -128,7 +128,7 @@ def test_growing_incomplete_never_stalls(hf_cache):
 
     calls: list[str] = []
     stop = xf.start_watchdog(
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5
     )
     try:
         time.sleep(1.0)  # well past stall_timeout, but bytes keep growing
@@ -144,11 +144,37 @@ def test_no_incomplete_never_stalls(hf_cache):
 
     calls: list[str] = []
     stop = xf.start_watchdog(
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5
     )
     try:
         time.sleep(0.8)
         assert calls == [], "watchdog fired with no active .incomplete"
+    finally:
+        stop.set()
+
+
+def test_transient_unmeasurable_tick_is_progress(hf_cache, monkeypatch):
+    """A tick whose cache state is momentarily unmeasurable (get_hf_download_state -> None on a
+    transient FS error) is treated as progress, so a run of None ticks cannot trip a false stall.
+    Once the state is readable again and confirms a frozen .incomplete, the real stall still fires --
+    the None-handling must not permanently mask a genuine stall."""
+    seq = {"n": 0}
+    frozen = (2048, True)  # constant size + active .incomplete: would stall if measured every tick
+
+    def fake_state(*args, **kwargs):
+        seq["n"] += 1
+        return None if seq["n"] <= 8 else frozen  # first ~8 ticks unmeasurable, then measurable+frozen
+
+    monkeypatch.setattr(xf, "get_hf_download_state", fake_state)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+    )
+    try:
+        time.sleep(0.3)  # within the unmeasurable window: no false stall despite no measured progress
+        assert calls == [], "watchdog fired during a transient-unmeasurable window"
+        assert _wait(lambda: len(calls) >= 1, timeout = 3.0), "stall never fired after state recovered"
     finally:
         stop.set()
 
@@ -229,7 +255,7 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
 
     calls: list[str] = []
     stop = xf.start_watchdog(   # default: repo-wide (watch_new_partials_only = False)
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5,
     )
     try:
         time.sleep(1.0)   # well past stall_timeout, but repo-wide bytes keep growing
@@ -248,7 +274,7 @@ def test_file_watchdog_ignores_baseline_only_partials(hf_cache):
 
     calls: list[str] = []
     stop = xf.start_watchdog(
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.2,
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5,
         watch_new_partials_only = True, baseline_incomplete_blobs = {"sibling.incomplete"},
     )
     try:
@@ -355,7 +381,7 @@ def test_file_watchdog_empty_open_set_ignores_sibling(hf_cache, monkeypatch):
 
     calls: list[str] = []
     stop = xf.start_watchdog(
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.2,
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5,
         watch_new_partials_only = True, baseline_incomplete_blobs = set(),
         child_pid = 4242,   # non-None so the precise child-open path is taken
     )
@@ -2176,6 +2202,20 @@ def test_pre_download_skips_complete_model(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
+def test_pre_download_defers_variant_on_canonical_cache(tmp_path):
+    """A variant load (variant="fp16") reads model.<variant>.safetensors, which the canonical gate
+    does not check. A cache holding only the non-variant canonical weight must NOT fast-path when a
+    variant is requested -- else the in-process load fetches the missing variant over un-killable Xet.
+    Same cache, no variant, still fast-paths (the child is only spawned when actually needed)."""
+    snap, blob = _mk_snapshot(tmp_path, "var")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+
 def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
     """The pre/post asymmetry: a diffusers warm is NOT fast-pathed (spawn the child), but the same
     complete diffusers result IS accepted post-download (it has component weights), so a good
@@ -2308,9 +2348,10 @@ def test_post_download_accepts_weightless_patterned_result(tmp_path):
 
 def test_gate_rejects_variant_only_shard_index(tmp_path):
     """codex :269 (over-accept): a variant-only shard index (model.safetensors.index.fp16.json) must
-    NOT satisfy the canonical allow=None fast path -- the fallback wrapper takes no variant param, so
-    a default load probes the canonical index whose weights are absent. Only a canonical
-    (non-variant) index counts; the variant layout defers to the watched child."""
+    NOT satisfy the canonical allow=None fast path -- snapshot_dir_is_complete is variant-blind (a
+    default load probes the canonical index whose weights are absent). Only a canonical (non-variant)
+    index counts here; a variant REQUEST is deferred one level up in _cache_can_skip_download (see
+    test_pre_download_defers_variant_on_canonical_cache)."""
     snap, blob = _mk_snapshot(tmp_path, "variant")
     (snap / "config.json").write_text("{}")
     (snap / "model-00001-of-00001.fp16.safetensors").symlink_to(blob)
