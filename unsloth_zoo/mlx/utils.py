@@ -573,6 +573,14 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
     by the trainer at setup.
     """
     _mods = list(lora_mods) if lora_mods is not None else []
+    if not _mods and not reference_free:
+        raise ValueError(
+            "Unsloth: DPO with a reference model is not yet supported for full "
+            "fine-tuning on MLX — the reference is obtained by disabling LoRA "
+            "adapters, but this model has none. Use a LoRA/PEFT model, or pass "
+            "reference_free=True to train without a reference (TRL-style "
+            "reference-free DPO)."
+        )
 
     def _row_logp_and_mask(model, batch, lengths):
         inputs = batch[:, :-1]
@@ -631,6 +639,14 @@ def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
     scales under stop_gradient, restore in finally (same mechanism as DPO).
     """
     _mods = list(lora_mods) if lora_mods is not None else []
+    if not _mods and not reference_free and beta != 0.0:
+        raise ValueError(
+            "Unsloth: GRPO KL regularization is not yet supported for full "
+            "fine-tuning on MLX — the KL reference is obtained by disabling LoRA "
+            "adapters, but this model has none. Use a LoRA/PEFT model, or set "
+            "grpo_beta=0 (equivalently reference_free=True) to train without the "
+            "KL term."
+        )
 
     def _per_token_logp_and_mask(model, batch, lengths):
         inp = batch[:, :-1]
