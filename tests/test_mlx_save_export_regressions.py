@@ -295,7 +295,7 @@ def test_vlm_generate_hf_kwargs(monkeypatch):
         _is_vlm_model=True,
         config=types.SimpleNamespace(eos_token_id=None),
     )
-    out = loader._mlx_generate_vlm(
+    out = loader._mlx_generate(
         model,
         input_ids=[1, 2],
         attention_mask=[1, 1],
@@ -332,12 +332,20 @@ def test_bound_save_pretrained_defaults_to_full_save_without_lora(
 
     tokenizer = object()
     model = types.SimpleNamespace(_tokenizer=tokenizer)
-    loader._mlx_save_pretrained_merged(model, tmp_path)
+    loader._mlx_save_pretrained_merged(
+        model,
+        tmp_path,
+        safe_serialization=True,
+        save_peft_format=True,
+        save_embedding_layers="auto",
+        path_initial_model_for_weight_conversion="/tmp/base",
+        token="hf_token",
+    )
 
     assert calls == {
         "tokenizer": tokenizer,
         "save_directory": tmp_path,
-        "kwargs": {"save_method": "merged_16bit"},
+        "kwargs": {"save_method": "merged_16bit", "token": "hf_token"},
     }
 
 

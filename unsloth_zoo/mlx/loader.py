@@ -3165,6 +3165,14 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
     tokenizer = tokenizer or self._tokenizer
     if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
         kwargs["save_method"] = "merged_16bit"
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        (
+            "save_method", "push_to_hub", "token", "private", "tags",
+            "repo_id", "commit_message", "commit_description",
+            "create_pr", "revision",
+        ),
+    )
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
@@ -3423,6 +3431,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
         batch.pop("attention_mask", None)
 
     prompt_ids = [int(token) for token in input_ids.flatten().tolist()]
+    prompt_ids = _mlx_apply_attention_mask(prompt_ids, batch.get("mask", None))
     if max_tokens is None:
         if max_new_tokens is not None:
             max_tokens = int(max_new_tokens)
@@ -3444,7 +3453,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     elif batch.get("temperature", None) is None:
         batch.pop("temperature", None)
 
-    _mlx_put_streamer_tokens(streamer, input_ids)
+    _mlx_put_streamer_tokens(streamer, [prompt_ids])
 
     generated_ids = []
     last_generation_tokens = None
