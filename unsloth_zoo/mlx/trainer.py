@@ -2432,6 +2432,36 @@ class MLXGRPOTrainer(MLXTrainer):
             prompts.append(ex["prompt"])
         return prompts
 
+    def _grpo_render_prompt(self, prompt, hf):
+        """Render a GRPO prompt to a string for rollout.
+
+        Conversational prompts (a list of ``{"role","content"}`` message dicts,
+        as passed by the GRPO notebooks) are rendered via the tokenizer's chat
+        template with ``add_generation_prompt``, mirroring TRL's
+        ``maybe_apply_chat_template`` (add_generation_prompt when the last role
+        is 'user'; continue_final_message when it is 'assistant'). Plain-string
+        prompts pass through unchanged (back-compat).
+        """
+        if (isinstance(prompt, list) and prompt
+                and isinstance(prompt[0], dict)
+                and "role" in prompt[0] and "content" in prompt[0]):
+            last_role = prompt[-1]["role"]
+            if last_role == "user":
+                add_gen, cont = True, False
+            elif last_role == "assistant":
+                add_gen, cont = False, True
+            else:
+                raise ValueError(
+                    f"GRPO chat prompt: invalid last-message role {last_role!r}; "
+                    "expected 'user' or 'assistant'."
+                )
+            return hf.apply_chat_template(
+                prompt, tokenize=False,
+                add_generation_prompt=add_gen,
+                continue_final_message=cont,
+            )
+        return prompt
+
     def _grpo_rollout_generator(self):
         """Infinite generator: each next() does generate->reward->advantage
         and yields (batch, lengths, advantages). Runs uncompiled."""
@@ -2447,7 +2477,8 @@ class MLXGRPOTrainer(MLXTrainer):
         while True:
             prompt = prompts[idx % len(prompts)]
             idx += 1
-            pids = hf.encode(prompt)
+            rendered = self._grpo_render_prompt(prompt, hf)
+            pids = hf.encode(rendered)
             resp = batch_generate(
                 self.model, self.tokenizer, prompts=[pids] * N,
                 max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
@@ -2465,7 +2496,7 @@ class MLXGRPOTrainer(MLXTrainer):
             pe = len(pids)
             rows, lengths = [], []
             for c in comps:
-                full = hf.encode(prompt + c)[: args.max_seq_length]
+                full = hf.encode(rendered + c)[: args.max_seq_length]
                 rows.append(full)
                 lengths.append([pe, len(full)])
             L = max(len(r) for r in rows)
