@@ -254,8 +254,11 @@ def get_chat_template_parts(tokenizer):
         # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
         response_part, instruction_part = asst_header, strip_lead(instr_gap, resp_gap[:-len(asst_header)])
     elif asst_header and asst_header == resp_gap:
-        # Terminator leaked into the gen-diff (Phi-3): strip shared separators
+        # Terminator leaked into the gen-diff (Phi-3): strip shared separators, then strip the
+        # assistant turn terminator (eos/bos) off the instruction marker so a non-final assistant
+        # turn's eos stays trainable, matching explicit markers.
         response_part, instruction_part = strip_shared(asst_header, instr_gap)
+        instruction_part = strip_lead(instruction_part, " ", "\t", eos, bos)
     else:
         # Headerless template (Mistral [INST]/[/INST]): strip bos/eos separators here.
         # Strip eos alone, never eos+"\n": a turn-delimiting newline stays as the marker

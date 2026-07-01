@@ -174,13 +174,17 @@ def _clear_cached_marker_attrs(obj):
     return obj
 
 
-def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
+def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer, return_function=False):
     """Object to auto-detect (instruction_part, response_part) from.
 
-    VLM templates live on the processor, so detection must see it (the HF helper
-    unwraps to the inner tokenizer for matching). A configured chat_template override
-    is applied here first so markers match the rendered batches. Falls back to
-    resolved_tokenizer when no processor/override applies.
+    VLM templates live on the processor, so detection must see it (the HF helper unwraps to the
+    inner tokenizer for matching). Detection must use the processor that will actually render the
+    masked batches: when return_function=False the trainer renders them via _resolve_vlm_processor
+    (trainer.processor / trainer.tokenizer / model._processor), so a tokenizer= override is not
+    used by batching and must not drive detection; when return_function=True the caller applies the
+    returned mask, so the explicit override is preferred. A configured chat_template override is
+    applied (and any markers cached from a prior template dropped first) so detection matches the
+    rendered batches. Falls back to resolved_tokenizer when no processor/override applies.
     """
     args = getattr(trainer, "args", None)
     model = getattr(trainer, "model", None)
@@ -188,14 +192,19 @@ def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
     model_type = _model_type_of(trainer)
 
     if bool(getattr(trainer, "_is_vlm", False)):
-        # source already honors the tokenizer= kwarg over trainer.tokenizer; prefer it.
-        processor = source if _looks_like_processor(source) else None
-        if processor is None:
-            processor = getattr(trainer, "processor", None)
-        if processor is None:
-            processor = getattr(model, "_processor", None)
+        override = source if _looks_like_processor(source) else None
+        trainer_tok = getattr(trainer, "tokenizer", None)
+        # Mirror _resolve_vlm_processor's resolution (what batching renders through).
+        batching = (
+            getattr(trainer, "processor", None)
+            or (trainer_tok if _looks_like_processor(trainer_tok) else None)
+            or getattr(model, "_processor", None)
+        )
+        processor = (override or batching) if return_function else (batching or override)
         if processor is not None:
             try:
+                if getattr(args, "vlm_chat_template", None) is not None:
+                    _clear_cached_marker_attrs(processor)
                 processor = normalize_vlm_processor_chat_template(
                     processor,
                     chat_template=getattr(args, "vlm_chat_template", None),
@@ -203,25 +212,26 @@ def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
                     model_type=model_type,
                     strict=False,
                 )
-                if getattr(args, "vlm_chat_template", None) is not None:
-                    _clear_cached_marker_attrs(processor)
             except Exception:
                 pass
             if _processor_ready_for_detect(processor):
                 return processor
         return resolved_tokenizer
 
-    # Text: apply the chat_template override before detecting so markers match batches.
+    # Text: apply the chat_template override before detecting so markers match batches. Clear stale
+    # markers BEFORE normalize: a raw Jinja override supplies none (so the HF helper re-detects),
+    # while an Unsloth template name/tuple sets fresh correct markers that must be preserved.
     if args is not None and getattr(args, "chat_template", None) is not None:
         try:
-            return _clear_cached_marker_attrs(normalize_mlx_chat_template(
+            _clear_cached_marker_attrs(resolved_tokenizer)
+            return normalize_mlx_chat_template(
                 resolved_tokenizer,
                 chat_template=args.chat_template,
                 model_name=model_name,
                 model_type=model_type,
                 is_vlm=False,
                 strict=False,
-            ))
+            )
         except Exception:
             pass
     if _processor_ready_for_detect(source):
@@ -2702,7 +2712,7 @@ def train_on_responses_only(
     # Omitted markers -> auto-detect from the right chat template (see helper).
     if instruction_part is None and response_part is None:
         _detect_source = _resolve_autodetect_template_source(
-            trainer, _source, _tokenizer,
+            trainer, _source, _tokenizer, return_function=return_function,
         )
     else:
         _detect_source = _tokenizer

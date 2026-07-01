@@ -149,20 +149,26 @@ def test_vlm_processor_only_template_is_used_for_detection():
     assert callable(fn)
 
 
-def test_vlm_explicit_processor_override_wins_over_trainer_processor():
-    """An explicit tokenizer=/processor override must drive detection over
-    trainer.processor, matching the wrapper's kwarg precedence."""
+def test_vlm_override_aligns_with_who_applies_the_mask():
+    """VLM detection must use the processor that renders the masked batches: the explicit
+    tokenizer= override when the caller applies the returned mask (return_function=True), but
+    trainer.processor when the trainer applies it to its own batches (return_function=False)."""
     T, get_parts = _load()
 
     # trainer.processor renders ChatML; the caller overrides with an INST processor.
     trainer_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(CHATML))
     override_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(INST))
     tr = _Trainer(trainer_proc, _Args(), is_vlm=True, processor=trainer_proc)
-
     resolved = T._resolve_response_mask_tokenizer(override_proc)
-    detect = T._resolve_autodetect_template_source(tr, override_proc, resolved)
+
+    # return_function=True: caller renders with the override -> honor it.
+    detect = T._resolve_autodetect_template_source(tr, override_proc, resolved, return_function=True)
     assert detect is override_proc
-    assert get_parts(detect) == get_parts(override_proc)  # INST markers, not ChatML
+
+    # return_function=False: trainer renders batches with trainer.processor -> detect from that,
+    # otherwise the mask is built for one template and applied to text from another.
+    detect = T._resolve_autodetect_template_source(tr, override_proc, resolved, return_function=False)
+    assert detect is trainer_proc
 
 
 def test_explicit_markers_bypass_template_resolution():
@@ -197,6 +203,26 @@ def test_headerless_template_marker_excludes_eos():
     assert ins.strip() == "[INST]" and res.strip() == "[/INST]"
 
 
+HEADER_EOS = (
+    "{% for m in messages %}"
+    "{% if m['role'] == 'user' %}{{ '<|user|>' + m['content'] }}"
+    "{% else %}{{ '<|assistant|>' + m['content'] + eos_token }}{% endif %}{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}"
+)
+
+
+def test_header_equals_respgap_strips_eos_from_instruction_marker():
+    """When the generation prompt equals the assistant header but only assistant turns carry eos,
+    the instruction marker must not glue on that eos (else non-final assistant eos is masked)."""
+    _, get_parts = _load()
+    tok = _new_tok()
+    tok.add_special_tokens({"additional_special_tokens": ["<|user|>", "<|assistant|>"]})
+    tok.chat_template = HEADER_EOS
+    ins, res = get_parts(tok)
+    assert tok.eos_token not in ins, (ins, res)
+    assert ins == "<|user|>" and res == "<|assistant|>"
+
+
 def test_chat_template_override_clears_stale_cached_markers():
     """A chat_template override must drop markers cached from a prior Unsloth template so the
     HF helper re-detects, instead of masking with the old markers."""
@@ -208,6 +234,25 @@ def test_chat_template_override_clears_stale_cached_markers():
     out = T._resolve_autodetect_template_source(tr, tok, resolved)
     assert not hasattr(out, "_unsloth_input_part")
     assert not hasattr(out, "_unsloth_output_part")
+
+
+def test_unsloth_template_override_preserves_fresh_markers(monkeypatch):
+    """An Unsloth template name/tuple override sets fresh correct markers via get_chat_template;
+    those must survive (only the stale ones are dropped, and only before the override applies)."""
+    T, _ = _load()
+    tok = _new_tok(); tok.chat_template = CHATML
+    tok._unsloth_input_part = "STALE_U"; tok._unsloth_output_part = "STALE_A"
+
+    def fake_normalize(target, **kw):  # simulate get_chat_template setting fresh markers
+        target._unsloth_input_part = "FRESH_U"; target._unsloth_output_part = "FRESH_A"
+        return target
+    monkeypatch.setattr(T, "normalize_mlx_chat_template", fake_normalize)
+
+    tr = _Trainer(tok, _Args(chat_template="some-unsloth-template"))
+    resolved = T._resolve_response_mask_tokenizer(tok)
+    out = T._resolve_autodetect_template_source(tr, tok, resolved)
+    assert out._unsloth_input_part == "FRESH_U"   # not cleared after the override set it
+    assert out._unsloth_output_part == "FRESH_A"
 
 
 def test_processor_template_preferred_over_inner_when_both_present():
