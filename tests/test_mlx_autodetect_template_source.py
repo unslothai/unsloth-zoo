@@ -180,5 +180,44 @@ def test_explicit_markers_bypass_template_resolution():
     assert callable(fn)
 
 
+MISTRAL = (
+    "{{ bos_token }}{% for m in messages %}"
+    "{% if m['role'] == 'user' %}{{ '[INST] ' + m['content'] + ' [/INST]' }}"
+    "{% elif m['role'] == 'assistant' %}{{ m['content'] + eos_token }}{% endif %}{% endfor %}"
+)
+
+
+def test_headerless_template_marker_excludes_eos():
+    """A headerless template (add_generation_prompt is a no-op) must reach the fallback and
+    detect [INST] without gluing the preceding eos into instruction_part."""
+    _, get_parts = _load()
+    tok = _new_tok(); tok.chat_template = MISTRAL
+    ins, res = get_parts(tok)
+    assert tok.eos_token not in ins, (ins, res)
+    assert ins.strip() == "[INST]" and res.strip() == "[/INST]"
+
+
+def test_chat_template_override_clears_stale_cached_markers():
+    """A chat_template override must drop markers cached from a prior Unsloth template so the
+    HF helper re-detects, instead of masking with the old markers."""
+    T, _ = _load()
+    tok = _new_tok(); tok.chat_template = CHATML
+    tok._unsloth_input_part = "OLD_USER"; tok._unsloth_output_part = "OLD_ASST"
+    tr = _Trainer(tok, _Args(chat_template=INST))
+    resolved = T._resolve_response_mask_tokenizer(tok)
+    out = T._resolve_autodetect_template_source(tr, tok, resolved)
+    assert not hasattr(out, "_unsloth_input_part")
+    assert not hasattr(out, "_unsloth_output_part")
+
+
+def test_processor_template_preferred_over_inner_when_both_present():
+    """When both the processor and its inner tokenizer carry a chat_template, detection must
+    render with the processor's (what VLM batching uses), not the inner tokenizer's."""
+    _, get_parts = _load()
+    proc = _ProcessorOnly(_new_tok_with(CHATML), _new_tok_with(INST))  # inner=ChatML, render=INST
+    proc.tokenizer.chat_template = CHATML   # inner tokenizer ALSO has a (different) template
+    assert get_parts(proc) == get_parts(_new_tok_with(INST))  # processor (INST) wins
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))

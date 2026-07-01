@@ -170,9 +170,10 @@ def get_chat_template_parts(tokenizer):
     from collections import Counter
 
     tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-    # Render with whichever object has the chat template (some VLM processors keep
-    # it only on the processor) but validate token ids with the inner tokenizer.
-    render_tok = tok if getattr(tok, "chat_template", None) is not None else tokenizer
+    # Render with the processor's template when it has one (that is what VLM batching renders
+    # through, and it can differ from the inner tokenizer's text template); validate token ids
+    # with the inner tokenizer. Fall back to the inner template for plain / processor-less cases.
+    render_tok = tokenizer if getattr(tokenizer, "chat_template", None) is not None else tok
     if getattr(render_tok, "chat_template", None) is None:
         raise ValueError("Unsloth: No chat_template to auto-detect from - pass instruction_part and response_part.")
 
@@ -220,28 +221,34 @@ def get_chat_template_parts(tokenizer):
             if nxt: out.append(full[e : min(nxt)])
         return Counter(out).most_common(1)[0][0] if out else ""
 
-    # Render a 3-turn probe; read markers off the gaps between content blocks. Some
-    # VLM processor templates require structured content blocks instead of a plain
-    # string, so probe both and keep whichever renders our sentinels.
-    def _convo(wrap):
-        return [{"role": "user", "content": wrap(U)}, {"role": "assistant", "content": wrap(A)}] * 3
-    wrap, full = None, ""
-    for _w in (lambda s: s, lambda s: [{"type": "text", "text": s}]):
-        try: rendered = render(_convo(_w), False)
+    # Render a 3-turn probe; read markers off the gaps between content blocks. VLM processors
+    # differ on content shape: some want plain strings, some structured parts, and some want the
+    # user as parts but the assistant collapsed to a string. Probe those shapes (per-role) and
+    # keep whichever renders our sentinels, matching what VLM batching would render.
+    _str, _lst = (lambda s: s), (lambda s: [{"type": "text", "text": s}])
+    def _convo(uwrap, awrap):
+        return [{"role": "user", "content": uwrap(U)}, {"role": "assistant", "content": awrap(A)}] * 3
+    uwrap, awrap, full = None, None, ""
+    for _uw, _aw in ((_str, _str), (_lst, _lst), (_lst, _str)):
+        try: rendered = render(_convo(_uw, _aw), False)
         except Exception: continue
         if starts(rendered, U) and starts(rendered, A):
-            wrap, full = _w, rendered; break
-    if wrap is None:
+            uwrap, awrap, full = _uw, _aw, rendered; break
+    if uwrap is None:
         raise ValueError("Unsloth: Could not auto-detect chat template structure - pass instruction_part and response_part.")
-    convo = _convo(wrap)
+    convo = _convo(uwrap, awrap)
     instr_gap = gap_mode(ends(full, A), starts(full, U))
     resp_gap  = gap_mode(ends(full, U), starts(full, A))
 
     # Clean assistant header = generation prompt. Diff the tails after the last user
     # turn; shared leading special-tokens are the turn terminator, so drop them.
+    # A headerless template (e.g. Mistral [INST]) leaves add_generation_prompt a no-op, so the
+    # two renders match and there is no header: force it empty to reach the headerless fallback
+    # (otherwise the shared tail like [/INST] is mistaken for a header and pulls eos into the marker).
     end_user = convo[:-1]
     tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
-    asst_header, _ = strip_shared(tail(render(end_user, True)), tail(render(end_user, False)))
+    _gen_on, _gen_off = render(end_user, True), render(end_user, False)
+    asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
 
     if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
         # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
@@ -273,8 +280,8 @@ def get_chat_template_parts(tokenizer):
         scaffold = response_part[mt.start():]
         header = response_part[:mt.start()]
         try:
-            filled = render([{"role": "user", "content": wrap(U)},
-                             {"role": "assistant", "content": wrap(f"<{tag}>rZ9</{tag}>{A}")}], False)
+            filled = render([{"role": "user", "content": uwrap(U)},
+                             {"role": "assistant", "content": awrap(f"<{tag}>rZ9</{tag}>{A}")}], False)
             pos = filled.rfind(header)
             after = filled[pos + len(header):] if pos != -1 else ""
             if pos != -1 and not after.startswith(scaffold):

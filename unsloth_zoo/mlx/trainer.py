@@ -160,6 +160,20 @@ def _model_type_of(trainer):
     return config.get("model_type") if isinstance(config, dict) else None
 
 
+def _clear_cached_marker_attrs(obj):
+    """Drop Unsloth's cached instruction/response markers (on obj and its inner tokenizer)
+    so a chat_template override forces re-detection instead of masking with markers from the
+    old template."""
+    for target in (obj, getattr(obj, "tokenizer", None)):
+        if target is None:
+            continue
+        for attr in ("_unsloth_input_part", "_unsloth_output_part"):
+            if hasattr(target, attr):
+                try: delattr(target, attr)
+                except Exception: pass
+    return obj
+
+
 def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
     """Object to auto-detect (instruction_part, response_part) from.
 
@@ -189,6 +203,8 @@ def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
                     model_type=model_type,
                     strict=False,
                 )
+                if getattr(args, "vlm_chat_template", None) is not None:
+                    _clear_cached_marker_attrs(processor)
             except Exception:
                 pass
             if _processor_ready_for_detect(processor):
@@ -198,14 +214,14 @@ def _resolve_autodetect_template_source(trainer, source, resolved_tokenizer):
     # Text: apply the chat_template override before detecting so markers match batches.
     if args is not None and getattr(args, "chat_template", None) is not None:
         try:
-            return normalize_mlx_chat_template(
+            return _clear_cached_marker_attrs(normalize_mlx_chat_template(
                 resolved_tokenizer,
                 chat_template=args.chat_template,
                 model_name=model_name,
                 model_type=model_type,
                 is_vlm=False,
                 strict=False,
-            )
+            ))
         except Exception:
             pass
     if _processor_ready_for_detect(source):
