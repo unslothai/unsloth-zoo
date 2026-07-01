@@ -20,8 +20,10 @@ import os, sys, types, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from unsloth_zoo.vision_utils import UnslothVisionDataCollator
-from unsloth_zoo.dataset_utils import train_on_responses_only
+# NOTE: unsloth_zoo is imported lazily inside _check (not at module top). Importing it
+# runs unsloth_zoo/__init__.py, which raises ImportError when the separate `unsloth`
+# package is absent; at module scope that would break pytest collection before the
+# "OFF by default" skip gate in test_vlm_collator_masking() can run.
 
 ENABLED = os.environ.get("UNSLOTH_TEST_VLM_COLLATOR", "") not in ("", "0", "false")
 CACHE = os.environ.get("UNSLOTH_VLM_PROC_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_vlm_proc"))
@@ -82,6 +84,8 @@ def _content_exact(collator, proc):
 
 def _check(repo, ins, res):
     from transformers import AutoProcessor, AutoConfig
+    from unsloth_zoo.vision_utils import UnslothVisionDataCollator
+    from unsloth_zoo.dataset_utils import train_on_responses_only
     try:
         path = _fetch(repo)
         proc = AutoProcessor.from_pretrained(path)
