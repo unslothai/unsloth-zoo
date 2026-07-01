@@ -20,9 +20,11 @@ from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     disable_grouped_moe,
     wrap_loader_for_grouped_moe,
     _block_is_eligible,
+    _expert_compute_dtype,
     _grouped_mm_supported,
     _route_softmax_topk,
     _BLOCK_SPECS,
+    HAS_BNB,
 )
 
 DEV = "cuda"
@@ -199,6 +201,25 @@ def test_wrap_loader_idempotent_and_enables():
     model, tok = wrapped()
     assert tok == "tokenizer", "wrapper must pass the loader's return value through unchanged"
     assert model.layers[0].forward.__func__ is grouped_moe_forward, "grouped MoE not enabled on return"
+
+
+def test_expert_compute_dtype_prefers_linear4bit_compute_dtype():
+    """The dtype guard must read Linear4bit.compute_dtype (the dtype bnb matmuls in), not the
+    quant_state dtype, so a compute_dtype != activation dtype config falls back correctly."""
+    if not HAS_BNB:
+        pytest.skip("bitsandbytes not available")
+    import bitsandbytes as bnb
+
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+    ex = nn.Module()
+    for name in spec[:3]:
+        lin = bnb.nn.Linear4bit(64, 64, bias=False, compute_dtype=torch.bfloat16, quant_type="nf4")
+        setattr(ex, name, lin.to(DEV))  # .to(cuda) quantizes -> weight becomes Params4bit
+    assert _expert_compute_dtype([ex], spec) == torch.bfloat16
+
+    for name in spec[:3]:  # if compute_dtype is unset, fall back to the quant_state dtype
+        getattr(ex, name).compute_dtype = None
+    assert isinstance(_expert_compute_dtype([ex], spec), torch.dtype)
 
 
 if __name__ == "__main__":

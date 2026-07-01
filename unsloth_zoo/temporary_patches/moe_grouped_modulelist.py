@@ -189,10 +189,17 @@ def _experts_have_lora(experts, spec) -> bool:
 
 
 def _expert_compute_dtype(experts, spec):
-    """The dtype the frozen expert matmul runs in: bnb uses the quant compute dtype,
-    a plain frozen Linear uses its weight dtype. Used to keep numerics bnb-identical."""
-    w = getattr(getattr(experts[0], spec[0], None), "weight", None)
+    """The dtype the frozen expert matmul runs in. bitsandbytes casts inputs to the
+    Linear4bit compute_dtype for the matmul, so that is what our dequant + grouped_mm must
+    match; we read it directly and fall back to the quant_state dtype only if compute_dtype
+    is unset. A plain frozen Linear uses its weight dtype. Used to keep numerics
+    bnb-identical and to decide when to fall back to the original loop."""
+    lin = getattr(experts[0], spec[0], None)
+    w = getattr(lin, "weight", None)
     if HAS_BNB and isinstance(w, Params4bit):
+        compute_dtype = getattr(lin, "compute_dtype", None)
+        if compute_dtype is not None:
+            return compute_dtype
         return getattr(getattr(w, "quant_state", None), "dtype", torch.bfloat16)
     return getattr(w, "dtype", torch.bfloat16)
 
