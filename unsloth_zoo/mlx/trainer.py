@@ -625,6 +625,7 @@ class MLXTrainer:
         # Training state
         self._global_step = 0
         self._train_loss_history = []
+        self._kl_history = []  # GRPO: mean k3 KL per logged step
         self._grad_norm_history = []
         self._tokens_per_second_history = []
         self._peak_memory_history = []
@@ -1815,6 +1816,19 @@ class MLXTrainer:
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
 
+            # Pre-update GRPO KL probe (eager, outside the compiled step). Runs
+            # only for steps that will be logged, on the SAME batch/lengths the
+            # loss uses, and BEFORE the optimizer update — so the KL reflects the
+            # step's (pre-update) weights and is comparable to CUDA's logged KL.
+            self._pending_grpo_kl = None
+            if (do_update and hasattr(self, "_grpo_mean_kl")
+                    and not isinstance(batch_data, dict)):
+                _prospective_step = it // grad_accum
+                if (_prospective_step % args.logging_steps == 0
+                        or _prospective_step == total_steps):
+                    self._pending_grpo_kl = self._grpo_mean_kl(
+                        batch_data[0], batch_data[1])
+
             try:
                 lvalue, toks, grad_accum_state, grad_norm = step_fn(
                     batch_data, grad_accum_state, do_update,
@@ -1899,6 +1913,8 @@ class MLXTrainer:
                 peak_mem = mx.get_peak_memory() / 1e9
 
                 self._train_loss_history.append(train_loss)
+                if getattr(self, "_pending_grpo_kl", None) is not None:
+                    self._kl_history.append(self._pending_grpo_kl)
                 grad_norm_val = (
                     float(grad_norm.item())
                     if grad_norm is not None else None
@@ -1921,10 +1937,15 @@ class MLXTrainer:
                     f"Grad: {grad_norm_val:.4f} | "
                     if grad_norm_val is not None else ""
                 )
+                kl_text = (
+                    f"KL: {self._pending_grpo_kl:.4f} | "
+                    if getattr(self, "_pending_grpo_kl", None) is not None else ""
+                )
                 print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
                     f"{grad_text}"
+                    f"{kl_text}"
                     f"LR: {lr_val:.2e} | "
                     f"Tok/s: {tokens_sec:.0f} | "
                     f"Peak: {peak_mem:.2f} GB"
@@ -2461,6 +2482,62 @@ class MLXGRPOTrainer(MLXTrainer):
                 continue_final_message=cont,
             )
         return prompt
+
+    def _grpo_mean_kl(self, batch, lengths):
+        """Eager masked-mean k3 KL for a GRPO batch at the CURRENT weights.
+
+        Mirrors make_grpo_loss_fn's KL term: policy logp with adapters,
+        reference logp via LoRA-disable, ``exp(d) - d - 1``, masked-mean over
+        completion tokens then mean over the group. Used only for logging; runs
+        eagerly OUTSIDE the compiled step. Toggles eval mode so dropout draws no
+        RNG (keeps the training trajectory and the compiled step untouched).
+        Returns a float, or None when KL is undefined for the config (no LoRA
+        adapters, beta == 0, or reference_free).
+        """
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten
+        from mlx_lm.tuner.lora import LoRALinear
+        args = self.args
+        if (getattr(args, "grpo_beta", 0.04) == 0.0
+                or bool(getattr(args, "reference_free", False))):
+            return None
+        mods = [mod for _, mod in tree_flatten(
+            self.model, is_leaf=lambda x: isinstance(x, LoRALinear))
+            if isinstance(mod, LoRALinear)]
+        if not mods:
+            return None
+
+        def _logp_mask(b, ln):
+            inp, tgt = b[:, :-1], b[:, 1:]
+            logits = self.model(inp)
+            steps = mx.arange(1, tgt.shape[1] + 1)
+            mask = mx.logical_and(
+                steps >= ln[:, 0:1], steps < ln[:, 1:]
+            ).astype(mx.float32)
+            return -nn.losses.cross_entropy(logits, tgt), mask
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            pol, mask = _logp_mask(batch, lengths)
+            saved = [md.scale for md in mods]
+            try:
+                for md in mods:
+                    md.scale = 0.0
+                ref, _ = _logp_mask(batch, lengths)
+            finally:
+                for md, s in zip(mods, saved):
+                    md.scale = s
+        finally:
+            if was_training:
+                self.model.train()
+        d = ref - pol
+        per_tok_kl = mx.exp(d) - d - 1
+        denom = mx.maximum(mask.sum(-1), 1.0)
+        kl = ((per_tok_kl * mask).sum(-1) / denom).mean()
+        mx.eval(kl)
+        return float(kl.item())
 
     def _grpo_rollout_generator(self):
         """Infinite generator: each next() does generate->reward->advantage
