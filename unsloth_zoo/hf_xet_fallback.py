@@ -1213,6 +1213,90 @@ def _cache_can_skip_download(
     )
 
 
+def _has_readable_weight(
+    snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any, variant: Optional[str],
+) -> bool:
+    """Invariant A (presence): a weight the in-process load will READ is present on disk, with the
+    request's ignore filter ALWAYS applied and the scope matched to the request:
+
+    - variant + UNPATTERNED -> a ROOT variant weight (``model.<variant>.*``);
+    - variant + PATTERNED   -> a SELECTED variant weight (within the allow scope);
+    - plain  + UNPATTERNED  -> a ROOT (or diffusers-component) weight, NOT a stray subfolder checkpoint;
+    - plain  + PATTERNED    -> a SELECTED weight (within the allow scope).
+
+    A partial that kept only the ignored format (an ``*.bin`` under ``ignore=['*.bin']``) does not count,
+    so the incomplete result is retried over HTTP rather than loaded in-process."""
+    if variant:
+        if allow_patterns is None:
+            return _root_has_variant_weight(snapshot_dir, variant, ignore_patterns = ignore_patterns)
+        return _has_selected_variant_weight(
+            snapshot_dir, allow_patterns = allow_patterns,
+            ignore_patterns = ignore_patterns, variant = variant,
+        )
+    if allow_patterns is None:
+        return _root_model_has_weight(snapshot_dir, ignore_patterns = ignore_patterns)
+    return _has_selected_weight(
+        snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
+    )
+
+
+def _readable_shard_set_incomplete(
+    snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any, variant: Optional[str],
+) -> bool:
+    """Invariant B (shard completeness): an IN-SCOPE shard set the load reads is incomplete (an index
+    present with a shard missing, or a lone numbered shard without its index) and must be retried. The
+    check is ALWAYS scoped to what the request selects, so a co-resident stale shard set the load never
+    reads (a leftover root checkpoint under a subfolder/adapter/gguf request) does not false-reject a
+    complete download:
+
+    - variant: the ROOT variant-shard check applies for an UNPATTERNED request, or a PATTERNED request
+      that selects a ROOT variant weight (a globbed ``['*.safetensors']``); a subfolder-scoped variant
+      request does not root-check.
+    - plain: the canonical-root-shard check applies for an UNPATTERNED request, or a GLOBBED request that
+      selects canonical root shards; an exact-named subset or an out-of-scope request does not.
+
+    The ignore filter is threaded through so completeness is judged for the FORMAT the load reads (a
+    complete safetensors set does not mask an incomplete ``.bin`` under ``ignore=['*.safetensors']``)."""
+    if variant:
+        if allow_patterns is None or _request_selects_root_variant_weight(
+            allow_patterns, ignore_patterns, variant
+        ):
+            return _has_incomplete_variant_root_shards(snapshot_dir, variant)
+        return False
+    if allow_patterns is None:
+        return _has_incomplete_canonical_root_shards(
+            snapshot_dir, ignore_patterns = ignore_patterns
+        )
+    if not _patterns_are_exact_names(allow_patterns) and _request_selects_canonical_root_shards(
+        allow_patterns, ignore_patterns
+    ):
+        return _has_incomplete_canonical_root_shards(
+            snapshot_dir, ignore_patterns = ignore_patterns
+        )
+    return False
+
+
+def _selected_readable_weight_complete(
+    snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any, variant: Optional[str],
+) -> bool:
+    """Single entry point for the weight-bearing MODEL acceptance check: the weight the in-process load
+    will READ is present (Invariant A) AND its in-scope shard set is complete (Invariant B). Both
+    invariants apply the request's ignore filter and match its scope uniformly, so a co-resident
+    out-of-scope / ignored-format partial neither masks an incomplete readable weight (a silent Xet hang)
+    nor false-rejects a complete download (a spurious ``DownloadStallError``)."""
+    if not _has_readable_weight(
+        snapshot_dir, allow_patterns = allow_patterns,
+        ignore_patterns = ignore_patterns, variant = variant,
+    ):
+        return False
+    if _readable_shard_set_incomplete(
+        snapshot_dir, allow_patterns = allow_patterns,
+        ignore_patterns = ignore_patterns, variant = variant,
+    ):
+        return False
+    return True
+
+
 def _download_result_usable(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
     variant: Optional[str] = None,
@@ -1228,11 +1312,11 @@ def _download_result_usable(
     - A dangling REQUESTED symlink (a missing / still-``.incomplete`` blob).
     - A missing EXACT-named requested file (grouped by weight equivalence: the either-format pair needs
       one; base AND adapter, or a ``["tokenizer.json"]`` request, each). Globs stay lenient.
-    - A weight-bearing MODEL request with no usable weight. A variant load needs a variant-named weight
-      (the canonical weight a partial kept does not satisfy it): a ROOT one when UNPATTERNED, else one
-      WITHIN scope. UNPATTERNED non-variant -> a ROOT-readable weight the load reads (ignore filter
-      applied; a stale ``checkpoint-7/``-only snapshot does not count) with a complete canonical shard
-      set. Patterned non-variant -> a weight WITHIN scope, shard set complete."""
+    - A weight-bearing MODEL request whose READABLE weight is absent or incomplete. Delegated to
+      ``_selected_readable_weight_complete``, which applies the request's ignore filter and scope
+      uniformly: the weight the load reads (variant vs canonical, root vs in-scope) must be present, and
+      its in-scope shard set complete. A co-resident out-of-scope / ignored-format partial neither masks
+      an incomplete readable weight nor false-rejects a complete download."""
     if snapshot_has_requested_broken_symlinks(
         snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
         repo_type = repo_type,
@@ -1243,60 +1327,11 @@ def _download_result_usable(
     ):
         return False
     if repo_type in (None, "model") and request_can_include_weights(allow_patterns, ignore_patterns):
-        if allow_patterns is None and variant:
-            # Variant root load: a partial that kept only the canonical weight would leave the load to
-            # fetch the requested variant over un-killable Xet -> require a variant-named root weight,
-            # and reject an incomplete variant shard set (index present, a listed variant shard missing).
-            if not _root_has_variant_weight(
-                snapshot_dir, variant, ignore_patterns = ignore_patterns
-            ):
-                return False
-            if _has_incomplete_variant_root_shards(snapshot_dir, variant):
-                return False
-        elif allow_patterns is None:
-            # Default root load: a root (or diffusers-component) weight the load reads (ignore filter
-            # applied), with the canonical shard set complete for the format the load READS (ignore
-            # filter applied, so a complete safetensors set does not mask an incomplete ``.bin`` the load
-            # reads under ignore=['*.safetensors']).
-            if not _root_model_has_weight(snapshot_dir, ignore_patterns = ignore_patterns):
-                return False
-            if _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns):
-                return False
-        elif variant:
-            # Patterned variant load (e.g. allow=['*.safetensors'] or subfolder= with variant=): require
-            # a SELECTED weight carrying the variant -- a partial that kept only the canonical weight in
-            # scope would leave the load to fetch the requested variant over un-killable Xet. Also reject
-            # an incomplete ROOT variant shard set (a lone shard with no index / a missing shard), same as
-            # the unpatterned variant branch. The CANONICAL-root-shard gate does not apply (the load reads
-            # variant weights; a co-resident canonical shard set is out of scope). A variant shard set in
-            # a subfolder is not root-checked. The ROOT variant-shard check applies only when the request
-            # SELECTS a root variant weight (a globbed allow like ['*.safetensors']); for a subfolder
-            # request (allow=['unet/*']) a stale root variant shard is out of scope and must not
-            # false-reject a complete in-scope download.
-            if not _has_selected_variant_weight(
-                snapshot_dir, allow_patterns = allow_patterns,
-                ignore_patterns = ignore_patterns, variant = variant,
-            ):
-                return False
-            if _request_selects_root_variant_weight(allow_patterns, ignore_patterns, variant) \
-                    and _has_incomplete_variant_root_shards(snapshot_dir, variant):
-                return False
-        else:
-            # Patterned weight request: a selected weight must be present AND -- only for a GLOBBED
-            # request that SELECTS canonical root shards (so a later load expects the whole sharded
-            # checkpoint), not an adapter / gguf / subfolder request whose co-resident canonical shards
-            # it never reads, and not an EXACT-named request that asked for precisely those files -- the
-            # canonical shard set must be complete (a lone ``model-00001-of-0000N`` without its index /
-            # remaining shards is a partial the in-process load would finish over Xet).
-            if not _has_selected_weight(
-                snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns
-            ):
-                return False
-            if not _patterns_are_exact_names(allow_patterns) \
-                    and _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) \
-                    and _has_incomplete_canonical_root_shards(
-                        snapshot_dir, ignore_patterns = ignore_patterns):
-                return False
+        if not _selected_readable_weight_complete(
+            snapshot_dir, allow_patterns = allow_patterns,
+            ignore_patterns = ignore_patterns, variant = variant,
+        ):
+            return False
     return True
 
 

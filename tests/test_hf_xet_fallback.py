@@ -2619,6 +2619,30 @@ def test_post_download_root_variant_weight_honors_ignore(tmp_path):
         variant = "fp16") is True
 
 
+def test_selected_readable_weight_complete_entry_point(tmp_path):
+    """The weight-bearing acceptance check funnels through one helper enforcing two invariants:
+    (A) a readable weight is present (ignore + scope applied), (B) its in-scope shard set is complete.
+    Directly exercise the entry point for a present+complete, an absent, and an incomplete-shard case."""
+    # Present + complete single weight -> True.
+    snap, blob = _mk_snapshot(tmp_path, "srwc_ok")
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._selected_readable_weight_complete(
+        snap, allow_patterns = None, ignore_patterns = None, variant = None) is True
+    # Invariant A fails: only an ignored-format weight present -> False.
+    snap2, blob2 = _mk_snapshot(tmp_path, "srwc_ignored")
+    (snap2 / "pytorch_model.bin").symlink_to(blob2)
+    assert xf._selected_readable_weight_complete(
+        snap2, allow_patterns = None, ignore_patterns = ["*.bin"], variant = None) is False
+    # Invariant B fails: readable weight present but its shard set incomplete -> False.
+    snap3, blob3 = _mk_snapshot(tmp_path, "srwc_incomplete")
+    (snap3 / "model-00001-of-00002.safetensors").symlink_to(blob3)
+    (snap3 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    assert xf._selected_readable_weight_complete(
+        snap3, allow_patterns = None, ignore_patterns = None, variant = None) is False
+
+
 def test_post_download_accepts_dataset_without_weight(tmp_path):
     snap, blob = _mk_snapshot(tmp_path, "ds")
     (snap / "data.parquet").symlink_to(blob)
