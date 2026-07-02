@@ -1556,6 +1556,7 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
+    import mlx.nn as nn
     quantized = {}
     quantized.update(_quantization_config_to_path_map(
         _get_existing_mlx_quantization(getattr(model, "_config", None))
@@ -1566,7 +1567,10 @@ def _effective_mlx_quantization_map(model):
     for path, module in model.named_modules():
         if not path:
             continue
-        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+        # isinstance, not an exact class-name match: a training-time subclass of
+        # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
+        # recognised, else embed_tokens is silently dropped from the map.
+        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
             continue
         path = _canonical_mlx_quantization_path(path)
         entry = {}

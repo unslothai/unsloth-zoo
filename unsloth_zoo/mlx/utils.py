@@ -3995,7 +3995,10 @@ def _effective_mlx_quantization_map(model):
     for name, module in model.named_modules():
         if not name:
             continue
-        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+        # isinstance, not an exact class-name match: a training-time subclass of
+        # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
+        # recognised, else embed_tokens is silently dropped from the map.
+        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
             continue
         name = _canonical_mlx_quantization_path(name)
         entry = {}

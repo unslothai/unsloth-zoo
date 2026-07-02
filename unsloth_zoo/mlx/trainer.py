@@ -1274,7 +1274,9 @@ class MLXTrainer:
         unchanged -- .weight stays readable for tied LM-head models, and
         __call__ resolves on the subtype so interception actually fires."""
         alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
-        if alpha <= 0:
+        # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison
+        # every embedding with nan/inf noise from step 0.
+        if not math.isfinite(alpha) or alpha <= 0:
             return
         if self._is_vlm:
             print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
