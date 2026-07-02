@@ -26,7 +26,7 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options, UNSLOTH_ENABLE_LOGGING
+from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
@@ -945,6 +945,9 @@ def grpo_accumulated_loss(
     _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
     if (_pack_enabled and pixel_values is None
             and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
+        # this function's source is copied into the generated GRPO trainer, so import the logging
+        # flag locally (before the try) to keep the bare name defined there too
+        from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING
         try:
             _pack_pad_id = trainer.processing_class.pad_token_id
             _pack_keep = input_ids != _pack_pad_id
