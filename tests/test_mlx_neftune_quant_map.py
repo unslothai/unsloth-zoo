@@ -88,3 +88,61 @@ def test_neftune_saved_map_reloads_against_base():
     # Reload validates the saved map against the now-unmodified base model.
     adapter_cfg = {"base_resolved_quantization_map": saved_map}
     _validate_mlx_adapter_base(model, adapter_cfg)  # must not raise
+
+
+@metal_only
+def test_neftune_subclass_is_name_transparent():
+    """The real _install_neftune subclass must report the base class name, so
+    every save-time name-based check sees through the transparent stand-in."""
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import _get_text_model
+
+    model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
+    emb = _get_text_model(model).model.embed_tokens
+    base_name = type(emb).__name__  # QuantizedEmbedding
+
+    tr = MLXTrainer(
+        model=model, tokenizer=tok, train_dataset=[{"text": "x"}],
+        args=MLXTrainingConfig(neftune_noise_alpha=5.0,
+                               output_dir="/tmp/neftune_name", report_to="none"),
+    )
+    tr._install_neftune()
+    try:
+        assert type(emb).__name__ == base_name, \
+            f"subclass leaked its name into introspection: {type(emb).__name__}"
+        assert isinstance(emb, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+    finally:
+        tr._remove_neftune()
+    assert type(emb).__name__ == base_name
+
+
+@metal_only
+def test_neftune_preserves_dora_name_detection():
+    """A DoRA-adapted embed_tokens must still satisfy the save-time
+    `type(module).__name__.startswith("DoRA")` check while NEFTune is active."""
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import _get_text_model
+
+    model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
+    emb = _get_text_model(model).model.embed_tokens
+    real_base = type(emb)
+    # Mimic what use_dora=True on the embedding produces: a DoRA-named class.
+    emb.__class__ = type("DoRAEmbedding", (real_base,), {})
+    try:
+        tr = MLXTrainer(
+            model=model, tokenizer=tok, train_dataset=[{"text": "x"}],
+            args=MLXTrainingConfig(neftune_noise_alpha=5.0,
+                                   output_dir="/tmp/neftune_dora", report_to="none"),
+        )
+        tr._install_neftune()
+        try:
+            assert type(emb).__name__.startswith("DoRA"), \
+                f"NEFTune broke DoRA save-time detection: {type(emb).__name__}"
+        finally:
+            tr._remove_neftune()
+        assert type(emb).__name__ == "DoRAEmbedding"
+    finally:
+        emb.__class__ = real_base

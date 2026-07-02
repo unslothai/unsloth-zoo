@@ -1319,6 +1319,15 @@ class MLXTrainer:
                     return out + noise
                 return out
 
+        # Report the base class's name so name-based introspection during the
+        # save window (which happens before _remove_neftune) sees through this
+        # transparent stand-in: the quantization-map scan and the DoRA detection
+        # (`type(module).__name__.startswith("DoRA")`) both key on the name, and
+        # a bare "_NEFTuneEmbed" would drop a quantized embed_tokens from the
+        # saved map and demote an embedding-only DoRA adapter to plain LoRA.
+        _NEFTuneEmbed.__name__ = _Base.__name__
+        _NEFTuneEmbed.__qualname__ = getattr(_Base, "__qualname__", _Base.__name__)
+
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
         emb.__class__ = _NEFTuneEmbed
