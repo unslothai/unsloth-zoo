@@ -73,6 +73,44 @@ def test_existing_token_type_ids_stripped_in_lockstep():
     assert all(len(t) == len(i) for t, i in zip(out["token_type_ids"], out["input_ids"]))
 
 
+def test_special_tokens_mask_stripped_and_padded():
+    # any per-token field (here special_tokens_mask) must be stripped and padded, not left ragged;
+    # its pad fill is 1 (padding is a special token).
+    text_inputs = {
+        "input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]],
+        "attention_mask": [[1, 1, 1], [1, 1, 1, 1]],
+        "special_tokens_mask": [[1, 1, 0], [1, 1, 0, 0]],
+    }
+    out = _fix_double_bos_and_pad(text_inputs, BOS, PAD, IMG, False, True, "left", "pt")
+    assert {len(x) for x in out["special_tokens_mask"]} == {3}
+    assert all(len(m) == len(i) for m, i in zip(out["special_tokens_mask"], out["input_ids"]))
+    assert out["special_tokens_mask"][0][0] == 1   # left pad filled as special
+
+
+def test_offset_mapping_tuples_stripped_and_padded():
+    # offset_mapping rows are (start, end) tuples; stripping drops the first pair and padding fills (0, 0).
+    text_inputs = {
+        "input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]],
+        "attention_mask": [[1, 1, 1], [1, 1, 1, 1]],
+        "offset_mapping": [[(0, 0), (0, 0), (0, 2)], [(0, 0), (0, 0), (0, 2), (2, 4)]],
+    }
+    out = _fix_double_bos_and_pad(text_inputs, BOS, PAD, IMG, False, True, "left", "pt")
+    assert {len(x) for x in out["offset_mapping"]} == {3}
+    assert out["offset_mapping"][0][0] == (0, 0)    # left pad filled with an offset pair
+
+
+def test_pad_to_multiple_of():
+    text_inputs = {"input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]], "attention_mask": [[1, 1, 1], [1, 1, 1, 1]]}
+    out = _fix_double_bos_and_pad(text_inputs, BOS, PAD, IMG, True, True, "left", "pt", pad_to_multiple_of=8)
+    assert {len(x) for x in out["input_ids"]} == {8}   # batch max 3 rounded up to 8
+
+
+def test_max_length_uses_model_max_when_unset():
+    text_inputs = {"input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]], "attention_mask": [[1, 1, 1], [1, 1, 1, 1]]}
+    out = _fix_double_bos_and_pad(text_inputs, BOS, PAD, IMG, True, "max_length", "left", "pt", model_max_length=6)
+    assert {len(x) for x in out["input_ids"]} == {6}
+
+
 if __name__ == "__main__":
     test_batched_ragged_rows_become_stackable()
     test_single_row_strips_bos_without_padding()
@@ -82,4 +120,8 @@ if __name__ == "__main__":
     test_padding_false_leaves_ragged()
     test_max_length_padding()
     test_existing_token_type_ids_stripped_in_lockstep()
+    test_special_tokens_mask_stripped_and_padded()
+    test_offset_mapping_tuples_stripped_and_padded()
+    test_pad_to_multiple_of()
+    test_max_length_uses_model_max_when_unset()
     print("OK: all gemma3 batched-processor padding tests passed")

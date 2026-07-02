@@ -101,33 +101,47 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
 def _fix_double_bos_and_pad(
     text_inputs, bos_token_id, pad_token_id, image_token_id,
     return_mm_token_type_ids, padding, padding_side, return_tensors,
-    max_length = None,
+    max_length = None, pad_to_multiple_of = None, model_max_length = None,
 ):
-    # Gemma3 adds a BOS in the chat template and another in the tokenizer; strip the duplicate on
-    # every row (including any tokenizer-provided token_type_ids), rebuild mm token type ids, then
-    # pad each field so ragged rows stack. Padding follows the HF contract (list output when
-    # return_tensors is None), honours "do_not_pad", and targets max_length when requested.
+    # Gemma3 doubles the BOS (chat template + tokenizer). Strip the duplicate on every row and on
+    # every per-token field returned (attention_mask, token_type_ids, special_tokens_mask,
+    # offset_mapping, ...), rebuild mm token type ids, then pad each field so ragged rows stack.
+    # Honours "do_not_pad"/max_length/model max/pad_to_multiple_of and the return_tensors=None list contract.
+    n_rows = len(text_inputs["input_ids"])
     double_bos = [bos_token_id, bos_token_id]
     strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
-    text_inputs["input_ids"] = [x[1:] if strip[i] else x for i, x in enumerate(text_inputs["input_ids"])]
-    if "attention_mask" in text_inputs:
-        text_inputs["attention_mask"] = [a[1:] if strip[i] else a for i, a in enumerate(text_inputs["attention_mask"])]
-    if "token_type_ids" in text_inputs:
-        text_inputs["token_type_ids"] = [t[1:] if strip[i] else t for i, t in enumerate(text_inputs["token_type_ids"])]
+    # any value that is one list per row stays aligned with input_ids, so strip its extra BOS too
+    per_token_keys = [
+        k for k, v in text_inputs.items()
+        if isinstance(v, (list, tuple)) and len(v) == n_rows
+        and all(isinstance(r, (list, tuple)) for r in v)
+    ]
+    for k in per_token_keys:
+        text_inputs[k] = [r[1:] if strip[i] else r for i, r in enumerate(text_inputs[k])]
     if return_mm_token_type_ids:
         text_inputs["token_type_ids"] = [[int(y == image_token_id) for y in x] for x in text_inputs["input_ids"]]
+        if "token_type_ids" not in per_token_keys: per_token_keys.append("token_type_ids")
     if padding not in (False, None, "do_not_pad"):
         if padding == "max_length" and max_length is not None:
             max_len = max_length
+        elif padding == "max_length" and model_max_length is not None:
+            max_len = model_max_length
         else:
             max_len = max((len(x) for x in text_inputs["input_ids"]), default = 0)
-        pad_id = pad_token_id or 0
+        if pad_to_multiple_of:
+            max_len = -(-max_len // pad_to_multiple_of) * pad_to_multiple_of
+        def fill_for(key):
+            if key == "input_ids": return pad_token_id or 0
+            if key == "special_tokens_mask": return 1
+            sample = next((r for r in text_inputs[key] if r), None)
+            return (0, 0) if (sample is not None and isinstance(sample[0], (tuple, list))) else 0
         def pad_seq(seq, fill):
             delta = max_len - len(seq)
             if delta <= 0: return list(seq)
             return ([fill]*delta + list(seq)) if padding_side == "left" else (list(seq) + [fill]*delta)
-        for key, fill in (("input_ids", pad_id), ("attention_mask", 0), ("token_type_ids", 0)):
-            if key in text_inputs: text_inputs[key] = [pad_seq(x, fill) for x in text_inputs[key]]
+        for key in per_token_keys:
+            fill = fill_for(key)
+            text_inputs[key] = [pad_seq(x, fill) for x in text_inputs[key]]
     return text_inputs
 pass
 
@@ -238,10 +252,15 @@ def patch_Gemma3Processor():
         padding_side = output_kwargs["text_kwargs"].pop("padding_side", None) or \
             getattr(self.tokenizer, "padding_side", "left")
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
+        # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
+        _mml = getattr(self.tokenizer, "model_max_length", None)
+        if not (isinstance(_mml, int) and 0 < _mml < int(1e15)): _mml = None
         text_inputs = _fix_double_bos_and_pad(
             text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
             self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
             max_length = output_kwargs["text_kwargs"].get("max_length", None),
+            pad_to_multiple_of = output_kwargs["text_kwargs"].get("pad_to_multiple_of", None),
+            model_max_length = _mml,
         )
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
