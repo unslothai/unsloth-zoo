@@ -53,11 +53,12 @@ def _normalize_seed(seed, default=3407):
 
 
 class _MLXNormOutputCastState:
-    __slots__ = ("patched_classes", "missing")
+    __slots__ = ("patched_classes", "missing", "lock")
 
     def __init__(self):
         self.patched_classes = set()
         self.missing = object()
+        self.lock = threading.RLock()
 
 
 _MLX_NORM_OUTPUT_CAST_STATE = _MLXNormOutputCastState()
@@ -246,14 +247,13 @@ def _set_mlx_norm_output_cast_classes(enabled: bool, norm_classes) -> None:
                 return out
 
             norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
+            norm_call_cast_output._unsloth_original_call = original_call
             norm_cls._unsloth_original_call = original_call
             norm_cls.__call__ = norm_call_cast_output
             norm_cls._unsloth_cast_output_to_input_dtype = True
             patched_classes.add(norm_cls)
         elif patched:
             if not getattr(norm_cls.__call__, "_unsloth_norm_output_cast_wrapper", False):
-                norm_cls._unsloth_original_call = None
-                norm_cls._unsloth_cast_output_to_input_dtype = False
                 patched_classes.discard(norm_cls)
                 continue
             original_call = getattr(norm_cls, "_unsloth_original_call", None)
@@ -265,38 +265,40 @@ def _set_mlx_norm_output_cast_classes(enabled: bool, norm_classes) -> None:
 
 
 def mlx_norm_output_cast_patched_classes():
-    return tuple(_MLX_NORM_OUTPUT_CAST_STATE.patched_classes)
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        return tuple(_MLX_NORM_OUTPUT_CAST_STATE.patched_classes)
 
 
 def snapshot_mlx_norm_output_cast_state(norm_classes=None):
-    patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
-    missing = _MLX_NORM_OUTPUT_CAST_STATE.missing
-    snapshot_classes = []
-    seen = set()
-    for norm_cls in patched_classes:
-        snapshot_classes.append(norm_cls)
-        seen.add(norm_cls)
-    for norm_cls in norm_classes or ():
-        if isinstance(norm_cls, type) and norm_cls not in seen:
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+        missing = _MLX_NORM_OUTPUT_CAST_STATE.missing
+        snapshot_classes = []
+        seen = set()
+        for norm_cls in patched_classes:
             snapshot_classes.append(norm_cls)
             seen.add(norm_cls)
+        for norm_cls in norm_classes or ():
+            if isinstance(norm_cls, type) and norm_cls not in seen:
+                snapshot_classes.append(norm_cls)
+                seen.add(norm_cls)
 
-    return tuple(
-        (
-            norm_cls,
-            norm_cls in patched_classes,
-            norm_cls.__dict__.get("__call__", missing),
-            norm_cls.__dict__.get(
-                "_unsloth_original_call",
-                missing,
-            ),
-            norm_cls.__dict__.get(
-                "_unsloth_cast_output_to_input_dtype",
-                missing,
-            ),
+        return tuple(
+            (
+                norm_cls,
+                norm_cls in patched_classes,
+                norm_cls.__dict__.get("__call__", missing),
+                norm_cls.__dict__.get(
+                    "_unsloth_original_call",
+                    missing,
+                ),
+                norm_cls.__dict__.get(
+                    "_unsloth_cast_output_to_input_dtype",
+                    missing,
+                ),
+            )
+            for norm_cls in snapshot_classes
         )
-        for norm_cls in snapshot_classes
-    )
 
 
 def _restore_mlx_norm_output_cast_attr(norm_cls, attr_name, value) -> None:
@@ -310,28 +312,36 @@ def _restore_mlx_norm_output_cast_attr(norm_cls, attr_name, value) -> None:
 
 
 def restore_mlx_norm_output_cast_state(snapshot) -> None:
-    patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
-    desired = {}
-    for entry in snapshot:
-        try:
-            norm_cls, was_patched, call, original_call, cast_output = entry
-        except (TypeError, ValueError):
-            continue
-        if isinstance(norm_cls, type):
-            desired[norm_cls] = (was_patched, call, original_call, cast_output)
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+        desired = {}
+        for entry in snapshot:
+            try:
+                norm_cls, was_patched, call, original_call, cast_output = entry
+            except (TypeError, ValueError):
+                continue
+            if isinstance(norm_cls, type):
+                desired[norm_cls] = (was_patched, call, original_call, cast_output)
 
-    for norm_cls, (was_patched, call, original_call, cast_output) in desired.items():
-        _restore_mlx_norm_output_cast_attr(norm_cls, "__call__", call)
-        _restore_mlx_norm_output_cast_attr(
-            norm_cls, "_unsloth_original_call", original_call
-        )
-        _restore_mlx_norm_output_cast_attr(
-            norm_cls, "_unsloth_cast_output_to_input_dtype", cast_output
-        )
-        if was_patched:
-            patched_classes.add(norm_cls)
-        else:
-            patched_classes.discard(norm_cls)
+        for norm_cls, (was_patched, call, original_call, cast_output) in desired.items():
+            current_call = getattr(norm_cls, "__call__", None)
+            current_is_wrapper = getattr(
+                current_call, "_unsloth_norm_output_cast_wrapper", False
+            )
+            if not was_patched and not current_is_wrapper:
+                patched_classes.discard(norm_cls)
+                continue
+            _restore_mlx_norm_output_cast_attr(norm_cls, "__call__", call)
+            _restore_mlx_norm_output_cast_attr(
+                norm_cls, "_unsloth_original_call", original_call
+            )
+            _restore_mlx_norm_output_cast_attr(
+                norm_cls, "_unsloth_cast_output_to_input_dtype", cast_output
+            )
+            if was_patched:
+                patched_classes.add(norm_cls)
+            else:
+                patched_classes.discard(norm_cls)
 
 
 def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
@@ -341,20 +351,26 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
     fp32 norm outputs flow through the rest of the graph promotes downstream
     intermediates and materially increases LoRA/QLoRA memory. Casting the
     result back keeps bf16/fp16 downstream activations.
-    """
-    try:
-        from . import compile as _mlx_compile
-        _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
-    except Exception:
-        pass
 
-    norm_classes = list(iter_mlx_norm_output_cast_classes(model))
-    if not enabled:
-        norm_classes.extend(
-            norm_cls for norm_cls in mlx_norm_output_cast_patched_classes()
-            if norm_cls not in norm_classes
-        )
-    _set_mlx_norm_output_cast_classes(enabled, norm_classes)
+    This patches norm classes process-wide, not per model. Use
+    snapshot_mlx_norm_output_cast_state() and restore_mlx_norm_output_cast_state()
+    to bracket temporary changes; overlapping trainer/inference runs in the
+    same process are still not safe because the patched classes are shared.
+    """
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        try:
+            from . import compile as _mlx_compile
+            _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
+        except Exception:
+            pass
+
+        norm_classes = list(iter_mlx_norm_output_cast_classes(model))
+        if not enabled:
+            norm_classes.extend(
+                norm_cls for norm_cls in mlx_norm_output_cast_patched_classes()
+                if norm_cls not in norm_classes
+            )
+        _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
 def _get_transformer_layers(model):
