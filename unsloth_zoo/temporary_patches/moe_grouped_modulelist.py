@@ -204,15 +204,25 @@ def _expert_compute_dtype(experts, spec):
     return getattr(w, "dtype", torch.bfloat16)
 
 
+def _experts_on_device(experts, spec, device) -> bool:
+    """True if the experts' weights live on `device`. A device_map / CPU offload can send a MoE
+    block's weights elsewhere while activations arrive on CUDA; building the stacks on the
+    experts' device and calling grouped_mm across devices would crash, so we fall back instead."""
+    w = getattr(getattr(experts[0], spec[0], None), "weight", None)
+    return getattr(w, "device", device) == device
+
+
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
     # Fall back to the exact original loop unless this is the frozen-expert CUDA path on a
-    # grouped_mm-supported dtype that matches the experts' compute dtype (so CPU/offload,
-    # LoRA-on-experts, fp32, or a bnb compute_dtype != activation dtype stay bit-identical).
+    # grouped_mm-supported dtype that matches the experts' compute dtype and device (so CPU/
+    # offload, LoRA-on-experts, fp32, a bnb compute_dtype != activation dtype, or experts placed
+    # on another device stay bit-identical / crash-free).
     if (not hidden_states.is_cuda) or _experts_have_lora(experts, spec) \
             or hidden_states.dtype not in (torch.bfloat16, torch.float16) \
-            or _expert_compute_dtype(experts, spec) != hidden_states.dtype:
+            or _expert_compute_dtype(experts, spec) != hidden_states.dtype \
+            or not _experts_on_device(experts, spec, hidden_states.device):
         return self._orig_moe_forward(hidden_states)
     is_3d = hidden_states.dim() == 3
     if is_3d:
@@ -294,7 +304,11 @@ def _block_is_eligible(block):
                 return None
             if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
                 return None
-            is_4bit = HAS_BNB and isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None
+            # The grouped path is frozen-only: _expert_weight reads w.data and _GroupedFrozenMM
+            # returns dX only, so a trainable expert weight would silently get no gradient. Require
+            # frozen for both 4-bit and plain experts; otherwise run the original loop.
+            is_4bit = (HAS_BNB and isinstance(w, Params4bit)
+                       and getattr(w, "quant_state", None) is not None and not w.requires_grad)
             # fp32 omitted: torch._grouped_mm targets low-precision CUDA inputs.
             is_plain_frozen = (not w.requires_grad) and w.dtype in (torch.bfloat16, torch.float16)
             if not (is_4bit or is_plain_frozen):

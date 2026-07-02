@@ -22,8 +22,8 @@ from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     wrap_loader_for_grouped_moe,
     _block_is_eligible,
     _expert_compute_dtype,
+    _experts_on_device,
     _grouped_mm_supported,
-    _route_softmax_topk,
     _BLOCK_SPECS,
     HAS_BNB,
 )
@@ -246,6 +246,45 @@ def test_expert_compute_dtype_prefers_linear4bit_compute_dtype():
     for name in spec[:3]:  # if compute_dtype is unset, fall back to the quant_state dtype
         getattr(ex, name).compute_dtype = None
     assert isinstance(_expert_compute_dtype([ex], spec), torch.dtype)
+
+
+def test_experts_on_device_gates_offload():
+    """Experts placed off the activation device (device_map / CPU offload) must make the block
+    fall back, since building stacks on the experts' device then calling grouped_mm across
+    devices would crash."""
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+    blk = _make_block("Qwen3MoeSparseMoeBlock", spec, 64, 128, 4, 2, True)  # experts on DEV
+    w_dev = getattr(blk.experts[0], spec[0]).weight.device
+    assert _experts_on_device(blk.experts, spec, w_dev)
+    assert not _experts_on_device(blk.experts, spec, torch.device("cpu"))
+
+
+def test_frozen_only_contract_for_experts():
+    """The grouped path is frozen-only. Frozen bnb 4-bit experts are eligible; an unfrozen
+    (trainable) expert must bail to the original loop rather than silently receive no gradient.
+    (A real Params4bit stores uint8 data and can never require grad, so the reachable trainable
+    case is a plain bf16 expert - that is what the frozen requirement protects.)"""
+    spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
+
+    if HAS_BNB:  # frozen 4-bit experts stay eligible with the frozen requirement in place
+        import bitsandbytes as bnb
+        blk4 = type("Qwen3MoeSparseMoeBlock", (nn.Module,), {})()
+        experts = nn.ModuleList()
+        for _ in range(2):
+            ex = nn.Module()
+            for name in spec[:3]:
+                lin = bnb.nn.Linear4bit(64, 64, bias=False, compute_dtype=torch.bfloat16, quant_type="nf4")
+                setattr(ex, name, lin.to(DEV))
+            experts.append(ex)
+        blk4.experts = experts
+        blk4.gate = nn.Linear(64, 2, bias=False).to(DEV, DTYPE)
+        blk4.num_experts, blk4.top_k, blk4.norm_topk_prob = 2, 2, True
+        assert _block_is_eligible(blk4) is not None, "frozen 4-bit experts should be eligible"
+
+    blk = _make_block("Qwen3MoeSparseMoeBlock", spec, 64, 128, 4, 2, True)  # frozen bf16 -> eligible
+    assert _block_is_eligible(blk) is not None
+    getattr(blk.experts[0], spec[0]).weight.requires_grad_(True)  # unfrozen expert (reachable for bf16)
+    assert _block_is_eligible(blk) is None, "trainable expert must bail to the original loop"
 
 
 if __name__ == "__main__":
