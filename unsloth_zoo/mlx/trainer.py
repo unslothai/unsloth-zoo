@@ -2262,10 +2262,13 @@ class MLXTrainer:
             if self._train_loss_history else 0.0
         )
 
+        # Report the step actually reached, which is < total_steps after an
+        # early stop (self._global_step == total_steps on a full run).
+        completed_steps = self._global_step
         print(f"\nUnsloth: Training complete! "
               f"Avg loss: {avg_loss:.4f} | "
               f"Total time: {total_time:.1f}s | "
-              f"Steps: {total_steps} | "
+              f"Steps: {completed_steps} | "
               f"Tokens: {trained_tokens}")
 
         # load_best_model_at_end: restore best adapters before the final save.
@@ -2290,7 +2293,7 @@ class MLXTrainer:
         return {
             "train_loss": avg_loss,
             "train_runtime": total_time,
-            "train_steps": total_steps,
+            "train_steps": completed_steps,
             "trained_tokens": trained_tokens,
             "train_samples_per_second": (
                 trained_tokens / total_time if total_time > 0 else 0
