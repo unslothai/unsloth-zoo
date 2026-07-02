@@ -4080,12 +4080,19 @@ class FastMLXModel:
                 _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
-                    model, processor = vlm_load(
-                        vlm_load_target,
-                        lazy=True,
-                        revision=revision,
-                        **extra_kwargs,
-                    )
+                    try:
+                        model, processor = vlm_load(
+                            vlm_load_target,
+                            lazy=True,
+                            revision=revision,
+                            **extra_kwargs,
+                        )
+                    except ValueError as error:
+                        # This path loads before quantizing, bypassing
+                        # _load_mlx_vlm_with_extra_weight_filter, so surface the
+                        # QK-norm version gap here too (never drop q_norm/k_norm).
+                        _raise_if_qk_norm_version_gap(model_type, str(error), error)
+                        raise
                     vlm_cfg = _vlm_load_config(vlm_load_target)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
