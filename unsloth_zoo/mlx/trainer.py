@@ -2097,6 +2097,12 @@ class MLXTrainer:
                 batch_size=args.per_device_train_batch_size,
                 max_seq_length=args.max_seq_length,
                 num_batches=total_batches_needed,
+                dataset_order=(
+                    "sequential"
+                    if getattr(args, "preserve_dataset_order", False)
+                    else getattr(args, "dataset_order", "default")
+                ),
+                seed=getattr(args, "seed", None),
             )
             return batches, None
 

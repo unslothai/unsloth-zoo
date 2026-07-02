@@ -613,18 +613,34 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
-                        num_batches=None):
+                        num_batches=None, dataset_order="default",
+                        preserve_dataset_order=False, seed=None):
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
-    Pairs are length-sorted (by max of the two), grouped into batches of
-    ``batch_size`` PAIRS, and every row in a batch is padded to that batch's
-    max length, rounded up to ``pad_to_multiple`` (Apple-Silicon padding).
+    Pairs are grouped into batches of ``batch_size`` PAIRS, and every row in a
+    batch is padded to that batch's max length, rounded up to
+    ``pad_to_multiple`` (Apple-Silicon padding).
+
+    ``dataset_order`` controls how pairs are ordered before batching (mirrors
+    the SFT/VLM builders so preference runs can match CUDA/TRL parity):
+      "default"       length-sort by ``max(len(chosen), len(rejected))`` — least
+                      padding / best throughput; the historical behavior.
+      "sequential"    keep dataset order — matches CUDA ``SequentialSampler``.
+      "torch_randperm" seeded permutation — matches CUDA ``RandomSampler``.
+    ``preserve_dataset_order=True`` forces "sequential" (Studio wiring).
+    ``seed`` seeds the "torch_randperm" order.
 
     Returns a list of ``(batch, lengths, None)`` tuples:
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
       lengths: (2B, 2) — per row [response_start, seq_end)
     """
+    order_mode = "sequential" if preserve_dataset_order else dataset_order
+    if order_mode not in ("default", "sequential", "torch_randperm"):
+        raise ValueError(
+            f"Unsloth MLX: unsupported preference dataset_order={order_mode!r}. "
+            "Expected 'default', 'sequential', or 'torch_randperm'."
+        )
     hf = getattr(tokenizer, "_tokenizer", tokenizer)
     pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
 
@@ -642,7 +658,13 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         pe = min(len(p_ids), len(c_ids), len(r_ids))
         rows.append((pe, c_ids, r_ids))
 
-    rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
+    # rows are collected in dataset order above; reorder per the requested mode.
+    if order_mode == "default":
+        rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
+    elif order_mode == "torch_randperm":
+        order = _torch_randperm_order(len(rows), _normalize_seed(seed))
+        rows = [rows[i] for i in order]
+    # "sequential": leave rows in dataset order (CUDA SequentialSampler parity).
 
     out = []
     for i in range(0, len(rows), batch_size):
