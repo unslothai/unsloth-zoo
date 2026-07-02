@@ -177,24 +177,10 @@ def _grouped_expert_gemm(x, offsets, weight_fn, recompute):
     return _grouped_mm_fix(x, weight_fn(), offsets)
 
 
-def _experts_have_lora(experts, spec) -> bool:
-    """True if any expert projection gained LoRA / a PEFT base_layer after patching
-    (so the frozen grouped path no longer holds). Cheap next to the per-call dequant."""
-    for ex in experts:
-        for name in spec[:3]:
-            lin = getattr(ex, name, None)
-            if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
-                return True
-    return False
-
-
-def _expert_compute_dtype(experts, spec):
-    """The dtype the frozen expert matmul runs in. bitsandbytes casts inputs to the
-    Linear4bit compute_dtype for the matmul, so that is what our dequant + grouped_mm must
-    match; we read it directly and fall back to the quant_state dtype only if compute_dtype
-    is unset. A plain frozen Linear uses its weight dtype. Used to keep numerics
-    bnb-identical and to decide when to fall back to the original loop."""
-    lin = getattr(experts[0], spec[0], None)
+def _lin_compute_dtype(lin):
+    """The dtype a single expert projection matmuls in: bitsandbytes casts inputs to the
+    Linear4bit compute_dtype, so that is what our dequant + grouped_mm must match (fall back to
+    the quant_state dtype if unset); a plain frozen Linear uses its weight dtype."""
     w = getattr(lin, "weight", None)
     if HAS_BNB and isinstance(w, Params4bit):
         compute_dtype = getattr(lin, "compute_dtype", None)
@@ -204,25 +190,45 @@ def _expert_compute_dtype(experts, spec):
     return getattr(w, "dtype", torch.bfloat16)
 
 
-def _experts_on_device(experts, spec, device) -> bool:
-    """True if the experts' weights live on `device`. A device_map / CPU offload can send a MoE
-    block's weights elsewhere while activations arrive on CUDA; building the stacks on the
-    experts' device and calling grouped_mm across devices would crash, so we fall back instead."""
-    w = getattr(getattr(experts[0], spec[0], None), "weight", None)
-    return getattr(w, "device", device) == device
+def _expert_compute_dtype(experts, spec):
+    """The compute dtype of the first expert's gate projection (see _lin_compute_dtype)."""
+    return _lin_compute_dtype(getattr(experts[0], spec[0], None))
+
+
+def _experts_grouped_ready(experts, spec, device, dtype) -> bool:
+    """Runtime re-check across EVERY expert projection (state can change after
+    enable_grouped_moe, and the stacks are built from all experts, so sampling experts[0] is not
+    enough for heterogeneous device_map / offload / partially-unfrozen / mixed-dtype blocks).
+    Each routed projection must be present, LoRA-free, frozen, on `device`, and matmul in `dtype`;
+    otherwise we fall back to the original loop (bit-identical / crash-free)."""
+    for ex in experts:
+        for name in spec[:3]:
+            lin = getattr(ex, name, None)
+            w = getattr(lin, "weight", None)
+            if w is None:
+                return False
+            if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
+                return False
+            if w.requires_grad:                                  # unfrozen -> grads would be dropped
+                return False
+            if getattr(w, "device", device) != device:           # offloaded / other device
+                return False
+            if _lin_compute_dtype(lin) != dtype:                 # different compute dtype
+                return False
+    return True
 
 
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
     # Fall back to the exact original loop unless this is the frozen-expert CUDA path on a
-    # grouped_mm-supported dtype that matches the experts' compute dtype and device (so CPU/
-    # offload, LoRA-on-experts, fp32, a bnb compute_dtype != activation dtype, or experts placed
-    # on another device stay bit-identical / crash-free).
-    if (not hidden_states.is_cuda) or _experts_have_lora(experts, spec) \
+    # grouped_mm-supported dtype, with every expert LoRA-free, frozen, on the activation device,
+    # and computing in the activation dtype (so CPU/offload, LoRA-on-experts, fp32, a bnb
+    # compute_dtype != activation dtype, unfrozen experts, or experts on another device stay
+    # bit-identical / crash-free).
+    if (not hidden_states.is_cuda) \
             or hidden_states.dtype not in (torch.bfloat16, torch.float16) \
-            or _expert_compute_dtype(experts, spec) != hidden_states.dtype \
-            or not _experts_on_device(experts, spec, hidden_states.device):
+            or not _experts_grouped_ready(experts, spec, hidden_states.device, hidden_states.dtype):
         return self._orig_moe_forward(hidden_states)
     is_3d = hidden_states.dim() == 3
     if is_3d:

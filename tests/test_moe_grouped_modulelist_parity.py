@@ -22,7 +22,7 @@ from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     wrap_loader_for_grouped_moe,
     _block_is_eligible,
     _expert_compute_dtype,
-    _experts_on_device,
+    _experts_grouped_ready,
     _grouped_mm_supported,
     _BLOCK_SPECS,
     HAS_BNB,
@@ -248,15 +248,20 @@ def test_expert_compute_dtype_prefers_linear4bit_compute_dtype():
     assert isinstance(_expert_compute_dtype([ex], spec), torch.dtype)
 
 
-def test_experts_on_device_gates_offload():
-    """Experts placed off the activation device (device_map / CPU offload) must make the block
-    fall back, since building stacks on the experts' device then calling grouped_mm across
-    devices would crash."""
+def test_experts_grouped_ready_checks_every_expert():
+    """The runtime guard must inspect every expert, not just experts[0]: a device / dtype /
+    unfrozen mismatch on ANY expert must make the block fall back to the original loop."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
-    blk = _make_block("Qwen3MoeSparseMoeBlock", spec, 64, 128, 4, 2, True)  # experts on DEV
-    w_dev = getattr(blk.experts[0], spec[0]).weight.device
-    assert _experts_on_device(blk.experts, spec, w_dev)
-    assert not _experts_on_device(blk.experts, spec, torch.device("cpu"))
+    blk = _make_block("Qwen3MoeSparseMoeBlock", spec, 64, 128, 4, 2, True)  # frozen bf16 on DEV
+    experts = blk.experts
+    dev = getattr(experts[0], spec[0]).weight.device
+    assert _experts_grouped_ready(experts, spec, dev, DTYPE)
+
+    # a mismatch on a LATER expert (index 1+) must still be caught
+    assert not _experts_grouped_ready(experts, spec, torch.device("cpu"), DTYPE)   # device
+    assert not _experts_grouped_ready(experts, spec, dev, torch.float32)           # compute dtype
+    getattr(experts[2], spec[1]).weight.requires_grad_(True)                        # unfrozen up_proj
+    assert not _experts_grouped_ready(experts, spec, dev, DTYPE)
 
 
 def test_frozen_only_contract_for_experts():
