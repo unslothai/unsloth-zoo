@@ -274,6 +274,35 @@ def _message_matches_known_fallback(message, rule):
     return all(token in message for token in rule.get("message_tokens", ()))
 
 
+def _raise_if_qk_norm_version_gap(model_type, message, error):
+    """QK-norm archs (gemma4, qwen3_5, ...) carry q_norm / k_norm weights. When a
+    strict mlx load rejects them ("... parameters not in model: ...k_norm..."),
+    the installed mlx-lm / mlx-vlm predates (or regressed on) this architecture -
+    notably mlx-lm 0.31.3 (see mlx-lm #1242). Dropping those weights would yield a
+    numerically broken model, so surface a clear, actionable error instead of the
+    raw mlx ValueError."""
+    if "parameters not in model" not in message:
+        return
+    if not any(marker in message for marker in ("k_norm", "q_norm")):
+        return
+    versions = []
+    for pkg in ("mlx-lm", "mlx-vlm"):
+        try:
+            from importlib.metadata import version as _dist_version
+
+            versions.append(f"{pkg}={_dist_version(pkg)}")
+        except Exception:
+            pass
+    installed = f" Installed: {', '.join(versions)}." if versions else ""
+    raise ValueError(
+        f"Unsloth: cannot load MLX {model_type or 'model'} - the installed "
+        f"mlx-lm / mlx-vlm rejects its QK-norm (q_norm/k_norm) weights, so it is "
+        f"too old or regressed for this architecture (mlx-lm 0.31.3 broke "
+        f"gemma4 / qwen3_5). Reinstall an arch-complete build, e.g. "
+        f'`pip install "mlx-lm!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
+    ) from error
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Let DeepSeek-OCR remote config imports survive newer Transformers.
 
@@ -385,6 +414,7 @@ def _load_mlx_lm_with_strict_fallback(
         message = str(error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
+            _raise_if_qk_norm_version_gap(model_type, message, error)
             raise
         print(rule["notice"])
         model, config = load_model(
@@ -425,6 +455,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
         message = str(error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
+            _raise_if_qk_norm_version_gap(model_type, message, error)
             raise
 
         print(rule["notice"])
