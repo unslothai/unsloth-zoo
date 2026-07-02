@@ -2103,6 +2103,7 @@ class MLXTrainer:
                     else getattr(args, "dataset_order", "default")
                 ),
                 seed=getattr(args, "seed", None),
+                append_eos=bool(getattr(args, "append_eos", True)),
             )
             return batches, None
 

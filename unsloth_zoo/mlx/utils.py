@@ -614,7 +614,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
                         num_batches=None, dataset_order="default",
-                        preserve_dataset_order=False, seed=None):
+                        preserve_dataset_order=False, seed=None,
+                        append_eos=True):
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
@@ -631,6 +632,13 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     ``preserve_dataset_order=True`` forces "sequential" (Studio wiring).
     ``seed`` seeds the "torch_randperm" order.
 
+    ``append_eos`` (default True, matching TRL) appends the tokenizer's EOS id
+    to each chosen/rejected completion, guarded to avoid a double EOS (mirrors
+    TRL's ``add_eos_token_if_needed``). EOS is appended before truncation to
+    ``max_seq_length`` (same contract as the SFT path). Because EOS lands after
+    the prompt boundary it falls inside the ``[response_start, seq_end)`` loss
+    span, so it is trained on — as in TRL.
+
     Returns a list of ``(batch, lengths, None)`` tuples:
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
       lengths: (2B, 2) — per row [response_start, seq_end)
@@ -642,7 +650,16 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
             "Expected 'default', 'sequential', or 'torch_randperm'."
         )
     hf = getattr(tokenizer, "_tokenizer", tokenizer)
-    pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
+    eos_id = hf.eos_token_id
+    pad_id = eos_id if eos_id is not None else 0
+
+    def _with_eos(ids):
+        # TRL appends EOS to the completion, avoiding a double EOS
+        # (add_eos_token_if_needed). Append before max_seq_length truncation,
+        # matching the SFT path's append-then-truncate contract.
+        if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
+            ids = ids + [eos_id]
+        return ids[:max_seq_length]
 
     rows = []
     for ex in dataset:
@@ -653,8 +670,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
             )
         prompt = ex[prompt_key]
         p_ids = hf.encode(prompt)
-        c_ids = hf.encode(prompt + ex[chosen_key])[:max_seq_length]
-        r_ids = hf.encode(prompt + ex[rejected_key])[:max_seq_length]
+        c_ids = _with_eos(hf.encode(prompt + ex[chosen_key]))
+        r_ids = _with_eos(hf.encode(prompt + ex[rejected_key]))
         pe = min(len(p_ids), len(c_ids), len(r_ids))
         rows.append((pe, c_ids, r_ids))
 
