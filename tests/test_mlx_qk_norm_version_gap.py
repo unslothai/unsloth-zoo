@@ -41,6 +41,22 @@ def test_qwen3_5_q_norm_also_caught():
         )
 
 
+def test_kv_sharing_plus_k_norm_raises_not_dropped():
+    # The tester's error: KV-sharing keys (k_proj/v_proj) AND k_norm together.
+    # The QK-norm guard must win over the gemma4 strict=False KV-sharing fallback
+    # so the load-bearing norms are never silently dropped.
+    from unsloth_zoo.mlx.loader import _raise_if_qk_norm_version_gap
+
+    msg = (
+        "Received 126 parameters not in model: "
+        "language_model.model.layers.24.self_attn.k_norm.weight, "
+        "language_model.model.layers.24.self_attn.k_proj.weight, "
+        "language_model.model.layers.24.self_attn.v_proj.weight"
+    )
+    with pytest.raises(ValueError):
+        _raise_if_qk_norm_version_gap("gemma4_text", msg, ValueError("orig"))
+
+
 def test_non_qk_norm_mismatch_passes_through():
     from unsloth_zoo.mlx.loader import _raise_if_qk_norm_version_gap
 

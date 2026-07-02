@@ -412,9 +412,13 @@ def _load_mlx_lm_with_strict_fallback(
         )
     except ValueError as error:
         message = str(error)
+        # QK-norm weights are load-bearing: never strict=False past them. Check
+        # first so an error carrying both KV-sharing keys and q_norm/k_norm (a
+        # broken mlx-lm) raises a clear error instead of silently dropping the
+        # norms via the strict=False fallback below.
+        _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
-            _raise_if_qk_norm_version_gap(model_type, message, error)
             raise
         print(rule["notice"])
         model, config = load_model(
@@ -453,9 +457,11 @@ def _load_mlx_vlm_with_extra_weight_filter(
             return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
+        # QK-norm weights are load-bearing: never filter past them (see the
+        # mlx-lm path). Check before the known extra-weight filter below.
+        _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
-            _raise_if_qk_norm_version_gap(model_type, message, error)
             raise
 
         print(rule["notice"])
