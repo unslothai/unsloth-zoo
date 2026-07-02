@@ -101,18 +101,26 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
 def _fix_double_bos_and_pad(
     text_inputs, bos_token_id, pad_token_id, image_token_id,
     return_mm_token_type_ids, padding, padding_side, return_tensors,
+    max_length = None,
 ):
     # Gemma3 adds a BOS in the chat template and another in the tokenizer; strip the duplicate on
-    # every row, add mm token type ids, then pad each field to the batch max so ragged rows stack.
+    # every row (including any tokenizer-provided token_type_ids), rebuild mm token type ids, then
+    # pad each field so ragged rows stack. Padding follows the HF contract (list output when
+    # return_tensors is None), honours "do_not_pad", and targets max_length when requested.
     double_bos = [bos_token_id, bos_token_id]
     strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
     text_inputs["input_ids"] = [x[1:] if strip[i] else x for i, x in enumerate(text_inputs["input_ids"])]
     if "attention_mask" in text_inputs:
         text_inputs["attention_mask"] = [a[1:] if strip[i] else a for i, a in enumerate(text_inputs["attention_mask"])]
+    if "token_type_ids" in text_inputs:
+        text_inputs["token_type_ids"] = [t[1:] if strip[i] else t for i, t in enumerate(text_inputs["token_type_ids"])]
     if return_mm_token_type_ids:
         text_inputs["token_type_ids"] = [[int(y == image_token_id) for y in x] for x in text_inputs["input_ids"]]
-    if padding and return_tensors is not None:
-        max_len = max((len(x) for x in text_inputs["input_ids"]), default = 0)
+    if padding not in (False, None, "do_not_pad"):
+        if padding == "max_length" and max_length is not None:
+            max_len = max_length
+        else:
+            max_len = max((len(x) for x in text_inputs["input_ids"]), default = 0)
         pad_id = pad_token_id or 0
         def pad_seq(seq, fill):
             delta = max_len - len(seq)
@@ -233,6 +241,7 @@ def patch_Gemma3Processor():
         text_inputs = _fix_double_bos_and_pad(
             text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
             self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
+            max_length = output_kwargs["text_kwargs"].get("max_length", None),
         )
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
