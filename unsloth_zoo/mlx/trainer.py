@@ -1921,8 +1921,11 @@ class MLXTrainer:
                     _cur = _em[_metric_name]
                     _greater = bool(getattr(args, "greater_is_better", False))
                     _improved = (
-                        self._best_metric is None
-                        or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                        _cur == _cur  # reject NaN: a diverged eval must never become "best"
+                        and (
+                            self._best_metric is None
+                            or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                        )
                     )
                     if _improved:
                         self._best_metric = _cur
