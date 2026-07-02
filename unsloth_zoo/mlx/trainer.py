@@ -1350,7 +1350,6 @@ class MLXTrainer:
         with gradient accumulation. Returns a dict of training metrics."""
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
-        self._setup_report_to_callbacks()
         self._install_neftune()
         args = self.args
         model = self.model
@@ -1441,6 +1440,10 @@ class MLXTrainer:
                 from .loader import _disable_fused_mrope
                 _disable_fused_mrope(model)
 
+            # Register W&B/TensorBoard reporters after arg auto-tuning so the
+            # W&B config snapshot reflects the settings actually used (e.g. VLM
+            # compile auto-tune can flip gradient_checkpointing before training).
+            self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
             _handles = getattr(self, "_report_to_handles", (None, None))
