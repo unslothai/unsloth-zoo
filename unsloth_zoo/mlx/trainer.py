@@ -1152,6 +1152,7 @@ class MLXTrainer:
         self.add_step_callback(_on_step)
         self.add_eval_callback(_on_eval)
         self._report_to_handles = (wandb_run, tb_writer)
+        self._report_to_callbacks = (_on_step, _on_eval)
 
 
     def train(self, resume_from_checkpoint: str | None = None):
@@ -1259,6 +1260,11 @@ class MLXTrainer:
             if _wb is not None:
                 try: _wb.finish()
                 except Exception: pass
+            for _cb in getattr(self, "_report_to_callbacks", ()):
+                if _cb in self._step_callbacks: self._step_callbacks.remove(_cb)
+                if _cb in self._eval_callbacks: self._eval_callbacks.remove(_cb)
+            self._report_to_handles = (None, None)
+            self._report_to_callbacks = ()
             if args.gradient_checkpointing:
                 try:
                     remove_gradient_checkpointing(model)
