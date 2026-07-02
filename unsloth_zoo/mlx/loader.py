@@ -2780,33 +2780,14 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
     try:
         import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
         import torch
-        from transformers import AutoConfig, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-        # Pick the right auto class: VLMs have a vision_config attribute or are
-        # explicitly listed in transformers' image-text-to-text mapping.
-        # AutoModelForCausalLM is text-only and rejects Qwen3VLConfig etc.
-        cfg = AutoConfig.from_pretrained(
-            source, token=token, trust_remote_code=trust_remote_code,
-        )
-        _is_vlm = (
-            hasattr(cfg, "vision_config")
-            or getattr(cfg, "model_type", "").endswith("_vl")
-            or getattr(cfg, "model_type", "") in (
-                "qwen3_vl", "qwen2_vl", "qwen2_5_vl", "llava", "llava_next",
-                "idefics2", "idefics3", "paligemma", "gemma3", "mllama",
-                "smolvlm", "internvl",
-            )
-        )
-        if _is_vlm:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
-            auto_cls = AutoModelForImageTextToText
-        else:
-            from transformers import AutoModelForCausalLM
-            auto_cls = AutoModelForCausalLM
-
-        model = auto_cls.from_pretrained(
+        # Only text bnb repos reach here; VLM bnb repos are rejected by the
+        # caller (mlx-vlm dequant is not wired up yet). AutoModelForCausalLM
+        # dequantizes the NF4 weights to fp16.
+        model = AutoModelForCausalLM.from_pretrained(
             source,
             dtype=torch.float16,
             device_map={"": device},
@@ -2845,17 +2826,10 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
         except Exception:
             pass
         model.save_pretrained(tmpdir, safe_serialization=True)
-        # VLMs need the full processor (image preprocessor + tokenizer); text
-        # models only need the tokenizer. Use the right class so downstream
-        # mlx-vlm / mlx-lm loads can read the saved artifacts.
-        if _is_vlm:
-            AutoProcessor.from_pretrained(
-                source, token=token, trust_remote_code=trust_remote_code,
-            ).save_pretrained(tmpdir)
-        else:
-            AutoTokenizer.from_pretrained(
-                source, token=token, trust_remote_code=trust_remote_code,
-            ).save_pretrained(tmpdir)
+        # Save the tokenizer so the downstream mlx-lm load can read it.
+        AutoTokenizer.from_pretrained(
+            source, token=token, trust_remote_code=trust_remote_code,
+        ).save_pretrained(tmpdir)
         # Release the fp16 model and bnb's MPS allocator cache so the caller's
         # MLX re-quantization (and any later loads) aren't starved of memory.
         del model
@@ -3789,6 +3763,16 @@ class FastMLXModel:
                 else "  - Try the non-bnb variant of this model (drop the "
                      "'-bnb-4bit' suffix)\n"
             )
+            # VLM bitsandbytes repos are out of scope on the MLX path: the
+            # dequant path only handles text models (mlx-lm), and mlx-vlm
+            # dequant is not wired up. Reject with the clear, actionable error
+            # instead of attempting an unverified VLM dequant + mlx-vlm load.
+            if _is_vlm(config_data):
+                raise ValueError(
+                    f"Unsloth: '{model_name}' is a bitsandbytes-quantized VLM, "
+                    "which isn't supported on the MLX path yet.\n"
+                    f"{_suggestion_line}"
+                )
             try:
                 _dequant_dir = _dequantize_bnb_to_tempdir(
                     local_path or model_name,
@@ -3853,6 +3837,11 @@ class FastMLXModel:
                     **(
                         {"mlx_quantization_config": mlx_quantization_config}
                         if mlx_quantization_config is not None
+                        else {}
+                    ),
+                    **(
+                        {"quantization_config": quantization_config}
+                        if quantization_config is not None
                         else {}
                     ),
                 )
