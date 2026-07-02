@@ -1193,6 +1193,13 @@ class MLXTrainer:
             return
         targets = raw if isinstance(raw, (list, tuple)) else [raw]
         targets = {str(t).lower() for t in targets}
+        # "all" mirrors HF: enable every backend we support on MLX.
+        if "all" in targets:
+            targets |= {"wandb", "tensorboard"}
+        unsupported = targets - {"wandb", "tensorboard", "all", "none"}
+        if unsupported:
+            print(f"Unsloth: report_to target(s) {sorted(unsupported)} are not "
+                  f"supported on MLX; only 'wandb' and 'tensorboard' are logged.")
 
         wandb_run = None
         if "wandb" in targets:
@@ -1217,8 +1224,12 @@ class MLXTrainer:
                 except ImportError:
                     SummaryWriter = None
             if SummaryWriter is not None:
-                tb_writer = SummaryWriter(
-                    log_dir=os.path.join(self.args.output_dir, "runs"))
+                try:
+                    tb_writer = SummaryWriter(
+                        log_dir=os.path.join(self.args.output_dir, "runs"))
+                except Exception as e:
+                    print(f"Unsloth: tensorboard init failed: {e}")
+                    tb_writer = None
 
         if wandb_run is None and tb_writer is None:
             return
