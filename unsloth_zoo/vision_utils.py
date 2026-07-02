@@ -33,29 +33,9 @@ __all__ = [
     "UnslothVisionDataCollator",
 ]
 
-IMAGE_TOKENS = [
-    "<|image|>",          # Llama 3.2 Vision, Phi 3.5
-    "<|vision_start|>",   # Qwen
-    "<|vision_end|>",     # Qwen
-    "<|vision_pad|>",     # Qwen
-    "<|image_pad|>",      # Qwen
-    "<|video_pad|>",      # Qwen
-    "<image>",            # PaliGemma / Llava
-    "[IMG]",              # Mistral
-    "[IMG_BREAK]",        # Mistral
-    "[IMG_END]",          # Mistral
-    "<image_soft_token>", # Gemma 3
-    "<start_of_image>",   # Gemma 3
-    "<end_of_image>",     # Gemma 3
-    "<|START_OF_IMG|>",   # Cohere
-    "<|END_OF_IMG|>",     # Cohere
-    "<|IMG_LINE_BREAK|>", # Cohere
-    "<|IMG_PATCH|>",      # Cohere
-]
-
-AUDIO_TOKENS = [
-    "<|audio|>",  # Gemma 4
-]
+# Canonical media placeholder tokens live in vlm_tokens so the CUDA and MLX paths
+# share one source of truth. Re-exported here for backwards compatibility.
+from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
@@ -654,6 +634,11 @@ def get_padding_tokens_ids(tokenizer):
         placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
+    # Tokens absent from this tokenizer map to the unk id; do not mask unk from loss
+    # (mirrors the MLX path in mlx/utils.py). pad_token_id is added separately below.
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None:
+        padding_token_ids = [x for x in padding_token_ids if x != unk_id]
     if hasattr(tokenizer, "pad_token_id"):
         padding_token_ids.append(tokenizer.pad_token_id)
 
@@ -1138,8 +1123,13 @@ class UnslothVisionDataCollator:
         audio_tokens = list(AUDIO_TOKENS)
         if getattr(tok, "audio_token", None) is not None:
             audio_tokens.append(tok.audio_token)
+        # Audio strings absent from this tokenizer map to the unk id (matching
+        # get_padding_tokens_ids); excluding it keeps a truncated unk text token from being
+        # miscounted as an audio token and tripping the alignment check below.
+        unk_id = getattr(tok, "unk_token_id", None)
         audio_ids = torch.tensor(
-            [i for i in tok.convert_tokens_to_ids(audio_tokens) if isinstance(i, int) and i >= 0],
+            [i for i in tok.convert_tokens_to_ids(audio_tokens)
+             if isinstance(i, int) and i >= 0 and i != unk_id],
             device=batch["input_ids"].device,
         )
         n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())
