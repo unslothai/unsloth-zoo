@@ -2836,6 +2836,14 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
                 _strip_quant_meta(getattr(cfg, _sub, None))
         _strip_quant_meta(model.config)
         tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
+        # transformers 5.x: the dequantized model still carries weight-name
+        # conversions with no reverse op, so save_pretrained's
+        # revert_weight_conversion raises NotImplementedError. The dequantized
+        # weights need no conversion; clear it. No-op on 4.x (attr absent).
+        try:
+            model._weight_conversions = []
+        except Exception:
+            pass
         model.save_pretrained(tmpdir, safe_serialization=True)
         # VLMs need the full processor (image preprocessor + tokenizer); text
         # models only need the tokenizer. Use the right class so downstream
@@ -3769,6 +3777,19 @@ class FastMLXModel:
                     "Unsloth can dequantize and re-quantize via MLX"
                 )
             except Exception as _bnb_exc:
+                # bnb-4bit loading in transformers requires `accelerate`, which
+                # is excluded from the darwin-arm64 deps — exactly where this
+                # path runs. Detect that specific failure and point the user at
+                # the real fix instead of misreporting it as a bnb problem.
+                if "accelerate" in str(_bnb_exc).lower():
+                    raise ValueError(
+                        f"Unsloth: loading the bitsandbytes model '{model_name}' "
+                        "requires the `accelerate` package, which isn't installed "
+                        "on this machine.\n"
+                        "  - Install it with: pip install accelerate\n"
+                        "  - Then re-run; Unsloth will dequantize and re-quantize "
+                        "via MLX."
+                    ) from _bnb_exc
                 raise ValueError(
                     f"Unsloth: failed to dequantize the bitsandbytes model "
                     f"'{model_name}' "
