@@ -1185,6 +1185,88 @@ class MLXTrainer:
             pass
         self._prior_metal_limits = {}
 
+    def _setup_report_to_callbacks(self):
+        """Auto-register W&B / TensorBoard callbacks from report_to, mirroring
+        Studio worker.py log keys so notebook and Studio runs chart identically."""
+        raw = getattr(self.args, "report_to", "none")
+        if not raw or raw == "none":
+            return
+        targets = raw if isinstance(raw, (list, tuple)) else [raw]
+        targets = {str(t).lower() for t in targets}
+
+        wandb_run = None
+        if "wandb" in targets:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=os.environ.get("WANDB_PROJECT", "unsloth-mlx"),
+                    config={k: v for k, v in vars(self.args).items()
+                            if not k.startswith("_")},
+                )
+            except Exception as e:
+                print(f"Unsloth: wandb init failed: {e}")
+                wandb_run = None
+
+        tb_writer = None
+        if "tensorboard" in targets:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError:
+                try:
+                    from tensorboardX import SummaryWriter
+                except ImportError:
+                    SummaryWriter = None
+            if SummaryWriter is not None:
+                tb_writer = SummaryWriter(
+                    log_dir=os.path.join(self.args.output_dir, "runs"))
+
+        if wandb_run is None and tb_writer is None:
+            return
+
+        def _on_step(step, total_steps, loss, lr, tokens_sec, peak_gb,
+                     elapsed, num_tokens, grad_norm=None):
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({
+                        "train/loss": loss,
+                        "train/learning_rate": lr,
+                        "train/tokens_per_sec": tokens_sec,
+                        "train/peak_gb": peak_gb,
+                        "train/num_tokens": num_tokens,
+                        **({"train/grad_norm": grad_norm} if grad_norm is not None else {}),
+                    }, step=step)
+                except Exception:
+                    pass
+            if tb_writer is not None:
+                try:
+                    tb_writer.add_scalar("train/loss", loss, step)
+                    tb_writer.add_scalar("train/learning_rate", lr, step)
+                    tb_writer.add_scalar("train/tokens_per_sec", tokens_sec, step)
+                    tb_writer.add_scalar("train/peak_gb", peak_gb, step)
+                    if grad_norm is not None:
+                        tb_writer.add_scalar("train/grad_norm", grad_norm, step)
+                except Exception:
+                    pass
+
+        def _on_eval(step, eval_loss, perplexity):
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({"eval/loss": eval_loss,
+                                   "eval/perplexity": perplexity}, step=step)
+                except Exception:
+                    pass
+            if tb_writer is not None:
+                try:
+                    tb_writer.add_scalar("eval/loss", eval_loss, step)
+                    tb_writer.add_scalar("eval/perplexity", perplexity, step)
+                except Exception:
+                    pass
+
+        self.add_step_callback(_on_step)
+        self.add_eval_callback(_on_eval)
+        self._report_to_handles = (wandb_run, tb_writer)
+        self._report_to_callbacks = (_on_step, _on_eval)
+
     def _install_neftune(self):
         """NEFTune: add scaled uniform noise to input embeddings during training.
         Text models only; no-op in eval. Uses __class__ reassignment (a real
@@ -1246,6 +1328,7 @@ class MLXTrainer:
         with gradient accumulation. Returns a dict of training metrics."""
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
+        self._setup_report_to_callbacks()
         self._install_neftune()
         args = self.args
         model = self.model
@@ -1338,6 +1421,19 @@ class MLXTrainer:
 
             return self._train_inner()
         finally:
+            _handles = getattr(self, "_report_to_handles", (None, None))
+            _wb, _tb = _handles
+            if _tb is not None:
+                try: _tb.close()
+                except Exception: pass
+            if _wb is not None:
+                try: _wb.finish()
+                except Exception: pass
+            for _cb in getattr(self, "_report_to_callbacks", ()):
+                if _cb in self._step_callbacks: self._step_callbacks.remove(_cb)
+                if _cb in self._eval_callbacks: self._eval_callbacks.remove(_cb)
+            self._report_to_handles = (None, None)
+            self._report_to_callbacks = ()
             self._remove_neftune()
             if args.gradient_checkpointing:
                 try:
