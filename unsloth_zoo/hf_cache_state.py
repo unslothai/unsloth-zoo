@@ -752,6 +752,24 @@ def _index_shard_rel_paths(index_path: Path, dir_rel: str) -> "Optional[list]":
     return out
 
 
+def _index_shard_probe(index_name: str, dir_rel: str) -> "Optional[str]":
+    """A representative numbered-shard path for a weight-shard INDEX whose listed shards are unknown (a
+    malformed / truncated index): the index's own base name + format as a first shard, joined under
+    *dir_rel*. Lets the malformed-index scope check judge the request's allow / ignore filter on the
+    WEIGHT the load reads rather than on the ``.json`` index filename -- ``ignore=['*.bin']`` does not
+    match ``pytorch_model.bin.index.json`` but the load never reads that ignored-format index, so
+    filtering the filename would wrongly retry a complete other-format download. None when the name is not
+    a recognizable shard index."""
+    for marker, ext in ((".safetensors.index.", "safetensors"), (".bin.index.", "bin")):
+        if marker in index_name:
+            base = index_name.split(marker, 1)[0]
+            if not base:
+                return None
+            prefix = f"{dir_rel}/" if dir_rel else ""
+            return f"{prefix}{base}-00001-of-00002.{ext}"
+    return None
+
+
 def _selected_shard_index_incomplete(
     snapshot_dir: Path, *, allow_patterns: "Optional[object]", ignore_patterns: "Optional[object]",
     variant: "Optional[str]",
@@ -807,11 +825,15 @@ def _selected_shard_index_incomplete(
             index_fmts.setdefault(dir_rel, set()).add(fmt)
             shard_rels = _index_shard_rel_paths(entry, dir_rel)
             if shard_rels is None:
-                # A malformed / non-string index. Defer to the watched child only when the REQUEST
-                # selects this index (the load would read it to enumerate its shards); a co-resident
-                # stale malformed index the request does NOT select (a leftover adapter index under a
-                # base ['model*'] / subfolder warm) is not read, so it must not force a spurious retry.
-                if _filter_paths([rel], allow_patterns, ignore_patterns):
+                # A malformed / non-string index. Defer to the watched child only when the REQUEST reads
+                # this index's weight set -- judged on a representative shard of the index's OWN base +
+                # format (via the allow / ignore filter), not the .json filename. So a co-resident stale
+                # malformed index the request does NOT select (a leftover adapter index under a base
+                # ['model*'] / subfolder warm) OR one for an IGNORED format (a *.bin index under
+                # ignore=['*.bin']) is not read and must not force a spurious retry; an unrecognizable
+                # index defers to the child.
+                probe = _index_shard_probe(name, dir_rel)
+                if probe is None or _filter_paths([probe], allow_patterns, ignore_patterns):
                     return True
                 continue
             if not _filter_paths(shard_rels, allow_patterns, ignore_patterns):
@@ -934,7 +956,14 @@ def _diffusers_component_shards_incomplete(
             index_fmts.setdefault(dir_rel, set()).add(fmt)
             shard_rels = _index_shard_rel_paths(entry, dir_rel)
             if shard_rels is None:
-                return True  # a malformed / non-string index -> defer to the watched child
+                # A malformed / non-string index. Defer only when its FORMAT is read (a representative
+                # shard of the index's base + format survives the ignore filter); a stale malformed
+                # index for an IGNORED format (a *.bin component index under ignore=['*.bin']) is not
+                # read, so it must not force a spurious retry of a complete other-format pipeline.
+                probe = _index_shard_probe(name, dir_rel)
+                if probe is None or _filter_paths([probe], None, ignore_patterns):
+                    return True
+                continue
             if not _filter_paths(shard_rels, None, ignore_patterns):
                 continue  # the load does not read this set (ignored format)
             per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)

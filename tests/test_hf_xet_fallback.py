@@ -3201,6 +3201,40 @@ def test_shard_index_rejects_unsafe_path_refs(tmp_path):
         "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"}
 
 
+def test_malformed_index_scope_honors_ignored_format(tmp_path):
+    """A malformed shard index is judged by the WEIGHT the load reads (a representative shard of the
+    index's base + format), not the .json filename. So a stale/truncated index for an IGNORED format
+    (a *.bin index under ignore=['*.bin']) is skipped -- the load reads safetensors and never touches it,
+    so a complete safetensors download must not be looped into a DownloadStallError (Codex #829). A
+    malformed index of the READ format is still breakage."""
+    # Patterned subfolder warm reading safetensors: a co-resident malformed bin index is ignored.
+    snap, blob = _mk_snapshot(tmp_path, "malformed_ignored_bin_idx")
+    (snap / "unet").mkdir()
+    (snap / "unet" / "config.json").write_text("{}")
+    (snap / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    (snap / "unet" / "diffusion_pytorch_model.bin.index.json").write_text("{ truncated")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = ["*.bin"]) is True
+    # The malformed index of the READ format (safetensors, not ignored) is still breakage.
+    snap2, _ = _mk_snapshot(tmp_path, "malformed_read_st_idx")
+    (snap2 / "unet").mkdir()
+    (snap2 / "unet" / "config.json").write_text("{}")
+    (snap2 / "unet" / "diffusion_pytorch_model.safetensors.index.json").write_text("{ truncated")
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is False
+    # Diffusers pipeline: a malformed component bin index under ignore=['*.bin'] does not reject a
+    # complete safetensors pipeline.
+    snap3, blob3 = _mk_snapshot(tmp_path, "malformed_diffusers_bin_idx")
+    (snap3 / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "U"], "vae": ["diffusers", "V"]}))
+    for comp in ("unet", "vae"):
+        (snap3 / comp).mkdir()
+        (snap3 / comp / "diffusion_pytorch_model.safetensors").symlink_to(blob3)
+    (snap3 / "unet" / "diffusion_pytorch_model.bin.index.json").write_text("{ truncated")
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
+
+
 def test_gate_ignored_canonical_weight_does_not_prove_complete(tmp_path):
     """Finding 3 (over-accept): a stale canonical weight whose FORMAT the request ignores must not
     count as proof of completeness. ignore=['*.bin'] with only a pytorch_model.bin on disk (no
