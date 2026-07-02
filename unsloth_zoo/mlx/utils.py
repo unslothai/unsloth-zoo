@@ -573,6 +573,14 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
     by the trainer at setup.
     """
     _mods = list(lora_mods) if lora_mods is not None else []
+    if not _mods and not reference_free:
+        raise ValueError(
+            "Unsloth: DPO with a reference model is not yet supported for full "
+            "fine-tuning on MLX — the reference is obtained by disabling LoRA "
+            "adapters, but this model has none. Use a LoRA/PEFT model, or pass "
+            "reference_free=True to train without a reference (TRL-style "
+            "reference-free DPO)."
+        )
 
     def _row_logp_and_mask(model, batch, lengths):
         inputs = batch[:, :-1]
