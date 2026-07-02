@@ -122,21 +122,28 @@ def _grouped_mm_with_backward_fix(
 ) -> torch.Tensor:
     """Grouped matmul via torch._grouped_mm with contiguous inputs.
 
-    The weight is passed AS-IS first. torch._grouped_mm accepts a transposed
-    (non-contiguous) view as long as one matmul dim is unit-stride. The base expert
+    The weight is passed AS-IS when the stack is known-safe. torch._grouped_mm accepts a
+    transposed (non-contiguous) view as long as one matmul dim is unit-stride. The base expert
     stacks are stored (E, 2I, H) / (E, H, I) and preprocess_weight transposes them into
     grouped layout, producing exactly such a view for the frozen base. Forcing
-    weight.contiguous() here materialised a full copy of that frozen stack (e.g. ~805 MB
-    for gate_up on Qwen3-30B) on every step; profiling attributed ~57% of MoE GPU time to
-    these copies. We only fall back to a contiguous copy (and then the per-group matmul)
-    when the kernel actually rejects the strides, which is the narrow case of some low-rank
-    LoRA weights whose row strides are below the 16-byte alignment requirement.
+    weight.contiguous() materialises a full copy of that frozen stack (e.g. ~805 MB for
+    gate_up on Qwen3-30B) on every step; profiling attributed ~57% of MoE GPU time to these
+    copies, so skipping it is a real speedup.
 
-    Bit-exact vs the previous always-contiguous path in forward and backward, for frozen
-    and trainable weights (torch._grouped_mm produces identical results for a contiguous
-    tensor and its equivalent view).
+    Some CUDA torch builds, however, silently miscompute torch._grouped_mm for exactly this
+    transposed bf16 view (pytorch/pytorch#186365). We therefore only skip the copy when a
+    one-time probe proves the view path is stable and matches the contiguous path on this
+    stack; otherwise we keep the contiguous copy (correct on every build). We also fall back
+    to a contiguous copy (and then the per-group matmul) when the kernel rejects the strides,
+    the narrow case of some low-rank LoRA weights below the 16-byte alignment requirement.
+
+    Bit-exact vs the always-contiguous path in forward and backward, for frozen and trainable
+    weights (torch._grouped_mm produces identical results for a contiguous tensor and its
+    equivalent view on stacks that pass the probe).
     """
     inputs = inputs.contiguous()
+    if not _transposed_view_grouped_mm_is_safe():
+        weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
@@ -263,6 +270,52 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
 
     return _TORCH_GROUPED_MM_SUPPORTED
+
+
+# Some CUDA torch builds miscompute torch._grouped_mm for a transposed (non-contiguous) bf16
+# weight view: results silently alternate / disagree with the contiguous copy when preceded by
+# a broadcast op (pytorch/pytorch#186365, seen on Blackwell with torch 2.11/2.13). We only skip
+# the contiguous copy in _grouped_mm_with_backward_fix on stacks where this probe proves the view
+# path is stable and matches the contiguous path; otherwise we keep the safe contiguous copy.
+_TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
+
+
+def _transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+
+    safe = False
+    try:
+        if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            E, N, K, M = 4, 64, 32, 32
+            torch.manual_seed(0)
+            A = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+            w = torch.randn(E, N, K, dtype=torch.bfloat16, device=device)
+            w_t = w.transpose(-2, -1)          # non-contiguous view (the fast path's layout)
+            w_tc = w_t.contiguous()            # known-correct reference
+            per = M // E
+            offs = torch.arange(per, M + 1, per, dtype=torch.int32, device=device)[:E]
+            offs[-1] = M
+            ok, ref = True, None
+            for _ in range(6):
+                row_wise_max = A.abs().amax(dim=-1, keepdim=True)
+                _ = A / (row_wise_max / 448.0)     # the #186365 trigger (result discarded)
+                r_view = torch._grouped_mm(A, w_t, offs=offs)
+                r_contig = torch._grouped_mm(A, w_tc, offs=offs)
+                if (r_view - r_contig).abs().max().item() > 1e-2:   # view disagrees with contiguous
+                    ok = False; break
+                if ref is None:
+                    ref = r_view
+                elif (r_view - ref).abs().max().item() > 1e-2:      # view not stable across calls
+                    ok = False; break
+            safe = ok
+    except Exception:
+        safe = False   # anything unexpected -> keep the safe contiguous copy
+
+    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = safe
+    return safe
 
 
 _TRITON_ALLOCATOR_INITIALIZED = False

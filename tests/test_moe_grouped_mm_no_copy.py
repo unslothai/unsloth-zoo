@@ -6,10 +6,11 @@ weight.contiguous() copied that whole frozen stack every step (~805 MB for gate_
 Qwen3-30B; ~57% of MoE GPU time). The fix passes the weight as-is and only falls back to a
 contiguous copy on the narrow 16-byte-stride error.
 
-test_no_forced_copy pins the control flow (device-independent): the weight reaches
-torch._grouped_mm as a non-contiguous view on a single attempt. test_view_matches_copy_*
-pin bit-exactness against the old always-contiguous path where torch._grouped_mm runs for
-real (H100+/B200), forward and backward.
+test_no_forced_copy pins the control flow: on a stack the #186365 probe deems safe the weight
+reaches torch._grouped_mm as a non-contiguous view in one attempt, otherwise a contiguous copy
+is forced. test_probe_gates_the_forced_copy pins that gate directly. test_view_matches_copy_*
+pin bit-exactness against the always-contiguous path where torch._grouped_mm runs for real
+(H100+/B200), forward and backward.
 """
 import pytest
 import torch
@@ -28,12 +29,13 @@ def _grouped_mm_ok():
 
 
 def test_no_forced_copy_on_happy_path(monkeypatch):
-    """The weight must reach torch._grouped_mm as a non-contiguous view, in one attempt.
-
-    Fails against the old code, which called weight.contiguous() before the single try
-    (materialising the full frozen-stack copy the fix exists to avoid).
-    """
-    from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
+    """On a probe-safe stack the weight reaches torch._grouped_mm as a non-contiguous view in
+    one attempt (no forced copy of the frozen stack); on an unproven stack it is made
+    contiguous. Fails against the old code, which always copied before the single try."""
+    from unsloth_zoo.temporary_patches.moe_utils import (
+        _grouped_mm_with_backward_fix, _transposed_view_grouped_mm_is_safe,
+    )
+    safe = _transposed_view_grouped_mm_is_safe()  # warm the cached probe with the REAL op first
 
     inputs = torch.randn(5, 4)
     weight_view = torch.randn(3, 2, 4).transpose(1, 2)  # (E, 4, 2) non-contiguous, like the base stack
@@ -49,7 +51,30 @@ def test_no_forced_copy_on_happy_path(monkeypatch):
     monkeypatch.setattr(torch, "_grouped_mm", spy, raising=False)
     _grouped_mm_with_backward_fix(inputs, weight_view, offsets)
 
-    assert seen == [False], f"expected one call with a non-contiguous weight view, got {seen}"
+    expected = [False] if safe else [True]  # safe -> view kept; unproven -> contiguous copy
+    assert seen == expected, f"probe safe={safe}: expected {expected}, got {seen}"
+
+
+def test_probe_gates_the_forced_copy(monkeypatch):
+    """The #186365 gate: when the probe reports the transposed-view path unsafe, the weight is
+    made contiguous before torch._grouped_mm; when safe, the view is passed as-is."""
+    import unsloth_zoo.temporary_patches.moe_utils as mu
+
+    inputs = torch.randn(5, 4)
+    weight_view = torch.randn(3, 2, 4).transpose(1, 2)
+    offsets = torch.tensor([2, 2, 5], dtype=torch.int32)
+
+    for probe_safe in (True, False):
+        seen = []
+
+        def spy(inp, w, offs=None):
+            seen.append(w.is_contiguous())
+            return torch.zeros(inp.shape[0], w.shape[-1], dtype=inp.dtype)
+
+        monkeypatch.setattr(mu, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", probe_safe, raising=False)
+        monkeypatch.setattr(torch, "_grouped_mm", spy, raising=False)
+        mu._grouped_mm_with_backward_fix(inputs, weight_view, offsets)
+        assert seen == [not probe_safe], f"probe_safe={probe_safe}: got {seen}"
 
 
 @pytest.mark.skipif(not _grouped_mm_ok(), reason="torch._grouped_mm unsupported on this device")
