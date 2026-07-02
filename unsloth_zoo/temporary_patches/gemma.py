@@ -98,6 +98,16 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     return functions
 
 
+def _resolve_truncation(padding, truncation, max_length):
+    # HF activates "longest_first" truncation when max_length is set with padding=False and no explicit
+    # truncation. We drop padding to pad manually, so pin the strategy the tokenizer would have derived
+    # (from the caller's original padding) and pass it explicitly, keeping truncation behaviour identical.
+    if truncation is not None:
+        return truncation
+    return "longest_first" if (max_length is not None and padding is False) else False
+pass
+
+
 def _fix_double_bos_and_pad(
     text_inputs, bos_token_id, pad_token_id, image_token_id,
     return_mm_token_type_ids, padding, padding_side, return_tensors,
@@ -255,11 +265,12 @@ def patch_Gemma3Processor():
         padding = output_kwargs["text_kwargs"].pop("padding", False)
         padding_side = output_kwargs["text_kwargs"].pop("padding_side", None) or \
             getattr(self.tokenizer, "padding_side", "left")
-        # We pad manually to max_length, so only leave max_length in for the tokenizer when truncation is
-        # requested; otherwise drop it to avoid HF's "max_length set without truncation" warning/ambiguity.
+        # HF derives truncation from padding + max_length (max_length with padding=False and no explicit
+        # truncation truncates). We drop padding to pad manually, so pin the truncation the tokenizer would
+        # have used from the original padding, keeping truncation behaviour identical.
         max_length = output_kwargs["text_kwargs"].get("max_length", None)
-        if not output_kwargs["text_kwargs"].get("truncation", None):
-            output_kwargs["text_kwargs"].pop("max_length", None)
+        output_kwargs["text_kwargs"]["truncation"] = _resolve_truncation(
+            padding, output_kwargs["text_kwargs"].get("truncation", None), max_length)
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
         # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
         _mml = getattr(self.tokenizer, "model_max_length", None)

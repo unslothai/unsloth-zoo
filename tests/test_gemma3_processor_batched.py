@@ -6,7 +6,7 @@ could not stack them. _fix_double_bos_and_pad strips the duplicate BOS on every 
 sequence fields. Padding follows the HF contract: it honours "do_not_pad"/False, pads list output
 even when return_tensors is None, and targets max_length when padding="max_length".
 """
-from unsloth_zoo.temporary_patches.gemma import _fix_double_bos_and_pad
+from unsloth_zoo.temporary_patches.gemma import _fix_double_bos_and_pad, _resolve_truncation
 
 BOS, PAD, IMG = 2, 0, 99
 
@@ -135,6 +135,16 @@ def test_length_recomputed_after_padding():
     assert out["length"] == [3, 3]
 
 
+def test_resolve_truncation_matches_hf():
+    # HF: max_length with padding=False and no explicit truncation -> "longest_first"; otherwise none.
+    assert _resolve_truncation(False, None, 100) == "longest_first"
+    assert _resolve_truncation("max_length", None, 100) is False   # padding set -> no auto-truncation
+    assert _resolve_truncation(True, None, 100) is False
+    assert _resolve_truncation(False, None, None) is False          # no max_length -> nothing to truncate to
+    assert _resolve_truncation(False, True, 100) is True            # explicit truncation preserved
+    assert _resolve_truncation(False, False, 100) is False
+
+
 if __name__ == "__main__":
     test_batched_ragged_rows_become_stackable()
     test_single_row_strips_bos_without_padding()
@@ -150,4 +160,5 @@ if __name__ == "__main__":
     test_max_length_uses_model_max_when_unset()
     test_non_aligned_fields_untouched()
     test_length_recomputed_after_padding()
+    test_resolve_truncation_matches_hf()
     print("OK: all gemma3 batched-processor padding tests passed")
