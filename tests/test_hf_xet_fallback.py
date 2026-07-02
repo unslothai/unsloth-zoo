@@ -2941,6 +2941,126 @@ def test_post_download_diffusers_presence_scoped_to_declared(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
+def test_post_download_diffusers_variant_presence_scoped_to_declared(tmp_path):
+    """Variant twin of the declared-scope check: an UNPATTERNED diffusers VARIANT warm counts a component
+    variant weight as proof only for a DECLARED component. A stale cache holding only an UNDECLARED variant
+    leftover (controlnet/....fp16.safetensors not in model_index.json) must be rejected, else the pipeline
+    fetches the declared unet/vae variant weights in-process over un-killable Xet (Codex #829)."""
+    snap, blob = _mk_snapshot(tmp_path, "diffusers_variant_undeclared_only")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "U"], "vae": ["diffusers", "V"]}))
+    (snap / "controlnet").mkdir()  # UNDECLARED
+    (snap / "controlnet" / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    # The declared component variant weights present -> accepted.
+    for comp in ("unet", "vae"):
+        (snap / comp).mkdir()
+        (snap / comp / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
+def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
+    """Variant twin of single-beats-index: transformers probes single model.<variant>.safetensors BEFORE
+    model.safetensors.index.<variant>.json, so a complete single variant weight co-resident with a STALE
+    incomplete variant index is usable and must not be looped into a DownloadStallError (Codex #829). Same
+    for a single .bin variant vs a stale .bin variant index; a stale variant index with NO single weight is
+    still breakage."""
+    snap, blob = _mk_snapshot(tmp_path, "single_variant_beats_index")
+    (snap / "config.json").write_text("{}")
+    (snap / "model.fp16.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))  # shards absent
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    # A single .bin variant co-resident with a stale .bin variant index (no safetensors) -> usable.
+    snapb, blobb = _mk_snapshot(tmp_path, "single_bin_variant_beats_index")
+    (snapb / "config.json").write_text("{}")
+    (snapb / "pytorch_model.fp16.bin").symlink_to(blobb)
+    (snapb / "pytorch_model.bin.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "pytorch_model.fp16-00001-of-00002.bin"}}))
+    assert xf._download_result_usable(
+        snapb, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    # A stale variant index with NO single variant weight -> the sharded load fetches missing shards.
+    snap2, _ = _mk_snapshot(tmp_path, "stale_variant_index_only")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+
+def test_post_download_diffusers_skips_root_model_shard_checks(tmp_path):
+    """A diffusers pipeline reads COMPONENT subfolders, not root model shards. A complete pipeline
+    (declared unet+vae present) co-resident with a STALE root model shard INDEX -- canonical or variant --
+    must be ACCEPTED: the root-model shard check does not apply to a diffusers snapshot, else a valid
+    pipeline is looped into a DownloadStallError (Codex #829). Component completeness is still enforced."""
+    # Plain: stale root model.safetensors.index.json alongside complete components.
+    snap, blob = _mk_snapshot(tmp_path, "diffusers_stale_root_index_plain")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "U"], "vae": ["diffusers", "V"]}))
+    for comp in ("unet", "vae"):
+        (snap / comp).mkdir()
+        (snap / comp / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))  # shards absent (stale)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # Variant: stale root model.safetensors.index.fp16.json alongside complete variant components.
+    snapv, blobv = _mk_snapshot(tmp_path, "diffusers_stale_root_index_variant")
+    (snapv / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "U"], "vae": ["diffusers", "V"]}))
+    for comp in ("unet", "vae"):
+        (snapv / comp).mkdir()
+        (snapv / comp / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blobv)
+    (snapv / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
+                        "b": "model.fp16-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snapv, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    # Hang protection kept: an incomplete DECLARED component is still rejected.
+    (snapv / "unet" / "diffusion_pytorch_model.fp16.safetensors").unlink()
+    (snapv / "unet" / "diffusion_pytorch_model.fp16-00001-of-00002.safetensors").symlink_to(blobv)
+    (snapv / "unet" / "diffusion_pytorch_model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model.fp16-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model.fp16-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snapv, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+
+def test_post_download_out_of_scope_malformed_index_not_rejected(tmp_path):
+    """A malformed shard index the REQUEST does not select is not read by the load, so it must not
+    false-reject a complete in-scope download into a DownloadStallError (Codex #829). A base ['model*'] warm
+    with a complete model.safetensors and a co-resident stale MALFORMED adapter index is accepted; an
+    IN-scope malformed index (an adapter warm) is still breakage."""
+    snap, blob = _mk_snapshot(tmp_path, "malformed_out_of_scope")
+    (snap / "config.json").write_text("{}")
+    (snap / "model.safetensors").symlink_to(blob)
+    (snap / "adapter_model.safetensors.index.json").write_text("{ not valid json")  # malformed, unselected
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["model*"], ignore_patterns = None) is True
+    # An IN-scope malformed index (adapter warm selects adapter_model*) is still rejected.
+    snap2, blob2 = _mk_snapshot(tmp_path, "malformed_in_scope")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / "adapter_config.json").write_text("{}")
+    (snap2 / "adapter_model-00001-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "adapter_model.safetensors.index.json").write_text("{ not valid json")
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
+        ignore_patterns = None) is False
+
+
 def test_selected_readable_weight_complete_entry_point(tmp_path):
     """The weight-bearing acceptance check funnels through one helper enforcing two invariants:
     (A) a readable weight is present (ignore + scope applied), (B) its in-scope shard set is complete.

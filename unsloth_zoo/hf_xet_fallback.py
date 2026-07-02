@@ -1133,12 +1133,19 @@ def _root_has_variant_weight(
 def _has_diffusers_component_variant_weight(
     snapshot_dir: Path, variant: str, *, ignore_patterns: Any = None
 ) -> bool:
-    """Variant analog of ``_has_diffusers_component_weight``: True if a diffusers pipeline COMPONENT
-    subfolder (unet/, vae/, text_encoder/, ...) holds a weight carrying the requested *variant* token
-    (``unet/diffusion_pytorch_model.fp16.safetensors``). A variant pipeline warm's weights are
-    component-scoped, not root ``model.<variant>.*`` files, so a root-only variant check would
-    false-reject a complete diffusers variant download into a ``DownloadStallError``. Excludes ROOT-level
-    and training-checkpoint weights (as the plain component check does) and reads only safetensors / bin."""
+    """Variant analog of ``_has_diffusers_component_weight``: True if a DECLARED diffusers pipeline
+    COMPONENT subfolder (unet/, vae/, text_encoder/, ... that ``model_index.json`` declares) holds a
+    weight carrying the requested *variant* token (``unet/diffusion_pytorch_model.fp16.safetensors``). A
+    variant pipeline warm's weights are component-scoped, not root ``model.<variant>.*`` files, so a
+    root-only variant check would false-reject a complete diffusers variant download into a
+    ``DownloadStallError``. Scoped to declared components (as the plain component helper is), so a stale
+    partial holding only an UNDECLARED leftover variant weight (a ``controlnet/`` dir not in
+    ``model_index.json``) does not read as proof the pipeline is warm while the declared unet / vae
+    variant weights are still missing -- which ``DiffusionPipeline.from_pretrained(..., variant=...)``
+    would then fetch over un-killable Xet. A malformed / empty ``model_index.json`` fails OPEN. Excludes
+    ROOT-level and training-checkpoint weights (as the plain component check does) and reads only
+    safetensors / bin."""
+    declared = _diffusers_declared_components(snapshot_dir)
     infix_dot = f".{variant}."
     infix_dash = f".{variant}-"
     rels: list = []
@@ -1158,6 +1165,8 @@ def _has_diffusers_component_variant_weight(
             parts = rel.split("/")
             if len(parts) < 2:
                 continue  # a ROOT-level variant weight is not a pipeline component
+            if declared is not None and parts[0] not in declared:
+                continue  # an UNDECLARED subtree the DiffusionPipeline load does not read
             if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
                 continue  # under a training-checkpoint subtree, not a component
             rels.append(rel)
@@ -1393,18 +1402,19 @@ def _readable_shard_set_incomplete(
     reads (a leftover root checkpoint under a subfolder/adapter/gguf request) does not false-reject a
     complete download:
 
-    - variant: the ROOT variant-shard check applies for an UNPATTERNED request, or a PATTERNED request
-      that selects a ROOT variant weight (a globbed ``['*.safetensors']``); a subfolder-scoped variant
-      request does not root-check.
-    - plain: the canonical-root-shard check applies for an UNPATTERNED request, or a GLOBBED request that
-      selects canonical root shards; an exact-named subset or an out-of-scope request does not.
+    - variant: the ROOT variant-shard check applies (for a NON-diffusers snapshot) for an UNPATTERNED
+      request, or a PATTERNED request that selects a ROOT variant weight (a globbed ``['*.safetensors']``);
+      a subfolder-scoped variant request does not root-check.
+    - plain: the canonical-root-shard check applies (for a NON-diffusers snapshot) for an UNPATTERNED
+      request, or a GLOBBED request that selects canonical root shards; an exact-named subset or an
+      out-of-scope request does not.
     - non-root: a PATTERNED request additionally checks any SELECTED shard index the root-model checks do
       not cover (a sharded adapter under ``['adapter_model*']``, a component subfolder) via
       ``_selected_shard_index_incomplete``; an exact-named subset defers to the exact-file presence check.
-    - diffusers: an UNPATTERNED plain / variant warm of a pipeline (root ``model_index.json``) reads
-      COMPONENT subfolders (unet/, vae/, ...), so a component shard index missing a shard -- which the
-      root-model checks do not cover -- is caught via ``_diffusers_component_shards_incomplete``. A
-      non-diffusers unpatterned request reads only the root model weight, so it does not sub-check.
+    - diffusers: a pipeline (root ``model_index.json``) reads COMPONENT subfolders (unet/, vae/, ...), NOT
+      root model shards, so the root-model checks above are SKIPPED for it (a stale root index must not
+      reject a complete pipeline); an UNPATTERNED warm's component shard sets are checked via
+      ``_diffusers_component_shards_incomplete``, and a PATTERNED one via ``_selected_shard_index_incomplete``.
 
     The ignore filter is threaded through so completeness is judged for the FORMAT the load reads (a
     complete safetensors set does not mask an incomplete ``.bin`` under ``ignore=['*.safetensors']``)."""
@@ -1413,9 +1423,13 @@ def _readable_shard_set_incomplete(
     except OSError:
         is_diffusers = False
     if variant:
-        if allow_patterns is None or _request_selects_root_variant_weight(
-            allow_patterns, ignore_patterns, variant
+        if not is_diffusers and (
+            allow_patterns is None
+            or _request_selects_root_variant_weight(allow_patterns, ignore_patterns, variant)
         ):
+            # A diffusers pipeline reads component-subfolder variant weights, not root model.<variant>
+            # shards, so a stale root variant index must not reject a complete pipeline (handled below by
+            # the component check); only a non-diffusers root variant load runs the root-shard check.
             if _has_incomplete_variant_root_shards(
                 snapshot_dir, variant, ignore_patterns = ignore_patterns
             ):
@@ -1434,9 +1448,11 @@ def _readable_shard_set_incomplete(
             return True
         return False
     if allow_patterns is None:
-        if _has_incomplete_canonical_root_shards(
+        if not is_diffusers and _has_incomplete_canonical_root_shards(
             snapshot_dir, ignore_patterns = ignore_patterns
         ):
+            # a non-diffusers root model load; a diffusers pipeline reads component subfolders, not root
+            # model shards, so a stale root index there is handled by the component check below.
             return True
         if is_diffusers and _diffusers_component_shards_incomplete(
             snapshot_dir, variant = None, ignore_patterns = ignore_patterns
@@ -1447,9 +1463,11 @@ def _readable_shard_set_incomplete(
         return False
     if _patterns_are_exact_names(allow_patterns):
         return False  # an exact-named subset defers to the exact-file presence check
-    if _request_selects_canonical_root_shards(allow_patterns, ignore_patterns) and (
-        _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns)
-    ):
+    if not is_diffusers and _request_selects_canonical_root_shards(
+        allow_patterns, ignore_patterns
+    ) and _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns):
+        # non-diffusers only: a diffusers pipeline never reads root model shards (its component sets are
+        # checked via _selected_shard_index_incomplete below), so a stale root index must not reject it.
         return True
     return _selected_shard_index_incomplete(
         snapshot_dir, allow_patterns = allow_patterns,

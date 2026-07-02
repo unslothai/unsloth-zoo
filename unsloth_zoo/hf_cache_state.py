@@ -626,7 +626,7 @@ def _has_incomplete_variant_root_shards(
     st_index_incomplete = None   # tri-state: None absent, else present & (in)complete
     bin_index_incomplete = None
     has_st_shard = has_bin_shard = False
-    has_single_st = False
+    has_single_st = has_single_bin = False
     for entry in entries:
         name = entry.name
         # Restrict to the ROOT model index (model.safetensors.index.<variant>.json /
@@ -651,18 +651,25 @@ def _has_incomplete_variant_root_shards(
                 else:
                     has_bin_shard = True
         elif dot_infix in name and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
-            # a single-file ROOT model variant weight; only a safetensors single-file matters for
-            # precedence (a single-file bin variant is complete and handled by the fall-through).
-            if name.endswith(".safetensors") and _safe_is_file(entry) and _format_kept(name):
-                has_single_st = True
-    # transformers reads safetensors before bin: judge the safetensors variant first, and fall to bin
-    # only when no safetensors variant is present in any form.
+            # a single-file ROOT model variant weight (model.<variant>.safetensors / .bin).
+            if _safe_is_file(entry) and _format_kept(name):
+                if name.endswith(".safetensors"):
+                    has_single_st = True
+                else:
+                    has_single_bin = True
+    # transformers' local precedence, mirrored: a single-file model.<variant>.safetensors is probed
+    # BEFORE the safetensors index, safetensors before .bin, and the single .bin before the .bin index.
+    # So a complete single-file variant is never masked by a co-resident stale index (that would force a
+    # spurious HTTP retry and DownloadStallError on a usable cache), and an incomplete PREFERRED
+    # (safetensors) index is still breakage a complete .bin must not mask.
+    if has_single_st:
+        return False  # a complete single-file safetensors variant, probed before the index
     if st_index_incomplete is not None:
         return st_index_incomplete
     if has_st_shard:
         return True   # variant safetensors shard files with no index -> incomplete
-    if has_single_st:
-        return False  # a complete single-file safetensors variant
+    if has_single_bin:
+        return False  # a complete single-file bin variant, probed before the .bin index
     if bin_index_incomplete is not None:
         return bin_index_incomplete
     if has_bin_shard:
@@ -780,7 +787,13 @@ def _selected_shard_index_incomplete(
             index_fmts.setdefault(dir_rel, set()).add(fmt)
             shard_rels = _index_shard_rel_paths(entry, dir_rel)
             if shard_rels is None:
-                return True  # a malformed / non-string index -> defer to the watched child
+                # A malformed / non-string index. Defer to the watched child only when the REQUEST
+                # selects this index (the load would read it to enumerate its shards); a co-resident
+                # stale malformed index the request does NOT select (a leftover adapter index under a
+                # base ['model*'] / subfolder warm) is not read, so it must not force a spurious retry.
+                if _filter_paths([rel], allow_patterns, ignore_patterns):
+                    return True
+                continue
             if not _filter_paths(shard_rels, allow_patterns, ignore_patterns):
                 continue  # the load does not read this set (out of scope / ignored format)
             per_dir.setdefault(dir_rel, {}).setdefault(fmt, []).append(shard_rels)
