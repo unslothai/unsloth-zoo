@@ -46,3 +46,35 @@ def test_cuda_baddbmm_matches_loop(use_transpose, dtype):
     ref = _loop_reference(merged, A, B, E, rank, alpha, use_transpose)
     got = _apply_fused_expert_lora_delta(merged.clone(), A, B, E, rank, dim_A, dim_B, alpha, use_transpose)
     assert torch.equal(got, ref), (got - ref).abs().max().item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the batched path")
+@pytest.mark.parametrize("use_transpose", [False, True])
+def test_bmm_oom_falls_back_to_loop(monkeypatch, use_transpose):
+    """If the batched (num_experts, dim_B, dim_A) delta OOMs, the helper must complete the merge
+    via the per-expert loop instead of letting the error escape (which would leave the weight
+    unmerged). The loop uses matmul, not bmm, so it is unaffected by the forced OOM."""
+    E, rank, dim_A, dim_B, alpha = 16, 8, 32, 48, 1.3
+    merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, torch.float32, "cuda")
+    ref = _loop_reference(merged, A, B, E, rank, alpha, use_transpose)
+
+    def oom(*a, **k):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 8.00 GiB")
+
+    monkeypatch.setattr(torch, "bmm", oom)
+    got = _apply_fused_expert_lora_delta(merged.clone(), A, B, E, rank, dim_A, dim_B, alpha, use_transpose)
+    assert torch.equal(got, ref), "OOM fallback loop must match the batched result"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the batched path")
+def test_non_oom_runtimeerror_propagates(monkeypatch):
+    """A non-OOM error from the batched path is a real bug and must not be swallowed."""
+    E, rank, dim_A, dim_B, alpha = 4, 4, 8, 8, 1.0
+    merged, A, B = _make(E, rank, dim_A, dim_B, False, torch.float32, "cuda")
+
+    def boom(*a, **k):
+        raise RuntimeError("some real shape error")
+
+    monkeypatch.setattr(torch, "bmm", boom)
+    with pytest.raises(RuntimeError, match="real shape error"):
+        _apply_fused_expert_lora_delta(merged, A, B, E, rank, dim_A, dim_B, alpha, False)

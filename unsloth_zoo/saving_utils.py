@@ -1654,19 +1654,37 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
     win. The batched path computes the same per-expert delta = B_e @ A_e and the same
     `merged[e] += alpha * delta` as the loop (a plain bmm + add_, NOT a fused baddbmm, so the
     rounding matches the loop exactly), so the result is bitwise-identical to the loop in
-    fp32/bf16/fp16. The merge callers run this in fp32."""
-    if merged.device.type != "cpu":
+    fp32/bf16/fp16. The merge callers run this in fp32.
+
+    The batched bmm allocates a full (num_experts, dim_B, dim_A) fp32 delta on top of the fp32
+    merged weight (e.g. ~8 GiB for a 128-expert 5760x2880 merge). If that OOMs we fall back to
+    the per-expert loop, which holds one expert-sized delta at a time, so the merge still
+    completes instead of the caller catching the error and writing back an unmerged weight."""
+    def _loop():
+        for expert_idx in range(num_experts):
+            start, end = expert_idx * rank, (expert_idx + 1) * rank
+            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
+            merged[expert_idx].add_(delta.T if use_transpose else delta, alpha=alpha)
+        return merged
+
+    if merged.device.type == "cpu":
+        return _loop()
+
+    try:
         # (E, dim_B, rank) @ (E, rank, dim_A) -> (E, dim_B, dim_A) = per-expert delta.
         B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
         A_exp = lora_A_dev.reshape(num_experts, rank, dim_A).contiguous()
         delta = torch.bmm(B_exp, A_exp)
         merged.add_(delta.transpose(1, 2) if use_transpose else delta, alpha=alpha)
-    else:
-        for expert_idx in range(num_experts):
-            start, end = expert_idx * rank, (expert_idx + 1) * rank
-            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
-            merged[expert_idx].add_(delta.T if use_transpose else delta, alpha=alpha)
-    return merged
+        return merged
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise   # a real error, not a memory shortfall
+    # OOM: drop the partial allocations and retry with the memory-light per-expert loop.
+    B_exp = A_exp = delta = None
+    if merged.device.type == "cuda":
+        torch.cuda.empty_cache()
+    return _loop()
 pass
 
 
