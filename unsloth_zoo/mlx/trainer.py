@@ -607,6 +607,10 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    load_best_model_at_end: bool = False
+    metric_for_best_model: str = "eval_loss"
+    greater_is_better: bool = False
+    early_stopping_patience: int = 0  # 0 = disabled
     neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
 
     # SFT-specific (from SFTConfig, for API compat)
@@ -703,6 +707,9 @@ class MLXTrainer:
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
         self.stop_requested = False  # Set True to stop training early
+        self._best_metric = None
+        self._best_step = None
+        self._es_patience_counter = 0
 
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
@@ -2160,6 +2167,44 @@ class MLXTrainer:
                     except Exception as e:
                         print(f"Unsloth: eval callback error: {e}")
 
+                # Best-model tracking + early stopping (Item-5).
+                _track = getattr(args, "load_best_model_at_end", False) or \
+                    int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                if _track:
+                    _metric_name = getattr(args, "metric_for_best_model", "eval_loss")
+                    _em = self._last_eval_metrics or {}
+                    if _metric_name not in _em:
+                        raise ValueError(
+                            f"metric_for_best_model={_metric_name!r} not in eval "
+                            f"metrics; available: {sorted(_em)}"
+                        )
+                    _cur = _em[_metric_name]
+                    _greater = bool(getattr(args, "greater_is_better", False))
+                    _improved = (
+                        _cur == _cur  # reject NaN: a diverged eval must never become "best"
+                        and (
+                            self._best_metric is None
+                            or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                        )
+                    )
+                    if _improved:
+                        self._best_metric = _cur
+                        self._best_step = current_step
+                        self._es_patience_counter = 0
+                        try:
+                            save_trainable_adapters(model, f"{args.output_dir}/best")
+                        except ValueError as e:
+                            print(f"  Unsloth: skipped best-model save ({e})")
+                    else:
+                        self._es_patience_counter += 1
+                        _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
+                        if _pat > 0 and self._es_patience_counter >= _pat:
+                            print(
+                                f"Unsloth: early stopping at step {current_step} "
+                                f"(no {_metric_name} improvement in {_pat} evals)."
+                            )
+                            self.stop_requested = True
+
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
@@ -2200,6 +2245,17 @@ class MLXTrainer:
               f"Total time: {total_time:.1f}s | "
               f"Steps: {total_steps} | "
               f"Tokens: {trained_tokens}")
+
+        # load_best_model_at_end: restore best adapters before the final save.
+        if getattr(args, "load_best_model_at_end", False) and self._best_step is not None:
+            _best_path = f"{args.output_dir}/best/adapters.safetensors"
+            if os.path.exists(_best_path):
+                try:
+                    model.load_weights(_best_path, strict=False)
+                    print(f"Unsloth: Restored best model from step {self._best_step} "
+                          f"({args.metric_for_best_model}={self._best_metric:.4f}).")
+                except Exception as e:
+                    print(f"Unsloth: failed to restore best model ({e}).")
 
         # Honor the documented save_steps=0 contract: save at end of training.
         try:
