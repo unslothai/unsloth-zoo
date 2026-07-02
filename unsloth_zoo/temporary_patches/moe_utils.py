@@ -290,9 +290,11 @@ def _transposed_view_grouped_mm_is_safe():
         if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
             device = torch.cuda.current_device()
             E, N, K, M = 4, 64, 32, 32
-            torch.manual_seed(0)
-            A = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-            w = torch.randn(E, N, K, dtype=torch.bfloat16, device=device)
+            # Draw from a LOCAL generator so the probe never touches the process-wide RNG state
+            # (torch.manual_seed here would perturb training dropout / sampling / data order).
+            gen = torch.Generator(device=device).manual_seed(0)
+            A = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=gen)
+            w = torch.randn(E, N, K, dtype=torch.bfloat16, device=device, generator=gen)
             w_t = w.transpose(-2, -1)          # non-contiguous view (the fast path's layout)
             w_tc = w_t.contiguous()            # known-correct reference
             per = M // E

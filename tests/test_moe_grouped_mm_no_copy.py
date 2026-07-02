@@ -58,7 +58,7 @@ def test_no_forced_copy_on_happy_path(monkeypatch):
 def test_probe_gates_the_forced_copy(monkeypatch):
     """The #186365 gate: when the probe reports the transposed-view path unsafe, the weight is
     made contiguous before torch._grouped_mm; when safe, the view is passed as-is."""
-    import unsloth_zoo.temporary_patches.moe_utils as mu
+    from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
 
     inputs = torch.randn(5, 4)
     weight_view = torch.randn(3, 2, 4).transpose(1, 2)
@@ -71,10 +71,32 @@ def test_probe_gates_the_forced_copy(monkeypatch):
             seen.append(w.is_contiguous())
             return torch.zeros(inp.shape[0], w.shape[-1], dtype=inp.dtype)
 
-        monkeypatch.setattr(mu, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", probe_safe, raising=False)
+        monkeypatch.setattr(
+            "unsloth_zoo.temporary_patches.moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE",
+            probe_safe, raising=False)
         monkeypatch.setattr(torch, "_grouped_mm", spy, raising=False)
-        mu._grouped_mm_with_backward_fix(inputs, weight_view, offsets)
+        _grouped_mm_with_backward_fix(inputs, weight_view, offsets)
         assert seen == [not probe_safe], f"probe_safe={probe_safe}: got {seen}"
+
+
+def test_probe_does_not_perturb_global_rng(monkeypatch):
+    """The probe must draw from a local generator, not torch.manual_seed, so it leaves the
+    process-wide RNG untouched (otherwise it would shift training dropout / sampling / data
+    order). Clear the cache so the probe actually runs, then compare RNG state."""
+    from unsloth_zoo.temporary_patches.moe_utils import _transposed_view_grouped_mm_is_safe
+
+    monkeypatch.setattr(
+        "unsloth_zoo.temporary_patches.moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE",
+        None, raising=False)
+    torch.manual_seed(1234)
+    cpu_before = torch.get_rng_state()
+    cuda_before = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
+    _transposed_view_grouped_mm_is_safe()
+
+    assert torch.equal(torch.get_rng_state(), cpu_before), "probe changed the CPU RNG state"
+    if cuda_before is not None:
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_before), "probe changed the CUDA RNG state"
 
 
 @pytest.mark.skipif(not _grouped_mm_ok(), reason="torch._grouped_mm unsupported on this device")
