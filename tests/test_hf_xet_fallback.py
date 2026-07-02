@@ -1171,6 +1171,25 @@ def test_scrub_redacts_presigned_url():
     assert "download=true" in plain
 
 
+def test_scrub_redaction_preserves_surrounding_delimiters():
+    """A signed URL embedded in structured text (JSON / dict repr) has no surrounding whitespace, so the
+    query redaction must stop at the closing delimiter and not swallow it -- else the ``"}`` is replaced
+    by ``***`` and the log line's structure is corrupted (Gemini #829). The signed query is still fully
+    redacted."""
+    embedded = (
+        '{"error": "403", "url": '
+        '"https://cas-bridge.xethub.hf.co/x/y?X-Amz-Signature=deadbeef&X-Amz-Expires=3600"}'
+    )
+    out = xf._default_scrub_secrets(embedded)
+    assert "deadbeef" not in out                       # the signed query is redacted
+    assert "cas-bridge.xethub.hf.co/x/y?***" in out
+    assert out.endswith('"}')                           # the closing delimiters are preserved
+    # A signed URL wrapped in single quotes / parens keeps those delimiters too.
+    wrapped = "(https://s3.amazonaws.com/b/k?X-Amz-Signature=abc123) tail"
+    out2 = xf._default_scrub_secrets(wrapped)
+    assert "abc123" not in out2 and "?***)" in out2 and out2.endswith(") tail")
+
+
 def test_local_files_only_file_resolves_in_process(monkeypatch):
     """local_files_only resolves the single file from cache in-process and never
     spawns a network child (Hugging Face offline semantics)."""
@@ -3147,6 +3166,39 @@ def test_gate_rejects_malformed_shard_index(tmp_path):
     snap3, blob3 = _mk_snapshot(tmp_path, "listidx")
     (snap3 / "model.safetensors.index.json").write_text(json.dumps({"weight_map": ["a", "b"]}))
     assert hcs._weight_shard_index_complete(snap3 / "model.safetensors.index.json") is False
+
+
+def test_shard_index_rejects_unsafe_path_refs(tmp_path):
+    """A weight-shard index is attacker-influenced (weight_map from a downloaded repo). An absolute,
+    Windows drive-letter, UNC, or parent-escaping shard value must be rejected so ``base / shard`` cannot
+    resolve to an existing file OUTSIDE the snapshot and read as "present" -- on Windows ``base / 'C:\\x'``
+    escapes, which a startswith(('/', '\\\\')) check misses (Gemini #829). Both the completeness check and
+    the shard-path enumerator reject these, judged under POSIX and Windows semantics on any OS."""
+    # Unit: the shared helper flags every escape variant and keeps legit relative names.
+    for bad in ["/etc/passwd", r"C:\evil.safetensors", "C:evil.safetensors", r"\\srv\share\x",
+                "../../x.safetensors", r"..\x.safetensors", "a/../../b"]:
+        assert hcs._is_unsafe_shard_ref(bad) is True, bad
+    for ok in ["model-00001-of-00002.safetensors", "unet/diffusion_pytorch_model.safetensors",
+               "model.fp16.safetensors"]:
+        assert hcs._is_unsafe_shard_ref(ok) is False, ok
+    # A crafted index listing a drive-letter shard is not "complete" (never probes outside the snapshot).
+    snap, blob = _mk_snapshot(tmp_path, "unsafe_shard_idx")
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": r"C:\Windows\System32\x.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    assert hcs._weight_shard_index_complete(snap / "model.safetensors.index.json") is False
+    # The enumerator returns None (defer to the child) rather than a path that escapes the snapshot.
+    assert hcs._index_shard_rel_paths(snap / "model.safetensors.index.json", "") is None
+    # A well-formed relative index still enumerates + validates normally.
+    snap2, blob2 = _mk_snapshot(tmp_path, "safe_shard_idx")
+    (snap2 / "model-00001-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "model-00002-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    assert hcs._weight_shard_index_complete(snap2 / "model.safetensors.index.json") is True
+    assert set(hcs._index_shard_rel_paths(snap2 / "model.safetensors.index.json", "")) == {
+        "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"}
 
 
 def test_gate_ignored_canonical_weight_does_not_prove_complete(tmp_path):

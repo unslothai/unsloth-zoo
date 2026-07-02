@@ -29,7 +29,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterator, Optional
 
 
@@ -243,6 +243,25 @@ def _is_canonical_weight_shard_index(name: str) -> bool:
     return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
+def _is_unsafe_shard_ref(shard: str) -> bool:
+    """True if a weight-index ``weight_map`` value is NOT a safe relative path inside the snapshot: an
+    absolute path, a Windows drive-letter reference (``C:\\x`` / ``C:x``), a UNC path, or a
+    parent-escaping (``..``) reference. Judged under BOTH POSIX and Windows path semantics so a crafted /
+    malformed index is rejected regardless of the OS running the check -- on Windows ``base / "C:\\x"``
+    resolves OUTSIDE the snapshot and would read as a present shard, and ``startswith(("/", "\\"))`` alone
+    misses a drive-letter value. A well-formed HF index lists a plain relative basename (or subfolder
+    path), so a legitimate index is never rejected."""
+    if not shard or shard.startswith(("/", "\\")):
+        return True
+    win = PureWindowsPath(shard)
+    if win.is_absolute() or win.drive or ".." in win.parts:
+        return True
+    posix = PurePosixPath(shard)
+    if posix.is_absolute() or ".." in posix.parts:
+        return True
+    return False
+
+
 def _weight_shard_index_complete(index_path: Path) -> bool:
     """True only if every shard a HF weight index lists is present next to it.
 
@@ -268,10 +287,10 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     shards = set(values)
     base = index_path.parent
     for shard in shards:
-        # A well-formed HF index lists a relative shard basename. Reject an absolute / parent-escaping
-        # value (a malformed or crafted index) rather than let ``base / shard`` resolve to an unrelated
-        # existing file OUTSIDE the snapshot and read as "present".
-        if shard.startswith(("/", "\\")) or ".." in shard.replace("\\", "/").split("/"):
+        # A well-formed HF index lists a relative shard basename. Reject an absolute / drive-letter /
+        # parent-escaping value (a malformed or crafted index) rather than let ``base / shard`` resolve
+        # to an unrelated existing file OUTSIDE the snapshot and read as "present".
+        if _is_unsafe_shard_ref(shard):
             return False
         try:
             if not (base / shard).exists():
@@ -707,8 +726,9 @@ def _index_variant_token(name: str) -> "Optional[str]":
 def _index_shard_rel_paths(index_path: Path, dir_rel: str) -> "Optional[list]":
     """The snapshot-relative posix paths of the shards a weight index lists, or None if the index is
     unreadable / malformed -- mirrors the fail-CLOSED rules of ``_weight_shard_index_complete`` (a
-    non-dict payload or ``weight_map``, an empty shard set, or a non-string / absolute / parent-escaping
-    shard value all return None). *dir_rel* is the index's snapshot-relative directory ("" at root), so a
+    non-dict payload or ``weight_map``, an empty shard set, or a non-string / absolute / drive-letter /
+    parent-escaping shard value all return None). *dir_rel* is the index's snapshot-relative dir ("" at
+    root), so a
     listed basename is joined back to a full repo-relative path for the request filter."""
     import json
 
@@ -726,7 +746,7 @@ def _index_shard_rel_paths(index_path: Path, dir_rel: str) -> "Optional[list]":
     prefix = f"{dir_rel}/" if dir_rel else ""
     out: list = []
     for shard in set(values):
-        if shard.startswith(("/", "\\")) or ".." in shard.replace("\\", "/").split("/"):
+        if _is_unsafe_shard_ref(shard):
             return None
         out.append(f"{prefix}{shard}")
     return out

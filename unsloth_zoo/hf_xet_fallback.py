@@ -165,7 +165,14 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
             return f"{base}?***"
         return match.group(0)
 
-    out = re.sub(r"(https?://[^\s?]+)\?([^\s]*)", _redact_signed_query, out)
+    # Match the query up to whitespace OR a structural delimiter (quote, bracket, brace, paren, angle,
+    # pipe): a signed URL embedded in JSON / a dict repr / other structured text has no surrounding
+    # whitespace, so a greedy [^\s]* would swallow the trailing "} / ") and replace it with ***,
+    # corrupting the log line. Real signed-query values percent-encode these chars, so the redaction of
+    # a genuine presigned URL is unaffected.
+    out = re.sub(
+        r"(https?://[^\s?]+)\?([^\s\"'()<>{}|[\]]*)", _redact_signed_query, out
+    )
     return out
 
 
