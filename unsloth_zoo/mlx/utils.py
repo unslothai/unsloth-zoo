@@ -3928,6 +3928,8 @@ def save_trainer_state(trainer_state, path):
     ``trainer_state`` is a plain dict (JSON-serializable). Currently:
       - ``global_step``: int, the step the checkpoint represents
       - ``train_loss_history``: list[float], for UI continuity
+      - ``best_metric``/``best_step``: best-model tracking (may be null)
+      - ``es_patience_counter``: int, early-stopping no-improve count
     Kept separate from the safetensors blob because these are scalars/lists,
     not tensors, and JSON is easier to inspect.
     """

@@ -1559,10 +1559,15 @@ class MLXTrainer:
                 )
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
-                # 3. Restore trainer scalars (step counter, loss history).
+                # 3. Restore trainer scalars (step counter, loss history, and
+                #    best-model / early-stopping tracking). .get defaults keep
+                #    pre-fix checkpoints (which lack these keys) resumable.
                 ts = load_trainer_state(_resume_from)
                 _resume_step = int(ts.get("global_step", 0))
                 self._train_loss_history = list(ts.get("train_loss_history", []))
+                self._best_metric = ts.get("best_metric", None)
+                self._best_step = ts.get("best_step", None)
+                self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
                 print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
@@ -2214,7 +2219,8 @@ class MLXTrainer:
                     print(f"  Unsloth: skipped checkpoint ({e})")
                 else:
                     # Also write optimizer + trainer state so resume_from_checkpoint
-                    # can restore Adam moments, step counter, and loss history.
+                    # can restore Adam moments, step counter, loss history, and
+                    # best-model / early-stopping tracking.
                     # Adapter save was successful -- treat the extra writes as
                     # best-effort: log on failure but don't undo the adapter save.
                     checkpoint_complete = False
@@ -2224,6 +2230,9 @@ class MLXTrainer:
                             {
                                 "global_step": current_step,
                                 "train_loss_history": list(self._train_loss_history),
+                                "best_metric": self._best_metric,
+                                "best_step": self._best_step,
+                                "es_patience_counter": self._es_patience_counter,
                             },
                             ckpt_dir,
                         )
