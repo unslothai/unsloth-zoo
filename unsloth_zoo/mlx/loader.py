@@ -2751,6 +2751,10 @@ def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, pre
 # twice, so it must be imported once per process and reused — re-importing
 # after purging it from sys.modules raises "Tried to register an operator".
 _REAL_BITSANDBYTES_MODULES = {}
+# Serialize the stub swap in _dequantize_bnb_to_tempdir: concurrent callers
+# would race the lifted-stub window and each other's sys.modules restore (and
+# two multi-GB dequants at once risks OOM on Apple Silicon).
+_BNB_IMPORT_LOCK = threading.Lock()
 
 
 def _bnb_module_names():
@@ -2771,84 +2775,91 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
     is unavailable so the caller can fall back to the clear bnb-unsupported error.
     """
     global _REAL_BITSANDBYTES_MODULES
-    saved_meta = list(sys.meta_path)
-    stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
-    sys.meta_path[:] = [
-        finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
-    ]
-    for name in _bnb_module_names():
-        del sys.modules[name]
-    # Reuse the already-initialized real bnb if we imported it earlier; only a
-    # cold process re-imports (and re-registers torch ops) for the first time.
-    sys.modules.update(_REAL_BITSANDBYTES_MODULES)
-    try:
-        import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-
-        # Only text bnb repos reach here; VLM bnb repos are rejected by the
-        # caller (mlx-vlm dequant is not wired up yet). AutoModelForCausalLM
-        # dequantizes the NF4 weights to fp16.
-        model = AutoModelForCausalLM.from_pretrained(
-            source,
-            dtype=torch.float16,
-            device_map={"": device},
-            token=token,
-            trust_remote_code=trust_remote_code,
-        ).dequantize()
-        # After dequantize, the model config still carries bnb's
-        # quantization_config plus _pre_quantization_dtype (a torch.dtype).
-        # For VLMs these also live in sub-configs (vision_config, text_config,
-        # etc.). The dtype is not JSON-serializable and breaks save_pretrained.
-        # The dequantized weights no longer need any of this metadata.
-        def _strip_quant_meta(cfg):
-            if cfg is None:
-                return
-            for _attr in ("quantization_config", "_pre_quantization_dtype"):
-                if hasattr(cfg, _attr):
-                    try:
-                        delattr(cfg, _attr)
-                    except Exception:
-                        pass
-            # Walk known sub-config attrs that VLMs use to nest configs.
-            for _sub in (
-                "vision_config", "text_config", "audio_config",
-                "speech_config", "image_config", "encoder_config",
-                "decoder_config",
-            ):
-                _strip_quant_meta(getattr(cfg, _sub, None))
-        _strip_quant_meta(model.config)
-        tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
-        # transformers 5.x: the dequantized model still carries weight-name
-        # conversions with no reverse op, so save_pretrained's
-        # revert_weight_conversion raises NotImplementedError. The dequantized
-        # weights need no conversion; clear it. No-op on 4.x (attr absent).
-        try:
-            model._weight_conversions = []
-        except Exception:
-            pass
-        model.save_pretrained(tmpdir, safe_serialization=True)
-        # Save the tokenizer so the downstream mlx-lm load can read it.
-        AutoTokenizer.from_pretrained(
-            source, token=token, trust_remote_code=trust_remote_code,
-        ).save_pretrained(tmpdir)
-        # Release the fp16 model and bnb's MPS allocator cache so the caller's
-        # MLX re-quantization (and any later loads) aren't starved of memory.
-        del model
-        gc.collect()
-        if device == "mps":
-            torch.mps.empty_cache()
-        return tmpdir
-    finally:
-        _REAL_BITSANDBYTES_MODULES = {
-            name: sys.modules[name] for name in _bnb_module_names()
-        }
+    with _BNB_IMPORT_LOCK:
+        saved_meta = list(sys.meta_path)
+        stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
+        sys.meta_path[:] = [
+            finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
+        ]
         for name in _bnb_module_names():
             del sys.modules[name]
-        sys.modules.update(stub_modules)
-        sys.meta_path[:] = saved_meta
+        # Reuse the already-initialized real bnb if we imported it earlier; only a
+        # cold process re-imports (and re-registers torch ops) for the first time.
+        sys.modules.update(_REAL_BITSANDBYTES_MODULES)
+        try:
+            import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+            # Only text bnb repos reach here; VLM bnb repos are rejected by the
+            # caller (mlx-vlm dequant is not wired up yet). AutoModelForCausalLM
+            # dequantizes the NF4 weights to fp16. Pass torch_dtype, not dtype:
+            # the supported transformers 4.x range only accepts torch_dtype (a
+            # `dtype` kwarg raises TypeError there), and 5.x still accepts it.
+            model = AutoModelForCausalLM.from_pretrained(
+                source,
+                torch_dtype=torch.float16,
+                device_map={"": device},
+                token=token,
+                trust_remote_code=trust_remote_code,
+            ).dequantize()
+            # After dequantize, the model config still carries bnb's
+            # quantization_config plus _pre_quantization_dtype (a torch.dtype).
+            # The dtype is not JSON-serializable and breaks save_pretrained; the
+            # dequantized weights no longer need any of this metadata.
+            def _strip_quant_meta(cfg):
+                if cfg is None:
+                    return
+                for _attr in ("quantization_config", "_pre_quantization_dtype"):
+                    if hasattr(cfg, _attr):
+                        try:
+                            delattr(cfg, _attr)
+                        except Exception:
+                            pass
+                # Walk known sub-config attrs that models use to nest configs.
+                for _sub in (
+                    "vision_config", "text_config", "audio_config",
+                    "speech_config", "image_config", "encoder_config",
+                    "decoder_config",
+                ):
+                    _strip_quant_meta(getattr(cfg, _sub, None))
+            _strip_quant_meta(model.config)
+            tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
+            try:
+                # transformers 5.x: the dequantized model still carries
+                # weight-name conversions with no reverse op, so save_pretrained's
+                # revert_weight_conversion raises NotImplementedError. The
+                # dequantized weights need no conversion; clear it. No-op on 4.x.
+                try:
+                    model._weight_conversions = []
+                except Exception:
+                    pass
+                model.save_pretrained(tmpdir, safe_serialization=True)
+                # Save the tokenizer so the downstream mlx-lm load can read it.
+                AutoTokenizer.from_pretrained(
+                    source, token=token, trust_remote_code=trust_remote_code,
+                ).save_pretrained(tmpdir)
+            except Exception:
+                # Don't leak the multi-GB fp16 scratch copy on a mid-save error.
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
+            # Release the fp16 model and bnb's MPS allocator cache so the caller's
+            # MLX re-quantization (and any later loads) aren't starved of memory.
+            del model
+            gc.collect()
+            if device == "mps":
+                torch.mps.empty_cache()
+            return tmpdir
+        finally:
+            _REAL_BITSANDBYTES_MODULES = {
+                name: sys.modules[name] for name in _bnb_module_names()
+            }
+            for name in _bnb_module_names():
+                del sys.modules[name]
+            sys.modules.update(stub_modules)
+            sys.meta_path[:] = saved_meta
 
 
 def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
@@ -3754,8 +3765,15 @@ class FastMLXModel:
         # re-quantizes it (the user gets an MLX 4-bit model, never seeing bnb).
         # If bitsandbytes is unavailable, fall back to a clear, actionable error.
         _existing_quant = _get_existing_mlx_quantization(config_data)
+        # A LoRA adapter dir can carry a copied base config.json (bitsandbytes
+        # when the base was a bnb repo). It must take the adapter branch below,
+        # not be dequantized as a full model, so skip the bnb path for it.
+        _is_adapter_dir = bool(local_path) and os.path.exists(
+            os.path.join(local_path, "adapter_config.json")
+        )
         if (
-            isinstance(_existing_quant, dict)
+            not _is_adapter_dir
+            and isinstance(_existing_quant, dict)
             and _existing_quant.get("quant_method") == "bitsandbytes"
         ):
             _suggested = re.sub(
