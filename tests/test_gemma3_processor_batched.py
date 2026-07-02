@@ -111,6 +111,30 @@ def test_max_length_uses_model_max_when_unset():
     assert {len(x) for x in out["input_ids"]} == {6}
 
 
+def test_non_aligned_fields_untouched():
+    # overflowing_tokens is a per-example list whose rows do NOT match input_ids lengths; it must be
+    # left exactly as-is (not BOS-stripped or padded).
+    text_inputs = {
+        "input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]],
+        "attention_mask": [[1, 1, 1], [1, 1, 1, 1]],
+        "overflowing_tokens": [[77], []],
+    }
+    out = _fix_double_bos_and_pad(text_inputs, BOS, PAD, IMG, True, True, "left", "pt")
+    assert out["overflowing_tokens"] == [[77], []]
+    assert {len(x) for x in out["input_ids"]} == {3}
+
+
+def test_length_recomputed_after_padding():
+    # return_length: the length field must reflect post-strip/pad token counts, not the raw tokenizer ones.
+    text_inputs = {
+        "input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]],
+        "attention_mask": [[1, 1, 1], [1, 1, 1, 1]],
+        "length": [3, 4],
+    }
+    out = _fix_double_bos_and_pad(text_inputs, BOS, PAD, IMG, True, True, "left", "pt")
+    assert out["length"] == [3, 3]
+
+
 if __name__ == "__main__":
     test_batched_ragged_rows_become_stackable()
     test_single_row_strips_bos_without_padding()
@@ -124,4 +148,6 @@ if __name__ == "__main__":
     test_offset_mapping_tuples_stripped_and_padded()
     test_pad_to_multiple_of()
     test_max_length_uses_model_max_when_unset()
+    test_non_aligned_fields_untouched()
+    test_length_recomputed_after_padding()
     print("OK: all gemma3 batched-processor padding tests passed")

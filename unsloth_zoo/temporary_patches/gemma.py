@@ -108,13 +108,15 @@ def _fix_double_bos_and_pad(
     # offset_mapping, ...), rebuild mm token type ids, then pad each field so ragged rows stack.
     # Honours "do_not_pad"/max_length/model max/pad_to_multiple_of and the return_tensors=None list contract.
     n_rows = len(text_inputs["input_ids"])
+    input_lens = [len(x) for x in text_inputs["input_ids"]]
     double_bos = [bos_token_id, bos_token_id]
     strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
-    # any value that is one list per row stays aligned with input_ids, so strip its extra BOS too
+    # only fields whose rows match the matching input_ids row length are token aligned; this keeps
+    # non-aligned tokenizer outputs (overflowing_tokens, ...) out of the per-row strip/pad
     per_token_keys = [
         k for k, v in text_inputs.items()
         if isinstance(v, (list, tuple)) and len(v) == n_rows
-        and all(isinstance(r, (list, tuple)) for r in v)
+        and all(isinstance(r, (list, tuple)) and len(r) == input_lens[i] for i, r in enumerate(v))
     ]
     for k in per_token_keys:
         text_inputs[k] = [r[1:] if strip[i] else r for i, r in enumerate(text_inputs[k])]
@@ -142,6 +144,8 @@ def _fix_double_bos_and_pad(
         for key in per_token_keys:
             fill = fill_for(key)
             text_inputs[key] = [pad_seq(x, fill) for x in text_inputs[key]]
+    if "length" in text_inputs:   # return_length: report the post-strip/pad token counts
+        text_inputs["length"] = [len(x) for x in text_inputs["input_ids"]]
     return text_inputs
 pass
 
@@ -251,6 +255,11 @@ def patch_Gemma3Processor():
         padding = output_kwargs["text_kwargs"].pop("padding", False)
         padding_side = output_kwargs["text_kwargs"].pop("padding_side", None) or \
             getattr(self.tokenizer, "padding_side", "left")
+        # We pad manually to max_length, so only leave max_length in for the tokenizer when truncation is
+        # requested; otherwise drop it to avoid HF's "max_length set without truncation" warning/ambiguity.
+        max_length = output_kwargs["text_kwargs"].get("max_length", None)
+        if not output_kwargs["text_kwargs"].get("truncation", None):
+            output_kwargs["text_kwargs"].pop("max_length", None)
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
         # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
         _mml = getattr(self.tokenizer, "model_max_length", None)
@@ -258,7 +267,7 @@ def patch_Gemma3Processor():
         text_inputs = _fix_double_bos_and_pad(
             text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
             self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
-            max_length = output_kwargs["text_kwargs"].get("max_length", None),
+            max_length = max_length,
             pad_to_multiple_of = output_kwargs["text_kwargs"].get("pad_to_multiple_of", None),
             model_max_length = _mml,
         )
