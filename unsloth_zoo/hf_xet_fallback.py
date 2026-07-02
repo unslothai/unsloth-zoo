@@ -608,6 +608,15 @@ def _is_retryable_download_error(exc: BaseException) -> bool:
     fail identically. Unknown errors are treated as deterministic, so a real repeatable failure
     is surfaced rather than looped between transports."""
     name = type(exc).__name__
+    # huggingface_hub raises LocalEntryNotFoundError BOTH for a genuine offline / uncached miss
+    # (deterministic) AND as its wrapper around a TRANSIENT HEAD connection error / timeout for an
+    # uncached file ("... Please check your connection and try again"). Retry the transient sub-case
+    # over the other transport; a true offline miss (no transient hint) falls through to the
+    # deterministic set below and keeps its reconstructed type.
+    if name == "LocalEntryNotFoundError" and any(
+        hint in f"{name}: {exc}".lower() for hint in _TRANSIENT_ERROR_HINTS
+    ):
+        return True
     if name in _DETERMINISTIC_ERROR_NAMES:
         return False
     # Disk full / quota: a different transport cannot help.

@@ -912,6 +912,35 @@ def test_is_retryable_download_error_classification():
     assert f(ValueError("unexpected response payload")) is False
 
 
+def test_local_entry_not_found_transient_is_retryable():
+    """huggingface_hub wraps a TRANSIENT HEAD connection error / timeout for an uncached file as
+    LocalEntryNotFoundError ('... check your connection and try again'). That sub-case must be retryable
+    (the other transport may recover), while a genuine offline miss ('outgoing traffic has been
+    disabled') stays deterministic and keeps its reconstructed type across the spawn boundary
+    (Codex #829)."""
+    f = xf._is_retryable_download_error
+
+    class LocalEntryNotFoundError(Exception):
+        pass
+
+    # Transient connection wrapper -> retryable.
+    transient = LocalEntryNotFoundError(
+        "An error happened while trying to locate the file on the Hub and we cannot find the "
+        "requested files in the local cache. Please check your connection and try again."
+    )
+    assert f(transient) is True
+    timed_out = LocalEntryNotFoundError("Read timed out while fetching metadata")
+    assert f(timed_out) is True
+    # Genuine offline miss (no transient hint) -> deterministic, and still type-preserved.
+    offline = LocalEntryNotFoundError(
+        "Cannot find the requested files in the disk cache and outgoing traffic has been disabled."
+    )
+    assert f(offline) is False
+    assert "LocalEntryNotFoundError" in xf._DETERMINISTIC_ERROR_NAMES
+    cls = xf._resolve_exception_class("LocalEntryNotFoundError")
+    assert cls is not None and issubclass(cls, BaseException)
+
+
 def test_immediate_success_uses_xet_only(monkeypatch):
     prepared = []
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: prepared.append(a))
