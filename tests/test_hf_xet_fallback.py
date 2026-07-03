@@ -2765,6 +2765,15 @@ def test_post_download_checks_explicit_checkpoint_shard_completeness(tmp_path):
     (snap3 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob3)  # lone, but not read
     assert xf._download_result_usable(
         snap3, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
+    # A NESTED checkpoint the request explicitly targets (subfolder=foo/checkpoint-7 ->
+    # allow=['foo/checkpoint-7/*']) is read INTO at depth, so its lone shard must still be rejected --
+    # the scope check matches the checkpoint dir at ANY literal leading segment, not just the first.
+    snap4, blob4 = _mk_snapshot(tmp_path, "ckpt_nested")
+    (snap4 / "foo" / "checkpoint-7").mkdir(parents = True)
+    (snap4 / "foo" / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob4)
+    assert xf._download_result_usable(
+        snap4, repo_type = "model",
+        allow_patterns = ["foo/checkpoint-7/*"], ignore_patterns = None) is False
 
 
 def test_post_download_accepts_exact_named_variant_shard_subset(tmp_path):

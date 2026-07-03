@@ -794,13 +794,20 @@ def _index_shard_probe(index_name: str, dir_rel: str) -> "Optional[str]":
 
 
 def _request_scopes_into_dir(allow_patterns: "Optional[list]", dir_name: str) -> bool:
-    """True when an allow pattern names *dir_name* as a literal leading path segment
-    (``subfolder=checkpoint-7`` -> ``allow=['checkpoint-7/*']``), i.e. the load reads INTO that
-    directory. Lets the shard-completeness check skip a leftover checkpoint subtree the request does not
-    target, while still validating a checkpoint the request explicitly loads from."""
+    """True when an allow pattern names *dir_name* among its LITERAL leading path segments
+    (``subfolder=checkpoint-7`` -> ``allow=['checkpoint-7/*']``; a NESTED ``subfolder=foo/checkpoint-7``
+    -> ``allow=['foo/checkpoint-7/*']``), i.e. the load reads INTO that directory at any depth. Lets the
+    shard-completeness check skip a leftover checkpoint subtree the request does not target, while still
+    validating a checkpoint the request explicitly loads from. Segments are read only up to the first
+    glob (a wildcard segment could match anything, so it is not a literal directory target)."""
     for p in allow_patterns or ():
-        if isinstance(p, str) and "/" in p and p.split("/", 1)[0] == dir_name:
-            return True
+        if not isinstance(p, str) or "/" not in p:
+            continue
+        for seg in p.split("/"):
+            if _has_glob(seg):
+                break  # a wildcard segment is not a literal directory target
+            if seg == dir_name:
+                return True
     return False
 
 
