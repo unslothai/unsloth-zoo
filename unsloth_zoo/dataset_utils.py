@@ -698,6 +698,7 @@ def train_on_responses_only(
             tokenizer          = coll_proc,
             return_function    = True,
             last_response_only = last_response_only,
+            mask_out_tokens    = mask_out_tokens,
             **parts,
         )
         print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
