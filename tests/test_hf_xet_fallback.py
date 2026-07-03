@@ -2890,6 +2890,90 @@ def test_post_download_diffusers_variant_presence_scoped_to_declared(tmp_path):
         variant = "fp16") is True
 
 
+def test_post_download_rejects_diffusers_missing_declared_component(tmp_path):
+    """A declared weight-bearing component absent (or holding only its config) is retried over HTTP, not
+    accepted -- else the in-process pipeline load fetches the missing component over un-killable Xet. A
+    ``[null, null]`` (disabled) component and weightless components (scheduler / tokenizer) are not
+    required."""
+    def _mi():
+        return json.dumps({
+            "_class_name": "StableDiffusionPipeline",
+            "unet": ["diffusers", "UNet2DConditionModel"],
+            "vae": ["diffusers", "AutoencoderKL"],
+            "text_encoder": ["transformers", "CLIPTextModel"],
+            "scheduler": ["diffusers", "PNDMScheduler"],
+            "tokenizer": ["transformers", "CLIPTokenizer"],
+            "safety_checker": [None, None],
+        })
+
+    def _model_comp(root, name, blob, *, weight = True, variant = None):
+        d = root / name
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+        if weight:
+            w = "diffusion_pytorch_model.safetensors" if variant is None \
+                else f"diffusion_pytorch_model.{variant}.safetensors"
+            (d / w).symlink_to(blob)
+
+    def _weightless(root, name):
+        d = root / name
+        d.mkdir()
+        # scheduler_config.json / tokenizer_config.json -- NOT a plain config.json, so no weight required
+        (d / f"{name}_config.json").write_text("{}")
+
+    # unet present, vae ABSENT (text_encoder present) -> reject.
+    snap, blob = _mk_snapshot(tmp_path, "diff_missing_vae")
+    (snap / "model_index.json").write_text(_mi())
+    _model_comp(snap, "unet", blob)
+    _model_comp(snap, "text_encoder", blob)
+    _weightless(snap, "scheduler")
+    _weightless(snap, "tokenizer")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # vae present with config ONLY (weight missing) -> reject.
+    snap2, blob2 = _mk_snapshot(tmp_path, "diff_vae_config_only")
+    (snap2 / "model_index.json").write_text(_mi())
+    _model_comp(snap2, "unet", blob2)
+    _model_comp(snap2, "text_encoder", blob2)
+    _model_comp(snap2, "vae", blob2, weight = False)  # config, no weight
+    _weightless(snap2, "scheduler")
+    _weightless(snap2, "tokenizer")
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # Every weight-bearing component complete; safety_checker [null,null] absent -> accept (no false-reject).
+    snap3, blob3 = _mk_snapshot(tmp_path, "diff_complete")
+    (snap3 / "model_index.json").write_text(_mi())
+    for c in ("unet", "vae", "text_encoder"):
+        _model_comp(snap3, c, blob3)
+    _weightless(snap3, "scheduler")
+    _weightless(snap3, "tokenizer")
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+    # Variant: vae absent -> reject; a mixed pipeline (unet fp16, vae/text_encoder canonical fallback) -> accept.
+    snap4, blob4 = _mk_snapshot(tmp_path, "diff_variant_missing_vae")
+    (snap4 / "model_index.json").write_text(_mi())
+    _model_comp(snap4, "unet", blob4, variant = "fp16")
+    _model_comp(snap4, "text_encoder", blob4, variant = "fp16")
+    _weightless(snap4, "scheduler")
+    _weightless(snap4, "tokenizer")
+    assert xf._download_result_usable(
+        snap4, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    snap5, blob5 = _mk_snapshot(tmp_path, "diff_variant_mixed")
+    (snap5 / "model_index.json").write_text(_mi())
+    _model_comp(snap5, "unet", blob5, variant = "fp16")
+    _model_comp(snap5, "vae", blob5)            # canonical fallback for this component
+    _model_comp(snap5, "text_encoder", blob5)   # canonical fallback
+    _weightless(snap5, "scheduler")
+    _weightless(snap5, "tokenizer")
+    assert xf._download_result_usable(
+        snap5, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
 def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
     """Variant twin of single-beats-index: a complete single variant weight beside a stale variant index is usable (ST and bin); a stale index with no single weight is breakage."""
     snap, blob = _mk_snapshot(tmp_path, "single_variant_beats_index")

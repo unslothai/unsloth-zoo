@@ -867,12 +867,9 @@ def _selected_shard_index_incomplete(
 _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
 
 
-def _diffusers_declared_components(snapshot_dir: Path) -> "Optional[set]":
-    """The component subfolder names a diffusers ``model_index.json`` declares (top-level keys mapping to
-    a ``[library, class]`` list; ``_``-prefixed metadata excluded). None when absent / unreadable /
-    malformed, so the caller falls back to every subfolder (fail OPEN, preserving hang protection).
-    Scopes the component check to what the pipeline reads, so a stale UNDECLARED subtree cannot
-    force-fail a complete pipeline download."""
+def _diffusers_declared_component_specs(snapshot_dir: Path) -> "Optional[dict]":
+    """name -> declared ``[library, class]`` spec from a diffusers ``model_index.json`` (``_``-prefixed
+    metadata excluded). None when absent / unreadable / malformed / empty, so the caller fails OPEN."""
     import json
 
     try:
@@ -882,13 +879,20 @@ def _diffusers_declared_components(snapshot_dir: Path) -> "Optional[set]":
         return None
     if not isinstance(data, dict):
         return None
-    components = {
-        key for key, value in data.items()
+    specs = {
+        key: value for key, value in data.items()
         if not key.startswith("_") and isinstance(value, (list, tuple))
     }
-    # An empty / all-metadata model_index.json is degenerate -> fail OPEN (None) so the caller checks
-    # every subfolder, preserving hang protection.
-    return components or None
+    # An empty / all-metadata model_index.json is degenerate -> fail OPEN (None).
+    return specs or None
+
+
+def _diffusers_declared_components(snapshot_dir: Path) -> "Optional[set]":
+    """The component subfolder names a diffusers ``model_index.json`` declares. None when absent /
+    unreadable / malformed so the caller falls back to every subfolder (fail OPEN). Scopes the component
+    check to what the pipeline reads, so a stale UNDECLARED subtree cannot force-fail a complete download."""
+    specs = _diffusers_declared_component_specs(snapshot_dir)
+    return set(specs) if specs else None
 
 
 def _diffusers_component_shards_incomplete(

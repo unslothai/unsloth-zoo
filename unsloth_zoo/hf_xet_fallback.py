@@ -41,7 +41,7 @@ from unsloth_zoo.hf_cache_state import (
     _ROOT_MODEL_VARIANT_WEIGHT_RE,
     _as_pattern_list,
     _diffusers_component_shards_incomplete,
-    _diffusers_declared_components,
+    _diffusers_declared_component_specs,
     _filter_paths,
     _has_glob,
     _has_incomplete_canonical_root_shards,
@@ -1015,24 +1015,44 @@ def _pytorch_root_weight_formats_ignored(ignore_patterns: Any) -> bool:
 _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
 
 
-def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
-    """True if a DECLARED diffusers pipeline COMPONENT weight (in a ``model_index.json``-declared
-    subfolder: unet/, vae/, ...) that the ignore filter keeps is present. Scoped to declared components so
-    a stale UNDECLARED leftover subtree (a controlnet/ dir not declared) does not read as a warm pipeline
-    while the declared unet / vae weights are missing (which the load would fetch over un-killable Xet).
-    Excludes ROOT-level weights and training-checkpoint subtrees. A malformed / empty ``model_index.json``
-    fails OPEN. Lenient on WHICH declared components are required (they can be optional) -- only
-    distinguishes a real component warm from an undeclared-leftover / checkpoint-only / config-only stale
-    snapshot. Counts only CANONICAL (non-variant) weights: a variant-only stale cache is retried over HTTP
-    (its non-variant component weight is still missing)."""
-    declared = _diffusers_declared_components(snapshot_dir)
-    rels: list = []
+def _diffusers_active_component_dirs(specs: dict) -> set:
+    """Declared components a pipeline actually loads: spec is a ``[library, class]`` pair with both
+    non-null. A ``[null, null]`` (a disabled / optional component such as safety_checker) is excluded --
+    the load skips it, so it is not required to be present."""
+    active: set = set()
+    for name, spec in specs.items():
+        if (
+            isinstance(spec, (list, tuple)) and len(spec) >= 2
+            and spec[0] is not None and spec[1] is not None
+        ):
+            active.add(name)
+    return active
+
+
+def _diffusers_component_weights_complete(
+    snapshot_dir: Path, *, variant: Optional[str], ignore_patterns: Any = None,
+) -> bool:
+    """True when a diffusers pipeline warm holds every weight a plain / variant load reads. Beyond "some
+    declared component weight is present" it requires each DECLARED ACTIVE component to be materialised (a
+    non-empty subfolder) AND each model-style component (one carrying ``config.json``) to hold a readable
+    weight of the read format -- so a stale partial missing a whole component (unet present, vae absent) or
+    holding a component's config without its weight is retried over un-killable Xet, not loaded. Excludes
+    ROOT-level weights and training-checkpoint subtrees; applies the ignore filter (format the load reads).
+    Fails OPEN on a malformed / empty ``model_index.json`` to the lenient any-component-weight check,
+    preserving hang protection without false-rejecting. A variant load accepts a component's canonical
+    weight as diffusers' per-component fallback."""
+    specs = _diffusers_declared_component_specs(snapshot_dir)
+    declared = set(specs) if specs else None
+    active = _diffusers_active_component_dirs(specs) if specs else None
+    infix_dot = f".{variant}." if variant else ""
+    infix_dash = f".{variant}-" if variant else ""
+    per_comp_canon: dict = {}
+    per_comp_variant: dict = {}
     try:
         for entry in snapshot_dir.rglob("*"):
-            if not _is_default_load_weight_file(entry.name):
+            name = entry.name
+            if not _is_default_load_weight_file(name):
                 continue
-            if not _CANONICAL_COMPONENT_WEIGHT_RE.match(entry.name):
-                continue  # a VARIANT weight -- a plain load reads the non-variant name
             try:
                 if not entry.is_file():
                     continue
@@ -1042,14 +1062,56 @@ def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any 
             parts = rel.split("/")
             if len(parts) < 2:
                 continue  # a ROOT-level weight is not a component
-            if declared is not None and parts[0] not in declared:
+            comp = parts[0]
+            if declared is not None and comp not in declared:
                 continue  # an UNDECLARED subtree the load does not read
             if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
                 continue  # a training-checkpoint subtree, not a component
-            rels.append(rel)
+            if variant and (infix_dot in name or infix_dash in name):
+                per_comp_variant.setdefault(comp, []).append(rel)
+            elif _CANONICAL_COMPONENT_WEIGHT_RE.match(name):
+                per_comp_canon.setdefault(comp, []).append(rel)
     except OSError:
         return False
-    return bool(_filter_paths(rels, None, ignore_patterns))
+
+    def _has_canon(comp: str) -> bool:
+        return bool(_filter_paths(per_comp_canon.get(comp, []), None, ignore_patterns))
+
+    def _has_variant(comp: str) -> bool:
+        return bool(_filter_paths(per_comp_variant.get(comp, []), None, ignore_patterns))
+
+    def _has_read_weight(comp: str) -> bool:
+        # variant load falls back to a component's canonical weight when it ships no variant file
+        return _has_variant(comp) or _has_canon(comp) if variant else _has_canon(comp)
+
+    if active is not None:
+        for comp in active:
+            comp_dir = snapshot_dir / comp
+            try:
+                present = comp_dir.is_dir() and any(comp_dir.iterdir())
+            except OSError:
+                present = False
+            if not present:
+                return False  # a declared active component was never materialised
+            try:
+                has_config = (comp_dir / "config.json").is_file()
+            except OSError:
+                has_config = False
+            if has_config and not _has_read_weight(comp):
+                return False  # a model-style component holds its config but no readable weight
+    # Floor: at least one component holds a weight of the READ format -- rejects a variant-only-for-plain,
+    # config-only, checkpoint-only, or undeclared-leftover-only stale snapshot.
+    if variant:
+        return any(_has_variant(c) for c in (declared or per_comp_variant))
+    return any(_has_canon(c) for c in (declared or per_comp_canon))
+
+
+def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
+    """Whether a PLAIN (non-variant) diffusers pipeline warm is complete for the weights a load reads
+    (see ``_diffusers_component_weights_complete``)."""
+    return _diffusers_component_weights_complete(
+        snapshot_dir, variant = None, ignore_patterns = ignore_patterns
+    )
 
 
 def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
@@ -1133,40 +1195,13 @@ def _root_has_variant_weight(
 def _has_diffusers_component_variant_weight(
     snapshot_dir: Path, variant: str, *, ignore_patterns: Any = None
 ) -> bool:
-    """Variant analog of ``_has_diffusers_component_weight``: True if a DECLARED component subfolder holds
-    a weight with the requested *variant* token. A variant pipeline's weights are component-scoped, not
-    root ``model.<variant>.*``, so a root-only check would false-reject a complete diffusers variant
-    download. Scoped to declared components (an undeclared leftover does not read as warm), fails OPEN on a
-    malformed ``model_index.json``, excludes ROOT-level / training-checkpoint weights, reads only
-    safetensors / bin."""
-    declared = _diffusers_declared_components(snapshot_dir)
-    infix_dot = f".{variant}."
-    infix_dash = f".{variant}-"
-    rels: list = []
-    try:
-        for entry in snapshot_dir.rglob("*"):
-            name = entry.name
-            if not _is_default_load_weight_file(name):
-                continue
-            if infix_dot not in name and infix_dash not in name:
-                continue
-            try:
-                if not entry.is_file():
-                    continue
-                rel = entry.relative_to(snapshot_dir).as_posix()
-            except (OSError, ValueError):
-                continue
-            parts = rel.split("/")
-            if len(parts) < 2:
-                continue  # a ROOT-level variant weight is not a component
-            if declared is not None and parts[0] not in declared:
-                continue  # an UNDECLARED subtree the load does not read
-            if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
-                continue  # a training-checkpoint subtree, not a component
-            rels.append(rel)
-    except OSError:
-        return False
-    return bool(_filter_paths(rels, None, ignore_patterns))
+    """Variant analog of ``_has_diffusers_component_weight``: whether a diffusers *variant* pipeline warm
+    is complete (a pipeline's variant weights are component-scoped, not root ``model.<variant>.*``, so a
+    root-only check would false-reject a complete variant download). See
+    ``_diffusers_component_weights_complete``."""
+    return _diffusers_component_weights_complete(
+        snapshot_dir, variant = variant, ignore_patterns = ignore_patterns
+    )
 
 
 def _root_model_has_variant_weight(
