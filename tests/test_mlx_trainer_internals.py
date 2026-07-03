@@ -67,7 +67,9 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "completion_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
-    assert field_names[field_names.index("eval_steps") + 1] == "dataset_text_field"
+    # dataset_text_field follows the eval block; newer eval knobs (eg load_best_model_at_end)
+    # may sit between them, so assert relative order rather than strict adjacency.
+    assert field_names.index("dataset_text_field") > field_names.index("eval_steps")
     assert field_names[field_names.index("append_eos") + 1] == "train_on_completions"
     assert field_names.index("per_device_eval_batch_size") > field_names.index("vlm_chat_template")
     assert field_names.index("image_size") > field_names.index("vlm_chat_template")

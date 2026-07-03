@@ -307,6 +307,10 @@ class _StubTrainer:
         self._batches = None
         self._prepared_batches_include_epochs = None
 
+    def _train_dataset_for_batches(self):
+        # mirror MLXTrainer: response-masked dataset overrides train_dataset when set
+        return getattr(self, "_mlx_train_dataset_for_batches", self.train_dataset)
+
 
 def _run_train_on_responses_only(monkeypatch, args):
     """Drive mlx.trainer.train_on_responses_only with an identity HF mask."""
