@@ -1367,8 +1367,13 @@ def _cache_can_skip_download(
         # the variant too).
         if variant:
             return False
+        # STRICT: a default load probes model.safetensors before pytorch_model.bin, so a bin-only cache
+        # for a repo that also publishes safetensors (which the local cache cannot rule out) would fetch
+        # the preferred safetensors in-process over Xet. prefer_safetensors defers such a cache to the
+        # child; a use_safetensors=False request (safetensors ignored) still fast-paths its bin cache.
         return snapshot_dir_is_complete(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
+            prefer_safetensors = True,
         )
     # Weightless / non-model: skip only for an intact exact-named subset. A None / glob request cannot
     # be proven complete from local files, so defer to the child for the manifest compare + resume.

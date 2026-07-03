@@ -496,7 +496,8 @@ def request_can_include_weights(
 
 
 def _canonical_root_weights_complete(
-    snapshot_dir: Path, entries: list, ignore_patterns: "Optional[list]" = None
+    snapshot_dir: Path, entries: list, ignore_patterns: "Optional[list]" = None,
+    *, prefer_safetensors: bool = False,
 ) -> bool:
     """True iff the snapshot holds a complete canonical ROOT weight set: a root
     ``model.safetensors`` / ``pytorch_model.bin``, OR a root shard index whose every shard is present.
@@ -504,7 +505,16 @@ def _canonical_root_weights_complete(
 
     A weight whose FORMAT the ignore filter drops does not count (a stale ``pytorch_model.bin`` under
     ``ignore=['*.bin']`` is not proof the requested safetensors are on disk). The format probe also
-    discards a ``pytorch_model.bin.index.json`` whose ``.json`` name would slip the raw filter."""
+    discards a ``pytorch_model.bin.index.json`` whose ``.json`` name would slip the raw filter.
+
+    *prefer_safetensors* is set by the STRICT pre-download gate: a default transformers load probes
+    ``model.safetensors`` BEFORE ``pytorch_model.bin``, so when safetensors is a format the load would
+    read (not ignored) a bin-only cache cannot be proven complete -- the local cache cannot show the
+    preferred safetensors is absent remotely, and skipping the child would let the in-process load fetch
+    it over un-killable Xet. So a ``.bin`` weight then satisfies the gate only when safetensors is
+    IGNORED (``use_safetensors=False``); otherwise the bin-only cache defers to the child. The lenient
+    POST path leaves this False: a finished bin-only download is a genuinely bin-only repo and must not
+    be false-rejected into a ``DownloadStallError``."""
     root_files: set = set()
     root_indices: list = []
     for entry in entries:
@@ -539,6 +549,11 @@ def _canonical_root_weights_complete(
         return True
     if st_index is not None and _format_kept("model.safetensors"):
         return _weight_shard_index_complete(st_index)
+    if prefer_safetensors and _format_kept("model.safetensors"):
+        # STRICT pre-download gate: safetensors is preferred (not ignored) but absent from the cache, so
+        # a default load would fetch model.safetensors over un-killable Xet. A bin-only cache cannot
+        # prove safetensors is absent remotely -> defer to the watched child rather than fast-path.
+        return False
     if "pytorch_model.bin" in root_files and _format_kept("pytorch_model.bin"):
         return True
     if bin_index is not None and _format_kept("pytorch_model.bin"):
@@ -552,6 +567,7 @@ def snapshot_dir_is_complete(
     allow_patterns: "Optional[object]" = None,
     ignore_patterns: "Optional[object]" = None,
     require_named_weights: bool = False,
+    prefer_safetensors: bool = False,
 ) -> bool:
     """Conservative fast-path gate: True only for an unambiguously complete canonical ROOT model cache,
     so an in-process load will not fetch a weight. True requires: an UNPATTERNED request
@@ -559,6 +575,11 @@ def snapshot_dir_is_complete(
     symlink, and canonical root weights present. Everything else defers to the watched child. A false
     True risks a silent Xet fetch; a false False only spawns the cheap child. *require_named_weights*
     is accepted for signature compatibility (a named-weight request is patterned, so never fast-pathed).
+
+    *prefer_safetensors* (set by the strict pre-download gate) rejects a bin-only cache when a default
+    load would prefer safetensors (not ignored): the local cache cannot prove the preferred file is
+    absent remotely, so fast-pathing it would let the in-process load fetch it over Xet. The POST caller
+    leaves it False so a genuinely bin-only download is still accepted.
 
     *ignore_patterns* need no eligibility gate: the canonical-weight check below is what the load reads,
     so an ignore that dropped some format (the common ``*.bin`` / subdir prefetch ignores) cannot make
@@ -575,7 +596,9 @@ def snapshot_dir_is_complete(
         return False  # diffusers needs component reasoning we do not fast-path
     if snapshot_dir_has_broken_symlinks(snapshot_dir):
         return False  # interrupted blob
-    return _canonical_root_weights_complete(snapshot_dir, entries, ignore_patterns)
+    return _canonical_root_weights_complete(
+        snapshot_dir, entries, ignore_patterns, prefer_safetensors = prefer_safetensors
+    )
 
 
 # A canonical numbered root shard: the index sits IMMEDIATELY before the extension (no variant token),

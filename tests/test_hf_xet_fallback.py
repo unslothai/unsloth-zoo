@@ -2338,6 +2338,45 @@ def test_pre_download_defers_variant_on_canonical_cache(tmp_path):
         variant = "fp16") is False
 
 
+def test_pre_download_defers_bin_only_when_safetensors_preferred(tmp_path):
+    """A default transformers load probes model.safetensors BEFORE pytorch_model.bin. A cache holding
+    only pytorch_model.bin cannot prove the repo has no safetensors, so the STRICT pre-download gate must
+    NOT fast-path it -- else the in-process load fetches the preferred model.safetensors over un-killable
+    Xet (Codex #829). It still fast-paths when safetensors is IGNORED (use_safetensors=False reads bin),
+    or when safetensors is present. The lenient POST path still accepts a finished bin-only download (a
+    genuinely bin-only repo), so a good download is never false-rejected."""
+    snap, blob = _mk_snapshot(tmp_path, "binonly")
+    (snap / "config.json").write_text("{}")
+    (snap / "pytorch_model.bin").symlink_to(blob)
+    # PRE: safetensors preferred (not ignored) + bin-only -> defer to the child.
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # PRE: use_safetensors=False (safetensors ignored) -> the bin cache fast-paths.
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None,
+        ignore_patterns = ["*.safetensors", "*.safetensors.index.json"]) is True
+    # PRE: safetensors present -> fast-path (the common load is unaffected).
+    (snap / "model.safetensors").symlink_to(blob)
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # POST stays LENIENT: a finished bin-only download is a genuinely bin-only repo -> accepted, not
+    # looped into a DownloadStallError.
+    snap2, blob2 = _mk_snapshot(tmp_path, "binonly_post")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / "pytorch_model.bin").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # POST: a sharded bin-only repo is likewise accepted (no false-reject).
+    snap3, blob3 = _mk_snapshot(tmp_path, "binonly_sharded_post")
+    (snap3 / "pytorch_model-00001-of-00002.bin").symlink_to(blob3)
+    (snap3 / "pytorch_model-00002-of-00002.bin").symlink_to(blob3)
+    (snap3 / "pytorch_model.bin.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "pytorch_model-00001-of-00002.bin",
+                        "b": "pytorch_model-00002-of-00002.bin"}}))
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
 def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
     """The pre/post asymmetry: a diffusers warm is NOT fast-pathed (spawn the child), but the same
     complete diffusers result IS accepted post-download (it has component weights), so a good
