@@ -1,12 +1,9 @@
-"""Parity tests for the transformers<5 ModuleList grouped-GEMM MoE path
-(unsloth_zoo/temporary_patches/moe_grouped_modulelist.py).
+"""Parity tests for the transformers<5 ModuleList grouped-GEMM MoE path.
 
-transformers>=5 stacks its MoE experts, so no shipped model exercises the ModuleList path
-directly on new transformers. These tests instead build synthetic ModuleList SparseMoeBlocks
-that mirror the real block structure (Qwen3-MoE / Mixtral / OLMoE) and check that
-grouped_moe_forward matches a plain per-expert reference loop, in the default, cache and
-recompute modes, plus forward+backward. Runs anywhere torch._grouped_mm is supported
-(H100+/B200); otherwise skipped.
+transformers>=5 stacks its experts, so no shipped model exercises the ModuleList path there.
+These build synthetic ModuleList blocks (Qwen3-MoE / Mixtral / OLMoE) and check
+grouped_moe_forward against a per-expert reference loop across the default/cache/recompute
+modes, forward and backward. Skipped where torch._grouped_mm is unsupported.
 """
 import types
 import torch
@@ -146,8 +143,7 @@ def test_eligibility_and_shared_expert_bail():
 
 
 def _eligible_block(cls_name, spec):
-    """A block with a real bound forward (the reference loop) and no patch attrs set,
-    so enable_grouped_moe/disable_grouped_moe drive the whole lifecycle themselves."""
+    """A block with a real bound forward and no patch attrs, so enable/disable drive the lifecycle."""
     hidden, inter, E, top_k = 64, 128, 4, 2
     blk = type(cls_name, (nn.Module,), {})()
     blk.experts = nn.ModuleList(
@@ -205,10 +201,8 @@ def test_wrap_loader_idempotent_and_enables():
 
 
 def test_auto_enable_reevaluates_after_adapter_attaches():
-    """The loader re-runs auto_enable_grouped_moe after attaching a PEFT adapter, so a block
-    whose experts gained LoRA must be restored to the original loop, while a frozen
-    (attention-only) block stays on the grouped path. This is what makes wrapping the
-    from_pretrained leaf safe for the adapter-loading path."""
+    """Re-running auto_enable after a PEFT adapter attaches restores an expert-LoRA block to the
+    original loop while a frozen block stays grouped (what makes the loader leaf-wrap safe)."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
     model = nn.Module()
     model.layers = nn.ModuleList(
@@ -230,8 +224,7 @@ def test_auto_enable_reevaluates_after_adapter_attaches():
 
 
 def test_expert_compute_dtype_prefers_linear4bit_compute_dtype():
-    """The dtype guard must read Linear4bit.compute_dtype (the dtype bnb matmuls in), not the
-    quant_state dtype, so a compute_dtype != activation dtype config falls back correctly."""
+    """The dtype guard reads Linear4bit.compute_dtype (what bnb matmuls in), not quant_state dtype."""
     if not HAS_BNB:
         pytest.skip("bitsandbytes not available")
     import bitsandbytes as bnb
@@ -249,29 +242,25 @@ def test_expert_compute_dtype_prefers_linear4bit_compute_dtype():
 
 
 def test_experts_grouped_ready_checks_every_expert():
-    """The runtime guard must inspect every expert, not just experts[0]: a device / dtype /
-    unfrozen mismatch on ANY expert must make the block fall back to the original loop."""
+    """A device / dtype / unfrozen mismatch on ANY expert (not just experts[0]) must fall back."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
-    blk = _make_block("Qwen3MoeSparseMoeBlock", spec, 64, 128, 4, 2, True)  # frozen bf16 on DEV
+    blk = _make_block("Qwen3MoeSparseMoeBlock", spec, 64, 128, 4, 2, True)
     experts = blk.experts
     dev = getattr(experts[0], spec[0]).weight.device
     assert _experts_grouped_ready(experts, spec, dev, DTYPE)
 
-    # a mismatch on a LATER expert (index 1+) must still be caught
     assert not _experts_grouped_ready(experts, spec, torch.device("cpu"), DTYPE)   # device
     assert not _experts_grouped_ready(experts, spec, dev, torch.float32)           # compute dtype
-    getattr(experts[2], spec[1]).weight.requires_grad_(True)                        # unfrozen up_proj
+    getattr(experts[2], spec[1]).weight.requires_grad_(True)                        # unfrozen later expert
     assert not _experts_grouped_ready(experts, spec, dev, DTYPE)
 
 
 def test_frozen_only_contract_for_experts():
-    """The grouped path is frozen-only. Frozen bnb 4-bit experts are eligible; an unfrozen
-    (trainable) expert must bail to the original loop rather than silently receive no gradient.
-    (A real Params4bit stores uint8 data and can never require grad, so the reachable trainable
-    case is a plain bf16 expert - that is what the frozen requirement protects.)"""
+    """Frozen bnb 4-bit experts are eligible; an unfrozen expert bails (a real Params4bit is uint8
+    and can never require grad, so the reachable trainable case is a plain bf16 expert)."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
 
-    if HAS_BNB:  # frozen 4-bit experts stay eligible with the frozen requirement in place
+    if HAS_BNB:
         import bitsandbytes as bnb
         blk4 = type("Qwen3MoeSparseMoeBlock", (nn.Module,), {})()
         experts = nn.ModuleList()

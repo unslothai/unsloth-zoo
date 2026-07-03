@@ -15,27 +15,16 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Grouped-GEMM MoE forward for transformers < 5 (the nn.ModuleList expert layout).
 
-On transformers < 5 a MoE block (Qwen3MoeSparseMoeBlock, MixtralSparseMoeBlock, ...)
-keeps its experts as a nn.ModuleList of per-expert MLPs and loops over them in Python,
-launching O(num_experts) tiny matmuls + a data-dependent sync per layer and never
-calling torch._grouped_mm. The v5 stacked layout already uses a grouped path; this
-brings the same recipe to the < 5 ModuleList layout:
+Replaces the Python per-expert loop with the v5 grouped path: route -> sort by expert ->
+grouped_mm(gate_up) -> act(gate)*up -> grouped_mm(down) -> router scale -> fp32 scatter-add.
+Same bf16 math as the loop, so accuracy is neutral. Activates only for a known block class
+with no shared expert, frozen bnb-4bit / plain-frozen experts, no expert LoRA, and
+torch._grouped_mm support (CUDA); otherwise the original forward runs unchanged. Patches the
+live instance forward so it wins over the compiled-cache class patch.
 
-    route -> sort tokens by expert -> grouped_mm (gate_up) -> act(gate)*up
-    -> grouped_mm (down) -> router-weight scale -> float32 scatter-add
-
-Experts stay 4-bit; the bf16 dequant stack is rebuilt in backward (recompute) or held
-resident (cache). Same bf16 math as the loop, so accuracy is neutral.
-
-Activates only when: a known block class with no shared expert, frozen bnb-4bit (or
-plain-frozen) ModuleList experts, no LoRA on the experts, and torch._grouped_mm is
-supported (CUDA). Otherwise the original forward runs unchanged (so v5, non-bnb,
-LoRA-on-experts and Mac/MLX/AMD/Intel/CPU are no-ops).
-
-Patches the live instance forward after the model is built, so it wins over the
-compiled-cache class patch. Disable with UNSLOTH_MOE_GROUPED=0. Force backward-recompute
-with UNSLOTH_MOE_GROUPED_RECOMPUTE=1 (auto-on when gradient checkpointing is off); hold
-the dequantized experts resident with UNSLOTH_MOE_GROUPED_CACHE=1 (big-GPU opt-in).
+Env: UNSLOTH_MOE_GROUPED=0 disables; UNSLOTH_MOE_GROUPED_RECOMPUTE=1 rebuilds the dequant
+stack in backward (auto-on without gradient checkpointing); UNSLOTH_MOE_GROUPED_CACHE=1 holds
+the dequantized experts resident.
 """
 from __future__ import annotations
 import os
@@ -85,8 +74,7 @@ def _grouped_mm_supported() -> bool:
 
 
 def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """torch._grouped_mm with a contiguity guard + per-group matmul fallback for the
-    rare 16-byte stride error (mirrors moe_utils._grouped_mm_with_backward_fix)."""
+    """torch._grouped_mm with a per-group matmul fallback for the 16-byte stride error."""
     x = x.contiguous()
     w = w.contiguous()
     try:
@@ -111,8 +99,7 @@ def _expert_weight(lin, dtype):
 
 
 def _route_softmax_topk(self, router_logits, top_k):
-    """softmax(fp32) -> top_k -> optional renorm. Covers Qwen3-MoE / Mixtral (Mixtral
-    has no norm_topk_prob attr -> default True == its routing_weights /= sum)."""
+    """softmax(fp32) -> top_k -> optional renorm (Mixtral has no norm_topk_prob attr -> True)."""
     rw = F.softmax(router_logits, dim=1, dtype=torch.float32)
     rw, sel = torch.topk(rw, top_k, dim=-1)
     if getattr(self, "norm_topk_prob", True):
@@ -120,16 +107,12 @@ def _route_softmax_topk(self, router_logits, top_k):
     return rw, sel
 
 
-# block class name -> (gate, up, down attr names, router fn). Add a row per model.
-# Qwen2MoeSparseMoeBlock is intentionally absent: its shared expert is not part of the
-# routed grouped GEMM, so it is skipped (see the shared-expert bail in _block_is_eligible).
+# block class name -> (gate, up, down attr names, router fn), one row per model. Blocks with a
+# shared expert (e.g. Qwen2Moe) are absent: it is not part of the routed GEMM.
 _BLOCK_SPECS = {
     "Qwen3MoeSparseMoeBlock": ("gate_proj", "up_proj", "down_proj", _route_softmax_topk),
     "MixtralSparseMoeBlock":  ("w1",        "w3",      "w2",        _route_softmax_topk),
-    # OLMoE has the identical routed structure to Qwen3-MoE (gate/up/down SwiGLU experts,
-    # softmax(fp32) -> top_k -> optional renorm via norm_topk_prob) and no shared expert, so
-    # the same spec/router applies. Verified against the reference loop in
-    # tests/test_moe_grouped_modulelist_parity.py.
+    # OLMoE has the same routed structure as Qwen3-MoE (see the parity test).
     "OlmoeSparseMoeBlock":    ("gate_proj", "up_proj", "down_proj", _route_softmax_topk),
 }
 
@@ -152,8 +135,7 @@ def _build_down_stack(experts, spec, dtype):
 
 
 class _GroupedFrozenMM(torch.autograd.Function):
-    """grouped_mm(x, W) for FROZEN experts. W is rebuilt by weight_fn in backward
-    instead of saved, so the bf16 dequant stack is not held across the step."""
+    """grouped_mm(x, W) for frozen experts: W is rebuilt by weight_fn in backward, not saved."""
     @staticmethod
     def forward(ctx, x, offsets, weight_fn):
         ctx.weight_fn = weight_fn
@@ -178,9 +160,7 @@ def _grouped_expert_gemm(x, offsets, weight_fn, recompute):
 
 
 def _lin_compute_dtype(lin):
-    """The dtype a single expert projection matmuls in: bitsandbytes casts inputs to the
-    Linear4bit compute_dtype, so that is what our dequant + grouped_mm must match (fall back to
-    the quant_state dtype if unset); a plain frozen Linear uses its weight dtype."""
+    """Matmul dtype of one projection: Linear4bit.compute_dtype (else quant_state dtype), else weight dtype."""
     w = getattr(lin, "weight", None)
     if HAS_BNB and isinstance(w, Params4bit):
         compute_dtype = getattr(lin, "compute_dtype", None)
@@ -196,11 +176,9 @@ def _expert_compute_dtype(experts, spec):
 
 
 def _experts_grouped_ready(experts, spec, device, dtype) -> bool:
-    """Runtime re-check across EVERY expert projection (state can change after
-    enable_grouped_moe, and the stacks are built from all experts, so sampling experts[0] is not
-    enough for heterogeneous device_map / offload / partially-unfrozen / mixed-dtype blocks).
-    Each routed projection must be present, LoRA-free, frozen, on `device`, and matmul in `dtype`;
-    otherwise we fall back to the original loop (bit-identical / crash-free)."""
+    """Every expert projection must be present, LoRA-free, frozen, on `device`, and matmul in
+    `dtype`, else fall back. Checks all experts (not just experts[0]): the stacks read them all,
+    and state can change after enable (heterogeneous device_map / offload / unfrozen / dtype)."""
     for ex in experts:
         for name in spec[:3]:
             lin = getattr(ex, name, None)
@@ -209,11 +187,11 @@ def _experts_grouped_ready(experts, spec, device, dtype) -> bool:
                 return False
             if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
                 return False
-            if w.requires_grad:                                  # unfrozen -> grads would be dropped
+            if w.requires_grad:
                 return False
-            if getattr(w, "device", device) != device:           # offloaded / other device
+            if getattr(w, "device", device) != device:
                 return False
-            if _lin_compute_dtype(lin) != dtype:                 # different compute dtype
+            if _lin_compute_dtype(lin) != dtype:
                 return False
     return True
 
@@ -221,11 +199,8 @@ def _experts_grouped_ready(experts, spec, device, dtype) -> bool:
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
-    # Fall back to the exact original loop unless this is the frozen-expert CUDA path on a
-    # grouped_mm-supported dtype, with every expert LoRA-free, frozen, on the activation device,
-    # and computing in the activation dtype (so CPU/offload, LoRA-on-experts, fp32, a bnb
-    # compute_dtype != activation dtype, unfrozen experts, or experts on another device stay
-    # bit-identical / crash-free).
+    # Run the original loop unless this is the frozen-expert CUDA path in a low-precision dtype
+    # with every expert grouped-ready (CPU/offload, LoRA, fp32, dtype/device mismatch fall back).
     if (not hidden_states.is_cuda) \
             or hidden_states.dtype not in (torch.bfloat16, torch.float16) \
             or not _experts_grouped_ready(experts, spec, hidden_states.device, hidden_states.dtype):
@@ -246,7 +221,7 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     dtype = hidden_states.dtype
 
     router_logits = self.gate(hidden_states)
-    rw, sel = spec[3](self, router_logits, top_k)   # exact per-model router
+    rw, sel = spec[3](self, router_logits, top_k)
     rw = rw.to(dtype)
 
     flat_e = sel.reshape(-1)
@@ -265,7 +240,7 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
 
     if cache:
         cu = getattr(self, "_cached_gate_up", None)
-        if cu is None or cu.device != dev or cu.dtype != dtype:   # (re)build on device/dtype change
+        if cu is None or cu.device != dev or cu.dtype != dtype:
             with torch.no_grad():
                 self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype)
                 self._cached_down = _build_down_stack(experts, spec, dtype)
@@ -302,7 +277,7 @@ def _block_is_eligible(block):
         if getattr(block, attr, None) is not None:
             return None
     g_name, u_name, d_name, _ = spec
-    for ex in experts:   # every expert must be frozen with no LoRA, else run the original loop
+    for ex in experts:   # frozen-only path (returns dX): any LoRA / trainable expert -> original loop
         for name in (g_name, u_name, d_name):
             lin = getattr(ex, name, None)
             w = getattr(lin, "weight", None)
@@ -310,9 +285,6 @@ def _block_is_eligible(block):
                 return None
             if getattr(lin, "lora_A", None) is not None or getattr(lin, "base_layer", None) is not None:
                 return None
-            # The grouped path is frozen-only: _expert_weight reads w.data and _GroupedFrozenMM
-            # returns dX only, so a trainable expert weight would silently get no gradient. Require
-            # frozen for both 4-bit and plain experts; otherwise run the original loop.
             is_4bit = (HAS_BNB and isinstance(w, Params4bit)
                        and getattr(w, "quant_state", None) is not None and not w.requires_grad)
             # fp32 omitted: torch._grouped_mm targets low-precision CUDA inputs.
@@ -341,9 +313,8 @@ def _restore_block(module):
 
 
 def enable_grouped_moe(model, recompute=None, cache=None, verbose=True):
-    """Patch eligible frozen ModuleList MoE blocks to the grouped forward. Re-entrant
-    (a block that became ineligible, e.g. LoRA was added, is restored). Safe no-op when
-    torch._grouped_mm is unsupported or no eligible block exists. Returns #patched."""
+    """Patch eligible frozen ModuleList MoE blocks to the grouped forward; returns #patched.
+    Re-entrant (a now-ineligible block is restored), and a no-op without grouped_mm support."""
     if os.environ.get("UNSLOTH_MOE_GROUPED", "1") == "0":
         for module in model.modules():
             _restore_block(module)
