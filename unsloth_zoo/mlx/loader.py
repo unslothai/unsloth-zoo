@@ -3296,14 +3296,57 @@ def _ensure_vlm_prompt_utils_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
-    from .utils import save_pretrained_merged
+    from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
+    if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
+        kwargs["save_method"] = "merged_16bit"
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        (
+            "save_method", "push_to_hub", "token", "private", "tags",
+            "repo_id", "commit_message", "commit_description",
+            "create_pr", "revision",
+        ),
+    )
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
 def _mlx_supported_kwargs(kwargs, supported):
     """Keep CUDA-compatible kwargs out of MLX-only save/export APIs."""
     return {key: kwargs[key] for key in supported if key in kwargs}
+
+
+def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
+    """Upload MLX LoRA adapters through the HF-style push_to_hub API."""
+    import tempfile
+    tokenizer = kwargs.pop("tokenizer", None) or getattr(self, "_tokenizer", None)
+    save_directory = kwargs.pop("save_directory", None)
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        (
+            "token", "private", "tags", "commit_message",
+            "commit_description", "create_pr", "revision",
+        ),
+    )
+    if save_directory is not None:
+        _mlx_save_pretrained_merged(
+            self,
+            save_directory,
+            tokenizer=tokenizer,
+            push_to_hub=True,
+            repo_id=repo_id,
+            **kwargs,
+        )
+        return
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _mlx_save_pretrained_merged(
+            self,
+            tmp_dir,
+            tokenizer=tokenizer,
+            push_to_hub=True,
+            repo_id=repo_id,
+            **kwargs,
+        )
 
 
 def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
@@ -3338,11 +3381,390 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None):
     save_lora_adapters(self, path, adapter_config=adapter_config)
 
 
+def _mlx_prompt_to_ids(prompt):
+    """Normalize HF/torch/MLX tokenizer outputs into one token-id list."""
+    if prompt is None:
+        raise ValueError("Unsloth MLX: generate() requires input_ids or a prompt.")
+    if isinstance(prompt, dict):
+        prompt = prompt.get("input_ids")
+    if isinstance(prompt, str):
+        return prompt
+    if hasattr(prompt, "tolist"):
+        prompt = prompt.tolist()
+    if isinstance(prompt, tuple):
+        prompt = list(prompt)
+    if isinstance(prompt, list):
+        if len(prompt) == 1 and isinstance(prompt[0], (list, tuple)):
+            prompt = list(prompt[0])
+        elif prompt and isinstance(prompt[0], (list, tuple)):
+            raise ValueError("Unsloth MLX: generate() only supports batch size 1.")
+        return [int(token) for token in prompt]
+    raise TypeError(
+        "Unsloth MLX: generate() expected input_ids as a string, list, "
+        "or tensor-like object with .tolist()."
+    )
+
+
+def _mlx_attention_mask_to_list(attention_mask):
+    """Normalize HF/torch/MLX attention masks into one mask list."""
+    if attention_mask is None:
+        return None
+    if hasattr(attention_mask, "tolist"):
+        attention_mask = attention_mask.tolist()
+    if isinstance(attention_mask, tuple):
+        attention_mask = list(attention_mask)
+    if isinstance(attention_mask, list):
+        if len(attention_mask) == 1 and isinstance(attention_mask[0], (list, tuple)):
+            attention_mask = list(attention_mask[0])
+        elif attention_mask and isinstance(attention_mask[0], (list, tuple)):
+            raise ValueError("Unsloth MLX: generate() only supports batch size 1.")
+        return [int(token) for token in attention_mask]
+    raise TypeError(
+        "Unsloth MLX: generate() expected attention_mask as a list "
+        "or tensor-like object with .tolist()."
+    )
+
+
+def _mlx_apply_attention_mask(prompt_ids, attention_mask):
+    """Drop padded prompt ids before MLX generation and max_length math."""
+    mask = _mlx_attention_mask_to_list(attention_mask)
+    if mask is None or isinstance(prompt_ids, str):
+        return prompt_ids
+    if len(mask) != len(prompt_ids):
+        raise ValueError(
+            "Unsloth MLX: attention_mask length must match input_ids length."
+        )
+    return [token for token, keep in zip(prompt_ids, mask) if keep != 0]
+
+
+def _mlx_eos_token_id_set(eos_token_id):
+    """Normalize HF-style eos_token_id values into a set of token ids."""
+    if eos_token_id is None:
+        return None
+    if hasattr(eos_token_id, "tolist"):
+        eos_token_id = eos_token_id.tolist()
+    if isinstance(eos_token_id, tuple):
+        eos_token_id = list(eos_token_id)
+    if isinstance(eos_token_id, list):
+        if len(eos_token_id) == 1 and isinstance(eos_token_id[0], (list, tuple)):
+            eos_token_id = list(eos_token_id[0])
+        return {int(token) for token in eos_token_id}
+    return {int(eos_token_id)}
+
+
+def _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id):
+    """Temporarily override mlx-lm tokenizer EOS ids for one generate call."""
+    eos_ids = _mlx_eos_token_id_set(eos_token_id)
+    if eos_ids is None:
+        return None
+    had_attr = hasattr(tokenizer, "eos_token_ids")
+    original = getattr(tokenizer, "eos_token_ids", None)
+    try:
+        tokenizer.eos_token_ids = eos_ids
+    except Exception:
+        return None
+    return (had_attr, original)
+
+
+def _mlx_restore_tokenizer_eos_ids(tokenizer, restore_state):
+    """Restore tokenizer EOS ids after a temporary generate override."""
+    if restore_state is None:
+        return
+    had_attr, original = restore_state
+    try:
+        if had_attr:
+            tokenizer.eos_token_ids = original
+        else:
+            delattr(tokenizer, "eos_token_ids")
+    except Exception:
+        pass
+
+
+def _mlx_put_streamer_tokens(streamer, token_ids):
+    """Send token ids to a HF TextStreamer-compatible object."""
+    if streamer is None:
+        return
+    import mlx.core as mx
+    streamer.put(mx.array(token_ids))
+
+
+def _mlx_token_to_int(token):
+    """Convert an MLX scalar / Python scalar token into a Python int."""
+    if token is None:
+        return None
+    if hasattr(token, "item"):
+        token = token.item()
+    return int(token)
+
+
+def _mlx_generate_vlm(self, *args, **kwargs):
+    """HF-style VLM generate() shim backed by mlx-vlm stream_generate."""
+    import mlx.core as mx
+    from mlx_vlm import stream_generate
+    from .utils import _to_mx_vlm_batch
+
+    processor = getattr(self, "_tokenizer", None)
+    if processor is None:
+        raise ValueError("Unsloth MLX: VLM generate() requires model._tokenizer.")
+
+    inputs = {}
+    if args:
+        if len(args) > 1:
+            raise TypeError(
+                "Unsloth MLX: VLM generate() accepts at most one positional "
+                "input argument."
+            )
+        positional = args[0]
+        if isinstance(positional, dict):
+            inputs.update(positional)
+        elif "input_ids" not in kwargs:
+            inputs["input_ids"] = positional
+        else:
+            raise TypeError(
+                "Unsloth MLX: pass input_ids either positionally or by keyword, "
+                "not both."
+            )
+    inputs.update(kwargs)
+
+    streamer = inputs.pop("streamer", None)
+    max_tokens = inputs.pop("max_tokens", None)
+    max_new_tokens = inputs.pop("max_new_tokens", None)
+    max_length = inputs.pop("max_length", None)
+
+    # HF generation flags commonly present in notebooks but not consumed by
+    # mlx-vlm's generation loop.
+    do_sample = inputs.pop("do_sample", None)
+    inputs.pop("use_cache", None)
+    inputs.pop("return_dict_in_generate", None)
+    inputs.pop("output_scores", None)
+    inputs.pop("output_attentions", None)
+    inputs.pop("output_hidden_states", None)
+    inputs.pop("pad_token_id", None)
+
+    eos_token_id = inputs.pop("eos_token_id", None)
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if hasattr(tokenizer, "stopping_criteria"):
+        eos = eos_token_id
+        if eos is None:
+            eos = getattr(getattr(self, "config", None), "eos_token_id", None)
+        tokenizer.stopping_criteria.reset(eos)
+
+    batch = _to_mx_vlm_batch(inputs)
+    batch = {
+        key: value for key, value in batch.items()
+        if key != "labels" and not key.startswith("_unsloth_")
+    }
+    input_ids = batch.get("input_ids")
+    if input_ids is None:
+        raise ValueError("Unsloth MLX: VLM generate() requires input_ids.")
+    if len(input_ids.shape) != 2 or input_ids.shape[0] != 1:
+        raise ValueError("Unsloth MLX: VLM generate() only supports batch size 1.")
+
+    if "mask" not in batch and "attention_mask" in batch:
+        batch["mask"] = batch.pop("attention_mask")
+    else:
+        batch.pop("attention_mask", None)
+
+    prompt_ids = [int(token) for token in input_ids.flatten().tolist()]
+    prompt_ids = _mlx_apply_attention_mask(prompt_ids, batch.get("mask", None))
+    if max_tokens is None:
+        if max_new_tokens is not None:
+            max_tokens = int(max_new_tokens)
+        elif max_length is not None:
+            max_tokens = max(0, int(max_length) - len(prompt_ids))
+        else:
+            max_tokens = 256
+
+    if "temp" in batch and "temperature" not in batch:
+        batch["temperature"] = batch.pop("temp")
+    if do_sample is False:
+        batch["temperature"] = 0.0
+        batch.pop("temp", None)
+        batch.pop("top_p", None)
+        batch.pop("top_k", None)
+        batch.pop("min_p", None)
+    elif do_sample is True and batch.get("temperature", None) is None:
+        batch["temperature"] = 1.0
+    elif batch.get("temperature", None) is None:
+        batch.pop("temperature", None)
+
+    _mlx_put_streamer_tokens(streamer, [prompt_ids])
+
+    generated_ids = []
+    last_generation_tokens = None
+    for response in stream_generate(
+        self,
+        processor,
+        "",
+        max_tokens=max_tokens,
+        **batch,
+    ):
+        token_id = _mlx_token_to_int(getattr(response, "token", None))
+        if token_id is None:
+            continue
+        generation_tokens = getattr(response, "generation_tokens", None)
+        if (
+            generation_tokens is not None
+            and generation_tokens == last_generation_tokens
+        ):
+            continue
+        last_generation_tokens = generation_tokens
+        generated_ids.append(token_id)
+        _mlx_put_streamer_tokens(streamer, [token_id])
+
+    if streamer is not None:
+        streamer.end()
+    return mx.array([prompt_ids + generated_ids])
+
+
+def _mlx_generate(self, *args, **kwargs):
+    """HF-style text generate() shim backed by mlx-lm stream_generate."""
+    import mlx.core as mx
+    from mlx_lm import stream_generate
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+    if getattr(self, "_is_vlm_model", False):
+        return _mlx_generate_vlm(self, *args, **kwargs)
+
+    tokenizer = getattr(self, "_tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("Unsloth MLX: generate() requires model._tokenizer.")
+
+    prompt = kwargs.pop("input_ids", None)
+    attention_mask = kwargs.pop("attention_mask", None)
+    if args:
+        if prompt is None:
+            prompt = args[0]
+            if attention_mask is None and isinstance(prompt, dict):
+                attention_mask = prompt.get("attention_mask")
+        else:
+            raise TypeError(
+                "Unsloth MLX: pass prompt input either positionally or as "
+                "input_ids, not both."
+            )
+    prompt_ids = _mlx_prompt_to_ids(prompt)
+    prompt_ids = _mlx_apply_attention_mask(prompt_ids, attention_mask)
+    if isinstance(prompt_ids, str):
+        add_special_tokens = (
+            getattr(tokenizer, "bos_token", None) is None
+            or not prompt_ids.startswith(getattr(tokenizer, "bos_token", ""))
+        )
+        try:
+            prompt_ids = tokenizer.encode(
+                prompt_ids,
+                add_special_tokens=add_special_tokens,
+            )
+        except TypeError:
+            prompt_ids = tokenizer.encode(prompt_ids)
+
+    streamer = kwargs.pop("streamer", None)
+    max_tokens = kwargs.pop("max_tokens", None)
+    max_new_tokens = kwargs.pop("max_new_tokens", None)
+    max_length = kwargs.pop("max_length", None)
+    if max_tokens is None:
+        if max_new_tokens is not None:
+            max_tokens = int(max_new_tokens)
+        elif max_length is not None:
+            max_tokens = max(0, int(max_length) - len(prompt_ids))
+        else:
+            max_tokens = 256
+
+    do_sample = kwargs.pop("do_sample", None)
+    eos_token_id = kwargs.pop("eos_token_id", None)
+    sampler = kwargs.pop("sampler", None)
+    _missing_temperature = object()
+    temp = kwargs.pop("temperature", kwargs.pop("temp", _missing_temperature))
+    if temp is _missing_temperature:
+        temp = 1.0 if do_sample is True else 0.0
+    if temp is None:
+        temp = 0.0
+    top_p = float(kwargs.pop("top_p", 0.0) or 0.0)
+    min_p = float(kwargs.pop("min_p", 0.0) or 0.0)
+    top_k = int(kwargs.pop("top_k", 0) or 0)
+    if do_sample is False and sampler is None:
+        temp = 0.0
+        top_p = 0.0
+        min_p = 0.0
+        top_k = 0
+    sampler = sampler or make_sampler(
+        temp=float(temp),
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+    )
+    logits_processors = kwargs.pop("logits_processors", None)
+    if logits_processors is None:
+        logits_processors = make_logits_processors(
+            logit_bias=kwargs.pop("logit_bias", None),
+            repetition_penalty=kwargs.pop("repetition_penalty", None),
+            presence_penalty=kwargs.pop("presence_penalty", None),
+            frequency_penalty=kwargs.pop("frequency_penalty", None),
+        )
+
+    stream_kwargs = _mlx_supported_kwargs(
+        kwargs,
+        (
+            "max_kv_size", "prompt_cache", "prefill_step_size",
+            "kv_bits", "kv_group_size", "quantized_kv_start",
+            "prompt_progress_callback", "input_embeddings",
+        ),
+    )
+
+    # HF TextStreamer(skip_prompt=True) expects one prompt callback first.
+    _mlx_put_streamer_tokens(streamer, [prompt_ids])
+
+    generated_ids = []
+    eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
+    try:
+        for response in stream_generate(
+            self,
+            tokenizer,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            **stream_kwargs,
+        ):
+            token = getattr(response, "token", None)
+            token_id = _mlx_token_to_int(token)
+            if token_id is None:
+                continue
+            generated_ids.append(token_id)
+            _mlx_put_streamer_tokens(streamer, [token_id])
+    finally:
+        _mlx_restore_tokenizer_eos_ids(tokenizer, eos_restore_state)
+
+    if streamer is not None:
+        streamer.end()
+    return mx.array([prompt_ids + generated_ids])
+
+
+def _patch_mlx_tokenizer_call(tokenizer):
+    """Make mlx-lm TokenizerWrapper callable like its wrapped HF tokenizer."""
+    if tokenizer is None:
+        return
+    cls = type(tokenizer)
+    if cls.__name__ != "TokenizerWrapper" or "__call__" in cls.__dict__:
+        return
+    if not hasattr(tokenizer, "_tokenizer") or not callable(tokenizer._tokenizer):
+        return
+
+    def tokenizer_wrapper_call(self, *args, **kwargs):
+        return self._tokenizer(*args, **kwargs)
+
+    tokenizer_wrapper_call._unsloth_mlx_call = True
+    cls.__call__ = tokenizer_wrapper_call
+
+
 def _patch_mlx_saving(model, tokenizer):
     """Attach save/push methods to the model, matching unsloth's CUDA pattern."""
+    _patch_mlx_tokenizer_call(tokenizer)
     model._tokenizer = tokenizer
+    model.generate               = types.MethodType(_mlx_generate, model)
+    model.save_pretrained        = types.MethodType(_mlx_save_pretrained_merged, model)
     model.save_pretrained_merged = types.MethodType(_mlx_save_pretrained_merged, model)
     model.save_pretrained_gguf   = types.MethodType(_mlx_save_pretrained_gguf, model)
+    model.push_to_hub            = types.MethodType(_mlx_push_to_hub, model)
     model.push_to_hub_merged     = types.MethodType(_mlx_push_to_hub_merged, model)
     model.push_to_hub_gguf       = types.MethodType(_mlx_push_to_hub_gguf, model)
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
@@ -3548,6 +3970,26 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
             )
 
 
+def _remap_unsloth_bnb_hub_id_for_mlx(model_name, revision):
+    """Map an unsloth/*-bnb-4bit Hub ID to its full-precision base repo.
+
+    mlx-lm cannot read bitsandbytes-packed weights, so load the base repo and
+    let MLX quantize to 4-bit. Returns (name, revision, remapped_from); the
+    bnb-pinned revision is dropped since it does not apply to the base repo.
+    Local paths and third-party repos keep the exact name given.
+    """
+    if (
+        not isinstance(model_name, str)
+        or not model_name.startswith("unsloth/")
+        or os.path.exists(model_name)
+    ):
+        return model_name, revision, None
+    for _bnb_suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
+        if model_name.endswith(_bnb_suffix):
+            return model_name[: -len(_bnb_suffix)], None, model_name
+    return model_name, revision, None
+
+
 def _coerce_list_extra_special_tokens():
     # why: the MLX path skips unsloth's TEMPORARY_PATCHES. Old transformers crash
     # on a list extra_special_tokens; v5 accepts it, so only coerce on failure.
@@ -3634,6 +4076,15 @@ class FastMLXModel:
         """
         _coerce_list_extra_special_tokens()
 
+        model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
+            model_name, revision
+        )
+        if _bnb_remapped_from is not None:
+            print(
+                f"Unsloth: mlx-lm cannot load bitsandbytes 4-bit weights; "
+                f"loading base '{model_name}' and applying MLX 4-bit "
+                f"quantization instead of '{_bnb_remapped_from}'."
+            )
         if full_finetuning and (
             load_in_4bit or load_in_8bit or load_in_fp8
             or load_in_mxfp4 or load_in_nvfp4
@@ -3900,6 +4351,17 @@ class FastMLXModel:
                         or adapter_cfg.get("base_quantization_map")
                     )
                     adapter_base_revision = _adapter_base_revision(adapter_cfg)
+                    # Keep the base repo consistent across the recursive load,
+                    # metadata download, and recorded _hf_repo when the adapter
+                    # base is an unsloth/*-bnb-4bit Hub ID.
+                    base_model_id, adapter_base_revision, _adapter_base_bnb = (
+                        _remap_unsloth_bnb_hub_id_for_mlx(base_model_id, adapter_base_revision)
+                    )
+                    if _adapter_base_bnb is not None:
+                        print(
+                            f"Unsloth: adapter base '{_adapter_base_bnb}' is bitsandbytes "
+                            f"4-bit; loading base '{base_model_id}' for MLX instead."
+                        )
                     adapter_requires_runtime_quant = _adapter_needs_runtime_quantization(
                         adapter_cfg,
                         adapter_quant_policy,
@@ -3977,6 +4439,18 @@ class FastMLXModel:
                                     "Use the saved base quantization policy or retrain "
                                     "the adapter for the requested base quantization."
                                 )
+                    # A bnb-4bit base always needs MLX 4-bit quantization. Force it
+                    # whenever the metadata branch above did not yield a usable MLX
+                    # config -- no metadata at all, or only a CUDA/bitsandbytes
+                    # base_quantization_config with no MLX map -- so we never reload a
+                    # full-precision base for a 4-bit-trained adapter. A usable MLX map
+                    # already set adapter_mlx_quant_config, so this leaves it intact.
+                    if _adapter_base_bnb is not None and adapter_mlx_quant_config is None:
+                        adapter_mlx_quant_config = {
+                            "bits": 4,
+                            "group_size": _MLX_QUANT_MODE_DEFAULTS["affine"][0],
+                            "mode": "affine",
+                        }
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).
@@ -4159,8 +4633,16 @@ class FastMLXModel:
                     model._src_path = base_local
                     model._unsloth_base_revision = adapter_base_revision
                     model._unsloth_base_commit_hash = (
-                        adapter_cfg.get("base_model_commit_hash")
-                        or _infer_snapshot_commit(base_local)
+                        # A bnb-4bit base was remapped to its full-precision repo; the
+                        # adapter's recorded base_model_commit_hash is the bnb repo's
+                        # commit and need not exist in the base repo, so infer from the
+                        # downloaded base snapshot to avoid writing an unresolvable rev.
+                        _infer_snapshot_commit(base_local)
+                        if _adapter_base_bnb is not None
+                        else (
+                            adapter_cfg.get("base_model_commit_hash")
+                            or _infer_snapshot_commit(base_local)
+                        )
                     )
                     model._is_vlm_model = is_vlm_model
                     if processor is not None:

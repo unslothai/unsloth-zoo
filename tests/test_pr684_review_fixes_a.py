@@ -561,9 +561,14 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils
     import unsloth_zoo.mlx.trainer as trainer_mod
 
+    class _TokenizerOutput(dict):
+        @property
+        def input_ids(self):
+            return self["input_ids"]
+
     class _CallableTokenizer(_SpaceTokenizer):
         def __call__(self, text, **kwargs):
-            return {"input_ids": self.encode(text)}
+            return _TokenizerOutput(input_ids=self.encode(text))
 
     inner = _CallableTokenizer()
 
@@ -604,3 +609,14 @@ def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
         return_function=True,
     )
     assert received["tokenizer"] is inner
+
+    monkeypatch.undo()
+    trainer = object.__new__(trainer_mod.MLXTrainer)
+    trainer.tokenizer = _ProxyWrapper(inner)
+    mask_fn = dataset_utils.train_on_responses_only(
+        trainer,
+        instruction_part="1",
+        response_part="2",
+        return_function=True,
+    )
+    assert mask_fn({"input_ids": [[1, 2, 3]]}) == {"labels": [[-100, -100, 3]]}

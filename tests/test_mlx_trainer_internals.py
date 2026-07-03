@@ -41,12 +41,14 @@ def _install_shim():
 def test_mlx_training_config_is_dataclass_with_all_fields():
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     assert dataclasses.is_dataclass(MLXTrainingConfig)
-    fields = {f.name for f in dataclasses.fields(MLXTrainingConfig)}
+    field_names = [f.name for f in dataclasses.fields(MLXTrainingConfig)]
+    fields = set(field_names)
     # Required SFT-compat fields
     for must_have in (
         "per_device_train_batch_size",
         "gradient_accumulation_steps",
         "max_steps",
+        "warmup_ratio",
         "learning_rate",
         "lr_scheduler_type",
         "optim",
@@ -65,6 +67,10 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "completion_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
+    assert field_names[field_names.index("eval_steps") + 1] == "dataset_text_field"
+    assert field_names[field_names.index("append_eos") + 1] == "train_on_completions"
+    assert field_names.index("per_device_eval_batch_size") > field_names.index("vlm_chat_template")
+    assert field_names.index("image_size") > field_names.index("vlm_chat_template")
 
 
 def test_mlx_training_config_exposes_completion_only_loss():
@@ -121,6 +127,54 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     trainer._set_optimizer_lr_for_step(optimizer, 1)
     second_lr = float(optimizer.learning_rate)
     assert second_lr > first_lr
+
+    ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    ratio_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_ratio=0.1,
+    )
+    ratio_schedule = ratio_trainer._build_schedule(total_steps=8)
+    assert ratio_trainer._resolve_warmup_steps(total_steps=8) == 1
+    assert ratio_schedule(0).item() < ratio_trainer.args.learning_rate
+    assert ratio_schedule(1).item() == pytest.approx(
+        ratio_trainer.args.learning_rate,
+    )
+
+    copied_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    copied_ratio_trainer.args = dataclasses.replace(
+        MLXTrainingConfig(learning_rate=5e-5, lr_scheduler_type="linear"),
+        warmup_ratio=0.1,
+    )
+    assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
+    explicit_default_trainer = MLXTrainer.__new__(MLXTrainer)
+    explicit_default_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_steps=5,
+        warmup_ratio=0.1,
+    )
+    assert explicit_default_trainer._resolve_warmup_steps(total_steps=8) == 5
+
+    clamped_trainer = MLXTrainer.__new__(MLXTrainer)
+    clamped_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_ratio=2.0,
+    )
+    assert clamped_trainer._resolve_warmup_steps(total_steps=8) == 8
+
+    # Explicit warmup_steps=0 must not disable a positive warmup_ratio (HF parity):
+    # a zero step count means "use the ratio", not "no warmup".
+    zero_steps_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    zero_steps_ratio_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_steps=0,
+        warmup_ratio=0.1,
+    )
+    assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
