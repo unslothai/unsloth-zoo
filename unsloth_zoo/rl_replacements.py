@@ -815,7 +815,8 @@ def grpo_accumulated_loss(
         input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
 
         completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
-        completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
+        _pure_completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id)
+        completion_mask = _pure_completion_mask.to(attention_mask.dtype)
 
         if trainer.use_vllm and sampling_per_token_logps is not None and getattr(trainer, "vllm_importance_sampling_correction", False):
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
@@ -825,6 +826,7 @@ def grpo_accumulated_loss(
         attention_mask =  input_ids != trainer.processing_class.pad_token_id
         attention_mask = attention_mask.to(attention_mask.dtype)
     else:
+        _pure_completion_mask = None  # no packing on the multimodal path -> masked columns already consistent
         completion_input_ids = input_ids[:, -logits_to_keep:]
         completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
 
@@ -997,14 +999,6 @@ def grpo_accumulated_loss(
                 _pack_result = torch.zeros(
                     total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
                 ).index_put((_pack_tgt,), _pack_sel.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
-                # Non-completion columns are 0 here, but grpo_compute_loss takes exp(new - old) BEFORE the
-                # completion mask, so a 0 against a real old logprob can overflow to inf (then inf*0 = nan).
-                # Copy old into those masked columns so the ratio is exactly 0 there (they are masked anyway).
-                if old_logps is not None:
-                    _pack_keepmask = create_completion_attention_mask(
-                        input_ids[:, -_pack_W:], left_pad_tokens_per_prompt, max_left_pad, _pack_pad_id
-                    )
-                    _pack_result = torch.where(_pack_keepmask, _pack_result, old_logps.to(_pack_result.dtype))
                 # trust decision: re-verify when T or the longest segment grows past what was verified
                 # (a LongRoPE cache switch can change the result)
                 _pack_vT = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_T", 0))
@@ -1236,6 +1230,19 @@ def grpo_accumulated_loss(
     if new_logprobs is None:
         # padded fallback (packing disabled / unsupported / not verified for this length)
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
+
+    if _pure_completion_mask is not None:
+        # grpo_compute_loss takes exp(new - old) and exp(ref - new) BEFORE the completion mask. The
+        # masked left-pad/prompt columns are dropped by that mask, but a packed path leaves them at 0
+        # while a padded one fills them with a real logprob, so when this grad path and the no-grad
+        # old/ref path pick different packing the ratios overflow to inf and inf * 0 = nan in the loss
+        # and its gradient. Zero those columns on all three so both ratios are exp(0) = 1 there; the
+        # loss is unchanged (they are masked out) and the completion columns are untouched.
+        new_logprobs = torch.where(_pure_completion_mask, new_logprobs, 0.0)
+        if old_logps is not None:
+            old_logps = torch.where(_pure_completion_mask, old_logps, 0.0)
+        if ref_logps is not None:
+            ref_logps = torch.where(_pure_completion_mask, ref_logps, 0.0)
 
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
