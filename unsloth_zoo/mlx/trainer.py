@@ -2208,6 +2208,10 @@ class MLXTrainer:
                     int(getattr(args, "early_stopping_patience", 0) or 0) > 0
                 if _track:
                     _metric_name = getattr(args, "metric_for_best_model", "eval_loss")
+                    # Mirror HF Trainer: a bare "loss"/"accuracy" is looked up as
+                    # "eval_loss"/"eval_accuracy", since eval metrics are eval_-prefixed.
+                    if not _metric_name.startswith("eval_"):
+                        _metric_name = f"eval_{_metric_name}"
                     _em = self._last_eval_metrics or {}
                     if _metric_name not in _em:
                         raise ValueError(
