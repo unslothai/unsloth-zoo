@@ -122,10 +122,13 @@ def _fix_double_bos_and_pad(
     double_bos = [bos_token_id, bos_token_id]
     strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
     # only fields whose rows match the matching input_ids row length are token aligned; this keeps
-    # non-aligned tokenizer outputs (overflowing_tokens, ...) out of the per-row strip/pad
+    # non-aligned tokenizer outputs out of the per-row strip/pad. overflowing_tokens is a per-example
+    # list of tails, so exclude it by name too in case a tail length coincidentally matches its row.
+    non_aligned = {"overflowing_tokens", "overflow_to_sample_mapping", "num_truncated_tokens", "length"}
     per_token_keys = [
         k for k, v in text_inputs.items()
-        if isinstance(v, (list, tuple)) and len(v) == n_rows
+        if k not in non_aligned
+        and isinstance(v, (list, tuple)) and len(v) == n_rows
         and all(isinstance(r, (list, tuple)) and len(r) == input_lens[i] for i, r in enumerate(v))
     ]
     for k in per_token_keys:
