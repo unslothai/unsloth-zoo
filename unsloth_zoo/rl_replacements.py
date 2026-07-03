@@ -1036,8 +1036,12 @@ def grpo_accumulated_loss(
                     # floor ~0.25 through different kernels; cross-sample contamination is >= 2.4
                     if _pack_diff < 7e-1:
                         unwrapped_model._unsloth_seq_packing_grad_ok = True
-                        unwrapped_model._unsloth_seq_packing_grad_verified_T = max(_pack_vT, _pack_T)
-                        unwrapped_model._unsloth_seq_packing_grad_verified_seg = max(_pack_vS, _pack_maxseg)
+                        # only widen the trusted shape when >= 2 completion rows actually exercised
+                        # cross-sample packing; a < 2 row pass proves nothing, so keep re-verifying
+                        # larger shapes until a real multi-row batch clears them
+                        if _pack_active >= 2:
+                            unwrapped_model._unsloth_seq_packing_grad_verified_T = max(_pack_vT, _pack_T)
+                            unwrapped_model._unsloth_seq_packing_grad_verified_seg = max(_pack_vS, _pack_maxseg)
                         _pack_ok = True
                         _pack_use = True
                     else:
