@@ -1036,6 +1036,17 @@ _CANONICAL_ROOT_MODEL_WEIGHT_RE = re.compile(
     r"^(?:model|pytorch_model)(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
 
+# A CANONICAL (non-variant) diffusers component weight name -- what a PLAIN pipeline load reads inside a
+# component subfolder: a base with no intermediate dotted token (diffusion_pytorch_model / model, single
+# or numbered shard), safetensors or bin. A VARIANT weight (diffusion_pytorch_model.fp16.safetensors)
+# carries an extra dotted token before the extension and is EXCLUDED here, so a stale cache left by a
+# prior variant='fp16' download does not read as a warm PLAIN pipeline -- the in-process
+# DiffusionPipeline load (reading the non-variant name) would otherwise fetch it over un-killable Xet.
+# This mirrors the root check (_CANONICAL_ROOT_MODEL_WEIGHT_RE) and the plain component shard regex.
+_CANONICAL_COMPONENT_WEIGHT_RE = re.compile(
+    r"^[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
+)
+
 # A training-checkpoint subdir (checkpoint-500/, checkpoint_7/): its weights are never read as diffusers
 # pipeline COMPONENTS, so they must not mask missing unet/vae/text-encoder weights.
 _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
@@ -1051,13 +1062,19 @@ def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any 
     does not read as a component) and training-checkpoint subtrees (checkpoint-N/). A malformed / empty
     ``model_index.json`` fails OPEN (any component subfolder counts). Stays lenient on WHICH declared
     components are required (a pipeline's components can be optional): it only tells a real component warm
-    from an undeclared-leftover / checkpoint-only / config-only stale snapshot."""
+    from an undeclared-leftover / checkpoint-only / config-only stale snapshot. Counts only CANONICAL
+    (non-variant) component weights (``_CANONICAL_COMPONENT_WEIGHT_RE``): a variant weight
+    (``unet/diffusion_pytorch_model.fp16.safetensors`` left by a prior ``variant='fp16'`` warm) is not
+    what a PLAIN pipeline load reads, so a variant-only stale cache is retried over HTTP rather than
+    loaded (its non-variant component weight is still missing)."""
     declared = _diffusers_declared_components(snapshot_dir)
     rels: list = []
     try:
         for entry in snapshot_dir.rglob("*"):
             if not _is_default_load_weight_file(entry.name):
                 continue
+            if not _CANONICAL_COMPONENT_WEIGHT_RE.match(entry.name):
+                continue  # a VARIANT component weight -- a plain load reads the non-variant name
             try:
                 if not entry.is_file():
                     continue

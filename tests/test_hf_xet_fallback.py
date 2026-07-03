@@ -2489,6 +2489,47 @@ def test_post_download_rejects_patterned_canonical_only_for_variant(tmp_path):
         variant = "fp16") is False
 
 
+def test_post_download_rejects_variant_only_diffusers_for_plain_load(tmp_path):
+    """A PLAIN diffusers warm (variant=None) whose returned partial kept only a prior variant='fp16'
+    download's component weights (unet/diffusion_pytorch_model.fp16.safetensors) must be rejected: the
+    plain pipeline load reads the NON-variant name, so accepting it would fetch the missing
+    diffusion_pytorch_model.safetensors in-process over un-killable Xet (Codex #829). A complete plain
+    pipeline, and a pipeline shipping both plain + variant, are still accepted; the variant='fp16' warm
+    of the same variant-only cache stays accepted (the plain restriction does not touch the variant
+    check)."""
+    def _mi(**comps):
+        data = {"_class_name": "StableDiffusionPipeline", "_diffusers_version": "0.21.0"}
+        data.update(comps)
+        return json.dumps(data)
+
+    snap, blob = _mk_snapshot(tmp_path, "plainvaronly")
+    (snap / "model_index.json").write_text(
+        _mi(unet = ["diffusers", "UNet2DConditionModel"], vae = ["diffusers", "AutoencoderKL"]))
+    for comp in ("unet", "vae"):
+        (snap / comp).mkdir()
+        (snap / comp / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
+    # plain load: variant-only components do not satisfy it -> retry over HTTP.
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = None) is False
+    # the SAME cache is a complete fp16 warm -> the variant load accepts it (no regression).
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+    # a COMPLETE plain pipeline (non-variant component weights) is accepted (no false-reject).
+    snap2, blob2 = _mk_snapshot(tmp_path, "plaincomplete")
+    (snap2 / "model_index.json").write_text(
+        _mi(unet = ["diffusers", "UNet2DConditionModel"], vae = ["diffusers", "AutoencoderKL"]))
+    for comp in ("unet", "vae"):
+        (snap2 / comp).mkdir()
+        (snap2 / comp / "diffusion_pytorch_model.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = None) is True
+    # a pipeline shipping BOTH plain + fp16 in a component is accepted for a plain load.
+    (snap2 / "unet" / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob2)
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = None) is True
+
+
 def test_post_download_rejects_incomplete_sharded_glob(tmp_path):
     """A globbed weight request (allow=['*.safetensors']) whose returned partial has a canonical shard
     index but is missing a shard must be rejected -- globs get the same shard-completeness check as the
