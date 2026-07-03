@@ -1644,22 +1644,12 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 
 def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, rank,
                                    dim_A, dim_B, alpha, use_transpose):
-    """In-place per-expert LoRA merge for a fused MoE weight: merged[e] += alpha * delta_e, where
-    delta_e = lora_B_e @ lora_A_e (transposed for GPT-OSS-style layouts). lora_B is contiguous-r
-    per expert (see moe_utils.py _canonical_lora_weights_for_grouped_mm), so a plain reshape
-    recovers the per-expert blocks the loop sliced.
-
-    On an accelerator (CUDA / XPU / MPS) this batches every expert into a single bmm (no Python
-    loop, faster for many experts); on CPU it keeps the loop, where the batched matmul is not a
-    win. The batched path computes the same per-expert delta = B_e @ A_e and the same
-    `merged[e] += alpha * delta` as the loop (a plain bmm + add_, NOT a fused baddbmm, so the
-    rounding matches the loop exactly), so the result is bitwise-identical to the loop in
-    fp32/bf16/fp16. The merge callers run this in fp32.
-
-    The batched bmm allocates a full (num_experts, dim_B, dim_A) fp32 delta on top of the fp32
-    merged weight (e.g. ~8 GiB for a 128-expert 5760x2880 merge). If that OOMs we fall back to
-    the per-expert loop, which holds one expert-sized delta at a time, so the merge still
-    completes instead of the caller catching the error and writing back an unmerged weight."""
+    """In-place per-expert LoRA merge for a fused MoE weight: merged[e] += alpha * B_e @ A_e
+    (transposed for GPT-OSS layouts). On an accelerator this batches all experts into one bmm; on
+    CPU it loops. Both use a plain bmm/matmul + add_ (not baddbmm), so the result is
+    bitwise-identical in fp32/bf16/fp16 (callers run fp32). The batched bmm allocates a full
+    (E, dim_B, dim_A) fp32 delta (~8 GiB for a 128-expert 5760x2880 merge); on OOM we fall back to
+    the loop so the merge completes rather than the caller writing back an unmerged weight."""
     def _loop():
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank

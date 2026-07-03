@@ -39,8 +39,7 @@ def test_cpu_path_matches_loop(use_transpose):
 @pytest.mark.parametrize("use_transpose", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_cuda_baddbmm_matches_loop(use_transpose, dtype):
-    # 128 experts to mirror a real fused MoE; compare baddbmm vs the per-expert loop on the SAME
-    # device so the only difference is batching (must be bitwise-identical).
+    # 128 experts, same device: only batching differs, so it must be bitwise-identical.
     E, rank, dim_A, dim_B, alpha = 128, 16, 64, 96, 1.7
     merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, dtype, "cuda")
     ref = _loop_reference(merged, A, B, E, rank, alpha, use_transpose)
@@ -51,9 +50,7 @@ def test_cuda_baddbmm_matches_loop(use_transpose, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the batched path")
 @pytest.mark.parametrize("use_transpose", [False, True])
 def test_bmm_oom_falls_back_to_loop(monkeypatch, use_transpose):
-    """If the batched (num_experts, dim_B, dim_A) delta OOMs, the helper must complete the merge
-    via the per-expert loop instead of letting the error escape (which would leave the weight
-    unmerged). The loop uses matmul, not bmm, so it is unaffected by the forced OOM."""
+    """On a batched-delta OOM the helper completes via the per-expert loop (matmul, not bmm)."""
     E, rank, dim_A, dim_B, alpha = 16, 8, 32, 48, 1.3
     merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, torch.float32, "cuda")
     ref = _loop_reference(merged, A, B, E, rank, alpha, use_transpose)
