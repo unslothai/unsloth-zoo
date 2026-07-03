@@ -222,10 +222,9 @@ class VisualServer:
         if self.p is None or self.p.poll() is not None:
             self.restart()
         req = {"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}
-        # Forward declared tools so the server can render them into the chat template
-        # (inputs.tools); the model then emits <|tool_call> blocks with schema-correct
-        # argument names instead of guessing. Omitted when absent so the request shape
-        # is unchanged for plain chat.
+        # Forward tools so the server can render them into the chat template (inputs.tools),
+        # for schema-correct <|tool_call> args instead of guesses. No-op until the visual
+        # server reads the field (pending llama.cpp support); harmless to send meanwhile.
         if tools:
             req["tools"] = tools
         with open(self.req, "w") as f:

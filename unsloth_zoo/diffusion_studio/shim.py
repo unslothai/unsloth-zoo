@@ -221,10 +221,7 @@ def health():
 async def chat(req: Request):
     body = await req.json()
     messages = body.get("messages", [])
-    # Declared tools ride through to the server so the chat template can render them
-    # (inputs.tools); the model then emits <|tool_call> blocks the caller can heal into
-    # structured tool_calls. None for plain chat, so the request shape is unchanged.
-    tools = body.get("tools")
+    tools = body.get("tools")  # forwarded to the visual server (rendered once the binary reads it)
     stream = bool(body.get("stream", False))
     max_blocks = _max_blocks(body)
     seed = int(body.get("seed", 3407))
