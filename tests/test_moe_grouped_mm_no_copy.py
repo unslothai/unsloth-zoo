@@ -1,16 +1,10 @@
 """Regression tests for the copy-elimination in _grouped_mm_with_backward_fix.
 
-The frozen base expert stacks are stored (E, 2I, H) / (E, H, I) and preprocess_weight
-transposes them into grouped layout, producing a non-contiguous view. Forcing
-weight.contiguous() copied that whole frozen stack every step (~805 MB for gate_up on
-Qwen3-30B; ~57% of MoE GPU time). The fix passes the weight as-is and only falls back to a
-contiguous copy on the narrow 16-byte-stride error.
-
-test_no_forced_copy pins the control flow: on a stack the #186365 probe deems safe the weight
-reaches torch._grouped_mm as a non-contiguous view in one attempt, otherwise a contiguous copy
-is forced. test_probe_gates_the_forced_copy pins that gate directly. test_view_matches_copy_*
-pin bit-exactness against the always-contiguous path where torch._grouped_mm runs for real
-(H100+/B200), forward and backward.
+The fix passes the frozen base stack to torch._grouped_mm as a transposed view instead of
+copying it (~805 MB / ~57% of MoE GPU time on Qwen3-30B) every step, gated on the #186365
+safety probe. These pin: the view is kept on a probe-safe stack (else a copy is forced), the
+probe gates that choice, the probe leaves global RNG untouched, and view == contiguous
+bit-exactly in forward and backward where torch._grouped_mm runs for real.
 """
 import pytest
 import torch
@@ -29,9 +23,7 @@ def _grouped_mm_ok():
 
 
 def test_no_forced_copy_on_happy_path(monkeypatch):
-    """On a probe-safe stack the weight reaches torch._grouped_mm as a non-contiguous view in
-    one attempt (no forced copy of the frozen stack); on an unproven stack it is made
-    contiguous. Fails against the old code, which always copied before the single try."""
+    """Probe-safe stack: weight kept as a non-contiguous view in one attempt; unproven: copied."""
     from unsloth_zoo.temporary_patches.moe_utils import (
         _grouped_mm_with_backward_fix, _transposed_view_grouped_mm_is_safe,
     )
@@ -56,8 +48,7 @@ def test_no_forced_copy_on_happy_path(monkeypatch):
 
 
 def test_probe_gates_the_forced_copy(monkeypatch):
-    """The #186365 gate: when the probe reports the transposed-view path unsafe, the weight is
-    made contiguous before torch._grouped_mm; when safe, the view is passed as-is."""
+    """The #186365 gate: probe unsafe -> weight made contiguous; safe -> view passed as-is."""
     from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
 
     inputs = torch.randn(5, 4)
@@ -80,9 +71,7 @@ def test_probe_gates_the_forced_copy(monkeypatch):
 
 
 def test_probe_does_not_perturb_global_rng(monkeypatch):
-    """The probe must draw from a local generator, not torch.manual_seed, so it leaves the
-    process-wide RNG untouched (otherwise it would shift training dropout / sampling / data
-    order). Clear the cache so the probe actually runs, then compare RNG state."""
+    """The probe uses a local generator, so it leaves the process-wide RNG untouched."""
     from unsloth_zoo.temporary_patches.moe_utils import _transposed_view_grouped_mm_is_safe
 
     monkeypatch.setattr(

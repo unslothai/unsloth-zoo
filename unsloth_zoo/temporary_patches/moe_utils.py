@@ -120,26 +120,14 @@ def get_forward_moe_backend():
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """Grouped matmul via torch._grouped_mm with contiguous inputs.
+    """Grouped matmul; passes the weight as a transposed view (no copy) when safe.
 
-    The weight is passed AS-IS when the stack is known-safe. torch._grouped_mm accepts a
-    transposed (non-contiguous) view as long as one matmul dim is unit-stride. The base expert
-    stacks are stored (E, 2I, H) / (E, H, I) and preprocess_weight transposes them into
-    grouped layout, producing exactly such a view for the frozen base. Forcing
-    weight.contiguous() materialises a full copy of that frozen stack (e.g. ~805 MB for
-    gate_up on Qwen3-30B) on every step; profiling attributed ~57% of MoE GPU time to these
-    copies, so skipping it is a real speedup.
-
-    Some CUDA torch builds, however, silently miscompute torch._grouped_mm for exactly this
-    transposed bf16 view (pytorch/pytorch#186365). We therefore only skip the copy when a
-    one-time probe proves the view path is stable and matches the contiguous path on this
-    stack; otherwise we keep the contiguous copy (correct on every build). We also fall back
-    to a contiguous copy (and then the per-group matmul) when the kernel rejects the strides,
-    the narrow case of some low-rank LoRA weights below the 16-byte alignment requirement.
-
-    Bit-exact vs the always-contiguous path in forward and backward, for frozen and trainable
-    weights (torch._grouped_mm produces identical results for a contiguous tensor and its
-    equivalent view on stacks that pass the probe).
+    Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
+    ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
+    but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
+    copy when a one-time probe proves the view path matches the contiguous one; else we keep the
+    always-correct copy. Falls back to a per-group matmul on the 16-byte stride error. Bit-exact
+    vs the always-contiguous path in forward and backward.
     """
     inputs = inputs.contiguous()
     if not _transposed_view_grouped_mm_is_safe():
@@ -205,9 +193,8 @@ def _moe_recompute_enabled(source) -> bool:
 
 
 class _GroupedMMRecompute(torch.autograd.Function):
-    """grouped_mm(inputs, W) for a frozen W from weight_provider(). Saves only
-    offsets + the provider (inputs is unused for the frozen-base dX, and the dense W is
-    rebuilt in backward rather than pinned)."""
+    """grouped_mm(inputs, W) for a frozen W from weight_provider(): saves only offsets and rebuilds
+    W in backward (dX only) instead of pinning the dense stack."""
 
     @staticmethod
     def forward(ctx, inputs, offsets, weight_provider):
@@ -272,11 +259,9 @@ def _check_torch_grouped_mm_supported():
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
-# Some CUDA torch builds miscompute torch._grouped_mm for a transposed (non-contiguous) bf16
-# weight view: results silently alternate / disagree with the contiguous copy when preceded by
-# a broadcast op (pytorch/pytorch#186365, seen on Blackwell with torch 2.11/2.13). We only skip
-# the contiguous copy in _grouped_mm_with_backward_fix on stacks where this probe proves the view
-# path is stable and matches the contiguous path; otherwise we keep the safe contiguous copy.
+# Some CUDA builds silently miscompute torch._grouped_mm for a transposed bf16 view preceded by a
+# broadcast op (pytorch/pytorch#186365, Blackwell + torch 2.11/2.13). This probe checks the view
+# matches the contiguous copy so _grouped_mm_with_backward_fix can skip the copy only when safe.
 _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
@@ -290,13 +275,12 @@ def _transposed_view_grouped_mm_is_safe():
         if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
             device = torch.cuda.current_device()
             E, N, K, M = 4, 64, 32, 32
-            # Draw from a LOCAL generator so the probe never touches the process-wide RNG state
-            # (torch.manual_seed here would perturb training dropout / sampling / data order).
+            # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
             A = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=gen)
             w = torch.randn(E, N, K, dtype=torch.bfloat16, device=device, generator=gen)
-            w_t = w.transpose(-2, -1)          # non-contiguous view (the fast path's layout)
-            w_tc = w_t.contiguous()            # known-correct reference
+            w_t = w.transpose(-2, -1)
+            w_tc = w_t.contiguous()
             per = M // E
             offs = torch.arange(per, M + 1, per, dtype=torch.int32, device=device)[:E]
             offs[-1] = M
@@ -742,11 +726,8 @@ def _extract_lora_weights(
 
 
 def _get_base_weight(param, target_dtype=None):
-    """Get base weight from a potentially wrapped parameter or module.
-
-    target_dtype mirrors _dequantize_bnb4bit_expert_weights for the recompute
-    providers: restore the packed Params4bit to its logical shape and cast.
-    """
+    """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
+    providers) restores the packed Params4bit to its logical shape and casts."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
