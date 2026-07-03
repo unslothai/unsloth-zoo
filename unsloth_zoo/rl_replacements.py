@@ -975,8 +975,11 @@ def grpo_accumulated_loss(
             _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
             _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
             _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
+            # cap the flattened forward at one padded mini-batch's token budget (B * seq_len); a larger
+            # batch falls back to the chunked padded loop instead of a [1, sum L] full-batch forward
+            _pack_cap = B * seq_len
             # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch)
-            if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2) \
+            if _pack_T >= 2 and _pack_T <= _pack_cap and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2) \
                     and not (_pack_unsafe is not None and _pack_T >= _pack_unsafe):
                 _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
                 # reset 0-based position_ids per segment
