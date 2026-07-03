@@ -963,7 +963,10 @@ def grpo_accumulated_loss(
             _pack_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
             _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
             _pack_active = int((completion_mask.sum(dim = 1) > 0).sum())
-            if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2):
+            _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
+            # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch)
+            if _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok and (_pack_ok is True or _pack_active >= 2) \
+                    and not (_pack_unsafe is not None and _pack_T >= _pack_unsafe):
                 _pack_psl = torch.tensor(_pack_nz_cpu, dtype = torch.int32, device = input_ids.device)
                 # reset 0-based position_ids per segment
                 _pack_pos = (_pack_keep.cumsum(dim = 1) - 1)[_pack_keep].unsqueeze(0)
@@ -994,16 +997,21 @@ def grpo_accumulated_loss(
                 _pack_result = torch.zeros(
                     total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
                 ).index_put((_pack_tgt,), _pack_sel.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                # Non-completion columns are 0 here, but grpo_compute_loss takes exp(new - old) BEFORE the
+                # completion mask, so a 0 against a real old logprob can overflow to inf (then inf*0 = nan).
+                # Copy old into those masked columns so the ratio is exactly 0 there (they are masked anyway).
+                if old_logps is not None:
+                    _pack_keepmask = create_completion_attention_mask(
+                        input_ids[:, -_pack_W:], left_pad_tokens_per_prompt, max_left_pad, _pack_pad_id
+                    )
+                    _pack_result = torch.where(_pack_keepmask, _pack_result, old_logps.to(_pack_result.dtype))
                 # trust decision: re-verify when T or the longest segment grows past what was verified
                 # (a LongRoPE cache switch can change the result)
                 _pack_vT = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_T", 0))
                 _pack_vS = int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_seg", 0))
-                _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
                 _pack_force_verify = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY", "0") == "1"
                 if (not _pack_force_verify) and _pack_ok is True and _pack_T <= _pack_vT and _pack_maxseg <= _pack_vS:
                     _pack_use = True                                           # already verified for this shape
-                elif _pack_unsafe is not None and _pack_T >= _pack_unsafe:
-                    _pack_use = False                                          # known-unsafe length region
                 else:
                     # verify against the per-row clean forward (exact ground truth; no grad, value check)
                     _pack_ref = torch.zeros_like(_pack_result)
@@ -1066,6 +1074,9 @@ def grpo_accumulated_loss(
     if _pack_use and _pack_result is not None:
         new_logprobs = _pack_result          # verified -> skip the loop
         zipped_inputs = []
+    else:
+        # packing rejected/unused: drop the packed graph before the padded loop so both don't co-reside
+        _pack_hidden = _pack_sel = _pack_result = None
 
     def to_device(tensor, device, non_blocking=True):
         if tensor is None: return None
