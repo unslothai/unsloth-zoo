@@ -720,6 +720,22 @@ def patch_sdpa_bool_causal_mask():
     ):
         m = attention_mask
 
+        # Banded sliding-window fast path (opt-in, UNSLOTH_BANDED_SDPA=1):
+        # block-local O(S*w) SDPA for sliding layers with head_dim <= 256
+        # (e.g. Gemma-4's 25 sliding layers). Returns None when not applicable.
+        if os.environ.get("UNSLOTH_BANDED_SDPA", "0") == "1":
+            try:
+                from .gemma4_banded_attention import maybe_banded_sliding
+                _banded = maybe_banded_sliding(
+                    module, query, key, value, attention_mask,
+                    dropout = dropout, scaling = scaling,
+                    sliding_window = kwargs.get("sliding_window", None),
+                )
+            except Exception:
+                _banded = None
+            if _banded is not None:
+                return _banded
+
         # Below 2**16 the Cutlass bool-mask overflow (pytorch/pytorch#162588)
         # cannot fire, so skip the wrapper. The pure-causal rewrite picks a
         # heavier SDPA backend (~2.5 GB on Gemma4-31B LoRA SFT, 8192 seq_len).
