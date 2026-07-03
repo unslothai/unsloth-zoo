@@ -1572,6 +1572,18 @@ class MLXTrainer:
         # was called, so we only handle optimizer and trainer state here.
         # The step offset is applied below at loop start so the LR scheduler
         # and dataloader fast-forward to the right position.
+        # Reset per-run tracking so reusing a trainer for a second train()
+        # without resume starts clean, rather than inheriting run-1's early-stop
+        # flag (which would break the loop at step 0), best metric, or step
+        # count. The resume block below re-seeds the persisted fields from the
+        # checkpoint when resuming.
+        self._global_step = 0
+        self._train_loss_history = []
+        self.stop_requested = False
+        self._best_metric = None
+        self._best_step = None
+        self._es_patience_counter = 0
+
         _resume_step = 0
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         if _resume_from:
@@ -2207,7 +2219,9 @@ class MLXTrainer:
                 _track = getattr(args, "load_best_model_at_end", False) or \
                     int(getattr(args, "early_stopping_patience", 0) or 0) > 0
                 if _track:
-                    _metric_name = getattr(args, "metric_for_best_model", "eval_loss")
+                    # `or "eval_loss"`: a present-but-None config value (HF treats
+                    # None as "fall back to loss") must not reach `.startswith`.
+                    _metric_name = getattr(args, "metric_for_best_model", None) or "eval_loss"
                     # Mirror HF Trainer: a bare "loss"/"accuracy" is looked up as
                     # "eval_loss"/"eval_accuracy", since eval metrics are eval_-prefixed.
                     if not _metric_name.startswith("eval_"):
