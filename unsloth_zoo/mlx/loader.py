@@ -2829,9 +2829,10 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
             tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
             try:
                 # transformers 5.x: the dequantized model still carries
-                # weight-name conversions with no reverse op, so save_pretrained's
-                # revert_weight_conversion raises NotImplementedError. The
-                # dequantized weights need no conversion; clear it. No-op on 4.x.
+                # weight-name conversions that can't be reversed for quantized
+                # weights, so save_pretrained's revert_weight_conversion raises.
+                # The dequantized weights need no conversion; clear it. No-op on
+                # 4.x, where the attribute doesn't exist.
                 try:
                     model._weight_conversions = []
                 except Exception:
