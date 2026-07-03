@@ -1185,6 +1185,39 @@ def patch_param_wrapper_for_moe():
         return False
 
 
+# Optional gate gradient via the inner-product identity dGate = <A, dA> / gate
+# (UNSLOTH_MOE_GATEGRAD=1), instead of <dOut, Y> which pins the down-projection
+# output Y on the tape solely for that gradient. Output unchanged; off by default.
+
+
+def _moe_gategrad_enabled() -> bool:
+    return os.environ.get("UNSLOTH_MOE_GATEGRAD", "0") == "1"
+
+
+class _MoEGateGradIdentity(torch.autograd.Function):
+    """Identity over the pre-down activation ``inter``; backward derives the gate
+    gradient as ``dGate = <inter, dA> / gate`` instead of ``<dOut, Y>``.
+
+    The incoming dA equals ``gate * (dOut @ W2_eff.T)`` for the effective down
+    weight (base + LoRA), so ``<inter, dA> / gate`` is exactly ``<Y, dOut>``
+    without ever materialising Y for the gradient. Exact for any linear down
+    projection; NOT valid with a post-matmul down bias, so callers must
+    disable it when one is present.
+    """
+
+    @staticmethod
+    def forward(ctx, inter, permuted_weights):
+        ctx.save_for_backward(inter, permuted_weights)
+        return inter
+
+    @staticmethod
+    def backward(ctx, grad_inter):
+        inter, gate = ctx.saved_tensors
+        dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
+        dgate = dgate / gate.to(torch.float32).clamp_min(1e-12)
+        return grad_inter, dgate.to(gate.dtype)
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -1359,6 +1392,17 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
+    # Gate gradient via the <A, dA> identity (env-gated) so the combine never
+    # caches Y just for the gate multiply. Disabled when a down bias exists.
+    _gategrad = (
+        _moe_gategrad_enabled()
+        and getattr(self, "down_proj_bias", None) is None
+    )
+    permuted_weights = None
+    if _gategrad:
+        permuted_weights = top_k_weights.view(-1)[sorted_indices]
+        inter = _MoEGateGradIdentity.apply(inter, permuted_weights)
+
     # Down projection with optional separated LoRA (default).
     down_lora = None
 
@@ -1435,9 +1479,13 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
     # Apply routing weights and scatter-add (reduce).
-    flat_weights = top_k_weights.view(-1)
-    permuted_weights = flat_weights[sorted_indices]
-    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+    if _gategrad:
+        # Gate grad comes from the identity; detach so the multiply does not pin Y.
+        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+    else:
+        flat_weights = top_k_weights.view(-1)
+        permuted_weights = flat_weights[sorted_indices]
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
     final_hidden_states = torch.zeros(
         (batch_size * sequence_length, hidden_dim),
