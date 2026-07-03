@@ -32,6 +32,7 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_torch_shim():
+    pytest.importorskip("torch")
     from mlx_simulation import simulate_mlx_on_torch
 
     simulate_mlx_on_torch()
@@ -223,6 +224,7 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
 def test_text_generate_honors_do_sample_false(monkeypatch):
     import mlx_lm
     import mlx_lm.sample_utils as sample_utils
+    import torch
     from transformers.tokenization_utils_base import to_py_obj
     import unsloth_zoo.mlx.loader as loader
 
@@ -264,6 +266,8 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
         max_length=4,
     )
 
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
     assert out.tolist() == [[1, 2, 9, 5]]
     assert out.shape == (1, 4)
     assert out[:, 2:].tolist() == [[9, 5]]
@@ -325,6 +329,7 @@ def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
 
 
 def test_vlm_generate_hf_kwargs(monkeypatch):
+    import torch
     from transformers.tokenization_utils_base import to_py_obj
     import unsloth_zoo.mlx.loader as loader
 
@@ -353,6 +358,8 @@ def test_vlm_generate_hf_kwargs(monkeypatch):
         max_new_tokens=1,
     )
 
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
     assert out.tolist() == [[1, 2]]
     assert out.shape == (1, 2)
     assert to_py_obj(out) == [[1, 2]]

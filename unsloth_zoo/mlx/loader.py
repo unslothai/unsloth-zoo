@@ -3440,9 +3440,13 @@ def _mlx_apply_attention_mask(prompt_ids, attention_mask):
 
 def _mlx_generate_output(prompt_ids, generated_ids):
     """Build a Transformers-friendly batched generate return value."""
-    import numpy as np
-
-    return np.asarray([list(prompt_ids) + list(generated_ids)], dtype=np.int64)
+    sequences = [list(prompt_ids) + list(generated_ids)]
+    try:
+        import torch
+        return torch.tensor(sequences, dtype=torch.long)
+    except ImportError:
+        import numpy as np
+        return np.asarray(sequences, dtype=np.int64)
 
 
 def _mlx_eos_token_id_set(eos_token_id):
