@@ -696,17 +696,26 @@ class MLXTrainer:
         # 1D second-moment init is numerically unstable).
         self._ensure_lora_frozen(model)
 
-        # Training state
+        # Training state. Per-run tracking lives in _reset_run_state (re-run at
+        # each train() so a reused trainer starts clean); callbacks and
+        # pre-created batches persist across runs and stay here.
+        self._reset_run_state()
+        self._batches = None  # Pre-created batches (skips internal batch creation)
+        self._step_callbacks = []  # Callbacks called after each logged step
+        self._eval_callbacks = []  # Callbacks called after each eval
+
+    def _reset_run_state(self):
+        """Per-run training/metric state. Reset from __init__ and at the start
+        of each train() so reusing a trainer for a second run starts clean;
+        stop_requested left False so a run-1 early stop doesn't block run 2.
+        Callbacks and pre-created batches persist across runs and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
         self._tokens_per_second_history = []
         self._peak_memory_history = []
         self._step_times = []
-        self._batches = None  # Pre-created batches (skips internal batch creation)
-        self._step_callbacks = []  # Callbacks called after each logged step
-        self._eval_callbacks = []  # Callbacks called after each eval
-        self.stop_requested = False  # Set True to stop training early
+        self.stop_requested = False
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
@@ -1572,17 +1581,10 @@ class MLXTrainer:
         # was called, so we only handle optimizer and trainer state here.
         # The step offset is applied below at loop start so the LR scheduler
         # and dataloader fast-forward to the right position.
-        # Reset per-run tracking so reusing a trainer for a second train()
-        # without resume starts clean, rather than inheriting run-1's early-stop
-        # flag (which would break the loop at step 0), best metric, or step
-        # count. The resume block below re-seeds the persisted fields from the
-        # checkpoint when resuming.
-        self._global_step = 0
-        self._train_loss_history = []
-        self.stop_requested = False
-        self._best_metric = None
-        self._best_step = None
-        self._es_patience_counter = 0
+        # Reset per-run state so reusing a trainer for a second train() without
+        # resume starts clean (else run-1's early-stop flag breaks the loop at
+        # step 0). The resume block below re-seeds the persisted fields.
+        self._reset_run_state()
 
         _resume_step = 0
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
