@@ -292,6 +292,7 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
 
             versions.append(f"{pkg}={_dist_version(pkg)}")
         except Exception:
+            # Version probe is best-effort; a missing/renamed dist just omits it from the hint.
             pass
     installed = f" Installed: {', '.join(versions)}." if versions else ""
     raise ValueError(
@@ -299,7 +300,7 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
         f"mlx-lm / mlx-vlm rejects its QK-norm (q_norm/k_norm) weights, so it is "
         f"too old or regressed for this architecture (mlx-lm 0.31.3 broke "
         f"gemma4 / qwen3_5). Reinstall an arch-complete build, e.g. "
-        f'`pip install "mlx-lm!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
+        f'`pip install -U "mlx-lm>=0.22.0,!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
     ) from error
 
 
