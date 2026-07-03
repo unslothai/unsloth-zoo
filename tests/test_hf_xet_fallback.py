@@ -328,6 +328,29 @@ def test_file_watchdog_detects_resumed_baseline_partial(hf_cache):
         child.wait(timeout = 5)
 
 
+def test_file_watchdog_resumed_partial_fires_without_pid_ownership(hf_cache, monkeypatch):
+    """No psutil AND no /proc (native Windows / macOS without psutil): _child_open_incomplete_blobs
+    returns None, so per-child ownership is unknowable. Excluding baseline names would let a RESUMED
+    partial (which reuses a baseline blob-hash name) hang forever. The None fallback drops to the
+    repo-wide measure, so a frozen resumed baseline partial still trips the stall instead of hanging."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "resumed.incomplete").write_bytes(b"\0" * 4096)   # leftover resume, constant (hung)
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda pid: None)  # no psutil / no /proc
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.3,
+        watch_new_partials_only = True, baseline_incomplete_blobs = {"resumed.incomplete"},
+        child_pid = 4242,   # non-None, but open-file inspection yields None -> repo-wide fallback
+    )
+    try:
+        assert _wait(lambda: len(calls) >= 1, timeout = 3.0), (
+            "watchdog never fired on a resumed baseline partial when pid ownership is unavailable"
+        )
+    finally:
+        stop.set()
+
+
 def test_file_watchdog_pid_scope_ignores_unowned_sibling(hf_cache):
     """With pid scoping, a sibling partial this child does NOT hold open is ignored even if
     it grows, so the child's own constant partial still trips the stall."""
@@ -2653,6 +2676,53 @@ def test_post_download_accepts_exact_named_shard_subset(tmp_path):
     assert xf._download_result_usable(
         snap2, repo_type = "model",
         allow_patterns = ["model-00001-of-00002.safetensors"], ignore_patterns = None) is False
+
+
+def test_post_download_accepts_from_tf_flax_weights(tmp_path):
+    """A from_tf / from_flax base load ignores BOTH PyTorch formats (ignore=['*.safetensors','*.bin',
+    ...]) and reads tf_model.h5 / flax_model.msgpack. A COMPLETE such download must be accepted, not
+    false-rejected into a DownloadStallError because the canonical safetensors/bin check found nothing
+    (#829 re-review). Gated on both PyTorch formats ignored, so a normal load and a stray leftover h5 do
+    not change."""
+    ig = ["*.safetensors", "*.safetensors.index.json", "*.bin", "*.bin.index.json"]
+    for wt in ("tf_model.h5", "flax_model.msgpack"):
+        snap, blob = _mk_snapshot(tmp_path, f"tf_{wt}")
+        (snap / wt).symlink_to(blob)
+        (snap / "config.json").write_text("{}")
+        assert xf._download_result_usable(
+            snap, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is True
+    # Both PyTorch formats ignored but NO h5/msgpack present -> still rejected (weight missing).
+    snap, _ = _mk_snapshot(tmp_path, "tf_none")
+    (snap / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is False
+    # A normal load (PyTorch format NOT ignored) is unchanged: a stray leftover h5 must NOT count as
+    # the readable weight, so a repo holding only tf_model.h5 is rejected for a default (non-tf) load.
+    snap, blob = _mk_snapshot(tmp_path, "stray_h5")
+    (snap / "tf_model.h5").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_post_download_accepts_exact_named_variant_shard_subset(tmp_path):
+    """A caller naming an EXACT variant shard (allow=['model.fp16-00001-of-00002.safetensors'] +
+    variant='fp16') asked for precisely that file; once present the result is accepted even though its
+    index / sibling shard is absent. The exact-name escape applies to the VARIANT branch too, not only
+    the plain one, so a satisfied exact variant request is not failed into a DownloadStallError
+    (#829 re-review)."""
+    snap, blob = _mk_snapshot(tmp_path, "exact_var_shard")
+    (snap / "model.fp16-00001-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model",
+        allow_patterns = ["model.fp16-00001-of-00002.safetensors"], ignore_patterns = None,
+        variant = "fp16") is True
+    # The exact-named variant shard absent -> still rejected.
+    snap2, _ = _mk_snapshot(tmp_path, "exact_var_absent")
+    (snap2 / "config.json").write_text("{}")
+    assert xf._download_result_usable(
+        snap2, repo_type = "model",
+        allow_patterns = ["model.fp16-00001-of-00002.safetensors"], ignore_patterns = None,
+        variant = "fp16") is False
 
 
 def test_post_download_rejects_patterned_incomplete_variant_shards(tmp_path):

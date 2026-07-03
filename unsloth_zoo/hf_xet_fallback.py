@@ -408,9 +408,19 @@ def start_watchdog(
                 # name, excludes siblings). hf_xet holds the .incomplete fd continuously, so an EMPTY
                 # set means the child owns no partial YET (connect / metadata phase), not a sibling's.
                 owned = {name: n for name, n in sizes.items() if name in open_names}
-            else:
-                # No psutil / /proc: fall back to following only newly-created (post-baseline) partials.
-                owned = {name: n for name, n in sizes.items() if name not in baseline}
+                return (sum(owned.values()), len(owned) > 0)
+            if child_pid:
+                # A pid was given but its open files cannot be inspected (no psutil AND no /proc: native
+                # Windows / macOS without psutil). Post-baseline name filtering would EXCLUDE a resumed
+                # partial that reuses a baseline blob name forever, so a frozen Xet resume never trips the
+                # watchdog and the hang persists -- defeating the fallback. Fall back to the repo-wide
+                # measure (as the snapshot path uses): a resumed partial is then watched; a concurrent
+                # same-repo sibling's progress may mask this child's stall, the accepted snapshot tradeoff.
+                return get_hf_download_state(
+                    [single_repo_id], repo_type = repo_type, cache_dir = cache_dir
+                )
+            # No child pid at all: follow only newly-created (post-baseline) partials.
+            owned = {name: n for name, n in sizes.items() if name not in baseline}
             return (sum(owned.values()), len(owned) > 0)
         return get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
 
@@ -1047,6 +1057,24 @@ _CANONICAL_COMPONENT_WEIGHT_RE = re.compile(
     r"^[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
 
+# A CANONICAL root TF / Flax weight name (transformers TF2_WEIGHTS_NAME / FLAX_WEIGHTS_NAME, single or
+# numbered shard): what a from_tf / from_flax load reads instead of a PyTorch format.
+_CANONICAL_ROOT_TF_FLAX_WEIGHT_RE = re.compile(
+    r"^(?:tf_model(?:-\d{5}-of-\d{5})?\.h5|flax_model(?:-\d{5}-of-\d{5})?\.msgpack)$"
+)
+
+
+def _pytorch_root_weight_formats_ignored(ignore_patterns: Any) -> bool:
+    """True when the request's ignore filter drops BOTH canonical PyTorch root weights
+    (``model.safetensors`` AND ``pytorch_model.bin``) -- the signature of a ``from_tf`` / ``from_flax``
+    load, whose prefetch ignores ``*.safetensors`` + ``*.bin`` and keeps ``*.h5`` / ``*.msgpack``. Lets
+    the readable-weight check count the TF/Flax weight the load actually reads (``tf_model.h5`` /
+    ``flax_model.msgpack``) rather than false-reject a complete h5/msgpack download into a
+    ``DownloadStallError``. Never true for a normal load (which keeps at least one PyTorch format)."""
+    return not _filter_paths(
+        ["model.safetensors", "pytorch_model.bin"], None, ignore_patterns
+    )
+
 # A training-checkpoint subdir (checkpoint-500/, checkpoint_7/): its weights are never read as diffusers
 # pipeline COMPONENTS, so they must not mask missing unet/vae/text-encoder weights.
 _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
@@ -1114,20 +1142,31 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
     if is_diffusers:
         return _has_diffusers_component_weight(snapshot_dir, ignore_patterns = ignore_patterns)
     rels: list = []
+    tf_flax_rels: list = []
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
-            if not _CANONICAL_ROOT_MODEL_WEIGHT_RE.match(name):
-                continue  # only a canonical model.safetensors / pytorch_model.bin (single or shard) is
-                # read by a default load -- an adapter, variant, gguf, or consolidated.* is not
             try:
-                if entry.is_file():
-                    rels.append(name)
+                if not entry.is_file():
+                    continue
             except OSError:
                 continue
+            if _CANONICAL_ROOT_MODEL_WEIGHT_RE.match(name):
+                rels.append(name)  # a canonical model.safetensors / pytorch_model.bin (single or shard)
+            elif _CANONICAL_ROOT_TF_FLAX_WEIGHT_RE.match(name):
+                tf_flax_rels.append(name)  # a TF/Flax root weight (from_tf / from_flax)
     except OSError:
         return False
-    return bool(_filter_paths(rels, None, ignore_patterns))
+    if _filter_paths(rels, None, ignore_patterns):
+        return True
+    # from_tf / from_flax: the ignore filter drops BOTH canonical PyTorch formats, so the load reads a
+    # TF (tf_model.h5) / Flax (flax_model.msgpack) root weight the safetensors/bin check above cannot
+    # see. Count that surviving root weight so a complete from_tf/from_flax download is not
+    # false-rejected into a DownloadStallError. Gated on "both PyTorch formats ignored", so a normal
+    # load (which keeps a PyTorch format) is unchanged and a stray leftover h5/msgpack never counts.
+    if tf_flax_rels and _pytorch_root_weight_formats_ignored(ignore_patterns):
+        return bool(_filter_paths(tf_flax_rels, None, ignore_patterns))
+    return False
 
 
 def _root_has_variant_weight(
@@ -1460,6 +1499,11 @@ def _readable_shard_set_incomplete(
         is_diffusers = (snapshot_dir / "model_index.json").is_file()
     except OSError:
         is_diffusers = False
+    if _patterns_are_exact_names(allow_patterns):
+        # An exact-named subset (variant or plain) defers to the exact-file presence check: the load
+        # reads exactly the named shard(s), so a lone exact variant shard is not judged against its
+        # (unrequested) index -- else a valid exact request is false-rejected into a DownloadStallError.
+        return False
     if variant:
         if not is_diffusers and (
             allow_patterns is None
@@ -1499,8 +1543,6 @@ def _readable_shard_set_incomplete(
             # component shard index missing a shard is not covered by the canonical ROOT-shard check.
             return True
         return False
-    if _patterns_are_exact_names(allow_patterns):
-        return False  # an exact-named subset defers to the exact-file presence check
     if not is_diffusers and _request_selects_canonical_root_shards(
         allow_patterns, ignore_patterns
     ) and _has_incomplete_canonical_root_shards(snapshot_dir, ignore_patterns = ignore_patterns):
