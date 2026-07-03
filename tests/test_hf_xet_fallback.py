@@ -2704,6 +2704,69 @@ def test_post_download_accepts_from_tf_flax_weights(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
 
+def test_post_download_checks_sharded_tf_flax_completeness(tmp_path):
+    """TF / Flax weights can be SHARDED (tf_model.h5.index.json / flax_model.msgpack.index.json). A
+    COMPLETE sharded set (index + all shards) is accepted, but an INCOMPLETE one (a shard missing, or a
+    lone shard with no index) must be rejected: the single-file regex no longer matches a lone shard, so
+    an incomplete sharded from_tf/from_flax download is retried over HTTP instead of loaded over Xet
+    (#829 re-review, sharded-TF false-accept)."""
+    ig = ["*.safetensors", "*.safetensors.index.json", "*.bin", "*.bin.index.json"]
+    for base, ext in (("tf_model", "h5"), ("flax_model", "msgpack")):
+        idx = json.dumps({"weight_map": {"a": f"{base}-00001-of-00002.{ext}",
+                                         "b": f"{base}-00002-of-00002.{ext}"}})
+        # Complete sharded set -> accepted.
+        snap, blob = _mk_snapshot(tmp_path, f"tfshard_ok_{base}")
+        (snap / f"{base}-00001-of-00002.{ext}").symlink_to(blob)
+        (snap / f"{base}-00002-of-00002.{ext}").symlink_to(blob)
+        (snap / f"{base}.{ext}.index.json").write_text(idx)
+        assert xf._download_result_usable(
+            snap, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is True
+        # A shard listed by the index is missing -> rejected.
+        snap2, blob2 = _mk_snapshot(tmp_path, f"tfshard_missing_{base}")
+        (snap2 / f"{base}-00001-of-00002.{ext}").symlink_to(blob2)
+        (snap2 / f"{base}.{ext}.index.json").write_text(idx)
+        assert xf._download_result_usable(
+            snap2, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is False
+        # A lone shard with NO index -> rejected (the load cannot enumerate the set).
+        snap3, blob3 = _mk_snapshot(tmp_path, f"tfshard_lone_{base}")
+        (snap3 / f"{base}-00001-of-00002.{ext}").symlink_to(blob3)
+        assert xf._download_result_usable(
+            snap3, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is False
+
+
+def test_post_download_checks_explicit_checkpoint_shard_completeness(tmp_path):
+    """An EXPLICIT checkpoint load (subfolder=checkpoint-N -> allow=['checkpoint-N/*']) reads the
+    checkpoint's weights, so a lone numbered shard there with no index must be rejected, not skipped as a
+    'leftover checkpoint subtree' (#829 re-review, checkpoint false-accept). A complete checkpoint shard
+    set is accepted; a leftover checkpoint the request does NOT target (subfolder=unet) is still ignored
+    so a complete in-scope download is not false-rejected."""
+    # Lone checkpoint shard, no index, explicitly requested -> rejected.
+    snap, blob = _mk_snapshot(tmp_path, "ckpt_lone")
+    (snap / "checkpoint-7").mkdir()
+    (snap / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["checkpoint-7/*"], ignore_patterns = None) is False
+    # Complete checkpoint shard set (index + all shards) -> accepted.
+    snap2, blob2 = _mk_snapshot(tmp_path, "ckpt_complete")
+    (snap2 / "checkpoint-7").mkdir()
+    (snap2 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "checkpoint-7" / "model-00002-of-00002.safetensors").symlink_to(blob2)
+    (snap2 / "checkpoint-7" / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["checkpoint-7/*"], ignore_patterns = None) is True
+    # A leftover checkpoint the request does NOT target (subfolder=unet) must not false-reject a complete
+    # in-scope download.
+    snap3, blob3 = _mk_snapshot(tmp_path, "ckpt_leftover")
+    (snap3 / "unet").mkdir()
+    (snap3 / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob3)
+    (snap3 / "checkpoint-7").mkdir()
+    (snap3 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob3)  # lone, but not read
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
+
+
 def test_post_download_accepts_exact_named_variant_shard_subset(tmp_path):
     """A caller naming an EXACT variant shard (allow=['model.fp16-00001-of-00002.safetensors'] +
     variant='fp16') asked for precisely that file; once present the result is accepted even though its

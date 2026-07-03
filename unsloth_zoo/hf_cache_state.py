@@ -793,6 +793,17 @@ def _index_shard_probe(index_name: str, dir_rel: str) -> "Optional[str]":
     return None
 
 
+def _request_scopes_into_dir(allow_patterns: "Optional[list]", dir_name: str) -> bool:
+    """True when an allow pattern names *dir_name* as a literal leading path segment
+    (``subfolder=checkpoint-7`` -> ``allow=['checkpoint-7/*']``), i.e. the load reads INTO that
+    directory. Lets the shard-completeness check skip a leftover checkpoint subtree the request does not
+    target, while still validating a checkpoint the request explicitly loads from."""
+    for p in allow_patterns or ():
+        if isinstance(p, str) and "/" in p and p.split("/", 1)[0] == dir_name:
+            return True
+    return False
+
+
 def _selected_shard_index_incomplete(
     snapshot_dir: Path, *, allow_patterns: "Optional[object]", ignore_patterns: "Optional[object]",
     variant: "Optional[str]",
@@ -870,7 +881,12 @@ def _selected_shard_index_incomplete(
                 or (want_variant is not None and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name))
             ):
                 continue
-            if any(_CHECKPOINT_DIR_RE.match(p) for p in rel.split("/")[:-1]):
+            ckpt_dirs = [p for p in rel.split("/")[:-1] if _CHECKPOINT_DIR_RE.match(p)]
+            if ckpt_dirs and not _request_scopes_into_dir(allow_patterns, ckpt_dirs[0]):
+                # a leftover training-checkpoint subtree the request does not explicitly target (a base /
+                # adapter / other-subfolder warm never reads it). But an EXPLICIT checkpoint load
+                # (subfolder=checkpoint-N -> allow=['checkpoint-N/*']) DOES read it, so its shard set must
+                # be checked for completeness rather than silently accepted as a lone shard.
                 continue
             if not _filter_paths([rel], allow_patterns, ignore_patterns):
                 continue  # the load does not read this shard (out of scope / ignored format)

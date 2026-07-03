@@ -53,6 +53,7 @@ from unsloth_zoo.hf_cache_state import (
     _has_incomplete_variant_root_shards,
     _is_loadable_weight_file,
     _selected_shard_index_incomplete,
+    _weight_shard_index_complete,
     blob_bytes_present,
     has_active_incomplete_blobs,
     hf_cache_root,
@@ -749,18 +750,24 @@ def _download_child_entry(
 
 def _terminate_process_group(proc: "mp.process.BaseProcess", grace_period: float) -> None:
     """Kill *proc* and its whole process group (Xet may spawn helpers). The child ``os.setsid()``s so
-    its pgid equals its pid; signal via ``os.killpg(pid, ...)`` -- NOT ``getpgid``, which before the
-    child is a group leader resolves to OUR group. SIGTERM, then SIGKILL after *grace_period*."""
+    its pgid equals its pid; the group is signalled via ``os.killpg(pid, ...)`` only once the child is
+    confirmed its own leader (``os.getpgid(pid) == pid``). SIGTERM, then SIGKILL after *grace_period*."""
     pid = proc.pid
 
     def _signal_group(sig: int) -> None:
-        if pid is not None and hasattr(os, "killpg"):
+        # Signal the whole GROUP only once the child is confirmed its own leader (setsid done): its pgid
+        # then equals its pid. BEFORE setsid the child is still in OUR group, and its freshly-allocated
+        # pid could collide with an unrelated recycled process group -- so ``getpgid(pid) != pid`` guards
+        # against ``killpg(pid)`` targeting the WRONG group; a reaped child raises here. Fall through to a
+        # single-process signal in all those cases (also Windows, which has no killpg / getpgid).
+        if pid is not None and hasattr(os, "killpg") and hasattr(os, "getpgid"):
             try:
-                os.killpg(pid, sig)
-                return
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, sig)
+                    return
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        # Windows or pre-setsid: best effort on the single process.
+        # Windows, pre-setsid, or the child is not (yet) its own group leader: signal the single process.
         try:
             proc.terminate() if sig != getattr(signal, "SIGKILL", -9) else proc.kill()
         except Exception:
@@ -1006,27 +1013,6 @@ def _intact_subset(
     )
 
 
-def _has_any_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
-    """True if the snapshot holds at least one loadable weight anywhere (root or subfolder) that the
-    request's ignore filter keeps. Lenient: it only tells a real model warm from a config-only stale
-    snapshot, without classifying layout. The ignore filter matters for diffusers, whose component
-    weights live in subfolders -- a partial holding only the ignored format (``unet/*.bin`` under
-    ``ignore=['*.bin']``) is not a usable weight for a safetensors load."""
-    rels: list = []
-    try:
-        for entry in snapshot_dir.rglob("*"):
-            if not _is_loadable_weight_file(entry.name):
-                continue
-            try:
-                if entry.is_file():
-                    rels.append(entry.relative_to(snapshot_dir).as_posix())
-            except (OSError, ValueError):
-                continue
-    except OSError:
-        return False
-    return bool(_filter_paths(rels, None, ignore_patterns))
-
-
 def _is_default_load_weight_file(name: str) -> bool:
     """A weight in a format a DEFAULT ``from_pretrained`` reads: safetensors or bin only. Excludes gguf /
     pt / pth / onnx / msgpack / ... -- a default (non-format-specific) transformers / diffusers load does
@@ -1057,11 +1043,14 @@ _CANONICAL_COMPONENT_WEIGHT_RE = re.compile(
     r"^[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
 
-# A CANONICAL root TF / Flax weight name (transformers TF2_WEIGHTS_NAME / FLAX_WEIGHTS_NAME, single or
-# numbered shard): what a from_tf / from_flax load reads instead of a PyTorch format.
-_CANONICAL_ROOT_TF_FLAX_WEIGHT_RE = re.compile(
-    r"^(?:tf_model(?:-\d{5}-of-\d{5})?\.h5|flax_model(?:-\d{5}-of-\d{5})?\.msgpack)$"
-)
+# A SINGLE-FILE canonical root TF / Flax weight (transformers TF2_WEIGHTS_NAME / FLAX_WEIGHTS_NAME):
+# what a from_tf / from_flax load reads instead of a PyTorch format. A SHARDED TF/Flax weight is judged
+# through its index (tf_model.h5.index.json / flax_model.msgpack.index.json) instead -- a lone shard
+# here must NOT read as a present weight, else an incomplete sharded set is loaded over Xet.
+_CANONICAL_ROOT_TF_FLAX_WEIGHT_RE = re.compile(r"^(?:tf_model\.h5|flax_model\.msgpack)$")
+
+# The shard-index sidecars a sharded TF / Flax weight is enumerated through.
+_TF_FLAX_WEIGHT_INDEX_NAMES = ("tf_model.h5.index.json", "flax_model.msgpack.index.json")
 
 
 def _pytorch_root_weight_formats_ignored(ignore_patterns: Any) -> bool:
@@ -1125,9 +1114,9 @@ def _has_diffusers_component_weight(snapshot_dir: Path, *, ignore_patterns: Any 
 def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -> bool:
     """Whether an UNPATTERNED model warm holds a weight a default load reads: a CANONICAL ROOT weight
     (``model.safetensors`` / ``pytorch_model.bin``, single or numbered shard), or -- for a diffusers
-    pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting any subtree weight (as
-    ``_has_any_weight`` does) would accept a stale checkpoint-only snapshot and then fetch the root
-    weights over un-killable Xet; diffusers is the one layout whose weights live in subfolders. Only the
+    pipeline (root ``model_index.json``) -- a component-subfolder weight. Counting ANY subtree weight
+    would accept a stale checkpoint-only snapshot and then fetch the root weights over un-killable Xet;
+    diffusers is the one layout whose weights live in subfolders. Only the
     canonical names are counted (``_CANONICAL_ROOT_MODEL_WEIGHT_RE``): a VARIANT-named root weight
     (``model.fp16.safetensors``), a PEFT adapter (``adapter_model.*``), a gguf, and a NON-canonical root
     weight (``consolidated.safetensors``) are excluded, since a default from_pretrained probes only the
@@ -1161,11 +1150,22 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
         return True
     # from_tf / from_flax: the ignore filter drops BOTH canonical PyTorch formats, so the load reads a
     # TF (tf_model.h5) / Flax (flax_model.msgpack) root weight the safetensors/bin check above cannot
-    # see. Count that surviving root weight so a complete from_tf/from_flax download is not
-    # false-rejected into a DownloadStallError. Gated on "both PyTorch formats ignored", so a normal
-    # load (which keeps a PyTorch format) is unchanged and a stray leftover h5/msgpack never counts.
-    if tf_flax_rels and _pytorch_root_weight_formats_ignored(ignore_patterns):
-        return bool(_filter_paths(tf_flax_rels, None, ignore_patterns))
+    # see. Count a SINGLE-FILE TF/Flax weight, or a COMPLETE sharded set (its index present with every
+    # listed shard present), so a complete from_tf/from_flax download is not false-rejected into a
+    # DownloadStallError -- while an INCOMPLETE sharded set (a lone shard, or an index missing a shard)
+    # is NOT counted, so it is retried over HTTP rather than loaded over un-killable Xet. Gated on "both
+    # PyTorch formats ignored", so a normal load is unchanged and a stray leftover h5/msgpack never
+    # counts.
+    if _pytorch_root_weight_formats_ignored(ignore_patterns):
+        if tf_flax_rels and _filter_paths(tf_flax_rels, None, ignore_patterns):
+            return True
+        for index_name in _TF_FLAX_WEIGHT_INDEX_NAMES:
+            index_path = snapshot_dir / index_name
+            try:
+                if index_path.is_file() and _weight_shard_index_complete(index_path):
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -1322,9 +1322,9 @@ def _requested_exact_files_present_grouped(
 def _has_selected_weight(
     snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any,
 ) -> bool:
-    """True if a loadable weight the request SELECTS is present. Applies the allow / ignore filter (vs
-    ``_has_any_weight``), so a patterned request is not satisfied by an out-of-scope weight (a stale
-    ``.bin``, an unrequested checkpoint subfolder)."""
+    """True if a loadable weight the request SELECTS is present. Applies the allow / ignore filter, so a
+    patterned request is not satisfied by an out-of-scope weight (a stale ``.bin``, an unrequested
+    checkpoint subfolder)."""
     weights: list = []
     try:
         for entry in snapshot_dir.rglob("*"):
