@@ -1590,6 +1590,11 @@ class MLXTrainer:
                 #    pre-fix checkpoints (which lack these keys) resumable.
                 ts = load_trainer_state(_resume_from)
                 _resume_step = int(ts.get("global_step", 0))
+                # Seed the live step counter from the checkpoint so a no-op
+                # resume (checkpoint already at max_steps, loop body never runs)
+                # still reports the reached step instead of the initial 0. The
+                # loop overwrites this on every optimizer step of a real resume.
+                self._global_step = _resume_step
                 self._train_loss_history = list(ts.get("train_loss_history", []))
                 self._best_metric = ts.get("best_metric", None)
                 self._best_step = ts.get("best_step", None)
