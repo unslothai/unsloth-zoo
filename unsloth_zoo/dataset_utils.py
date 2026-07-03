@@ -331,6 +331,26 @@ def train_on_responses_only(
     old_labels).
     """
     # All Unsloth Zoo code licensed under LGPLv3
+    if trainer is not None:
+        try:
+            from .mlx.trainer import (
+                MLXTrainer,
+                train_on_responses_only as _mlx_train_on_responses_only,
+            )
+        except ImportError:
+            MLXTrainer = None
+        if MLXTrainer is not None and isinstance(trainer, MLXTrainer):
+            return _mlx_train_on_responses_only(
+                trainer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+                force_match=force_match,
+                tokenizer=tokenizer,
+                return_function=return_function,
+                num_proc=num_proc,
+                last_response_only=last_response_only,
+            )
+
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
     # Keep the original object (may be a VLM processor) so auto-detect can read a
