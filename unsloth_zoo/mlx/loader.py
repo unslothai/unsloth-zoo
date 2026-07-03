@@ -3790,7 +3790,10 @@ class FastMLXModel:
             # dequant path only handles text models (mlx-lm), and mlx-vlm
             # dequant is not wired up. Reject with the clear, actionable error
             # instead of attempting an unverified VLM dequant + mlx-vlm load.
-            if _is_vlm(config_data):
+            # DeepSeek-OCR is a VLM routed through mlx-vlm but carries a
+            # *ForCausalLM architecture, so `_is_vlm` short-circuits to False;
+            # detect it explicitly so it's rejected rather than mis-dequantized.
+            if _is_vlm(config_data) or _deepseek_ocr_config_model_type(config_data):
                 raise ValueError(
                     f"Unsloth: '{model_name}' is a bitsandbytes-quantized VLM, "
                     "which isn't supported on the MLX path yet.\n"
