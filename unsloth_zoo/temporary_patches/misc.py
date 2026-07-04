@@ -720,9 +720,8 @@ def patch_sdpa_bool_causal_mask():
     ):
         m = attention_mask
 
-        # Banded sliding-window fast path (opt-in, UNSLOTH_BANDED_SDPA=1):
-        # block-local O(S*w) SDPA for sliding layers with head_dim <= 256
-        # (e.g. Gemma-4's 25 sliding layers). Returns None when not applicable.
+        # Banded sliding-window fast path (opt-in, UNSLOTH_BANDED_SDPA=1): block-local
+        # O(S*w) SDPA for sliding layers with head_dim <= 256 (e.g. Gemma-4's 25 sliding layers).
         if os.environ.get("UNSLOTH_BANDED_SDPA", "0") == "1":
             try:
                 from .gemma4_banded_attention import maybe_banded_sliding

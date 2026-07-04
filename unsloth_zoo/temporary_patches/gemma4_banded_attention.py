@@ -17,17 +17,14 @@
 # ============================================================================
 # Banded (block-local) SDPA for sliding-window attention layers.
 #
-# A sliding window only needs keys in (i-w, i] for query i, but SDPA with a
-# band mask still materialises the full O(S^2) score matrix. Compute it in
-# O(S*w) instead: cut the sequence into w-sized blocks, let query block b
-# attend key blocks b-1 and b (length 2w) under one static (w, 2w) mask
-# (block 0 masks its phantom previous block), and fold blocks into the batch
-# dim for a single SDPA call. Backward is exact through SDPA; fp32 rel ~1e-8
-# vs full SDPA + band mask.
-#
-# Engaged only when the layer's mask is exactly the causal+sliding band with
-# no token padding (verified on probe rows); else defers to the original SDPA.
-# Opt-in via UNSLOTH_BANDED_SDPA=1.
+# A sliding window only needs keys in (i-w, i] for query i, but SDPA with a band
+# mask still materialises the full O(S^2) score matrix. Compute it in O(S*w):
+# cut the sequence into w-sized blocks, let query block b attend key blocks b-1
+# and b (length 2w) under one static (w, 2w) mask (block 0 masks its phantom
+# previous block), and fold blocks into the batch dim for a single SDPA call.
+# Backward is exact through SDPA; fp32 rel ~1e-8 vs full SDPA + band mask.
+# Engaged only when the mask is exactly the causal+sliding band with no token
+# padding (verified on probe rows), else defers to SDPA. Opt-in UNSLOTH_BANDED_SDPA=1.
 # ============================================================================
 
 import os
