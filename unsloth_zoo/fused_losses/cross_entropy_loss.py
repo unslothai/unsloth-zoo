@@ -144,11 +144,8 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
         free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
         free_gb = free / 1024 / 1024 / 1024
         free_gb = free_gb * 0.5
-        # Cap the per-chunk target. On very large GPUs (e.g. 180GB) half of the
-        # free pool is big enough that the multiplier rounds to a single chunk,
-        # which materializes the full logits (and their float32 upcast) at once.
-        # At long sequence lengths that transient dominates peak memory, so keep
-        # the target bounded and let chunking stay active.
+        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
+        # single chunk, materializing full float32 logits and dominating peak memory.
         target_gb = min(free_gb, 4.0)
     pass
 
