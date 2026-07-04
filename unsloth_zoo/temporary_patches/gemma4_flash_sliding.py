@@ -39,7 +39,6 @@ except Exception:
     _flash_attn_func = None
     _HAS_FA2 = False
 
-_BAND_OK = {}        # id(attention_mask) -> bool (plain causal band, no padding)
 _ORIG_SDPA = [None]  # boxed reference to the wrapped sdpa function
 _ENGAGED = [0]       # count of FA2-path invocations (debug)
 
@@ -54,32 +53,26 @@ def _mask_is_plain_band(mask, S, w):
         return True
     if not torch.is_tensor(mask) or mask.dim() != 4:
         return False
-    key = id(mask)
-    cached = _BAND_OK.get(key)
+    # Cache the verdict on the tensor itself. An id()-keyed dict can alias a
+    # freed mask to a newly allocated one and return a stale result; binding to
+    # the tensor lifetime avoids that. `is not None` preserves a cached False.
+    cached = getattr(mask, "_unsloth_plain_band", None)
     if cached is not None:
         return cached
-    if len(_BAND_OK) > 64:
-        _BAND_OK.clear()
-    m = mask[:, 0]
-    if m.shape[-2] != S or m.shape[-1] != S:
-        _BAND_OK[key] = False
+    if mask.shape[-2] != S or mask.shape[-1] != S:
+        try: mask._unsloth_plain_band = False
+        except (AttributeError, RuntimeError): pass
         return False
-    allowed = m if m.dtype == torch.bool else (m > -1e4)
-    dev = m.device
-    cand = sorted({x for x in (0, 1, w - 1, w, w + 1, 2 * w, S // 2, S - 1, S - w, S - w - 1) if 0 <= x < S})
-    probes = torch.tensor(cand, device=dev)
-    # Probe EVERY batch element: with right padding only the longest sample
-    # keeps a clean band, and FA2's window_size cannot express per-sample
-    # padding, so any deviating element must reject the whole batch.
-    rows = allowed[:, probes]                             # (B, P, S)
-    idx = torch.arange(S, device=dev)[None, None, :]
-    cnt = rows.sum(-1)
-    minidx = torch.where(rows, idx, torch.full_like(idx, S)).amin(-1)
-    maxidx = torch.where(rows, idx, torch.full_like(idx, -1)).amax(-1)
-    lo = torch.clamp(probes - w + 1, min=0)[None, :]
-    hi = probes[None, :]
-    ok = bool(((cnt == (hi - lo + 1)) & (minidx == lo) & (maxidx == hi)).all().item())
-    _BAND_OK[key] = ok
+    # Verify the WHOLE mask over every batch element and head. A sampled-row
+    # probe would miss a packed-sequence boundary that falls between the sampled
+    # rows and let FA2 attend across samples. A plain band allows key j for
+    # query i iff i - w < j <= i; anything else (padding, packing) must reject.
+    allowed = mask if mask.dtype == torch.bool else (mask > -1e4)
+    idx = torch.arange(S, device=mask.device)
+    band = (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - w)
+    ok = bool((allowed == band).all().item())
+    try: mask._unsloth_plain_band = ok
+    except (AttributeError, RuntimeError): pass
     return ok
 
 
@@ -93,7 +86,13 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
         w = kwargs.get("sliding_window", None) or getattr(module, "sliding_window", None)
         Sq = query.shape[2]
         Sk = key.shape[2]
-        if (w and Sq == Sk and Sq > w and _mask_is_plain_band(attention_mask, Sq, w)):
+        # Mirror SDPA's derivation. With no explicit mask, only a causal module
+        # may take the causal FA2 window; a bidirectional call (is_causal False)
+        # must stay bidirectional instead of being forced causal.
+        causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
+        if (w and Sq == Sk and Sq > w
+                and (attention_mask is not None or causal)
+                and _mask_is_plain_band(attention_mask, Sq, w)):
             try:
                 # flash_attn_func wants (B, S, H, D); a causal window of w keys is
                 # window_size=(w-1, 0). FA2 handles GQA (H q heads, Hkv kv heads).
@@ -125,11 +124,13 @@ def patch_gemma4_flash_sliding():
     try:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     except Exception as e:
-        return raise_error("transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS", e)
+        raise_error("transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS", e)
+        return
     try:
         current = ALL_ATTENTION_FUNCTIONS["sdpa"]
     except Exception as e:
-        return raise_error("ALL_ATTENTION_FUNCTIONS['sdpa']", e)
+        raise_error("ALL_ATTENTION_FUNCTIONS['sdpa']", e)
+        return
     if getattr(current, "_unsloth_gemma4_flash", False):
         return
     _ORIG_SDPA[0] = current
