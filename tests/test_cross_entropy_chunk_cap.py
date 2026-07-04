@@ -6,6 +6,10 @@ materializes the full logits and their float32 upcast at once, so at long
 sequence lengths the transient dominates peak memory. The target is capped so
 chunking keeps working regardless of how much memory is free.
 """
+import os
+# Let the module import on CPU-only CI (device detection otherwise raises).
+os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
+
 import importlib
 import types
 
