@@ -41,17 +41,41 @@ def test_qwen3_5_q_norm_also_caught():
         )
 
 
-def test_kv_sharing_plus_k_norm_raises_not_dropped():
-    # The tester's error: KV-sharing keys (k_proj/v_proj) AND k_norm together.
-    # The QK-norm guard must win over the gemma4 strict=False KV-sharing fallback
-    # so the load-bearing norms are never silently dropped.
-    from unsloth_zoo.mlx.loader import _raise_if_qk_norm_version_gap
+def test_kv_sharing_dead_tail_falls_through_to_strict_false():
+    # A gemma4 KV-sharing checkpoint's shared tail carries DEAD k_proj/v_proj/
+    # k_norm (those layers reuse an earlier layer's K/V), so mlx-lm 0.31.3 rejects
+    # exactly that dead tail: k_proj + v_proj + k_norm, never q_norm. Dropping it
+    # via the registered strict=False fallback is safe, so the guard must NOT
+    # raise here (else it regresses a working gemma4_text load - mlx-lm #1242).
+    from unsloth_zoo.mlx.loader import (
+        _KNOWN_MLX_LM_STRICT_FALLBACKS,
+        _message_matches_known_fallback,
+        _raise_if_qk_norm_version_gap,
+    )
 
     msg = (
         "Received 126 parameters not in model: "
         "language_model.model.layers.24.self_attn.k_norm.weight, "
         "language_model.model.layers.24.self_attn.k_proj.weight, "
         "language_model.model.layers.24.self_attn.v_proj.weight"
+    )
+    # Guard must not raise on the dead shared-KV tail.
+    _raise_if_qk_norm_version_gap("gemma4_text", msg, ValueError("orig"))
+    # ... and the message must still match the strict=False fallback that loads it.
+    rule = _KNOWN_MLX_LM_STRICT_FALLBACKS["gemma4_text"]
+    assert _message_matches_known_fallback(msg, rule)
+
+
+def test_active_layer_k_norm_and_q_norm_still_raises():
+    # A genuine QK-norm version gap rejects q_norm/k_norm on active layers WITHOUT
+    # the paired KV-sharing k_proj/v_proj - dropping these would break the model,
+    # so the guard must still raise even though k_norm is present.
+    from unsloth_zoo.mlx.loader import _raise_if_qk_norm_version_gap
+
+    msg = (
+        "Received 8 parameters not in model: "
+        "model.layers.7.self_attn.k_norm.weight, "
+        "model.layers.7.self_attn.q_norm.weight"
     )
     with pytest.raises(ValueError):
         _raise_if_qk_norm_version_gap("gemma4_text", msg, ValueError("orig"))

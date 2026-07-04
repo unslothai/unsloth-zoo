@@ -289,6 +289,24 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
         return
     if not any(marker in message for marker in ("k_norm", "q_norm")):
         return
+    # A gemma4 / gemma3n KV-sharing checkpoint carries DEAD k_proj / v_proj /
+    # k_norm on its shared tail: those layers reuse an earlier layer's K/V and
+    # never run their own K path, so mlx-lm 0.31.3 (which gates k_proj/k_norm on
+    # a non-shared `has_kv`) rejects exactly that dead tail. Such a rejection
+    # lists k_proj AND v_proj alongside k_norm but never q_norm (the Q path is
+    # never shared), and dropping only that dead tail via the registered
+    # strict=False fallback is numerically safe - it is the load this guard must
+    # not break (see _KNOWN_MLX_LM_STRICT_FALLBACKS["gemma4_text"], mlx-lm #1242).
+    # A genuine QK-norm version gap instead rejects q_norm / k_norm on real
+    # (active) layers WITHOUT the paired k_proj / v_proj, because a build lacking
+    # QK-norm still registers standard k_proj / v_proj. Only raise for the latter.
+    kv_sharing_dead_tail = (
+        "self_attn.k_proj" in message
+        and "self_attn.v_proj" in message
+        and "q_norm" not in message
+    )
+    if kv_sharing_dead_tail:
+        return
     versions = []
     for pkg in ("mlx-lm", "mlx-vlm"):
         try:
@@ -417,10 +435,11 @@ def _load_mlx_lm_with_strict_fallback(
         )
     except ValueError as error:
         message = str(error)
-        # QK-norm weights are load-bearing: never strict=False past them. Check
-        # first so an error carrying both KV-sharing keys and q_norm/k_norm (a
-        # broken mlx-lm) raises a clear error instead of silently dropping the
-        # norms via the strict=False fallback below.
+        # Active-layer QK-norm weights are load-bearing: never strict=False past
+        # them. Raise a clear version-gap error for a genuine QK-norm mismatch,
+        # but let the dead KV-sharing tail (k_proj/v_proj/k_norm, no q_norm) fall
+        # through to the registered strict=False fallback below - see
+        # _raise_if_qk_norm_version_gap.
         _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
