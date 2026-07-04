@@ -1029,14 +1029,29 @@ def _diffusers_active_component_dirs(specs: dict) -> set:
     return active
 
 
+def _is_weightless_component(names: list) -> bool:
+    """Whether a component dir (given its top-level file names) is a WEIGHTLESS component --
+    scheduler / tokenizer / feature_extractor, which ship a ``*_config.json`` / tokenizer sidecar and no
+    model weight. Lets such a component satisfy the warm without a weight, while a dir carrying neither a
+    ``config.json`` nor a readable weight nor a recognised sidecar reads as an incomplete model component."""
+    return any(
+        n.endswith("_config.json")
+        or n.startswith("tokenizer")
+        or n in ("preprocessor_config.json", "special_tokens_map.json", "merges.txt", "vocab.json")
+        for n in names
+    )
+
+
 def _diffusers_component_weights_complete(
     snapshot_dir: Path, *, variant: Optional[str], ignore_patterns: Any = None,
 ) -> bool:
     """True when a diffusers pipeline warm holds every weight a plain / variant load reads. Beyond "some
     declared component weight is present" it requires each DECLARED ACTIVE component to be materialised (a
-    non-empty subfolder) AND each model-style component (one carrying ``config.json``) to hold a readable
-    weight of the read format -- so a stale partial missing a whole component (unet present, vae absent) or
-    holding a component's config without its weight is retried over un-killable Xet, not loaded. Excludes
+    non-empty subfolder) AND a model-style component to hold a readable weight of the read format -- a
+    component is model-style unless it is WEIGHTLESS-shaped (a scheduler / tokenizer / feature_extractor
+    sidecar, no config.json + no weight). So a stale partial missing a whole component (unet present, vae
+    absent), holding a component's config without its weight, or holding only a stray / nested-checkpoint
+    file in a component dir is retried over un-killable Xet, not loaded. Excludes
     ROOT-level weights and training-checkpoint subtrees; applies the ignore filter (format the load reads).
     Fails OPEN on a malformed / empty ``model_index.json`` to the lenient any-component-weight check,
     preserving hang protection without false-rejecting. A variant load accepts a component's canonical
@@ -1088,17 +1103,19 @@ def _diffusers_component_weights_complete(
         for comp in active:
             comp_dir = snapshot_dir / comp
             try:
-                present = comp_dir.is_dir() and any(comp_dir.iterdir())
+                names = [e.name for e in comp_dir.iterdir()] if comp_dir.is_dir() else []
             except OSError:
-                present = False
-            if not present:
+                names = []
+            if not names:
                 return False  # a declared active component was never materialised
-            try:
-                has_config = (comp_dir / "config.json").is_file()
-            except OSError:
-                has_config = False
-            if has_config and not _has_read_weight(comp):
-                return False  # a model-style component holds its config but no readable weight
+            if "config.json" in names:  # a model-style component MUST hold a readable weight
+                if not _has_read_weight(comp):
+                    return False
+            elif not _has_read_weight(comp) and not _is_weightless_component(names):
+                # No config.json and no readable weight: OK only when the dir is weightless-SHAPED
+                # (scheduler / tokenizer / feature_extractor sidecars). Otherwise it is an incomplete
+                # model-style component whose weight the load would fetch over un-killable Xet.
+                return False
     # Floor: at least one component holds a weight of the READ format -- rejects a variant-only-for-plain,
     # config-only, checkpoint-only, or undeclared-leftover-only stale snapshot.
     if variant:

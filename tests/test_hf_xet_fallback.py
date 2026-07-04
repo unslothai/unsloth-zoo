@@ -2974,6 +2974,58 @@ def test_post_download_rejects_diffusers_missing_declared_component(tmp_path):
         variant = "fp16") is True
 
 
+def test_post_download_rejects_diffusers_component_dir_without_weight_or_config(tmp_path):
+    """A declared active component dir that is non-empty but holds NEITHER a config.json NOR a readable
+    weight NOR a weightless sidecar (only a stray file or a nested checkpoint) is an incomplete model
+    component -> retried over HTTP, not accepted. A weightless component (its *_config.json sidecar) still
+    passes without a weight."""
+    def _mi():
+        return json.dumps({
+            "_class_name": "StableDiffusionPipeline",
+            "unet": ["diffusers", "UNet2DConditionModel"],
+            "vae": ["diffusers", "AutoencoderKL"],
+            "scheduler": ["diffusers", "PNDMScheduler"],
+            "tokenizer": ["transformers", "CLIPTokenizer"],
+        })
+
+    def _base(root, name, blob):
+        (root / "model_index.json").write_text(_mi())
+        d = root / "unet"
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+        (d / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+        for n in ("scheduler", "tokenizer"):
+            wl = root / n
+            wl.mkdir()
+            (wl / f"{n}_config.json").write_text("{}")
+
+    # vae dir holds only a nested training-checkpoint weight (no top-level config / weight) -> reject.
+    snap, blob = _mk_snapshot(tmp_path, "diff_comp_nested_ckpt")
+    _base(snap, "unet", blob)
+    ckpt = snap / "vae" / "checkpoint-500"
+    ckpt.mkdir(parents = True)
+    (ckpt / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # vae dir holds only a stray non-weight file -> reject.
+    snap2, blob2 = _mk_snapshot(tmp_path, "diff_comp_stray")
+    _base(snap2, "unet", blob2)
+    (snap2 / "vae").mkdir()
+    (snap2 / "vae" / "README.md").write_text("x")
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # Complete: vae holds config + weight -> accept (weightless scheduler/tokenizer need no weight).
+    snap3, blob3 = _mk_snapshot(tmp_path, "diff_comp_complete")
+    _base(snap3, "unet", blob3)
+    (snap3 / "vae").mkdir()
+    (snap3 / "vae" / "config.json").write_text("{}")
+    (snap3 / "vae" / "diffusion_pytorch_model.safetensors").symlink_to(blob3)
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
 def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
     """Variant twin of single-beats-index: a complete single variant weight beside a stale variant index is usable (ST and bin); a stale index with no single weight is breakage."""
     snap, blob = _mk_snapshot(tmp_path, "single_variant_beats_index")
