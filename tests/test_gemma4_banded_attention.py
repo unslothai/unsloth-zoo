@@ -90,3 +90,26 @@ def test_mask_is_plain_band_detection():
     padded[..., S - 1, 0:1] = True
     assert not _mask_is_plain_band(padded, S, w)
     assert _mask_is_plain_band(None, S, w)
+
+
+def test_mask_is_plain_band_rejects_non_probe_violation():
+    # A band broken only at an interior row (a packed-sequence boundary) must be
+    # rejected: the verifier checks every row, not a sampled subset.
+    S, w = 128, 32
+    packed = _band_mask_full(S, w)[None, None].clone()
+    packed[..., 50, 40] = False    # drop an in-band key at a non-probe row
+    assert not _mask_is_plain_band(packed, S, w)
+
+
+def test_mask_is_plain_band_survives_id_reuse():
+    # A recycled object id must not produce a stale cached verdict for packed masks.
+    S, w = 128, 32
+    template = _band_mask_full(S, w)[None, None].clone()
+    template[..., 50, 40] = False    # packed-style violation on a non-probe row
+    valid = _band_mask_full(S, w)[None, None]
+    assert _mask_is_plain_band(valid, S, w)    # caches a True verdict on this object
+    del valid                                  # frees its id for reuse
+    for _ in range(5000):
+        packed = template.clone()              # a distinct object, may land on the freed id
+        assert not _mask_is_plain_band(packed, S, w)
+        del packed

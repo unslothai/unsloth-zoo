@@ -24,7 +24,8 @@
 # previous block), and fold blocks into the batch dim for a single SDPA call.
 # Backward is exact through SDPA; fp32 rel ~1e-8 vs full SDPA + band mask.
 # Engaged only when the mask is exactly the causal+sliding band with no token
-# padding (verified on probe rows), else defers to SDPA. Opt-in UNSLOTH_BANDED_SDPA=1.
+# padding (fully verified, so packed masks defer), else defers to SDPA.
+# Opt-in UNSLOTH_BANDED_SDPA=1.
 # ============================================================================
 
 import os
@@ -35,7 +36,6 @@ from .common import logger
 __all__ = ["maybe_banded_sliding"]
 
 _MASK_CACHE = {}    # (w, nb, device) -> (nb,1,w,2w) bool block mask
-_BAND_OK = {}       # id(attention_mask) -> bool (is it a plain no-padding band)
 _ENGAGED = [0]      # count of banded-path invocations (debug)
 
 
@@ -59,34 +59,32 @@ def _block_mask(w, nb, device):
 
 
 def _mask_is_plain_band(mask, S, w):
-    """True if `mask` is exactly the causal+sliding band with no token padding."""
+    """True only if `mask` is exactly the causal+sliding band with no token padding.
+
+    Every row is verified (not a sampled subset), so packed or padded masks, whose
+    extra segment boundaries the banded path cannot honour, are always rejected. The
+    verdict is stashed on the tensor itself, so it can never collide with a recycled
+    object id.
+    """
     if mask is None:
         return True
     if not torch.is_tensor(mask) or mask.dim() != 4:
         return False
-    key = id(mask)
-    cached = _BAND_OK.get(key)
+    cached = getattr(mask, "_unsloth_plain_band", None)
     if cached is not None:
         return cached
-    if len(_BAND_OK) > 64:
-        _BAND_OK.clear()
     m = mask[0, 0]
     if m.shape[-2] != S or m.shape[-1] != S:
-        _BAND_OK[key] = False
-        return False
-    allowed = m if m.dtype == torch.bool else (m > -1e4)
-    dev = m.device
-    cand = sorted({x for x in (0, 1, w - 1, w, w + 1, 2 * w, S // 2, S - 1, S - w, S - w - 1) if 0 <= x < S})
-    probes = torch.tensor(cand, device=dev)
-    rows = allowed[probes]                                # (P, S)
-    idx = torch.arange(S, device=dev)[None, :]
-    cnt = rows.sum(-1)
-    minidx = torch.where(rows, idx, torch.full_like(idx, S)).amin(-1)
-    maxidx = torch.where(rows, idx, torch.full_like(idx, -1)).amax(-1)
-    lo = torch.clamp(probes - w + 1, min=0)
-    hi = probes
-    ok = bool(((cnt == (hi - lo + 1)) & (minidx == lo) & (maxidx == hi)).all().item())
-    _BAND_OK[key] = ok
+        ok = False
+    else:
+        allowed = m if m.dtype == torch.bool else (m > -1e4)
+        idx = torch.arange(S, device=m.device)
+        band = (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - w)
+        ok = bool((allowed == band).all().item())
+    try:
+        mask._unsloth_plain_band = ok
+    except Exception:
+        pass
     return ok
 
 
@@ -103,7 +101,7 @@ def _banded_sdpa_core(query, key, value, w, scaling, dropout, num_key_value_grou
         key = F.pad(key, (0, 0, 0, Sp - S))
         value = F.pad(value, (0, 0, 0, Sp - S))
     nb = Sp // w
-    qb = query.view(B, H, nb, w, d).permute(0, 2, 1, 3, 4).reshape(B * nb, H, w, d)
+    qb = query.reshape(B, H, nb, w, d).permute(0, 2, 1, 3, 4).reshape(B * nb, H, w, d)
     kpad = F.pad(key, (0, 0, w, 0))                       # (B,H, w+Sp, d)
     vpad = F.pad(value, (0, 0, w, 0))
     kw = kpad.unfold(2, 2 * w, w).permute(0, 1, 2, 4, 3)  # (B,H,nb,2w,d)
@@ -113,7 +111,7 @@ def _banded_sdpa_core(query, key, value, w, scaling, dropout, num_key_value_grou
     mask = _block_mask(w, nb, query.device)
     mask = mask.expand(B, nb, 1, w, 2 * w).reshape(B * nb, 1, w, 2 * w)
     out = F.scaled_dot_product_attention(qb, kw, vw, attn_mask=mask, dropout_p=dropout, scale=scaling)
-    out = out.view(B, nb, H, w, d).permute(0, 2, 1, 3, 4).reshape(B, H, Sp, d)[:, :, :S]
+    out = out.reshape(B, nb, H, w, d).permute(0, 2, 1, 3, 4).reshape(B, H, Sp, d)[:, :, :S]
     return out.transpose(1, 2).contiguous()               # (B,S,H,d) to match sdpa_attention_forward
 
 
