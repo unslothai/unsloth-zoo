@@ -19,27 +19,21 @@
 #
 # Direct analog of the Gemma3 float32 patches in gemma.py. When gemma4 is in
 # unsloth_zoo.model_lists.FORCE_FLOAT32, a fp16 request loads bf16 weights,
-# down-casts them to fp16 (do_forced_float32), and relies on these per-module
-# patches to keep the residual stream in float32 while running the matmuls in
-# fp16. Without them fp16 NaNs the grad_norm in the backward (forward peaks at
-# ~350, far below fp16's 65504, so it is a backward gradient overflow), and a
-# generic fp32 RoPE upcast of q/k while v stays fp16 makes SDPA raise a dtype
-# mismatch. All three patches gate on UNSLOTH_FORCE_FLOAT32 == "1" so bf16 /
-# fp32 runs (and fp16 runs on other archs) are untouched.
+# down-casts them to fp16, and relies on these per-module patches to keep the
+# residual stream in float32 while matmuls run in fp16. Without them fp16 NaNs
+# the grad_norm in backward (forward peaks ~350, far below fp16's 65504, so it
+# is a backward gradient overflow), and an fp32 RoPE upcast of q/k while v stays
+# fp16 makes SDPA raise a dtype mismatch. All three gate on
+# UNSLOTH_FORCE_FLOAT32 == "1", so bf16 / fp32 (and fp16 on other archs) are untouched.
 #
-# What each patch does (only the precision-sensitive ops upcast; the rest of
-# the model stays fp16, so this is targeted, not a whole-model float32 wrap):
-#   * ScaledWordEmbedding -> returns float32, keeping the residual highway in
-#     float32 so gradients accumulate without fp16 overflow.
-#   * RMSNorm             -> computes in float32, returns fp16 (clamped), so
-#     each sub-layer entry down-casts the fp32 residual back to fp16 for the
-#     fp16 projections; residual adds (fp32 + fp16) stay fp32.
-#   * TextAttention       -> q/k/v + scores all float32 (consistent dtype, no
-#     SDPA mismatch), attention output down-cast to fp16 for o_proj.
-# The MLP / MoE-expert path is handled by the existing fp16 overflow clamp in
-# gemma4.py (patch_Gemma4TextMLP) plus the grouped-GEMM expert forward, both of
-# which already run gate*up in float32 for fp16 inputs, so no extra MLP patch is
-# needed here.
+# Only the precision-sensitive ops upcast (targeted, not a whole-model wrap):
+#   * ScaledWordEmbedding -> returns float32, keeping the residual highway fp32.
+#   * RMSNorm             -> computes in float32, returns fp16 (clamped); residual
+#     adds (fp32 + fp16) stay fp32.
+#   * TextAttention       -> q/k/v + scores all float32 (no SDPA mismatch), output
+#     down-cast to fp16 for o_proj.
+# MLP / MoE experts are already handled by gemma4.py's fp16 overflow clamp plus
+# the grouped-GEMM expert forward, so no extra MLP patch is needed here.
 # ============================================================================
 
 import os
@@ -181,11 +175,9 @@ def patch_Gemma4TextAttention():
         attn_output = self.o_proj(attn_output)
         return attn_output, None
     pass
-    # force = True: this patch runs after gemma4.py's shared-KV carrier has already
-    # wrapped forward as (self, *args, **kwargs); a signature check would reject the
-    # replacement, so the compiler would capture the carrier/original attention (q/k
-    # float32 vs v fp16 -> SDPA dtype mismatch) instead of this float32 forward. The
-    # carrier is handled inline above, so replacing it outright is safe.
+    # force = True: gemma4.py's shared-KV carrier already wrapped forward as
+    # (self, *args, **kwargs); a signature check would reject this replacement (capturing
+    # the carrier's q/k-fp32-vs-v-fp16 SDPA mismatch). Carrier handled inline above, so safe.
     patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4TextAttention, "forward", forward, force = True, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextAttention)

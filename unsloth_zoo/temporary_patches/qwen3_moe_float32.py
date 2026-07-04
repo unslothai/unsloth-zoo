@@ -19,32 +19,25 @@
 #
 # Direct analog of the Gemma4 float32 patches in gemma4_float32.py. When
 # qwen3_moe is in unsloth_zoo.model_lists.FORCE_FLOAT32, a fp16 request loads
-# bf16 weights, down-casts them to fp16 (do_forced_float32, bnb compute = fp16)
-# and runs under autocast(fp16); these per-module patches keep the residual
-# stream in float32 while the matmuls / experts stay fp16. Without them fp16
-# NaNs the grad_norm in the backward (forward peaks at ~350, far below fp16's
-# 65504, so it is a backward gradient overflow), and do_forced_float32 upcasts
-# the RMSNorm weights to float32 which makes q/k float32 while v stays fp16 ->
-# SDPA raises "expected mat1 and mat2 to have the same dtype, float != Half".
-# All patches gate on UNSLOTH_FORCE_FLOAT32 == "1" so bf16 / fp32 runs (and fp16
-# runs on other archs) are untouched.
+# bf16 weights, down-casts them to fp16 and runs under autocast(fp16); these
+# patches keep the residual stream in float32 while the matmuls / experts stay
+# fp16. Without them fp16 NaNs the grad_norm in backward (forward peaks ~350,
+# far below fp16's 65504, so it is a backward gradient overflow), and
+# do_forced_float32 upcasts the RMSNorm weights to float32, making q/k float32
+# while v stays fp16 -> SDPA raises "float != Half". All patches gate on
+# UNSLOTH_FORCE_FLOAT32 == "1", so bf16 / fp32 (and fp16 on other archs) are untouched.
 #
-# What each patch does (only the precision-sensitive ops upcast; projections /
-# experts / router stay fp16, so this is targeted, not a whole-model float32):
+# Only the precision-sensitive ops upcast (targeted, not a whole-model float32):
 #   * DecoderLayer -> residual stream upcast to float32 at each sub-layer entry.
-#     Qwen3 has a PLAIN (unscaled) embedding, so unlike Gemma4's
-#     ScaledWordEmbedding we keep the residual highway float32 here instead. The
-#     RMSNorm down-casts the fp32 residual back to fp16 for the fp16 projections;
-#     residual adds (fp32 + fp16) stay fp32, so backward gradients accumulate
-#     without fp16 overflow. This layer is NOT torch.compiled (the compiler only
-#     rewrites the sub-modules), so patching it runs as plain eager Python.
+#     Qwen3's embedding is PLAIN (unscaled), so we hold the residual highway fp32
+#     here; RMSNorm down-casts it back to fp16 and residual adds (fp32 + fp16)
+#     stay fp32. Not torch.compiled (the compiler only rewrites sub-modules).
 #   * RMSNorm      -> computes in float32, returns fp16 (clamped). Qwen3 scales by
-#     `weight` directly (NO 1.0 + weight, unlike Gemma) and uses variance_epsilon.
-#   * Attention    -> q/k/v + scores all float32 (consistent dtype, no SDPA
-#     mismatch), attention output down-cast to fp16 for o_proj.
-# The MoE expert / router path is untouched here: the existing qwen3_moe.py
-# block-forward already computes the router softmax in float32 and the grouped
-# expert GEMM stays fp16, so no extra MLP/expert patch is needed.
+#     `weight` directly (no 1.0 + weight) with variance_epsilon.
+#   * Attention    -> q/k/v + scores all float32 (no SDPA mismatch), output
+#     down-cast to fp16 for o_proj.
+# MoE experts / router are untouched: qwen3_moe.py's block-forward already does the
+# router softmax in float32 and the grouped expert GEMM stays fp16.
 # ============================================================================
 
 import os
