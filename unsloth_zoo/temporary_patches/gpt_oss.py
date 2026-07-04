@@ -905,9 +905,8 @@ class GptOssExpertsBnb4bit(nn.Module):
 
         cached = getattr(self, "_unsloth_grouped_qs", None)
         if cached is None:
-            # One QuantState spanning all experts (packed NF4 is elementwise
-            # row-major, so per-expert byte + fp32 absmax concat is exact):
-            # ONE dequantize_4bit launch per stack instead of num_experts.
+            # One QuantState spanning all experts (packed NF4 is elementwise row-major,
+            # so per-expert byte + fp32 absmax concat is exact): one dequant launch per stack.
             from bitsandbytes.functional import QuantState
 
             def _absmax_fp32(qs):
