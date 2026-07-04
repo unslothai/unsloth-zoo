@@ -17,13 +17,10 @@
 """Make the bundled ``flash-linear-attention`` (fla) kernels importable as
 top-level ``fla`` so users do not need ``pip install flash-linear-attention``.
 
-Qwen3.5 / Qwen3.6 / Qwen3-Next are hybrid gated-deltanet models. Transformers
-routes their linear-attention layers to fla's Triton kernels when
-``is_flash_linear_attention_available()`` is true, otherwise to a pure-PyTorch
-chunked recurrence that is several times slower. This patch registers the
-pruned, pinned ``unsloth_zoo/_vendored/fla`` snapshot into ``sys.modules`` under
-the name ``fla`` (a real, walkable package) and reports availability, so the
-fast path works out of the box.
+Qwen3.5 / Qwen3.6 / Qwen3-Next gated-deltanet models use fla's Triton kernels
+when ``is_flash_linear_attention_available()`` is true, else a several-times
+slower pure-PyTorch path. This registers the pruned ``unsloth_zoo/_vendored/fla``
+snapshot into ``sys.modules`` as a real, walkable ``fla`` and reports availability.
 
 Precedence / escape hatches:
   * ``UNSLOTH_DISABLE_VENDORED_FLA=1`` -> do nothing (keep the pure-torch path).
@@ -33,8 +30,6 @@ Precedence / escape hatches:
   * Only injects when torch >= 2.7, triton >= 3.3 and CUDA are available (the
     requirements of the vendored fla-core 0.5.1 kernels); otherwise the
     pure-torch fallback is left untouched.
-
-Injection style mirrors ``unsloth_zoo/stubs/triton_stub.py:inject_into_sys_modules``.
 """
 
 __all__ = [
@@ -56,11 +51,9 @@ from .common import (
 # apart from a user-installed fla.
 _VENDORED_MARK = "_UNSLOTH_VENDORED_FLA"
 
-# Subpackages eagerly registered so `is_flash_linear_attention_available`,
-# `pkgutil.walk_packages(fla.__path__)` (used by compile_fla_no_autotune) and the
-# transformers `from fla... import ...` all resolve to the vendored tree. Importing
-# gated_delta_rule transitively pulls fla.ops.common(.*), fla.ops.cp(.*),
-# fla.ops.utils and fla.utils.
+# Eagerly registered so compile_fla_no_autotune's walk_packages and transformers'
+# `from fla... import ...` resolve to the vendored tree. Importing gated_delta_rule
+# transitively pulls fla.ops.common/cp/utils and fla.utils.
 _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 
 # Gated-deltanet modeling modules that bind the fla symbols as module globals at
@@ -80,8 +73,8 @@ def _flag(name):
 
 def _vendored_fla_dir():
     # This file lives at unsloth_zoo/temporary_patches/fla_vendor.py
-    here = os.path.dirname(os.path.abspath(__file__))   # .../unsloth_zoo/temporary_patches
-    pkg_root = os.path.dirname(here)                    # .../unsloth_zoo
+    here = os.path.dirname(os.path.abspath(__file__))
+    pkg_root = os.path.dirname(here)
     return os.path.join(pkg_root, "_vendored", "fla")
 
 
