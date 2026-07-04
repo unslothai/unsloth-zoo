@@ -26,7 +26,7 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from .temporary_patches.common import torch_compile_options, UNSLOTH_ENABLE_LOGGING
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
@@ -944,6 +944,77 @@ def grpo_accumulated_loss(
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
 
+    # ---- PrefixGrouper (GRPO shared-prompt dedup; default OFF => byte-identical) ----
+    # In GRPO every prompt spawns G=num_generations completions that share the prompt prefix.
+    # The full-row packed path below forwards that prefix G times; PrefixGrouper stores it ONCE
+    # and concatenates only the G suffixes (FlexAttention shared-prefix mask), cutting the trunk
+    # forward from G*(P+R) to P+G*R tokens. Gated behind UNSLOTH_GRPO_PREFIX_GROUPER (requires
+    # seq-packing on). tok_r auto-gate + first-use self-verify vs the full-row packed new_logprobs
+    # (fall back + mark-unsafe on mismatch). Loss/gradients flow through the shared-prefix stream
+    # (the prefix contributes grad once = the sum of the G repeats, mathematically identical). When
+    # off / grouping fails / not yet verified, the full-row packed path below runs as before.
+    _pg_result = None
+    _pg_use = False
+    _pg_skip_pack = False
+    _pg_num_gen = getattr(trainer, "num_generations", None)
+    # Cheap env check FIRST so the default-off path never imports or runs any PG code
+    # (truly byte-identical when the gate is unset).
+    _pg_engage = os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "0").lower() not in (
+        "0", "false", "no", "off",
+    )
+    if _pg_engage:
+        try:
+            from unsloth.utils.prefix_grouper import (
+                build_group_layout as _pg_build_layout,
+                prefix_grouper_enabled as _pg_enabled_fn,
+                verify_on as _pg_verify_on,
+                tol_ok as _pg_tol_ok,
+                TOL_KILL as _PG_TOL_KILL,
+            )
+            _pg_engage = (
+                _pg_enabled_fn()
+                and pixel_values is None
+                and token_type_ids is None
+                and mm_token_type_ids is None
+                and _pg_num_gen is not None
+                and _pg_num_gen >= 2
+            )
+        except Exception:
+            _pg_engage = False
+    _pg_layout = None
+    _pg_trusted = False   # signature already verified -> skip the full-row forward this step
+    if _pg_engage:
+        try:
+            _pg_pad_id = trainer.processing_class.pad_token_id
+            # Build the layout from the LEFT-PACKED input_ids with the ORIGINAL left-pad counts,
+            # so PrefixGrouper's prefix/suffix split matches the packed path's prompt/completion
+            # split (_pack_cstart) exactly and the verify is apples-to-apples.
+            _pg_layout = _pg_build_layout(
+                input_ids, logits_to_keep, _pg_pad_id, _pg_num_gen, left_pad_tokens_per_prompt,
+            )
+            _pg_unsafe = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
+            if _pg_unsafe is None:
+                _pg_unsafe = set()
+            if _pg_layout is not None and _pg_layout.signature in _pg_unsafe:
+                _pg_layout = None
+            elif _pg_layout is not None:
+                _pg_layout.W = logits_to_keep + max_left_pad
+                _pg_verified = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
+                if _pg_verified is None:
+                    _pg_verified = set()
+                if (not _pg_verify_on()) or _pg_layout.signature in _pg_verified:
+                    _pg_trusted = True
+                    _pg_skip_pack = True   # trusted shape -> skip the full-row forward
+        except Exception as _pg_err:
+            _pg_layout = None
+            _pg_trusted = False
+            _pg_skip_pack = False
+            if isinstance(_pg_err, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+            os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"[Unsloth] GRPO PrefixGrouper (grad) disabled (fell back to packed): {_pg_err!r}", flush = True)
+
     # ---- Sequence packing (default-on; disable with UNSLOTH_GRPO_SEQ_PACKING=0) ----
     # One varlen [1, sum L] block-diagonal forward replaces the padded [B, Lmax] loop: the exact per-row
     # result, and it fixes the padded path's left-pad RoPE error. Loss/gradients flow through it. Self-
@@ -954,7 +1025,7 @@ def grpo_accumulated_loss(
     _pack_use = False
     _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
     _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
-    if (_pack_enabled and pixel_values is None
+    if (_pack_enabled and not _pg_skip_pack and pixel_values is None
             and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
         # this function's source is copied into the generated GRPO trainer, so import the logging
         # flag locally (before the try) to keep the bare name defined there too
@@ -1078,7 +1149,79 @@ def grpo_accumulated_loss(
             unwrapped_model._unsloth_seq_packing_grad_ok = False
             if UNSLOTH_ENABLE_LOGGING:
                 print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
-    if _pack_use and _pack_result is not None:
+    # ---- PrefixGrouper resolution + first-use self-verify (grad) ----
+    # Verify (no_grad, value only) and the loss forward (grad) are DECOUPLED: the shared-prefix
+    # verify forward runs under torch.no_grad() so its inference tensors never enter autograd,
+    # then a SEPARATE grad forward builds new_logprobs for the loss. This mirrors the packed
+    # path's verify/trust model and avoids "inference tensors saved for backward".
+    def _pg_grad_forward():
+        _pg_chunks = max(1, total_rows * multiplier)
+        with autocaster:
+            _h = unwrapped_model(
+                input_ids = _pg_layout.flat_ids,
+                position_ids = _pg_layout.position_ids,
+                prefix_seg_info = _pg_layout.prefix_seg_info,
+                use_cache = False,
+            ).logits
+            return _pg_layout.extract_logps(
+                _h, lm_head, chunked_hidden_states_selective_log_softmax,
+                _pg_chunks, logit_scale_multiply, logit_scale_divide,
+                logit_softcapping, temperature,
+            )  # [total_rows, W] with grad
+
+    if _pg_layout is not None:
+        try:
+            if not _pg_trusted:
+                # first use for this structure: verify vs the full-row packed new_logprobs
+                # (itself self-verified vs per-row). PASS < tol_ok -> trust; >= TOL_KILL ->
+                # mark unsafe forever; borderline -> fall back this shape.
+                if _pack_use and _pack_result is not None:
+                    with torch.no_grad():
+                        _pg_ref = _pg_grad_forward()
+                    _pg_W2 = logits_to_keep + max_left_pad
+                    _pg_cm = create_completion_attention_mask(
+                        input_ids[:, -_pg_W2:], left_pad_tokens_per_prompt, max_left_pad,
+                        trainer.processing_class.pad_token_id,
+                    ).float()
+                    _pg_a = _pg_ref[:, -_pg_W2:].float()
+                    _pg_b = _pack_result.detach()[:, -_pg_W2:].float()
+                    _pg_diff = float(((_pg_a - _pg_b).abs() * _pg_cm).max())
+                    if UNSLOTH_ENABLE_LOGGING:
+                        print(
+                            f"[Unsloth] GRPO PrefixGrouper (grad) verify: sig={_pg_layout.signature} "
+                            f"shared-prefix vs full-row-packed max|d|={_pg_diff:.4f}", flush = True,
+                        )
+                    if _pg_diff < _pg_tol_ok():
+                        _pg_v = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
+                        if _pg_v is None:
+                            _pg_v = set()
+                        _pg_v.add(_pg_layout.signature)
+                        unwrapped_model._unsloth_prefix_grouper_grad_verified = _pg_v
+                        _pg_trusted = True
+                    else:
+                        _pg_u = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
+                        if _pg_u is None:
+                            _pg_u = set()
+                        if _pg_diff >= _PG_TOL_KILL:
+                            _pg_u.add(_pg_layout.signature)
+                            unwrapped_model._unsloth_prefix_grouper_grad_unsafe = _pg_u
+                        _pg_trusted = False
+                # else: no full-row reference (packing off/failed) -> cannot verify -> fall back.
+            if _pg_trusted:
+                _pg_result = _pg_grad_forward()   # grad forward for the loss
+                _pg_use = True
+        except Exception as _pg_err2:
+            _pg_use = False
+            os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+            if isinstance(_pg_err2, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"[Unsloth] GRPO PrefixGrouper (grad) forward failed -> full-row packed: {_pg_err2!r}", flush = True)
+
+    if _pg_use and _pg_result is not None:
+        new_logprobs = _pg_result            # PrefixGrouper verified/trusted -> skip the loop
+        zipped_inputs = []
+    elif _pack_use and _pack_result is not None:
         new_logprobs = _pack_result          # verified -> skip the loop
         zipped_inputs = []
     else:
