@@ -64,7 +64,6 @@ def test_twin_built_for_per_expert_expert_converter():
     twin = twins[0]
 
     # Aux keys come first so they are collected alongside the weights.
-    n_base = len(conv.source_patterns)
     expected_aux = [b + suf for b in conv.source_patterns for suf in _AUX_SUFFIXES]
     assert list(twin.source_patterns[: len(expected_aux)]) == expected_aux
 

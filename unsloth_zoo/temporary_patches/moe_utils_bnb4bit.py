@@ -609,7 +609,8 @@ def _bnb4bit_expert_weight_conversions(hf_quantizer):
         def convert(self, input_dict, model=None, full_layer_name=None, **kwargs):
             if len(input_dict) == 1:
                 return input_dict  # no quant stats collected -> not prequantized
-            for key, value in input_dict.items():
+            input_dict = dict(input_dict)  # avoid mutating the caller's dict
+            for key, value in list(input_dict.items()):
                 if isinstance(value, list):
                     input_dict[key] = value[0]
             weight = input_dict.pop(self.param_name)
@@ -621,6 +622,9 @@ def _bnb4bit_expert_weight_conversions(hf_quantizer):
                 device=weight.device,
                 module=module,
             )
+            # _original_shape is needed by PEFT LoRA to recover the logical 3D shape.
+            if getattr(new_value, "quant_state", None) is not None:
+                new_value._original_shape = new_value.quant_state.shape
             module._is_hf_initialized = True
             return {self.param_name: new_value}
 
@@ -740,28 +744,40 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     )
                 return out
 
+            input_dict = dict(input_dict)  # avoid mutating the caller's dict
             for key, value in list(input_dict.items()):
                 if not isinstance(value, list):
                     input_dict[key] = [value]
 
-            counts = {len(input_dict[a]) for a in self.anchored_sources if a in input_dict}
+            # Only keep sources actually present; guard against missing/mismatched keys.
+            present_sources = [
+                (base, anch)
+                for base, anch in zip(self.base_sources, self.anchored_sources)
+                if anch in input_dict
+            ]
+            if not present_sources:
+                raise ValueError(
+                    f"Unsloth: no expert weights found in input_dict for {full_layer_name}"
+                )
+
+            counts = {len(input_dict[anch]) for _, anch in present_sources}
             if len(counts) != 1:
                 raise ValueError(
                     f"Unsloth: inconsistent per-expert tensor counts {counts} for {full_layer_name}"
                 )
             num_experts = counts.pop()
 
-            device = input_dict[self.anchored_sources[0]][0].device
+            device = input_dict[present_sources[0][1]][0].device
             first_qs = None
             src_shapes = []
             per_src_absmax = []  # [src][expert] fp32 absmax
-            for base, anch in zip(self.base_sources, self.anchored_sources):
+            for base, anch in present_sources:
                 absmax_list = []
                 for e in range(num_experts):
                     qd = {}
                     for suf in _AUX_SUFFIXES:
                         vals = input_dict.get(base + suf)
-                        if vals is not None:
+                        if vals is not None and e < len(vals):
                             qd["weight" + suf] = vals[e]
                     qs = QuantState.from_dict(qs_dict=qd, device=device)
                     if first_qs is None:
@@ -779,9 +795,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             packed_rows, absmax_rows = [], []
             for e in range(num_experts):
                 packed_rows.append(torch.cat(
-                    [input_dict[a][e].reshape(-1) for a in self.anchored_sources]
+                    [input_dict[anch][e].reshape(-1) for _, anch in present_sources]
                 ))
-                absmax_rows.append(torch.cat([per_src_absmax[i][e] for i in range(len(self.base_sources))]))
+                absmax_rows.append(torch.cat([per_src_absmax[i][e] for i in range(len(present_sources))]))
             data = torch.stack(packed_rows).unsqueeze(-1)  # (E, bytes_per_expert, 1)
             absmax = torch.cat(absmax_rows)
 
@@ -811,6 +827,10 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     twins = []
     for conv in model_conversions:
         if not isinstance(conv, WeightConverter):
+            continue
+        # Single-target only: a twin returns target_patterns[0] alone, so a
+        # many-to-many mapping would leave its remaining targets unloaded.
+        if len(conv.target_patterns) != 1:
             continue
         target = conv.target_patterns[0]
         if not target.endswith(("gate_up_proj", "down_proj")):
@@ -879,7 +899,9 @@ def patch_bnb4bit_dequantize_plain_params():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
 
-    original_after_load = Bnb4BitHfQuantizer._process_model_after_weight_loading
+    original_after_load = getattr(Bnb4BitHfQuantizer, "_process_model_after_weight_loading", None)
+    if original_after_load is None:
+        return
     if getattr(original_after_load, "_unsloth_plain_dequant_patched", False):
         return
 
@@ -914,7 +936,7 @@ def _dequantize_plain_param_slots(model: nn.Module):
             if quant_state is None:
                 continue
             dequant = bnb.functional.dequantize_4bit(param.data, quant_state)
-            setattr(module, name, nn.Parameter(dequant, requires_grad=False))
+            setattr(module, name, nn.Parameter(dequant, requires_grad=param.requires_grad))
             if UNSLOTH_ENABLE_LOGGING:
                 logger.info(
                     f"Unsloth: dequantized non-Linear 4-bit param {module_name}.{name} "
