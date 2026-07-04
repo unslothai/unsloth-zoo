@@ -1392,8 +1392,7 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
-    # Gate gradient via the <A, dA> identity (env-gated) so the combine never
-    # caches Y just for the gate multiply. Disabled when a down bias exists.
+    # Env-gated gate-grad identity; disabled when a down bias exists (identity assumes a linear down).
     _gategrad = (
         _moe_gategrad_enabled()
         and getattr(self, "down_proj_bias", None) is None
