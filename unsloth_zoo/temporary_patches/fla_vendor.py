@@ -81,7 +81,11 @@ def _vendored_fla_dir():
 def _version_at_least(value, minimum):
     try:
         from packaging import version
-        return version.parse(str(value).split("+")[0]) >= version.parse(minimum)
+        # Compare base versions so dev/nightly/pre-release builds still satisfy
+        # the minimum: version.parse orders 2.7.0.dev... / 3.3.0a0 *below* the
+        # release, which would wrongly reject a valid 2.7 nightly.
+        parsed = version.parse(str(value).split("+")[0])
+        return version.parse(parsed.base_version) >= version.parse(minimum)
     except Exception:
         return False
 
@@ -157,6 +161,15 @@ def _inject_vendored_fla():
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: vendored fla missing at {init_path}; keeping pure-torch path.")
         return False
+
+    # The pruned snapshot drops the TileLang kernels (backends/tilelang/chunk_bwd
+    # and parallel_attn_*) and the IntraCard CP impl (ops/common/intracard_cp), so
+    # force their backend flags off. Otherwise the 'common' dispatch would route a
+    # gated chunk_bwd_dqkwg to TileLang (on by default whenever an external
+    # tilelang is installed) and hit ModuleNotFoundError. Set only for our injected
+    # tree; a deferred-to real fla install never reaches here.
+    os.environ["FLA_TILELANG"] = "0"
+    os.environ["FLA_INTRACARD_CP"] = "0"
 
     # Snapshot then purge any pre-existing fla* modules (e.g. a real install we
     # are shadowing under UNSLOTH_FORCE_VENDORED_FLA) so imports resolve to the
