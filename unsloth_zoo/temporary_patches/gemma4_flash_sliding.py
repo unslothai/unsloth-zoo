@@ -17,15 +17,12 @@
 # ============================================================================
 # FlashAttention-2 for Gemma-4 sliding-window layers.
 #
-# Gemma-4's head_dim 512 global layers force FA2 off model-wide, so all 30
-# layers fall back to O(S^2) SDPA. But a causal sliding window is exactly
-# FA2's window_size=(w-1, 0), so route just the sliding layers (head_dim <=
-# 256, plain causal band mask, no padding) through FA2; global layers and
-# padded / non-band masks defer unchanged to the original SDPA. Backward is
-# exact through FA2; numerics match SDPA to bf16 rounding.
-#
-# On by default when flash-attn is importable; UNSLOTH_GEMMA4_FLASH_SLIDING=0
-# reverts to SDPA.
+# Gemma-4's head_dim 512 global layers force FA2 off model-wide, so every layer
+# falls back to O(S^2) SDPA. A causal sliding window is exactly FA2's
+# window_size=(w-1, 0), so route only the sliding layers (head_dim <= 256, plain
+# causal band mask, no padding) through FA2; global and padded / non-band masks
+# defer to the original SDPA. Backward is exact; numerics match SDPA to bf16.
+# On by default with flash-attn; UNSLOTH_GEMMA4_FLASH_SLIDING=0 reverts to SDPA.
 # ============================================================================
 
 import os
@@ -134,7 +131,7 @@ def patch_gemma4_flash_sliding():
     except Exception as e:
         return raise_error("ALL_ATTENTION_FUNCTIONS['sdpa']", e)
     if getattr(current, "_unsloth_gemma4_flash", False):
-        return  # already wrapped
+        return
     _ORIG_SDPA[0] = current
     _sdpa_maybe_flash_sliding._unsloth_gemma4_flash = True
     # Direct assignment: AttentionInterface.register() does not update the
