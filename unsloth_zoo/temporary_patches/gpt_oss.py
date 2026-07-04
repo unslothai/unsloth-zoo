@@ -874,7 +874,11 @@ class GptOssExpertsBnb4bit(nn.Module):
                 if w.requires_grad:
                     return _fail("expert weight requires_grad")
                 b = getattr(lin, "bias", None)
-                if b is not None and b.requires_grad:
+                # Grouped path stacks per-expert biases, so a missing bias would
+                # break torch.stack; require all present and fall back otherwise.
+                if b is None:
+                    return _fail("expert bias is None")
+                if b.requires_grad:
                     return _fail("expert bias requires_grad")
         except Exception as e:
             return _fail(f"{type(e).__name__}: {e}")
@@ -955,7 +959,9 @@ class GptOssExpertsBnb4bit(nn.Module):
         weighted = out.to(torch.float32) * routing_weights[sorted_tokens, sorted_experts, None].to(torch.float32)
         next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=device)
         next_states.index_add_(0, sorted_tokens, weighted)
-        return next_states.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+        # Grouped path only runs in training; mirror torch_native_forward's
+        # training branch, which returns fp32 (fp16 NaN protection).
+        return next_states.view(batch_size, -1, self.hidden_size).to(torch.float32)
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
