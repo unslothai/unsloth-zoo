@@ -1,0 +1,25 @@
+Unsloth Zoo
+Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team.
+
+This product bundles the following third-party components. Each is redistributed
+under its own license, a copy of which is included alongside the vendored source.
+
+--------------------------------------------------------------------------------
+flash-linear-attention (fla-core)
+--------------------------------------------------------------------------------
+  Version:   0.5.1
+  Tag:       v0.5.1
+  Upstream:  https://github.com/fla-org/flash-linear-attention
+  PyPI:      https://pypi.org/project/fla-core/0.5.1/
+  License:   MIT
+  Copyright: (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
+  Location:  unsloth_zoo/_vendored/fla/
+  License text + provenance: unsloth_zoo/_vendored/fla/LICENSE and
+                             unsloth_zoo/_vendored/fla/MANIFEST
+
+  Only the minimal transitive file closure required by the gated-delta-rule fast
+  path is vendored (FusedRMSNormGated, chunk_gated_delta_rule and
+  fused_recurrent_gated_delta_rule), so the Qwen3.5 / Qwen3.6 / Qwen3-Next
+  gated-deltanet models get the Triton kernels without an extra
+  `pip install flash-linear-attention`. Package __init__ exports were narrowed;
+  all other files retain their original upstream MIT headers verbatim.

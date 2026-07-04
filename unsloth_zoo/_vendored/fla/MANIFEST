@@ -1,0 +1,39 @@
+name = flash-linear-attention (fla-core)
+version = 0.5.1
+tag = v0.5.1
+upstream = https://github.com/fla-org/flash-linear-attention
+pypi = https://pypi.org/project/fla-core/0.5.1/
+license = MIT
+license_file = LICENSE
+copyright = 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
+
+description =
+    Minimal, pinned, pruned snapshot of fla-core 0.5.1. Only the transitive file
+    closure needed by the gated-delta-rule fast path is vendored, so Unsloth can
+    enable the Triton kernels for the Qwen3.5 / Qwen3.6 / Qwen3-Next
+    gated-deltanet models without requiring `pip install flash-linear-attention`.
+
+exported_api =
+    fla.modules.FusedRMSNormGated
+    fla.ops.gated_delta_rule.chunk_gated_delta_rule
+    fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule
+
+modifications =
+    - Narrowed package __init__ exports for fla, fla.ops, fla.modules and
+      fla.ops.gated_delta_rule so importing the package does not eagerly pull
+      fla.layers / fla.models / "import every op" (see the "Modified by Unsloth"
+      note atop each narrowed __init__.py). All other files are verbatim upstream
+      with their original MIT headers preserved.
+    - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
+      reference implementation is unused on the fast path).
+    - Dropped the three heavy tilelang kernel files
+      fla/ops/common/backends/tilelang/{chunk_bwd,parallel_attn_fwd,
+      parallel_attn_bwd}.py. The guarded tilelang/__init__.py wrapper is kept;
+      its lazy imports of those files execute only when the optional `tilelang`
+      package is installed and its backend is selected (not the default path).
+
+file_count = 42 python modules + this MANIFEST + LICENSE
+closure_measured = 43 python modules (includes naive.py); vendored set drops
+    naive.py, leaving 42.
+
+vendored_by = Unsloth (unsloth_zoo/_vendored/fla)
