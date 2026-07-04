@@ -1212,10 +1212,28 @@ class _MoEGateGradIdentity(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_inter):
+        # grad_inter is None when nothing downstream needs inter's gradient
+        # (e.g. a frozen down projection); there is nothing to propagate then.
+        if grad_inter is None:
+            return None, None
         inter, gate = ctx.saved_tensors
-        dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
-        dgate = dgate / gate.to(torch.float32).clamp_min(1e-12)
-        return grad_inter, dgate.to(gate.dtype)
+        grad_gate = None
+        # Skip the gate gradient when the routing weight is frozen (e.g. a frozen
+        # router under LoRA), where its gradient is never consumed.
+        if ctx.needs_input_grad[1]:
+            dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
+            # Divide by the signed routing weight: a negative gate (e.g. Gemma4's
+            # per_expert_scale folded into top_k_weights) must keep its sign, so
+            # clamping toward +eps would flip it. Floor the magnitude to avoid
+            # dividing by ~0; a gate that underflows to zero carries no
+            # recoverable gate gradient, so it collapses to 0 rather than NaN.
+            gate_f = gate.to(torch.float32)
+            safe_gate = torch.where(
+                gate_f >= 0, gate_f.clamp_min(1e-12), gate_f.clamp_max(-1e-12)
+            )
+            grad_gate = (dgate / safe_gate).to(gate.dtype)
+        # inter passes through unchanged, so its gradient is grad_inter.
+        return grad_inter, grad_gate
 
 
 def forward_native_grouped_mm(
@@ -1399,7 +1417,7 @@ def forward_native_grouped_mm(
     )
     permuted_weights = None
     if _gategrad:
-        permuted_weights = top_k_weights.view(-1)[sorted_indices]
+        permuted_weights = top_k_weights.reshape(-1)[sorted_indices]
         inter = _MoEGateGradIdentity.apply(inter, permuted_weights)
 
     # Down projection with optional separated LoRA (default).
@@ -1482,7 +1500,7 @@ def forward_native_grouped_mm(
         # Gate grad comes from the identity; detach so the multiply does not pin Y.
         mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
     else:
-        flat_weights = top_k_weights.view(-1)
+        flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
         mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 

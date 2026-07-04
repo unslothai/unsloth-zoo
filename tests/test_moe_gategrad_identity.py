@@ -72,6 +72,37 @@ def test_exact_with_lora_down_projection():
     torch.testing.assert_close(g_gate, g_gate_ref, rtol=5e-4, atol=5e-5)
 
 
+def test_matches_autograd_with_negative_gate():
+    # Gemma4 folds an unconstrained per_expert_scale into top_k_weights, so the
+    # routing weight can be negative; the identity must divide by the signed
+    # weight rather than clamp it toward a positive floor.
+    torch.manual_seed(2)
+    inter = torch.randn(16, 24)
+    gate = torch.randn(16) * 0.5
+    gate = torch.where(gate.abs() < 0.05, torch.full_like(gate, 0.1), gate)
+    W2 = torch.randn(24, 20)
+    dOut = torch.randn(16, 20)
+
+    _, g_gate_ref = _reference(inter, gate, W2, dOut)
+    _, g_gate = _identity_path(inter, gate, W2, dOut)
+    torch.testing.assert_close(g_gate, g_gate_ref, rtol=5e-4, atol=5e-5)
+
+
+def test_gate_gradient_skipped_when_router_frozen():
+    # A frozen router (routing weights with requires_grad=False) must not crash
+    # the backward; inter keeps its passthrough gradient, the gate gets none.
+    inter = torch.randn(6, 8, requires_grad=True)
+    gate = torch.rand(6)
+    W2 = torch.randn(8, 5)
+
+    inter_id = _MoEGateGradIdentity.apply(inter, gate)
+    out = (inter_id @ W2) * gate.detach().unsqueeze(-1)
+    out.backward(torch.randn(6, 5))
+
+    assert inter.grad is not None
+    assert gate.grad is None
+
+
 def test_forward_is_identity_and_env_gated(monkeypatch):
     x = torch.randn(5, 3, requires_grad=True)
     g = torch.rand(5)
