@@ -104,6 +104,32 @@ def test_all_vendored_python_compiles():
         py_compile.compile(str(p), doraise=True)
 
 
+def test_backported_blackwell_hopper_fixes_present():
+    """Guard the three post-v0.5.1 correctness backports against a silent drop on
+    re-vendoring (PR #953 Blackwell fwd-h race, #1000 Blackwell bwd hang,
+    #983 Hopper Triton>=3.7.1 guard). Source-level so it needs no GPU."""
+    cdh = (VENDORED / "ops" / "common" / "chunk_delta_h.py").read_text()
+    assert "GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in cdh
+    assert "for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS" in cdh
+    # The bwd sibling kernel is intentionally NOT restricted (upstream #953).
+    assert cdh.count("for num_warps in [2, 4]") == 1, "bwd-dhu block should keep [2, 4]"
+
+    wy = (VENDORED / "ops" / "gated_delta_rule" / "wy_fast.py").read_text()
+    assert "PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in wy
+    assert "PREPARE_WY_REPR_BWD_NUM_STAGES = [4] if IS_NVIDIA_BLACKWELL else [2, 3, 4]" in wy
+    assert "for num_warps in PREPARE_WY_REPR_BWD_NUM_WARPS" in wy
+    # The fwd recompute kernel keeps its wider space.
+    assert "for num_warps in [2, 4, 8]" in wy
+
+    co = (VENDORED / "ops" / "common" / "chunk_o.py").read_text()
+    assert "IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1" in co
+
+    compat = (VENDORED / "utils" / "_compat.py").read_text()
+    assert "TRITON_ABOVE_3_7_1 = " in compat
+    utils_init = (VENDORED / "utils" / "__init__.py").read_text()
+    assert "TRITON_ABOVE_3_7_1," in utils_init
+
+
 # ---------------------------------------------------------------------------
 # Import hygiene (fresh interpreter)
 # ---------------------------------------------------------------------------

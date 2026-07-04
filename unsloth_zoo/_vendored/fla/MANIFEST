@@ -23,7 +23,18 @@ modifications =
       fla.ops.gated_delta_rule so importing the package does not eagerly pull
       fla.layers / fla.models / "import every op" (see the "Modified by Unsloth"
       note atop each narrowed __init__.py). All other files are verbatim upstream
-      with their original MIT headers preserved.
+      with their original MIT headers preserved, except the backported fixes below.
+    - Backported three post-v0.5.1 upstream correctness fixes (each marked with an
+      inline "Unsloth: backported from fla PR #..." comment):
+        * PR #953 (issue #945) in ops/common/chunk_delta_h.py: pin the Blackwell
+          fwd-h kernel to num_warps=2 (the 4-warp config hits a Triton tl.dot
+          recurrence race that silently corrupts h / v_new on B200).
+        * PR #1000 (issue #999) in ops/gated_delta_rule/wy_fast.py: restrict the
+          Blackwell prepare_wy_repr_bwd_kernel autotune to the B200-validated
+          config (unstable configs can hang / misaligned-address the bwd).
+        * PR #983 (issue #640) in ops/common/chunk_o.py (+ TRITON_ABOVE_3_7_1 in
+          utils/_compat.py and utils/__init__.py): narrow the Hopper gated
+          chunk_bwd_dqkwg guard to Triton [3.4.0, 3.7.1); 3.7.1 fixes the bug.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
