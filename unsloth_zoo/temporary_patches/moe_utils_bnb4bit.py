@@ -390,11 +390,8 @@ pass
 
 # ============================================================================
 # PEFT LoRA support for stacked-MoE bnb 4-bit experts.
-# Teach peft.tuners.lora.layer.ParamWrapper to expose a Params4bit's logical
-# 3-D shape (so LoRA picks the right (E, out, in) layout) and to merge/unmerge
-# via a dequant -> add -> requant cycle (so merge_and_unload() works against
-# packed 4-bit storage). Kept here as partners to
-# replace_expert_params_with_bnb_params + patch_bnb4bit_* rather than in misc.py.
+# Expose a Params4bit's logical 3-D shape to ParamWrapper and merge/unmerge via a
+# dequant -> add -> requant cycle so merge_and_unload() works on packed 4-bit storage.
 # ============================================================================
 
 class _ParamShapeProxy:
@@ -804,8 +801,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             new_param.quant_type = quant_state.quant_type
             new_param.quant_storage = data.dtype
             new_param.bnb_quantized = True
-            # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param, which routes
-            # stacked experts through target_parameters and needs _original_shape.
+            # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param (_original_shape).
             new_param._original_shape = torch.Size((num_experts, out_dim, in_dim))
             module, _ = get_module_from_name(model, full_layer_name)
             new_param.module = module
