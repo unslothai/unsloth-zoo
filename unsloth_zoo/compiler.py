@@ -3275,8 +3275,7 @@ DISABLE_COMPILE_MODULES = [
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
     # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf at real gradient scales.
-    # Tiny modules, so eager costs nothing.
+    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
 ]
