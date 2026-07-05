@@ -251,3 +251,41 @@ def test_uncovered_model_imports_on_fallback_subprocess():
     )
     assert "OLMO_FALLBACK_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
+
+
+def test_python_39_skips_injection(monkeypatch):
+    # The snapshot uses runtime PEP 604 annotations, which raise on 3.9; the
+    # support gate must answer False there instead of import-fail + rollback.
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setattr(fla_vendor.sys, "version_info", (3, 9, 19, "final", 0))
+    assert fla_vendor._torch_triton_cuda_supported() is False
+
+
+def test_hopper_bad_triton_range_skips_injection():
+    # Upstream chunk_bwd_dqkwg raises on Hopper + triton [3.4.0, 3.7.1) and
+    # points at the pruned TileLang backend, so injection must bail there.
+    import types
+
+    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
+
+    def fake_torch(name, major):
+        cuda = types.SimpleNamespace(
+            get_device_name=lambda i=0: name,
+            get_device_capability=lambda i=0: (major, 0),
+        )
+        return types.SimpleNamespace(cuda=cuda)
+
+    hopper = fake_torch("NVIDIA H100 80GB HBM3", 9)
+    blackwell = fake_torch("NVIDIA B200", 10)
+    for ver, want_on_hopper in (
+        ("3.3.1", False),
+        ("3.4.0", True),
+        ("3.6.0", True),
+        ("3.7.0", True),
+        ("3.7.1", False),
+        ("3.8.0", False),
+    ):
+        tri = types.SimpleNamespace(__version__=ver)
+        assert _hopper_triton_needs_tilelang(hopper, tri) is want_on_hopper, ver
+        assert _hopper_triton_needs_tilelang(blackwell, tri) is False, ver

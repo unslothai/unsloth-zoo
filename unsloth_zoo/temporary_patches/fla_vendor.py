@@ -95,8 +95,34 @@ def _version_at_least(value, minimum):
         return False
 
 
+def _hopper_triton_needs_tilelang(torch_mod, triton_mod):
+    """True on Hopper with triton in [3.4.0, 3.7.1), where the vendored tree
+    cannot serve gated-delta training.
+
+    Upstream chunk_bwd_dqkwg raises on that combination (Triton precision bug,
+    fla #640) and points at its TileLang backend, which this snapshot prunes,
+    so injection must be skipped there to keep the pure-torch fallback.
+    Mirrors upstream's exact constants (full version parse, not base_version).
+    """
+    try:
+        name = torch_mod.cuda.get_device_name(0)
+        major = torch_mod.cuda.get_device_capability(0)[0]
+        if not ("NVIDIA H" in name or major == 9):
+            return False
+        from packaging import version
+        v = version.parse(str(triton_mod.__version__).split("+")[0])
+        return version.parse("3.4.0") <= v < version.parse("3.7.1")
+    except Exception:
+        return False
+
+
 def _torch_triton_cuda_supported():
     """The vendored fla-core 0.5.1 kernels need torch >= 2.7, triton >= 3.3, CUDA."""
+    # The snapshot uses runtime-evaluated PEP 604 annotations (e.g. `int | None`
+    # in fla/utils/_device.py), which raise at import on Python 3.9; skip the
+    # injection outright instead of importing, failing and rolling back.
+    if sys.version_info < (3, 10):
+        return False
     try:
         import torch
         if not _version_at_least(torch.__version__, _MIN_TORCH):
@@ -110,6 +136,8 @@ def _torch_triton_cuda_supported():
         if not _version_at_least(triton.__version__, _MIN_TRITON):
             return False
     except Exception:
+        return False
+    if _hopper_triton_needs_tilelang(torch, triton):
         return False
     return True
 
