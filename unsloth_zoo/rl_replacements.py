@@ -956,8 +956,8 @@ def grpo_accumulated_loss(
     # One-time env gate + import, resolved once per process. Function attributes survive into
     # the cache (the function object is rebuilt there once per module and grpo_accumulated_loss
     # is a cache-module global), so memoize on grpo_accumulated_loss itself. The env gate is
-    # checked FIRST so the default-off path never imports or runs any PG code (byte-identical
-    # when unset). () means gate off / unavailable / failed import -> PrefixGrouper stays off.
+    # checked FIRST, so UNSLOTH_GRPO_PREFIX_GROUPER=0 never imports or runs any PG code (that path
+    # is byte-identical to before). () means gate off / unavailable / failed import -> PG stays off.
     _pg_funcs = getattr(grpo_accumulated_loss, "_pg_funcs", None)
     if _pg_funcs is None:
         _pg_funcs = ()
@@ -983,7 +983,7 @@ def grpo_accumulated_loss(
     # (which runs the full-row path too) is net overhead. Keep the packed path instead.
     _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False)
 
-    # ---- PrefixGrouper (GRPO shared-prompt dedup; default OFF => byte-identical) ----
+    # ---- PrefixGrouper (GRPO shared-prompt dedup; default ON, UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
     # In GRPO every prompt spawns G=num_generations completions that share the prompt prefix.
     # The full-row packed path below forwards that prefix G times; PrefixGrouper stores it ONCE
     # and concatenates only the G suffixes (FlexAttention shared-prefix mask), cutting the trunk
