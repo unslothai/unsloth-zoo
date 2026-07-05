@@ -131,6 +131,36 @@ def test_matches_autograd_with_zero_gate():
     torch.testing.assert_close(gate.grad, g_gate_ref, rtol=5e-4, atol=5e-5)
 
 
+def test_fp16_gate_floors_in_fp32_without_output_leak():
+    # fp16 routing weights must be floored in fp32 (eps 1e-12), not at fp16's
+    # smallest normal (~6e-5): flooring a masked (zero) route at 6e-5 would leak
+    # eps * |Y| into the output at a magnitude fp16 can represent. Mirrors the
+    # call-site upcast in forward_native_grouped_mm.
+    torch.manual_seed(5)
+    gate16 = torch.rand(8, dtype=torch.float16) * 0.5
+    gate16[0] = 0.0
+    inter = torch.randn(8, 16)
+    W2 = torch.randn(16, 10)
+
+    gate = gate16.detach().requires_grad_(True)
+    raw = gate.to(torch.float32)
+    eps = 1e-12
+    floored = torch.where(raw >= 0, raw.clamp(min=eps), raw.clamp(max=-eps))
+    safe = raw + (floored - raw).detach()
+    inter_id = _MoEGateGradIdentity.apply(inter, safe)
+    out = (inter_id @ W2) * safe.detach().unsqueeze(-1)
+
+    # The masked route's output leak is bounded by eps * |Y|, invisible in fp16.
+    leak = out[0].abs().max().item()
+    assert leak < 1e-10, leak
+
+    # The zero route still gets its true gradient <Y, dOut>.
+    dOut = torch.randn(8, 10)
+    out.backward(dOut)
+    ref = ((inter[0] @ W2) * dOut[0]).sum()
+    torch.testing.assert_close(gate.grad[0], ref.to(gate.dtype), rtol=5e-3, atol=5e-3)
+
+
 def test_double_backward_raises():
     # The identity is only first-order exact; create_graph must fail loudly
     # instead of returning wrong second derivatives.

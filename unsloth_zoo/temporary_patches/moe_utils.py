@@ -1431,9 +1431,13 @@ def forward_native_grouped_mm(
         # gradient still reaches top_k_weights). The multiply below and the
         # identity's divide use the SAME floored value, so they cancel exactly and
         # the gate gradient <Y, dOut> survives even a routing weight of exactly
-        # zero. Forward changes by at most eps * |Y| for |gate| < eps, far below
-        # dtype resolution. eps respects fp16's smallest normal.
-        eps = max(1e-12, float(torch.finfo(raw_weights.dtype).tiny))
+        # zero. Floor in float32 so eps stays 1e-12 even for fp16 routing weights
+        # (fp16's smallest normal is ~6e-5, large enough to visibly leak masked
+        # routes into the output); the forward then changes by at most
+        # 1e-12 * |Y| for |gate| < 1e-12, far below any dtype's resolution.
+        if raw_weights.dtype == torch.float16:
+            raw_weights = raw_weights.to(torch.float32)
+        eps = 1e-12
         floored = torch.where(
             raw_weights >= 0,
             raw_weights.clamp(min=eps),
