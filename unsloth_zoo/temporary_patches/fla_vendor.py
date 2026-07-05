@@ -76,6 +76,14 @@ def _flag(name):
     return os.environ.get(name, "0") == "1"
 
 
+def _restore_env(name, previous):
+    """Restore an env var to a snapshotted value (``None`` means it was unset)."""
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
+
+
 def _vendored_fla_dir():
     # This file lives at unsloth_zoo/temporary_patches/fla_vendor.py
     here = os.path.dirname(os.path.abspath(__file__))
@@ -142,6 +150,17 @@ def _torch_triton_cuda_supported():
     return True
 
 
+def _vendored_injection_supported():
+    """Whether ``patch_vendor_fla`` would actually inject the vendored kernels.
+
+    Exposed so tests can gate their subprocess assertions on the exact same
+    production support check (Python >= 3.10, torch/triton minimums, CUDA, and
+    the Hopper/Triton range that needs the pruned TileLang backend) instead of a
+    looser mirror that would fail rather than skip on unsupported hosts.
+    """
+    return _torch_triton_cuda_supported()
+
+
 def _vendored_already_injected():
     mod = sys.modules.get("fla")
     return mod is not None and getattr(mod, _VENDORED_MARK, False) is True
@@ -187,20 +206,29 @@ def _inject_vendored_fla():
     fla.ops.utils, fla.modules, fla.utils) is registered. Python's normal
     FileFinder resolves every submodule and the internal ``from fla...`` absolute
     imports against this ``__path__``.
+
+    Returns ``(injected, replaced_real)``. ``replaced_real`` is True when a real
+    (non-vendored) fla was purged to make room for the vendored tree (only under
+    ``UNSLOTH_FORCE_VENDORED_FLA``); callers use it to rebind already-imported
+    modeling modules whose kernel globals still point at the old install.
     """
     vendored_dir = _vendored_fla_dir()
     init_path = os.path.join(vendored_dir, "__init__.py")
     if not os.path.isfile(init_path):
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: vendored fla missing at {init_path}; keeping pure-torch path.")
-        return False
+        return False, False
 
     # The pruned snapshot drops the TileLang kernels (backends/tilelang/chunk_bwd
     # and parallel_attn_*) and the IntraCard CP impl (ops/common/intracard_cp), so
     # force their backend flags off. Otherwise the 'common' dispatch would route a
     # gated chunk_bwd_dqkwg to TileLang (on by default whenever an external
     # tilelang is installed) and hit ModuleNotFoundError. Set only for our injected
-    # tree; a deferred-to real fla install never reaches here.
+    # tree; a deferred-to real fla install never reaches here. Snapshot the prior
+    # values so a failed injection does not leave a user's real fla with these
+    # backends disabled for the rest of the process (restored in the rollback).
+    prev_tilelang = os.environ.get("FLA_TILELANG")
+    prev_intracard = os.environ.get("FLA_INTRACARD_CP")
     os.environ["FLA_TILELANG"] = "0"
     os.environ["FLA_INTRACARD_CP"] = "0"
 
@@ -212,6 +240,9 @@ def _inject_vendored_fla():
         for k in list(sys.modules)
         if k == "fla" or k.startswith("fla.")
     }
+    replaced_real = any(
+        getattr(m, _VENDORED_MARK, False) is not True for m in saved.values()
+    )
     for k in saved:
         del sys.modules[k]
 
@@ -226,15 +257,19 @@ def _inject_vendored_fla():
         for sub in _EXPORT_SUBMODULES:
             importlib.import_module(sub)
     except Exception as e:
-        # Roll back a partial injection and restore whatever we purged.
+        # Roll back a partial injection and restore whatever we purged, including
+        # the backend env flags so a shadowed real fla is left exactly as we
+        # found it.
         for k in list(sys.modules):
             if k == "fla" or k.startswith("fla."):
                 sys.modules.pop(k, None)
         sys.modules.update(saved)
+        _restore_env("FLA_TILELANG", prev_tilelang)
+        _restore_env("FLA_INTRACARD_CP", prev_intracard)
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: failed injecting vendored fla ({e}); keeping pure-torch path.")
-        return False
-    return True
+        return False, False
+    return True, replaced_real
 
 
 def _vendored_availability_probe():
@@ -266,20 +301,42 @@ def _patch_is_available():
         import transformers.utils.import_utils as iu
     except Exception:
         return False
+    original = getattr(iu, "is_flash_linear_attention_available", None)
     try:
         iu.is_flash_linear_attention_available.cache_clear()
     except Exception:
         pass
     iu.is_flash_linear_attention_available = _vendored_availability_probe
+    # Re-exporting namespaces (e.g. ``transformers.utils`` on versions that alias
+    # it, or any transformers.* module that did ``from ...import_utils import
+    # is_flash_linear_attention_available`` before this ran) still hold the
+    # original cached callable, so public callers there would keep seeing False.
+    # Rebind every transformers.* namespace that points at that exact object.
+    if original is not None:
+        for name, mod in list(sys.modules.items()):
+            if mod is None or name == "transformers.utils.import_utils":
+                continue
+            if not (name == "transformers" or name.startswith("transformers.")):
+                continue
+            if getattr(mod, "is_flash_linear_attention_available", None) is original:
+                try:
+                    setattr(mod, "is_flash_linear_attention_available", _vendored_availability_probe)
+                except Exception:
+                    pass
     return True
 
 
-def _repair_already_imported_modeling():
+def _repair_already_imported_modeling(force_rebind=False):
     """Rebind fla globals on modeling modules imported before injection.
 
     If a gated-deltanet modeling module was imported while fla was unavailable it
     holds ``chunk_gated_delta_rule = fused_recurrent_gated_delta_rule =
     FusedRMSNormGated = None``. Rebind those to the vendored kernels.
+
+    When ``force_rebind`` is set (``UNSLOTH_FORCE_VENDORED_FLA`` just replaced a
+    real fla install), those globals are non-``None`` but still point at the old
+    user kernels, so the None-only check misses them; rebind by module identity
+    (anything not already the vendored callable) so the escape hatch takes hold.
     """
     fused_rms = chunk_fn = fused_recurrent_fn = None
     loaded = False
@@ -293,7 +350,7 @@ def _repair_already_imported_modeling():
             or getattr(mod, "fused_recurrent_gated_delta_rule", "MISSING") is None
             or getattr(mod, "FusedRMSNormGated", "MISSING") is None
         )
-        if not needs:
+        if not needs and not force_rebind:
             continue
         if not loaded:
             try:
@@ -310,6 +367,13 @@ def _repair_already_imported_modeling():
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not load vendored fla symbols for repair: {e}")
                 return
+        # Already bound to the vendored kernels (e.g. an idempotent re-run): skip.
+        if (
+            getattr(mod, "chunk_gated_delta_rule", None) is chunk_fn
+            and getattr(mod, "fused_recurrent_gated_delta_rule", None) is fused_recurrent_fn
+            and getattr(mod, "FusedRMSNormGated", None) is fused_rms
+        ):
+            continue
         setattr(mod, "FusedRMSNormGated", fused_rms)
         setattr(mod, "chunk_gated_delta_rule", chunk_fn)
         setattr(mod, "fused_recurrent_gated_delta_rule", fused_recurrent_fn)
@@ -325,6 +389,7 @@ def patch_vendor_fla(phase=None):
     if _flag("UNSLOTH_DISABLE_VENDORED_FLA"):
         return
 
+    replaced_real = False
     if not _vendored_already_injected():
         force = _flag("UNSLOTH_FORCE_VENDORED_FLA")
         if not force and _real_fla_present_and_compatible():
@@ -333,11 +398,12 @@ def patch_vendor_fla(phase=None):
         if not _torch_triton_cuda_supported():
             # Cannot run the Triton kernels here; leave the pure-torch fallback.
             return
-        if not _inject_vendored_fla():
+        injected, replaced_real = _inject_vendored_fla()
+        if not injected:
             return
 
     _patch_is_available()
-    _repair_already_imported_modeling()
+    _repair_already_imported_modeling(force_rebind=replaced_real)
 
 
 TEMPORARY_PATCHES.append(patch_vendor_fla)

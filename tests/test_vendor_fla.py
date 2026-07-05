@@ -41,16 +41,16 @@ ZOO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 
 
-def _cuda_triton_ok() -> bool:
+def _injection_supported() -> bool:
+    # Mirror the production support gate exactly (Python>=3.10, torch/triton
+    # minimums, CUDA, and the Hopper/Triton range that needs the pruned TileLang
+    # backend). A looser check would run the subprocess tests on hosts where the
+    # patch intentionally skips injection, so they would fail instead of skip.
     try:
-        import torch
-        import triton
-        from packaging import version
-        return (
-            bool(torch.cuda.is_available())
-            and version.parse(torch.__version__.split("+")[0]) >= version.parse("2.7")
-            and version.parse(triton.__version__.split("+")[0]) >= version.parse("3.3")
+        from unsloth_zoo.temporary_patches.fla_vendor import (
+            _vendored_injection_supported,
         )
+        return bool(_vendored_injection_supported())
     except Exception:
         return False
 
@@ -173,7 +173,7 @@ _HYGIENE_SUBPROCESS = textwrap.dedent(
 
 
 @pytest.mark.skipif(
-    not _cuda_triton_ok(),
+    not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
 def test_import_hygiene_subprocess():
@@ -237,7 +237,7 @@ _OLMO_SUBPROCESS = textwrap.dedent(
 
 
 @pytest.mark.skipif(
-    not _cuda_triton_ok(),
+    not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
 def test_uncovered_model_imports_on_fallback_subprocess():
@@ -289,3 +289,89 @@ def test_hopper_bad_triton_range_skips_injection():
         tri = types.SimpleNamespace(__version__=ver)
         assert _hopper_triton_needs_tilelang(hopper, tri) is want_on_hopper, ver
         assert _hopper_triton_needs_tilelang(blackwell, tri) is False, ver
+
+
+def test_failed_injection_restores_backend_env(monkeypatch, tmp_path):
+    # A vendored import that fails after FLA_TILELANG / FLA_INTRACARD_CP were
+    # forced off must restore whatever the user had, so a shadowed real fla is
+    # not left with those backends disabled for the rest of the process.
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    bad = tmp_path / "fla"
+    bad.mkdir()
+    (bad / "__init__.py").write_text("raise RuntimeError('boom')\n")
+    monkeypatch.setattr(fla_vendor, "_vendored_fla_dir", lambda: str(bad))
+
+    # One flag pre-set by the user, one unset: both must be returned as found.
+    monkeypatch.setenv("FLA_TILELANG", "1")
+    monkeypatch.delenv("FLA_INTRACARD_CP", raising=False)
+
+    injected, replaced_real = fla_vendor._inject_vendored_fla()
+    assert injected is False
+    assert replaced_real is False
+    assert os.environ.get("FLA_TILELANG") == "1"
+    assert "FLA_INTRACARD_CP" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# Force-rebind: replacing an already-loaded real fla under the escape hatch
+# ---------------------------------------------------------------------------
+_FORCE_REBIND_SUBPROCESS = textwrap.dedent(
+    """
+    import os, sys, types
+    os.environ["UNSLOTH_IS_PRESENT"] = "1"
+    os.environ["UNSLOTH_FORCE_VENDORED_FLA"] = "1"
+
+    # Stand in for a real (non-vendored) fla install already cached in
+    # sys.modules, plus a gated-delta modeling module imported against it whose
+    # kernel globals are bound to non-None, non-vendored callables.
+    sys.modules["fla"] = types.ModuleType("fla")
+
+    def _old_chunk(*a, **k):
+        raise AssertionError("stale real-fla kernel still bound")
+    def _old_recurrent(*a, **k):
+        raise AssertionError("stale real-fla kernel still bound")
+    class _OldRMS:
+        pass
+
+    fake = types.ModuleType("transformers.models.qwen3_5.modeling_qwen3_5")
+    fake.chunk_gated_delta_rule = _old_chunk
+    fake.fused_recurrent_gated_delta_rule = _old_recurrent
+    fake.FusedRMSNormGated = _OldRMS
+    sys.modules["transformers.models.qwen3_5.modeling_qwen3_5"] = fake
+
+    from unsloth_zoo.temporary_patches.fla_vendor import patch_vendor_fla
+    patch_vendor_fla()
+
+    import fla
+    assert getattr(fla, "_UNSLOTH_VENDORED_FLA", False) is True, "vendored not injected"
+
+    from fla.modules import FusedRMSNormGated
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule, fused_recurrent_gated_delta_rule,
+    )
+    # The force flag must rebind the non-None stale globals to the vendored ones.
+    assert fake.chunk_gated_delta_rule is chunk_gated_delta_rule, "chunk not rebound"
+    assert fake.fused_recurrent_gated_delta_rule is fused_recurrent_gated_delta_rule
+    assert fake.FusedRMSNormGated is FusedRMSNormGated
+    assert fake.chunk_gated_delta_rule is not _old_chunk
+    print("FORCE_REBIND_OK")
+    """
+)
+
+
+@pytest.mark.skipif(
+    not _injection_supported(),
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
+def test_force_rebinds_already_loaded_real_fla_subprocess():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", _FORCE_REBIND_SUBPROCESS],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "FORCE_REBIND_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
