@@ -161,6 +161,39 @@ def test_fp16_gate_floors_in_fp32_without_output_leak():
     torch.testing.assert_close(gate.grad[0], ref.to(gate.dtype), rtol=5e-3, atol=5e-3)
 
 
+def test_fp16_inter_zero_route_router_gradient_matches_reference():
+    # With fp16 activations, the gradient into the identity is
+    # grad_inter = gate * (W2 @ dOut); a near-zero floored gate makes that product
+    # underflow fp16 to zero before backward runs, so the identity drops the
+    # zero-route router gradient. forward_native_grouped_mm therefore excludes
+    # fp16 inter from the identity and keeps the standard multiply, which recovers
+    # the true <Y, dOut> gradient. This pins both halves of that rationale.
+    torch.manual_seed(7)
+    inter16 = torch.randn(4, 16, dtype=torch.float16)
+    W2 = torch.randn(16, 10, dtype=torch.float16) * 0.1
+    dOut = torch.randn(4, 10, dtype=torch.float16)
+    gate0 = torch.zeros(4, dtype=torch.float16)
+    gate0[0] = 0.6  # one live route; routes 1..3 are exactly zero
+
+    ref = ((inter16.float() @ W2.float()) * dOut.float()).sum(-1)  # true <Y, dOut>
+
+    # Identity path with fp16 inter: the tiny floored gate underflows grad_inter,
+    # so at least one exactly-zero route loses its router gradient.
+    gate = gate0.detach().float().requires_grad_(True)
+    floored = torch.where(gate >= 0, gate.clamp(min=1e-12), gate.clamp(max=-1e-12))
+    safe = gate + (floored - gate).detach()
+    inter_id = _MoEGateGradIdentity.apply(inter16.clone().requires_grad_(True), safe)
+    ((inter_id @ W2) * safe.detach().unsqueeze(-1)).backward(dOut)
+    assert (gate.grad[1:] == 0).any()
+
+    # Standard multiply (the fp16 path forward_native_grouped_mm now uses):
+    # every zero route recovers the correct gradient.
+    gate_s = gate0.detach().requires_grad_(True)
+    ((inter16 @ W2) * gate_s.unsqueeze(-1)).backward(dOut)
+    assert (gate_s.grad[1:] != 0).all()
+    torch.testing.assert_close(gate_s.grad.float(), ref, rtol=5e-2, atol=5e-2)
+
+
 def test_double_backward_raises():
     # The identity is only first-order exact; create_graph must fail loudly
     # instead of returning wrong second derivatives.

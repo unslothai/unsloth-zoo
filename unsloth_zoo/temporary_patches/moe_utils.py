@@ -1417,12 +1417,18 @@ def forward_native_grouped_mm(
         inter = F.silu(gate) * up
 
     # Env-gated gate-grad identity; disabled when a down bias exists (identity
-    # assumes a linear down) or the router is frozen (nothing to synthesize, and
-    # the Function would needlessly keep inter saved).
+    # assumes a linear down), the router is frozen (nothing to synthesize, and
+    # the Function would needlessly keep inter saved), or inter is float16. For
+    # fp16, the gradient into the identity carries the tiny floored gate as a
+    # factor (grad_inter = gate * (W2 @ dOut)); with a near-zero gate that product
+    # underflows fp16 to 0 before backward runs, dropping the router gradient for
+    # near-zero routes. fp16 therefore keeps the standard multiply (correct
+    # gradient, saves Y); bf16/fp32 hold the tiny value and are unaffected.
     _gategrad = (
         _moe_gategrad_enabled()
         and getattr(self, "down_proj_bias", None) is None
         and top_k_weights.requires_grad
+        and inter.dtype != torch.float16
     )
     permuted_weights = None
     if _gategrad:
@@ -1431,10 +1437,10 @@ def forward_native_grouped_mm(
         # gradient still reaches top_k_weights). The multiply below and the
         # identity's divide use the SAME floored value, so they cancel exactly and
         # the gate gradient <Y, dOut> survives even a routing weight of exactly
-        # zero. Floor in float32 so eps stays 1e-12 even for fp16 routing weights
-        # (fp16's smallest normal is ~6e-5, large enough to visibly leak masked
-        # routes into the output); the forward then changes by at most
-        # 1e-12 * |Y| for |gate| < 1e-12, far below any dtype's resolution.
+        # zero. An fp16 gate cannot represent eps=1e-12 (its smallest normal is
+        # ~6e-5), so upcast it to float32; inter is non-fp16 here, so the floored
+        # value survives in grad_inter. The forward then changes by at most
+        # 1e-12 * |Y| for |gate| < 1e-12.
         if raw_weights.dtype == torch.float16:
             raw_weights = raw_weights.to(torch.float32)
         eps = 1e-12
