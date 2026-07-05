@@ -975,6 +975,9 @@ def grpo_accumulated_loss(
                 tol_ok as _pg_tol_ok,
                 TOL_KILL as _PG_TOL_KILL,
             )
+            # the FlexAttention kernel never applies attn_logit_softcapping, so skip PG entirely
+            # for softcap models (e.g. gemma2) before building any layout.
+            _pg_cfg = getattr(unwrapped_model, "config", None)
             _pg_engage = (
                 _pg_enabled_fn()
                 and pixel_values is None
@@ -982,6 +985,7 @@ def grpo_accumulated_loss(
                 and mm_token_type_ids is None
                 and _pg_num_gen is not None
                 and _pg_num_gen >= 2
+                and not getattr(_pg_cfg, "attn_logit_softcapping", None)
             )
         except Exception:
             _pg_engage = False
@@ -993,8 +997,14 @@ def grpo_accumulated_loss(
             # Build the layout from the LEFT-PACKED input_ids with the ORIGINAL left-pad counts,
             # so PrefixGrouper's prefix/suffix split matches the packed path's prompt/completion
             # split (_pack_cstart) exactly and the verify is apples-to-apples.
+            # sliding-window models lose the per-sequence window in the packed stream, so cap the
+            # PG span (P+max(R)) at the window, mirroring the packed _pack_sw guard below.
+            _pg_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
+            if not (isinstance(_pg_sw, int) and _pg_sw > 0):
+                _pg_sw = None
             _pg_layout = _pg_build_layout(
                 input_ids, logits_to_keep, _pg_pad_id, _pg_num_gen, left_pad_tokens_per_prompt,
+                max_segment_cap = _pg_sw,
             )
             _pg_unsafe = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
             if _pg_unsafe is None:
