@@ -944,9 +944,41 @@ def grpo_accumulated_loss(
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
 
-    # this function's source is copied into the generated GRPO trainer, so import the logging
-    # flag locally to keep the bare name defined there too
+    # --- Consolidated lazy imports + env gate for the GRPO PrefixGrouper grad path ---
+    # This function's SOURCE is inspect.getsource-copied verbatim into the generated
+    # UnslothGRPOTrainer cache, whose namespace does NOT carry unsloth_zoo's module-level
+    # imports, so these names must be bound inside the body (do NOT hoist to module scope).
+    # The unsloth.utils.prefix_grouper import must also stay lazy + guarded: unsloth imports
+    # unsloth_zoo at init (circular) and may not ship prefix_grouper at all, so a failed
+    # import degrades to "PrefixGrouper off" and never raises.
     from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING
+
+    # One-time env gate + import, resolved once per process. Function attributes survive into
+    # the cache (the function object is rebuilt there once per module and grpo_accumulated_loss
+    # is a cache-module global), so memoize on grpo_accumulated_loss itself. The env gate is
+    # checked FIRST so the default-off path never imports or runs any PG code (byte-identical
+    # when unset). () means gate off / unavailable / failed import -> PrefixGrouper stays off.
+    _pg_funcs = getattr(grpo_accumulated_loss, "_pg_funcs", None)
+    if _pg_funcs is None:
+        _pg_funcs = ()
+        if os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "0").lower() not in (
+            "0", "false", "no", "off",
+        ):
+            try:
+                from unsloth.utils.prefix_grouper import (
+                    build_group_layout as _pg_build_layout,
+                    prefix_grouper_enabled as _pg_enabled_fn,
+                    verify_on as _pg_verify_on,
+                    tol_ok as _pg_tol_ok,
+                    TOL_KILL as _PG_TOL_KILL,
+                )
+                _pg_funcs = (
+                    _pg_build_layout, _pg_enabled_fn, _pg_verify_on, _pg_tol_ok, _PG_TOL_KILL,
+                )
+            except Exception:
+                _pg_funcs = ()
+        grpo_accumulated_loss._pg_funcs = _pg_funcs
+    _pg_engage = bool(_pg_funcs)
 
     # ---- PrefixGrouper (GRPO shared-prompt dedup; default OFF => byte-identical) ----
     # In GRPO every prompt spawns G=num_generations completions that share the prompt prefix.
@@ -961,20 +993,12 @@ def grpo_accumulated_loss(
     _pg_use = False
     _pg_skip_pack = False
     _pg_num_gen = getattr(trainer, "num_generations", None)
-    # Cheap env check FIRST so the default-off path never imports or runs any PG code
-    # (truly byte-identical when the gate is unset).
-    _pg_engage = os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "0").lower() not in (
-        "0", "false", "no", "off",
-    )
-    if _pg_engage:
+    # Runtime gate (uses the memoized prefix_grouper callables); kept next to its use because it
+    # reads unwrapped_model.config etc. Broad except -> engage False, matching the original
+    # single import+gate try/except semantics exactly.
+    if _pg_engage and _pg_funcs:
         try:
-            from unsloth.utils.prefix_grouper import (
-                build_group_layout as _pg_build_layout,
-                prefix_grouper_enabled as _pg_enabled_fn,
-                verify_on as _pg_verify_on,
-                tol_ok as _pg_tol_ok,
-                TOL_KILL as _PG_TOL_KILL,
-            )
+            _pg_build_layout, _pg_enabled_fn, _pg_verify_on, _pg_tol_ok, _PG_TOL_KILL = _pg_funcs
             # the FlexAttention kernel never applies attn_logit_softcapping, so skip PG entirely
             # for softcap models (e.g. gemma2) before building any layout.
             _pg_cfg = getattr(unwrapped_model, "config", None)
@@ -989,6 +1013,8 @@ def grpo_accumulated_loss(
             )
         except Exception:
             _pg_engage = False
+    else:
+        _pg_engage = False
     _pg_layout = None
     _pg_trusted = False   # signature already verified -> skip the full-row forward this step
     if _pg_engage:
