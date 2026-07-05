@@ -1227,12 +1227,18 @@ def grpo_accumulated_loss(
             return _pg_lp
 
     if _pg_layout is not None:
+        # A verify-phase OOM must not poison the signature. During first-use verify the full-row
+        # packed graph is still co-resident (it is the comparison reference), so an OOM there does
+        # not prove PG alone cannot fit; only an OOM in the trusted PG-alone forward below (after the
+        # packed graph is freed) is a deterministic PG-alone failure worth marking unsafe.
+        _pg_phase_verify = False
         try:
             if not _pg_trusted:
                 # first use for this structure: verify vs the full-row packed new_logprobs
                 # (itself self-verified vs per-row). PASS < tol_ok -> trust; >= TOL_KILL ->
                 # mark unsafe forever; borderline -> fall back this shape.
                 if _pack_use and _pack_result is not None:
+                    _pg_phase_verify = True   # packed graph co-resident until it is freed below
                     with torch.no_grad():
                         _pg_ref = _pg_grad_forward()
                     _pg_W2 = logits_to_keep + max_left_pad
@@ -1275,6 +1281,7 @@ def grpo_accumulated_loss(
                 # exactly when packed+PG exceed VRAM but PG alone would fit; on a PG failure
                 # the padded loop recomputes new_logprobs, so packed is no longer needed.
                 _pack_hidden = _pack_sel = _pack_result = None
+                _pg_phase_verify = False   # packed freed: an OOM below is a genuine PG-alone failure
                 _pg_result = _pg_grad_forward()   # grad forward for the loss
                 _pg_use = True
         except Exception as _pg_err2:
@@ -1286,12 +1293,16 @@ def grpo_accumulated_loss(
             if isinstance(_pg_v, dict):
                 _pg_v.pop(_pg_layout.signature, None)
             if isinstance(_pg_err2, torch.cuda.OutOfMemoryError):
-                # OOM would recur deterministically at these lengths: mark unsafe for good
-                _pg_u = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
-                if _pg_u is None:
-                    _pg_u = set()
-                _pg_u.add(_pg_layout.signature)
-                unwrapped_model._unsloth_prefix_grouper_grad_unsafe = _pg_u
+                # OOM would recur deterministically at these lengths: mark unsafe for good, but only
+                # when it happened in the PG-alone forward. A verify-phase OOM (packed graph still
+                # co-resident) does not prove PG alone cannot fit, so leave the signature off the
+                # unsafe set and just retry the full-row packed path next batch.
+                if not _pg_phase_verify:
+                    _pg_u = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
+                    if _pg_u is None:
+                        _pg_u = set()
+                    _pg_u.add(_pg_layout.signature)
+                    unwrapped_model._unsloth_prefix_grouper_grad_unsafe = _pg_u
                 torch.cuda.empty_cache()
             if UNSLOTH_ENABLE_LOGGING:
                 print(f"[Unsloth] GRPO PrefixGrouper (grad) forward failed -> packed/padded fallback: {_pg_err2!r}", flush = True)
