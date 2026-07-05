@@ -279,27 +279,17 @@ def _message_matches_known_fallback(message, rule):
 
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
-    """QK-norm archs (gemma4, qwen3_5, ...) carry q_norm / k_norm weights. When a
-    strict mlx load rejects them ("... parameters not in model: ...k_norm..."),
-    the installed mlx-lm / mlx-vlm predates (or regressed on) this architecture -
-    notably mlx-lm 0.31.3 (see mlx-lm #1242). Dropping those weights would yield a
-    numerically broken model, so surface a clear, actionable error instead of the
-    raw mlx ValueError."""
+    """A strict mlx load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too
+    old (or regressed, e.g. 0.31.3 - mlx-lm #1242) for a QK-norm arch; dropping
+    those weights breaks the model, so raise a clear error instead."""
     if "parameters not in model" not in message:
         return
     if not any(marker in message for marker in ("k_norm", "q_norm")):
         return
-    # A gemma4 / gemma3n KV-sharing checkpoint carries DEAD k_proj / v_proj /
-    # k_norm on its shared tail: those layers reuse an earlier layer's K/V and
-    # never run their own K path, so mlx-lm 0.31.3 (which gates k_proj/k_norm on
-    # a non-shared `has_kv`) rejects exactly that dead tail. Such a rejection
-    # lists k_proj AND v_proj alongside k_norm but never q_norm (the Q path is
-    # never shared), and dropping only that dead tail via the registered
-    # strict=False fallback is numerically safe - it is the load this guard must
-    # not break (see _KNOWN_MLX_LM_STRICT_FALLBACKS["gemma4_text"], mlx-lm #1242).
-    # A genuine QK-norm version gap instead rejects q_norm / k_norm on real
-    # (active) layers WITHOUT the paired k_proj / v_proj, because a build lacking
-    # QK-norm still registers standard k_proj / v_proj. Only raise for the latter.
+    # gemma4/gemma3n KV-sharing tails carry DEAD k_proj/v_proj/k_norm (Q is never
+    # shared, so never q_norm); dropping that tail via the registered strict=False
+    # fallback is safe and must not be blocked (mlx-lm #1242). A genuine version
+    # gap rejects q_norm/k_norm WITHOUT the paired projections - raise only then.
     kv_sharing_dead_tail = (
         "self_attn.k_proj" in message
         and "self_attn.v_proj" in message
@@ -314,7 +304,7 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
 
             versions.append(f"{pkg}={_dist_version(pkg)}")
         except Exception:
-            # Version probe is best-effort; a missing/renamed dist just omits it from the hint.
+            # Best-effort hint; a missing dist is just omitted.
             pass
     installed = f" Installed: {', '.join(versions)}." if versions else ""
     raise ValueError(
@@ -436,10 +426,7 @@ def _load_mlx_lm_with_strict_fallback(
     except ValueError as error:
         message = str(error)
         # Active-layer QK-norm weights are load-bearing: never strict=False past
-        # them. Raise a clear version-gap error for a genuine QK-norm mismatch,
-        # but let the dead KV-sharing tail (k_proj/v_proj/k_norm, no q_norm) fall
-        # through to the registered strict=False fallback below - see
-        # _raise_if_qk_norm_version_gap.
+        # them; the dead KV-sharing tail still falls through to the fallback below.
         _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
@@ -481,8 +468,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
             return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
-        # QK-norm weights are load-bearing: never filter past them (see the
-        # mlx-lm path). Check before the known extra-weight filter below.
+        # QK-norm weights are load-bearing: check before the extra-weight filter.
         _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
@@ -4821,9 +4807,8 @@ class FastMLXModel:
                             **extra_kwargs,
                         )
                     except ValueError as error:
-                        # This path loads before quantizing, bypassing
-                        # _load_mlx_vlm_with_extra_weight_filter, so surface the
-                        # QK-norm version gap here too (never drop q_norm/k_norm).
+                        # Pre-quantize load bypasses the extra-weight filter, so
+                        # surface the QK-norm version gap here too.
                         _raise_if_qk_norm_version_gap(model_type, str(error), error)
                         raise
                     vlm_cfg = _vlm_load_config(vlm_load_target)
