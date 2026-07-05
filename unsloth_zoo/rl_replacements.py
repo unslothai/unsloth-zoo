@@ -1000,7 +1000,9 @@ def grpo_accumulated_loss(
         try:
             _pg_build_layout, _pg_enabled_fn, _pg_verify_on, _pg_tol_ok, _PG_TOL_KILL = _pg_funcs
             # the FlexAttention kernel never applies attn_logit_softcapping, so skip PG entirely
-            # for softcap models (e.g. gemma2) before building any layout.
+            # for softcap models (e.g. gemma2) before building any layout. Hybrid SSM models
+            # (FalconH1 etc.) are excluded too: only attention gets the shared-prefix isolation,
+            # a Mamba branch would leak state across suffixes.
             _pg_cfg = getattr(unwrapped_model, "config", None)
             _pg_engage = (
                 _pg_enabled_fn()
@@ -1010,6 +1012,10 @@ def grpo_accumulated_loss(
                 and _pg_num_gen is not None
                 and _pg_num_gen >= 2
                 and not getattr(_pg_cfg, "attn_logit_softcapping", None)
+                and not any(
+                    getattr(_pg_cfg, _pg_a, None) is not None
+                    for _pg_a in ("mamba_d_ssm", "mamba_d_state", "mamba_expand")
+                )
             )
         except Exception:
             _pg_engage = False
@@ -1040,9 +1046,17 @@ def grpo_accumulated_loss(
             elif _pg_layout is not None:
                 _pg_layout.W = logits_to_keep + max_left_pad
                 _pg_verified = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
-                if _pg_verified is None:
-                    _pg_verified = set()
-                if (not _pg_verify_on()) or _pg_layout.signature in _pg_verified:
+                # trust needs the verified envelope to cover this batch's lengths too
+                # (re-verify when T or the longest segment grows, like the packed path)
+                _pg_T = int(_pg_layout.flat_ids.shape[1])
+                _pg_maxseg = int(_pg_layout.position_ids.max()) + 1
+                _pg_env = (
+                    _pg_verified.get(_pg_layout.signature)
+                    if isinstance(_pg_verified, dict) else None
+                )
+                if (not _pg_verify_on()) or (
+                    _pg_env is not None and _pg_T <= _pg_env[0] and _pg_maxseg <= _pg_env[1]
+                ):
                     _pg_trusted = True
                     _pg_skip_pack = True   # trusted shape -> skip the full-row forward
         except Exception as _pg_err:
@@ -1233,9 +1247,14 @@ def grpo_accumulated_loss(
                         )
                     if _pg_diff < _pg_tol_ok():
                         _pg_v = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
-                        if _pg_v is None:
-                            _pg_v = set()
-                        _pg_v.add(_pg_layout.signature)
+                        if not isinstance(_pg_v, dict):
+                            _pg_v = {}
+                        _pg_vT = int(_pg_layout.flat_ids.shape[1])
+                        _pg_vS = int(_pg_layout.position_ids.max()) + 1
+                        _pg_old = _pg_v.get(_pg_layout.signature, (0, 0))
+                        _pg_v[_pg_layout.signature] = (
+                            max(_pg_vT, _pg_old[0]), max(_pg_vS, _pg_old[1]),
+                        )
                         unwrapped_model._unsloth_prefix_grouper_grad_verified = _pg_v
                         _pg_trusted = True
                     else:
@@ -1256,7 +1275,18 @@ def grpo_accumulated_loss(
         except Exception as _pg_err2:
             _pg_use = False
             os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+            # untrust this signature so the next batch runs the full-row packed path again
+            # instead of skipping it and landing on the padded loop repeatedly
+            _pg_v = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
+            if isinstance(_pg_v, dict):
+                _pg_v.pop(_pg_layout.signature, None)
             if isinstance(_pg_err2, torch.cuda.OutOfMemoryError):
+                # OOM would recur deterministically at these lengths: mark unsafe for good
+                _pg_u = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
+                if _pg_u is None:
+                    _pg_u = set()
+                _pg_u.add(_pg_layout.signature)
+                unwrapped_model._unsloth_prefix_grouper_grad_unsafe = _pg_u
                 torch.cuda.empty_cache()
             if UNSLOTH_ENABLE_LOGGING:
                 print(f"[Unsloth] GRPO PrefixGrouper (grad) forward failed -> packed/padded fallback: {_pg_err2!r}", flush = True)
