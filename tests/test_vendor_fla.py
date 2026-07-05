@@ -269,10 +269,11 @@ def test_hopper_bad_triton_range_skips_injection():
 
     from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
 
-    def fake_torch(name, major):
+    def fake_torch(name, major, count=1):
         cuda = types.SimpleNamespace(
-            get_device_name=lambda i=0: name,
-            get_device_capability=lambda i=0: (major, 0),
+            device_count=lambda c=count: c,
+            get_device_name=lambda i=0, n=name: n,
+            get_device_capability=lambda i=0, m=major: (m, 0),
         )
         return types.SimpleNamespace(cuda=cuda)
 
@@ -289,6 +290,111 @@ def test_hopper_bad_triton_range_skips_injection():
         tri = types.SimpleNamespace(__version__=ver)
         assert _hopper_triton_needs_tilelang(hopper, tri) is want_on_hopper, ver
         assert _hopper_triton_needs_tilelang(blackwell, tri) is False, ver
+
+
+def test_hopper_at_nonzero_device_index_trips_guard():
+    # On a mixed host the model can run on a nonzero Hopper card while cuda:0 is a
+    # different architecture; the guard must scan every visible device, not just 0.
+    import types
+
+    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
+
+    def mixed_torch(caps, names):
+        cuda = types.SimpleNamespace(
+            device_count=lambda: len(caps),
+            get_device_name=lambda i: names[i],
+            get_device_capability=lambda i: caps[i],
+        )
+        return types.SimpleNamespace(cuda=cuda)
+
+    # cuda:0 Ada (sm89), cuda:1 Hopper (sm90). A device-0 probe would say "safe".
+    ada_then_hopper = mixed_torch(
+        {0: (8, 9), 1: (9, 0)},
+        {0: "NVIDIA RTX 6000 Ada Generation", 1: "NVIDIA H100 80GB HBM3"},
+    )
+    # cuda:0 Ada, cuda:1 Ada (no Hopper anywhere): fast path stays enabled.
+    ada_only = mixed_torch(
+        {0: (8, 9), 1: (8, 9)},
+        {0: "NVIDIA RTX 6000 Ada Generation", 1: "NVIDIA RTX 6000 Ada Generation"},
+    )
+
+    bad = types.SimpleNamespace(__version__="3.6.0")   # in [3.4.0, 3.7.1)
+    ok = types.SimpleNamespace(__version__="3.7.1")    # patched Triton
+
+    # A Hopper card at cuda:1 must trip the guard in the bad Triton range.
+    assert _hopper_triton_needs_tilelang(ada_then_hopper, bad) is True
+    # Same host, patched Triton: no skip.
+    assert _hopper_triton_needs_tilelang(ada_then_hopper, ok) is False
+    # No Hopper on any index: never skip.
+    assert _hopper_triton_needs_tilelang(ada_only, bad) is False
+
+
+# ---------------------------------------------------------------------------
+# Pruned TileLang backend cannot import a broken external tilelang
+# ---------------------------------------------------------------------------
+_TILELANG_NEUTRALIZED_SUBPROCESS = textwrap.dedent(
+    """
+    import os, sys, pathlib, tempfile
+    os.environ["UNSLOTH_IS_PRESENT"] = "1"
+    os.environ["UNSLOTH_FORCE_VENDORED_FLA"] = "1"
+
+    # A broken/incompatible tilelang install: importable finder, but executing its
+    # __init__ raises a NON-ImportError (e.g. an ABI/CUDA mismatch). The vendored
+    # TileLangBackend.is_available() does `import tilelang` catching only
+    # ImportError, so an un-neutralized probe would let this abort the call.
+    root = pathlib.Path(tempfile.mkdtemp())
+    (root / "tilelang").mkdir()
+    (root / "tilelang" / "__init__.py").write_text(
+        "raise RuntimeError('broken tilelang ABI')\\n"
+    )
+    sys.path.insert(0, str(root))
+
+    # Sanity: importing it really raises a non-ImportError.
+    try:
+        import tilelang
+        raise AssertionError("expected broken tilelang to raise RuntimeError")
+    except RuntimeError:
+        pass
+    finally:
+        sys.modules.pop("tilelang", None)
+
+    from unsloth_zoo.temporary_patches.fla_vendor import patch_vendor_fla
+    patch_vendor_fla()
+
+    import fla.ops.common.backends as cb
+    from fla.ops.common.backends.tilelang import TileLangBackend
+
+    # Neutralized: the probe answers False without importing the broken tilelang.
+    assert TileLangBackend.is_available() is False, "tilelang probe not neutralized"
+    assert "tilelang" not in sys.modules, "broken tilelang got imported"
+
+    # Emulate the dispatch loop's `is_available() and is_enabled()` guard across
+    # every registered backend: it must not raise even with a broken tilelang on
+    # the path, and the tilelang backend stays unusable.
+    for be in cb.common_registry._get_sorted_backends():
+        usable = be.is_available() and be.is_enabled()
+        assert usable in (True, False)
+    assert "tilelang" not in sys.modules, "broken tilelang imported during dispatch probe"
+    print("TILELANG_NEUTRALIZED_OK")
+    """
+)
+
+
+@pytest.mark.skipif(
+    not _injection_supported(),
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
+def test_broken_tilelang_does_not_abort_dispatch_subprocess():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", _TILELANG_NEUTRALIZED_SUBPROCESS],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "TILELANG_NEUTRALIZED_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
 def test_failed_injection_restores_backend_env(monkeypatch, tmp_path):

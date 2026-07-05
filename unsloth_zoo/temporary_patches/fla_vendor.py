@@ -111,15 +111,34 @@ def _hopper_triton_needs_tilelang(torch_mod, triton_mod):
     fla #640) and points at its TileLang backend, which this snapshot prunes,
     so injection must be skipped there to keep the pure-torch fallback.
     Mirrors upstream's exact constants (full version parse, not base_version).
+
+    Every visible CUDA device is probed, not just device 0: on a mixed host a
+    model can be placed on a nonzero Hopper card (e.g. cuda:0 Ada, cuda:1 H100),
+    and a device-0-only check would report that setup as safe and inject kernels
+    that crash mid-backward on the Hopper card. If any visible GPU would hit the
+    bug we conservatively skip injection for the whole process.
     """
     try:
-        name = torch_mod.cuda.get_device_name(0)
-        major = torch_mod.cuda.get_device_capability(0)[0]
-        if not ("NVIDIA H" in name or major == 9):
-            return False
         from packaging import version
         v = version.parse(str(triton_mod.__version__).split("+")[0])
-        return version.parse("3.4.0") <= v < version.parse("3.7.1")
+        if not (version.parse("3.4.0") <= v < version.parse("3.7.1")):
+            return False
+        try:
+            count = int(torch_mod.cuda.device_count())
+        except Exception:
+            count = 0
+        for i in range(count):
+            try:
+                name = torch_mod.cuda.get_device_name(i)
+            except Exception:
+                name = ""
+            try:
+                major = torch_mod.cuda.get_device_capability(i)[0]
+            except Exception:
+                major = -1
+            if "NVIDIA H" in name or major == 9:
+                return True
+        return False
     except Exception:
         return False
 
@@ -197,6 +216,35 @@ def _real_fla_present_and_compatible():
     return _version_at_least(ver, _MIN_FLA)
 
 
+def _neutralize_tilelang_backend_probe():
+    """Permanently make the pruned TileLang backend unavailable without importing
+    the external ``tilelang``.
+
+    The vendored ``TileLangBackend`` overrides ``is_available()`` to ``import
+    tilelang`` (catching only ``ImportError``), and both backend registration
+    (``can_use``) and the dispatch loop evaluate ``is_available()`` *before* the
+    ``FLA_TILELANG=0`` ``is_enabled()`` gate. A broken/ABI-incompatible installed
+    tilelang that raises a non-``ImportError`` on import would therefore abort the
+    injection (during registration) and every later gated-delta dispatch. The
+    pruned snapshot dropped the tilelang kernels, so the backend can never serve a
+    call anyway; override the probe to a plain ``False``.
+
+    Must be called while ``import tilelang`` is shadowed (see ``_inject_vendored_fla``)
+    so importing the backend module here cannot raise. Best effort.
+    """
+    try:
+        from fla.ops.common.backends.tilelang import TileLangBackend
+        TileLangBackend.is_available = classmethod(lambda cls: False)
+        try:
+            # can_use is @cache and may have memoized a probe from registration.
+            TileLangBackend.can_use.cache_clear()
+        except Exception:
+            pass
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: could not neutralize vendored tilelang backend: {e}")
+
+
 def _inject_vendored_fla():
     """Register the vendored fla tree into sys.modules under the name ``fla``.
 
@@ -252,10 +300,32 @@ def _inject_vendored_fla():
     fla_mod = importlib.util.module_from_spec(spec)
     setattr(fla_mod, _VENDORED_MARK, True)
     sys.modules["fla"] = fla_mod
+
+    # Importing fla.ops.gated_delta_rule transitively registers the common
+    # backends, whose TileLangBackend.is_available() does `import tilelang`
+    # (catching only ImportError) and is probed before the FLA_TILELANG=0 gate. A
+    # broken/incompatible installed tilelang that raises a non-ImportError would
+    # abort this injection during registration (and every later dispatch). Shadow
+    # the external tilelang with None (a clean ImportError) across the import so
+    # registration cannot raise, permanently neutralize the probe, then restore
+    # tilelang so a real, working install stays importable for any non-fla use.
+    _tl_sentinel = object()
+    _tl_prev = sys.modules.get("tilelang", _tl_sentinel)
+    _tl_shadow = _tl_prev is _tl_sentinel or _tl_prev is None
     try:
-        spec.loader.exec_module(fla_mod)
-        for sub in _EXPORT_SUBMODULES:
-            importlib.import_module(sub)
+        try:
+            if _tl_shadow:
+                sys.modules["tilelang"] = None
+            spec.loader.exec_module(fla_mod)
+            for sub in _EXPORT_SUBMODULES:
+                importlib.import_module(sub)
+            _neutralize_tilelang_backend_probe()
+        finally:
+            if _tl_shadow:
+                if _tl_prev is _tl_sentinel:
+                    sys.modules.pop("tilelang", None)
+                else:
+                    sys.modules["tilelang"] = _tl_prev
     except Exception as e:
         # Roll back a partial injection and restore whatever we purged, including
         # the backend env flags so a shadowed real fla is left exactly as we
