@@ -101,6 +101,43 @@ def test_mask_is_plain_band_rejects_non_probe_violation():
     assert not _mask_is_plain_band(packed, S, w)
 
 
+def test_mask_is_plain_band_rejects_per_head_mask():
+    # A 4D mask with a head dim > 1 cannot be honoured by the single block mask
+    # applied to every head, so it must be rejected even if head 0 is a band.
+    S, w = 128, 32
+    band = _band_mask_full(S, w)
+    per_head = band[None, None].expand(1, 4, S, S).clone()   # (1, 4, S, S)
+    assert not _mask_is_plain_band(per_head, S, w)
+    assert _mask_is_plain_band(band[None, None], S, w)       # (1, 1, S, S) still ok
+
+
+def test_mask_is_plain_band_rejects_inband_bias():
+    # A finite in-band bias (soft penalty) must be rejected: the banded path
+    # swaps in a boolean block mask and would silently drop the bias.
+    S, w = 128, 32
+    band = _band_mask_full(S, w)
+    biased = torch.where(band, -5.0, float("-inf")).to(torch.float32)[None, None]
+    assert not _mask_is_plain_band(biased, S, w)
+    clean = torch.where(band, 0.0, float("-inf")).to(torch.float32)[None, None]
+    assert _mask_is_plain_band(clean, S, w)
+
+
+def test_mask_is_plain_band_chunked_equals_single_block():
+    # Row-chunked verification must agree with a single-block scan on every mask.
+    S, w = 96, 16
+    band = _band_mask_full(S, w)
+    packed = band.clone(); packed[50, 40] = False
+    cases = {
+        "band_bool": band[None, None],
+        "band_float": torch.where(band, 0.0, float("-inf")).to(torch.float32)[None, None],
+        "packed_bool": packed[None, None],
+    }
+    for name, m in cases.items():
+        full = _mask_is_plain_band(m.clone(), S, w, _block=S)
+        chunked = _mask_is_plain_band(m.clone(), S, w, _block=7)  # crosses block edges
+        assert full == chunked, name
+
+
 def test_mask_is_plain_band_survives_id_reuse():
     # A recycled object id must not produce a stale cached verdict for packed masks.
     S, w = 128, 32

@@ -58,7 +58,7 @@ def _block_mask(w, nb, device):
     return m
 
 
-def _mask_is_plain_band(mask, S, w):
+def _mask_is_plain_band(mask, S, w, _block=1024):
     """True only if `mask` is exactly the causal+sliding band with no token padding.
 
     Every row is verified (not a sampled subset), so packed or padded masks, whose
@@ -73,14 +73,29 @@ def _mask_is_plain_band(mask, S, w):
     cached = getattr(mask, "_unsloth_plain_band", None)
     if cached is not None:
         return cached
-    m = mask[0, 0]
-    if m.shape[-2] != S or m.shape[-1] != S:
+    # The banded path applies a single block mask to every head, so a per-head
+    # (shape[1] > 1) mask cannot be honoured; reject it instead of validating
+    # only head 0 and silently dropping the rest.
+    if mask.shape[1] != 1 or mask.shape[-2] != S or mask.shape[-1] != S:
         ok = False
     else:
-        allowed = m if m.dtype == torch.bool else (m > -1e4)
+        m = mask[0, 0]
+        # Scan in row blocks so we never materialise a second dense S x S band
+        # plus its comparison: at 16k/32k that is gigabytes of transient GPU
+        # memory. Each block only builds a (block, S) band. A float mask must
+        # additionally carry no in-band bias (exactly 0), else the banded path
+        # would replace it with a boolean mask and silently drop the bias.
+        is_bool = m.dtype == torch.bool
         idx = torch.arange(S, device=m.device)
-        band = (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - w)
-        ok = bool((allowed == band).all().item())
+        ok = True
+        for start in range(0, S, _block):
+            rows = idx[start : start + _block]                                       # (br,)
+            band = (idx[None, :] <= rows[:, None]) & (idx[None, :] > rows[:, None] - w)  # (br, S)
+            msl = m[start : start + _block, :]                                       # (br, S)
+            match = (msl == band) if is_bool else torch.where(band, msl == 0, msl <= -1e4)
+            if not bool(match.all().item()):
+                ok = False
+                break
     try:
         mask._unsloth_plain_band = ok
     except Exception:
