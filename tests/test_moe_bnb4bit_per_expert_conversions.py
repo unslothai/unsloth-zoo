@@ -213,3 +213,38 @@ def test_fused_prequantized_builds_params4bit():
     assert tuple(new_param._original_shape) == (2, 8, 16)
     deq = bnb.functional.dequantize_4bit(new_param.data, new_param.quant_state)
     assert torch.allclose(deq.float(), w.float(), atol=0.5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+def test_fused_prequantized_orientation_mismatch_raises():
+    """A blob quantized in the transposed (checkpoint) layout must fail loudly:
+    a transpose op cannot be applied to packed 4-bit data."""
+    import bitsandbytes as bnb
+    import torch.nn as nn
+
+    conv = _fused_passthrough_converter()
+    twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
+    op = twin.operations[0]
+
+    w = torch.randn(2, 16, 8, device="cuda", dtype=torch.bfloat16)  # transposed layout
+    packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
+    base = op.base_source
+    input_dict = {base + "." + k: v for k, v in qs.as_dict(packed=True).items()}
+    input_dict[op.anchored_source] = packed
+
+    experts = nn.Module()
+    # Real-rank meta param carrying the model layout.
+    experts.gate_up_proj = nn.Parameter(torch.empty(2, 8, 16), requires_grad=False)
+    mlp = nn.Module(); mlp.experts = experts
+    layer = nn.Module(); layer.mlp = mlp
+    layers = nn.ModuleList([layer])
+    inner = nn.Module(); inner.layers = layers
+    model = nn.Module(); model.model = inner
+
+    with pytest.raises(ValueError, match="model layout"):
+        op.convert(
+            input_dict,
+            model=model,
+            full_layer_name="model.layers.0.mlp.experts.gate_up_proj",
+            target_patterns=[conv.target_patterns[0]],
+        )

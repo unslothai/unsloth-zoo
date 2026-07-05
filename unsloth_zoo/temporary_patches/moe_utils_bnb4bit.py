@@ -876,6 +876,26 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param.
             if getattr(new_value, "quant_state", None) is not None:
                 new_value._original_shape = new_value.quant_state.shape
+                # Orientation is baked in at quantize time (converters run before
+                # the quant op, so supported saves are always model layout). A
+                # same-rank mismatch means an unsupported checkpoint layout that a
+                # transpose op cannot fix on packed data: fail loudly here.
+                try:
+                    expected = tuple(model.get_parameter(full_layer_name).shape)
+                except Exception:
+                    expected = None
+                qshape = tuple(new_value.quant_state.shape)
+                if (
+                    expected is not None
+                    and len(expected) == len(qshape)
+                    and expected != qshape
+                ):
+                    raise ValueError(
+                        f"Unsloth: prequantized expert `{full_layer_name}` was "
+                        f"quantized with shape {qshape} but the model expects "
+                        f"{expected}. Requantize the checkpoint from weights in "
+                        f"the model layout."
+                    )
             module._is_hf_initialized = True
             return {target_patterns[0]: new_value}
 
