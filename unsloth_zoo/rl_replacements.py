@@ -961,7 +961,7 @@ def grpo_accumulated_loss(
     _pg_funcs = getattr(grpo_accumulated_loss, "_pg_funcs", None)
     if _pg_funcs is None:
         _pg_funcs = ()
-        if os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "0").lower() not in (
+        if os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "1").lower() not in (
             "0", "false", "no", "off",
         ):
             try:
