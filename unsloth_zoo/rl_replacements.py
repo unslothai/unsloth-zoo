@@ -978,7 +978,10 @@ def grpo_accumulated_loss(
             except Exception:
                 _pg_funcs = ()
         grpo_accumulated_loss._pg_funcs = _pg_funcs
-    _pg_engage = bool(_pg_funcs)
+    # Skip PG when vLLM drives generation (fast_inference=True): the colocated rollout dominates
+    # the step, so the shared-prefix forward saves little end-to-end and its first-use self-verify
+    # (which runs the full-row path too) is net overhead. Keep the packed path instead.
+    _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False)
 
     # ---- PrefixGrouper (GRPO shared-prompt dedup; default OFF => byte-identical) ----
     # In GRPO every prompt spawns G=num_generations completions that share the prompt prefix.
