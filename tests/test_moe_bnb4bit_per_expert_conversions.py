@@ -128,3 +128,88 @@ def test_quantstate_absmax_fp32_plain():
     out = _quantstate_absmax_fp32(qs)
     assert out.dtype == torch.float32
     assert torch.equal(out, torch.tensor([1.0, 2.5]))
+
+
+class _StubTranspose(ConversionOps):
+    """Stands in for the model's Transpose op on fused expert params."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def convert(self, input_dict, **kwargs):
+        self.calls += 1
+        return {k: (v[0] if isinstance(v, list) else v).transpose(1, 2) for k, v in input_dict.items()}
+
+
+def _fused_passthrough_converter(name="model.layers.*.mlp.experts.gate_up_proj"):
+    return WeightConverter(
+        source_patterns=name,
+        target_patterns=name,
+        operations=[_StubTranspose()],
+    )
+
+
+def test_fused_passthrough_converter_twinned():
+    """Model converters over a fused expert param (e.g. qwen3_vl_moe's Transpose)
+    precede appended quantizer conversions, so they need a prepended twin too."""
+    conv = _fused_passthrough_converter()
+    twins = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)
+    assert len(twins) == 1
+    twin = twins[0]
+    base = conv.source_patterns[0]
+    assert list(twin.source_patterns) == [base + suf for suf in _AUX_SUFFIXES] + [base + "$"]
+    assert twin.target_patterns[0] == conv.target_patterns[0]
+    assert type(twin.operations[0]).__name__ == "_FusedExpertDeserialize"
+
+
+def test_fused_unquantized_falls_back_to_original_ops():
+    conv = _fused_passthrough_converter()
+    twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
+    op = twin.operations[0]
+    orig = op.original_ops[0]
+
+    fused = torch.randn(3, 4, 2)
+    out = op.convert(
+        {op.anchored_source: fused},
+        model=None,
+        full_layer_name="model.layers.0.mlp.experts.gate_up_proj",
+        target_patterns=[conv.target_patterns[0]],
+    )
+    assert orig.calls == 1
+    assert out[op.base_source].shape == (3, 2, 4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+def test_fused_prequantized_builds_params4bit():
+    import bitsandbytes as bnb
+    import torch.nn as nn
+
+    conv = _fused_passthrough_converter()
+    twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
+    op = twin.operations[0]
+
+    w = torch.randn(2, 8, 16, device="cuda", dtype=torch.bfloat16)
+    packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
+    base = op.base_source
+    input_dict = {base + "." + k: v for k, v in qs.as_dict(packed=True).items()}
+    input_dict[op.anchored_source] = packed
+
+    experts = nn.Module()
+    experts.gate_up_proj = nn.Parameter(torch.empty(1), requires_grad=False)
+    mlp = nn.Module(); mlp.experts = experts
+    layer = nn.Module(); layer.mlp = mlp
+    layers = nn.ModuleList([layer])
+    inner = nn.Module(); inner.layers = layers
+    model = nn.Module(); model.model = inner
+
+    out = op.convert(
+        input_dict,
+        model=model,
+        full_layer_name="model.layers.0.mlp.experts.gate_up_proj",
+        target_patterns=[conv.target_patterns[0]],
+    )
+    new_param = out[conv.target_patterns[0]]
+    assert type(new_param).__name__ == "Params4bit"
+    assert tuple(new_param._original_shape) == (2, 8, 16)
+    deq = bnb.functional.dequantize_4bit(new_param.data, new_param.quant_state)
+    assert torch.allclose(deq.float(), w.float(), atol=0.5)

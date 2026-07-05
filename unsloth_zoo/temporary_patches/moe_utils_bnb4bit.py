@@ -824,6 +824,61 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             module._is_hf_initialized = True
             return {target_patterns[0]: new_param}
 
+    class _FusedExpertDeserialize(ConversionOps):
+        """Quantized twin of a model's fused expert converter (e.g. a Transpose).
+
+        A fused prequantized checkpoint stores packed uint8 + aux keys that the
+        model's own converter would mangle (ops like Transpose cannot apply to
+        packed data). With aux keys, rebuild the Params4bit directly; without
+        them, replicate the model's ops so unquantized checkpoints are untouched.
+        """
+
+        def __init__(self, base_source, anchored_source, original_ops):
+            self.base_source = base_source
+            self.anchored_source = anchored_source
+            self.original_ops = original_ops
+
+        def convert(self, input_dict, model=None, full_layer_name=None,
+                    target_patterns=None, missing_keys=None, config=None, **kwargs):
+            has_aux = any((self.base_source + suf) in input_dict for suf in _AUX_SUFFIXES)
+            if not has_aux:
+                out = {self.base_source: input_dict[self.anchored_source]}
+                for op in self.original_ops:
+                    out = op.convert(
+                        out,
+                        source_patterns=[self.base_source],
+                        target_patterns=target_patterns,
+                        full_layer_name=full_layer_name,
+                        model=model,
+                        config=config,
+                        missing_keys=missing_keys,
+                    )
+                return out
+
+            input_dict = dict(input_dict)  # avoid mutating the caller's dict
+            for key, value in list(input_dict.items()):
+                if isinstance(value, list):
+                    input_dict[key] = value[0]
+            weight = input_dict.pop(self.anchored_source)
+            stats = {
+                (self.base_source + suf): input_dict[self.base_source + suf]
+                for suf in _AUX_SUFFIXES
+                if (self.base_source + suf) in input_dict
+            }
+            module, _ = get_module_from_name(model, full_layer_name)
+            new_value = Params4bit.from_prequantized(
+                data=weight,
+                quantized_stats=stats,
+                requires_grad=False,
+                device=weight.device,
+                module=module,
+            )
+            # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param.
+            if getattr(new_value, "quant_state", None) is not None:
+                new_value._original_shape = new_value.quant_state.shape
+            module._is_hf_initialized = True
+            return {target_patterns[0]: new_value}
+
     twins = []
     for conv in model_conversions:
         if not isinstance(conv, WeightConverter):
@@ -835,22 +890,41 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
         target = conv.target_patterns[0]
         if not target.endswith(("gate_up_proj", "down_proj")):
             continue
-        if not all(s.endswith(".weight") for s in conv.source_patterns):
-            continue
-        base_sources = list(conv.source_patterns)
-        anchored_sources = [s + "$" for s in base_sources]
-        aux_sources = [b + suf for b in base_sources for suf in _AUX_SUFFIXES]
-        twins.append(
-            WeightConverter(
-                source_patterns=aux_sources + anchored_sources,
-                target_patterns=target,
-                operations=[
-                    _PerExpertStackDeserialize(
-                        base_sources, anchored_sources, deepcopy(conv.operations)
-                    )
-                ],
+        if all(s.endswith(".weight") for s in conv.source_patterns):
+            base_sources = list(conv.source_patterns)
+            anchored_sources = [s + "$" for s in base_sources]
+            aux_sources = [b + suf for b in base_sources for suf in _AUX_SUFFIXES]
+            twins.append(
+                WeightConverter(
+                    source_patterns=aux_sources + anchored_sources,
+                    target_patterns=target,
+                    operations=[
+                        _PerExpertStackDeserialize(
+                            base_sources, anchored_sources, deepcopy(conv.operations)
+                        )
+                    ],
+                )
             )
-        )
+        elif (
+            len(conv.source_patterns) == 1
+            and conv.source_patterns[0].endswith(("gate_up_proj", "down_proj"))
+        ):
+            # Fused passthrough converter (e.g. qwen3_vl_moe's Transpose). The
+            # model converter precedes appended quantizer conversions and matching
+            # stops at the first hit, so without this twin a fused prequantized
+            # checkpoint feeds packed uint8 into the model's ops.
+            base = conv.source_patterns[0]
+            anchored = base + "$"
+            aux_sources = [base + suf for suf in _AUX_SUFFIXES]
+            twins.append(
+                WeightConverter(
+                    source_patterns=aux_sources + [anchored],
+                    target_patterns=target,
+                    operations=[
+                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations))
+                    ],
+                )
+            )
     return twins
 
 
