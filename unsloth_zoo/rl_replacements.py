@@ -1005,7 +1005,10 @@ def grpo_accumulated_loss(
             # the FlexAttention kernel never applies attn_logit_softcapping, so skip PG entirely
             # for softcap models (e.g. gemma2) before building any layout. Hybrid SSM models
             # (FalconH1 etc.) are excluded too: only attention gets the shared-prefix isolation,
-            # a Mamba branch would leak state across suffixes.
+            # a Mamba branch would leak state across suffixes. MoE models (e.g. Qwen3-MoE) are
+            # excluded for the same reason: they reuse LlamaModel_fast_forward but their decoder
+            # does not thread prefix_seg_info to the attention, so the MoE branch runs plain causal
+            # attention and would leak state across suffixes.
             _pg_cfg = getattr(unwrapped_model, "config", None)
             _pg_engage = (
                 _pg_enabled_fn()
@@ -1018,6 +1021,13 @@ def grpo_accumulated_loss(
                 and not any(
                     getattr(_pg_cfg, _pg_a, None) is not None
                     for _pg_a in ("mamba_d_ssm", "mamba_d_state", "mamba_expand")
+                )
+                and not any(
+                    getattr(_pg_cfg, _pg_a, None) is not None
+                    for _pg_a in (
+                        "num_experts", "num_experts_per_tok", "num_local_experts",
+                        "n_routed_experts", "moe_intermediate_size",
+                    )
                 )
             )
         except Exception:
