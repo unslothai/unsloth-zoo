@@ -1270,11 +1270,13 @@ def grpo_accumulated_loss(
                         _pg_trusted = False
                 # else: no full-row reference (packing off/failed) -> cannot verify -> fall back.
             if _pg_trusted:
+                # free the full-row packed graph BEFORE the grad forward (it was already
+                # consumed above as the verify reference). Holding both graphs here can OOM
+                # exactly when packed+PG exceed VRAM but PG alone would fit; on a PG failure
+                # the padded loop recomputes new_logprobs, so packed is no longer needed.
+                _pack_hidden = _pack_sel = _pack_result = None
                 _pg_result = _pg_grad_forward()   # grad forward for the loss
                 _pg_use = True
-                # PG owns the loss now: drop the full-row packed graph from the verify step
-                # (kept until here so a PG forward failure could still fall back to it)
-                _pack_hidden = _pack_sel = _pack_result = None
         except Exception as _pg_err2:
             _pg_use = False
             os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
