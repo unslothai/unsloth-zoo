@@ -103,6 +103,20 @@ def test_gate_gradient_skipped_when_router_frozen():
     assert gate.grad is None
 
 
+def test_double_backward_raises():
+    # The identity is only first-order exact; create_graph must fail loudly
+    # instead of returning wrong second derivatives.
+    inter = torch.randn(4, 6, requires_grad=True)
+    gate = torch.rand(4, requires_grad=True) + 0.1
+    W2 = torch.randn(6, 3)
+
+    inter_id = _MoEGateGradIdentity.apply(inter, gate)
+    out = (inter_id @ W2) * gate.detach().unsqueeze(-1)
+    (g_gate,) = torch.autograd.grad(out.sum(), gate, create_graph=True)
+    with pytest.raises(RuntimeError):
+        torch.autograd.grad(g_gate.sum(), gate)
+
+
 def test_forward_is_identity_and_env_gated(monkeypatch):
     x = torch.randn(5, 3, requires_grad=True)
     g = torch.rand(5)

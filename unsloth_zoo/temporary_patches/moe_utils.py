@@ -1211,7 +1211,11 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         return inter
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(ctx, grad_inter):
+        # once_differentiable: the reconstruction is first-order exact but its
+        # graph is not the original one, so create_graph must raise, not
+        # silently return wrong second derivatives.
         # grad_inter is None when nothing downstream needs inter's gradient
         # (e.g. a frozen down projection); there is nothing to propagate then.
         if grad_inter is None:
@@ -1410,10 +1414,13 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
-    # Env-gated gate-grad identity; disabled when a down bias exists (identity assumes a linear down).
+    # Env-gated gate-grad identity; disabled when a down bias exists (identity
+    # assumes a linear down) or the router is frozen (nothing to synthesize, and
+    # the Function would needlessly keep inter saved).
     _gategrad = (
         _moe_gategrad_enabled()
         and getattr(self, "down_proj_bias", None) is None
+        and top_k_weights.requires_grad
     )
     permuted_weights = None
     if _gategrad:
