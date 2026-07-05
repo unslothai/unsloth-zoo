@@ -45,6 +45,9 @@ import torch
 from .common import TEMPORARY_PATCHES
 from .utils import patch_function, raise_error
 
+# Mirrors gemma.py: flex dispatch can be turned off globally.
+_UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+
 
 def patch_Qwen3MoeDecoderLayer_float32():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
@@ -82,6 +85,10 @@ def patch_Qwen3MoeDecoderLayer_float32():
         residual = hidden_states  # fp32
         hidden_states = self.post_attention_layernorm(hidden_states)  # -> fp16
         hidden_states = self.mlp(hidden_states)  # MoE / MLP -> fp16
+        # Old-transformers sparse MoE blocks return (hidden_states, router_logits);
+        # mirror the upstream decoder's unpack.
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         hidden_states = residual + hidden_states  # fp32 + fp16 -> fp32
         return hidden_states
     pass
@@ -121,7 +128,7 @@ def patch_Qwen3MoeAttention_float32():
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS
     except Exception as e:
         return raise_error("Qwen3MoeAttention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
@@ -157,20 +164,40 @@ def patch_Qwen3MoeAttention_float32():
         attn_mask = attention_mask
         if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(torch.float32)
-        is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask = attn_mask,
-            dropout_p = self.attention_dropout if self.training else 0.0,
-            is_causal = is_causal,
-            scale = self.scaling,
-            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
-        )
+        attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
+        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
+            attn_impl = "sdpa"
+        if attn_impl == "flex_attention":
+            # Flex builds a BlockMask that raw SDPA cannot consume; dispatch to the
+            # interface (returns (b, q, h, d), already transposed).
+            attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout = self.attention_dropout if self.training else 0.0,
+                scaling = self.scaling,
+                sliding_window = getattr(self, "sliding_window", None),
+                **kwargs,
+            )
+        else:
+            is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
+            attn_output = scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask = attn_mask,
+                dropout_p = self.attention_dropout if self.training else 0.0,
+                is_causal = is_causal,
+                scale = self.scaling,
+                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+            )
+            attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
-        # (b, h, q, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+        # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
+        attn_output = attn_output.contiguous().reshape(*input_shape, -1)
         attn_output = attn_output.to(torch.float16)
         attn_output = self.o_proj(attn_output)
         return attn_output, None

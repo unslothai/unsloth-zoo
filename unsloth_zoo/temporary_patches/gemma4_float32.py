@@ -42,6 +42,9 @@ import torch
 from .common import TEMPORARY_PATCHES
 from .utils import patch_function, raise_error
 
+# Mirrors gemma.py: flex dispatch can be turned off globally.
+_UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+
 
 def patch_Gemma4TextScaledWordEmbedding():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
@@ -95,7 +98,7 @@ def patch_Gemma4TextAttention():
     try:
         import transformers.models.gemma4.modeling_gemma4
         transformers.models.gemma4.modeling_gemma4.Gemma4TextAttention
-        from transformers.models.gemma4.modeling_gemma4 import apply_rotary_pos_emb
+        from transformers.models.gemma4.modeling_gemma4 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS
     except Exception as e:
         return raise_error("Gemma4TextAttention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
@@ -106,10 +109,11 @@ def patch_Gemma4TextAttention():
         hidden_states,
         position_embeddings = None,
         attention_mask = None,
+        shared_kv_states = None,
         past_key_values = None,
         **kwargs,
     ):
-        # Shared-KV carrier (Gemma-4 E-series, num_kv_shared_layers > 0); a no-op
+        # Shared-KV carrier (5.5.0-5.5.1, no native shared_kv_states); a no-op
         # for 31B / 26B-A4B where num_kv_shared_layers == 0 and no carrier is attached.
         carrier = getattr(self, "_unsloth_shared_kv_carrier", None)
         if carrier is not None and past_key_values is None:
@@ -128,7 +132,14 @@ def patch_Gemma4TextAttention():
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim = 2)
         query_states = query_states.transpose(1, 2).contiguous()
 
-        if self.is_kv_shared_layer and past_key_values is not None:
+        if self.is_kv_shared_layer and shared_kv_states is not None:
+            # Native shared-KV (5.5.2+): dict keyed by layer_type, read even with a
+            # cache (sliding caches forget past the window). Shared layers define no
+            # k/v projections on these builds, so this branch must win.
+            key_states, value_states = shared_kv_states[self.layer_type]
+            key_states = key_states.to(query_states.device, torch.float32)
+            value_states = value_states.to(query_states.device, torch.float32)
+        elif self.is_kv_shared_layer and past_key_values is not None:
             key_states, value_states = past_key_values.shared_layers[self.kv_shared_layer_index]
             key_states = key_states.to(query_states.device, torch.float32)
             value_states = value_states.to(query_states.device, torch.float32)
@@ -145,10 +156,13 @@ def patch_Gemma4TextAttention():
             value_states = self.v_norm(value_states).to(torch.float32)
             value_states = value_states.transpose(1, 2).contiguous()
 
-        if past_key_values is not None:
-            if not self.is_kv_shared_layer:
-                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
-            if self.store_full_length_kv:
+        if past_key_values is not None and not self.is_kv_shared_layer:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        if getattr(self, "store_full_length_kv", False):
+            if shared_kv_states is not None:
+                # Native producer stores unconditionally (the dict is passed every call).
+                shared_kv_states[self.layer_type] = key_states, value_states
+            elif past_key_values is not None:
                 if not hasattr(past_key_values, "shared_layers"):
                     past_key_values.shared_layers = {}
                 past_key_values.shared_layers[self.layer_idx] = key_states, value_states
@@ -157,20 +171,40 @@ def patch_Gemma4TextAttention():
         attn_mask = attention_mask
         if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(torch.float32)
-        is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask = attn_mask,
-            dropout_p = self.attention_dropout if self.training else 0.0,
-            is_causal = is_causal,
-            scale = self.scaling,
-            enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
-        )
+        attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
+        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
+            attn_impl = "sdpa"
+        if attn_impl == "flex_attention":
+            # Flex builds a BlockMask that raw SDPA cannot consume; dispatch to the
+            # interface (returns (b, q, h, d), already transposed).
+            attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout = self.attention_dropout if self.training else 0.0,
+                scaling = self.scaling,
+                sliding_window = getattr(self, "sliding_window", None),
+                **kwargs,
+            )
+        else:
+            is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
+            attn_output = scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask = attn_mask,
+                dropout_p = self.attention_dropout if self.training else 0.0,
+                is_causal = is_causal,
+                scale = self.scaling,
+                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+            )
+            attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
-        # (b, h, q, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+        # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
+        attn_output = attn_output.contiguous().reshape(*input_shape, -1)
         attn_output = attn_output.to(torch.float16)
         attn_output = self.o_proj(attn_output)
         return attn_output, None
