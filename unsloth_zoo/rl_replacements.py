@@ -1200,11 +1200,14 @@ def grpo_accumulated_loss(
                 prefix_seg_info = _pg_layout.prefix_seg_info,
                 use_cache = False,
             ).logits
-            return _pg_layout.extract_logps(
+            _pg_lp = _pg_layout.extract_logps(
                 _h, lm_head, chunked_hidden_states_selective_log_softmax,
                 _pg_chunks, logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature,
             )  # [total_rows, W] with grad
+            # GPT-OSS offload race guard (matches the packed and padded paths)
+            device_synchronize()
+            return _pg_lp
 
     if _pg_layout is not None:
         try:
@@ -1247,13 +1250,16 @@ def grpo_accumulated_loss(
             if _pg_trusted:
                 _pg_result = _pg_grad_forward()   # grad forward for the loss
                 _pg_use = True
+                # PG owns the loss now: drop the full-row packed graph from the verify step
+                # (kept until here so a PG forward failure could still fall back to it)
+                _pack_hidden = _pack_sel = _pack_result = None
         except Exception as _pg_err2:
             _pg_use = False
             os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
             if isinstance(_pg_err2, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
             if UNSLOTH_ENABLE_LOGGING:
-                print(f"[Unsloth] GRPO PrefixGrouper (grad) forward failed -> full-row packed: {_pg_err2!r}", flush = True)
+                print(f"[Unsloth] GRPO PrefixGrouper (grad) forward failed -> packed/padded fallback: {_pg_err2!r}", flush = True)
 
     if _pg_use and _pg_result is not None:
         new_logprobs = _pg_result            # PrefixGrouper verified/trusted -> skip the loop
