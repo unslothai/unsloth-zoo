@@ -285,6 +285,35 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
     assert tokenizer.eos_token_ids == {2}
 
 
+def test_mlx_generate_output_numpy_fallback_without_torch(monkeypatch):
+    import builtins
+    import numpy as np
+    import unsloth_zoo.mlx.loader as loader
+
+    # torch is installed here (the sim needs it), so force `import torch` to fail
+    # inside _mlx_generate_output to cover the numpy int64 fallback branch. Test
+    # both a missing torch (ImportError) and an installed-but-broken torch
+    # (OSError) -- the broadened except must degrade to numpy in both cases.
+    real_import = builtins.__import__
+
+    def failing_import(exc):
+        def _fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise exc
+            return real_import(name, *args, **kwargs)
+        return _fake_import
+
+    for exc in (ImportError("no torch"), OSError("broken torch native lib")):
+        monkeypatch.setattr(builtins, "__import__", failing_import(exc))
+        out = loader._mlx_generate_output([1, 2], [9, 5])
+        monkeypatch.undo()
+        assert isinstance(out, np.ndarray)
+        assert out.dtype == np.int64
+        assert out.shape == (1, 4)
+        assert out.tolist() == [[1, 2, 9, 5]]
+        assert out[:, 2:].tolist() == [[9, 5]]
+
+
 def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
     import unsloth_zoo.mlx.loader as loader
 

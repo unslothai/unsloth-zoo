@@ -3442,9 +3442,12 @@ def _mlx_generate_output(prompt_ids, generated_ids):
     """Build a Transformers-friendly batched generate return value."""
     sequences = [list(prompt_ids) + list(generated_ids)]
     try:
+        # Broad except: a torch that is installed but broken (bad native libs)
+        # raises OSError/RuntimeError, not ImportError; fall back to numpy so
+        # MLX generation keeps working instead of failing hard.
         import torch
         return torch.tensor(sequences, dtype=torch.long)
-    except ImportError:
+    except Exception:
         import numpy as np
         return np.asarray(sequences, dtype=np.int64)
 
