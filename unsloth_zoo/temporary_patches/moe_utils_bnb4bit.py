@@ -701,8 +701,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     Old checkpoints store one quantized tensor per expert per projection; the
     model's MergeModulelist converters byte-concat the packed uint8 as if bf16
     and drop the absmax/quant_map aux keys. Each twin also collects the aux
-    keys and rebuilds one stacked Params4bit (NF4 packing is elementwise
-    row-major, so per-expert byte concat is exact). Twins must be PREPENDED to
+    keys and rebuilds one stacked Params4bit (byte concat is exact when each
+    segment fills whole quant blocks; otherwise it repacks from dequantized
+    values to keep block boundaries aligned). Twins must be PREPENDED to
     win the first-match scan; bare-weight patterns are `$`-anchored so they do
     not shadow the model converter in pattern_to_converter.
     """
@@ -771,8 +772,9 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
             first_qs = None
             src_shapes = []
             per_src_absmax = []  # [src][expert] fp32 absmax
+            per_src_qs = []      # [src][expert] QuantState (for the misaligned fallback)
             for base, anch in present_sources:
-                absmax_list = []
+                absmax_list, qs_list = [], []
                 for e in range(num_experts):
                     qd = {}
                     for suf in _AUX_SUFFIXES:
@@ -785,30 +787,54 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     if e == 0:
                         src_shapes.append(tuple(qs.shape))
                     absmax_list.append(_quantstate_absmax_fp32(qs))
+                    qs_list.append(qs)
                 per_src_absmax.append(absmax_list)
+                per_src_qs.append(qs_list)
 
             out_dim = sum(s[0] for s in src_shapes)
             in_dim = src_shapes[0][1]
             if any(s[1] != in_dim for s in src_shapes):
                 raise ValueError(f"Unsloth: mismatched expert in_dims {src_shapes} for {full_layer_name}")
 
-            packed_rows, absmax_rows = [], []
-            for e in range(num_experts):
-                packed_rows.append(torch.cat(
-                    [input_dict[anch][e].reshape(-1) for _, anch in present_sources]
-                ))
-                absmax_rows.append(torch.cat([per_src_absmax[i][e] for i in range(len(present_sources))]))
-            data = torch.stack(packed_rows).unsqueeze(-1)  # (E, bytes_per_expert, 1)
-            absmax = torch.cat(absmax_rows)
+            blocksize = first_qs.blocksize
+            if any((s[0] * s[1]) % blocksize != 0 for s in src_shapes):
+                # A segment ends mid-block, so raw byte/absmax concatenation would
+                # scale everything after it with the wrong absmax. Repack from
+                # dequantized values instead (exact block boundaries, tiny requant noise).
+                full = torch.stack([
+                    torch.cat([
+                        bnb.functional.dequantize_4bit(
+                            input_dict[anch][e].reshape(-1, 1), per_src_qs[i][e]
+                        )
+                        for i, (_, anch) in enumerate(present_sources)
+                    ], dim=0)
+                    for e in range(num_experts)
+                ])
+                data, quant_state = bnb.functional.quantize_4bit(
+                    full.to(device, first_qs.dtype).contiguous(),
+                    blocksize=blocksize,
+                    quant_type=first_qs.quant_type,
+                    compress_statistics=False,
+                )
+                quant_state.shape = torch.Size((num_experts, out_dim, in_dim))
+            else:
+                packed_rows, absmax_rows = [], []
+                for e in range(num_experts):
+                    packed_rows.append(torch.cat(
+                        [input_dict[anch][e].reshape(-1) for _, anch in present_sources]
+                    ))
+                    absmax_rows.append(torch.cat([per_src_absmax[i][e] for i in range(len(present_sources))]))
+                data = torch.stack(packed_rows).unsqueeze(-1)  # (E, bytes_per_expert, 1)
+                absmax = torch.cat(absmax_rows)
 
-            quant_state = QuantState(
-                absmax=absmax,
-                shape=torch.Size((num_experts, out_dim, in_dim)),
-                code=first_qs.code.to(device),
-                blocksize=first_qs.blocksize,
-                quant_type=first_qs.quant_type,
-                dtype=first_qs.dtype,
-            )
+                quant_state = QuantState(
+                    absmax=absmax,
+                    shape=torch.Size((num_experts, out_dim, in_dim)),
+                    code=first_qs.code.to(device),
+                    blocksize=blocksize,
+                    quant_type=first_qs.quant_type,
+                    dtype=first_qs.dtype,
+                )
             new_param = torch.Tensor._make_subclass(Params4bit, data.to(device))
             new_param.requires_grad = False
             new_param.quant_state = quant_state
@@ -1017,11 +1043,20 @@ def patch_bnb4bit_dequantize_plain_params():
 pass
 
 
+def _is_bnb_module(module: nn.Module) -> bool:
+    """Any bitsandbytes module (Linear4bit, Embedding4bit, ...) or subclass:
+    their forwards consume quant_state, so their weights must stay quantized."""
+    return any(
+        getattr(klass, "__module__", "").startswith("bitsandbytes")
+        for klass in type(module).__mro__
+    )
+
+
 def _dequantize_plain_param_slots(model: nn.Module):
     if not HAS_BNB:
         return
     for module_name, module in model.named_modules():
-        if isinstance(module, (bnb.nn.Linear4bit,)) or _is_expert_module(module):
+        if _is_bnb_module(module) or _is_expert_module(module):
             continue
         for name, param in list(module.named_parameters(recurse=False)):
             if not isinstance(param, Params4bit):

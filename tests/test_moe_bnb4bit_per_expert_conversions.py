@@ -248,3 +248,123 @@ def test_fused_prequantized_orientation_mismatch_raises():
             full_layer_name="model.layers.0.mlp.experts.gate_up_proj",
             target_patterns=[conv.target_patterns[0]],
         )
+
+
+def _stack_input_dict(op, weights_per_src):
+    """Build the per-expert list input_dict for _PerExpertStackDeserialize.
+
+    weights_per_src: [src][expert] float weight tensors (out, in) on CUDA.
+    """
+    import bitsandbytes as bnb
+
+    input_dict = {}
+    for (base, anch), expert_ws in zip(
+        zip(op.base_sources, op.anchored_sources), weights_per_src
+    ):
+        packed_list = []
+        aux_lists = {}
+        for w in expert_ws:
+            packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
+            packed_list.append(packed)
+            for k, v in qs.as_dict(packed=True).items():
+                aux_lists.setdefault("." + k, []).append(v)
+        input_dict[anch] = packed_list
+        for suf, vals in aux_lists.items():
+            input_dict[base + suf] = vals
+    return input_dict
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.parametrize(
+    "out_dim,in_dim,exact",
+    [
+        (8, 16, True),   # 128 elems per segment: whole 64-blocks, raw concat is exact
+        (6, 10, False),  # 60 elems: partial block, must take the repack path
+    ],
+)
+def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
+    import bitsandbytes as bnb
+
+    torch.manual_seed(0)
+    conv = _expert_merge_converter()
+    twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
+    op = twin.operations[0]
+
+    n_experts = 2
+    weights_per_src = [
+        [torch.randn(out_dim, in_dim, device="cuda", dtype=torch.bfloat16) for _ in range(n_experts)]
+        for _ in range(len(op.base_sources))
+    ]
+    input_dict = _stack_input_dict(op, weights_per_src)
+
+    from transformers.quantizers.quantizers_utils import get_module_from_name  # noqa: F401
+    import torch.nn as nn
+    experts = nn.Module()
+    experts.gate_up_proj = nn.Parameter(torch.empty(1), requires_grad=False)
+    mlp = nn.Module(); mlp.experts = experts
+    layer = nn.Module(); layer.mlp = mlp
+    inner = nn.Module(); inner.layers = nn.ModuleList([layer])
+    model = nn.Module(); model.model = inner
+
+    out = op.convert(
+        input_dict,
+        model=model,
+        full_layer_name="model.layers.0.mlp.experts.gate_up_proj",
+        target_patterns=[conv.target_patterns[0]],
+    )
+    new_param = out[conv.target_patterns[0]]
+    # Reference: what the per-expert quantized segments actually dequantize to.
+    seg_ref = torch.stack([
+        torch.cat([
+            bnb.functional.dequantize_4bit(
+                *bnb.functional.quantize_4bit(weights_per_src[s][e], quant_type="nf4")
+            ).float()
+            for s in range(len(weights_per_src))
+        ], dim=0)
+        for e in range(n_experts)
+    ])
+    assert tuple(new_param._original_shape) == tuple(seg_ref.shape)
+    deq = bnb.functional.dequantize_4bit(new_param.data, new_param.quant_state).float()
+    deq = deq.reshape(seg_ref.shape)
+    err = (deq - seg_ref).abs().max().item()
+    if exact:
+        # Same bytes and absmax as the per-expert quantization: dequant is identical.
+        assert err == 0.0, err
+    else:
+        # Repack path adds one requant of already-quantized values (~0.16 here);
+        # raw concat instead mis-scales across the partial block boundary.
+        assert err < 0.25, err
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+def test_plain_dequant_skips_bnb_embedding4bit():
+    import bitsandbytes as bnb
+    import torch.nn as nn
+
+    from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+        _dequantize_plain_param_slots,
+    )
+
+    class Holder(nn.Module):
+        pass
+
+    model = Holder()
+    model.emb = bnb.nn.Embedding4bit(16, 64)
+    model.emb = model.emb.cuda()  # quantizes weight into Params4bit
+    model.plain = Holder()
+    packed, qs = bnb.functional.quantize_4bit(
+        torch.randn(4, 64, device="cuda", dtype=torch.bfloat16), quant_type="nf4"
+    )
+    from bitsandbytes.nn import Params4bit
+    router = torch.Tensor._make_subclass(Params4bit, packed)
+    router.requires_grad = False
+    router.quant_state = qs
+    model.plain.weight = router
+
+    _dequantize_plain_param_slots(model)
+
+    # bnb module keeps its quantized weight; the genuinely plain slot converts.
+    assert type(model.emb.weight).__name__ == "Params4bit"
+    assert getattr(model.emb.weight, "quant_state", None) is not None
+    assert type(model.plain.weight).__name__ == "Parameter"
+    assert model.plain.weight.shape == (4, 64)
