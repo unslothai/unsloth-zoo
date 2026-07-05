@@ -1,12 +1,18 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
-# This file is licensed under the GNU Affero General Public License v3.0 only
-# (AGPL-3.0-only), unlike the rest of unsloth_zoo which is LGPL-3.0-or-later. It
-# is the single shared home for the sparse-aware Hugging Face cache primitives
-# used by the Xet -> HTTP stall fallback (unsloth_zoo.hf_xet_fallback) and by
-# Unsloth Studio's download manager, which re-exports the names below.
-# See <https://www.gnu.org/licenses/agpl-3.0.html>.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Sparse-aware introspection of the active Hugging Face hub cache.
 
