@@ -899,12 +899,18 @@ def _run_download_attempt(
                 # them. Prefer the per-pid open-fd set; else post-baseline partials; None -> coarser mtime
                 # guard.
                 owned = _child_open_incomplete_blobs(proc.pid) if proc.pid else None
-                if owned is None and baseline_partials is not None:
+                if not owned and baseline_partials is not None:
+                    # None (no psutil / proc) OR an empty set (the child stalled in the connect / metadata
+                    # phase before opening any partial): try the post-baseline diff before giving up on scope.
                     current = set(
                         _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
                     )
                     owned = current - baseline_partials
-                params["_owned_incomplete_blobs"] = owned
+                # An empty ownership set would scope the HTTP-prep purge to NOTHING, leaving a pre-existing
+                # stale *.incomplete blob / dangling link for the retry to inherit and re-trip on. Fall back
+                # to None (unscoped) so the mtime + active-partner guards still clear genuinely-stale state
+                # while sparing a live sibling.
+                params["_owned_incomplete_blobs"] = owned or None
                 _terminate_process_group(proc, grace_period)
                 return ("stall", None)
             try:
@@ -1042,6 +1048,32 @@ def _is_weightless_component(names: list) -> bool:
     )
 
 
+# Diffusers component classes that ship NO model weight (a config / tokenizer / preprocessor sidecar
+# only). Matched as a SUBSTRING so *Scheduler / *Tokenizer / *TokenizerFast / *FeatureExtractor /
+# *ImageProcessor / *Processor all register; no weight-bearing pipeline component class (a *Model /
+# *Transformer2DModel / *AutoencoderKL / *ControlNetModel / *UNet*) contains one of these tokens.
+_WEIGHTLESS_COMPONENT_CLASS_RE = re.compile(
+    r"Scheduler|Tokenizer|FeatureExtractor|ImageProcessor|Processor"
+)
+
+
+def _component_requires_weight(spec: Any, names: list) -> bool:
+    """Whether a component holding NEITHER a ``config.json`` NOR a readable weight is an INCOMPLETE model
+    component (True -> reject) rather than a genuinely WEIGHTLESS one (False). Prefers the DECLARED class
+    from ``model_index.json`` (a ``[library, class]`` pair): a scheduler / tokenizer / feature_extractor
+    class needs no weight, everything else does -- so a model component holding only a stray sidecar
+    (a lone ``tokenizer_config.json`` under ``unet/``) cannot masquerade as weightless. Falls back to the
+    sidecar-name heuristic only when the class is unavailable (a malformed / non-string spec)."""
+    cls = (
+        spec[1]
+        if isinstance(spec, (list, tuple)) and len(spec) >= 2 and isinstance(spec[1], str)
+        else None
+    )
+    if cls is not None:
+        return not bool(_WEIGHTLESS_COMPONENT_CLASS_RE.search(cls))
+    return not _is_weightless_component(names)
+
+
 def _diffusers_component_weights_complete(
     snapshot_dir: Path, *, variant: Optional[str], ignore_patterns: Any = None,
 ) -> bool:
@@ -1059,8 +1091,18 @@ def _diffusers_component_weights_complete(
     specs = _diffusers_declared_component_specs(snapshot_dir)
     declared = set(specs) if specs else None
     active = _diffusers_active_component_dirs(specs) if specs else None
-    infix_dot = f".{variant}." if variant else ""
-    infix_dash = f".{variant}-" if variant else ""
+    # A VARIANT component weight is a CANONICAL component base carrying the variant token, single or
+    # numbered shard: diffusion_pytorch_model.fp16.safetensors / ...fp16-00001-of-00002.safetensors.
+    # Filtering to canonical bases (like the plain branch below) stops a variant-named SIDECAR
+    # (unet/adapter_model.fp16.safetensors) from counting as a warm component weight the pipeline, which
+    # reads unet/diffusion_pytorch_model.fp16.*, would otherwise fetch over un-killable Xet.
+    variant_weight_re = (
+        re.compile(
+            rf"^(?:diffusion_pytorch_model|model|pytorch_model)\.{re.escape(variant)}"
+            rf"(?:-\d{{5}}-of-\d{{5}})?\.(?:safetensors|bin)$"
+        )
+        if variant else None
+    )
     per_comp_canon: dict = {}
     per_comp_variant: dict = {}
     try:
@@ -1082,7 +1124,7 @@ def _diffusers_component_weights_complete(
                 continue  # an UNDECLARED subtree the load does not read
             if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
                 continue  # a training-checkpoint subtree, not a component
-            if variant and (infix_dot in name or infix_dash in name):
+            if variant_weight_re is not None and variant_weight_re.match(name):
                 per_comp_variant.setdefault(comp, []).append(rel)
             elif _CANONICAL_COMPONENT_WEIGHT_RE.match(name):
                 per_comp_canon.setdefault(comp, []).append(rel)
@@ -1111,10 +1153,11 @@ def _diffusers_component_weights_complete(
             if "config.json" in names:  # a model-style component MUST hold a readable weight
                 if not _has_read_weight(comp):
                     return False
-            elif not _has_read_weight(comp) and not _is_weightless_component(names):
-                # No config.json and no readable weight: OK only when the dir is weightless-SHAPED
-                # (scheduler / tokenizer / feature_extractor sidecars). Otherwise it is an incomplete
-                # model-style component whose weight the load would fetch over un-killable Xet.
+            elif not _has_read_weight(comp) and _component_requires_weight(specs.get(comp), names):
+                # No config.json and no readable weight: an incomplete model-style component whose weight
+                # the load would fetch over un-killable Xet. A genuinely weightless component (scheduler /
+                # tokenizer / feature_extractor) is exempt -- decided by its DECLARED class when known, so
+                # a model component holding only a stray sidecar cannot pass as weightless.
                 return False
     # Floor: at least one component holds a weight of the READ format -- rejects a variant-only-for-plain,
     # config-only, checkpoint-only, or undeclared-leftover-only stale snapshot.

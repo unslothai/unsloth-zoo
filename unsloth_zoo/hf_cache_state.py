@@ -786,7 +786,10 @@ def _selected_shard_index_incomplete(
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     want_variant = variant or None
-    _canon = r"(?:diffusion_pytorch_model|model|pytorch_model)"
+    # Canonical single-weight bases whose presence beats a stale same-dir shard index. Includes
+    # adapter_model so a single adapter_model.safetensors (a PEFT adapter load, allow=['adapter_model*'])
+    # is not false-rejected by a co-resident stale adapter_model.safetensors.index.json.
+    _canon = r"(?:diffusion_pytorch_model|model|pytorch_model|adapter_model)"
     if want_variant is None:
         shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
         single_file_re = re.compile(rf"^{_canon}\.(?:safetensors|bin)$")
@@ -932,9 +935,15 @@ def _diffusers_component_shards_incomplete(
     declared = _diffusers_declared_components(snapshot_dir)
     if want_variant is None:
         shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
+        single_file_re = re.compile(
+            r"^(?:diffusion_pytorch_model|model|pytorch_model)\.(?:safetensors|bin)$"
+        )
     else:
         v = re.escape(want_variant)
         shard_file_re = re.compile(rf"^[^.]+\.{v}-\d{{5}}-of-\d{{5}}\.(?:safetensors|bin)$")
+        single_file_re = re.compile(
+            rf"^(?:diffusion_pytorch_model|model|pytorch_model)\.{v}\.(?:safetensors|bin)$"
+        )
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
@@ -942,6 +951,7 @@ def _diffusers_component_shards_incomplete(
     per_dir: dict = {}
     index_fmts: dict = {}   # component dir_rel -> {fmt} an index of the read variant is present
     shard_fmts: dict = {}   # component dir_rel -> {fmt} a numbered shard file (ignore-kept) is present
+    single_fmts: dict = {}  # component dir_rel -> {fmt} a SINGLE component weight (beats that dir's index)
     for entry in entries:
         name = entry.name
         if not _safe_is_file(entry):
@@ -978,8 +988,22 @@ def _diffusers_component_shards_incomplete(
         elif shard_file_re.match(name) and _filter_paths([rel], None, ignore_patterns):
             fmt = "safetensors" if name.endswith(".safetensors") else "bin"
             shard_fmts.setdefault(dir_rel, set()).add(fmt)
-    for by_fmt in per_dir.values():
-        for shard_rels in by_fmt.get("safetensors") or by_fmt.get("bin") or []:
+        elif single_file_re.match(name) and _filter_paths([rel], None, ignore_patterns):
+            # a SINGLE canonical component weight: the pipeline reads it before a same-format shard index
+            # in the SAME component dir, so a stale co-resident index must not reject a complete component.
+            fmt = "safetensors" if name.endswith(".safetensors") else "bin"
+            single_fmts.setdefault(dir_rel, set()).add(fmt)
+    for dir_rel, by_fmt in per_dir.items():
+        singles = single_fmts.get(dir_rel, set())
+        # safetensors is read before bin, and a single weight of a format beats that format's stale index.
+        if "safetensors" in singles:
+            continue
+        required = by_fmt.get("safetensors")
+        if required is None:
+            if "bin" in singles:
+                continue
+            required = by_fmt.get("bin") or []
+        for shard_rels in required:
             for shard in shard_rels:
                 try:
                     if not (snapshot_dir / shard).exists():

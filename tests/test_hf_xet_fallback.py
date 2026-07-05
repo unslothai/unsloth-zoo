@@ -3102,6 +3102,151 @@ def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
         variant = "fp16") is False
 
 
+def test_post_download_variant_component_sidecar_is_not_warm(tmp_path):
+    """A variant diffusers load must count only CANONICAL component variant weights: a variant-named
+    SIDECAR (unet/adapter_model.fp16.safetensors) is not the weight the pipeline reads
+    (unet/diffusion_pytorch_model.fp16.*), so a component holding only the sidecar is retried over Xet,
+    not accepted. Mirrors the plain-branch canonical-basename filter."""
+    snap, blob = _mk_snapshot(tmp_path, "variant_comp_sidecar_only")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
+    unet = snap / "unet"
+    unet.mkdir()
+    (unet / "config.json").write_text("{}")
+    (unet / "adapter_model.fp16.safetensors").symlink_to(blob)  # variant sidecar, not the base weight
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+    # The canonical component variant weight present -> accepted.
+    (unet / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+
+def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
+    """A diffusers pipeline component reads a single canonical weight before a same-format shard index in
+    its own subfolder, so a stale co-resident index must not false-reject a complete component; a component
+    holding only a stale index (no single) is still incomplete."""
+    # unet single diffusion_pytorch_model.safetensors beside a stale same-dir index -> accepted.
+    snap, blob = _mk_snapshot(tmp_path, "diff_comp_single_beats_index")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
+    unet = snap / "unet"
+    unet.mkdir()
+    (unet / "config.json").write_text("{}")
+    (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    (unet / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))  # shards absent
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+    # No single, index lists a missing shard -> still incomplete.
+    snap2, blob2 = _mk_snapshot(tmp_path, "diff_comp_index_only")
+    (snap2 / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
+    unet2 = snap2 / "unet"
+    unet2.mkdir()
+    (unet2 / "config.json").write_text("{}")
+    (unet2 / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                        "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))
+    (unet2 / "diffusion_pytorch_model-00001-of-00002.safetensors").symlink_to(blob2)  # 1 shard, 2nd absent
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+
+def test_post_download_adapter_single_beats_stale_index(tmp_path):
+    """A PEFT adapter load (allow=['adapter_model*', 'adapter_config.json']) reads a single
+    adapter_model.safetensors before a shard index, so a stale co-resident adapter_model.safetensors.index.json
+    must not false-reject the warm; a sharded adapter missing a shard is still incomplete."""
+    snap, blob = _mk_snapshot(tmp_path, "adapter_single_beats_index")
+    (snap / "adapter_config.json").write_text("{}")
+    (snap / "adapter_model.safetensors").symlink_to(blob)
+    (snap / "adapter_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "adapter_model-00001-of-00002.safetensors",
+                        "b": "adapter_model-00002-of-00002.safetensors"}}))  # shards absent (stale)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
+        ignore_patterns = None) is True
+    # Sharded adapter, one shard absent, no single -> incomplete.
+    snap2, blob2 = _mk_snapshot(tmp_path, "adapter_sharded_incomplete")
+    (snap2 / "adapter_config.json").write_text("{}")
+    (snap2 / "adapter_model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "adapter_model-00001-of-00002.safetensors",
+                        "b": "adapter_model-00002-of-00002.safetensors"}}))
+    (snap2 / "adapter_model-00001-of-00002.safetensors").symlink_to(blob2)  # 1 shard, 2nd absent
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
+        ignore_patterns = None) is False
+
+
+def test_post_download_model_component_stray_sidecar_rejected(tmp_path):
+    """A declared MODEL component (unet) holding only a stray weightless sidecar (a lone
+    tokenizer_config.json), no config.json and no weight, is an incomplete component -> rejected: its
+    declared class (UNet2DConditionModel) is weight-bearing, so a stray sidecar cannot pass it as
+    weightless. A genuinely weightless component (PNDMScheduler) needs no weight."""
+    snap, blob = _mk_snapshot(tmp_path, "model_comp_stray_sidecar")
+    (snap / "model_index.json").write_text(json.dumps({
+        "_class_name": "StableDiffusionPipeline",
+        "unet": ["diffusers", "UNet2DConditionModel"],
+        "vae": ["diffusers", "AutoencoderKL"],
+        "scheduler": ["diffusers", "PNDMScheduler"],
+    }))
+    # vae complete (satisfies the floor); scheduler weightless; unet holds ONLY a stray sidecar.
+    vae = snap / "vae"; vae.mkdir()
+    (vae / "config.json").write_text("{}")
+    (vae / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    sched = snap / "scheduler"; sched.mkdir()
+    (sched / "scheduler_config.json").write_text("{}")
+    unet = snap / "unet"; unet.mkdir()
+    (unet / "tokenizer_config.json").write_text("{}")  # stray weightless-shaped sidecar, no weight/config
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # unet now holds its config + canonical weight -> accepted (scheduler still needs no weight).
+    (unet / "config.json").write_text("{}")
+    (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_http_prep_empty_owned_set_scopes_to_nothing(tmp_path):
+    """An EMPTY owned-set scopes the purge to nothing (own nothing -> delete nothing). A stall that fires
+    before the child opens any partial must therefore pass ownership=None (unscoped), not the empty set, or
+    an aged pre-existing stale blob/link is stranded for the retry to inherit. Documents the semantic the
+    stall path relies on when it normalises an empty ownership set to None."""
+    repo = "ztest/empty-owned"
+    repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
+    blobs = repo_dir / "blobs"
+    snap = repo_dir / "snapshots" / "sha"
+    blobs.mkdir(parents = True)
+    snap.mkdir(parents = True)
+    old = time.time() - 600
+
+    def _seed():
+        for p in list(snap.iterdir()):
+            p.unlink()
+        stale_blob = blobs / "stalehash.incomplete"
+        stale_blob.write_bytes(b"x")
+        os.utime(stale_blob, (old, old))
+        (snap / "stale.safetensors").symlink_to(blobs / "stalehash")
+        return stale_blob
+
+    # Empty owned-set: scope to nothing -> the aged stale blob/link SURVIVE (why the empty set is unsafe).
+    stale_blob = _seed()
+    _REAL_DEFAULT_PREPARE("model", repo, cache_dir = str(tmp_path), active_grace = 180,
+                          owned_incomplete_blobs = set())
+    assert stale_blob.exists(), "empty owned-set must scope to nothing (delete nothing)"
+    assert (snap / "stale.safetensors").is_symlink()
+
+    # None (what the stall path sends when ownership is empty): the mtime guard clears the aged stale state.
+    stale_blob = _seed()
+    _REAL_DEFAULT_PREPARE("model", repo, cache_dir = str(tmp_path), active_grace = 180,
+                          owned_incomplete_blobs = None)
+    assert not stale_blob.exists(), "unscoped prep must purge the aged stale partial"
+    assert not (snap / "stale.safetensors").is_symlink()
+
+
 def test_post_download_diffusers_skips_root_model_shard_checks(tmp_path):
     """A diffusers pipeline reads component subfolders, so a stale root model shard index (canonical or variant) is accepted; component completeness is still enforced."""
     # Plain: stale root model.safetensors.index.json alongside complete components.
