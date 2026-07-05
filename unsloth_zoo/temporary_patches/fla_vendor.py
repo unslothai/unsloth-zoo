@@ -245,6 +245,55 @@ def _neutralize_tilelang_backend_probe():
             logger.info(f"Unsloth: could not neutralize vendored tilelang backend: {e}")
 
 
+def _neutralize_intracard_backend_probe():
+    """Permanently make the pruned IntraCard CP backend unavailable.
+
+    The vendored snapshot drops ``fla.ops.common.intracard_cp``, but
+    ``IntraCardCPBackend.is_available()`` still returns ``True`` unconditionally.
+    Dispatch checks ``is_available() and is_enabled()`` per call, so a user who
+    flips ``FLA_INTRACARD_CP=1`` after import would route varlen inference into
+    ``chunk_gated_delta_rule_fwd_h`` and hit ``ModuleNotFoundError`` on the pruned
+    module. Forcing the env flag off is not enough (it is user-flippable), so
+    override the probe to ``False`` like the TileLang backend. Best effort.
+    """
+    try:
+        from fla.ops.common.backends.intracard import IntraCardCPBackend
+        IntraCardCPBackend.is_available = classmethod(lambda cls: False)
+        try:
+            IntraCardCPBackend.can_use.cache_clear()
+        except Exception:
+            pass
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: could not neutralize vendored intracard backend: {e}")
+
+
+def _blackwell_import_device(torch_mod):
+    """A Blackwell CUDA device index to make current during the vendored import,
+    or ``None`` when no switch is needed.
+
+    The vendored ``fla.utils`` freezes ``IS_NVIDIA_BLACKWELL`` (and the Blackwell
+    autotune configs / tl.dot workaround derived from it) at import time from the
+    *current* device's capability. On a mixed host (e.g. cuda:0 Ada, cuda:1 B200)
+    importing while cuda:0 is current wrongly disables the Blackwell-pinned configs
+    for kernels that later launch on the B200, reintroducing the corruption the
+    backports guard against. If any visible device is Blackwell (capability major
+    10/12) but the current one is not, point the import at the Blackwell device.
+    """
+    try:
+        if not torch_mod.cuda.is_available():
+            return None
+        current = torch_mod.cuda.current_device()
+        if torch_mod.cuda.get_device_capability(current)[0] in (10, 12):
+            return None  # already Blackwell-current
+        for index in range(torch_mod.cuda.device_count()):
+            if torch_mod.cuda.get_device_capability(index)[0] in (10, 12):
+                return index
+    except Exception:
+        return None
+    return None
+
+
 def _inject_vendored_fla():
     """Register the vendored fla tree into sys.modules under the name ``fla``.
 
@@ -312,15 +361,34 @@ def _inject_vendored_fla():
     _tl_sentinel = object()
     _tl_prev = sys.modules.get("tilelang", _tl_sentinel)
     _tl_shadow = _tl_prev is _tl_sentinel or _tl_prev is None
+
+    # Make a Blackwell device current for the import so fla.utils freezes
+    # IS_NVIDIA_BLACKWELL (and its pinned autotune configs) correctly on a mixed
+    # host where cuda:0 is not the Blackwell card the model runs on.
+    _bw_dev = _bw_prev = None
+    try:
+        import torch as _torch_bw
+        _bw_dev = _blackwell_import_device(_torch_bw)
+    except Exception:
+        _bw_dev = None
     try:
         try:
+            if _bw_dev is not None:
+                _bw_prev = _torch_bw.cuda.current_device()
+                _torch_bw.cuda.set_device(_bw_dev)
             if _tl_shadow:
                 sys.modules["tilelang"] = None
             spec.loader.exec_module(fla_mod)
             for sub in _EXPORT_SUBMODULES:
                 importlib.import_module(sub)
             _neutralize_tilelang_backend_probe()
+            _neutralize_intracard_backend_probe()
         finally:
+            if _bw_prev is not None:
+                try:
+                    _torch_bw.cuda.set_device(_bw_prev)
+                except Exception:
+                    pass
             if _tl_shadow:
                 if _tl_prev is _tl_sentinel:
                     sys.modules.pop("tilelang", None)

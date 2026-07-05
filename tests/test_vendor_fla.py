@@ -37,6 +37,15 @@ import pytest
 # is present. Set the flag defensively so the test is self-contained.
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
+# In a zoo-only environment (the separate `unsloth` package not installed),
+# unsloth_zoo's init raises on find_spec("unsloth") before any submodule loads,
+# which the flag above does not satisfy. Skip the module cleanly there instead of
+# erroring at collection; the repo CI installs unsloth so these still run.
+try:
+    import unsloth_zoo  # noqa: F401
+except ImportError as _e:
+    pytest.skip(f"unsloth_zoo unavailable: {_e}", allow_module_level=True)
+
 ZOO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 
@@ -329,6 +338,32 @@ def test_hopper_at_nonzero_device_index_trips_guard():
     assert _hopper_triton_needs_tilelang(ada_only, bad) is False
 
 
+def test_blackwell_import_device_scans_visible_devices():
+    # fla.utils freezes IS_NVIDIA_BLACKWELL from the current device at import, so
+    # on a mixed host the vendored import must run with a Blackwell device current.
+    import types
+
+    from unsloth_zoo.temporary_patches.fla_vendor import _blackwell_import_device
+
+    def fake_torch(caps, current):
+        cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: len(caps),
+            current_device=lambda: current,
+            get_device_capability=lambda i: caps[i],
+        )
+        return types.SimpleNamespace(cuda=cuda)
+
+    # cuda:0 Ada current, cuda:1 B200 (sm100): switch the import to index 1.
+    assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (10, 0)}, 0)) == 1
+    # sm120 consumer Blackwell is also covered.
+    assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (12, 0)}, 0)) == 1
+    # Already Blackwell-current: no switch needed.
+    assert _blackwell_import_device(fake_torch({0: (10, 0), 1: (8, 9)}, 0)) is None
+    # No Blackwell anywhere: no switch.
+    assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (9, 0)}, 0)) is None
+
+
 # ---------------------------------------------------------------------------
 # Pruned TileLang backend cannot import a broken external tilelang
 # ---------------------------------------------------------------------------
@@ -394,6 +429,64 @@ def test_broken_tilelang_does_not_abort_dispatch_subprocess():
         text=True,
     )
     assert "TILELANG_NEUTRALIZED_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Pruned IntraCard CP backend cannot be re-enabled into the missing module
+# ---------------------------------------------------------------------------
+_INTRACARD_NEUTRALIZED_SUBPROCESS = textwrap.dedent(
+    """
+    import os, sys
+    os.environ["UNSLOTH_IS_PRESENT"] = "1"
+    os.environ["UNSLOTH_FORCE_VENDORED_FLA"] = "1"
+
+    from unsloth_zoo.temporary_patches.fla_vendor import patch_vendor_fla
+    patch_vendor_fla()
+
+    import fla.ops.common.backends as cb
+    from fla.ops.common.backends.intracard import IntraCardCPBackend
+
+    # Injection forces FLA_INTRACARD_CP=0, but a user can flip it back on after
+    # import; dispatch reads is_enabled() from the env per call, so the env force
+    # alone would re-route varlen inference into the pruned module.
+    os.environ["FLA_INTRACARD_CP"] = "1"
+
+    # The pruned module really is absent from the vendored snapshot.
+    import importlib.util
+    assert importlib.util.find_spec("fla.ops.common.intracard_cp") is None, \\
+        "intracard_cp unexpectedly present"
+
+    # Neutralized: the probe answers False even though FLA_INTRACARD_CP=1 enables it.
+    assert IntraCardCPBackend.is_enabled() is True, "env flag should read enabled"
+    assert IntraCardCPBackend.is_available() is False, "intracard probe not neutralized"
+
+    # The dispatch loop's `is_available() and is_enabled()` guard must never select
+    # the intracard backend, so no call imports the missing module.
+    for be in cb.common_registry._get_sorted_backends():
+        usable = be.is_available() and be.is_enabled()
+        assert usable in (True, False)
+        if be is IntraCardCPBackend or getattr(be, "backend_type", None) == "intracard_cp":
+            assert usable is False, "pruned intracard backend selected by dispatch"
+    print("INTRACARD_NEUTRALIZED_OK")
+    """
+)
+
+
+@pytest.mark.skipif(
+    not _injection_supported(),
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
+def test_reenabled_intracard_stays_unavailable_subprocess():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", _INTRACARD_NEUTRALIZED_SUBPROCESS],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "INTRACARD_NEUTRALIZED_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
