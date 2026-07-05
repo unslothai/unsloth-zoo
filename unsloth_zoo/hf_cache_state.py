@@ -786,11 +786,14 @@ def _selected_shard_index_incomplete(
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     want_variant = variant or None
+    _canon = r"(?:diffusion_pytorch_model|model|pytorch_model)"
     if want_variant is None:
         shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
+        single_file_re = re.compile(rf"^{_canon}\.(?:safetensors|bin)$")
     else:
         v = re.escape(want_variant)
         shard_file_re = re.compile(rf"^[^.]+\.{v}-\d{{5}}-of-\d{{5}}\.(?:safetensors|bin)$")
+        single_file_re = re.compile(rf"^{_canon}\.{v}\.(?:safetensors|bin)$")
     try:
         entries = list(snapshot_dir.rglob("*"))
     except OSError:
@@ -798,6 +801,7 @@ def _selected_shard_index_incomplete(
     per_dir: dict = {}       # dir_rel -> {"safetensors": [shard_rels, ...], "bin": [...]} (from indices)
     index_fmts: dict = {}    # dir_rel -> {fmt} an index of the read variant is present (non-root-model)
     shard_fmts: dict = {}    # dir_rel -> {fmt} a SELECTED numbered shard file is present (non-root-model)
+    single_fmts: dict = {}   # dir_rel -> {fmt} a SELECTED single weight is present (beats that dir's index)
     for entry in entries:
         name = entry.name
         if not _safe_is_file(entry):
@@ -844,9 +848,23 @@ def _selected_shard_index_incomplete(
                 continue  # the load does not read this shard (out of scope / ignored format)
             fmt = "safetensors" if name.endswith(".safetensors") else "bin"
             shard_fmts.setdefault(dir_rel, set()).add(fmt)
-    for by_fmt in per_dir.values():
-        # safetensors read before bin: require only the preferred format present in this directory.
-        for shard_rels in by_fmt.get("safetensors") or by_fmt.get("bin") or []:
+        elif single_file_re.match(name):
+            # a SINGLE canonical weight of the read variant: transformers/diffusers read it before a
+            # same-format shard index in the SAME dir, so a stale co-resident index must not reject it.
+            if _filter_paths([rel], allow_patterns, ignore_patterns):
+                fmt = "safetensors" if name.endswith(".safetensors") else "bin"
+                single_fmts.setdefault(dir_rel, set()).add(fmt)
+    for dir_rel, by_fmt in per_dir.items():
+        singles = single_fmts.get(dir_rel, set())
+        # safetensors read before bin, and a single weight of a format beats that format's stale index.
+        if "safetensors" in singles:
+            continue
+        required = by_fmt.get("safetensors")
+        if required is None:
+            if "bin" in singles:
+                continue
+            required = by_fmt.get("bin") or []
+        for shard_rels in required:
             for shard in shard_rels:
                 try:
                     if not (snapshot_dir / shard).exists():

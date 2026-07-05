@@ -3026,6 +3026,51 @@ def test_post_download_rejects_diffusers_component_dir_without_weight_or_config(
         snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
+def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_path):
+    """A declared component whose only weight is a non-canonical sidecar (unet/adapter_model.safetensors)
+    is NOT a warm component: the pipeline still loads unet/diffusion_pytorch_model.* and would fetch it
+    over Xet. Only the canonical component weight names count."""
+    snap, blob = _mk_snapshot(tmp_path, "comp_sidecar_only")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
+    unet = snap / "unet"
+    unet.mkdir()
+    (unet / "config.json").write_text("{}")
+    (unet / "adapter_model.safetensors").symlink_to(blob)  # sidecar, not the base weight
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # The canonical base weight present -> accepted.
+    (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_subfolder_single_weight_beats_stale_index(tmp_path):
+    """In a selected subfolder, a single canonical weight is read before a same-format shard index
+    (transformers precedence), so a stale co-resident index must not false-reject the warm; a shard index
+    with no single is still required complete."""
+    # encoder/model.safetensors present beside a stale encoder/model.safetensors.index.json -> accepted.
+    snap, blob = _mk_snapshot(tmp_path, "subdir_single_beats_index")
+    enc = snap / "encoder"
+    enc.mkdir()
+    (enc / "model.safetensors").symlink_to(blob)
+    (enc / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))  # shards absent (stale)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = ["encoder/*"], ignore_patterns = None) is True
+    # No single, index missing shards -> still incomplete.
+    snap2, blob2 = _mk_snapshot(tmp_path, "subdir_index_only")
+    enc2 = snap2 / "encoder"
+    enc2.mkdir()
+    (enc2 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
+    (enc2 / "model-00001-of-00002.safetensors").symlink_to(blob2)  # one shard, second absent
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = ["encoder/*"], ignore_patterns = None) is False
+
+
 def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
     """Variant twin of single-beats-index: a complete single variant weight beside a stale variant index is usable (ST and bin); a stale index with no single weight is breakage."""
     snap, blob = _mk_snapshot(tmp_path, "single_variant_beats_index")

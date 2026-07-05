@@ -989,7 +989,7 @@ _CANONICAL_ROOT_MODEL_WEIGHT_RE = re.compile(
 # weight (diffusion_pytorch_model.fp16.safetensors) is EXCLUDED, so a variant='fp16' stale cache does not
 # read as a warm PLAIN pipeline (which would fetch the non-variant name over un-killable Xet).
 _CANONICAL_COMPONENT_WEIGHT_RE = re.compile(
-    r"^[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
+    r"^(?:diffusion_pytorch_model|model|pytorch_model)(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
 
 # SINGLE-FILE canonical root TF / Flax weight a from_tf / from_flax load reads instead of a PyTorch
