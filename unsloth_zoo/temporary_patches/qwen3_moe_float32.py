@@ -146,8 +146,8 @@ def patch_Qwen3MoeAttention_float32():
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         cos, sin = position_embeddings
-        cos = cos.to(torch.float32)
-        sin = sin.to(torch.float32)
+        cos_fp32 = cos.to(torch.float32)
+        sin_fp32 = sin.to(torch.float32)
 
         # q/k: fp16 proj -> fp16 q_norm/k_norm (returns fp16) -> float32 -> (b, h, s, d) -> RoPE (float32)
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).to(torch.float32).transpose(1, 2)
@@ -155,34 +155,65 @@ def patch_Qwen3MoeAttention_float32():
         value_states = self.v_proj(hidden_states).view(hidden_shape).to(torch.float32).transpose(1, 2)
 
         # Qwen3 applies RoPE to both q and k together, unsqueeze_dim = 1 (post-transpose layout).
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_fp32, sin_fp32)
 
         if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            # 4.57.x static caches need cache_position to write the right slot;
+            # 5.x layer caches absorb the extra dict harmlessly.
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": kwargs.get("cache_position", None)}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # Core attention in float32 (consistent q/k/v dtype -> no SDPA mismatch).
-        attn_mask = attention_mask
-        if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
-            attn_mask = attn_mask.to(torch.float32)
-        attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
+        attn_impl = getattr(self.config, "_attn_implementation", "sdpa") or "sdpa"
+        if attn_impl == "flex_attention" and _UNSLOTH_FLEX_ATTENTION_DISABLED:
             attn_impl = "sdpa"
-        if attn_impl == "flex_attention":
-            # Flex builds a BlockMask that raw SDPA cannot consume; dispatch to the
-            # interface (returns (b, q, h, d), already transposed).
-            attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
-            attn_output, _ = attention_interface(
+        attention_interface = None
+        if attn_impl not in ("sdpa", "eager"):
+            try:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
+            except KeyError:
+                attention_interface = None  # unknown backend -> raw SDPA below
+        attn_weights = None
+
+        if attn_impl == "eager":
+            # Mirror upstream eager (additive mask, fp32 softmax) and return weights.
+            g = getattr(self, "num_key_value_groups", 1) or 1
+            k_r = key_states.repeat_interleave(g, dim = 1) if g != 1 else key_states
+            v_r = value_states.repeat_interleave(g, dim = 1) if g != 1 else value_states
+            attn_weights = torch.matmul(query_states, k_r.transpose(2, 3)) * self.scaling
+            if attention_mask is not None:
+                m = attention_mask[..., : k_r.shape[-2]]
+                if m.dtype == torch.bool:
+                    m = torch.zeros_like(attn_weights).masked_fill_(~m, torch.finfo(torch.float32).min)
+                attn_weights = attn_weights + m.to(torch.float32)
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim = -1)
+            attn_weights = torch.nn.functional.dropout(
+                attn_weights, p = self.attention_dropout if self.training else 0.0, training = self.training,
+            )
+            attn_output = torch.matmul(attn_weights, v_r).transpose(1, 2)
+        elif attention_interface is not None:
+            # Registered backend (flex / flash) owns the mask semantics; pass the
+            # mask exactly as upstream prepared it (FA uses a 2-D padding mask,
+            # flex a BlockMask). Flash kernels need fp16 inputs and accumulate in
+            # float32 internally, so stability is preserved; flex handles fp32.
+            q, k, v = query_states, key_states, value_states
+            if attn_impl != "flex_attention":
+                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+            attn_output, attn_weights = attention_interface(
                 self,
-                query_states,
-                key_states,
-                value_states,
+                q,
+                k,
+                v,
                 attention_mask,
                 dropout = self.attention_dropout if self.training else 0.0,
                 scaling = self.scaling,
                 sliding_window = getattr(self, "sliding_window", None),
                 **kwargs,
-            )
+            )  # returns (b, q, h, d), already transposed
         else:
+            attn_mask = attention_mask
+            if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
+                attn_mask = attn_mask.to(torch.float32)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
             attn_output = scaled_dot_product_attention(
                 query_states,
@@ -200,7 +231,7 @@ def patch_Qwen3MoeAttention_float32():
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
         attn_output = attn_output.to(torch.float16)
         attn_output = self.o_proj(attn_output)
-        return attn_output, None
+        return attn_output, attn_weights
     pass
     # force = True: win over the compiled / dtype-aligned attention forward that
     # unsloth installs (q/k float32 vs v fp16 -> SDPA mismatch otherwise).
