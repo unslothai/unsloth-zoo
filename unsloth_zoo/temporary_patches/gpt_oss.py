@@ -970,7 +970,13 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
 
-        if self.training and self._grouped_bnb4bit_ready():
+        # fp16 keeps the loop path, whose fp32 swiglu + autocast-disabled down
+        # projection protect against fp16 overflow; grouped runs in model dtype.
+        if (
+            self.training
+            and hidden_states.dtype is not torch.float16
+            and self._grouped_bnb4bit_ready()
+        ):
             try:
                 return self._forward_grouped_bnb4bit(
                     hidden_states, router_indices, routing_weights,
@@ -1897,8 +1903,11 @@ def torch_native_forward(
 
     # Grouped bnb-4bit fast path. The class dispatches this module-level
     # function (forward is rebound below), so the gate must live here too.
+    # fp16 keeps the loop path below, whose fp32 swiglu + autocast-disabled
+    # down projection protect against fp16 overflow.
     if (
         self.training
+        and hidden_states.dtype is not torch.float16
         and hasattr(self, "_grouped_bnb4bit_ready")
         and self._grouped_bnb4bit_ready()
     ):
