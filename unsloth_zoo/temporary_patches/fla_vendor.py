@@ -123,6 +123,11 @@ def _hopper_triton_needs_tilelang(torch_mod, triton_mod):
         v = version.parse(str(triton_mod.__version__).split("+")[0])
         if not (version.parse("3.4.0") <= v < version.parse("3.7.1")):
             return False
+        # The Hopper TileLang workaround is NVIDIA-specific. On a ROCm build a card
+        # can report capability major 9 (e.g. AMD Instinct) without being Hopper, so
+        # only the bare major==9 signal is gated on a CUDA (non-HIP) build; a name
+        # that literally says "NVIDIA H" is unambiguous either way.
+        is_nvidia = getattr(getattr(torch_mod, "version", None), "hip", None) is None
         try:
             count = int(torch_mod.cuda.device_count())
         except Exception:
@@ -136,7 +141,7 @@ def _hopper_triton_needs_tilelang(torch_mod, triton_mod):
                 major = torch_mod.cuda.get_device_capability(i)[0]
             except Exception:
                 major = -1
-            if "NVIDIA H" in name or major == 9:
+            if "NVIDIA H" in name or (is_nvidia and major == 9):
                 return True
         return False
     except Exception:
@@ -549,8 +554,14 @@ TEMPORARY_PATCHES.append(patch_vendor_fla)
 # Run once at import so the vendored fla is registered as early as possible
 # (before any gated-deltanet modeling module is imported). Re-run later via
 # TEMPORARY_PATCHES once transformers is fully initialised.
-try:
-    patch_vendor_fla()
-except Exception as _e:
-    if UNSLOTH_ENABLE_LOGGING:
-        logger.warning(f"Unsloth: early vendored-fla injection deferred: {_e}")
+#
+# Setting UNSLOTH_VENDORED_FLA_NO_AUTORUN=1 suppresses only this import-time run,
+# not the TEMPORARY_PATCHES pass or an explicit patch_vendor_fla() call. Tests
+# import this module purely to read the support gate; without the guard that
+# import would inject fla into their own interpreter as a side effect.
+if not _flag("UNSLOTH_VENDORED_FLA_NO_AUTORUN"):
+    try:
+        patch_vendor_fla()
+    except Exception as _e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: early vendored-fla injection deferred: {_e}")

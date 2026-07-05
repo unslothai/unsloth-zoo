@@ -37,6 +37,14 @@ import pytest
 # is present. Set the flag defensively so the test is self-contained.
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
+# The skip gate below imports fla_vendor to read its support check. On a CUDA host
+# that import would otherwise run fla_vendor's import-time patch_vendor_fla() and
+# inject fla into this pytest process, contaminating the in-process tests and the
+# rest of the session. Suppress only that autorun; the subprocess tests set their
+# own env and call patch_vendor_fla() explicitly, so real injection still happens
+# there.
+os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
+
 # In a zoo-only environment (the separate `unsloth` package not installed),
 # unsloth_zoo's init raises on find_spec("unsloth") before any submodule loads,
 # which the flag above does not satisfy. Skip the module cleanly there instead of
@@ -62,6 +70,19 @@ def _injection_supported() -> bool:
         return bool(_vendored_injection_supported())
     except Exception:
         return False
+
+
+def test_probe_import_does_not_inject_fla_into_parent():
+    # The skip gate imports fla_vendor to read _vendored_injection_supported(). That
+    # import must not run the module's early patch_vendor_fla(), or fla leaks into
+    # this process (and every later test) just from evaluating the marker. Importing
+    # it here reproduces exactly what pytest does during collection.
+    import unsloth_zoo.temporary_patches.fla_vendor  # noqa: F401
+
+    fla = sys.modules.get("fla")
+    assert not getattr(fla, "_UNSLOTH_VENDORED_FLA", False), (
+        "vendored fla leaked into the parent pytest process at import"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +320,33 @@ def test_hopper_bad_triton_range_skips_injection():
         tri = types.SimpleNamespace(__version__=ver)
         assert _hopper_triton_needs_tilelang(hopper, tri) is want_on_hopper, ver
         assert _hopper_triton_needs_tilelang(blackwell, tri) is False, ver
+
+
+def test_rocm_major9_device_not_treated_as_hopper():
+    # ROCm/AMD cards can report capability major 9 without being NVIDIA Hopper. On a
+    # HIP build (torch.version.hip set) the bare major==9 signal must not trip the
+    # Hopper guard, or AMD users lose the vendored path on triton [3.4.0, 3.7.1).
+    import types
+
+    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
+
+    def fake_torch(name, major, hip):
+        cuda = types.SimpleNamespace(
+            device_count=lambda: 1,
+            get_device_name=lambda i=0, n=name: n,
+            get_device_capability=lambda i=0, m=major: (m, 0),
+        )
+        return types.SimpleNamespace(cuda=cuda, version=types.SimpleNamespace(hip=hip))
+
+    bad = types.SimpleNamespace(__version__="3.6.0")  # in [3.4.0, 3.7.1)
+    # AMD Instinct on a ROCm build: major 9 but not Hopper -> keep the fast path.
+    amd = fake_torch("AMD Instinct MI300X", 9, "6.0.32830")
+    assert _hopper_triton_needs_tilelang(amd, bad) is False
+    # A real Hopper on a CUDA build (hip=None) still trips, by name and by major.
+    nvidia_named = fake_torch("NVIDIA H100 80GB HBM3", 9, None)
+    nvidia_unnamed = fake_torch("", 9, None)
+    assert _hopper_triton_needs_tilelang(nvidia_named, bad) is True
+    assert _hopper_triton_needs_tilelang(nvidia_unnamed, bad) is True
 
 
 def test_hopper_at_nonzero_device_index_trips_guard():
