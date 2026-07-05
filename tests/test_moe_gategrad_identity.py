@@ -103,6 +103,34 @@ def test_gate_gradient_skipped_when_router_frozen():
     assert gate.grad is None
 
 
+def test_matches_autograd_with_zero_gate():
+    # A routing weight of exactly zero (or below the floor) must still get its
+    # true gradient <Y, dOut>. The call site sign-floors the gate away from zero
+    # (straight-through) and both the multiply and the identity's divide use the
+    # same floored value, so the floor cancels exactly.
+    torch.manual_seed(3)
+    inter0 = torch.randn(12, 16)
+    gate0 = torch.randn(12) * 0.5
+    gate0[0] = 0.0
+    gate0[1] = 1e-30
+    gate0[2] = -1e-30
+    W2 = torch.randn(16, 10)
+    dOut = torch.randn(12, 10)
+
+    _, g_gate_ref = _reference(inter0, gate0, W2, dOut)
+
+    inter = inter0.detach().requires_grad_(True)
+    gate = gate0.detach().requires_grad_(True)
+    eps = max(1e-12, float(torch.finfo(gate.dtype).tiny))
+    floored = torch.where(gate >= 0, gate.clamp(min=eps), gate.clamp(max=-eps))
+    safe = gate + (floored - gate).detach()
+    inter_id = _MoEGateGradIdentity.apply(inter, safe)
+    out = (inter_id @ W2) * safe.detach().unsqueeze(-1)
+    out.backward(dOut)
+
+    torch.testing.assert_close(gate.grad, g_gate_ref, rtol=5e-4, atol=5e-5)
+
+
 def test_double_backward_raises():
     # The identity is only first-order exact; create_graph must fail loudly
     # instead of returning wrong second derivatives.

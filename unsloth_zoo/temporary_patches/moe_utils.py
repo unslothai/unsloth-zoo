@@ -1200,7 +1200,9 @@ class _MoEGateGradIdentity(torch.autograd.Function):
 
     The incoming dA equals ``gate * (dOut @ W2_eff.T)`` for the effective down
     weight (base + LoRA), so ``<inter, dA> / gate`` is exactly ``<Y, dOut>``
-    without ever materialising Y for the gradient. Exact for any linear down
+    without ever materialising Y for the gradient. The caller passes a
+    sign-floored gate and multiplies Y by that same value, so the identity holds
+    for any routing weight, including exact zeros. Exact for any linear down
     projection; NOT valid with a post-matmul down bias, so callers must
     disable it when one is present.
     """
@@ -1226,11 +1228,11 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         # router under LoRA), where its gradient is never consumed.
         if ctx.needs_input_grad[1]:
             dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
-            # Divide by the signed routing weight: a negative gate (e.g. Gemma4's
-            # per_expert_scale folded into top_k_weights) must keep its sign, so
-            # clamping toward +eps would flip it. Floor the magnitude to avoid
-            # dividing by ~0; a gate that underflows to zero carries no
-            # recoverable gate gradient, so it collapses to 0 rather than NaN.
+            # The call site multiplies Y by this same sign-floored gate, so the
+            # floor cancels exactly and the quotient equals <Y, dOut> for any
+            # gate, including exact zeros. The re-clamp is a no-op for the safe
+            # gate passed by forward_native_grouped_mm; it only protects direct
+            # callers from dividing by a raw zero.
             gate_f = gate.to(torch.float32)
             safe_gate = torch.where(
                 gate_f >= 0, gate_f.clamp_min(1e-12), gate_f.clamp_max(-1e-12)
@@ -1424,7 +1426,20 @@ def forward_native_grouped_mm(
     )
     permuted_weights = None
     if _gategrad:
-        permuted_weights = top_k_weights.reshape(-1)[sorted_indices]
+        raw_weights = top_k_weights.reshape(-1)[sorted_indices]
+        # Sign-floor the gate away from zero (straight-through, so the synthesized
+        # gradient still reaches top_k_weights). The multiply below and the
+        # identity's divide use the SAME floored value, so they cancel exactly and
+        # the gate gradient <Y, dOut> survives even a routing weight of exactly
+        # zero. Forward changes by at most eps * |Y| for |gate| < eps, far below
+        # dtype resolution. eps respects fp16's smallest normal.
+        eps = max(1e-12, float(torch.finfo(raw_weights.dtype).tiny))
+        floored = torch.where(
+            raw_weights >= 0,
+            raw_weights.clamp(min=eps),
+            raw_weights.clamp(max=-eps),
+        )
+        permuted_weights = raw_weights + (floored - raw_weights).detach()
         inter = _MoEGateGradIdentity.apply(inter, permuted_weights)
 
     # Down projection with optional separated LoRA (default).
