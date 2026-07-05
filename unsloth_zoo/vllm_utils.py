@@ -1913,8 +1913,10 @@ def _install_vllm_decompose_size_nodes_fix():
 
             # ---- Scalar case: x.size(dim) -> single SymInt / literal int -------
             # (This is the LoRA punica `token_lora_mapping[:x.size(0)]` case.)
-            if len(node.args) >= 2:
-                dim = node.args[1]
+            # `dim` may be positional (x.size(0)) or a kwarg (x.size(dim=0)); a
+            # kwarg dim must still take the scalar path, not the tuple expansion.
+            dim = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
+            if dim is not None:
                 ndim = ev.dim()
                 norm_dim = dim + ndim if isinstance(dim, int) and dim < 0 else dim
                 dim_val = ev.shape[norm_dim] if isinstance(norm_dim, int) else None
@@ -1955,32 +1957,52 @@ def _install_vllm_decompose_size_nodes_fix():
                             f"got {type(dim_val)} for dim {i} of '{node.name}'"
                         )
 
-            for user in list(node.users):
-                # getitem(size, N) -> dims[N]
-                if (
-                    user.op == "call_function"
-                    and user.target is operator.getitem
-                    and len(user.args) == 2
-                    and user.args[0] is node
-                    and isinstance(user.args[1], int)
-                ):
-                    user.replace_all_uses_with(dims[user.args[1]])
-                    graph.graph.erase_node(user)
-                    continue
+            # Rewire consumers of the tuple-valued size node via a worklist so a
+            # `x.size()[:-1]` slice-getitem becomes a derived tuple node processed
+            # the same way. `getitem` leaves are erased immediately; the tuple
+            # nodes (the size node plus any slice-getitems) are erased last in
+            # reverse push order so a child is always gone before its parent.
+            worklist = [(node, dims)]
+            to_erase = []
+            while worklist:
+                n, ds = worklist.pop()
+                for user in list(n.users):
+                    if (
+                        user.op == "call_function"
+                        and user.target is operator.getitem
+                        and len(user.args) == 2
+                        and user.args[0] is n
+                    ):
+                        index = user.args[1]
+                        # size()[i] -> dims[i] (plain ints included).
+                        if isinstance(index, int):
+                            user.replace_all_uses_with(ds[index])
+                            graph.graph.erase_node(user)
+                            continue
+                        # size()[start:stop] -> derived tuple; process on its turn.
+                        if isinstance(index, slice):
+                            worklist.append((user, ds[index]))
+                            continue
 
-                # Everything else: rewire args + kwargs, handling size nodes nested
-                # in slices, tuples and lists.
-                user.args = tuple(_replace_size_in_args(user.args, node, dims))
-                if user.kwargs:
-                    user.kwargs = {
-                        k: (
-                            _replace_size_in_args((v,), node, dims)[0]
-                            if isinstance(v, (fx.Node, slice, tuple, list))
-                            else v
-                        )
-                        for k, v in user.kwargs.items()
-                    }
-            graph.graph.erase_node(node)
+                    # Everything else: rewire args (size nodes nested in slices,
+                    # tuples and lists expand per-dim) and kwargs. A kwarg whose
+                    # value IS the size node takes the full tuple of dims.
+                    user.args = tuple(_replace_size_in_args(user.args, n, ds))
+                    if user.kwargs:
+                        user.kwargs = {
+                            k: (
+                                tuple(ds)
+                                if v is n
+                                else _replace_size_in_args((v,), n, ds)[0]
+                                if isinstance(v, (slice, tuple, list))
+                                else v
+                            )
+                            for k, v in user.kwargs.items()
+                        }
+                to_erase.append(n)
+
+            for n in reversed(to_erase):
+                graph.graph.erase_node(n)
 
     try:
         _vllm_backends._decompose_size_nodes = _patched_decompose_size_nodes
