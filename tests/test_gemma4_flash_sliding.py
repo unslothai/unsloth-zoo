@@ -68,6 +68,50 @@ def test_mask_probe_accepts_band_rejects_padding():
     assert gf._mask_is_plain_band(padded, S, w) is False
 
 
+def _band(S, w, device="cuda"):
+    idx = torch.arange(S, device=device)
+    return (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - w)
+
+
+def test_mask_probe_rejects_packed_boundary():
+    # An interior band break (a packed-sequence boundary) must be rejected; the
+    # whole-mask verification does not sample rows.
+    from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
+    S, w = 512, 128
+    band = _band(S, w)
+    packed = torch.where(band, 0.0, float("-inf")).to(torch.float32)[None, None]
+    packed[..., 300, 200] = float("-inf")     # drop an in-band key at an interior row
+    assert gf._mask_is_plain_band(packed, S, w) is False
+
+
+def test_float_mask_inband_bias_rejected():
+    # A finite in-band bias would be silently dropped when routing to FA2, so a
+    # float mask is only accepted when in-band entries are exactly 0.
+    from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
+    S, w = 256, 64
+    band = _band(S, w)
+    biased = torch.where(band, -5.0, float("-inf")).to(torch.float32)[None, None]
+    assert gf._mask_is_plain_band(biased, S, w) is False
+    clean = torch.where(band, 0.0, float("-inf")).to(torch.float32)[None, None]
+    assert gf._mask_is_plain_band(clean, S, w) is True
+
+
+def test_chunked_verification_matches_dense():
+    # Row-chunked verification must agree with a single-block scan on band,
+    # padded, and packed masks (the memory win needs no test).
+    from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
+    S, w = 96, 16
+    band = _band(S, w)
+    band_f = torch.where(band, 0.0, float("-inf")).to(torch.float32)[None, None]
+    padded = band_f.clone(); padded[..., :, S // 2] = float("-inf")
+    packed = band_f.clone(); packed[..., 50, 40] = float("-inf")
+    for name, m in {"band_bool": band[None, None], "band_float": band_f,
+                    "padded": padded, "packed": packed}.items():
+        full = gf._mask_is_plain_band(m.clone(), S, w, _block=S)
+        chunked = gf._mask_is_plain_band(m.clone(), S, w, _block=7)  # crosses block edges
+        assert full == chunked, name
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

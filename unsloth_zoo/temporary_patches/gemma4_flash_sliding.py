@@ -47,7 +47,7 @@ def _enabled():
     return os.environ.get("UNSLOTH_GEMMA4_FLASH_SLIDING", "1") != "0"
 
 
-def _mask_is_plain_band(mask, S, w):
+def _mask_is_plain_band(mask, S, w, _block=1024):
     """True if `mask` is exactly the causal + sliding band with no token padding."""
     if mask is None:
         return True
@@ -67,10 +67,22 @@ def _mask_is_plain_band(mask, S, w):
     # probe would miss a packed-sequence boundary that falls between the sampled
     # rows and let FA2 attend across samples. A plain band allows key j for
     # query i iff i - w < j <= i; anything else (padding, packing) must reject.
-    allowed = mask if mask.dtype == torch.bool else (mask > -1e4)
+    # Scan in row blocks so we never materialise a second S x S tensor: at
+    # 16k/32k contexts a full S x S band plus its comparison would add multiple
+    # GB of transient memory and can OOM before the FA2 path even runs. Each
+    # block only builds a (block, S) band. A float mask must additionally carry
+    # no in-band bias (exactly 0) so routing to FA2 cannot silently drop it.
+    is_bool = mask.dtype == torch.bool
     idx = torch.arange(S, device=mask.device)
-    band = (idx[None, :] <= idx[:, None]) & (idx[None, :] > idx[:, None] - w)
-    ok = bool((allowed == band).all().item())
+    ok = True
+    for start in range(0, S, _block):
+        rows = idx[start : start + _block]                                       # (br,)
+        band = (idx[None, :] <= rows[:, None]) & (idx[None, :] > rows[:, None] - w)  # (br, S)
+        msl = mask[..., start : start + _block, :]                               # (..., br, S)
+        match = (msl == band) if is_bool else torch.where(band, msl == 0, msl <= -1e4)
+        if not bool(match.all().item()):
+            ok = False
+            break
     try: mask._unsloth_plain_band = ok
     except (AttributeError, RuntimeError): pass
     return ok
