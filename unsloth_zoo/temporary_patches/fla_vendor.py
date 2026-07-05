@@ -60,6 +60,11 @@ _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 # import time (and set them to None when fla was unavailable).
 _REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
 
+# Models whose fla imports are fully covered by the vendored exports. olmo_hybrid
+# also imports ShortConvolution, which is not vendored, so its probe must answer
+# False (keep the pure-torch path) or its modeling module crashes on import.
+_VENDOR_COVERED_MODELS = frozenset(_REPAIR_MODELING)
+
 # Minimum versions declared by fla-core 0.5.1.
 _MIN_TORCH = "2.7"
 _MIN_TRITON = "3.3"
@@ -204,8 +209,26 @@ def _inject_vendored_fla():
     return True
 
 
+def _vendored_availability_probe():
+    """Availability answer while the vendored (pruned) fla is the active one.
+
+    Modeling modules call this once at import time and then ``from fla import``
+    the kernels, so answer True only for callers the pruned exports fully cover;
+    an uncovered model (olmo_hybrid needs ShortConvolution) keeps its pure-torch
+    fallback instead of crashing on the import. Non-modeling callers get True.
+    """
+    try:
+        caller = sys._getframe(1).f_globals.get("__name__", "")
+    except Exception:
+        caller = ""
+    if caller.startswith("transformers.models."):
+        parts = caller.split(".")
+        return len(parts) > 2 and parts[2] in _VENDOR_COVERED_MODELS
+    return True
+
+
 def _patch_is_available():
-    """Force transformers' cached availability probe to True.
+    """Replace transformers' cached availability probe.
 
     The probe is @lru_cache and keys on dist metadata that a vendored package
     lacks, so we clear the cache and replace the callable outright. Modeling
@@ -219,7 +242,7 @@ def _patch_is_available():
         iu.is_flash_linear_attention_available.cache_clear()
     except Exception:
         pass
-    iu.is_flash_linear_attention_available = lambda: True
+    iu.is_flash_linear_attention_available = _vendored_availability_probe
     return True
 
 

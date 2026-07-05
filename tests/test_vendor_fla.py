@@ -187,3 +187,67 @@ def test_import_hygiene_subprocess():
     )
     assert "HYGIENE_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Caller-aware availability probe (uncovered models keep the pure-torch path)
+# ---------------------------------------------------------------------------
+
+def test_probe_covers_only_vendor_complete_models():
+    from unsloth_zoo.temporary_patches.fla_vendor import _vendored_availability_probe
+
+    def call_as(module_name):
+        return eval(
+            "probe()",
+            {"probe": _vendored_availability_probe, "__name__": module_name},
+        )
+
+    # Covered gated-deltanet models get the fast path.
+    assert call_as("transformers.models.qwen3_5.modeling_qwen3_5") is True
+    assert call_as("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe") is True
+    assert call_as("transformers.models.qwen3_next.modeling_qwen3_next") is True
+    # olmo_hybrid needs ShortConvolution (not vendored): must answer False so its
+    # modeling module falls back to pure torch instead of crashing on import.
+    assert call_as("transformers.models.olmo_hybrid.modeling_olmo_hybrid") is False
+    # Non-modeling callers see the vendored fla as available.
+    assert call_as("unsloth.models.loader") is True
+    assert call_as("__main__") is True
+
+
+_OLMO_SUBPROCESS = textwrap.dedent(
+    """
+    import os
+    os.environ["UNSLOTH_FORCE_VENDORED_FLA"] = "1"
+    from unsloth_zoo.temporary_patches.fla_vendor import patch_vendor_fla
+    patch_vendor_fla()
+    import sys
+    assert getattr(sys.modules["fla"], "_UNSLOTH_VENDORED_FLA", False) is True
+
+    # Covered model binds the vendored kernels.
+    import transformers.models.qwen3_5.modeling_qwen3_5 as q
+    assert q.chunk_gated_delta_rule is not None
+
+    # Uncovered model must import cleanly on its pure-torch fallback.
+    import transformers.models.olmo_hybrid.modeling_olmo_hybrid as m
+    assert m.ShortConvolution is None
+    assert m.chunk_gated_delta_rule is None
+    print("OLMO_FALLBACK_OK")
+    """
+)
+
+
+@pytest.mark.skipif(
+    not _cuda_triton_ok(),
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
+def test_uncovered_model_imports_on_fallback_subprocess():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", _OLMO_SUBPROCESS],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "OLMO_FALLBACK_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
