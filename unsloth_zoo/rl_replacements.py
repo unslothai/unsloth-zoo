@@ -392,7 +392,10 @@ def grpo_compute_loss(
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
+    vllm_importance_sampling_mode = kwargs.get("vllm_importance_sampling_mode", "sequence_mask")
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
+    vllm_importance_sampling_clip_min = kwargs.get("vllm_importance_sampling_clip_min", None)
+    vllm_importance_sampling_clip_max = kwargs.get("vllm_importance_sampling_clip_max", 3.0)
     get_sapo_token_loss = kwargs.get("get_sapo_token_loss", None)
     sapo_temperature_pos = kwargs.get("sapo_temperature_pos", 1.0)
     sapo_temperature_neg = kwargs.get("sapo_temperature_neg", 1.05)
@@ -428,13 +431,39 @@ def grpo_compute_loss(
             off_policy_threshold=off_policy_mask_threshold,
         )
 
-    with torch.no_grad():
-        if use_vllm and sampling_per_token_logps is not None:
-            # Filter out extra leading prompt tokens after left-padding input_ids.
-            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-            importance_sampling_ratio = torch.clamp(
-                importance_sampling_ratio, max=vllm_importance_sampling_cap
-            )
+    if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
+        importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
+
+    if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
+        importance_sampling_ratio = torch.clamp(
+            importance_sampling_ratio, 
+            min=vllm_importance_sampling_clip_min,
+            max=vllm_importance_sampling_clip_max
+        )
+    elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
+        min_val = (
+            vllm_importance_sampling_clip_min
+            if vllm_importance_sampling_clip_min is not None
+            else -math.inf
+        )
+
+        max_val = (
+            vllm_importance_sampling_clip_max
+            if vllm_importance_sampling_clip_max is not None
+            else math.inf
+        )
+
+        invalid_mis_mask = (importance_sampling_ratio < min_val) | (
+                importance_sampling_ratio > max_val
+        )
+
+        importance_sampling_ratio = importance_sampling_ratio.masked_fill(
+                invalid_mis_mask, value=0.0
+        )
+    else:
+        raise ValueError(
+                f"Unknown vLLM importance sampling level: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+        )
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -502,7 +531,7 @@ def grpo_compute_loss(
             advantages=advantages,
             log_ratio_per_token=log_ratio,
             mask=mask,
-            importance_sampling_ratio=kwargs.get("importance_sampling_ratio"),
+            importance_sampling_ratio=importance_sampling_ratio,
             k_pos=vespo_k_pos,
             lambda_pos=vespo_lambda_pos,
             k_neg=vespo_k_neg,
@@ -751,7 +780,10 @@ def grpo_accumulated_loss(
 
     # Pop from kwargs to avoid downstream issues.
     _ = kwargs.pop("sampling_per_token_logps", None)
-    kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
+    kwargs["vllm_importance_sampling_cap"] = trainer.args.vllm_importance_sampling_cap if hasattr(trainer.args, "vllm_importance_sampling_cap") is not None else None
+    kwargs["vllm_importance_sampling_mode"] = trainer.args.vllm_importance_sampling_mode if hasattr(trainer.args, "vllm_importance_sampling_mode") is not None else None
+    kwargs["vllm_importance_sampling_clip_min"] = trainer.args.vllm_importance_sampling_clip_min if hasattr(trainer.args, "vllm_importance_sampling_clip_min") is not None else None
+    kwargs["vllm_importance_sampling_clip_max"] = trainer.args.vllm_importance_sampling_clip_max if hasattr(trainer.args, "vllm_importance_sampling_clip_max") is not None else None
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
     kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None
     kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None
@@ -767,6 +799,10 @@ def grpo_accumulated_loss(
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
+
+    if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
+        kwargs["vllm_importance_sampling_clip_min"] = 0
+        kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
 
     if not hasattr(trainer, '_autocast_dtype'):
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
