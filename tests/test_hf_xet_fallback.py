@@ -2197,6 +2197,56 @@ def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
+def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_path):
+    """A sentence-transformers model reads a weight-bearing subfolder module (2_Dense) the canonical root
+    gate does not check, so a partial cache holding the root weight but missing the 2_Dense weight must
+    defer to the child (else the ST load fetches it over un-killable Xet). A weightless module (Pooling)
+    needs no weight, and a complete ST cache still fast-paths."""
+    def _modules(*mods):
+        return json.dumps([
+            {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+            *mods,
+        ])
+
+    # Partial: root weight present, 2_Dense declared but its weight missing -> defer.
+    snap, blob = _mk_snapshot(tmp_path, "st_partial")
+    (snap / "model.safetensors").symlink_to(blob)
+    (snap / "modules.json").write_text(_modules(
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        {"idx": 2, "name": "2", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}))
+    (snap / "1_Pooling").mkdir()
+    (snap / "1_Pooling" / "config.json").write_text("{}")  # pooling: config only, no weight
+    (snap / "2_Dense").mkdir()
+    (snap / "2_Dense" / "config.json").write_text("{}")    # dense config present, WEIGHT MISSING
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # Complete: the 2_Dense weight is now present -> fast-path.
+    (snap / "2_Dense" / "model.safetensors").symlink_to(blob)
+    assert xf._cache_can_skip_download(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+    # Pooling-only ST (no weight-bearing subfolder module) -> fast-path on the root weight alone.
+    snap2, blob2 = _mk_snapshot(tmp_path, "st_pooling_only")
+    (snap2 / "model.safetensors").symlink_to(blob2)
+    (snap2 / "modules.json").write_text(_modules(
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"}))
+    (snap2 / "1_Pooling").mkdir()
+    (snap2 / "1_Pooling" / "config.json").write_text("{}")
+    assert xf._cache_can_skip_download(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+    # A Dense weight in bin format also counts as present -> fast-path.
+    snap3, blob3 = _mk_snapshot(tmp_path, "st_dense_bin")
+    (snap3 / "model.safetensors").symlink_to(blob3)
+    (snap3 / "modules.json").write_text(_modules(
+        {"idx": 1, "name": "1", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}))
+    (snap3 / "2_Dense").mkdir()
+    (snap3 / "2_Dense" / "pytorch_model.bin").symlink_to(blob3)
+    assert xf._cache_can_skip_download(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
 def test_post_download_rejects_config_only_model(tmp_path):
     """A model warm returning no weight (stale config-only snapshot) is rejected post-download and retried."""
     snap, _ = _mk_snapshot(tmp_path, "cfg")

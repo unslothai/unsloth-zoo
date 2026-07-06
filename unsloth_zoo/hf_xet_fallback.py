@@ -55,6 +55,7 @@ from unsloth_zoo.hf_cache_state import (
     _has_incomplete_variant_root_shards,
     _is_loadable_weight_file,
     _selected_shard_index_incomplete,
+    _sentence_transformers_subfolder_incomplete,
     _weight_shard_index_complete,
     blob_bytes_present,
     has_active_incomplete_blobs,
@@ -1436,6 +1437,11 @@ def _cache_can_skip_download(
         # A variant load reads variant-named weights the canonical gate does not check, so a
         # canonical-only cache would fetch the variant over un-killable Xet. Defer to the child.
         if variant:
+            return False
+        # A sentence-transformers multi-module model reads a weight-bearing subfolder module (e.g.
+        # 2_Dense) that the canonical ROOT gate does not check; a partial cache holding the root weight
+        # but missing that subfolder weight would fetch it over un-killable Xet, so defer to the child.
+        if _sentence_transformers_subfolder_incomplete(snapshot_dir):
             return False
         # A default load probes model.safetensors before pytorch_model.bin, so a bin-only cache for a
         # repo that also publishes safetensors (unprovable locally) would fetch the safetensors over Xet.

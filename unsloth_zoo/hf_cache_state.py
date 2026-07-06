@@ -581,6 +581,51 @@ def snapshot_dir_is_complete(
     )
 
 
+# sentence-transformers ``modules.json`` module types that ship NO weight (config-only), matched on the
+# final dotted component of the "type". Any OTHER module type is treated as weight-bearing (a Dense / CNN
+# / LSTM head), so a stray / custom type conservatively requires its weight -- a false requirement only
+# spawns the cheap child, never a hang.
+_ST_WEIGHTLESS_MODULE_TYPES = frozenset({"pooling", "normalize", "layernorm", "dropout"})
+
+
+def _sentence_transformers_subfolder_incomplete(snapshot_dir: Path) -> bool:
+    """True when a sentence-transformers ``modules.json`` declares a weight-bearing module in a SUBFOLDER
+    (e.g. ``2_Dense``) whose weight is absent. Such a subfolder weight is read by the ST load but is NOT
+    covered by the canonical ROOT weight check, so a partial cache holding the root weight yet missing the
+    subfolder weight would be fast-pathed and then fetch the missing weight over un-killable Xet. Present
+    but unreadable ``modules.json`` -> True (defer, safe); absent -> False (not an ST multi-module repo)."""
+    modules_path = snapshot_dir / "modules.json"
+    if not _safe_is_file(modules_path):
+        return False
+    import json
+
+    try:
+        with open(modules_path, "r", encoding = "utf-8") as f:
+            modules = json.load(f)
+    except (OSError, ValueError):
+        return True  # an ST repo with an unreadable layout -> defer to the child
+    if not isinstance(modules, list):
+        return True
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        path = module.get("path")
+        if not isinstance(path, str) or not path.strip("/"):
+            continue  # the root module (path "") -- covered by the canonical root check
+        module_type = module.get("type")
+        leaf = module_type.rsplit(".", 1)[-1].lower() if isinstance(module_type, str) else ""
+        if leaf in _ST_WEIGHTLESS_MODULE_TYPES:
+            continue  # a config-only module (pooling / normalize / ...) needs no weight
+        sub = snapshot_dir / path.strip("/")
+        try:
+            names = {entry.name for entry in sub.iterdir()} if _safe_is_dir(sub) else set()
+        except OSError:
+            names = set()
+        if not ({"model.safetensors", "pytorch_model.bin"} & names):
+            return True  # a weight-bearing module subfolder missing its weight -> defer to the child
+    return False
+
+
 # A canonical numbered root shard (no variant token): ``model-00001-of-00002.safetensors`` matches but
 # ``model-00001-of-00002.fp16.safetensors`` does not.
 _CANONICAL_ROOT_SHARD_RE = re.compile(
