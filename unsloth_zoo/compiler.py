@@ -485,6 +485,59 @@ def _all_attention_functions_has_sdpa():
 pass
 
 
+def _build_forwarding_parameters(parameters):
+    forwarding_parts = []
+    for key, value in parameters.items():
+        if value.kind == inspect.Parameter.VAR_KEYWORD:
+            forwarding_parts.append("**" + key)
+        elif value.kind == inspect.Parameter.VAR_POSITIONAL:
+            forwarding_parts.append("*" + key)
+        elif key == "self":
+            forwarding_parts.append("self")
+        elif value.kind == inspect.Parameter.POSITIONAL_ONLY:
+            forwarding_parts.append(key)
+        else:
+            forwarding_parts.append(f"{key}={key}")
+    return ", ".join(forwarding_parts)
+
+
+def _build_forwarding_parameters_from_definition(definition):
+    """Build a forwarding call that matches the emitted wrapper signature."""
+    function_source = textwrap.dedent(definition).strip() + "\n    pass\n"
+    parsed = ast.parse(function_source)
+    function_def = parsed.body[0]
+    args = function_def.args
+    parameters = {}
+
+    for arg in args.posonlyargs:
+        parameters[arg.arg] = inspect.Parameter(
+            arg.arg,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+    for arg in args.args:
+        parameters[arg.arg] = inspect.Parameter(
+            arg.arg,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    if args.vararg is not None:
+        parameters[args.vararg.arg] = inspect.Parameter(
+            args.vararg.arg,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+    for arg in args.kwonlyargs:
+        parameters[arg.arg] = inspect.Parameter(
+            arg.arg,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    if args.kwarg is not None:
+        parameters[args.kwarg.arg] = inspect.Parameter(
+            args.kwarg.arg,
+            inspect.Parameter.VAR_KEYWORD,
+        )
+
+    return _build_forwarding_parameters(parameters)
+
+
 # Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
 def higher_precision_softmax(source):
     """
@@ -1382,30 +1435,6 @@ def create_standalone_class(
     else:
         compile = ""
 
-    # Create new forward calling optimized function
-    parameters = inspect.signature(f.forward).parameters
-    # Build the forwarding call using keyword arguments (name=name) for regular
-    # parameters so that decorators like @merge_with_config_defaults can find
-    # them in **kwargs.  When args are passed positionally, the decorator's
-    # func.__code__.co_varnames lookup fails (it sees the inner wrapper's
-    # varnames, not the original function's), and it injects the arg into kwargs
-    # again, causing "got multiple values for argument 'use_cache'".
-    keys = list(parameters.keys())
-    values = list(parameters.values())
-    forwarding_parts = []
-    for j, (key, value) in enumerate(zip(keys, values)):
-        value_str = str(value)
-        if value_str.startswith("**"):
-            forwarding_parts.append("**" + key)
-        elif value_str.startswith("*"):
-            forwarding_parts.append("*" + key)
-        elif key == "self":
-            forwarding_parts.append("self")
-        else:
-            forwarding_parts.append(f"{key}={key}")
-    pass
-    parameters = ", ".join(forwarding_parts)
-
     # Now create the forward function!
     # When forward is patched, use the original forward definition from class source
     definition_source = patched_forward_info[1] if patched_forward_info else old_source
@@ -1424,6 +1453,17 @@ def create_standalone_class(
             f"Source starts with: {definition_source[:200]}"
         )
     definition = definition_matches[0]
+
+    # Create new forward calling optimized function. Build the forwarding call
+    # from the emitted wrapper definition, not from inspect.signature(f.forward).
+    # Some upstream forwards are decorated and inspect as (self, *args, **kwargs)
+    # even though the class source has explicit parameters. Mixing those sources
+    # generates a wrapper body that references undefined args.
+    try:
+        parameters = _build_forwarding_parameters_from_definition(definition)
+    except Exception:
+        parameters = _build_forwarding_parameters(inspect.signature(f.forward).parameters)
+
     leftover = full_class[full_class.find(definition) + len(definition) :]
 
     # Add **loss_kwargs
