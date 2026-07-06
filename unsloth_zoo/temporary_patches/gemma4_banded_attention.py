@@ -29,6 +29,7 @@
 # ============================================================================
 
 import os
+import functools
 import torch
 import torch.nn.functional as F
 from .common import logger
@@ -39,7 +40,15 @@ _MASK_CACHE = {}    # (w, nb, device) -> (nb,1,w,2w) bool block mask
 _ENGAGED = [0]      # count of banded-path invocations (debug)
 
 
+@functools.lru_cache(maxsize=1)
 def _enabled():
+    """Whether the pure-SDPA banded sliding-window path is enabled. Opt-in via
+    UNSLOTH_BANDED_SDPA=1; off by default.
+
+    Cached with maxsize=1 since the env var is read once per process. Any code or
+    test that toggles UNSLOTH_BANDED_SDPA at runtime must call
+    _enabled.cache_clear() afterwards for the change to take effect.
+    """
     return os.environ.get("UNSLOTH_BANDED_SDPA", "0") == "1"
 
 
