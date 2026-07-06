@@ -431,39 +431,44 @@ def grpo_compute_loss(
             off_policy_threshold=off_policy_mask_threshold,
         )
 
-    if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
-        importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
+    with torch.no_grad():
+        if use_vllm and sampling_per_token_logps is not None:
+            # Filter out extra leading prompt tokens after left-padding input_ids.
+            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
 
-    if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
-        importance_sampling_ratio = torch.clamp(
-            importance_sampling_ratio, 
-            min=vllm_importance_sampling_clip_min,
-            max=vllm_importance_sampling_clip_max
-        )
-    elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
-        min_val = (
-            vllm_importance_sampling_clip_min
-            if vllm_importance_sampling_clip_min is not None
-            else -math.inf
-        )
+            if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
+                importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
 
-        max_val = (
-            vllm_importance_sampling_clip_max
-            if vllm_importance_sampling_clip_max is not None
-            else math.inf
-        )
+            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
+                importance_sampling_ratio = torch.clamp(
+                    importance_sampling_ratio, 
+                    min=vllm_importance_sampling_clip_min,
+                    max=vllm_importance_sampling_clip_max
+                )
+            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
+                min_val = (
+                    vllm_importance_sampling_clip_min
+                    if vllm_importance_sampling_clip_min is not None
+                    else -math.inf
+                )
 
-        invalid_mis_mask = (importance_sampling_ratio < min_val) | (
-                importance_sampling_ratio > max_val
-        )
+                max_val = (
+                    vllm_importance_sampling_clip_max
+                    if vllm_importance_sampling_clip_max is not None
+                    else math.inf
+                )
 
-        importance_sampling_ratio = importance_sampling_ratio.masked_fill(
-                invalid_mis_mask, value=0.0
-        )
-    else:
-        raise ValueError(
-                f"Unknown vLLM importance sampling level: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
-        )
+                invalid_mis_mask = (importance_sampling_ratio < min_val) | (
+                        importance_sampling_ratio > max_val
+                )
+
+                importance_sampling_ratio = importance_sampling_ratio.masked_fill(
+                        invalid_mis_mask, value=0.0
+                )
+            else:
+                raise ValueError(
+                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                )
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
