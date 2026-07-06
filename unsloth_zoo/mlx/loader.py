@@ -286,10 +286,9 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
         return
     if not any(marker in message for marker in ("k_norm", "q_norm")):
         return
-    # gemma4/gemma3n KV-sharing tails carry DEAD k_proj/v_proj/k_norm (Q is never
-    # shared, so never q_norm); dropping that tail via the registered strict=False
-    # fallback is safe and must not be blocked (mlx-lm #1242). A genuine version
-    # gap rejects q_norm/k_norm WITHOUT the paired projections - raise only then.
+    # gemma4/gemma3n KV-sharing tails ship DEAD k_proj/v_proj/k_norm (never
+    # q_norm); dropping them via strict=False is safe (mlx-lm #1242). A real gap
+    # rejects q_norm/k_norm WITHOUT the paired projections - raise only then.
     kv_sharing_dead_tail = (
         "self_attn.k_proj" in message
         and "self_attn.v_proj" in message
@@ -304,7 +303,7 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
 
             versions.append(f"{pkg}={_dist_version(pkg)}")
         except Exception:
-            # Best-effort hint; a missing dist is just omitted.
+            # Best-effort hint; omit a missing dist.
             pass
     installed = f" Installed: {', '.join(versions)}." if versions else ""
     raise ValueError(
@@ -426,7 +425,7 @@ def _load_mlx_lm_with_strict_fallback(
     except ValueError as error:
         message = str(error)
         # Active-layer QK-norm weights are load-bearing: never strict=False past
-        # them; the dead KV-sharing tail still falls through to the fallback below.
+        # them (the dead KV-sharing tail still falls through to the fallback).
         _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
@@ -498,10 +497,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
                 with _temporary_hf_token_env(hf_token):
                     return vlm_load(model_name, **vlm_kwargs)
             except ValueError as retry_error:
-                # Filtering the allow-listed extras can unmask an older-mlx-vlm
-                # q_norm/k_norm mismatch on the retry; surface the same actionable
-                # version-gap error as the first attempt instead of letting the raw
-                # strict-load message (the one this guard exists to replace) escape.
+                # Filtering the extras can unmask a q_norm/k_norm version gap on
+                # the retry; surface the actionable error instead of the raw one.
                 _raise_if_qk_norm_version_gap(model_type, str(retry_error), retry_error)
                 raise
             finally:

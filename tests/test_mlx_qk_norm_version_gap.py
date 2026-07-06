@@ -1,4 +1,19 @@
 # Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 # Strict mlx load rejecting q_norm/k_norm = mlx-lm/mlx-vlm too old for a QK-norm
 # arch; the guard must raise a clear error instead of the raw mlx ValueError.
 
@@ -91,10 +106,8 @@ def test_non_qk_norm_mismatch_passes_through():
 
 
 def test_vlm_retry_qk_norm_mismatch_raises_actionable_error():
-    # First strict VLM load fails on the allow-listed per_layer_model_projection
-    # extras (so the code enters the filtered retry); the retry then hits an
-    # older-mlx-vlm q_norm/k_norm mismatch, which must surface the actionable
-    # version-gap error rather than escaping as the raw strict-load ValueError.
+    # First load fails on allow-listed extras (entering the filtered retry); the
+    # retry then hits a q_norm/k_norm gap, which must surface the actionable error.
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_with_extra_weight_filter
 
     calls = {"n": 0}
