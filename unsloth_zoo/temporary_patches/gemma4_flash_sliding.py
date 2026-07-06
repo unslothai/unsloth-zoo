@@ -34,6 +34,7 @@
 # ============================================================================
 
 import os
+import functools
 import torch
 from .common import TEMPORARY_PATCHES, logger
 from .utils import raise_error
@@ -53,7 +54,22 @@ _ENGAGED = [0]           # count of FA2-path invocations (debug)
 _BANDED_ENGAGED = [0]    # count of banded-path invocations (debug)
 
 
+@functools.lru_cache(maxsize=1)
 def _enabled():
+    """Whether the gemma-4 sliding-window fast router is active.
+
+    On by default and effectively always on: the router auto-prefers
+    FlashAttention-2's window kernel when flash-attn is importable, and the
+    pure-SDPA banded fallback works on every setup and dtype. So "always on if
+    Flash Attention exists and/or if it works" holds without gating on _HAS_FA2:
+    the "or if it works" case is covered by the universal banded path, which is
+    why this must NOT be gated on _HAS_FA2 (that would wrongly disable the
+    banded fallback). Set UNSLOTH_GEMMA4_FLASH_SLIDING=0 to revert to plain SDPA.
+
+    Cached with maxsize=1 since the env var is read once per process. Any code or
+    test that toggles UNSLOTH_GEMMA4_FLASH_SLIDING at runtime must call
+    _enabled.cache_clear() afterwards for the change to take effect.
+    """
     return os.environ.get("UNSLOTH_GEMMA4_FLASH_SLIDING", "1") != "0"
 
 

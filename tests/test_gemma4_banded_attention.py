@@ -211,6 +211,7 @@ def test_router_falls_back_to_banded_without_flash(monkeypatch, with_mask):
     monkeypatch.setattr(gf, "_HAS_FA2", False)
     monkeypatch.setattr(gf, "_flash_attn_func", None)
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1")
+    gf._enabled.cache_clear()  # _enabled is lru_cache(1); re-read the toggled env
     monkeypatch.delenv("UNSLOTH_BANDED_SDPA", raising=False)
 
     S, w, H, Hkv, d = 300, 64, 8, 2, 32
@@ -257,6 +258,7 @@ def test_router_force_banded_env_skips_flash(monkeypatch):
     monkeypatch.setattr(gf, "_HAS_FA2", True)
     monkeypatch.setattr(gf, "_flash_attn_func", _flash_should_not_run)
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1")
+    gf._enabled.cache_clear()  # _enabled is lru_cache(1); re-read the toggled env
     monkeypatch.setenv("UNSLOTH_BANDED_SDPA", "1")
 
     S, w, H, Hkv, d = 256, 64, 4, 4, 32
@@ -292,6 +294,7 @@ def test_router_kill_switch_defers_to_sdpa(monkeypatch):
     monkeypatch.setattr(gf, "_HAS_FA2", False)
     monkeypatch.setattr(gf, "_flash_attn_func", None)
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "0")
+    gf._enabled.cache_clear()  # _enabled is lru_cache(1); re-read the toggled env
 
     S, w, H, d = 256, 64, 4, 32
     torch.manual_seed(4)

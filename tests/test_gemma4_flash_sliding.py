@@ -130,6 +130,7 @@ def test_router_routes_to_fa2_and_matches_band(monkeypatch):
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1")
+    gf._enabled.cache_clear()  # _enabled is lru_cache(1); re-read the toggled env
     monkeypatch.delenv("UNSLOTH_BANDED_SDPA", raising=False)
     assert gf._HAS_FA2, "flash_attn imported by the test but not by the router"
 
