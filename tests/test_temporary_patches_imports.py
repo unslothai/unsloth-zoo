@@ -41,6 +41,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.gemma",
     "unsloth_zoo.temporary_patches.gemma3n",
     "unsloth_zoo.temporary_patches.gemma4",
+    "unsloth_zoo.temporary_patches.gemma4_banded_attention",
     "unsloth_zoo.temporary_patches.gemma4_moe",
     "unsloth_zoo.temporary_patches.glm4_moe",
     "unsloth_zoo.temporary_patches.gpt_oss",
