@@ -408,6 +408,8 @@ def grpo_compute_loss(
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
 
+    importance_sampling_ratio = None
+
     # exp(new - old) and exp(ref - new) below are taken before `mask` is applied. A sequence-packed
     # logp path leaves the masked (prompt/pad) columns at 0 while a padded one fills them with a real
     # logp, so when new and old/ref disagree there those ratios can overflow to inf and inf * 0 (the
