@@ -72,17 +72,43 @@ def _injection_supported() -> bool:
         return False
 
 
-def test_probe_import_does_not_inject_fla_into_parent():
-    # The skip gate imports fla_vendor to read _vendored_injection_supported(). That
-    # import must not run the module's early patch_vendor_fla(), or fla leaks into
-    # this process (and every later test) just from evaluating the marker. Importing
-    # it here reproduces exactly what pytest does during collection.
+_NO_AUTORUN_SUBPROCESS = textwrap.dedent(
+    """
+    import os, sys
+    os.environ["UNSLOTH_IS_PRESENT"] = "1"
+    os.environ["UNSLOTH_VENDORED_FLA_NO_AUTORUN"] = "1"
+
+    # Reading the support gate imports fla_vendor. With the autorun suppressed this
+    # import must NOT run patch_vendor_fla() by itself, so no vendored fla is
+    # injected into the interpreter merely from evaluating the support marker.
     import unsloth_zoo.temporary_patches.fla_vendor  # noqa: F401
 
     fla = sys.modules.get("fla")
     assert not getattr(fla, "_UNSLOTH_VENDORED_FLA", False), (
-        "vendored fla leaked into the parent pytest process at import"
+        "autorun injected vendored fla despite UNSLOTH_VENDORED_FLA_NO_AUTORUN"
     )
+    print("NO_AUTORUN_OK")
+    """
+)
+
+
+def test_no_autorun_suppresses_import_time_injection():
+    # Runs in a fresh interpreter so it isolates the autorun-suppression invariant.
+    # The in-process pytest session cannot assert this directly: conftest does
+    # `import unsloth`, which legitimately applies TEMPORARY_PATCHES and (when an
+    # installed fla is not newer than the vendored snapshot) correctly injects the
+    # vendored copy. That is real patching, not an autorun leak, so the invariant is
+    # checked in a subprocess that does not import unsloth.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", _NO_AUTORUN_SUBPROCESS],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "NO_AUTORUN_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +307,52 @@ def test_uncovered_model_imports_on_fallback_subprocess():
     )
     assert "OLMO_FALLBACK_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
+
+
+def test_version_strictly_after():
+    from unsloth_zoo.temporary_patches.fla_vendor import _version_strictly_after
+
+    assert _version_strictly_after("0.6.0", "0.5.1") is True
+    assert _version_strictly_after("0.5.2", "0.5.1") is True
+    assert _version_strictly_after("0.5.1", "0.5.1") is False
+    assert _version_strictly_after("0.5.0", "0.5.1") is False
+    # A dev/nightly of the same release is not counted as newer.
+    assert _version_strictly_after("0.5.1.dev3", "0.5.1") is False
+    # A dev build of a later release is newer.
+    assert _version_strictly_after("0.6.0.dev1", "0.5.1") is True
+    # Unparseable input is conservatively not-newer.
+    assert _version_strictly_after("not-a-version", "0.5.1") is False
+
+
+def test_defer_to_installed_fla_only_when_strictly_newer(monkeypatch):
+    # Auto-detection: use a user-installed fla only when it is strictly newer than
+    # the vendored snapshot; an equal or older install is shadowed by the vendored
+    # kernels (which carry post-0.5.1 backports). No env flag required.
+    import types
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    def set_installed(ver):
+        m = types.ModuleType("fla")
+        if ver is not None:
+            m.__version__ = ver
+        # No vendored marker: looks like a genuine user install.
+        monkeypatch.setitem(sys.modules, "fla", m)
+
+    set_installed("0.6.0")
+    assert fv._should_defer_to_installed_fla() is True          # newer -> use theirs
+    set_installed(fv._VENDORED_FLA_VERSION)
+    assert fv._should_defer_to_installed_fla() is False         # equal -> use vendored
+    set_installed("0.4.0")
+    assert fv._should_defer_to_installed_fla() is False         # older -> use vendored
+    set_installed(None)
+    assert fv._should_defer_to_installed_fla() is True          # unversioned deliberate install
+
+    # Our own vendored module must never be treated as a user install.
+    m = types.ModuleType("fla")
+    m.__version__ = fv._VENDORED_FLA_VERSION
+    setattr(m, fv._VENDORED_MARK, True)
+    monkeypatch.setitem(sys.modules, "fla", m)
+    assert fv._should_defer_to_installed_fla() is False
 
 
 def test_python_39_skips_injection(monkeypatch):

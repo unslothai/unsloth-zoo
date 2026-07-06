@@ -24,9 +24,11 @@ snapshot into ``sys.modules`` as a real, walkable ``fla`` and reports availabili
 
 Precedence / escape hatches:
   * ``UNSLOTH_DISABLE_VENDORED_FLA=1`` -> do nothing (keep the pure-torch path).
-  * A real, importable, version-compatible ``fla`` already present -> defer to
-    it (do not shadow a deliberate user install), unless
-    ``UNSLOTH_FORCE_VENDORED_FLA=1``.
+  * Version-aware auto-detection: a user-installed ``fla`` that is strictly newer
+    than the vendored snapshot is used instead (a newer upstream supersedes ours);
+    an equal or older install is shadowed by the vendored kernels, which carry
+    post-0.5.1 backports. ``UNSLOTH_FORCE_VENDORED_FLA=1`` forces the vendored copy
+    even over a newer install (rarely needed now that selection is automatic).
   * Only injects when torch >= 2.7, triton >= 3.3 and CUDA are available (the
     requirements of the vendored fla-core 0.5.1 kernels); otherwise the
     pure-torch fallback is left untouched.
@@ -68,8 +70,12 @@ _VENDOR_COVERED_MODELS = frozenset(_REPAIR_MODELING)
 # Minimum versions declared by fla-core 0.5.1.
 _MIN_TORCH = "2.7"
 _MIN_TRITON = "3.3"
-# Transformers accepts fla >= 0.2.2 for is_flash_linear_attention_available.
-_MIN_FLA = "0.2.2"
+# The version of the bundled fla-core snapshot. A user-installed fla is used
+# instead of the vendored one only when it is strictly newer than this; an equal
+# or older install is shadowed by the vendored kernels, which carry post-0.5.1
+# correctness backports (Blackwell / Hopper). Kept in sync with
+# unsloth_zoo/_vendored/fla/__init__.py (guarded by test_vendored_tree_layout).
+_VENDORED_FLA_VERSION = "0.5.1"
 
 
 def _flag(name):
@@ -99,6 +105,18 @@ def _version_at_least(value, minimum):
         # release, which would wrongly reject a valid 2.7 nightly.
         parsed = version.parse(str(value).split("+")[0])
         return version.parse(parsed.base_version) >= version.parse(minimum)
+    except Exception:
+        return False
+
+
+def _version_strictly_after(value, threshold):
+    """True if ``value`` parses to a release strictly greater than ``threshold``.
+    Base-version comparison, so a dev/nightly of the same release (e.g. 0.5.1.devN)
+    is not counted as newer than 0.5.1."""
+    try:
+        from packaging import version
+        parsed = version.parse(str(value).split("+")[0])
+        return version.parse(parsed.base_version) > version.parse(threshold)
     except Exception:
         return False
 
@@ -190,8 +208,16 @@ def _vendored_already_injected():
     return mod is not None and getattr(mod, _VENDORED_MARK, False) is True
 
 
-def _real_fla_present_and_compatible():
-    """True if a user-installed (non-vendored) importable fla >= _MIN_FLA exists."""
+def _should_defer_to_installed_fla():
+    """True if a user-installed (non-vendored) fla should be used instead of the
+    vendored snapshot.
+
+    We defer only when the installed fla is *strictly newer* than the vendored
+    version: a newer upstream supersedes our copy, while an equal or older install
+    is shadowed by the vendored kernels (which carry post-0.5.1 backports). A
+    deliberate install whose version cannot be read is respected rather than
+    shadowed. ``UNSLOTH_FORCE_VENDORED_FLA`` overrides this to force the vendored
+    copy even over a newer install."""
     mod = sys.modules.get("fla")
     if mod is not None:
         if getattr(mod, _VENDORED_MARK, False) is True:
@@ -216,9 +242,10 @@ def _real_fla_present_and_compatible():
         except Exception:
             ver = None
     if ver is None:
-        # Importable but version unknown: respect the user's deliberate install.
+        # Importable but version unknown: respect the user's deliberate install
+        # rather than shadowing something we cannot assess.
         return True
-    return _version_at_least(ver, _MIN_FLA)
+    return _version_strictly_after(ver, _VENDORED_FLA_VERSION)
 
 
 def _neutralize_tilelang_backend_probe():
@@ -535,8 +562,8 @@ def patch_vendor_fla(phase=None):
     replaced_real = False
     if not _vendored_already_injected():
         force = _flag("UNSLOTH_FORCE_VENDORED_FLA")
-        if not force and _real_fla_present_and_compatible():
-            # A deliberate user install is present; defer to it entirely.
+        if not force and _should_defer_to_installed_fla():
+            # A newer (or unversioned deliberate) user install is present; use it.
             return
         if not _torch_triton_cuda_supported():
             # Cannot run the Triton kernels here; leave the pure-torch fallback.
