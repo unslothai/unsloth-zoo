@@ -1875,24 +1875,42 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     blocks_tensor, scales_tensor
                 )
 
-                if device_type == 'cpu':
-                    try:
-                        from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu
-                        W = convert_moe_packed_tensors_cpu(
-                            blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
-                        ).transpose(1, 2).contiguous()
-                        if UNSLOTH_ENABLE_LOGGING:
-                            logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
-                    except ImportError:
-                        W = convert_moe_packed_tensors(
-                            blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
-                        ).transpose(1, 2).contiguous()
-                else:
-                    W = convert_moe_packed_tensors(
+                # Transpose convention: Unsloth's mxfp4 patch replaces convert_moe_packed_tensors
+                # with a variant that returns the un-transposed [E, D, G*B*2] layout AND injects
+                # convert_moe_packed_tensors_cpu (both together). Stock transformers'
+                # convert_moe_packed_tensors instead already returns the transposed GPT-OSS layout
+                # (`return out.transpose(1, 2).contiguous()`). So the external transpose(1, 2) below
+                # is only correct against the Unsloth (no-self-transpose) variants; applying it to the
+                # stock function double-transposes and silently corrupts the exported weights. The
+                # presence of convert_moe_packed_tensors_cpu is the signal that the Unsloth patch is
+                # active, i.e. the base is the no-self-transpose variant. Re-import fresh so a patch
+                # applied after this module was imported is still picked up.
+                try:
+                    from transformers.integrations.mxfp4 import convert_moe_packed_tensors as _cmpt_base
+                except (ImportError, ModuleNotFoundError):
+                    _cmpt_base = convert_moe_packed_tensors
+                try:
+                    from transformers.integrations.mxfp4 import convert_moe_packed_tensors_cpu as _cmpt_cpu
+                except (ImportError, ModuleNotFoundError):
+                    _cmpt_cpu = None
+                _unsloth_no_self_transpose = _cmpt_cpu is not None
+
+                if device_type == 'cpu' and _cmpt_cpu is not None:
+                    W = _cmpt_cpu(
                         blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                     ).transpose(1, 2).contiguous()
                     if UNSLOTH_ENABLE_LOGGING:
-                        logger.info(f"[DEBUG] Using GPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                        logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
+                else:
+                    W = _cmpt_base(
+                        blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
+                    )
+                    # Only add the external transpose for the Unsloth no-self-transpose base;
+                    # the stock base already returns the transposed layout.
+                    W = W.transpose(1, 2).contiguous() if _unsloth_no_self_transpose else W.contiguous()
+                    if UNSLOTH_ENABLE_LOGGING:
+                        _which = "GPU" if device_type != 'cpu' else "CPU-fallback"
+                        logger.info(f"[DEBUG] Using {_which} dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
 
                 processed_mxfp4_keys.add(key); processed_mxfp4_keys.add(scales_key)
 
