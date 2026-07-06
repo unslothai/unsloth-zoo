@@ -36,7 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 import concurrent.futures
 import math
 import os
@@ -67,6 +67,109 @@ class MLXTrainOutput(dict):
     @property
     def training_loss(self):
         return self.get("train_loss", 0.0)
+
+
+@dataclass
+class TrainerControl:
+    """Torch-free subset of Hugging Face TrainerControl used by callbacks."""
+
+    should_training_stop: bool = False
+    should_epoch_stop: bool = False
+    should_save: bool = False
+    should_evaluate: bool = False
+    should_log: bool = False
+
+
+@dataclass
+class TrainerState:
+    """Torch-free subset of Hugging Face TrainerState used by callbacks."""
+
+    epoch: float | None = None
+    global_step: int = 0
+    max_steps: int = 0
+    logging_steps: int = 500
+    eval_steps: int = 500
+    save_steps: int = 500
+    train_batch_size: int | None = None
+    num_train_epochs: int = 0
+    num_input_tokens_seen: int = 0
+    total_flos: float = 0
+    log_history: list = field(default_factory=list)
+    best_metric: float | None = None
+    best_global_step: int | None = None
+    best_model_checkpoint: str | None = None
+    is_local_process_zero: bool = True
+    is_world_process_zero: bool = True
+    is_hyper_param_search: bool = False
+    trial_name: str | None = None
+    trial_params: dict | None = None
+    stateful_callbacks: dict = field(default_factory=dict)
+
+
+class _MLXCallbackHandler:
+    """Small HF-compatible callback dispatcher that keeps MLX imports Torch-free."""
+
+    def __init__(self, callbacks, model, processing_class, optimizer, lr_scheduler):
+        self.callbacks = []
+        for callback in callbacks:
+            self.add_callback(callback)
+        self.model = model
+        self.processing_class = processing_class
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.train_dataloader = None
+        self.eval_dataloader = None
+
+    @property
+    def callback_list(self):
+        """Return callback class names for diagnostics."""
+        return "\n".join(cb.__class__.__name__ for cb in self.callbacks)
+
+    def add_callback(self, callback):
+        """Add a callback class or instance."""
+        self.callbacks.append(callback() if isinstance(callback, type) else callback)
+
+    def pop_callback(self, callback):
+        """Remove and return a callback class or instance."""
+        if isinstance(callback, type):
+            for cb in self.callbacks:
+                if isinstance(cb, callback):
+                    self.callbacks.remove(cb)
+                    return cb
+        else:
+            for cb in self.callbacks:
+                if cb == callback:
+                    self.callbacks.remove(cb)
+                    return cb
+        return None
+
+    def remove_callback(self, callback):
+        """Remove a callback class or instance."""
+        removed = self.pop_callback(callback)
+        if removed is None and not isinstance(callback, type):
+            self.callbacks.remove(callback)
+
+    def call_event(self, event, args, state, control, **kwargs):
+        """Dispatch one callback event and return the latest control object."""
+        for callback in self.callbacks:
+            method = getattr(callback, event, None)
+            if method is None:
+                continue
+            result = method(
+                args,
+                state,
+                control,
+                model=self.model,
+                processing_class=self.processing_class,
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                train_dataloader=self.train_dataloader,
+                eval_dataloader=self.eval_dataloader,
+                **kwargs,
+            )
+            if result is not None:
+                control = result
+        return control
 
 
 class _MLXTokenizedDatasetView:
@@ -729,6 +832,8 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    eval_strategy: str | None = None  # None = derive from eval_steps
+    eval_delay: float = 0.0
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
     greater_is_better: bool = False
@@ -833,6 +938,7 @@ class MLXTrainer:
         args=None,
         formatting_func=None,
         processor=None,
+        callbacks=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -898,6 +1004,20 @@ class MLXTrainer:
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
+        self._ensure_callback_args_compat()
+        self.callback_handler = _MLXCallbackHandler(
+            callbacks or [],
+            model=self.model,
+            processing_class=self.processor or self.tokenizer,
+            optimizer=None,
+            lr_scheduler=None,
+        )
+        self.state = TrainerState()
+        self.control = TrainerControl()
+        self.control = self.callback_handler.call_event(
+            "on_init_end",
+            self.args, self.state, self.control,
+        )
         self.stop_requested = False  # Set True to stop training early
         self._best_metric = None
         self._best_step = None
@@ -921,6 +1041,154 @@ class MLXTrainer:
         fn(step, eval_loss, perplexity)
         """
         self._eval_callbacks.append(fn)
+
+    def add_callback(self, callback):
+        """Add a Hugging Face TrainerCallback class or instance."""
+        self.callback_handler.add_callback(callback)
+        self._ensure_callback_args_compat()
+
+    def remove_callback(self, callback):
+        """Remove a Hugging Face TrainerCallback class or instance."""
+        self.callback_handler.remove_callback(callback)
+
+    def pop_callback(self, callback):
+        """Remove and return a Hugging Face TrainerCallback class or instance."""
+        return self.callback_handler.pop_callback(callback)
+
+    def _ensure_callback_args_compat(self):
+        """Populate TrainingArguments-style fields read by common callbacks."""
+        args = self.args
+        if not hasattr(args, "logging_strategy"):
+            args.logging_strategy = "steps" if getattr(args, "logging_steps", 0) else "no"
+        if not hasattr(args, "eval_strategy") or getattr(args, "eval_strategy", None) is None:
+            args.eval_strategy = self._default_callback_eval_strategy()
+        if not hasattr(args, "save_strategy"):
+            args.save_strategy = "steps" if getattr(args, "save_steps", 0) else "no"
+        if not hasattr(args, "logging_first_step"):
+            args.logging_first_step = False
+        if not hasattr(args, "eval_delay"):
+            args.eval_delay = 0
+        if not hasattr(args, "include_num_input_tokens_seen"):
+            args.include_num_input_tokens_seen = False
+
+    @staticmethod
+    def _callback_interval_name(value):
+        """Normalize HF interval enum/string values for callback scheduling."""
+        value = getattr(value, "value", value)
+        value = str(value).lower()
+        return value.rsplit(".", 1)[-1]
+
+    def _default_callback_eval_strategy(self):
+        """Return the MLX-derived eval strategy for callback compatibility."""
+        return (
+            "steps"
+            if self.eval_dataset is not None and getattr(self.args, "eval_steps", 0)
+            else "no"
+        )
+
+    def _init_callback_state(self, total_steps, resume_step):
+        """Initialize TrainerState for HF callback lifecycle events."""
+        args = self.args
+        eval_steps = int(getattr(args, "eval_steps", 0) or 0)
+        self.state = TrainerState(
+            global_step=int(resume_step),
+            max_steps=int(total_steps),
+            logging_steps=int(getattr(args, "logging_steps", 0) or 0),
+            eval_steps=eval_steps,
+            save_steps=int(getattr(args, "save_steps", 0) or 0),
+            train_batch_size=int(getattr(args, "per_device_train_batch_size", 0) or 0),
+            num_train_epochs=max(0, int(getattr(args, "num_train_epochs", 0) or 0)),
+            log_history=[],
+            is_local_process_zero=True,
+            is_world_process_zero=True,
+        )
+        self.control = TrainerControl()
+
+    def _sync_callback_stop(self):
+        """Mirror TrainerControl stop requests into MLXTrainer's loop flag."""
+        if getattr(self.control, "should_training_stop", False):
+            self.stop_requested = True
+
+    def _call_callback_log(self, logs):
+        """Record and dispatch a Hugging Face on_log callback event."""
+        output = dict(logs)
+        output["step"] = self.state.global_step
+        self.state.log_history.append(output)
+        self.control.should_log = False
+        self.control = self.callback_handler.call_event(
+            "on_log",
+            self.args, self.state, self.control, logs=logs,
+        )
+        self._sync_callback_stop()
+
+    def _call_callback_evaluate(self, metrics):
+        """Dispatch a Hugging Face on_evaluate callback event."""
+        self._call_callback_log(dict(metrics))
+        self.control.should_evaluate = False
+        self.control = self.callback_handler.call_event(
+            "on_evaluate",
+            self.args, self.state, self.control, metrics=metrics,
+        )
+        self._sync_callback_stop()
+
+    def _call_callback_save(self):
+        """Dispatch a Hugging Face on_save callback event."""
+        self.control.should_save = False
+        self.control = self.callback_handler.call_event(
+            "on_save",
+            self.args, self.state, self.control,
+        )
+        self._sync_callback_stop()
+
+    def _callback_batches_per_epoch(self, batches):
+        """Return the finite micro-batch count for one callback epoch."""
+        if batches is None:
+            return None
+        total = len(batches)
+        if total <= 0:
+            return None
+        if getattr(self, "_prepared_batches_include_epochs", False):
+            epochs = int(getattr(self.args, "num_train_epochs", 0) or 0)
+            if epochs > 0 and total % epochs == 0:
+                return max(1, total // epochs)
+        return total
+
+    def _metric_for_best_model_name(self, metrics=None, require=False):
+        """Return the HF-normalized metric_for_best_model key."""
+        metric_name = getattr(self.args, "metric_for_best_model", None)
+        if not metric_name:
+            return None
+        metric_name = str(metric_name)
+        if not metric_name.startswith("eval_"):
+            metric_name = f"eval_{metric_name}"
+        if metrics is not None and metric_name not in metrics:
+            if require:
+                raise ValueError(
+                    f"metric_for_best_model={metric_name!r} not in eval "
+                    f"metrics; available: {sorted(metrics)}"
+                )
+            return None
+        return metric_name
+
+    def _update_callback_best_metric(self, metrics):
+        """Update TrainerState.best_metric after on_evaluate, matching HF timing."""
+        metric_name = self._metric_for_best_model_name(
+            metrics,
+            require=False,
+        )
+        if metric_name is None:
+            return
+        value = metrics[metric_name]
+        if value != value:
+            return
+        greater = bool(getattr(self.args, "greater_is_better", False))
+        improved = (
+            self.state.best_metric is None
+            or (value > self.state.best_metric if greater else value < self.state.best_metric)
+        )
+        if improved:
+            self.state.best_metric = value
+            self.state.best_global_step = self.state.global_step
 
     @staticmethod
     def _apply_compile_recommendations(args, decision):
@@ -1801,6 +2069,12 @@ class MLXTrainer:
                     f"silently restart from step 0."
                 ) from e
 
+        self.callback_handler.optimizer = optimizer
+        self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
+        self.callback_handler.processing_class = self.processor or self.tokenizer
+        self._ensure_callback_args_compat()
+        self._init_callback_state(total_steps, _resume_step)
+
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
@@ -2112,7 +2386,12 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
-        if args.eval_steps > 0 and self.eval_dataset is not None:
+
+        def _prepare_eval_batches():
+            """Materialize eval batches the first time evaluation is requested."""
+            nonlocal eval_batches
+            if eval_batches is not None or self.eval_dataset is None:
+                return eval_batches
             eval_batch_size = (
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
@@ -2165,13 +2444,23 @@ class MLXTrainer:
                     }
                 else:
                     eval_batches = _create_eval_batches(self.eval_dataset)
-            if eval_batches:
+            self.callback_handler.eval_dataloader = eval_batches
+            if eval_batches and args.eval_steps > 0:
                 eval_batch_count = (
                     sum(len(value) for value in eval_batches.values())
                     if isinstance(eval_batches, dict) else len(eval_batches)
                 )
                 print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
                       f"({eval_batch_count} eval batches).")
+            return eval_batches
+
+        self.callback_handler.train_dataloader = batches if batches is not None else batch_iter
+        self.control.should_training_stop = False
+        self.control = self.callback_handler.call_event(
+            "on_train_begin",
+            args, self.state, self.control,
+        )
+        self._sync_callback_stop()
 
         features = []
         if is_vlm:
@@ -2212,6 +2501,216 @@ class MLXTrainer:
         trained_tokens = 0
         train_time = 0
         grad_accum_state = None
+        accum_progress = 0
+        batches_per_epoch = self._callback_batches_per_epoch(batches)
+
+        def _run_callback_epoch_begin(epoch_value):
+            """Dispatch one epoch-begin event at the requested epoch value."""
+            self.state.epoch = epoch_value
+            self.control.should_epoch_stop = False
+            self.control = self.callback_handler.call_event(
+                "on_epoch_begin",
+                args, self.state, self.control,
+            )
+            self._sync_callback_stop()
+
+        def _maybe_callback_epoch_begin(microstep):
+            """Dispatch epoch-begin at finite dataset boundaries."""
+            if not batches_per_epoch or (microstep - 1) % batches_per_epoch != 0:
+                return False
+            _run_callback_epoch_begin((microstep - 1) / batches_per_epoch)
+            return True
+
+        def _maybe_callback_epoch_end(microstep, current_step, grad_norm):
+            """Dispatch epoch-end after an optimizer step at a dataset boundary."""
+            if not batches_per_epoch or microstep % batches_per_epoch != 0:
+                return
+            self.state.epoch = microstep / batches_per_epoch
+            self.control = self.callback_handler.call_event(
+                "on_epoch_end",
+                args, self.state, self.control,
+            )
+            self._sync_callback_stop()
+            if self.control.should_log or self.control.should_evaluate or self.control.should_save:
+                _run_callback_control_actions(current_step, grad_norm)
+
+        def _run_training_log(current_step, grad_norm):
+            """Emit one MLX/HF training log from accumulated loss counters."""
+            nonlocal losses, n_tokens, steps, train_time, trained_tokens
+            tok_count = n_tokens.item() if hasattr(n_tokens, "item") else n_tokens
+            if int(tok_count) == 0:
+                self.control.should_log = False
+                return
+            train_loss = (losses / n_tokens).item()
+            trained_tokens += tok_count
+            lr_val = optimizer.learning_rate.item()
+            tokens_sec = tok_count / train_time if train_time > 0 else 0
+            peak_mem = mx.get_peak_memory() / 1e9
+
+            self._train_loss_history.append(train_loss)
+            grad_norm_val = (
+                float(grad_norm.item())
+                if grad_norm is not None else None
+            )
+            if grad_norm_val is not None:
+                self._grad_norm_history.append(grad_norm_val)
+            self._tokens_per_second_history.append(tokens_sec)
+            self._peak_memory_history.append(peak_mem)
+            self._step_times.append(train_time / steps if steps > 0 else 0)
+
+            reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
+            if reset_after > 0 and current_step == reset_after:
+                mx.synchronize()
+                mx.reset_peak_memory()
+
+            elapsed_total = time.perf_counter() - start_time
+            grad_text = (
+                f"Grad: {grad_norm_val:.4f} | "
+                if grad_norm_val is not None else ""
+            )
+            print(
+                f"  Step {current_step}/{total_steps} | "
+                f"Loss: {train_loss:.4f} | "
+                f"{grad_text}"
+                f"LR: {lr_val:.2e} | "
+                f"Tok/s: {tokens_sec:.0f} | "
+                f"Peak: {peak_mem:.2f} GB"
+            )
+
+            for cb in self._step_callbacks:
+                try:
+                    cb(
+                        current_step, total_steps, train_loss, lr_val,
+                        tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                        grad_norm_val,
+                    )
+                except Exception as e:
+                    print(f"Unsloth: step callback error: {e}")
+
+            logs = {
+                "loss": train_loss,
+                "learning_rate": lr_val,
+                "tokens_per_second": tokens_sec,
+                "peak_memory_gb": peak_mem,
+                "trained_tokens": trained_tokens,
+            }
+            if grad_norm_val is not None:
+                logs["grad_norm"] = grad_norm_val
+            self._call_callback_log(logs)
+
+            losses = 0
+            n_tokens = 0
+            steps = 0
+            train_time = 0
+
+        def _run_eval(current_step):
+            """Run eval and dispatch MLX/HF eval callbacks."""
+            current_eval_batches = _prepare_eval_batches()
+            if not current_eval_batches:
+                self.control.should_evaluate = False
+                return False
+            val_loss, ppl = self._evaluate(
+                current_eval_batches, loss_fn, is_vlm=is_vlm)
+            model.train()
+            print(
+                f"  Eval  {current_step}/{total_steps} | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"Perplexity: {ppl:.2f}"
+            )
+            for cb in self._eval_callbacks:
+                try:
+                    cb(current_step, val_loss, ppl)
+                except Exception as e:
+                    print(f"Unsloth: eval callback error: {e}")
+
+            self._call_callback_evaluate(self._last_eval_metrics or {})
+            self._update_callback_best_metric(self._last_eval_metrics or {})
+            return True
+
+        def _run_best_tracking(current_step):
+            """Update MLX native best-model and early-stopping state."""
+            _track = getattr(args, "load_best_model_at_end", False) or \
+                int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+            if not _track:
+                return
+            _metric_name = self._metric_for_best_model_name(
+                self._last_eval_metrics or {},
+                require=True,
+            )
+            if _metric_name is None:
+                raise ValueError(
+                    "metric_for_best_model must be set when best-model "
+                    "tracking or early stopping is enabled."
+                )
+            _em = self._last_eval_metrics or {}
+            _cur = _em[_metric_name]
+            _greater = bool(getattr(args, "greater_is_better", False))
+            _improved = (
+                _cur == _cur
+                and (
+                    self._best_metric is None
+                    or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                )
+            )
+            if _improved:
+                self._best_metric = _cur
+                self._best_step = current_step
+                self.state.best_metric = _cur
+                self.state.best_global_step = current_step
+                self.state.best_model_checkpoint = f"{args.output_dir}/best"
+                self._es_patience_counter = 0
+                try:
+                    save_trainable_adapters(model, f"{args.output_dir}/best")
+                except ValueError as e:
+                    print(f"  Unsloth: skipped best-model save ({e})")
+            else:
+                self._es_patience_counter += 1
+                _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
+                if _pat > 0 and self._es_patience_counter >= _pat:
+                    print(
+                        f"Unsloth: early stopping at step {current_step} "
+                        f"(no {_metric_name} improvement in {_pat} evals)."
+                    )
+                    self.stop_requested = True
+
+        def _run_checkpoint(current_step):
+            """Save a step checkpoint and dispatch HF save callbacks on success."""
+            ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
+            try:
+                save_trainable_adapters(model, ckpt_dir)
+            except ValueError as e:
+                print(f"  Unsloth: skipped checkpoint ({e})")
+                self.control.should_save = False
+                return
+
+            checkpoint_complete = False
+            try:
+                save_optimizer_state(optimizer, ckpt_dir)
+                save_trainer_state(
+                    {
+                        "global_step": current_step,
+                        "train_loss_history": list(self._train_loss_history),
+                    },
+                    ckpt_dir,
+                )
+                checkpoint_complete = True
+            except Exception as e:
+                print(f"  Unsloth: checkpoint saved without resume state ({e})")
+            print(f"  Saved checkpoint to {ckpt_dir}")
+            if checkpoint_complete:
+                _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
+            self._call_callback_save()
+
+        def _run_callback_control_actions(current_step, grad_norm):
+            """Run log/eval/save actions requested by callback control flags."""
+            if self.control.should_log:
+                _run_training_log(current_step, grad_norm)
+            if self.control.should_evaluate:
+                if _run_eval(current_step):
+                    _run_best_tracking(current_step)
+            if self.control.should_save:
+                _run_checkpoint(current_step)
+
         # When resuming, start batch_idx at the resume position so
         # batches[batch_idx % len(batches)] lands on the same batch the
         # original run would have seen next.
@@ -2232,10 +2731,31 @@ class MLXTrainer:
                         f"Dataset may be shorter than the killed run consumed."
                     ) from None
 
-        for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
+        microstep = _resume_step * grad_accum
+        self._global_step = _resume_step
+        while self._global_step < total_steps:
+            it = microstep + 1
             if self.stop_requested:
                 print("Unsloth: Stop requested — ending training early.")
                 break
+
+            if _maybe_callback_epoch_begin(it):
+                if self.stop_requested:
+                    print("Unsloth: Stop requested — ending training early.")
+                    break
+
+            if accum_progress == 0:
+                self.control.should_log = False
+                self.control.should_evaluate = False
+                self.control.should_save = False
+                self.control = self.callback_handler.call_event(
+                    "on_step_begin",
+                    args, self.state, self.control,
+                )
+                self._sync_callback_stop()
+                if self.stop_requested:
+                    print("Unsloth: Stop requested — ending training early.")
+                    break
 
             tic = time.perf_counter()
 
@@ -2246,11 +2766,11 @@ class MLXTrainer:
                 batch_data = batches[batch_idx % len(batches)]
                 batch_idx += 1
 
-            do_update = (it % grad_accum == 0)
+            do_update = (accum_progress + 1 >= grad_accum)
             if do_update:
                 # Keep callable scheduler evaluation outside mx.compile. The
                 # compiled step reads the scalar LR already in optimizer state.
-                self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
+                self._set_optimizer_lr_for_step(optimizer, self._global_step)
 
             try:
                 lvalue, toks, grad_accum_state, grad_norm = step_fn(
@@ -2317,154 +2837,83 @@ class MLXTrainer:
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
+            if do_update:
+                self.control = self.callback_handler.call_event(
+                    "on_optimizer_step",
+                    args, self.state, self.control,
+                )
+                self._sync_callback_stop()
+            self.state.num_input_tokens_seen += int(toks.item())
+            if batches_per_epoch:
+                self.state.epoch = it / batches_per_epoch
             train_time += time.perf_counter() - tic
 
             # Only log/eval on actual optimizer steps
             if not do_update:
+                accum_progress += 1
+                self.control = self.callback_handler.call_event(
+                    "on_substep_end",
+                    args, self.state, self.control,
+                )
+                self._sync_callback_stop()
+                microstep = it
                 continue
 
-            self._global_step = it // grad_accum
-            current_step = self._global_step
+            current_step = self._global_step + 1
+            self._global_step = current_step
+            self.state.global_step = current_step
+            accum_progress = 0
+            self.control = self.callback_handler.call_event(
+                "on_step_end",
+                args, self.state, self.control,
+            )
+            self._sync_callback_stop()
 
             # Logging
-            if current_step % args.logging_steps == 0 or current_step == total_steps:
-                train_loss = (losses / n_tokens).item()
-                tok_count = n_tokens.item()
-                trained_tokens += tok_count
-                lr_val = optimizer.learning_rate.item()
-                tokens_sec = tok_count / train_time if train_time > 0 else 0
-                peak_mem = mx.get_peak_memory() / 1e9
-
-                self._train_loss_history.append(train_loss)
-                grad_norm_val = (
-                    float(grad_norm.item())
-                    if grad_norm is not None else None
-                )
-                if grad_norm_val is not None:
-                    self._grad_norm_history.append(grad_norm_val)
-                self._tokens_per_second_history.append(tokens_sec)
-                self._peak_memory_history.append(peak_mem)
-                self._step_times.append(train_time / steps if steps > 0 else 0)
-
-                # Benchmark hook: reset peak memory after warmup
-                reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
-                if reset_after > 0 and current_step == reset_after:
-                    mx.synchronize()
-                    mx.reset_peak_memory()
-
-                elapsed_total = time.perf_counter() - start_time
-
-                grad_text = (
-                    f"Grad: {grad_norm_val:.4f} | "
-                    if grad_norm_val is not None else ""
-                )
-                print(
-                    f"  Step {current_step}/{total_steps} | "
-                    f"Loss: {train_loss:.4f} | "
-                    f"{grad_text}"
-                    f"LR: {lr_val:.2e} | "
-                    f"Tok/s: {tokens_sec:.0f} | "
-                    f"Peak: {peak_mem:.2f} GB"
-                )
-
-                for cb in self._step_callbacks:
-                    try:
-                        cb(
-                            current_step, total_steps, train_loss, lr_val,
-                            tokens_sec, peak_mem, elapsed_total, trained_tokens,
-                            grad_norm_val,
-                        )
-                    except Exception as e:
-                        print(f"Unsloth: step callback error: {e}")
-
-                losses = 0
-                n_tokens = 0
-                steps = 0
-                train_time = 0
+            logging_steps = int(getattr(args, "logging_steps", 0) or 0)
+            should_log = (
+                (logging_steps > 0 and current_step % logging_steps == 0)
+                or current_step == total_steps
+                or self.control.should_log
+            )
+            if should_log:
+                _run_training_log(current_step, grad_norm)
 
             # Eval
-            if (eval_batches and args.eval_steps > 0
-                    and current_step % args.eval_steps == 0):
-                val_loss, ppl = self._evaluate(
-                    eval_batches, loss_fn, is_vlm=is_vlm)
-                model.train()
-                print(
-                    f"  Eval  {current_step}/{total_steps} | "
-                    f"Val Loss: {val_loss:.4f} | "
-                    f"Perplexity: {ppl:.2f}"
-                )
-                for cb in self._eval_callbacks:
-                    try:
-                        cb(current_step, val_loss, ppl)
-                    except Exception as e:
-                        print(f"Unsloth: eval callback error: {e}")
-
-                # Best-model tracking + early stopping (Item-5).
-                _track = getattr(args, "load_best_model_at_end", False) or \
-                    int(getattr(args, "early_stopping_patience", 0) or 0) > 0
-                if _track:
-                    _metric_name = getattr(args, "metric_for_best_model", "eval_loss")
-                    _em = self._last_eval_metrics or {}
-                    if _metric_name not in _em:
-                        raise ValueError(
-                            f"metric_for_best_model={_metric_name!r} not in eval "
-                            f"metrics; available: {sorted(_em)}"
-                        )
-                    _cur = _em[_metric_name]
-                    _greater = bool(getattr(args, "greater_is_better", False))
-                    _improved = (
-                        _cur == _cur  # reject NaN: a diverged eval must never become "best"
-                        and (
-                            self._best_metric is None
-                            or (_cur > self._best_metric if _greater else _cur < self._best_metric)
-                        )
+            eval_strategy = self._callback_interval_name(
+                getattr(args, "eval_strategy", "no"),
+            )
+            eval_delay = float(getattr(args, "eval_delay", 0) or 0)
+            should_eval = (
+                self.eval_dataset is not None
+                and (
+                    (
+                        eval_strategy == "steps"
+                        and args.eval_steps > 0
+                        and current_step % args.eval_steps == 0
+                        and current_step >= eval_delay
                     )
-                    if _improved:
-                        self._best_metric = _cur
-                        self._best_step = current_step
-                        self._es_patience_counter = 0
-                        try:
-                            save_trainable_adapters(model, f"{args.output_dir}/best")
-                        except ValueError as e:
-                            print(f"  Unsloth: skipped best-model save ({e})")
-                    else:
-                        self._es_patience_counter += 1
-                        _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
-                        if _pat > 0 and self._es_patience_counter >= _pat:
-                            print(
-                                f"Unsloth: early stopping at step {current_step} "
-                                f"(no {_metric_name} improvement in {_pat} evals)."
-                            )
-                            self.stop_requested = True
+                    or self.control.should_evaluate
+                )
+            )
+            if should_eval:
+                if _run_eval(current_step):
+                    _run_best_tracking(current_step)
 
             # Checkpointing
-            if args.save_steps > 0 and current_step % args.save_steps == 0:
-                ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                try:
-                    save_trainable_adapters(model, ckpt_dir)
-                except ValueError as e:
-                    print(f"  Unsloth: skipped checkpoint ({e})")
-                else:
-                    # Also write optimizer + trainer state so resume_from_checkpoint
-                    # can restore Adam moments, step counter, and loss history.
-                    # Adapter save was successful -- treat the extra writes as
-                    # best-effort: log on failure but don't undo the adapter save.
-                    checkpoint_complete = False
-                    try:
-                        save_optimizer_state(optimizer, ckpt_dir)
-                        save_trainer_state(
-                            {
-                                "global_step": current_step,
-                                "train_loss_history": list(self._train_loss_history),
-                            },
-                            ckpt_dir,
-                        )
-                        checkpoint_complete = True
-                    except Exception as e:
-                        print(f"  Unsloth: checkpoint saved without resume state ({e})")
-                    print(f"  Saved checkpoint to {ckpt_dir}")
-                    if checkpoint_complete:
-                        _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
+            should_save = (
+                (args.save_steps > 0 and current_step % args.save_steps == 0)
+                or self.control.should_save
+            )
+            if should_save:
+                _run_checkpoint(current_step)
+
+            if self.stop_requested:
+                break
+            _maybe_callback_epoch_end(it, current_step, grad_norm)
+            if self.stop_requested:
+                break
+            microstep = it
 
         total_time = time.perf_counter() - start_time
         avg_loss = (
@@ -2496,6 +2945,13 @@ class MLXTrainer:
             print(f"Unsloth: skipped final save ({e})")
         else:
             print(f"Unsloth: Saved final adapters to {args.output_dir}")
+            self._call_callback_save()
+
+        self.control = self.callback_handler.call_event(
+            "on_train_end",
+            args, self.state, self.control,
+        )
+        self._sync_callback_stop()
 
         return MLXTrainOutput({
             "train_loss": avg_loss,
