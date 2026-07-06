@@ -16,6 +16,9 @@ flash-linear-attention (fla-core)
   Location:  unsloth_zoo/_vendored/fla/
   License text + provenance: unsloth_zoo/_vendored/fla/LICENSE and
                              unsloth_zoo/_vendored/fla/MANIFEST
+                             (also embedded verbatim in the shipped module
+                             unsloth_zoo/_vendored/_licenses.py, so the license
+                             travels inside wheel installs too).
 
   Only the minimal transitive file closure required by the gated-delta-rule fast
   path is vendored (FusedRMSNormGated, chunk_gated_delta_rule and
