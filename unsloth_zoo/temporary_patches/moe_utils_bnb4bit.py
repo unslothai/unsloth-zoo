@@ -50,6 +50,9 @@ __all__ = [
     "patch_bnb4bit_quantize_convert",
     "patch_bnb4bit_quantizer_param_needs_quantization",
     "patch_bnb4bit_quantizer_process_model",
+    "patch_bnb4bit_quantizer_weight_conversions",
+    "patch_bnb4bit_model_conversion_mapping",
+    "patch_bnb4bit_dequantize_plain_params",
     "patch_transformers_weight_converter_kwargs",
     "replace_expert_params_with_bnb_params",
     "forward_moe_backend_bnb4bit",
@@ -387,11 +390,8 @@ pass
 
 # ============================================================================
 # PEFT LoRA support for stacked-MoE bnb 4-bit experts.
-# Teach peft.tuners.lora.layer.ParamWrapper to expose a Params4bit's logical
-# 3-D shape (so LoRA picks the right (E, out, in) layout) and to merge/unmerge
-# via a dequant -> add -> requant cycle (so merge_and_unload() works against
-# packed 4-bit storage). Kept here as partners to
-# replace_expert_params_with_bnb_params + patch_bnb4bit_* rather than in misc.py.
+# Expose a Params4bit's logical 3-D shape to ParamWrapper and merge/unmerge via a
+# dequant -> add -> requant cycle so merge_and_unload() works on packed 4-bit storage.
 # ============================================================================
 
 class _ParamShapeProxy:
@@ -586,12 +586,503 @@ def patch_peft_param_wrapper_merge_4bit():
 pass
 
 
+# ============================================================================
+# Prequantized checkpoint loading (transformers v5)
+# ============================================================================
+
+def _bnb4bit_expert_weight_conversions(hf_quantizer):
+    """WeightConverters for prequantized bnb 4-bit MoE expert params.
+
+    The stock quantizer registers Bnb4bitDeserialize only for params named
+    `weight`, so fused expert params (gate_up_proj/down_proj) load as raw
+    packed uint8 and their aux keys are dropped. Register equivalents here.
+    """
+    from transformers.core_model_loading import WeightConverter
+    from transformers.integrations.bitsandbytes import Bnb4bitDeserialize
+    from transformers.quantizers.quantizers_utils import get_module_from_name
+
+    class _ExpertDeserialize(Bnb4bitDeserialize):
+        def __init__(self, hf_quantizer, param_name):
+            super().__init__(hf_quantizer)
+            self.param_name = param_name
+
+        def convert(self, input_dict, model=None, full_layer_name=None, **kwargs):
+            if len(input_dict) == 1:
+                return input_dict  # no quant stats collected -> not prequantized
+            input_dict = dict(input_dict)  # avoid mutating the caller's dict
+            for key, value in list(input_dict.items()):
+                if isinstance(value, list):
+                    input_dict[key] = value[0]
+            weight = input_dict.pop(self.param_name)
+            module, _ = get_module_from_name(model, full_layer_name)
+            new_value = Params4bit.from_prequantized(
+                data=weight,
+                quantized_stats=input_dict,
+                requires_grad=False,
+                device=weight.device,
+                module=module,
+            )
+            # _original_shape is needed by PEFT LoRA to recover the logical 3D shape.
+            if getattr(new_value, "quant_state", None) is not None:
+                new_value._original_shape = new_value.quant_state.shape
+            module._is_hf_initialized = True
+            return {self.param_name: new_value}
+
+    converters = []
+    for pname in ("gate_up_proj", "down_proj"):
+        converters.append(
+            WeightConverter(
+                source_patterns=[
+                    f"{pname}.nested_absmax",
+                    f"{pname}.nested_quant_map",
+                    f"{pname}.quant_map",
+                    f"{pname}.absmax",
+                    f"{pname}.quant_state.bitsandbytes__nf4",
+                    f"{pname}.quant_state.bitsandbytes__fp4",
+                    pname,
+                ],
+                target_patterns=pname,
+                operations=[_ExpertDeserialize(hf_quantizer, pname)],
+            )
+        )
+    return converters
+
+
+def patch_bnb4bit_quantizer_weight_conversions():
+    """Extend get_weight_conversions so prequantized MoE expert params deserialize."""
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
+
+    original_get_weight_conversions = getattr(Bnb4BitHfQuantizer, "get_weight_conversions", None)
+    if original_get_weight_conversions is None:
+        return
+    if getattr(original_get_weight_conversions, "_unsloth_moe_patched", False):
+        return
+
+    def patched_get_weight_conversions(self):
+        conversions = original_get_weight_conversions(self)
+        if self.pre_quantized:
+            try:
+                conversions = list(conversions) + _bnb4bit_expert_weight_conversions(self)
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.info(f"Unsloth: expert weight conversions unavailable: {e}")
+        return conversions
+
+    patched_get_weight_conversions._unsloth_moe_patched = True
+    patch_function(Bnb4BitHfQuantizer, "get_weight_conversions", patched_get_weight_conversions)
+pass
+
+
+_AUX_SUFFIXES = (
+    ".nested_absmax",
+    ".nested_quant_map",
+    ".quant_map",
+    ".absmax",
+    ".quant_state.bitsandbytes__nf4",
+    ".quant_state.bitsandbytes__fp4",
+)
+
+
+def _quantstate_absmax_fp32(qs):
+    """Materialize a QuantState's absmax as flat fp32 (denesting double-quant)."""
+    if getattr(qs, "nested", False):
+        absmax = bnb.functional.dequantize_blockwise(qs.absmax, qs.state2)
+        absmax = absmax + qs.offset
+        return absmax.float()
+    return qs.absmax.float()
+
+
+def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
+    """Quantized twins of the model's per-expert MoE merge converters.
+
+    Old checkpoints store one quantized tensor per expert per projection; the
+    model's MergeModulelist converters byte-concat the packed uint8 as if bf16
+    and drop the absmax/quant_map aux keys. Each twin also collects the aux
+    keys and rebuilds one stacked Params4bit (byte concat is exact when each
+    segment fills whole quant blocks; otherwise it repacks from dequantized
+    values to keep block boundaries aligned). Twins must be PREPENDED to
+    win the first-match scan; bare-weight patterns are `$`-anchored so they do
+    not shadow the model converter in pattern_to_converter.
+    """
+    from transformers.core_model_loading import WeightConverter, ConversionOps
+    from transformers.quantizers.quantizers_utils import get_module_from_name
+    from bitsandbytes.functional import QuantState
+    from copy import deepcopy
+
+    class _PerExpertStackDeserialize(ConversionOps):
+        def __init__(self, base_sources, anchored_sources, original_ops):
+            self.base_sources = base_sources          # e.g. ["mlp.experts.*.gate_proj.weight", ...]
+            self.anchored_sources = anchored_sources  # same, "$"-anchored (collection keys)
+            self.original_ops = original_ops          # model's ops, for unquantized fallback
+
+        def convert(self, input_dict, model=None, full_layer_name=None,
+                    target_patterns=None, missing_keys=None, config=None, **kwargs):
+            has_aux = any(
+                (base + suf) in input_dict
+                for base in self.base_sources
+                for suf in _AUX_SUFFIXES
+            )
+            if not has_aux:
+                # Unquantized experts in this layer (e.g. dynamic-quant skip layers):
+                # replicate the model's own merge exactly.
+                out = {
+                    orig: input_dict[anch]
+                    for orig, anch in zip(self.base_sources, self.anchored_sources)
+                    if anch in input_dict
+                }
+                for op in self.original_ops:
+                    out = op.convert(
+                        out,
+                        source_patterns=self.base_sources,
+                        target_patterns=target_patterns,
+                        full_layer_name=full_layer_name,
+                        model=model,
+                        config=config,
+                        missing_keys=missing_keys,
+                    )
+                return out
+
+            input_dict = dict(input_dict)  # avoid mutating the caller's dict
+            for key, value in list(input_dict.items()):
+                if not isinstance(value, list):
+                    input_dict[key] = [value]
+
+            # Only keep sources actually present; guard against missing/mismatched keys.
+            present_sources = [
+                (base, anch)
+                for base, anch in zip(self.base_sources, self.anchored_sources)
+                if anch in input_dict
+            ]
+            if not present_sources:
+                raise ValueError(
+                    f"Unsloth: no expert weights found in input_dict for {full_layer_name}"
+                )
+
+            counts = {len(input_dict[anch]) for _, anch in present_sources}
+            if len(counts) != 1:
+                raise ValueError(
+                    f"Unsloth: inconsistent per-expert tensor counts {counts} for {full_layer_name}"
+                )
+            num_experts = counts.pop()
+
+            device = input_dict[present_sources[0][1]][0].device
+            first_qs = None
+            src_shapes = []
+            per_src_absmax = []  # [src][expert] fp32 absmax
+            per_src_qs = []      # [src][expert] QuantState (for the misaligned fallback)
+            for base, anch in present_sources:
+                absmax_list, qs_list = [], []
+                for e in range(num_experts):
+                    qd = {}
+                    for suf in _AUX_SUFFIXES:
+                        vals = input_dict.get(base + suf)
+                        if vals is not None and e < len(vals):
+                            qd["weight" + suf] = vals[e]
+                    qs = QuantState.from_dict(qs_dict=qd, device=device)
+                    if first_qs is None:
+                        first_qs = qs
+                    if e == 0:
+                        src_shapes.append(tuple(qs.shape))
+                    absmax_list.append(_quantstate_absmax_fp32(qs))
+                    qs_list.append(qs)
+                per_src_absmax.append(absmax_list)
+                per_src_qs.append(qs_list)
+
+            out_dim = sum(s[0] for s in src_shapes)
+            in_dim = src_shapes[0][1]
+            if any(s[1] != in_dim for s in src_shapes):
+                raise ValueError(f"Unsloth: mismatched expert in_dims {src_shapes} for {full_layer_name}")
+
+            blocksize = first_qs.blocksize
+            if any((s[0] * s[1]) % blocksize != 0 for s in src_shapes):
+                # A segment ends mid-block, so raw byte/absmax concatenation would
+                # scale everything after it with the wrong absmax. Repack from
+                # dequantized values instead (exact block boundaries, tiny requant noise).
+                full = torch.stack([
+                    torch.cat([
+                        bnb.functional.dequantize_4bit(
+                            input_dict[anch][e].reshape(-1, 1), per_src_qs[i][e]
+                        )
+                        for i, (_, anch) in enumerate(present_sources)
+                    ], dim=0)
+                    for e in range(num_experts)
+                ])
+                data, quant_state = bnb.functional.quantize_4bit(
+                    full.to(device, first_qs.dtype).contiguous(),
+                    blocksize=blocksize,
+                    quant_type=first_qs.quant_type,
+                    compress_statistics=False,
+                )
+                quant_state.shape = torch.Size((num_experts, out_dim, in_dim))
+            else:
+                packed_rows, absmax_rows = [], []
+                for e in range(num_experts):
+                    packed_rows.append(torch.cat(
+                        [input_dict[anch][e].reshape(-1) for _, anch in present_sources]
+                    ))
+                    absmax_rows.append(torch.cat([per_src_absmax[i][e] for i in range(len(present_sources))]))
+                data = torch.stack(packed_rows).unsqueeze(-1)  # (E, bytes_per_expert, 1)
+                absmax = torch.cat(absmax_rows)
+
+                quant_state = QuantState(
+                    absmax=absmax,
+                    shape=torch.Size((num_experts, out_dim, in_dim)),
+                    code=first_qs.code.to(device),
+                    blocksize=blocksize,
+                    quant_type=first_qs.quant_type,
+                    dtype=first_qs.dtype,
+                )
+            new_param = torch.Tensor._make_subclass(Params4bit, data.to(device))
+            new_param.requires_grad = False
+            new_param.quant_state = quant_state
+            new_param.blocksize = quant_state.blocksize
+            new_param.compress_statistics = False
+            new_param.quant_type = quant_state.quant_type
+            new_param.quant_storage = data.dtype
+            new_param.bnb_quantized = True
+            # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param (_original_shape).
+            new_param._original_shape = torch.Size((num_experts, out_dim, in_dim))
+            module, _ = get_module_from_name(model, full_layer_name)
+            new_param.module = module
+            module._is_hf_initialized = True
+            return {target_patterns[0]: new_param}
+
+    class _FusedExpertDeserialize(ConversionOps):
+        """Quantized twin of a model's fused expert converter (e.g. a Transpose).
+
+        A fused prequantized checkpoint stores packed uint8 + aux keys that the
+        model's own converter would mangle (ops like Transpose cannot apply to
+        packed data). With aux keys, rebuild the Params4bit directly; without
+        them, replicate the model's ops so unquantized checkpoints are untouched.
+        """
+
+        def __init__(self, base_source, anchored_source, original_ops):
+            self.base_source = base_source
+            self.anchored_source = anchored_source
+            self.original_ops = original_ops
+
+        def convert(self, input_dict, model=None, full_layer_name=None,
+                    target_patterns=None, missing_keys=None, config=None, **kwargs):
+            has_aux = any((self.base_source + suf) in input_dict for suf in _AUX_SUFFIXES)
+            if not has_aux:
+                out = {self.base_source: input_dict[self.anchored_source]}
+                for op in self.original_ops:
+                    out = op.convert(
+                        out,
+                        source_patterns=[self.base_source],
+                        target_patterns=target_patterns,
+                        full_layer_name=full_layer_name,
+                        model=model,
+                        config=config,
+                        missing_keys=missing_keys,
+                    )
+                return out
+
+            input_dict = dict(input_dict)  # avoid mutating the caller's dict
+            for key, value in list(input_dict.items()):
+                if isinstance(value, list):
+                    input_dict[key] = value[0]
+            weight = input_dict.pop(self.anchored_source)
+            stats = {
+                (self.base_source + suf): input_dict[self.base_source + suf]
+                for suf in _AUX_SUFFIXES
+                if (self.base_source + suf) in input_dict
+            }
+            module, _ = get_module_from_name(model, full_layer_name)
+            new_value = Params4bit.from_prequantized(
+                data=weight,
+                quantized_stats=stats,
+                requires_grad=False,
+                device=weight.device,
+                module=module,
+            )
+            # Logical 3D shape for PEFT LoRA's ParamWrapper.get_param.
+            if getattr(new_value, "quant_state", None) is not None:
+                new_value._original_shape = new_value.quant_state.shape
+                # Orientation is baked in at quantize time (converters run before
+                # the quant op, so supported saves are always model layout). A
+                # same-rank mismatch means an unsupported checkpoint layout that a
+                # transpose op cannot fix on packed data: fail loudly here.
+                try:
+                    expected = tuple(model.get_parameter(full_layer_name).shape)
+                except Exception:
+                    expected = None
+                qshape = tuple(new_value.quant_state.shape)
+                if (
+                    expected is not None
+                    and len(expected) == len(qshape)
+                    and expected != qshape
+                ):
+                    raise ValueError(
+                        f"Unsloth: prequantized expert `{full_layer_name}` was "
+                        f"quantized with shape {qshape} but the model expects "
+                        f"{expected}. Requantize the checkpoint from weights in "
+                        f"the model layout."
+                    )
+            module._is_hf_initialized = True
+            return {target_patterns[0]: new_value}
+
+    twins = []
+    for conv in model_conversions:
+        if not isinstance(conv, WeightConverter):
+            continue
+        # Single-target only: a twin returns target_patterns[0] alone, so a
+        # many-to-many mapping would leave its remaining targets unloaded.
+        if len(conv.target_patterns) != 1:
+            continue
+        target = conv.target_patterns[0]
+        if not target.endswith(("gate_up_proj", "down_proj")):
+            continue
+        if all(s.endswith(".weight") for s in conv.source_patterns):
+            base_sources = list(conv.source_patterns)
+            anchored_sources = [s + "$" for s in base_sources]
+            aux_sources = [b + suf for b in base_sources for suf in _AUX_SUFFIXES]
+            twins.append(
+                WeightConverter(
+                    source_patterns=aux_sources + anchored_sources,
+                    target_patterns=target,
+                    operations=[
+                        _PerExpertStackDeserialize(
+                            base_sources, anchored_sources, deepcopy(conv.operations)
+                        )
+                    ],
+                )
+            )
+        elif (
+            len(conv.source_patterns) == 1
+            and conv.source_patterns[0].endswith(("gate_up_proj", "down_proj"))
+        ):
+            # Fused passthrough converter (e.g. qwen3_vl_moe's Transpose). The
+            # model converter precedes appended quantizer conversions and matching
+            # stops at the first hit, so without this twin a fused prequantized
+            # checkpoint feeds packed uint8 into the model's ops.
+            base = conv.source_patterns[0]
+            anchored = base + "$"
+            aux_sources = [base + suf for suf in _AUX_SUFFIXES]
+            twins.append(
+                WeightConverter(
+                    source_patterns=aux_sources + [anchored],
+                    target_patterns=target,
+                    operations=[
+                        _FusedExpertDeserialize(base, anchored, deepcopy(conv.operations))
+                    ],
+                )
+            )
+    return twins
+
+
+def patch_bnb4bit_model_conversion_mapping():
+    """Prepend per-expert quantized-MoE converters to the model conversion mapping."""
+    try:
+        import transformers.conversion_mapping as conversion_mapping
+        import transformers.modeling_utils as modeling_utils
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except Exception as e:
+        return raise_error("transformers.conversion_mapping", e)
+
+    original = conversion_mapping.get_model_conversion_mapping
+    if getattr(original, "_unsloth_moe_patched", False):
+        return
+
+    def patched_get_model_conversion_mapping(model, key_mapping=None, hf_quantizer=None, add_legacy=True):
+        conversions = original(model, key_mapping, hf_quantizer, add_legacy)
+        if isinstance(hf_quantizer, Bnb4BitHfQuantizer) and hf_quantizer.pre_quantized:
+            try:
+                twins = _bnb4bit_per_expert_conversions(conversions, hf_quantizer)
+                if twins:
+                    conversions = twins + conversions
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.info(f"Unsloth: per-expert bnb4bit converters unavailable: {e}")
+        return conversions
+
+    patched_get_model_conversion_mapping._unsloth_moe_patched = True
+    conversion_mapping.get_model_conversion_mapping = patched_get_model_conversion_mapping
+    if getattr(modeling_utils, "get_model_conversion_mapping", None) is original:
+        modeling_utils.get_model_conversion_mapping = patched_get_model_conversion_mapping
+pass
+
+
+def patch_bnb4bit_dequantize_plain_params():
+    """Dequantize prequantized Params4bit left on plain nn.Parameter slots.
+
+    Old checkpoints quantize small non-Linear weights too (e.g. the MoE
+    router), which under v5 live on bare nn.Parameter slots, so a packed
+    Params4bit lands where a float weight is expected. After loading,
+    dequantize any such param on a non-Linear4bit, non-experts module.
+    """
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_bnb_4bit.Bnb4BitHfQuantizer", e)
+
+    original_after_load = getattr(Bnb4BitHfQuantizer, "_process_model_after_weight_loading", None)
+    if original_after_load is None:
+        return
+    if getattr(original_after_load, "_unsloth_plain_dequant_patched", False):
+        return
+
+    def patched_after_load(self, model, **kwargs):
+        result = original_after_load(self, model, **kwargs)
+        target = result if result is not None else model
+        try:
+            _dequantize_plain_param_slots(target)
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(f"Unsloth: plain-param dequantize pass failed: {e}")
+        return result
+
+    patched_after_load._unsloth_plain_dequant_patched = True
+    patch_function(
+        Bnb4BitHfQuantizer, "_process_model_after_weight_loading", patched_after_load,
+        match_level="relaxed",
+    )
+pass
+
+
+def _is_bnb_module(module: nn.Module) -> bool:
+    """Any bitsandbytes module (Linear4bit, Embedding4bit, ...) or subclass:
+    their forwards consume quant_state, so their weights must stay quantized."""
+    return any(
+        getattr(klass, "__module__", "").startswith("bitsandbytes")
+        for klass in type(module).__mro__
+    )
+
+
+def _dequantize_plain_param_slots(model: nn.Module):
+    if not HAS_BNB:
+        return
+    for module_name, module in model.named_modules():
+        if _is_bnb_module(module) or _is_expert_module(module):
+            continue
+        for name, param in list(module.named_parameters(recurse=False)):
+            if not isinstance(param, Params4bit):
+                continue
+            quant_state = getattr(param, "quant_state", None)
+            if quant_state is None:
+                continue
+            dequant = bnb.functional.dequantize_4bit(param.data, quant_state)
+            setattr(module, name, nn.Parameter(dequant, requires_grad=param.requires_grad))
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(
+                    f"Unsloth: dequantized non-Linear 4-bit param {module_name}.{name} "
+                    f"to {tuple(dequant.shape)} {dequant.dtype}"
+                )
+pass
+
+
 def _register_transformers_v5_moe_bnb4bit_patches():
     if not is_transformers_v5_moe_quantization_available():
         return
     TEMPORARY_PATCHES.append(patch_bnb4bit_quantize_convert)
     TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_param_needs_quantization)
     TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_process_model)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_weight_conversions)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_model_conversion_mapping)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_dequantize_plain_params)
     TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_merge_4bit)
