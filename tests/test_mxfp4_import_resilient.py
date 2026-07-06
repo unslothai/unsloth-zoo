@@ -23,8 +23,14 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 
 def test_convert_moe_packed_tensors_survives_missing_cpu_variant():
+    # The mxfp4 integration only exists from transformers ~4.55 (GPT-OSS); on the older
+    # transformers unsloth_zoo still supports (pin floor 4.51.3) the module is absent, so the
+    # subprocess import below would error rather than exercise the resilience. Skip cleanly there.
+    pytest.importorskip("transformers.integrations.mxfp4")
     # Fresh process WITHOUT importing unsloth first, so convert_moe_packed_tensors_cpu is not
     # injected: this is exactly the stock-transformers case the combined import broke.
     code = textwrap.dedent(
