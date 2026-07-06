@@ -199,7 +199,13 @@ def _moe_recompute_default() -> bool:
     the pin is momentary and cheap; otherwise recompute (return True), so a
     non-checkpointed forward does not hold every layer's dense stack across the whole
     backward. UNSLOTH_MOE_RECOMPUTE overrides it: "1" forces recompute (max memory
-    saving), "0" forces pinning (max speed for memory-rich runs)."""
+    saving), "0" forces pinning (max speed for memory-rich runs).
+
+    The GC branch reads a thread-local; under torch.compile of the MoE forward that
+    read can be traced away and frozen at the first trace, so the adaptive choice may
+    not re-evaluate per GC pass. That only trades memory for speed (pin and recompute
+    are dX-identical), never correctness, and the grouped GEMM path generally runs
+    eager anyway; set UNSLOTH_MOE_RECOMPUTE explicitly to pin the choice if needed."""
     override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
     if override == "1":
         return True
