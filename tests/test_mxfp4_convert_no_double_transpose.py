@@ -38,6 +38,8 @@ import sys
 import tempfile
 import textwrap
 
+import pytest
+
 
 _RUNNER = textwrap.dedent(
     """
@@ -91,6 +93,10 @@ def _run(mode, outfile):
 
 
 def test_mxfp4_export_layout_matches_with_and_without_cpu_variant():
+    # transformers.integrations.mxfp4 only exists from ~4.55 (GPT-OSS); on the older
+    # transformers unsloth_zoo still supports (pin floor 4.51.3) the subprocess converter
+    # below cannot run, so skip cleanly rather than error.
+    pytest.importorskip("transformers.integrations.mxfp4")
     import torch
     with tempfile.TemporaryDirectory() as d:
         stock = os.path.join(d, "stock.pt")
