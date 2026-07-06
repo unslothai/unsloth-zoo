@@ -2022,6 +2022,16 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                     continue
 
+                # Refuse DoRA on packed MoE experts BEFORE the dequant below. GPT-OSS
+                # gate_up_proj/down_proj experts take this packed path (not the dense
+                # _merge_moe_*_expert helpers), and for a use_dora adapter the dequant +
+                # _merge_lora would otherwise fail with an opaque 3D shape error instead of
+                # the clear refuse. Mirrors the dense helpers' guard; the late call below is
+                # now unreachable for DoRA but kept as a defensive backstop.
+                _mxfp4_lora_stats = converted_lora_weights.get(base_name, None)
+                if _mxfp4_lora_stats is not None and getattr(_mxfp4_lora_stats, "lora_A", None) is not None:
+                    _refuse_dora_on_moe(_mxfp4_lora_stats)
+
                 blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
                 # Free the allocator before the large dequant alloc.
