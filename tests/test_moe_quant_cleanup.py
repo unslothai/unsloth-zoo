@@ -85,16 +85,25 @@ def test_peft_bnb4bit_moe_patches_live_in_moe_utils_bnb4bit():
 
 def test_temporary_patches_register_expected_count():
     """Phase 3 must NOT silently drop a TEMPORARY_PATCHES.append entry.
-    moe_utils_bnb4bit now registers 3 more patches than before."""
+    moe_utils_bnb4bit now registers 9 patches."""
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit
     import inspect
 
     src = inspect.getsource(moe_utils_bnb4bit)
     # Count is sticky to the file; if Phase 3 forgets the .append, we drop one.
+    # 9 = 4 original bnb4bit patches (patch_bnb4bit_quantize_convert,
+    #   patch_bnb4bit_quantizer_param_needs_quantization,
+    #   patch_bnb4bit_quantizer_process_model, patch_transformers_weight_converter_kwargs)
+    #   + the 2 PEFT MoE patches relocated from misc.py
+    #   (patch_peft_param_wrapper_4bit_expert_shape, patch_peft_param_wrapper_merge_4bit)
+    #   + the 3 v5 prequantized-checkpoint loaders added by #856
+    #   (patch_bnb4bit_quantizer_weight_conversions,
+    #   patch_bnb4bit_model_conversion_mapping, patch_bnb4bit_dequantize_plain_params).
     count = src.count("TEMPORARY_PATCHES.append(")
-    assert count == 6, (
-        f"moe_utils_bnb4bit registers {count} patches; expected 6 "
-        "(4 original bnb4bit patches + the 2 PEFT MoE patches relocated from misc.py)."
+    assert count == 9, (
+        f"moe_utils_bnb4bit registers {count} patches; expected 9 "
+        "(4 original bnb4bit patches + the 2 PEFT MoE patches relocated from misc.py "
+        "+ the 3 transformers v5 prequantized bnb 4-bit MoE checkpoint loaders from #856)."
     )
 
 

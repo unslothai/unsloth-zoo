@@ -168,8 +168,15 @@ def test_dora_on_mxfp4_packed_moe_is_refused(monkeypatch, tmp_path):
     # Patch the heavy mxfp4 machinery; only the DoRA-refuse behavior is under test.
     monkeypatch.setattr(su, "_convert_lora_keys_to_safetensor_format",
                         lambda lw, keys, model_class_name=None: lw)
-    monkeypatch.setattr(su, "convert_moe_packed_tensors",
-                        lambda b, s, rows_per_chunk=None: torch.randn(E, 2 * I, H))
+    # _merge_and_overwrite_lora_mxfp4 re-imports convert_moe_packed_tensors fresh from
+    # transformers.integrations.mxfp4 (so a runtime Unsloth patch is picked up), so stub it
+    # there, not just on the saving_utils module, otherwise the real converter runs on this
+    # deliberately-minimal packed group and asserts on the block/scale shapes before the
+    # DoRA guard is reached.
+    _stub_convert = lambda b, s, rows_per_chunk=None: torch.randn(E, 2 * I, H)
+    monkeypatch.setattr(su, "convert_moe_packed_tensors", _stub_convert)
+    from transformers.integrations import mxfp4 as _mxfp4_mod
+    monkeypatch.setattr(_mxfp4_mod, "convert_moe_packed_tensors", _stub_convert)
     monkeypatch.setattr(su, "_choose_mxfp4_processing_strategy",
                         lambda b, s: ("cuda", 0, 1024))
 
