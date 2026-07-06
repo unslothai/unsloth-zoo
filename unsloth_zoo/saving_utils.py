@@ -243,6 +243,19 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         W = W_new.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
     else:
         W = W.addmm_(lora_B, lora_A, alpha=lora_stats.alpha)
+    # DoRA: rescale the merged direction to the learned magnitude. With delta = alpha*(B@A),
+    # PEFT's DoRA merge is (m / ||W0 + delta||_row) * (W0 + delta), one L2 norm per output row
+    # over the input dim. W already holds W0 + delta here, so fold m onto it.
+    magnitude = getattr(lora_stats, "magnitude", None)
+    if magnitude is not None:
+        magnitude = magnitude.to(device, dtype = torch.float32, non_blocking = True).reshape(-1)
+        if magnitude.shape[0] != W.shape[0]:
+            raise ValueError(
+                f"Unsloth: DoRA magnitude for `{name}` has {magnitude.shape[0]} entries but the "
+                f"merged weight has {W.shape[0]} output rows."
+            )
+        weight_norm = torch.linalg.norm(W, dim = 1).clamp_min(1e-9)
+        W = (magnitude / weight_norm).unsqueeze(1) * W
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
     return W
@@ -332,6 +345,7 @@ class LoraStats:
     lora_A : torch.Tensor
     lora_B : torch.Tensor
     alpha  : float
+    magnitude : object = None   # DoRA lora_magnitude_vector weight (None for plain LoRA)
 pass
 
 
@@ -344,13 +358,15 @@ def assert_same_keys(model, new_state_dict):
 
     def _should_ignore(key: str) -> bool:
         # Ignore helper wrappers and raw LoRA adapter tensors; the merged
-        # state_dict intentionally omits lora_A / lora_B weights.
+        # state_dict intentionally omits lora_A / lora_B / DoRA magnitude weights
+        # (the magnitude is folded into the merged weight in _merge_lora).
         return (
             "modules_to_save" in key
             or "original_module" in key
             or ".lora_A" in key
             or ".lora_B" in key
             or ".lora_embedding" in key
+            or ".lora_magnitude_vector" in key
         )
 
     def _normalize(key: str) -> str:
@@ -440,6 +456,12 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_B_count += 1
             expand_module_keys(name, module, remove_keys)
 
+        elif name.endswith(".lora_magnitude_vector.default"):
+            # DoRA magnitude vector m; folded onto the merged weight in _merge_lora. Register its
+            # key so the key-consistency check does not flag it (the merged model omits it).
+            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = module.weight
+            expand_module_keys(name, module, remove_keys)
+
         elif isinstance(module, Linear_LoRA_Layers):
             lora_weights[name].alpha = _get_lora_scaling(module)
             scaling_count += 1
@@ -504,6 +526,26 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             and _stats.module is None
         ):
             module_count += 1
+
+    # DoRA on a non-dense target (e.g. an Embedding / tied lm_head trained with
+    # use_dora=True) captures a lora_magnitude_vector but no mergeable lora_A/lora_B
+    # (PEFT stores the embedding delta as lora_embedding_A/lora_embedding_B, which
+    # this merge does not read). _merge_lora only folds the magnitude onto W0+delta
+    # for a dense nn.Linear; here it would early-return the base weight and the
+    # magnitude (and the embedding delta) would be silently dropped -- and since
+    # assert_same_keys now ignores lora_magnitude_vector keys, that wrong merge would
+    # not even trip the key check. Fail loud instead (matches _refuse_dora_on_moe).
+    for _key, _stats in lora_weights.items():
+        if getattr(_stats, "magnitude", None) is not None and (
+            _stats.lora_A is None or _stats.lora_B is None
+        ):
+            raise RuntimeError(
+                f"Unsloth: DoRA (use_dora=True) merging is not yet supported for `{_key}` "
+                "(a non-Linear target such as an embedding / tied lm_head has a DoRA "
+                "magnitude but no mergeable LoRA delta, so the magnitude would be silently "
+                "dropped). Fine-tune such layers without DoRA, or open an issue at "
+                "https://github.com/unslothai/unsloth/issues."
+            )
 
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
@@ -1200,10 +1242,24 @@ def _detect_moe_lora_layout(lora_A, lora_B, num_experts, out_dim, in_dim, lora_m
     return "unknown", r
 
 
+def _refuse_dora_on_moe(lora_stats):
+    """DoRA on MoE experts is not yet supported: the expert merge helpers fold only the LoRA
+    delta, not the DoRA magnitude (the dense path handles it in _merge_lora). Fail loud rather
+    than emit a checkpoint with the magnitude silently dropped."""
+    if getattr(lora_stats, "magnitude", None) is not None:
+        raise RuntimeError(
+            "Unsloth: DoRA (use_dora=True) merging is not yet supported for MoE expert layers. "
+            "Fine-tune only the non-expert (attention/MLP) layers with DoRA, or open an issue at "
+            "https://github.com/unslothai/unsloth/issues."
+        )
+pass
+
+
 def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_dtype, *, role):
     """Per-expert merge for gate_proj/up_proj (role='gate' -> first I, 'up' -> last I)."""
     if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
         return W
+    _refuse_dora_on_moe(lora_stats)
     _MOE_MERGE_STATE["attempted"] += 1
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
@@ -1287,6 +1343,7 @@ pass
 def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, output_dtype):
     if lora_stats is None or lora_stats.lora_A is None or lora_stats.lora_B is None:
         return down_W
+    _refuse_dora_on_moe(lora_stats)
     _MOE_MERGE_STATE["attempted"] += 1
     try:
         num_experts = _resolve_num_experts_from_lora_stats(lora_stats, num_experts)
@@ -1688,6 +1745,7 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
       - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
     """
+    _refuse_dora_on_moe(lora_stats)
     _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
@@ -1771,6 +1829,7 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
       - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
     is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
     """
+    _refuse_dora_on_moe(lora_stats)
     _MOE_MERGE_STATE["attempted"] += 1
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
@@ -1930,6 +1989,11 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
                 lora_stats = converted_lora_weights.get(base_name, None)
                 if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                    # Packed MoE experts (GPT-OSS gate_up_proj/down_proj) take this path, not the
+                    # dense _merge_moe_*_expert helpers, so mirror their DoRA guard here. Otherwise a
+                    # use_dora adapter on the experts bypasses the refuse and _merge_lora fails with an
+                    # opaque shape error on the 3D expert group instead of the clear message.
+                    _refuse_dora_on_moe(lora_stats)
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
