@@ -50,6 +50,14 @@ def test_decision_matrix_patch_and_version():
     assert _mxfp4_base_returns_transposed(None, "4.57.0") is True
     assert _mxfp4_base_returns_transposed(None, "4.57.6") is True
 
+    # 4.56.0 pre-releases (dev/rc) already carry the self-transpose, so they must be
+    # treated like the final 4.56.0 (not sorted below it, which would double-transpose).
+    assert _mxfp4_base_returns_transposed(None, "4.56.0.dev0") is True
+    assert _mxfp4_base_returns_transposed(None, "4.56.0.dev20250801") is True
+    assert _mxfp4_base_returns_transposed(None, "4.56.0rc1") is True
+    # A 4.55 dev pre-release still predates the transpose move -> external transpose.
+    assert _mxfp4_base_returns_transposed(None, "4.55.4.dev0") is False
+
 
 def test_unparseable_version_defaults_to_modern_stock():
     # None / garbage version must not crash; assume modern stock (self-transposes).

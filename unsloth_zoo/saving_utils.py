@@ -1836,7 +1836,11 @@ def _mxfp4_base_returns_transposed(convert_cpu_variant, transformers_version):
     if convert_cpu_variant is not None:
         return False
     try:
-        return Version(transformers_version) >= Version("4.56.0")
+        # Compare on the release tuple so 4.56.0 pre-releases (4.56.0.dev*, 4.56.0rc*)
+        # are treated like the final 4.56.0, which self-transposes -- a plain
+        # Version(...) >= Version("4.56.0") sorts every pre-release BELOW 4.56.0 and
+        # would wrongly re-apply the external transpose (double-transpose) on them.
+        return Version(transformers_version).release >= (4, 56, 0)
     except Exception:
         # Version unparseable: assume the modern stock behaviour (self-transposes).
         return True
