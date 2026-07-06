@@ -14,27 +14,16 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+"""Vendored third-party components bundled with Unsloth Zoo.
 
-from .common import *
-from .fla_vendor import *
-from .gemma import *
-from .misc import *
-from .gemma3n import *
-from .gemma4 import *
-from .gpt_oss import *
-from .qwen3_moe import *
-from .qwen3_vl_moe import *
-from .qwen3_next_moe import *
-from .qwen3_5_moe import *
-from .glm4_moe import *
-from .deepseek_v3_moe import *
-from .gemma4_moe import *
-from .lfm2_moe import *
-from .ernie4_5_moe import *
-from .pixtral import *
-from .ministral import *
-from .mxfp4 import *
-from .bitsandbytes import *
-from .moe_utils_bnb4bit import *
-from .moe_utils_fp8 import *
-from .flex_attention_bwd import *
+Each subpackage keeps its own upstream LICENSE and a MANIFEST recording the
+source project, pinned version, tag, upstream URL and the exported API. See the
+repo-root NOTICE for the summary list. These components are shipped verbatim
+(only their package __init__ exports are narrowed) so Unsloth can offer the fast
+kernel paths without requiring an extra `pip install`.
+
+Currently vendored:
+  * fla  -  flash-linear-attention (fla-core) 0.5.1, MIT. The minimal
+            gated-delta-rule kernel closure used by the Qwen3.5 / Qwen3.6 /
+            Qwen3-Next gated-deltanet models.
+"""
