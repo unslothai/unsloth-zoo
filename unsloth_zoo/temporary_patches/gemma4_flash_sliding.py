@@ -73,10 +73,16 @@ def _enabled():
     return os.environ.get("UNSLOTH_GEMMA4_FLASH_SLIDING", "1") != "0"
 
 
+@functools.lru_cache(maxsize=1)
 def _force_banded():
-    # Optional override: force the pure-SDPA banded kernel even when flash-attn is
-    # importable. The router already prefers FA2 automatically, so this is only for
-    # benchmarking or working around a flash-attn issue; off by default.
+    """Optional override: force the pure-SDPA banded kernel even when flash-attn is
+    importable. The router already prefers FA2 automatically, so this is only for
+    benchmarking or working around a flash-attn issue; off by default.
+
+    Cached with maxsize=1 since the env var is read once per process. Any code or
+    test that toggles UNSLOTH_BANDED_SDPA at runtime must call
+    _force_banded.cache_clear() afterwards for the change to take effect.
+    """
     return os.environ.get("UNSLOTH_BANDED_SDPA", "0") == "1"
 
 
