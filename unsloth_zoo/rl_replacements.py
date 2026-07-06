@@ -785,10 +785,10 @@ def grpo_accumulated_loss(
 
     # Pop from kwargs to avoid downstream issues.
     _ = kwargs.pop("sampling_per_token_logps", None)
-    kwargs["vllm_importance_sampling_cap"] = trainer.args.vllm_importance_sampling_cap if hasattr(trainer.args, "vllm_importance_sampling_cap") is not None else None
-    kwargs["vllm_importance_sampling_mode"] = trainer.args.vllm_importance_sampling_mode if hasattr(trainer.args, "vllm_importance_sampling_mode") is not None else None
-    kwargs["vllm_importance_sampling_clip_min"] = trainer.args.vllm_importance_sampling_clip_min if hasattr(trainer.args, "vllm_importance_sampling_clip_min") is not None else None
-    kwargs["vllm_importance_sampling_clip_max"] = trainer.args.vllm_importance_sampling_clip_max if hasattr(trainer.args, "vllm_importance_sampling_clip_max") is not None else None
+    kwargs["vllm_importance_sampling_cap"] = getattr(trainer.args, "vllm_importance_sampling_cap", None)
+    kwargs["vllm_importance_sampling_mode"] = getattr(trainer.args, "vllm_importance_sampling_mode", None)
+    kwargs["vllm_importance_sampling_clip_min"] = getattr(trainer.args, "vllm_importance_sampling_clip_min", None)
+    kwargs["vllm_importance_sampling_clip_max"] = getattr(trainer.args, "vllm_importance_sampling_clip_max", None)
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
     kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None
     kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None
