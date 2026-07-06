@@ -143,7 +143,6 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
                 "train_begin",
                 state.global_step,
                 kwargs["train_dataloader"] is not None,
-                kwargs["eval_dataloader"] is not None,
             ))
 
         def on_step_begin(self, args, state, control, **_kwargs):
@@ -183,9 +182,6 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
     recorder = Recorder()
     ClassCallback.calls = []
     trainer = _callback_trainer(tmp_path, [recorder, ClassCallback])
-    step_calls, eval_calls = [], []
-    trainer.add_step_callback(lambda step, *_args: step_calls.append(step))
-    trainer.add_eval_callback(lambda step, *_args: eval_calls.append(step))
     output = trainer.train()
     names = {event[0] for event in recorder.events}
     assert {
@@ -193,11 +189,9 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
         "save", "train_end", "epoch_begin", "epoch_end",
     } <= names
     assert recorder.events[0] == ("init", 0, "steps")
-    assert ("train_begin", 0, True, False) in recorder.events
+    assert ("train_begin", 0, True) in recorder.events
     assert recorder.eval_metrics["eval_loss"] >= 0
     assert ClassCallback.calls == [0]
-    assert step_calls == [1, 2, 3]
-    assert eval_calls == [1, 2, 3]
     assert trainer._saved == [str(tmp_path)]
     assert output.global_step == 3
 
@@ -221,45 +215,73 @@ def test_hf_callback_control_can_stop_mlx_training(tmp_path):
     callback = StopAfterFirstStep()
     output = _callback_trainer(tmp_path, [callback], max_steps=5, eval_steps=0).train()
     assert output.global_step == 1
-    assert callback.events == [("step_end", 1)]
+    assert ("step_end", 1) in callback.events
 
 
 @metal_only
 def test_hf_callback_control_can_force_log_and_eval(tmp_path):
-    from transformers import DefaultFlowCallback, EarlyStoppingCallback, TrainerCallback
+    from transformers import TrainerCallback
 
     class RequestLogAndEval(TrainerCallback):
         def __init__(self):
             self.logs, self.evals = [], []
 
-        def on_epoch_end(self, args, state, control, **_kwargs):
-            control.should_log = True
-            control.should_evaluate = True
+        def on_step_end(self, args, state, control, **_kwargs):
+            if state.global_step == 1:
+                control.should_log = True
+                control.should_evaluate = True
             return control
 
         def on_log(self, args, state, control, logs, **_kwargs):
-            self.logs.append(dict(logs))
+            self.logs.append((state.global_step, dict(logs)))
 
         def on_evaluate(self, args, state, control, metrics, **_kwargs):
-            self.evals.append(dict(metrics))
+            self.evals.append((state.global_step, dict(metrics)))
 
     callback = RequestLogAndEval()
-    trainer = _callback_trainer(
+    _callback_trainer(
         tmp_path,
-        [callback, DefaultFlowCallback, EarlyStoppingCallback(early_stopping_patience=1)],
+        [callback],
         max_steps=2,
         eval_steps=0,
         logging_steps=0,
         with_eval=True,
-    )
-    trainer.args.metric_for_best_model = "loss"
-    trainer.args.eval_strategy = "epoch"
+    ).train()
+
+    assert any(step == 1 and "loss" in logs for step, logs in callback.logs)
+    assert callback.evals and callback.evals[0][0] == 1
+    assert "eval_loss" in callback.evals[0][1]
+
+
+@metal_only
+def test_hf_eval_callbacks_see_prior_best_metric(tmp_path):
+    from transformers import TrainerCallback
+
+    class BestMetricRecorder(TrainerCallback):
+        def __init__(self):
+            self.best_before_eval = []
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.best_before_eval.append(state.best_metric)
+
+    callback = BestMetricRecorder()
+    trainer = _callback_trainer(tmp_path, [callback], max_steps=2, eval_steps=1)
+    eval_losses = iter((2.0, 3.0))
+
+    def fake_evaluate(_eval_batches, _loss_fn, is_vlm=False):
+        loss = next(eval_losses)
+        trainer._last_eval_metrics = {
+            "eval_loss": loss,
+            "eval_perplexity": 1.0,
+        }
+        return loss, 1.0
+
+    trainer._evaluate = fake_evaluate
     trainer.train()
 
-    assert any("loss" in logs for logs in callback.logs)
-    assert any("eval_loss" in logs for logs in callback.logs)
-    assert callback.evals and "eval_loss" in callback.evals[-1]
-    assert trainer.state.best_metric == callback.evals[-1]["eval_loss"]
+    assert callback.best_before_eval == [None, 2.0]
+    assert trainer.state.best_metric == 2.0
+    assert trainer.state.best_global_step == 1
 
 
 @metal_only

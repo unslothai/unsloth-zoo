@@ -70,18 +70,17 @@ class MLXTrainOutput(dict):
 
 
 @dataclass
-class TrainerControl:
+class _MLXTrainerControl:
     """Torch-free subset of Hugging Face TrainerControl used by callbacks."""
 
     should_training_stop: bool = False
-    should_epoch_stop: bool = False
     should_save: bool = False
     should_evaluate: bool = False
     should_log: bool = False
 
 
 @dataclass
-class TrainerState:
+class _MLXTrainerState:
     """Torch-free subset of Hugging Face TrainerState used by callbacks."""
 
     epoch: float | None = None
@@ -832,8 +831,6 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
-    eval_strategy: str | None = None  # None = derive from eval_steps
-    eval_delay: float = 0.0
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
     greater_is_better: bool = False
@@ -1012,8 +1009,8 @@ class MLXTrainer:
             optimizer=None,
             lr_scheduler=None,
         )
-        self.state = TrainerState()
-        self.control = TrainerControl()
+        self.state = _MLXTrainerState()
+        self.control = _MLXTrainerControl()
         self.control = self.callback_handler.call_event(
             "on_init_end",
             self.args, self.state, self.control,
@@ -1071,13 +1068,6 @@ class MLXTrainer:
         if not hasattr(args, "include_num_input_tokens_seen"):
             args.include_num_input_tokens_seen = False
 
-    @staticmethod
-    def _callback_interval_name(value):
-        """Normalize HF interval enum/string values for callback scheduling."""
-        value = getattr(value, "value", value)
-        value = str(value).lower()
-        return value.rsplit(".", 1)[-1]
-
     def _default_callback_eval_strategy(self):
         """Return the MLX-derived eval strategy for callback compatibility."""
         return (
@@ -1090,7 +1080,7 @@ class MLXTrainer:
         """Initialize TrainerState for HF callback lifecycle events."""
         args = self.args
         eval_steps = int(getattr(args, "eval_steps", 0) or 0)
-        self.state = TrainerState(
+        self.state = _MLXTrainerState(
             global_step=int(resume_step),
             max_steps=int(total_steps),
             logging_steps=int(getattr(args, "logging_steps", 0) or 0),
@@ -1102,7 +1092,7 @@ class MLXTrainer:
             is_local_process_zero=True,
             is_world_process_zero=True,
         )
-        self.control = TrainerControl()
+        self.control = _MLXTrainerControl()
 
     def _sync_callback_stop(self):
         """Mirror TrainerControl stop requests into MLXTrainer's loop flag."""
@@ -1171,11 +1161,8 @@ class MLXTrainer:
         return metric_name
 
     def _update_callback_best_metric(self, metrics):
-        """Update TrainerState.best_metric after on_evaluate, matching HF timing."""
-        metric_name = self._metric_for_best_model_name(
-            metrics,
-            require=False,
-        )
+        """Update TrainerState.best_metric after eval callbacks inspect prior state."""
+        metric_name = self._metric_for_best_model_name(metrics, require=False)
         if metric_name is None:
             return
         value = metrics[metric_name]
@@ -2507,7 +2494,6 @@ class MLXTrainer:
         def _run_callback_epoch_begin(epoch_value):
             """Dispatch one epoch-begin event at the requested epoch value."""
             self.state.epoch = epoch_value
-            self.control.should_epoch_stop = False
             self.control = self.callback_handler.call_event(
                 "on_epoch_begin",
                 args, self.state, self.control,
@@ -2880,19 +2866,10 @@ class MLXTrainer:
                 _run_training_log(current_step, grad_norm)
 
             # Eval
-            eval_strategy = self._callback_interval_name(
-                getattr(args, "eval_strategy", "no"),
-            )
-            eval_delay = float(getattr(args, "eval_delay", 0) or 0)
             should_eval = (
                 self.eval_dataset is not None
                 and (
-                    (
-                        eval_strategy == "steps"
-                        and args.eval_steps > 0
-                        and current_step % args.eval_steps == 0
-                        and current_step >= eval_delay
-                    )
+                    (args.eval_steps > 0 and current_step % args.eval_steps == 0)
                     or self.control.should_evaluate
                 )
             )
@@ -2908,8 +2885,6 @@ class MLXTrainer:
             if should_save:
                 _run_checkpoint(current_step)
 
-            if self.stop_requested:
-                break
             _maybe_callback_epoch_end(it, current_step, grad_norm)
             if self.stop_requested:
                 break
