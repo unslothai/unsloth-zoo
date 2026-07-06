@@ -191,7 +191,7 @@ def _base_is_recomputable(source) -> bool:
     return False
 
 
-def _moe_recompute_default() -> bool:
+def _moe_recompute_default(prefer_memory: bool = False) -> bool:
     """Pin-vs-recompute decision independent of the source weight.
 
     Adaptive by default: pin (return False) inside a gradient-checkpoint recompute
@@ -200,6 +200,13 @@ def _moe_recompute_default() -> bool:
     non-checkpointed forward does not hold every layer's dense stack across the whole
     backward. UNSLOTH_MOE_RECOMPUTE overrides it: "1" forces recompute (max memory
     saving), "0" forces pinning (max speed for memory-rich runs).
+
+    ``prefer_memory`` biases the no-override case toward recompute even inside a GC
+    recompute pass. It is set for bases whose pinned form is a large dense dequant of
+    a compressed weight (bnb 4-bit MoE experts): there the "momentary" pin still
+    materializes the full bf16 expert stack the 4-bit storage exists to avoid, which
+    can be several GiB per layer on large MoEs, so recompute is the better default
+    when the model is already memory-constrained (4-bit + gradient checkpointing).
 
     The GC branch reads a thread-local; under torch.compile of the MoE forward that
     read can be traced away and frozen at the first trace, so the adaptive choice may
@@ -211,6 +218,8 @@ def _moe_recompute_default() -> bool:
         return True
     if override == "0":
         return False
+    if prefer_memory:
+        return True
     try:
         from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
         return not in_gradient_checkpoint_recompute()
@@ -218,11 +227,32 @@ def _moe_recompute_default() -> bool:
         return True  # safe default: recompute rather than pin across a full backward
 
 
+def _source_pins_large_dequant(source) -> bool:
+    """True iff pinning this base means holding a large dense dequant of a compressed
+    weight (a frozen bnb 4-bit MoE expert). For these the pinned path materializes the
+    full bf16 expert stack, so recompute is the memory-preserving default under
+    gradient checkpointing; a plain bf16/fp16/fp32 base pins its own storage (no
+    extra dequant) and keeps the speed-oriented adaptive policy."""
+    if not (HAS_BNB and Params4bit is not None):
+        return False
+    try:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        return isinstance(param, Params4bit) and getattr(param, "quant_state", None) is not None
+    except Exception:
+        return False
+
+
 def _moe_recompute_enabled(source) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used."""
-    return _base_is_recomputable(source) and _moe_recompute_default()
+    everything else the pinned eager path is used. A bnb 4-bit base prefers recompute
+    even under gradient checkpointing so the momentary pin never holds the full bf16
+    expert dequant (see _source_pins_large_dequant)."""
+    return _base_is_recomputable(source) and _moe_recompute_default(
+        prefer_memory = _source_pins_large_dequant(source)
+    )
 
 
 class _GroupedMMRecompute(torch.autograd.Function):
