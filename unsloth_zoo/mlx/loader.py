@@ -319,10 +319,7 @@ def _materialize_mlx_vlm_config_data(local_path, config_data):
         dst = os.path.join(override_dir, name)
         if name == "config.json":
             continue
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            pass
+        _link_or_copy_path(src, dst)
     with open(os.path.join(override_dir, "config.json"), "w") as f:
         json.dump(config_data, f, indent=2)
     return override_dir
@@ -442,6 +439,32 @@ def _mlx_lm_metadata_allow_patterns():
     ]
 
 
+def _link_or_copy_path(src, dst):
+    try:
+        os.symlink(src, dst)
+        return
+    except FileExistsError:
+        return
+    except OSError:
+        pass
+
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            os.link(src, dst)
+        return
+    except FileExistsError:
+        return
+    except OSError:
+        pass
+
+    if os.path.isdir(src):
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dst)
+
+
 def _mlx_lm_snapshot_view(model_path, *, weight_files=()):
     src_root = Path(model_path).resolve()
     dst_root = Path(tempfile.mkdtemp(prefix="unsloth_mlx_dist_view_"))
@@ -463,10 +486,7 @@ def _mlx_lm_snapshot_view(model_path, *, weight_files=()):
                 continue
             src = os.path.join(root, name)
             dst = dst_dir / name
-            try:
-                os.symlink(src, dst)
-            except OSError:
-                shutil.copy2(src, dst)
+            _link_or_copy_path(src, dst)
     return dst_root
 
 
@@ -560,7 +580,13 @@ def _load_mlx_lm_distributed(
                         metadata_model_path / "model.safetensors.index.json",
                         "r",
                     ) as file:
-                        weight_index = json.load(file)["weight_map"]
+                        index_data = json.load(file)
+                        weight_index = index_data.get("weight_map")
+                        if not isinstance(weight_index, dict):
+                            raise ValueError(
+                                "Unsloth: MLX pipeline distributed loading requires a "
+                                "valid 'weight_map' in model.safetensors.index.json."
+                            )
                 except FileNotFoundError as error:
                     raise ValueError(
                         "Unsloth: MLX pipeline distributed loading requires a "
@@ -581,14 +607,9 @@ def _load_mlx_lm_distributed(
                             )
                         local_files.add(file_name)
 
-        if mode == "pipeline":
-            _download(model_name, revision=revision, allow_patterns=sorted(local_files))
-            final_model_path = _mlx_lm_snapshot_view(model_path, weight_files=local_files)
-            cleanup_final_model_path = True
-        else:
-            _download(model_name, revision=revision)
-            final_model_path = model_path
-            cleanup_final_model_path = False
+        _download(model_name, revision=revision, allow_patterns=sorted(local_files))
+        final_model_path = _mlx_lm_snapshot_view(model_path, weight_files=local_files)
+        cleanup_final_model_path = True
 
         try:
             tokenizer = load_tokenizer(
@@ -602,6 +623,7 @@ def _load_mlx_lm_distributed(
                 strict=False,
                 model_config=model_config,
             )
+            config = _config
             _apply_mlx_distributed_sharding(
                 model,
                 pipeline_group=pipeline_group,
@@ -3938,9 +3960,9 @@ class FastMLXModel:
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
             pipeline_group: Optional MLX distributed group for pipeline
-                parallel text-model inference.
+                parallel text or VLM inference.
             tensor_group: Optional MLX distributed group for tensor parallel
-                text-model inference.
+                text or VLM inference.
         """
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)

@@ -132,7 +132,11 @@ def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_
         path = Path(path)
         load_paths.append(path)
         events.append(("load", sorted(p.name for p in path.glob("*.safetensors"))))
-        return _PipelineModel(), {"model_type": "llama", "eos_token_id": 2}
+        final_load = any(path.glob("*.safetensors"))
+        return _PipelineModel(), {
+            "model_type": "llama",
+            "eos_token_id": 3 if final_load else 2,
+        }
 
     monkeypatch.setattr(mlx_lm_utils, "_download", _download)
     monkeypatch.setattr(mlx_lm_utils, "load_model", _load_model)
@@ -154,6 +158,7 @@ def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_
     assert ("download", local_shards) in events
     assert ("load", list(local_shards)) in events
     assert all(not path.exists() for path in load_paths)
+    assert config["eos_token_id"] == 3
     assert config["model_type"] == "llama"
     assert model._unsloth_mlx_distributed_parallel_mode == "pipeline"
     assert not hasattr(model, "_unsloth_mlx_distributed_snapshot_view")
