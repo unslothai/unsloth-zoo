@@ -161,16 +161,15 @@ def _manual_grouped_mm(
     return inputs.new_empty((0, weight.shape[-1]))
 
 
-# Optional recompute-in-backward for the frozen base expert GEMM. With
-# UNSLOTH_MOE_RECOMPUTE=1 the dequantized bf16 expert stack is rebuilt from the 4-bit
-# Params4bit in backward (for dX only; the base is frozen and LoRA is a separate additive
-# grouped_mm) instead of being pinned on the tape. Output is unchanged; off by default the
-# call below is the prior eager path.
+# Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
+# is rebuilt from the 4-bit Params4bit in backward (dX only; the base is frozen and
+# LoRA is a separate additive grouped_mm) instead of being pinned on the tape. Output
+# is unchanged. See _moe_recompute_enabled for the pin-vs-recompute policy.
 
 
-def _moe_recompute_enabled(source) -> bool:
-    if os.environ.get("UNSLOTH_MOE_RECOMPUTE", "0") != "1":
-        return False
+def _base_is_recomputable(source) -> bool:
+    """True iff the base expert weight can be rebuilt in backward (frozen and
+    grouped-mm capable). A trainable or unsupported base must use the pinned path."""
     try:
         if not _should_use_separated_lora():          # merged LoRA folds the delta into base
             return False
@@ -190,6 +189,34 @@ def _moe_recompute_enabled(source) -> bool:
     except Exception:
         return False
     return False
+
+
+def _moe_recompute_default() -> bool:
+    """Pin-vs-recompute decision independent of the source weight.
+
+    Adaptive by default: pin (return False) inside a gradient-checkpoint recompute
+    pass, where the stack is rebuilt immediately before the layer's own backward so
+    the pin is momentary and cheap; otherwise recompute (return True), so a
+    non-checkpointed forward does not hold every layer's dense stack across the whole
+    backward. UNSLOTH_MOE_RECOMPUTE overrides it: "1" forces recompute (max memory
+    saving), "0" forces pinning (max speed for memory-rich runs)."""
+    override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    try:
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        return not in_gradient_checkpoint_recompute()
+    except Exception:
+        return True  # safe default: recompute rather than pin across a full backward
+
+
+def _moe_recompute_enabled(source) -> bool:
+    """Whether to recompute the dequantized base stack in backward (True) or pin it
+    for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
+    everything else the pinned eager path is used."""
+    return _base_is_recomputable(source) and _moe_recompute_default()
 
 
 class _GroupedMMRecompute(torch.autograd.Function):
