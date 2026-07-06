@@ -1125,12 +1125,14 @@ def _diffusers_component_weights_complete(
             except (OSError, ValueError):
                 continue
             parts = rel.split("/")
-            if len(parts) < 2:
-                continue  # a ROOT-level weight is not a component
+            if len(parts) != 2:
+                continue  # only a weight AT the component root counts (not a root file nor a nested
+                # descendant such as unet/old/diffusion_pytorch_model.safetensors, which diffusers does
+                # not read and which must not mask a missing top-level unet/diffusion_pytorch_model.*)
             comp = parts[0]
             if declared is not None and comp not in declared:
                 continue  # an UNDECLARED subtree the load does not read
-            if any(_CHECKPOINT_DIR_RE.match(p) for p in parts[:-1]):
+            if _CHECKPOINT_DIR_RE.match(comp):
                 continue  # a training-checkpoint subtree, not a component
             if variant_weight_re is not None and variant_weight_re.match(name):
                 per_comp_variant.setdefault(comp, []).append(rel)
@@ -1441,7 +1443,9 @@ def _cache_can_skip_download(
         # A sentence-transformers multi-module model reads a weight-bearing subfolder module (e.g.
         # 2_Dense) that the canonical ROOT gate does not check; a partial cache holding the root weight
         # but missing that subfolder weight would fetch it over un-killable Xet, so defer to the child.
-        if _sentence_transformers_subfolder_incomplete(snapshot_dir):
+        if _sentence_transformers_subfolder_incomplete(
+            snapshot_dir, prefer_safetensors = True, ignore_patterns = ignore_patterns, strict = True
+        ):
             return False
         # A default load probes model.safetensors before pytorch_model.bin, so a bin-only cache for a
         # repo that also publishes safetensors (unprovable locally) would fetch the safetensors over Xet.
@@ -1612,6 +1616,14 @@ def _download_result_usable(
         if not _selected_readable_weight_complete(
             snapshot_dir, allow_patterns = allow_patterns,
             ignore_patterns = ignore_patterns, variant = variant,
+        ):
+            return False
+        # A known weight-bearing sentence-transformers subfolder module (e.g. 2_Dense) missing from a
+        # stale partial the child handed back is fetched in-process over un-killable Xet; reject so it
+        # retries over HTTP. Lenient (strict=False): only a KNOWN weighted module rejects, so an unknown
+        # weightless module cannot false-reject a finished download.
+        if _sentence_transformers_subfolder_incomplete(
+            snapshot_dir, prefer_safetensors = False, ignore_patterns = ignore_patterns, strict = False
         ):
             return False
     return True

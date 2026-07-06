@@ -2236,15 +2236,55 @@ def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_
     assert xf._cache_can_skip_download(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
-    # A Dense weight in bin format also counts as present -> fast-path.
+    # A bin-only Dense subfolder DEFERS under the default safetensors-preferred gate (the load could fetch
+    # 2_Dense/model.safetensors over Xet), but fast-paths when safetensors is ignored (bin is the read format).
     snap3, blob3 = _mk_snapshot(tmp_path, "st_dense_bin")
     (snap3 / "model.safetensors").symlink_to(blob3)
+    (snap3 / "pytorch_model.bin").symlink_to(blob3)
     (snap3 / "modules.json").write_text(_modules(
         {"idx": 1, "name": "1", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}))
     (snap3 / "2_Dense").mkdir()
     (snap3 / "2_Dense" / "pytorch_model.bin").symlink_to(blob3)
     assert xf._cache_can_skip_download(
-        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    assert xf._cache_can_skip_download(
+        snap3, repo_type = "model", allow_patterns = None,
+        ignore_patterns = ["*.safetensors", "*.safetensors.index.json"]) is True
+
+
+def test_post_download_rejects_sentence_transformers_missing_known_subfolder_weight(tmp_path):
+    """POST mirrors the ST subfolder guard but leniently: a KNOWN weight-bearing module (2_Dense) missing
+    its weight is rejected so it retries over HTTP, while an UNKNOWN / custom module type with no weight
+    must NOT false-reject a finished download."""
+    def _modules(*mods):
+        return json.dumps([
+            {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+            *mods,
+        ])
+
+    # Known Dense module missing its weight -> reject.
+    snap, blob = _mk_snapshot(tmp_path, "st_post_dense_missing")
+    (snap / "model.safetensors").symlink_to(blob)
+    (snap / "modules.json").write_text(_modules(
+        {"idx": 1, "name": "1", "path": "2_Dense", "type": "sentence_transformers.models.Dense"}))
+    (snap / "2_Dense").mkdir()
+    (snap / "2_Dense" / "config.json").write_text("{}")  # config only, weight missing
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # Dense weight present -> accept.
+    (snap / "2_Dense" / "model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+    # An UNKNOWN module type (genuinely weightless custom module) with no weight must NOT be rejected POST.
+    snap2, blob2 = _mk_snapshot(tmp_path, "st_post_unknown_weightless")
+    (snap2 / "model.safetensors").symlink_to(blob2)
+    (snap2 / "modules.json").write_text(_modules(
+        {"idx": 1, "name": "1", "path": "3_Custom", "type": "my_pkg.CustomWeightless"}))
+    (snap2 / "3_Custom").mkdir()
+    (snap2 / "3_Custom" / "config.json").write_text("{}")  # no weight, unknown type
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
 def test_post_download_rejects_config_only_model(tmp_path):
@@ -3104,6 +3144,49 @@ def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
     # The canonical base weight present -> accepted.
     (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_diffusers_component_weight_must_be_at_component_root(tmp_path):
+    """A component weight counts only at the component ROOT (unet/diffusion_pytorch_model.safetensors); a
+    stale NESTED file (unet/old/diffusion_pytorch_model.safetensors) must not mask a missing top-level
+    weight, else the pipeline load fetches the real component weight over Xet."""
+    snap, blob = _mk_snapshot(tmp_path, "comp_nested_only")
+    (snap / "model_index.json").write_text(json.dumps(
+        {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
+    unet = snap / "unet"
+    unet.mkdir()
+    (unet / "config.json").write_text("{}")
+    (unet / "old").mkdir()
+    (unet / "old" / "diffusion_pytorch_model.safetensors").symlink_to(blob)  # nested, not read
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # The top-level component weight present -> accepted.
+    (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
+def test_post_download_disabled_diffusers_component_shard_index_not_rejected(tmp_path):
+    """A [null, null] disabled component (safety_checker) that the pipeline does not load must not
+    force-fail a complete pipeline: a stale incomplete shard index under it is ignored by the shard check."""
+    snap, blob = _mk_snapshot(tmp_path, "disabled_comp_stale_index")
+    (snap / "model_index.json").write_text(json.dumps({
+        "_class_name": "StableDiffusionPipeline",
+        "unet": ["diffusers", "UNet2DConditionModel"],
+        "safety_checker": [None, None],  # disabled -> not loaded
+    }))
+    unet = snap / "unet"
+    unet.mkdir()
+    (unet / "config.json").write_text("{}")
+    (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+    # safety_checker holds a stale incomplete shard index (shards absent), but it is disabled.
+    sc = snap / "safety_checker"
+    sc.mkdir()
+    (sc / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}))
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 

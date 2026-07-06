@@ -581,31 +581,47 @@ def snapshot_dir_is_complete(
     )
 
 
-# sentence-transformers ``modules.json`` module types that ship NO weight (config-only), matched on the
-# final dotted component of the "type". Any OTHER module type is treated as weight-bearing (a Dense / CNN
-# / LSTM head), so a stray / custom type conservatively requires its weight -- a false requirement only
-# spawns the cheap child, never a hang.
+# sentence-transformers ``modules.json`` module types that ship NO weight (config-only), and those that
+# DO ship a weight (a Dense / CNN / LSTM head saving model.safetensors / pytorch_model.bin), matched on
+# the final dotted component of the "type".
 _ST_WEIGHTLESS_MODULE_TYPES = frozenset({"pooling", "normalize", "layernorm", "dropout"})
+_ST_WEIGHTED_MODULE_TYPES = frozenset({"dense", "cnn", "lstm"})
 
 
-def _sentence_transformers_subfolder_incomplete(snapshot_dir: Path) -> bool:
+def _sentence_transformers_subfolder_incomplete(
+    snapshot_dir: Path, *, prefer_safetensors: bool = False,
+    ignore_patterns: "Optional[object]" = None, strict: bool = True,
+) -> bool:
     """True when a sentence-transformers ``modules.json`` declares a weight-bearing module in a SUBFOLDER
-    (e.g. ``2_Dense``) whose weight is absent. Such a subfolder weight is read by the ST load but is NOT
-    covered by the canonical ROOT weight check, so a partial cache holding the root weight yet missing the
-    subfolder weight would be fast-pathed and then fetch the missing weight over un-killable Xet. Present
-    but unreadable ``modules.json`` -> True (defer, safe); absent -> False (not an ST multi-module repo)."""
+    (e.g. ``2_Dense``) whose READABLE weight is absent. Such a subfolder weight is read by the ST load but
+    is NOT covered by the canonical ROOT weight check, so a partial cache holding the root weight yet
+    missing the subfolder weight would be fast-pathed / accepted and then fetch it over un-killable Xet.
+
+    The format preference and ignore filter are honored exactly as the root check: with *prefer_safetensors*
+    (the STRICT pre gate) a bin-only subfolder is incomplete when safetensors is the read format; the
+    lenient POST path leaves it False so a finished bin-only subfolder is accepted.
+
+    *strict* selects which modules must hold a weight. The PRE gate (strict=True) requires one for every
+    module NOT known to be weightless, so an unknown / custom type conservatively defers -- a false
+    requirement only spawns the cheap child. The POST path (strict=False) requires one only for a module
+    KNOWN to be weight-bearing (dense / cnn / lstm), so an unknown weightless module can never false-reject
+    a finished download into a ``DownloadStallError``.
+
+    Present but unreadable ``modules.json`` -> *strict* (defer PRE, do not reject a finished POST download);
+    absent -> False (not an ST multi-module repo)."""
     modules_path = snapshot_dir / "modules.json"
     if not _safe_is_file(modules_path):
         return False
     import json
 
+    ignore_patterns = _as_pattern_list(ignore_patterns)
     try:
         with open(modules_path, "r", encoding = "utf-8") as f:
             modules = json.load(f)
     except (OSError, ValueError):
-        return True  # an ST repo with an unreadable layout -> defer to the child
+        return strict  # unreadable layout: defer PRE (safe), never reject a finished download POST
     if not isinstance(modules, list):
-        return True
+        return strict
     for module in modules:
         if not isinstance(module, dict):
             continue
@@ -614,15 +630,33 @@ def _sentence_transformers_subfolder_incomplete(snapshot_dir: Path) -> bool:
             continue  # the root module (path "") -- covered by the canonical root check
         module_type = module.get("type")
         leaf = module_type.rsplit(".", 1)[-1].lower() if isinstance(module_type, str) else ""
-        if leaf in _ST_WEIGHTLESS_MODULE_TYPES:
-            continue  # a config-only module (pooling / normalize / ...) needs no weight
-        sub = snapshot_dir / path.strip("/")
+        if strict:
+            if leaf in _ST_WEIGHTLESS_MODULE_TYPES:
+                continue  # a config-only module (pooling / normalize / ...) needs no weight
+        elif leaf not in _ST_WEIGHTED_MODULE_TYPES:
+            continue  # POST rejects only a KNOWN weight-bearing module (no false-reject on unknowns)
+        path = path.strip("/")
+        sub = snapshot_dir / path
         try:
             names = {entry.name for entry in sub.iterdir()} if _safe_is_dir(sub) else set()
         except OSError:
             names = set()
-        if not ({"model.safetensors", "pytorch_model.bin"} & names):
-            return True  # a weight-bearing module subfolder missing its weight -> defer to the child
+        st_read = (not ignore_patterns) or bool(
+            _filter_paths([f"{path}/model.safetensors"], None, ignore_patterns)
+        )
+        bin_read = (not ignore_patterns) or bool(
+            _filter_paths([f"{path}/pytorch_model.bin"], None, ignore_patterns)
+        )
+        st_present = "model.safetensors" in names and st_read
+        bin_present = "pytorch_model.bin" in names and bin_read
+        if prefer_safetensors and st_read:
+            # safetensors is the read format and not ignored: a bin-only subfolder cannot prove the
+            # preferred safetensors absent remotely, so the load would fetch it over Xet -> defer.
+            if not st_present:
+                return True
+            continue
+        if not (st_present or bin_present):
+            return True  # no readable weight of the format the load reads
     return False
 
 
@@ -967,6 +1001,21 @@ def _diffusers_declared_components(snapshot_dir: Path) -> "Optional[set]":
     return set(specs) if specs else None
 
 
+def _diffusers_active_components(snapshot_dir: Path) -> "Optional[set]":
+    """The ACTIVE (loaded) component names: a declared ``[library, class]`` pair with BOTH non-null. A
+    ``[null, null]`` disabled / optional component (e.g. safety_checker) is excluded -- the pipeline does
+    not load it, so a stale incomplete shard set under it must not force-fail a complete download. None
+    when the model_index is absent / malformed (fail OPEN to every subfolder)."""
+    specs = _diffusers_declared_component_specs(snapshot_dir)
+    if not specs:
+        return None
+    return {
+        name for name, spec in specs.items()
+        if isinstance(spec, (list, tuple)) and len(spec) >= 2
+        and spec[0] is not None and spec[1] is not None
+    }
+
+
 def _diffusers_component_shards_incomplete(
     snapshot_dir: Path, *, variant: "Optional[str]" = None,
     ignore_patterns: "Optional[object]" = None,
@@ -983,7 +1032,9 @@ def _diffusers_component_shards_incomplete(
     component set passes."""
     want_variant = variant or None
     ignore_patterns = _as_pattern_list(ignore_patterns)
-    declared = _diffusers_declared_components(snapshot_dir)
+    # ACTIVE components only: a [null, null] disabled component (safety_checker) is not loaded, so a stale
+    # incomplete shard index under it must not force-fail a complete pipeline into a DownloadStallError.
+    declared = _diffusers_active_components(snapshot_dir)
     if want_variant is None:
         shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
         single_file_re = re.compile(
