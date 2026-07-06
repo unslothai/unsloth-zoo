@@ -527,6 +527,26 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
         ):
             module_count += 1
 
+    # DoRA on a non-dense target (e.g. an Embedding / tied lm_head trained with
+    # use_dora=True) captures a lora_magnitude_vector but no mergeable lora_A/lora_B
+    # (PEFT stores the embedding delta as lora_embedding_A/lora_embedding_B, which
+    # this merge does not read). _merge_lora only folds the magnitude onto W0+delta
+    # for a dense nn.Linear; here it would early-return the base weight and the
+    # magnitude (and the embedding delta) would be silently dropped -- and since
+    # assert_same_keys now ignores lora_magnitude_vector keys, that wrong merge would
+    # not even trip the key check. Fail loud instead (matches _refuse_dora_on_moe).
+    for _key, _stats in lora_weights.items():
+        if getattr(_stats, "magnitude", None) is not None and (
+            _stats.lora_A is None or _stats.lora_B is None
+        ):
+            raise RuntimeError(
+                f"Unsloth: DoRA (use_dora=True) merging is not yet supported for `{_key}` "
+                "(a non-Linear target such as an embedding / tied lm_head has a DoRA "
+                "magnitude but no mergeable LoRA delta, so the magnitude would be silently "
+                "dropped). Fine-tune such layers without DoRA, or open an issue at "
+                "https://github.com/unslothai/unsloth/issues."
+            )
+
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
             f"[Unsloth merge debug] LoRA count mismatch: modules={module_count}, "
@@ -1931,6 +1951,11 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
                 lora_stats = converted_lora_weights.get(base_name, None)
                 if lora_stats and hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
+                    # Packed MoE experts (GPT-OSS gate_up_proj/down_proj) take this path, not the
+                    # dense _merge_moe_*_expert helpers, so mirror their DoRA guard here. Otherwise a
+                    # use_dora adapter on the experts bypasses the refuse and _merge_lora fails with an
+                    # opaque shape error on the 3D expert group instead of the clear message.
+                    _refuse_dora_on_moe(lora_stats)
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
