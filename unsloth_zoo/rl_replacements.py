@@ -944,20 +944,14 @@ def grpo_accumulated_loss(
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
 
-    # --- Consolidated lazy imports + env gate for the GRPO PrefixGrouper grad path ---
-    # This function's SOURCE is inspect.getsource-copied verbatim into the generated
-    # UnslothGRPOTrainer cache, whose namespace does NOT carry unsloth_zoo's module-level
-    # imports, so these names must be bound inside the body (do NOT hoist to module scope).
-    # The unsloth.utils.prefix_grouper import must also stay lazy + guarded: unsloth imports
-    # unsloth_zoo at init (circular) and may not ship prefix_grouper at all, so a failed
-    # import degrades to "PrefixGrouper off" and never raises.
+    # PrefixGrouper grad path. This function's source is copied into the generated
+    # UnslothGRPOTrainer cache without unsloth_zoo's module imports, so bind names
+    # inside the body; the prefix_grouper import stays lazy + guarded (circular import,
+    # may be absent) and a failed import just leaves PG off.
     from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING
 
-    # One-time env gate + import, resolved once per process. Function attributes survive into
-    # the cache (the function object is rebuilt there once per module and grpo_accumulated_loss
-    # is a cache-module global), so memoize on grpo_accumulated_loss itself. The env gate is
-    # checked FIRST, so UNSLOTH_GRPO_PREFIX_GROUPER=0 never imports or runs any PG code (that path
-    # is byte-identical to before). () means gate off / unavailable / failed import -> PG stays off.
+    # Memoize env gate + import once per process on the function object (which survives
+    # into the cache). Env gate checked first so =0 never imports PG code; () = PG off.
     _pg_funcs = getattr(grpo_accumulated_loss, "_pg_funcs", None)
     if _pg_funcs is None:
         _pg_funcs = ()
@@ -978,37 +972,27 @@ def grpo_accumulated_loss(
             except Exception:
                 _pg_funcs = ()
         grpo_accumulated_loss._pg_funcs = _pg_funcs
-    # Skip PG when vLLM drives generation (fast_inference=True): the colocated rollout dominates
-    # the step, so the shared-prefix forward saves little end-to-end and its first-use self-verify
-    # (which runs the full-row path too) is net overhead. Keep the packed path instead.
+    # Skip PG under vLLM (fast_inference=True): rollout dominates the step, so the
+    # saving is small and the first-use self-verify is net overhead.
     _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False)
 
-    # ---- PrefixGrouper (GRPO shared-prompt dedup; default ON, UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
-    # In GRPO every prompt spawns G=num_generations completions that share the prompt prefix.
-    # The full-row packed path below forwards that prefix G times; PrefixGrouper stores it ONCE
-    # and concatenates only the G suffixes (FlexAttention shared-prefix mask), cutting the trunk
-    # forward from G*(P+R) to P+G*R tokens. Gated behind UNSLOTH_GRPO_PREFIX_GROUPER (requires
-    # seq-packing on). tok_r auto-gate + first-use self-verify vs the full-row packed new_logprobs
-    # (fall back + mark-unsafe on mismatch). Loss/gradients flow through the shared-prefix stream
-    # (the prefix contributes grad once = the sum of the G repeats, mathematically identical). When
-    # off / grouping fails / not yet verified, the full-row packed path below runs as before.
+    # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
+    # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
+    # (FlexAttention shared-prefix mask), cutting G*(P+R) tokens to P+G*R. First-use
+    # self-verify vs the full-row packed new_logprobs; grads flow through the shared stream
+    # (prefix grad once = sum of G repeats, identical math). Off/failed/unverified ->
+    # full-row packed path runs as before.
     _pg_result = None
     _pg_use = False
     _pg_skip_pack = False
     _pg_num_gen = getattr(trainer, "num_generations", None)
-    # Runtime gate (uses the memoized prefix_grouper callables); kept next to its use because it
-    # reads unwrapped_model.config etc. Broad except -> engage False, matching the original
-    # single import+gate try/except semantics exactly.
+    # Runtime gate; broad except -> engage False.
     if _pg_engage and _pg_funcs:
         try:
             _pg_build_layout, _pg_enabled_fn, _pg_verify_on, _pg_tol_ok, _PG_TOL_KILL = _pg_funcs
-            # the FlexAttention kernel never applies attn_logit_softcapping, so skip PG entirely
-            # for softcap models (e.g. gemma2) before building any layout. Hybrid SSM models
-            # (FalconH1 etc.) are excluded too: only attention gets the shared-prefix isolation,
-            # a Mamba branch would leak state across suffixes. MoE models (e.g. Qwen3-MoE) are
-            # excluded for the same reason: they reuse LlamaModel_fast_forward but their decoder
-            # does not thread prefix_seg_info to the attention, so the MoE branch runs plain causal
-            # attention and would leak state across suffixes.
+            # Exclusions: softcap models (gemma2) - the FlexAttention kernel skips
+            # attn_logit_softcapping; hybrid SSM (FalconH1) and MoE (Qwen3-MoE) - their
+            # decoders do not thread prefix_seg_info, so state would leak across suffixes.
             _pg_cfg = getattr(unwrapped_model, "config", None)
             _pg_engage = (
                 _pg_enabled_fn()
@@ -1039,11 +1023,10 @@ def grpo_accumulated_loss(
     if _pg_engage:
         try:
             _pg_pad_id = trainer.processing_class.pad_token_id
-            # Build the layout from the LEFT-PACKED input_ids with the ORIGINAL left-pad counts,
-            # so PrefixGrouper's prefix/suffix split matches the packed path's prompt/completion
-            # split (_pack_cstart) exactly and the verify is apples-to-apples.
-            # sliding-window models lose the per-sequence window in the packed stream, so cap the
-            # PG span (P+max(R)) at the window, mirroring the packed _pack_sw guard below.
+            # Build the layout from the left-packed input_ids with the original left-pad
+            # counts so the prefix/suffix split matches the packed path (_pack_cstart) and
+            # the verify is apples-to-apples. Cap the PG span at any sliding window,
+            # mirroring the packed _pack_sw guard.
             _pg_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
             if not (isinstance(_pg_sw, int) and _pg_sw > 0):
                 _pg_sw = None
@@ -1059,8 +1042,8 @@ def grpo_accumulated_loss(
             elif _pg_layout is not None:
                 _pg_layout.W = logits_to_keep + max_left_pad
                 _pg_verified = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
-                # trust needs the verified envelope to cover this batch's lengths too
-                # (re-verify when T or the longest segment grows, like the packed path)
+                # trust only if the verified envelope covers this batch's lengths
+                # (re-verify when T or the longest segment grows)
                 _pg_T = int(_pg_layout.flat_ids.shape[1])
                 _pg_maxseg = int(_pg_layout.position_ids.max()) + 1
                 _pg_env = (
@@ -1214,10 +1197,8 @@ def grpo_accumulated_loss(
             if UNSLOTH_ENABLE_LOGGING:
                 print(f"[Unsloth] GRPO sequence-packing disabled (fell back to padded): {_pack_err!r}", flush = True)
     # ---- PrefixGrouper resolution + first-use self-verify (grad) ----
-    # Verify (no_grad, value only) and the loss forward (grad) are DECOUPLED: the shared-prefix
-    # verify forward runs under torch.no_grad() so its inference tensors never enter autograd,
-    # then a SEPARATE grad forward builds new_logprobs for the loss. This mirrors the packed
-    # path's verify/trust model and avoids "inference tensors saved for backward".
+    # Verify runs under no_grad, then a separate grad forward builds new_logprobs,
+    # so no inference tensors are saved for backward.
     def _pg_grad_forward():
         _pg_chunks = max(1, total_rows * multiplier)
         with autocaster:
@@ -1232,23 +1213,20 @@ def grpo_accumulated_loss(
                 _pg_chunks, logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature,
             )  # [total_rows, W] with grad
-            # GPT-OSS offload race guard (matches the packed and padded paths)
+            # GPT-OSS offload race guard
             device_synchronize()
             return _pg_lp
 
     if _pg_layout is not None:
-        # A verify-phase OOM must not poison the signature. During first-use verify the full-row
-        # packed graph is still co-resident (it is the comparison reference), so an OOM there does
-        # not prove PG alone cannot fit; only an OOM in the trusted PG-alone forward below (after the
-        # packed graph is freed) is a deterministic PG-alone failure worth marking unsafe.
+        # A verify-phase OOM (packed graph co-resident) does not prove PG alone cannot fit;
+        # only an OOM after the packed graph is freed is worth marking unsafe.
         _pg_phase_verify = False
         try:
             if not _pg_trusted:
-                # first use for this structure: verify vs the full-row packed new_logprobs
-                # (itself self-verified vs per-row). PASS < tol_ok -> trust; >= TOL_KILL ->
-                # mark unsafe forever; borderline -> fall back this shape.
+                # first use: verify vs the packed new_logprobs. < tol_ok -> trust;
+                # >= TOL_KILL -> unsafe forever; borderline -> fall back this shape.
                 if _pack_use and _pack_result is not None:
-                    _pg_phase_verify = True   # packed graph co-resident until it is freed below
+                    _pg_phase_verify = True   # packed graph still co-resident
                     with torch.no_grad():
                         _pg_ref = _pg_grad_forward()
                     _pg_W2 = logits_to_keep + max_left_pad
@@ -1284,29 +1262,24 @@ def grpo_accumulated_loss(
                             _pg_u.add(_pg_layout.signature)
                             unwrapped_model._unsloth_prefix_grouper_grad_unsafe = _pg_u
                         _pg_trusted = False
-                # else: no full-row reference (packing off/failed) -> cannot verify -> fall back.
+                # else: no packed reference -> cannot verify -> fall back.
             if _pg_trusted:
-                # free the full-row packed graph BEFORE the grad forward (it was already
-                # consumed above as the verify reference). Holding both graphs here can OOM
-                # exactly when packed+PG exceed VRAM but PG alone would fit; on a PG failure
-                # the padded loop recomputes new_logprobs, so packed is no longer needed.
+                # free the packed graph BEFORE the grad forward: holding both can OOM when
+                # PG alone would fit, and on PG failure the padded loop recomputes anyway.
                 _pack_hidden = _pack_sel = _pack_result = None
-                _pg_phase_verify = False   # packed freed: an OOM below is a genuine PG-alone failure
-                _pg_result = _pg_grad_forward()   # grad forward for the loss
+                _pg_phase_verify = False   # packed freed: an OOM below is PG-alone
+                _pg_result = _pg_grad_forward()
                 _pg_use = True
         except Exception as _pg_err2:
             _pg_use = False
             os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-            # untrust this signature so the next batch runs the full-row packed path again
-            # instead of skipping it and landing on the padded loop repeatedly
+            # untrust this signature so the next batch runs the packed path again
             _pg_v = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
             if isinstance(_pg_v, dict):
                 _pg_v.pop(_pg_layout.signature, None)
             if isinstance(_pg_err2, torch.cuda.OutOfMemoryError):
-                # OOM would recur deterministically at these lengths: mark unsafe for good, but only
-                # when it happened in the PG-alone forward. A verify-phase OOM (packed graph still
-                # co-resident) does not prove PG alone cannot fit, so leave the signature off the
-                # unsafe set and just retry the full-row packed path next batch.
+                # mark unsafe only for a PG-alone OOM (deterministic at these lengths);
+                # a verify-phase OOM (packed co-resident) proves nothing, just retry.
                 if not _pg_phase_verify:
                     _pg_u = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_unsafe", None)
                     if _pg_u is None:
@@ -1318,7 +1291,7 @@ def grpo_accumulated_loss(
                 print(f"[Unsloth] GRPO PrefixGrouper (grad) forward failed -> packed/padded fallback: {_pg_err2!r}", flush = True)
 
     if _pg_use and _pg_result is not None:
-        new_logprobs = _pg_result            # PrefixGrouper verified/trusted -> skip the loop
+        new_logprobs = _pg_result            # PrefixGrouper verified -> skip the loop
         zipped_inputs = []
     elif _pack_use and _pack_result is not None:
         new_logprobs = _pack_result          # verified -> skip the loop
