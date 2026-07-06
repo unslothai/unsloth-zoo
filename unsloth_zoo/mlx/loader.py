@@ -497,6 +497,13 @@ def _load_mlx_vlm_with_extra_weight_filter(
             try:
                 with _temporary_hf_token_env(hf_token):
                     return vlm_load(model_name, **vlm_kwargs)
+            except ValueError as retry_error:
+                # Filtering the allow-listed extras can unmask an older-mlx-vlm
+                # q_norm/k_norm mismatch on the retry; surface the same actionable
+                # version-gap error as the first attempt instead of letting the raw
+                # strict-load message (the one this guard exists to replace) escape.
+                _raise_if_qk_norm_version_gap(model_type, str(retry_error), retry_error)
+                raise
             finally:
                 nn.Module.load_weights = original_load_weights
 

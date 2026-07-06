@@ -88,3 +88,33 @@ def test_non_qk_norm_mismatch_passes_through():
     _raise_if_qk_norm_version_gap(
         "llama", "some unrelated value error", ValueError("orig")
     )
+
+
+def test_vlm_retry_qk_norm_mismatch_raises_actionable_error():
+    # First strict VLM load fails on the allow-listed per_layer_model_projection
+    # extras (so the code enters the filtered retry); the retry then hits an
+    # older-mlx-vlm q_norm/k_norm mismatch, which must surface the actionable
+    # version-gap error rather than escaping as the raw strict-load ValueError.
+    from unsloth_zoo.mlx.loader import _load_mlx_vlm_with_extra_weight_filter
+
+    calls = {"n": 0}
+    first = (
+        "Received 4 parameters not in model: "
+        "language_model.model.per_layer_model_projection.scales, "
+        "language_model.model.per_layer_model_projection.biases"
+    )
+    retry = (
+        "Received 8 parameters not in model: "
+        "language_model.model.layers.15.self_attn.k_norm.weight, "
+        "language_model.model.layers.15.self_attn.q_norm.weight"
+    )
+
+    def fake_vlm_load(model_name, **kwargs):
+        calls["n"] += 1
+        raise ValueError(first if calls["n"] == 1 else retry)
+
+    with pytest.raises(ValueError) as exc:
+        _load_mlx_vlm_with_extra_weight_filter("some/model", "gemma4", fake_vlm_load, {}, hf_token=None)
+    msg = str(exc.value)
+    assert "mlx-lm" in msg and "0.31.3" in msg and "gemma4" in msg
+    assert calls["n"] == 2  # it must have entered the filtered retry
