@@ -22,7 +22,6 @@ and quantize those parameters and route the experts forward through the
 standard backend after on-the-fly dequantization.
 """
 
-import os
 from typing import Optional, List, Union
 
 import torch
@@ -135,19 +134,25 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
+        _moe_recompute_default,
     )
 
     target_dtype = hidden_states.dtype
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
-    # Fix 3: defer dequant into forward_native_grouped_mm's providers (recomputed in
-    # backward) instead of pre-dequantizing the full bf16 stack and pinning it.
+    # Defer dequant into forward_native_grouped_mm's providers instead of
+    # pre-dequantizing the full bf16 stack up front. Gated on the same adaptive
+    # pin-vs-recompute policy as the plain path (UNSLOTH_MOE_RECOMPUTE overrides it;
+    # pin inside a gradient-checkpoint recompute pass, recompute otherwise). This keeps
+    # the packed Params4bit and rebuilds the dense stack on demand; the pre-dequantize
+    # path below is only taken when the policy says pin, so we never pre-dequantize into
+    # a dense stack and then re-hold it for a backward recompute.
     if (
-        os.environ.get("UNSLOTH_MOE_RECOMPUTE", "0") == "1"
-        and select_moe_backend() == "grouped_mm"
+        select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
+        and _moe_recompute_default()
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
         return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
