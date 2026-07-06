@@ -210,9 +210,14 @@ def test_forward_is_identity_and_env_gated(monkeypatch):
     assert torch.equal(_MoEGateGradIdentity.apply(x, g), x)
 
     # On by default (memory saving); UNSLOTH_MOE_GATEGRAD=0 is the kill-switch.
+    # _moe_gategrad_enabled is lru_cache(1), so clear it after each env change.
     monkeypatch.delenv("UNSLOTH_MOE_GATEGRAD", raising=False)
+    _moe_gategrad_enabled.cache_clear()
     assert _moe_gategrad_enabled()
     monkeypatch.setenv("UNSLOTH_MOE_GATEGRAD", "0")
+    _moe_gategrad_enabled.cache_clear()
     assert not _moe_gategrad_enabled()
     monkeypatch.setenv("UNSLOTH_MOE_GATEGRAD", "1")
+    _moe_gategrad_enabled.cache_clear()
     assert _moe_gategrad_enabled()
+    _moe_gategrad_enabled.cache_clear()  # leave cache clean for later tests

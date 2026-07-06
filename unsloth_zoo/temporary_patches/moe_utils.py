@@ -1192,7 +1192,14 @@ def patch_param_wrapper_for_moe():
 # UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
 
 
+@lru_cache(maxsize=1)
 def _moe_gategrad_enabled() -> bool:
+    """Whether the MoE gate-gradient identity path is active (on by default).
+
+    Cached with maxsize=1 since UNSLOTH_MOE_GATEGRAD is read once per process. Any
+    code or test that toggles the env var at runtime must call
+    _moe_gategrad_enabled.cache_clear() afterwards for the change to take effect.
+    """
     return os.environ.get("UNSLOTH_MOE_GATEGRAD", "1") != "0"
 
 
