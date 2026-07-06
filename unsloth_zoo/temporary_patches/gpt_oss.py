@@ -913,14 +913,13 @@ class GptOssExpertsBnb4bit(nn.Module):
     def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
                                  batch_size, num_tokens, num_experts, top_k):
         """Grouped equivalent of the per-expert loop: one gather, two grouped_mm
-        calls over dequantized stacks (rebuilt in backward when
-        UNSLOTH_MOE_RECOMPUTE=1), grouped bias adds, fp32 index_add combine.
+        calls over dequantized stacks (pinned or rebuilt in backward per the adaptive
+        _moe_recompute_default policy), grouped bias adds, fp32 index_add combine.
 
         Self-contained (local imports, no module globals) for the standalone
         compiled cache; see _grouped_bnb4bit_ready."""
-        import os
         import bitsandbytes as bnb
-        from unsloth_zoo.temporary_patches.moe_utils import _base_grouped_mm
+        from unsloth_zoo.temporary_patches.moe_utils import _base_grouped_mm, _moe_recompute_default
         from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
 
         device = hidden_states.device
@@ -936,7 +935,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                 torch.arange(num_experts, device=device), counts
             )
 
-        recompute = os.environ.get("UNSLOTH_MOE_RECOMPUTE", "0") == "1"
+        recompute = _moe_recompute_default()
 
         cached = getattr(self, "_unsloth_grouped_qs", None)
         if cached is None:
