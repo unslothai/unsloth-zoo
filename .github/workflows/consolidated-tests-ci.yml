@@ -99,11 +99,14 @@ jobs:
         # invisible until #739 because no job executed it (collect-only plus
         # the macOS shim smoke). test_training_utils_use_cache pins the
         # use_cache disable/restore contract for gradient checkpointing
-        # (#715). Executing both here keeps fixture/source drift visible.
+        # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
+        # + cache-completeness gate (CPU-pure; collect-only would let it
+        # regress silently). Executing them here keeps fixture/source drift visible.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_mlx_finetune_last_n_layers.py \
+            tests/test_hf_xet_fallback.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
