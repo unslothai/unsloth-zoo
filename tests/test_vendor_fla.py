@@ -72,6 +72,22 @@ def _injection_supported() -> bool:
         return False
 
 
+def _transformers_has_models(*names) -> bool:
+    # The model-binding subprocess tests import real Transformers modeling modules.
+    # Skip cleanly on a supported-but-older Transformers that predates them (e.g.
+    # 4.57.x ships qwen3_next but not qwen3_5 / olmo_hybrid) instead of failing with
+    # ModuleNotFoundError; a newer Transformers that has them still runs the tests.
+    import importlib.util
+
+    for name in names:
+        try:
+            if importlib.util.find_spec(f"transformers.models.{name}") is None:
+                return False
+        except Exception:
+            return False
+    return True
+
+
 _NO_AUTORUN_SUBPROCESS = textwrap.dedent(
     """
     import os, sys
@@ -295,6 +311,10 @@ _OLMO_SUBPROCESS = textwrap.dedent(
 @pytest.mark.skipif(
     not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
+@pytest.mark.skipif(
+    not _transformers_has_models("qwen3_5", "olmo_hybrid"),
+    reason="installed transformers lacks the qwen3_5 / olmo_hybrid modeling modules",
 )
 def test_uncovered_model_imports_on_fallback_subprocess():
     env = dict(os.environ)

@@ -23,7 +23,9 @@ slower pure-PyTorch path. This registers the pruned ``unsloth_zoo/_vendored/fla`
 snapshot into ``sys.modules`` as a real, walkable ``fla`` and reports availability.
 
 Precedence / escape hatches:
-  * ``UNSLOTH_DISABLE_VENDORED_FLA=1`` -> do nothing (keep the pure-torch path).
+  * ``UNSLOTH_DISABLE_VENDORED_FLA=1`` -> never inject the vendored copy. With no
+    other fla present this keeps the pure-torch path; a separately installed fla is
+    left untouched and still used (the flag scopes to the vendored injection only).
   * Version-aware auto-detection: a user-installed ``fla`` that is strictly newer
     than the vendored snapshot is used instead (a newer upstream supersedes ours);
     an equal or older install is shadowed by the vendored kernels, which carry
@@ -557,6 +559,8 @@ def patch_vendor_fla(phase=None):
     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
     """
     if _flag("UNSLOTH_DISABLE_VENDORED_FLA"):
+        # Scope is the vendored injection only: a user's own fla install is left as
+        # found so Transformers' native availability probe still governs it.
         return
 
     replaced_real = False
