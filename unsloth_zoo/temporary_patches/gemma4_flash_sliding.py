@@ -106,8 +106,12 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
                 and _mask_is_plain_band(attention_mask, Sq, w)):
             # Prefer FlashAttention-2's window kernel when importable and the dtype
             # is supported; otherwise fall to the pure-SDPA banded kernel so the
-            # O(S*w) speedup is automatic with or without flash-attn.
-            if _HAS_FA2 and not _force_banded() and query.dtype in (torch.float16, torch.bfloat16):
+            # O(S*w) speedup is automatic with or without flash-attn. A runtime FA2
+            # failure (unsupported GPU/build, CPU tensors) falls to the banded
+            # kernel too, so it is not skipped, and only then to the original SDPA.
+            use_fa2 = (_HAS_FA2 and not _force_banded()
+                       and query.dtype in (torch.float16, torch.bfloat16))
+            if use_fa2:
                 try:
                     # flash_attn_func wants (B, S, H, D); a causal window of w keys
                     # is window_size=(w-1, 0). FA2 handles GQA (H q, Hkv kv heads).
@@ -128,25 +132,26 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
                         )
                     return out, None                      # (B, S, H, D), no weights
                 except Exception as e:
-                    logger.warning_once(f"Unsloth: gemma-4 FA2 sliding fell back to SDPA ({e})")
-            else:
-                try:
-                    # Pure-SDPA block-local kernel; batch-general. ng folds the kv
-                    # heads up to the q heads exactly as SDPA's GQA expansion does.
-                    ng = getattr(module, "num_key_value_groups", query.shape[1] // key.shape[1])
-                    out = _banded_sdpa_core(
-                        query, key, value, w, scaling,
-                        dropout if module.training else 0.0, ng,
+                    logger.warning_once(f"Unsloth: gemma-4 FA2 sliding fell back to banded SDPA ({e})")
+            # Reached when FA2 is not used or its attempt failed: try the pure-SDPA
+            # block-local kernel before deferring to the original SDPA.
+            try:
+                # Pure-SDPA block-local kernel; batch-general. ng folds the kv
+                # heads up to the q heads exactly as SDPA's GQA expansion does.
+                ng = getattr(module, "num_key_value_groups", query.shape[1] // key.shape[1])
+                out = _banded_sdpa_core(
+                    query, key, value, w, scaling,
+                    dropout if module.training else 0.0, ng,
+                )
+                _BANDED_ENGAGED[0] += 1
+                if _BANDED_ENGAGED[0] == 1:
+                    logger.info_once(
+                        f"Unsloth: banded sliding SDPA engaged for gemma-4 "
+                        f"(window={w})."
                     )
-                    _BANDED_ENGAGED[0] += 1
-                    if _BANDED_ENGAGED[0] == 1:
-                        logger.info_once(
-                            f"Unsloth: banded sliding SDPA engaged for gemma-4 "
-                            f"(window={w})."
-                        )
-                    return out, None                      # (B, S, H, D), no weights
-                except Exception as e:
-                    logger.warning_once(f"Unsloth: gemma-4 banded sliding fell back to SDPA ({e})")
+                return out, None                      # (B, S, H, D), no weights
+            except Exception as e:
+                logger.warning_once(f"Unsloth: gemma-4 banded sliding fell back to SDPA ({e})")
     return _ORIG_SDPA[0](module, query, key, value, attention_mask,
                          dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs)
 

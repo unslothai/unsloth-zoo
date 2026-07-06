@@ -51,6 +51,11 @@ def _block_mask(w, nb, device):
     m = base[None].expand(nb, w, 2 * w).clone()           # (nb, w, 2w)
     m[0] &= (torch.arange(2 * w, device=device)[None, :] >= w)  # block 0: drop phantom prev-block
     m = m[:, None]                                         # (nb, 1, w, 2w)
+    # FIFO bound: varying seq lengths yield many (w, nb) keys, so evict the oldest
+    # entry once the cache hits the cap (dict is insertion-ordered) to keep this a
+    # pure recompute-on-miss optimization rather than an unbounded leak.
+    if len(_MASK_CACHE) >= 8:
+        _MASK_CACHE.pop(next(iter(_MASK_CACHE)))
     _MASK_CACHE[key] = m
     return m
 
@@ -69,6 +74,12 @@ def _mask_is_plain_band(mask, S, w, _block=1024):
     if mask is None:
         return True
     if not torch.is_tensor(mask) or mask.dim() != 4:
+        return False
+    # Under torch.compile the band verdict drives Python control flow via .item()
+    # (a data-dependent graph break -> hard error under fullgraph) and mutates a
+    # tensor attribute, neither of which is traceable. Defer to the original SDPA
+    # while compiling so the graph stays intact; correctness is unchanged.
+    if torch.compiler.is_compiling():
         return False
     cached = getattr(mask, "_unsloth_plain_band", None)
     if cached is not None:

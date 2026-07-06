@@ -16,6 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from unsloth_zoo.temporary_patches import gemma4_banded_attention as gba
 from unsloth_zoo.temporary_patches.gemma4_banded_attention import (
     _banded_sdpa_core,
     _block_mask,
@@ -88,6 +89,28 @@ def test_gradients_match_fp32():
     torch.testing.assert_close(q2.grad, q1.grad, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(k2.grad, k1.grad, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(v2.grad, v1.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_mask_is_plain_band_defers_while_compiling(monkeypatch):
+    # Under torch.compile the .item() verdict and the tensor-attribute write are
+    # untraceable, so while compiling the probe must return False and route to the
+    # original SDPA regardless of the mask contents (here a genuine band).
+    S, w = 128, 32
+    band = _band_mask_full(S, w)[None, None].clone()
+    assert _mask_is_plain_band(band.clone(), S, w)          # eager: a real band is accepted
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert _mask_is_plain_band(band.clone(), S, w) is False  # compiling: always defers
+
+
+def test_block_mask_cache_is_bounded(monkeypatch):
+    # Varying sequence lengths yield many distinct (w, nb) keys; the FIFO bound
+    # must keep _MASK_CACHE from growing without limit (cap 8).
+    monkeypatch.setattr(gba, "_MASK_CACHE", {})
+    w = 8
+    for nb in range(1, 40):
+        _block_mask(w, nb, torch.device("cpu"))
+        assert len(gba._MASK_CACHE) <= 8
+    assert len(gba._MASK_CACHE) == 8
 
 
 def test_block_mask_block0_masks_phantom_prev():
