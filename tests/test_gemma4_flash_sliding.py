@@ -112,6 +112,56 @@ def test_chunked_verification_matches_dense():
         assert full == chunked, name
 
 
+class Gemma4SlidingFake:
+    """Minimal stand-in for a Gemma-4 sliding-window attention module: just the
+    attributes the router gates on (is_sliding, class name, head_dim <= 256)."""
+    is_sliding = True
+    is_causal = True
+    training = False
+
+    def __init__(self, w, ng):
+        self.sliding_window = w
+        self.num_key_value_groups = ng
+
+
+def test_router_routes_to_fa2_and_matches_band(monkeypatch):
+    # With flash-attn present the unified wrapper must take the FA2 window branch
+    # (never the wrapped SDPA) and match full SDPA + band mask.
+    from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
+
+    monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1")
+    monkeypatch.delenv("UNSLOTH_BANDED_SDPA", raising=False)
+    assert gf._HAS_FA2, "flash_attn imported by the test but not by the router"
+
+    S, w, H, Hkv, d = 4096, 1024, 16, 8, 256
+    torch.manual_seed(0)
+    q = torch.randn(1, H, S, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, Hkv, S, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, Hkv, S, d, device="cuda", dtype=torch.bfloat16)
+    scaling = d ** -0.5
+    ng = H // Hkv
+    module = Gemma4SlidingFake(w, ng)
+
+    def _boom(*a, **kw):
+        raise AssertionError("router did not take the FA2 path")
+
+    orig = gf._ORIG_SDPA[0]
+    gf._ORIG_SDPA[0] = _boom
+    before = gf._ENGAGED[0]
+    try:
+        out, weights = gf._sdpa_maybe_flash_sliding(
+            module, q, k, v, None, dropout=0.0, scaling=scaling, is_causal=None,
+        )
+    finally:
+        gf._ORIG_SDPA[0] = orig
+
+    assert weights is None
+    assert gf._ENGAGED[0] == before + 1, "FA2 path was not engaged"
+    ref = _full_sdpa_band(q, k, v, w, scaling, ng)
+    rel = (out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-9)
+    assert rel < 3e-2, f"router FA2 rel {rel:.2e}"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
