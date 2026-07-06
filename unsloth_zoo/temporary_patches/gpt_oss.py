@@ -859,6 +859,11 @@ class GptOssExpertsBnb4bit(nn.Module):
         import os
         if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
             return False
+        # The grouped path materializes torch._grouped_mm stacks meant to run under the
+        # compiled cache; when the user disables compilation they have opted into the plain
+        # eager per-expert loop, so honor that and fall back.
+        if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+            return False
         def _fail(reason):
             if (
                 os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
