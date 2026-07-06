@@ -32,6 +32,7 @@ import sys
 import tempfile
 import types
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
@@ -3437,6 +3438,20 @@ def _mlx_apply_attention_mask(prompt_ids, attention_mask):
     return [token for token, keep in zip(prompt_ids, mask) if keep != 0]
 
 
+def _mlx_generate_output(prompt_ids, generated_ids):
+    """Build a Transformers-friendly batched generate return value."""
+    sequences = [list(prompt_ids) + list(generated_ids)]
+    try:
+        # Broad except: a torch that is installed but broken (bad native libs)
+        # raises OSError/RuntimeError, not ImportError; fall back to numpy so
+        # MLX generation keeps working instead of failing hard.
+        import torch
+        return torch.tensor(sequences, dtype=torch.long)
+    except Exception:
+        import numpy as np
+        return np.asarray(sequences, dtype=np.int64)
+
+
 def _mlx_eos_token_id_set(eos_token_id):
     """Normalize HF-style eos_token_id values into a set of token ids."""
     if eos_token_id is None:
@@ -3499,7 +3514,6 @@ def _mlx_token_to_int(token):
 
 def _mlx_generate_vlm(self, *args, **kwargs):
     """HF-style VLM generate() shim backed by mlx-vlm stream_generate."""
-    import mlx.core as mx
     from mlx_vlm import stream_generate
     from .utils import _to_mx_vlm_batch
 
@@ -3614,12 +3628,11 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     if streamer is not None:
         streamer.end()
-    return mx.array([prompt_ids + generated_ids])
+    return _mlx_generate_output(prompt_ids, generated_ids)
 
 
 def _mlx_generate(self, *args, **kwargs):
     """HF-style text generate() shim backed by mlx-lm stream_generate."""
-    import mlx.core as mx
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
@@ -3736,24 +3749,72 @@ def _mlx_generate(self, *args, **kwargs):
 
     if streamer is not None:
         streamer.end()
-    return mx.array([prompt_ids + generated_ids])
+    return _mlx_generate_output(prompt_ids, generated_ids)
+
+
+def _mlx_chat_template_batch_encoding(output):
+    """Wrap tokenized chat-template output in a HF mapping when requested."""
+    from transformers import BatchEncoding
+
+    if isinstance(output, BatchEncoding):
+        return output
+    if isinstance(output, Mapping):
+        return BatchEncoding(dict(output))
+    return BatchEncoding({"input_ids": output})
 
 
 def _patch_mlx_tokenizer_call(tokenizer):
-    """Make mlx-lm TokenizerWrapper callable like its wrapped HF tokenizer."""
+    """Patch mlx-lm TokenizerWrapper to match HF notebook tokenizer APIs."""
     if tokenizer is None:
         return
     cls = type(tokenizer)
-    if cls.__name__ != "TokenizerWrapper" or "__call__" in cls.__dict__:
+    if cls.__name__ != "TokenizerWrapper":
         return
-    if not hasattr(tokenizer, "_tokenizer") or not callable(tokenizer._tokenizer):
+    if "__call__" not in cls.__dict__:
+        if hasattr(tokenizer, "_tokenizer") and callable(tokenizer._tokenizer):
+            def tokenizer_wrapper_call(self, *args, **kwargs):
+                return self._tokenizer(*args, **kwargs)
+
+            tokenizer_wrapper_call._unsloth_mlx_call = True
+            cls.__call__ = tokenizer_wrapper_call
+
+    if getattr(cls, "_unsloth_mlx_apply_chat_template", False):
+        return
+    original_apply_chat_template = getattr(cls, "apply_chat_template", None)
+    if original_apply_chat_template is None:
         return
 
-    def tokenizer_wrapper_call(self, *args, **kwargs):
-        return self._tokenizer(*args, **kwargs)
+    def tokenizer_wrapper_apply_chat_template(self, *args, tokenize=True, **kwargs):
+        return_dict = bool(kwargs.get("return_dict", False))
+        inner_tokenizer = getattr(self, "_tokenizer", None)
+        if (
+            tokenize
+            and return_dict
+            and getattr(self, "_chat_template", None) is None
+            and hasattr(inner_tokenizer, "apply_chat_template")
+        ):
+            if "enable_thinking" not in kwargs:
+                kwargs["enable_thinking"] = getattr(self, "has_thinking", False)
+            output = inner_tokenizer.apply_chat_template(
+                *args,
+                tokenize=tokenize,
+                **kwargs,
+            )
+            return _mlx_chat_template_batch_encoding(output)
 
-    tokenizer_wrapper_call._unsloth_mlx_call = True
-    cls.__call__ = tokenizer_wrapper_call
+        output = original_apply_chat_template(
+            self,
+            *args,
+            tokenize=tokenize,
+            **kwargs,
+        )
+        if tokenize and return_dict:
+            return _mlx_chat_template_batch_encoding(output)
+        return output
+
+    tokenizer_wrapper_apply_chat_template._unsloth_mlx_call = True
+    cls.apply_chat_template = tokenizer_wrapper_apply_chat_template
+    cls._unsloth_mlx_apply_chat_template = True
 
 
 def _patch_mlx_saving(model, tokenizer):
