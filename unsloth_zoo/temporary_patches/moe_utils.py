@@ -1185,13 +1185,15 @@ def patch_param_wrapper_for_moe():
         return False
 
 
-# Optional gate gradient via the inner-product identity dGate = <A, dA> / gate
-# (UNSLOTH_MOE_GATEGRAD=1), instead of <dOut, Y> which pins the down-projection
-# output Y on the tape solely for that gradient. Output unchanged; off by default.
+# Gate gradient via the inner-product identity dGate = <A, dA> / gate, instead of
+# <dOut, Y> which pins the down-projection output Y on the tape solely for that
+# gradient. Output unchanged; on by default to save memory. The runtime gate below
+# still auto-disables it for fp16, down-bias models and frozen routers. Set
+# UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
 
 
 def _moe_gategrad_enabled() -> bool:
-    return os.environ.get("UNSLOTH_MOE_GATEGRAD", "0") == "1"
+    return os.environ.get("UNSLOTH_MOE_GATEGRAD", "1") != "0"
 
 
 class _MoEGateGradIdentity(torch.autograd.Function):

@@ -8,12 +8,8 @@ projection; these tests check it in fp32 against plain autograd, with and
 without an additive LoRA term on the down weight.
 """
 
-import os
-
 import pytest
 import torch
-
-os.environ.setdefault("UNSLOTH_MOE_GATEGRAD", "0")
 
 from unsloth_zoo.temporary_patches.moe_utils import (
     _MoEGateGradIdentity,
@@ -213,7 +209,10 @@ def test_forward_is_identity_and_env_gated(monkeypatch):
     g = torch.rand(5)
     assert torch.equal(_MoEGateGradIdentity.apply(x, g), x)
 
+    # On by default (memory saving); UNSLOTH_MOE_GATEGRAD=0 is the kill-switch.
     monkeypatch.delenv("UNSLOTH_MOE_GATEGRAD", raising=False)
+    assert _moe_gategrad_enabled()
+    monkeypatch.setenv("UNSLOTH_MOE_GATEGRAD", "0")
     assert not _moe_gategrad_enabled()
     monkeypatch.setenv("UNSLOTH_MOE_GATEGRAD", "1")
     assert _moe_gategrad_enabled()
