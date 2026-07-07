@@ -360,7 +360,11 @@ def assert_same_keys(model, new_state_dict):
     (base_layer, modules_to_save, original_module) and LoRA suffixes so they
     don't trigger false mismatches.
     """
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    # Resolve the base model the same way create_lora_statistics built new_state_dict
+    # (line: inner_model = find_lora_base_model(model)). Using the shared helper guards
+    # each level, so a PEFT base whose base_model has no ".model" (e.g. Phi-3 / Phi-4-mini)
+    # no longer raises AttributeError here, and the key comparison stays like-for-like. (#95)
+    inner_model = find_lora_base_model(model)
 
     def _should_ignore(key: str) -> bool:
         # Ignore helper wrappers and raw LoRA adapter tensors; the merged
