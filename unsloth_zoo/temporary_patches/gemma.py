@@ -70,6 +70,16 @@ def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states
     return padding_mask & causal_mask[None, None, :, :]
 
 
+def _gemma3_rms_norm(x, weight, eps, out_dtype):
+    # Inline Gemma3RMSNorm so compiled prepare() doesn't nest another compiled
+    # forward, which broke Dynamo on older torch (unsloth#3535).
+    x_fp32 = x.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim=True)
+    hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    output_fp32 = hidden_states_fp32 * (1.0 + weight.to(torch.float32))
+    return output_fp32.to(out_dtype)
+
+
 def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     """Build the past_key_value / past_key_values forward variants."""
     functions = []
@@ -86,6 +96,71 @@ def _make_gemma3_attn_forwards(forward_function, has_cache_position):
     functions.append(forward_past_key_value)
     functions.append(forward_past_key_values)
     return functions
+
+
+def _resolve_truncation(padding, truncation, max_length):
+    # HF activates "longest_first" truncation when max_length is set with padding=False and no explicit
+    # truncation. We drop padding to pad manually, so pin the strategy the tokenizer would have derived
+    # (from the caller's original padding) and pass it explicitly, keeping truncation behaviour identical.
+    if truncation is not None:
+        return truncation
+    return "longest_first" if (max_length is not None and padding is False) else False
+pass
+
+
+def _fix_double_bos_and_pad(
+    text_inputs, bos_token_id, pad_token_id, image_token_id,
+    return_mm_token_type_ids, padding, padding_side, return_tensors,
+    max_length = None, pad_to_multiple_of = None, model_max_length = None,
+):
+    # Gemma3 doubles the BOS (chat template + tokenizer). Strip the duplicate on every row and on
+    # every per-token field returned (attention_mask, token_type_ids, special_tokens_mask,
+    # offset_mapping, ...), rebuild mm token type ids, then pad each field so ragged rows stack.
+    # Honours "do_not_pad"/max_length/model max/pad_to_multiple_of and the return_tensors=None list contract.
+    n_rows = len(text_inputs["input_ids"])
+    input_lens = [len(x) for x in text_inputs["input_ids"]]
+    double_bos = [bos_token_id, bos_token_id]
+    strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
+    # only fields whose rows match the matching input_ids row length are token aligned; this keeps
+    # non-aligned tokenizer outputs out of the per-row strip/pad. overflowing_tokens is a per-example
+    # list of tails, so exclude it by name too in case a tail length coincidentally matches its row.
+    non_aligned = {"overflowing_tokens", "overflow_to_sample_mapping", "num_truncated_tokens", "length"}
+    per_token_keys = [
+        k for k, v in text_inputs.items()
+        if k not in non_aligned
+        and isinstance(v, (list, tuple)) and len(v) == n_rows
+        and all(isinstance(r, (list, tuple)) and len(r) == input_lens[i] for i, r in enumerate(v))
+    ]
+    for k in per_token_keys:
+        text_inputs[k] = [r[1:] if strip[i] else r for i, r in enumerate(text_inputs[k])]
+    if return_mm_token_type_ids:
+        text_inputs["token_type_ids"] = [[int(y == image_token_id) for y in x] for x in text_inputs["input_ids"]]
+        if "token_type_ids" not in per_token_keys: per_token_keys.append("token_type_ids")
+    if padding not in (False, None, "do_not_pad"):
+        if padding == "max_length" and max_length is not None:
+            max_len = max_length
+        elif padding == "max_length" and model_max_length is not None:
+            max_len = model_max_length
+        else:
+            max_len = max((len(x) for x in text_inputs["input_ids"]), default = 0)
+        if pad_to_multiple_of:
+            max_len = -(-max_len // pad_to_multiple_of) * pad_to_multiple_of
+        def fill_for(key):
+            if key == "input_ids": return pad_token_id or 0
+            if key == "special_tokens_mask": return 1
+            sample = next((r for r in text_inputs[key] if r), None)
+            return (0, 0) if (sample is not None and isinstance(sample[0], (tuple, list))) else 0
+        def pad_seq(seq, fill):
+            delta = max_len - len(seq)
+            if delta <= 0: return list(seq)
+            return ([fill]*delta + list(seq)) if padding_side == "left" else (list(seq) + [fill]*delta)
+        for key in per_token_keys:
+            fill = fill_for(key)
+            text_inputs[key] = [pad_seq(x, fill) for x in text_inputs[key]]
+    if "length" in text_inputs:   # return_length: report the post-strip/pad token counts
+        text_inputs["length"] = [len(x) for x in text_inputs["input_ids"]]
+    return text_inputs
+pass
 
 
 def patch_Gemma3Processor():
@@ -189,23 +264,27 @@ def patch_Gemma3Processor():
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
 
+        # Tokenize unpadded so the double-BOS strip cannot desync row lengths, then pad afterwards.
+        padding = output_kwargs["text_kwargs"].pop("padding", False)
+        padding_side = output_kwargs["text_kwargs"].pop("padding_side", None) or \
+            getattr(self.tokenizer, "padding_side", "left")
+        # HF derives truncation from padding + max_length (max_length with padding=False and no explicit
+        # truncation truncates). We drop padding to pad manually, so pin the truncation the tokenizer would
+        # have used from the original padding, keeping truncation behaviour identical.
+        max_length = output_kwargs["text_kwargs"].get("max_length", None)
+        output_kwargs["text_kwargs"]["truncation"] = _resolve_truncation(
+            padding, output_kwargs["text_kwargs"].get("truncation", None), max_length)
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
-        # Fix double BOS tokens
-        double_bos_token_id = [self.tokenizer.bos_token_id]*2
-        input_ids = text_inputs["input_ids"]
-        text_inputs["input_ids"] = [x[1:] if x[:2] == double_bos_token_id else x for x in input_ids]
-
-        # Add token type ids manually, as tokenizer can't do arbitrary position token types
-        # [TODO] FAILS for batched tokens since text_inputs["input_ids"] is a list of lists, so np.array creates an object!
-        if return_mm_token_type_ids:
-            input_ids = text_inputs["input_ids"]
-            image_token_id = self.image_token_id
-            mm_token_type_ids = [[1 if y == image_token_id else 0 for y in x] for x in input_ids]
-            # array_ids = np.array(text_inputs["input_ids"])
-            # mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
-            # mm_token_type_ids[array_ids == self.image_token_id] = 1
-            # text_inputs = {k: v.tolist() for k, v in text_inputs.items()}  # in case user requested list inputs
-            text_inputs["token_type_ids"] = mm_token_type_ids#.tolist()
+        # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
+        _mml = getattr(self.tokenizer, "model_max_length", None)
+        if not (isinstance(_mml, int) and 0 < _mml < int(1e15)): _mml = None
+        text_inputs = _fix_double_bos_and_pad(
+            text_inputs, self.tokenizer.bos_token_id, self.tokenizer.pad_token_id,
+            self.image_token_id, return_mm_token_type_ids, padding, padding_side, return_tensors,
+            max_length = max_length,
+            pad_to_multiple_of = output_kwargs["text_kwargs"].get("pad_to_multiple_of", None),
+            model_max_length = _mml,
+        )
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
     pass
 
@@ -422,9 +501,12 @@ def patch_Gemma3Attention():
         key_states_fp32   = key_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2)
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).to(torch.float32).transpose(1, 2) # V for attention also fp32
 
-        # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
-        key_norm_out_fp16   = k_norm(key_states_fp32) # self.q_norm doesn't use auto compiler
+        # 3. Normalization: inline RMSNorm, then clamp+emit fp16 to match patch_Gemma3RMSNorm.
+        fp16_max = torch.finfo(torch.float16).max
+        query_norm_out_fp16 = _gemma3_rms_norm(query_states_fp32, q_norm.weight, q_norm.eps, torch.float32)
+        key_norm_out_fp16   = _gemma3_rms_norm(key_states_fp32,   k_norm.weight, k_norm.eps, torch.float32)
+        query_norm_out_fp16 = torch.clamp(query_norm_out_fp16, min=-fp16_max, max=fp16_max).to(torch.float16)
+        key_norm_out_fp16   = torch.clamp(key_norm_out_fp16,   min=-fp16_max, max=fp16_max).to(torch.float16)
 
         query_states_fp32 = query_norm_out_fp16.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16.to(torch.float32)
@@ -656,9 +738,9 @@ def patch_Gemma3Attention_generic():
         key_states_fp32   = key_states_fp16.view(kv_hidden_shape).transpose(1, 2)
         value_states_fp32 = value_states_fp16.view(kv_hidden_shape).transpose(1, 2) # V for attention also fp32
 
-        # 3. Normalization (q_norm, k_norm are RMSNorms)
-        query_norm_out_fp16 = q_norm(query_states_fp32) # self.q_norm doesn't use auto compiler
-        key_norm_out_fp16   = k_norm(key_states_fp32) # self.k_norm doesn't use auto compiler
+        # 3. Normalization: inline RMSNorm, output dtype mirrors input to match patch_Gemma3RMSNorm_generic.
+        query_norm_out_fp16 = _gemma3_rms_norm(query_states_fp32, q_norm.weight, q_norm.eps, query_states_fp32.dtype)
+        key_norm_out_fp16   = _gemma3_rms_norm(key_states_fp32,   k_norm.weight, k_norm.eps, key_states_fp32.dtype)
 
         query_states_fp32 = query_norm_out_fp16#.to(torch.float32)
         key_states_fp32   = key_norm_out_fp16#.to(torch.float32)

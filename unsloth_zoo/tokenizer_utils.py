@@ -14,7 +14,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import torch
+try:
+    import torch
+except ImportError:
+    # MLX (Apple Silicon) is torch-free. Only the embedding-fix helpers below use
+    # torch and they are never called on MLX, so keep the module importable so the
+    # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
+    torch = None
+import functools
 import gc
 import numpy as np
 import itertools
@@ -30,7 +37,19 @@ __all__ = [
 ]
 
 
-@torch.inference_mode
+def _maybe_inference_mode(func):
+    """torch.inference_mode when torch is present; a plain passthrough on torch-free
+    installs (MLX), where these torch-only helpers are never invoked."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch is None:
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+@_maybe_inference_mode
 def mean_of_trained_tokens(model, eps = 1e-16):
     """
     Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
@@ -199,7 +218,7 @@ def add_new_tokens(
 pass
 
 
-@torch.inference_mode
+@_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
     Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
@@ -457,30 +476,15 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
 pass
 
 
-POSSIBLE_RESERVED_TOKENS = (
-    "<|finetune_right_pad_id|>", # Llama-3.1
-    "<pad>",                     # Mistral Nemo
-    "<|vision_pad|>",            # Qwen 2.5
-    "<|image_pad|>",             # Qwen 2.5
-    "<|video_pad|>",             # Qwen 2.5
-    "<|reserved",                # Llama-3
-    "<|placeholder",             # Phi-3
-    "[control",                  # Mistral type models
-    "|<EXTRA_TOKENS_",           # Molmo
-    "<SPECIAL_",                 # Pixtral
-    "<unused",                   # PaliGemma
+# Pad-token repair lives in the shared pad_token module (single source of truth
+# for unsloth + unsloth-zoo). Re-exported here for backwards compatibility.
+from .pad_token import (
+    fix_pad_token,
+    POSSIBLE_RESERVED_TOKENS,
+    VISION_RESERVED_TOKENS,
 )
 
-# Vision tokens that must not be a pad_token for text-only models. Qwen3 text
-# models share Qwen3-VL's vocab and include these, but using them as pad_token
-# is wrong. See https://github.com/unslothai/unsloth/issues/4104
-VISION_RESERVED_TOKENS = frozenset((
-    "<|vision_pad|>",
-    "<|image_pad|>",
-    "<|video_pad|>",
-))
-
-@torch.inference_mode
+@_maybe_inference_mode
 def patch_tokenizer(model, tokenizer):
     """
         Set a sensible pad_token when missing (Phi3 -> <|placeholder...,
@@ -493,9 +497,6 @@ def patch_tokenizer(model, tokenizer):
     # Guard against None tokenizer (e.g., some VLM processors without tokenizer)
     if tokenizer is None:
         return model, tokenizer
-
-    joiner = "\1\0=+=\0\1"
-    number_repetitions = 3 - 1 # Number of reserved tokens needed
 
     original_tokenizer = tokenizer
 
@@ -510,123 +511,22 @@ def patch_tokenizer(model, tokenizer):
             return model, original_tokenizer
         tokenizer = inner
 
-    # Text-only models must not use vision tokens (e.g. <|vision_pad|>) as
-    # pad_token. See https://github.com/unslothai/unsloth/issues/4104
-    is_vision_model = hasattr(original_tokenizer, "image_processor")
-    if not is_vision_model and model is not None and hasattr(model, "config"):
-        model_type = getattr(model.config, "model_type", "") or ""
-        is_vision_model = "vl" in model_type.lower()
-    pass
+    # Heal a bad/missing pad_token via the shared single source of truth: it picks
+    # a reserved pad-like token already in the vocab (text-only models never reuse
+    # a vision token), or adds one and raises if none exists, and stamps
+    # model.config / generation_config pad_token_id when it changes.
+    # Fixes https://github.com/unslothai/unsloth/issues/5 and #4104.
+    model_config = getattr(model, "config", None)
+    result = fix_pad_token(original_tokenizer, model = model, model_config = model_config)
 
-    bad_pad_token = False
-    if hasattr(tokenizer, "pad_token") and tokenizer.pad_token is not None:
-        # pad_token == eos_token makes the loss ignore it
-        bad_pad_token = tokenizer.eos_token == tokenizer.pad_token
-        # Also fix text-only models with a vision token baked in as pad_token
-        if not bad_pad_token and not is_vision_model:
-            bad_pad_token = tokenizer.pad_token in VISION_RESERVED_TOKENS
-    elif hasattr(tokenizer, "pad_token") and tokenizer.pad_token is None:
-        bad_pad_token = True
-    else:
-        bad_pad_token = False
-    pass
-
-    if bad_pad_token:
-        # Find a better pad token
-        added_tokens = [str(x) for x in tokenizer.added_tokens_decoder.values()]
-        all_added_tokens = joiner.join(added_tokens[::-1])
-        all_added_tokens += joiner
-
-        final_pad_token  = None
-        final_good_match = False
-
-        for possible_reserved_token in POSSIBLE_RESERVED_TOKENS:
-            # Skip vision-specific tokens for text-only models
-            if not is_vision_model and possible_reserved_token in VISION_RESERVED_TOKENS:
-                continue
-            possible_reserved_token = re.escape(possible_reserved_token)
-            found = re.finditer(f"{possible_reserved_token}", all_added_tokens)
-            first_match = None
-            good_match  = False
-            for j, x in enumerate(found):
-                if j == 0: first_match = x
-                if j >= number_repetitions:
-                    good_match = True
-                    break
-                pass
-            pass
-
-            if first_match is None: continue
-
-            # If it ends with |> or > etc, then set it as a good pad token!
-            start = first_match.span(0)[0]
-            possible_pad_token = first_match.group(0)
-            end = all_added_tokens.find(joiner, start)
-            first_match = all_added_tokens[start:end]
-
-            if first_match is not None:
-                good_match = possible_pad_token.endswith((">", "|>", "]", ")"))
-            pass
-            possible_pad_token = first_match
-
-            # Replace current pad token if another exact match is found
-            if not final_good_match and good_match:
-                final_good_match = True
-                final_pad_token = possible_pad_token
-                break
-            else:
-                final_good_match = False
-                final_pad_token = possible_pad_token
-            pass
-        pass
-        possible_pad_token = final_pad_token
-
-        # Try unk_token
-        if possible_pad_token is None and hasattr(tokenizer, "unk_token"):
-            possible_pad_token = tokenizer.unk_token
-        pass
-
-        # Check pad token's id must be less than vocab size
-        if possible_pad_token is not None:
-            check_pad_token = tokenizer(possible_pad_token, add_special_tokens = False).input_ids
-            if len(check_pad_token) != 1:
-                possible_pad_token = None
-
-            if model is not None and \
-                hasattr(model.config, "vocab_size") and \
-                check_pad_token[0] >= model.config.vocab_size:
-
-                possible_pad_token = None
-        pass
-
-        if possible_pad_token is None:
-            # Failure to find a good replacement!! We shall manually add one!
-            new_pad_token = "<|PAD_TOKEN|>"
-            while new_pad_token in tokenizer.get_vocab():
-                new_pad_token = f"<{new_pad_token}>"
-            pass
-            possible_pad_token = new_pad_token
-        pass
-
-        name = model.config._name_or_path if model is not None else "Model"
-        print(
-            f"{name} does not have a padding token! Will use pad_token = {possible_pad_token}."
-        )
-        
-        # Edit pad_token
-        tokenizer.add_special_tokens({"pad_token" : possible_pad_token})
-        tokenizer.pad_token = possible_pad_token
-        if model is not None:
-            model.config.update({"pad_token_id" : tokenizer.pad_token_id})
+    # No-op case: tokenizer already had a valid pad_token, but the model config
+    # may still be missing pad_token_id - mirror it across.
+    if not result["changed"] and model is not None and model_config is not None:
+        if getattr(model_config, "pad_token_id", None) is None:
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+            model.config.update({"pad_token_id" : pad_token_id})
             if getattr(model, "generation_config", None) is not None:
-                model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
-    else:
-        if model is not None:
-            if getattr(model.config, "pad_token_id", None) is None:
-                model.config.update({"pad_token_id" : tokenizer.pad_token_id})
-                if getattr(model, "generation_config", None) is not None:
-                    model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
-        pass
+                model.generation_config.update(pad_token_id = pad_token_id)
     pass
 
     if model is not None:

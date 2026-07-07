@@ -2508,6 +2508,7 @@ def quantize_gguf(
     quantizer_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize"),
     n_threads = None,
     print_output = True,
+    imatrix = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
@@ -2527,11 +2528,11 @@ def quantize_gguf(
         n_threads *= 2
 
     def _quote(s):
-        """Quote a path for shell usage, handling both Windows and Unix."""
+        """Quote a path for shell usage (the command runs under shell=True)."""
         s = str(s)
         if IS_WINDOWS:
-            # On Windows cmd, wrap in double quotes if path contains spaces
-            return f'"{s}"' if ' ' in s else s
+            # cmd.exe: always wrap so spaces and metachars (& | ^) stay literal.
+            return f'"{s}"'
         import shlex
         return shlex.quote(s)
 
@@ -2543,7 +2544,8 @@ def quantize_gguf(
     # override doesn't leak into other tensors containing "ffn_down".
     _display_quant_type = quant_type
     _extra_flags = ""
-    if str(quant_type).strip().lower() == "q2_k_l":
+    _is_q2_k_l_preset = str(quant_type).strip().lower() == "q2_k_l"
+    if _is_q2_k_l_preset:
         _extra_flags = (
             '--tensor-type "\\.ffn_down_exps=Q3_K" '
             '--tensor-type "\\.ffn_down=Q3_K" '
@@ -2552,6 +2554,15 @@ def quantize_gguf(
         )
         quant_type = "q2_k"
 
+    # An imatrix unlocks the IQ low-bit quants; prepend it (before positional args) and quote.
+    if imatrix is not None and str(imatrix).strip() != "":
+        # Normalize to a clean string first: os.path.exists(True) would treat a bool as a file
+        # descriptor, and a space-padded path must be trimmed before the existence check / quoting.
+        imatrix = str(imatrix).strip()
+        if not os.path.exists(imatrix):
+            raise FileNotFoundError(f"Unsloth: imatrix file `{imatrix}` does not exist.")
+        _extra_flags = f"--imatrix {_quote(imatrix)} " + _extra_flags
+
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
         f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
@@ -2559,7 +2570,7 @@ def quantize_gguf(
 
     if print_output:
         print(f"Unsloth: Quantizing to {_display_quant_type}...")
-        if _extra_flags:
+        if _is_q2_k_l_preset:
             print(
                 "Unsloth: Expanding Q2_K_L preset "
                 "(q2_k base, .ffn_down_exps=Q3_K + .ffn_down=Q3_K, "

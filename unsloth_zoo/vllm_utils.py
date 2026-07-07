@@ -1817,6 +1817,202 @@ def _get_torchao_fp8_config(fp8_mode: str):
     )
 
 
+# Idempotency flag so the piecewise-compile fix is only installed once per process.
+_UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX_INSTALLED = False
+
+
+def _install_vllm_decompose_size_nodes_fix():
+    """Patch vLLM's `_decompose_size_nodes` so `compilation_config=3` (piecewise
+    CUDA graphs) survives with a LoRA adapter on vLLM >= 0.19.
+
+    vLLM >= 0.19 ships a piecewise graph-partition pass (`_decompose_size_nodes`
+    in `vllm/compilation/backends.py`, introduced by vllm-project/vllm#36038) that
+    replaces every `x.size()` / `x.size(dim)` FX node with per-dim `sym_size.int`
+    calls before the graph is split at attention boundaries. Its rewrite loop only
+    rewires users where the size node is a *direct positional arg*
+    (`if arg is node`). But vLLM's own LoRA punica wrapper produces
+    `token_lora_mapping[:token_nums]` / `token_indices_sorted_by_lora_ids[:token_nums]`
+    (see `vllm/lora/ops/triton_ops/lora_kernel_metadata.py::meta_args`, with
+    `token_nums = x.size(0)`), which Dynamo traces as
+    `getitem(tensor, slice(None, size_1, None))` -- the size node is nested *inside*
+    a `slice(...)` object, so the pass never rewires it and
+    `graph.graph.erase_node(node)` raises
+
+        RuntimeError: Tried to erase Node size_1 but it still had 2 users in the
+        graph: {getitem_3: None, getitem_4: None}!
+
+    This is a stock-vLLM bug (both the pass and the LoRA slicing are stock vLLM);
+    the fix here matches upstream vllm-project/vllm#42543. Both `size()` (tuple) and
+    `size(dim)` (scalar) nodes are handled, and references nested inside `slice`,
+    `tuple`, `list` and kwargs are correctly rewired before the node is erased.
+
+    Returns True if the (fixed) pass is installed, so the caller can keep
+    `compilation_config=3`. Returns False if vLLM has no such pass (older vLLM, or a
+    future vLLM that removed/renamed it) so the caller can fall back to
+    `compilation_config=2`.
+    """
+    global _UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX_INSTALLED
+    if _UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX_INSTALLED:
+        return True
+
+    try:
+        import operator
+        import torch.fx as fx
+        import vllm.compilation.backends as _vllm_backends
+    except Exception:
+        return False
+
+    if not hasattr(_vllm_backends, "_decompose_size_nodes"):
+        # This vLLM does not ship the piecewise size-decompose pass; nothing to fix.
+        return False
+
+    def _replace_size_in_slice(s, node, dims):
+        # A slice bound must be a scalar. The intended value is the token count,
+        # i.e. the unique dynamic (SymInt) dim; use it when exactly one exists,
+        # otherwise fall back to dims[0]. Matches upstream vllm#42543.
+        def _sub(bound):
+            if isinstance(bound, fx.Node) and bound is node:
+                sym_dims = [d for d in dims if isinstance(d, fx.Node)]
+                if len(sym_dims) == 1:
+                    return sym_dims[0]
+                return dims[0]
+            return bound
+        new_start, new_stop, new_step = _sub(s.start), _sub(s.stop), _sub(s.step)
+        if new_start is not s.start or new_stop is not s.stop or new_step is not s.step:
+            return slice(new_start, new_stop, new_step)
+        return s
+
+    def _replace_size_in_args(args, node, dims):
+        # Recursively replace `node` in an args/kwargs container. At expandable
+        # positions (top-level args, inside tuples/lists) the size node is expanded
+        # into per-dim values (view(x, size) -> view(x, d0, d1, ...)). At slice
+        # bounds it is replaced with a single scalar dim.
+        result = []
+        for arg in args:
+            if isinstance(arg, fx.Node) and arg is node:
+                result.extend(dims)
+            elif isinstance(arg, slice):
+                result.append(_replace_size_in_slice(arg, node, dims))
+            elif isinstance(arg, (tuple, list)):
+                inner = _replace_size_in_args(arg, node, dims)
+                result.append(type(arg)(inner))
+            else:
+                result.append(arg)
+        return result
+
+    def _patched_decompose_size_nodes(graph):
+        size_nodes = list(graph.graph.find_nodes(op="call_method", target="size"))
+
+        for node in size_nodes:
+            tensor_node = node.args[0]
+            ev = tensor_node.meta.get("example_value")
+            assert ev is not None, (
+                f"Tensor node '{tensor_node.name}' has no example_value metadata. "
+                f"Cannot decompose size node '{node.name}'."
+            )
+
+            # ---- Scalar case: x.size(dim) -> single SymInt / literal int -------
+            # (This is the LoRA punica `token_lora_mapping[:x.size(0)]` case.)
+            # `dim` may be positional (x.size(0)) or a kwarg (x.size(dim=0)); a
+            # kwarg dim must still take the scalar path, not the tuple expansion.
+            dim = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
+            if dim is not None:
+                ndim = ev.dim()
+                norm_dim = dim + ndim if isinstance(dim, int) and dim < 0 else dim
+                dim_val = ev.shape[norm_dim] if isinstance(norm_dim, int) else None
+
+                if isinstance(dim_val, int) and not isinstance(dim_val, torch.SymInt):
+                    # Static dim: replace every reference (including inside slice/
+                    # tuple/list/kwargs) with the literal int. fx recurses for us.
+                    node.replace_all_uses_with(dim_val)
+                else:
+                    with graph.graph.inserting_after(tensor_node):
+                        dn = graph.graph.call_function(
+                            torch.ops.aten.sym_size.int, args=(tensor_node, norm_dim)
+                        )
+                    if dim_val is not None:
+                        dn.meta["example_value"] = dim_val
+                    # replace_all_uses_with recurses into slice()/tuple/list/kwargs
+                    # (verified), so slice(None, size, None) is rewired correctly.
+                    node.replace_all_uses_with(dn)
+                graph.graph.erase_node(node)
+                continue
+
+            # ---- Tuple case: x.size() -> torch.Size([...]) --------------------
+            dims = []
+            with graph.graph.inserting_after(tensor_node):
+                for i in range(ev.dim()):
+                    dim_val = ev.shape[i]
+                    if isinstance(dim_val, torch.SymInt):
+                        dn = graph.graph.call_function(
+                            torch.ops.aten.sym_size.int, args=(tensor_node, i)
+                        )
+                        dn.meta["example_value"] = dim_val
+                        dims.append(dn)
+                    elif isinstance(dim_val, int):
+                        dims.append(dim_val)
+                    else:
+                        raise AssertionError(
+                            f"dim_val is either torch.SymInt or int, "
+                            f"got {type(dim_val)} for dim {i} of '{node.name}'"
+                        )
+
+            # Rewire consumers of the tuple-valued size node via a worklist so a
+            # `x.size()[:-1]` slice-getitem becomes a derived tuple node processed
+            # the same way. `getitem` leaves are erased immediately; the tuple
+            # nodes (the size node plus any slice-getitems) are erased last in
+            # reverse push order so a child is always gone before its parent.
+            worklist = [(node, dims)]
+            to_erase = []
+            while worklist:
+                n, ds = worklist.pop()
+                for user in list(n.users):
+                    if (
+                        user.op == "call_function"
+                        and user.target is operator.getitem
+                        and len(user.args) == 2
+                        and user.args[0] is n
+                    ):
+                        index = user.args[1]
+                        # size()[i] -> dims[i] (plain ints included).
+                        if isinstance(index, int):
+                            user.replace_all_uses_with(ds[index])
+                            graph.graph.erase_node(user)
+                            continue
+                        # size()[start:stop] -> derived tuple; process on its turn.
+                        if isinstance(index, slice):
+                            worklist.append((user, ds[index]))
+                            continue
+
+                    # Everything else: rewire args (size nodes nested in slices,
+                    # tuples and lists expand per-dim) and kwargs. A kwarg whose
+                    # value IS the size node takes the full tuple of dims.
+                    user.args = tuple(_replace_size_in_args(user.args, n, ds))
+                    if user.kwargs:
+                        user.kwargs = {
+                            k: (
+                                tuple(ds)
+                                if v is n
+                                else _replace_size_in_args((v,), n, ds)[0]
+                                if isinstance(v, (slice, tuple, list))
+                                else v
+                            )
+                            for k, v in user.kwargs.items()
+                        }
+                to_erase.append(n)
+
+            for n in reversed(to_erase):
+                graph.graph.erase_node(n)
+
+    try:
+        _vllm_backends._decompose_size_nodes = _patched_decompose_size_nodes
+    except Exception:
+        return False
+
+    _UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX_INSTALLED = True
+    return True
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -2218,23 +2414,42 @@ def load_vllm(
     # vLLM >= 0.19.0 ships a piecewise graph-partition pass (`_decompose_size_nodes`,
     # vllm-project/vllm#36038) that crashes on Unsloth's LoRA graph under
     # compilation_config=3: "Tried to erase Node size_N but it still had N users".
-    # Still unpatched as of vLLM 0.23. compilation_config=2 skips piecewise splitting and
-    # is unaffected, so step 3 -> 2 while the installed vLLM ships the broken pass. Detect
-    # by the pass itself (not a version number) so this self-heals once vLLM fixes it.
-    # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 regardless.
+    # Root cause: the pass fails to rewire `size` nodes nested inside a `slice(...)`
+    # object (from the stock LoRA punica `token_lora_mapping[:x.size(0)]` slicing).
+    # `_install_vllm_decompose_size_nodes_fix` monkeypatches a corrected pass (matching
+    # upstream vllm-project/vllm#42543) so CUDA graphs (compilation_config=3) work with
+    # LoRA. If the pass is not present (older/newer vLLM), we fall back to
+    # compilation_config=2 (skips piecewise splitting; no CUDA graphs but no crash).
+    # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 without the fix
+    # (e.g. once vLLM ships the fix upstream), or UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX=0 to
+    # disable the Unsloth-side monkeypatch and take the compilation_config=2 fallback.
     if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
-        try:
-            import vllm.compilation.backends as _vllm_backends
-            broken_piecewise = hasattr(_vllm_backends, "_decompose_size_nodes")
-        except Exception:
-            broken_piecewise = False
-        if broken_piecewise:
+        install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
+        fixed = False
+        if install_fix:
+            try:
+                fixed = _install_vllm_decompose_size_nodes_fix()
+            except Exception as e:
+                print(f"Unsloth: Failed installing piecewise-compile LoRA fix: {e}")
+                fixed = False
+        if fixed:
             print(
-                "Unsloth: This vLLM's piecewise compile is incompatible with LoRA "
-                "(compilation_config=3); using compilation_config=2 instead. "
-                "Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to override."
+                "Unsloth: Patched vLLM's piecewise graph-partition pass so "
+                "compilation_config=3 (CUDA graphs) works with LoRA."
             )
-            compilation_config = 2
+        else:
+            try:
+                import vllm.compilation.backends as _vllm_backends
+                has_pass = hasattr(_vllm_backends, "_decompose_size_nodes")
+            except Exception:
+                has_pass = False
+            if has_pass:
+                print(
+                    "Unsloth: This vLLM's piecewise compile is incompatible with LoRA "
+                    "(compilation_config=3); using compilation_config=2 instead. "
+                    "Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to override."
+                )
+                compilation_config = 2
 
     if compilation_config == 3:
         try:
