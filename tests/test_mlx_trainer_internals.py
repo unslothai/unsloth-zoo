@@ -490,6 +490,110 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     assert trainer.model.modes == ["eval", "train"]
 
 
+def test_evaluate_compute_metrics_pads_and_prefixes_without_metal():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def eval(self):
+            pass
+
+        def train(self):
+            pass
+
+        def __call__(self, input_ids):
+            shape = (input_ids.shape[0], input_ids.shape[1], 8)
+            return {"logits": mx.zeros(shape)}
+
+    seen = {}
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+
+    def preprocess(logits, labels):
+        seen["last_logits_shape"] = tuple(logits.shape)
+        seen["last_labels_shape"] = tuple(labels.shape)
+        return labels
+
+    def compute_metrics(prediction):
+        seen["prediction_type"] = type(prediction).__name__
+        seen["predictions"] = prediction.predictions.tolist()
+        seen["labels"] = prediction.label_ids.tolist()
+        return {"rows": prediction.label_ids.shape[0], "loss": 123.0}
+
+    trainer.preprocess_logits_for_metrics = preprocess
+    trainer.compute_metrics = compute_metrics
+
+    def loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(1.0), mx.array(2)
+
+    loss, _ppl = trainer._evaluate(
+        [
+            (
+                mx.array([[0, 1, 2, 3]]),
+                mx.array([[1, 4]]),
+                mx.array([[0, 1, 2, 3]]),
+            ),
+            (
+                mx.array([[4, 5, 0]]),
+                mx.array([[0, 2]]),
+                mx.array([[4, 5, 0]]),
+            ),
+        ],
+        loss_fn,
+        is_vlm=False,
+    )
+
+    assert loss == pytest.approx(1.0)
+    assert seen["prediction_type"] == "EvalPrediction"
+    assert seen["last_logits_shape"] == (1, 3, 8)
+    assert seen["last_labels_shape"] == (1, 3)
+    assert seen["predictions"] == [[-100, 1, 2, 3], [4, 5, -100, -100]]
+    assert seen["labels"] == [[-100, 1, 2, 3], [4, 5, -100, -100]]
+    assert trainer._last_eval_metrics["eval_rows"] == 2
+    assert trainer._last_eval_metrics["eval_loss"] == pytest.approx(1.0)
+
+
+def test_metric_chunk_concat_handles_scalar_payloads():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    result = MLXTrainer._pad_and_concat_metric_chunks(
+        [mx.array(1.0), mx.array(2.0)]
+    )
+
+    assert result.tolist() == [1.0, 2.0]
+
+
+def test_metric_chunk_concat_handles_mapping_payloads():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    result = MLXTrainer._pad_and_concat_metric_chunks(
+        [
+            {"scores": mx.array([[1, 2]])},
+            {"scores": mx.array([[3]])},
+        ]
+    )
+
+    assert result["scores"].tolist() == [[1, 2], [3, -100]]
+
+
+def test_metric_logits_extractor_accepts_mapping_outputs():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    logits = mx.array([1, 2, 3])
+    hidden = mx.array([4, 5, 6])
+
+    assert MLXTrainer._extract_metric_logits({"logits": logits}) is logits
+    assert MLXTrainer._extract_metric_logits({"loss": mx.array(0.0), "hidden": hidden}) is hidden
+
+
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
