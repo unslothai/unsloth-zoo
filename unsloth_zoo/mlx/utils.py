@@ -2939,10 +2939,10 @@ def _tokenize_mlx_pretokenized_row(
         ]
 
     assistant_masks = item.get("assistant_masks")
-    if assistant_only_loss and assistant_masks is None:
+    if assistant_only_loss and assistant_masks is None and labels is None:
         raise ValueError(
             "Unsloth MLX: pretokenized assistant_only_loss=True rows must "
-            "include 'assistant_masks'."
+            "include 'assistant_masks' or explicit 'labels'."
         )
 
     # Match TRL's collator: pretokenized assistant_masks are labels metadata.
@@ -2954,6 +2954,10 @@ def _tokenize_mlx_pretokenized_row(
             raise ValueError(
                 "Unsloth MLX: pretokenized 'assistant_masks' must match "
                 "'input_ids' length."
+            )
+        if assistant_only_loss:
+            _validate_mlx_assistant_mask(
+                input_ids, assistant_mask, source="pretokenized",
             )
         labels = labels if labels is not None else list(input_ids)
         labels = _apply_mlx_text_label_masks(
@@ -4273,6 +4277,11 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                 "Unsloth MLX: assistant_only_loss=True produced no "
                 "assistant-labeled text rows."
             )
+        if completion_only_loss is True:
+            raise ValueError(
+                "Unsloth MLX: text completion_only_loss=True requires "
+                "prompt/completion rows."
+            )
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
@@ -4368,6 +4377,11 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             if len(ids) >= 2:
                 tokenized.append((ids, labels))
         labeled = bool(tokenized)
+        if completion_only_loss is True and not labeled:
+            raise ValueError(
+                "Unsloth MLX: text completion_only_loss=True requires "
+                "prompt/completion rows."
+            )
 
     if not labeled:
         ds = _prepare_dataset(
