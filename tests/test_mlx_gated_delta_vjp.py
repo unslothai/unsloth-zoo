@@ -1,15 +1,11 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Consolidated gated-delta VJP tests:
-#   * patch_gated_delta consumer-binding sweep — consumers that did
-#     `from .gated_delta import gated_delta_update` hold stale bindings;
-#     the sweep must rebind them by identity and never touch foreign
-#     implementations. Runs everywhere (torch shim on CI without mlx).
+# Gated-delta VJP tests:
+#   * consumer-binding sweep: stale `from .gated_delta import ...` bindings
+#     must be rebound by identity, foreign impls left alone (torch shim on CI).
 #   * structural gated-delta detection for the patch trigger.
-#   * gradient parity vs PLAIN AUTODIFF for both the ops and the fused-
-#     kernel VJP (B >= 2 everywhere: mx `.at[:, t].add` scatters corrupted
-#     every batch row past the first on mlx 0.31 — fixed upstream in
-#     ml-explore/mlx#3483, unreleased; parity-vs-previous-implementation
-#     could not catch that class of bug). Metal-only.
+#   * gradient parity vs PLAIN AUTODIFF for the ops and fused-kernel VJP,
+#     B >= 2 (mx `.at[:, t].add` corrupted rows past the first on mlx 0.31,
+#     fixed by ml-explore/mlx#3483). Metal-only.
 #   * kernel routing: training calls must reach the fused-kernel VJP.
 
 from __future__ import annotations
@@ -33,12 +29,10 @@ requires_metal = pytest.mark.skipif(
     not _HAS_METAL, reason="needs Apple Silicon Metal GPU"
 )
 
-# Snapshot the REAL mlx/mlx_lm modules at collection time. Sibling test
-# files install the mlx_simulation torch-stub into sys.modules at fixture
-# time; the lazy `from mlx_lm...` imports inside the code under test must
-# resolve to the real stack here regardless of execution order. The
-# explicit import below pulls mlx_lm.models.gated_delta into the snapshot
-# (the kernel path from-imports it at call time).
+# Snapshot the REAL mlx/mlx_lm modules now, before sibling test files install
+# the mlx_simulation torch-stub into sys.modules, so the code under test
+# resolves the real stack regardless of order. The explicit import pulls in
+# mlx_lm.models.gated_delta (the kernel path from-imports it at call time).
 if _HAS_REAL_MLX:
     import mlx_lm.models.gated_delta  # noqa: F401
 
@@ -142,8 +136,7 @@ def test_sweep_rebinds_stale_consumers_only(fake_mlx_lm):
     assert fake_mlx_lm.gated_delta._unsloth_gated_delta_patched
     for name, module in fake_mlx_lm.consumers.items():
         assert module.gated_delta_update is patched, f"{name} still stale"
-    # Foreign implementations (same attribute, different function — e.g.
-    # mlx-vlm >= 0.6 ships its own gated_delta module) must not be replaced.
+    # Foreign impls (a different function, e.g. mlx-vlm >= 0.6's own module) stay.
     assert fake_mlx_lm.foreign.gated_delta_update is fake_mlx_lm.foreign_fn
 
 

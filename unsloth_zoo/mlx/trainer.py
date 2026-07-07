@@ -1034,8 +1034,7 @@ class MLXTrainer:
                 patch_gated_delta()
                 patch_gated_delta_vlm()
                 gated_delta_patched = True
-            # Structural, not model_type-based: qwen3_next / kimi_linear share
-            # the same gated_delta_update call sites and need the efficient VJP.
+            # Structural check: qwen3_next / kimi_linear also need the VJP.
             if not gated_delta_patched and model_has_gated_delta_layers(model):
                 from ..gated_delta_vjp import patch_gated_delta
                 patch_gated_delta()

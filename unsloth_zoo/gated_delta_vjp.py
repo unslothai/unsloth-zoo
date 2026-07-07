@@ -274,10 +274,8 @@ def patch_gated_delta():
             q, k, v, a, b, A_log, dt_bias,
             state=None, mask=None, use_kernel=True,
         ):
-            # Heuristic: training calls enter with state=None (no cache); inference
-            # passes the cached state in. Route training through the efficient ops
-            # so the custom VJP runs — gated_delta_kernel has none, so it would keep
-            # all T intermediate states alive and defeat this module.
+            # state=None marks a training call (no cache); route it through
+            # the custom VJP, since gated_delta_kernel has none.
             is_training_call = state is None
             beta = mx.sigmoid(b)
             g = gated_delta.compute_g(A_log, a, dt_bias)
@@ -286,9 +284,7 @@ def patch_gated_delta():
                 Hv, Dv = v.shape[-2:]
                 state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-            # No incoming state cache: training. Prefer the fused-kernel VJP
-            # (fast, O(chunks) graph); fall back to the ops VJP when the call
-            # shape is outside kernel support.
+            # Training: prefer the fused-kernel VJP, ops VJP otherwise.
             if is_training_call:
                 if gated_delta_kernel_supported(q, g, mask, v):
                     return gated_delta_kernel_efficient(
@@ -306,12 +302,10 @@ def patch_gated_delta():
         gated_delta._unsloth_gated_delta_patched = True
         print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
 
-    # Sweep on every call (not just the first): a consumer module imported
-    # after a previous patch still holds a stale from-import binding.
+    # Sweep every call: a consumer imported after a prior patch is still stale.
     original = getattr(gated_delta, "_unsloth_gated_delta_original", None)
     if original is None:
-        # An older patch set the flag without recording the original; the
-        # identity sweep has nothing safe to match against.
+        # Older patch set the flag without recording the original; nothing to match.
         return
     patched = gated_delta.gated_delta_update
     rebound = []
@@ -323,13 +317,11 @@ def patch_gated_delta():
         if binding is None or binding is patched:
             continue
         if "patch_gated_delta" in getattr(binding, "__qualname__", ""):
-            # A sibling unsloth patch (patch_gated_delta_vlm) already owns
-            # this binding; it is not a foreign implementation.
+            # Owned by a sibling unsloth patch (patch_gated_delta_vlm); not foreign.
             continue
         if binding is original:
-            # Identity match: this is a stale from-import of the function we
-            # replaced. Anything else (e.g. mlx-vlm >= 0.6 ships its own
-            # gated_delta module) is a foreign implementation we must not touch.
+            # Stale from-import of the function we replaced; rebind it. Anything
+            # else is a foreign implementation (e.g. mlx-vlm >= 0.6's own module).
             module.gated_delta_update = patched
             rebound.append(name)
         else:
@@ -392,8 +384,7 @@ def patch_gated_delta_vlm():
         q, k, v, a, b, A_log, dt_bias,
         state=None, mask=None, use_kernel=True,
     ):
-        # state=None means a training call; route it through the
-        # differentiable VJP. Inference (state provided) keeps the kernel.
+        # state=None is training (use the VJP); inference keeps the kernel.
         if state is not None:
             return original_update(
                 q, k, v, a, b, A_log, dt_bias,
@@ -418,22 +409,18 @@ def patch_gated_delta_vlm():
 # --------------------------------------------------------------------------
 # Fused Metal kernels for the training backward pass.
 #
-# The ops-based VJP above is memory-correct but builds ~T*12 lazy
-# primitives per layer per step (dispatch-bound, unfusable by mx.compile).
-# These kernels replace both directions at chunk granularity: forward
-# reuses mlx-lm's fused gated_delta_kernel per chunk; backward replays the
-# chunk states (K1) and reverse-scans with atomic grad accumulation (K2).
-# Eligibility: Metal GPU, no mask (training passes mask=None), and
-# Dk % 32 == 0; both scalar (qwen3_5/qwen3_next) and vectorized
-# (kimi_linear) gating are supported — anything else falls back to the
-# ops VJP. Atomic accumulation makes low-order gradient bits
-# nondeterministic, matching Metal reduction-order behavior elsewhere.
+# The ops VJP above is memory-correct but dispatch-bound (~T*12 lazy
+# primitives per layer per step, unfusable by mx.compile). These kernels work
+# at chunk granularity: forward reuses mlx-lm's gated_delta_kernel per chunk;
+# backward replays chunk states (K1) and reverse-scans with atomic grad
+# accumulation (K2). Eligible on Metal GPU, mask=None, Dk % 32 == 0, for both
+# scalar (qwen3_5/qwen3_next) and vectorized (kimi_linear) gating; else falls
+# back to the ops VJP. Atomic accumulation leaves low-order gradient bits
+# nondeterministic, as elsewhere on Metal.
 #
-# NOTE: this section must stay BELOW patch_gated_delta. The pinned-symbol
-# suite asserts the patched function's training branch precedes the first
-# `gated_delta_kernel(` occurrence in this file (commit 46866ce regression
-# net), and the chunked forward below legitimately calls that kernel.
-# patch_gated_delta resolves these names at call time, so definition
+# Must stay BELOW patch_gated_delta: the pinned-symbol suite (commit 46866ce)
+# asserts the patched training branch precedes the first `gated_delta_kernel(`
+# here. patch_gated_delta resolves these names at call time, so definition
 # order is semantically irrelevant.
 # --------------------------------------------------------------------------
 
@@ -775,8 +762,8 @@ def gated_delta_kernel_efficient(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     if (repeat_factor := Hv // Hk) > 1:
-        # The repeat is recorded outside the custom_function, so autodiff
-        # folds the per-group gradient sum back to [B, T, Hk, Dk] for us.
+        # Repeat outside custom_function so autodiff folds the per-group
+        # gradient sum back to [B, T, Hk, Dk].
         q = mx.repeat(q, repeat_factor, -2)
         k = mx.repeat(k, repeat_factor, -2)
 
