@@ -1929,7 +1929,10 @@ class MLXTrainer:
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
-        self._setup_report_to_callbacks()
+        # Only rank 0 opens W&B / TensorBoard; other ranks would each start a
+        # duplicate run under the same output_dir (HF Trainer gates this too).
+        if self.is_main_process:
+            self._setup_report_to_callbacks()
         self._install_neftune()
         is_main_process = self.is_main_process
 
@@ -3079,10 +3082,14 @@ class MLXTrainer:
                         self._best_metric = _cur
                         self._best_step = current_step
                         self._es_patience_counter = 0
-                        try:
-                            save_trainable_adapters(model, f"{args.output_dir}/best")
-                        except ValueError as e:
-                            print(f"  Unsloth: skipped best-model save ({e})")
+                        # Bookkeeping above runs on every rank so early-stopping
+                        # stays in lockstep; only rank 0 writes output_dir/best to
+                        # avoid concurrent writes to the same file.
+                        if is_main_process:
+                            try:
+                                save_trainable_adapters(model, f"{args.output_dir}/best")
+                            except ValueError as e:
+                                print(f"  Unsloth: skipped best-model save ({e})")
                     else:
                         self._es_patience_counter += 1
                         _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
