@@ -144,7 +144,9 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
         free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
         free_gb = free / 1024 / 1024 / 1024
         free_gb = free_gb * 0.5
-        target_gb = free_gb
+        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
+        # single chunk, materializing full float32 logits and dominating peak memory.
+        target_gb = min(free_gb, 4.0)
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -160,9 +162,15 @@ def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
     """Number of chunks that fits the target max memory usage."""
     multiplier = _get_chunk_multiplier(vocab_size, target_gb)
     n_splits = (bsz*qlen) * multiplier
-    # n_splits = max(round(n_splits / 4) * 4, 1) # Output only multiples of 4
-    n_splits = max(round(n_splits) * 4, 1)
-    return n_splits
+    # n_splits * 4 == (full float32 logits GiB) / target: the exact number of
+    # chunks needed to keep every chunk within target. Round UP to the next
+    # multiple of 4 so the target stays a real ceiling. Nearest-rounding could
+    # round down (round(0.5) -> 0) and collapse a 4-8 GiB logits transient into
+    # a single uncapped chunk; a config that already fits one chunk stays at one.
+    exact = n_splits * 4
+    if exact <= 1.0 + 1e-9:
+        return 1
+    return math.ceil(exact / 4 - 1e-9) * 4
 pass
 
 class UnslothFusedLoss(torch.autograd.Function):
