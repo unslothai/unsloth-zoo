@@ -3795,31 +3795,26 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
 
 
 def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
-    """Mask synthetic VLM eval padding rows so they do not affect metrics.
+    """Mask synthetic VLM eval padding labels so they do not affect metrics.
 
-    Keep input_ids unchanged: VLM processors may have already attached row-
-    aligned image features, and blanking image tokens would desynchronize the
-    text/image counts expected by Qwen/Gemma-style VLM forwards.
+    Keep input_ids and attention_mask unchanged: VLM processors may have
+    already attached row-aligned image features, and the forward still needs a
+    valid text/vision row. Labels alone exclude the row from eval loss.
     """
     if not any(empty_rows):
         return batch_dict
     row_mask = np.asarray(empty_rows, dtype=bool)
-    for key, fill_value in (
-        ("attention_mask", 0),
-        ("labels", -100),
-    ):
-        value = batch_dict.get(key)
-        if value is None or not hasattr(value, "shape"):
-            continue
-        if int(value.shape[0]) != int(row_mask.shape[0]):
-            continue
-        dtype = np.int64 if key == "labels" else np.int32
-        arr = np.asarray(
-            value.tolist() if hasattr(value, "tolist") else value,
-            dtype=dtype,
-        )
-        arr[row_mask] = fill_value
-        batch_dict[key] = mx.array(arr)
+    value = batch_dict.get("labels")
+    if value is None or not hasattr(value, "shape"):
+        return batch_dict
+    if int(value.shape[0]) != int(row_mask.shape[0]):
+        return batch_dict
+    arr = np.asarray(
+        value.tolist() if hasattr(value, "tolist") else value,
+        dtype=np.int64,
+    )
+    arr[row_mask] = -100
+    batch_dict["labels"] = mx.array(arr)
     return batch_dict
 
 

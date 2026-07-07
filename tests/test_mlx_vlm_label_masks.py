@@ -289,7 +289,7 @@ def test_vlm_response_mask_filters_before_batching_like_cuda():
     ]
 
 
-def test_vlm_empty_eval_padding_keeps_image_tokens_with_vision_features():
+def test_vlm_empty_eval_padding_keeps_forward_valid_with_vision_features():
     from unsloth_zoo.mlx.utils import create_vlm_batches
 
     class FakeWorld:
@@ -309,7 +309,7 @@ def test_vlm_empty_eval_padding_keeps_image_tokens_with_vision_features():
 
     empty_batch = batches[1]
     assert empty_batch["input_ids"].tolist()[0] == [101, 200, 102, 0]
-    assert empty_batch["attention_mask"].tolist()[0] == [0, 0, 0, 0]
+    assert empty_batch["attention_mask"].tolist()[0] == [1, 1, 1, 0]
     assert empty_batch["labels"].tolist()[0] == [-100, -100, -100, -100]
     assert empty_batch["pixel_values"].shape[0] == 1
     assert len(empty_batch["image_grid_thw"]) == 1

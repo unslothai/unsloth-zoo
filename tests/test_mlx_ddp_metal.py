@@ -474,7 +474,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[0]["vlm_empty_eval"][1]["ids"][0][0] == 12
     assert ranks[1]["vlm_empty_eval"][1]["ids"][0][0] == 12
     assert ranks[1]["vlm_empty_eval"][1]["ids"][0][1] == 20
-    assert all(value == 0 for value in ranks[1]["vlm_empty_eval"][1]["mask"][0])
+    assert ranks[1]["vlm_empty_eval"][1]["mask"][0] == [1, 1, 1, 1]
     assert all(value == -100 for value in ranks[1]["vlm_empty_eval"][1]["labels"][0])
     assert [rank["stream_text"] for rank in ranks] == expected_stream
     assert [rank["stream_vlm"] for rank in ranks] == expected_stream
