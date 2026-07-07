@@ -36,7 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 import concurrent.futures
 import math
 import os
@@ -51,6 +51,107 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
+
+
+class MLXTrainOutput(dict):
+    """Dict-compatible train() result with HF Trainer-style attributes."""
+
+    @property
+    def metrics(self):
+        return self
+
+    @property
+    def global_step(self):
+        return self.get("train_steps", 0)
+
+    @property
+    def training_loss(self):
+        return self.get("train_loss", 0.0)
+
+
+class _MLXTokenizedDatasetView:
+    """Lazy public dataset view that adds input_ids for SFTTrainer parity."""
+
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        max_seq_length,
+        formatting_func=None,
+        dataset_text_field="text",
+        chat_template=None,
+        model_name=None,
+        model_type=None,
+        append_eos=True,
+    ):
+        self._dataset = dataset
+        self._tokenizer = normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        self._max_seq_length = max_seq_length
+        self._formatting_func = formatting_func
+        self._dataset_text_field = dataset_text_field
+        self._append_eos = append_eos
+
+    def __getattr__(self, name):
+        return getattr(self._dataset, name)
+
+    def __len__(self):
+        return len(self._dataset)
+
+    def __iter__(self):
+        for item in self._dataset:
+            yield self._with_input_ids(item)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key in ("input_ids", "attention_mask"):
+                return [self._with_input_ids(self._dataset[idx])[key] for idx in range(len(self))]
+            try:
+                return self._dataset[key]
+            except (KeyError, TypeError):
+                values = []
+                for idx in range(len(self)):
+                    item = self._dataset[idx]
+                    if not isinstance(item, dict) or key not in item:
+                        raise
+                    values.append(item[key])
+                return values
+        if not isinstance(key, int):
+            return self._dataset[key]
+        return self._with_input_ids(self._dataset[key])
+
+    def _with_input_ids(self, item):
+        if not isinstance(item, dict) or "input_ids" in item:
+            return item
+
+        source = self._formatting_func(item) if self._formatting_func is not None else item
+        texts = collect_mlx_texts(
+            self._tokenizer,
+            source,
+            dataset_text_field=self._dataset_text_field,
+            is_vlm=False,
+        )
+        if not texts:
+            return item
+
+        encoded = encode_mlx_text(self._tokenizer, texts[0])
+        eos_id = getattr(self._tokenizer, "eos_token_id", None)
+        if self._append_eos and eos_id is not None and (not encoded or encoded[-1] != eos_id):
+            encoded = list(encoded) + [eos_id]
+        if self._max_seq_length and len(encoded) > self._max_seq_length:
+            encoded = encoded[:self._max_seq_length]
+
+        item = dict(item)
+        item["input_ids"] = encoded
+        item["attention_mask"] = [1] * len(encoded)
+        return item
+
 
 from .utils import (
     make_cce_loss_fn,
@@ -83,6 +184,7 @@ from .utils import (
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
+    _get_text_model,
 )
 from .compile import (
     build_compile_policy,
@@ -255,7 +357,24 @@ def _text_completion_only_loss_arg(args):
 
 
 def _normalize_mlx_optimizer_name(name):
+    if hasattr(name, "value"):
+        name = name.value
     opt_name = str(name or "adamw").strip().lower()
+    opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
+    if opt_name in (
+        "adamw_8bit",
+        "paged_adamw_8bit",
+        "adamw_bnb_8bit",
+        "paged_adamw_32bit",
+        "adamw_torch",
+        "adamw_torch_fused",
+        "paged_adamw",
+        "adamw_32bit",
+        "adamw_hf",
+        "adamw_anyprecision",
+        "adamw_apex_fused",
+    ):
+        opt_name = "adamw"
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
         supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
         raise ValueError(
@@ -271,7 +390,10 @@ _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
 
 
 def _normalize_mlx_scheduler_type(name):
+    if hasattr(name, "value"):
+        name = name.value
     sched_type = str(name or "linear").strip().lower()
+    sched_type = sched_type.rsplit(".", 1)[-1].replace("-", "_")
     if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
         supported = ", ".join(SUPPORTED_MLX_LR_SCHEDULERS)
         raise ValueError(
@@ -399,6 +521,7 @@ class MLXTrainingConfig:
     max_steps: int = 60
     num_train_epochs: int = -1  # -1 means use max_steps instead
     warmup_steps: int = 5
+    warmup_ratio: float = 0.0
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "linear"  # "cosine", "linear", "constant"
 
@@ -436,6 +559,11 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    load_best_model_at_end: bool = False
+    metric_for_best_model: str = "eval_loss"
+    greater_is_better: bool = False
+    early_stopping_patience: int = 0  # 0 = disabled
+    neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -469,6 +597,54 @@ class MLXTrainingConfig:
     completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
+    per_device_eval_batch_size: int | None = None
+    image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
+
+    def __init__(self, *args, **kwargs):
+        config_fields = [field for field in fields(type(self)) if field.init]
+        if len(args) > len(config_fields):
+            raise TypeError(
+                f"MLXTrainingConfig expected at most {len(config_fields)} "
+                f"positional arguments, got {len(args)}"
+            )
+        for field, value in zip(config_fields, args):
+            if field.name in kwargs:
+                raise TypeError(
+                    f"MLXTrainingConfig got multiple values for argument "
+                    f"{field.name!r}"
+                )
+            kwargs[field.name] = value
+
+        provided = set(kwargs)
+        unknown = provided - {field.name for field in config_fields}
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise TypeError(f"MLXTrainingConfig got unexpected arguments: {names}")
+
+        for field in config_fields:
+            if field.name in kwargs:
+                value = kwargs[field.name]
+            elif field.default is not MISSING:
+                value = field.default
+            elif field.default_factory is not MISSING:
+                value = field.default_factory()
+            else:
+                raise TypeError(
+                    f"MLXTrainingConfig missing required argument: {field.name!r}"
+                )
+            setattr(self, field.name, value)
+
+        warmup_steps_default = type(self).warmup_steps
+        warmup_ratio_default = type(self).warmup_ratio
+        copied_all_fields = len(provided) == len(config_fields)
+        copied_default_warmup_with_ratio = (
+            copied_all_fields
+            and getattr(self, "warmup_steps", None) == warmup_steps_default
+            and getattr(self, "warmup_ratio", None) != warmup_ratio_default
+        )
+        self._unsloth_mlx_warmup_steps_explicit = (
+            "warmup_steps" in provided and not copied_default_warmup_with_ratio
+        )
 
 
 class MLXTrainer:
@@ -492,6 +668,7 @@ class MLXTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.train_dataset = train_dataset
+        self._mlx_train_dataset_for_batches = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
         # Use args or defaults
@@ -515,6 +692,27 @@ class MLXTrainer:
             )
             self.args.packing = False
 
+        if (
+            not self._is_vlm
+            and self.train_dataset is not None
+            and self.tokenizer is not None
+            and hasattr(self.train_dataset, "__getitem__")
+            and hasattr(self.train_dataset, "__len__")
+        ):
+            config = getattr(self.model, "_config", {})
+            model_type = config.get("model_type") if isinstance(config, dict) else None
+            self.train_dataset = _MLXTokenizedDatasetView(
+                self.train_dataset,
+                self.tokenizer,
+                self.args.max_seq_length,
+                formatting_func=self.formatting_func,
+                dataset_text_field=self.args.dataset_text_field,
+                chat_template=getattr(self.args, "chat_template", None),
+                model_name=getattr(self.model, "_hf_repo", None),
+                model_type=model_type,
+                append_eos=bool(getattr(self.args, "append_eos", True)),
+            )
+
         # Freeze non-LoRA params when LoRA is detected. Otherwise LayerNorm
         # weights stay trainable and adaptive optimizers NaN on step 1 (their
         # 1D second-moment init is numerically unstable).
@@ -531,6 +729,13 @@ class MLXTrainer:
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
         self.stop_requested = False  # Set True to stop training early
+        self._best_metric = None
+        self._best_step = None
+        self._es_patience_counter = 0
+
+    def _train_dataset_for_batches(self):
+        """Return the internal dataset used for MLX batch construction."""
+        return getattr(self, "_mlx_train_dataset_for_batches", self.train_dataset)
 
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
@@ -611,10 +816,41 @@ class MLXTrainer:
             f"parameters to prevent optimizer NaN."
         )
 
+    def _resolve_warmup_steps(self, total_steps):
+        get_warmup_steps = getattr(self.args, "get_warmup_steps", None)
+        if callable(get_warmup_steps):
+            return max(0, int(get_warmup_steps(total_steps)))
+
+        warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
+        warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
+        if warmup_ratio is None:
+            return max(0, warmup_steps)
+        try:
+            warmup_ratio = float(warmup_ratio)
+        except (TypeError, ValueError):
+            return max(0, warmup_steps)
+        if warmup_ratio == 0.0:
+            return max(0, warmup_steps)
+
+        default_warmup_steps = getattr(type(self.args), "warmup_steps", 5)
+        steps_explicit = getattr(
+            self.args,
+            "_unsloth_mlx_warmup_steps_explicit",
+            warmup_steps != default_warmup_steps,
+        )
+        # HF get_warmup_steps parity: a zero warmup_steps never overrides a positive
+        # warmup_ratio. warmup_steps == 0 means "use the ratio" even when explicitly
+        # set, so only a positive explicit step count wins over the ratio.
+        if steps_explicit and warmup_steps > 0:
+            return max(0, warmup_steps)
+
+        resolved = math.ceil(max(0.0, warmup_ratio) * max(0, int(total_steps)))
+        return min(max(0, int(total_steps)), max(0, resolved))
+
     def _build_schedule(self, total_steps):
         """Build LR schedule from config. Returns a callable or float."""
         lr = self.args.learning_rate
-        warmup = self.args.warmup_steps
+        warmup = self._resolve_warmup_steps(total_steps)
         sched_type = _normalize_mlx_scheduler_type(self.args.lr_scheduler_type)
 
         if sched_type == "constant" and warmup == 0:
@@ -1006,11 +1242,151 @@ class MLXTrainer:
             pass
         self._prior_metal_limits = {}
 
+    def _setup_report_to_callbacks(self):
+        """Auto-register W&B / TensorBoard callbacks from report_to, mirroring
+        Studio worker.py log keys so notebook and Studio runs chart identically."""
+        raw = getattr(self.args, "report_to", "none")
+        if not raw or raw == "none":
+            return
+        targets = raw if isinstance(raw, (list, tuple)) else [raw]
+        targets = {str(t).lower() for t in targets}
+
+        wandb_run = None
+        if "wandb" in targets:
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=os.environ.get("WANDB_PROJECT", "unsloth-mlx"),
+                    config={k: v for k, v in vars(self.args).items()
+                            if not k.startswith("_")},
+                )
+            except Exception as e:
+                print(f"Unsloth: wandb init failed: {e}")
+                wandb_run = None
+
+        tb_writer = None
+        if "tensorboard" in targets:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError:
+                try:
+                    from tensorboardX import SummaryWriter
+                except ImportError:
+                    SummaryWriter = None
+            if SummaryWriter is not None:
+                tb_writer = SummaryWriter(
+                    log_dir=os.path.join(self.args.output_dir, "runs"))
+
+        if wandb_run is None and tb_writer is None:
+            return
+
+        def _on_step(step, total_steps, loss, lr, tokens_sec, peak_gb,
+                     elapsed, num_tokens, grad_norm=None):
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({
+                        "train/loss": loss,
+                        "train/learning_rate": lr,
+                        "train/tokens_per_sec": tokens_sec,
+                        "train/peak_gb": peak_gb,
+                        "train/num_tokens": num_tokens,
+                        **({"train/grad_norm": grad_norm} if grad_norm is not None else {}),
+                    }, step=step)
+                except Exception:
+                    pass
+            if tb_writer is not None:
+                try:
+                    tb_writer.add_scalar("train/loss", loss, step)
+                    tb_writer.add_scalar("train/learning_rate", lr, step)
+                    tb_writer.add_scalar("train/tokens_per_sec", tokens_sec, step)
+                    tb_writer.add_scalar("train/peak_gb", peak_gb, step)
+                    if grad_norm is not None:
+                        tb_writer.add_scalar("train/grad_norm", grad_norm, step)
+                except Exception:
+                    pass
+
+        def _on_eval(step, eval_loss, perplexity):
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({"eval/loss": eval_loss,
+                                   "eval/perplexity": perplexity}, step=step)
+                except Exception:
+                    pass
+            if tb_writer is not None:
+                try:
+                    tb_writer.add_scalar("eval/loss", eval_loss, step)
+                    tb_writer.add_scalar("eval/perplexity", perplexity, step)
+                except Exception:
+                    pass
+
+        self.add_step_callback(_on_step)
+        self.add_eval_callback(_on_eval)
+        self._report_to_handles = (wandb_run, tb_writer)
+        self._report_to_callbacks = (_on_step, _on_eval)
+
+    def _install_neftune(self):
+        """NEFTune: add scaled uniform noise to input embeddings during training.
+        Text models only; no-op in eval. Uses __class__ reassignment (a real
+        subclass) rather than a module swap, so the embedding object is
+        unchanged -- .weight stays readable for tied LM-head models, and
+        __call__ resolves on the subtype so interception actually fires."""
+        alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
+        if alpha <= 0:
+            return
+        if self._is_vlm:
+            print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
+                  "for VLM models on MLX; ignoring.")
+            return
+        try:
+            tm = _get_text_model(self.model)
+            backbone = getattr(tm, "model", tm)
+            emb = backbone.embed_tokens
+        except Exception as e:
+            print(f"Unsloth: NEFTune could not locate embed_tokens ({e}); ignoring.")
+            return
+        if getattr(emb, "_unsloth_neftune_active", False):
+            return
+
+        _Base = type(emb)
+        _alpha = alpha
+
+        class _NEFTuneEmbed(_Base):
+            _unsloth_neftune_active = True
+            def __call__(self, x):
+                out = _Base.__call__(self, x)
+                if getattr(self, "training", False):
+                    dim = out.shape[-1] * out.shape[-2]
+                    scale = _alpha / (dim ** 0.5)
+                    noise = mx.random.uniform(
+                        low=-1.0, high=1.0, shape=out.shape
+                    ).astype(out.dtype) * scale
+                    return out + noise
+                return out
+
+        self._neftune_emb = emb
+        self._neftune_base_cls = _Base
+        emb.__class__ = _NEFTuneEmbed
+        print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}).")
+
+    def _remove_neftune(self):
+        emb = getattr(self, "_neftune_emb", None)
+        base = getattr(self, "_neftune_base_cls", None)
+        if emb is not None and base is not None:
+            try:
+                emb.__class__ = base
+            except Exception:
+                pass
+        self._neftune_emb = None
+        self._neftune_base_cls = None
+
+
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
+        self._setup_report_to_callbacks()
+        self._install_neftune()
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
@@ -1105,6 +1481,20 @@ class MLXTrainer:
 
             return self._train_inner()
         finally:
+            _handles = getattr(self, "_report_to_handles", (None, None))
+            _wb, _tb = _handles
+            if _tb is not None:
+                try: _tb.close()
+                except Exception: pass
+            if _wb is not None:
+                try: _wb.finish()
+                except Exception: pass
+            for _cb in getattr(self, "_report_to_callbacks", ()):
+                if _cb in self._step_callbacks: self._step_callbacks.remove(_cb)
+                if _cb in self._eval_callbacks: self._eval_callbacks.remove(_cb)
+            self._report_to_handles = (None, None)
+            self._report_to_callbacks = ()
+            self._remove_neftune()
             if args.gradient_checkpointing:
                 try:
                     remove_gradient_checkpointing(model)
@@ -1556,6 +1946,10 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
+            eval_batch_size = (
+                getattr(args, "per_device_eval_batch_size", None)
+                or args.per_device_train_batch_size
+            )
             # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
@@ -1571,8 +1965,9 @@ class MLXTrainer:
                             dataset=eval_dataset,
                             processor=processor,
                             config=config,
-                            batch_size=args.per_device_train_batch_size,
+                            batch_size=eval_batch_size,
                             max_seq_length=args.max_seq_length,
+                            image_size=getattr(args, "image_size", None),
                             seed=args.seed,
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
@@ -1581,7 +1976,7 @@ class MLXTrainer:
                     return create_batches(
                         dataset=eval_dataset,
                         tokenizer=self.tokenizer,
-                        batch_size=args.per_device_train_batch_size,
+                        batch_size=eval_batch_size,
                         max_seq_length=args.max_seq_length,
                         seed=args.seed,
                         dataset_text_field=args.dataset_text_field,
@@ -1837,6 +2232,44 @@ class MLXTrainer:
                     except Exception as e:
                         print(f"Unsloth: eval callback error: {e}")
 
+                # Best-model tracking + early stopping (Item-5).
+                _track = getattr(args, "load_best_model_at_end", False) or \
+                    int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                if _track:
+                    _metric_name = getattr(args, "metric_for_best_model", "eval_loss")
+                    _em = self._last_eval_metrics or {}
+                    if _metric_name not in _em:
+                        raise ValueError(
+                            f"metric_for_best_model={_metric_name!r} not in eval "
+                            f"metrics; available: {sorted(_em)}"
+                        )
+                    _cur = _em[_metric_name]
+                    _greater = bool(getattr(args, "greater_is_better", False))
+                    _improved = (
+                        _cur == _cur  # reject NaN: a diverged eval must never become "best"
+                        and (
+                            self._best_metric is None
+                            or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                        )
+                    )
+                    if _improved:
+                        self._best_metric = _cur
+                        self._best_step = current_step
+                        self._es_patience_counter = 0
+                        try:
+                            save_trainable_adapters(model, f"{args.output_dir}/best")
+                        except ValueError as e:
+                            print(f"  Unsloth: skipped best-model save ({e})")
+                    else:
+                        self._es_patience_counter += 1
+                        _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
+                        if _pat > 0 and self._es_patience_counter >= _pat:
+                            print(
+                                f"Unsloth: early stopping at step {current_step} "
+                                f"(no {_metric_name} improvement in {_pat} evals)."
+                            )
+                            self.stop_requested = True
+
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
@@ -1878,6 +2311,17 @@ class MLXTrainer:
               f"Steps: {total_steps} | "
               f"Tokens: {trained_tokens}")
 
+        # load_best_model_at_end: restore best adapters before the final save.
+        if getattr(args, "load_best_model_at_end", False) and self._best_step is not None:
+            _best_path = f"{args.output_dir}/best/adapters.safetensors"
+            if os.path.exists(_best_path):
+                try:
+                    model.load_weights(_best_path, strict=False)
+                    print(f"Unsloth: Restored best model from step {self._best_step} "
+                          f"({args.metric_for_best_model}={self._best_metric:.4f}).")
+                except Exception as e:
+                    print(f"Unsloth: failed to restore best model ({e}).")
+
         # Honor the documented save_steps=0 contract: save at end of training.
         try:
             self.save_model()
@@ -1886,10 +2330,11 @@ class MLXTrainer:
         else:
             print(f"Unsloth: Saved final adapters to {args.output_dir}")
 
-        return {
+        return MLXTrainOutput({
             "train_loss": avg_loss,
             "train_runtime": total_time,
-            "train_steps": total_steps,
+            "train_steps": self._global_step,
+            "total_train_steps": total_steps,
             "trained_tokens": trained_tokens,
             "train_samples_per_second": (
                 trained_tokens / total_time if total_time > 0 else 0
@@ -1921,7 +2366,7 @@ class MLXTrainer:
             "base_quantized_source": getattr(
                 self.model, "_unsloth_quantized_source", None,
             ),
-        }
+        })
 
     def _resolve_vlm_processor(self):
         """Resolve the processor used for VLM collation without mutating model."""
@@ -1960,6 +2405,7 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
@@ -2003,11 +2449,12 @@ class MLXTrainer:
             )
             if args.streaming:
                 return None, iterate_vlm_training_batches(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     processor=processor,
                     config=config,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
+                    image_size=getattr(args, "image_size", None),
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
                     formatting_func=self.formatting_func,
@@ -2017,11 +2464,12 @@ class MLXTrainer:
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
                 batches = create_vlm_batches(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     processor=processor,
                     config=config,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
+                    image_size=getattr(args, "image_size", None),
                     num_batches=total_batches_needed,
                     seed=args.seed,
                     response_mask_fn=_vlm_mask_fn,
@@ -2047,7 +2495,7 @@ class MLXTrainer:
                         "streaming or materialize batches."
                     )
                 return None, iterate_training_batches(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     tokenizer=self.tokenizer,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
@@ -2061,7 +2509,7 @@ class MLXTrainer:
                 )
             else:
                 batch_kwargs = dict(
-                    dataset=self.train_dataset,
+                    dataset=train_dataset,
                     tokenizer=self.tokenizer,
                     batch_size=args.per_device_train_batch_size,
                     max_seq_length=args.max_seq_length,
@@ -2236,7 +2684,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             model_name=None, model_type=None,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
-                            num_epochs=None):
+                            num_epochs=None, return_dataset=False):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -2408,7 +2856,22 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         all_tensors.extend([batch_arr, lengths_arr, labels_arr])
     mx.eval(all_tensors)
 
+    if return_dataset:
+        return batches, _create_response_masked_dataset(all_items)
     return batches
+
+
+def _create_response_masked_dataset(items):
+    """Build a Dataset-like public view from tokenized response-masked rows."""
+    rows = [
+        {"input_ids": list(input_ids), "labels": list(labels)}
+        for input_ids, labels in items
+    ]
+    try:
+        from datasets import Dataset
+    except ImportError:
+        return rows
+    return Dataset.from_list(rows)
 
 
 def _check_all_masked(batches, max_check=100):
@@ -2590,8 +3053,9 @@ def train_on_responses_only(
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
-        batches = _create_labeled_batches(
-            dataset=trainer.train_dataset,
+        train_dataset = trainer._train_dataset_for_batches()
+        batches, response_masked_dataset = _create_labeled_batches(
+            dataset=train_dataset,
             tokenizer=_tokenizer,
             mask_fn=mask_fn,
             batch_size=args.per_device_train_batch_size,
@@ -2611,7 +3075,10 @@ def train_on_responses_only(
             dataset_order=getattr(args, "dataset_order", "default"),
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
+            return_dataset=True,
         )
+        trainer.train_dataset = response_masked_dataset
+        trainer._mlx_train_dataset_for_batches = response_masked_dataset
 
         # Safety check: detect all-masked labels early
         _check_all_masked(batches)
@@ -2622,13 +3089,18 @@ def train_on_responses_only(
 
         # Process eval dataset too
         if trainer.eval_dataset is not None:
+            eval_batch_size = (
+                getattr(args, "per_device_eval_batch_size", None)
+                or args.per_device_train_batch_size
+            )
+
             def _create_labeled_eval_batches(eval_dataset):
                 """Build response-masked eval batches for one dataset split."""
-                return _create_labeled_batches(
+                batches, response_masked_dataset = _create_labeled_batches(
                     dataset=eval_dataset,
                     tokenizer=_tokenizer,
                     mask_fn=mask_fn,
-                    batch_size=args.per_device_train_batch_size,
+                    batch_size=eval_batch_size,
                     max_seq_length=args.max_seq_length,
                     formatting_func=trainer.formatting_func,
                     dataset_text_field=args.dataset_text_field,
@@ -2643,15 +3115,20 @@ def train_on_responses_only(
                     append_eos=bool(getattr(args, "append_eos", True)),
                     dataset_order=getattr(args, "dataset_order", "default"),
                     preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
+                    return_dataset=True,
                 )
+                return batches, response_masked_dataset
 
             if isinstance(trainer.eval_dataset, dict):
-                eval_batches = {
-                    key: _create_labeled_eval_batches(value)
-                    for key, value in trainer.eval_dataset.items()
-                }
+                eval_batches = {}
+                for key, value in trainer.eval_dataset.items():
+                    split_batches, split_dataset = _create_labeled_eval_batches(value)
+                    eval_batches[key] = split_batches
+                    trainer.eval_dataset[key] = split_dataset
             else:
-                eval_batches = _create_labeled_eval_batches(trainer.eval_dataset)
+                eval_batches, trainer.eval_dataset = _create_labeled_eval_batches(
+                    trainer.eval_dataset
+                )
             trainer._eval_batches_labeled = eval_batches
 
         print(f"Unsloth: train_on_responses_only enabled "
