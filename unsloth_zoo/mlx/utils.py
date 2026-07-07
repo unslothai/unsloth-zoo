@@ -4149,7 +4149,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     Yields:
         (batch, lengths) tuples — same format as create_batches.
     """
-    normalize_mlx_chat_template(
+    tokenizer = normalize_mlx_chat_template(
         tokenizer,
         chat_template=chat_template,
         model_name=model_name,

@@ -3084,12 +3084,23 @@ class MLXTrainer:
                         self._es_patience_counter = 0
                         # Bookkeeping above runs on every rank so early-stopping
                         # stays in lockstep; only rank 0 writes output_dir/best to
-                        # avoid concurrent writes to the same file.
+                        # avoid concurrent writes. Sync any save failure across
+                        # ranks (mirrors the checkpoint path) so a rank-0 disk or
+                        # permission error does not leave peers hanging at the next
+                        # collective.
+                        best_save_error = None
                         if is_main_process:
                             try:
                                 save_trainable_adapters(model, f"{args.output_dir}/best")
                             except ValueError as e:
                                 print(f"  Unsloth: skipped best-model save ({e})")
+                            except Exception as e:
+                                best_save_error = e
+                        self._raise_distributed_failure(
+                            best_save_error is not None,
+                            "best-model save",
+                            best_save_error,
+                        )
                     else:
                         self._es_patience_counter += 1
                         _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
