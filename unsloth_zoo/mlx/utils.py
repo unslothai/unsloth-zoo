@@ -3018,6 +3018,17 @@ def _ensure_reiterable_text_dataset(dataset):
     return list(dataset)
 
 
+def _labeled_row_has_supervision(labels, max_seq_length):
+    # A labeled row supervises loss only on labels[1:length] (causal shift);
+    # length is capped at max_seq_length by the batch builder. Rows that are
+    # entirely -100 there contribute zero supervised tokens; once length
+    # sorting clusters them they can form a fully masked batch that aborts
+    # training. Plain-LM rows (labels is None) are always kept.
+    if labels is None:
+        return True
+    return any(int(x) != -100 for x in labels[1:max_seq_length])
+
+
 def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
     """Pad pretokenized ids plus optional labels for one MLX text batch."""
     lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
@@ -3089,6 +3100,10 @@ def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
 def _iterate_tokenized_text_batches(tokenized, batch_size, max_seq_length,
                                     seed=42, loop=False, pad_id=0):
     """Yield pretokenized text batches with the same grouping used by materialization."""
+    tokenized = [
+        row for row in tokenized
+        if _labeled_row_has_supervision(row[1], max_seq_length)
+    ]
     if len(tokenized) < batch_size:
         raise ValueError(
             f"Dataset must have at least batch_size={batch_size}"
@@ -3100,8 +3115,8 @@ def _iterate_tokenized_text_batches(tokenized, batch_size, max_seq_length,
         idx[i : i + batch_size]
         for i in range(0, len(idx) - batch_size + 1, batch_size)
     ]
-    if seed:
-        np.random.seed(seed)
+    if seed is not None:
+        np.random.seed(int(seed))
 
     while True:
         for batch_group_idx in np.random.permutation(len(batch_idx)):
@@ -4368,6 +4383,12 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             ids = list(ids)[:max_seq_length]
             if len(ids) >= 2:
                 tokenized.append(ids)
+
+    if labeled:
+        tokenized = [
+            row for row in tokenized
+            if _labeled_row_has_supervision(row[1], max_seq_length)
+        ]
 
     if not tokenized:
         raise ValueError(
