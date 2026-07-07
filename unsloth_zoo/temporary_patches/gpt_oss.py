@@ -2464,8 +2464,29 @@ def patch_GptOssModel():
     # Inspect the mask factory signatures once and pass only the kwargs they
     # actually accept so this patch works on both 4.x and 5.x.
     import inspect as _inspect
-    _ccm_params = set(_inspect.signature(create_causal_mask).parameters)
-    _cswc_params = set(_inspect.signature(create_sliding_window_causal_mask).parameters)
+    def _mask_factory_params(fn, name):
+        # The factory may be wrapped (see misc.py) or torch-compiled, which
+        # collapses inspect.signature() to (*args, **kwargs) and would make the
+        # kwargs filter below drop every mask argument -> create_causal_mask()
+        # called with no args -> "missing required positional arguments". Recover
+        # the true parameter names from the pristine reference misc.py saves, then
+        # __wrapped__, then the object itself, then a static 4.x + 5.x fallback.
+        for cand in (
+            getattr(transformers.masking_utils, "_unsloth_original_" + name, None),
+            getattr(fn, "__wrapped__", None),
+            fn,
+        ):
+            if cand is None: continue
+            try:
+                params = set(_inspect.signature(cand).parameters)
+            except (TypeError, ValueError):
+                continue
+            if not params <= {"args", "kwargs", "self"}:
+                return params
+        return {"config", "inputs_embeds", "input_embeds", "attention_mask",
+                "cache_position", "past_key_values", "position_ids"}
+    _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
+    _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
     _mask_params = _ccm_params | _cswc_params
 
     def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):
