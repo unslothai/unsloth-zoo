@@ -38,6 +38,7 @@ Usage mirrors TRL notebooks:
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 import concurrent.futures
+import json
 import math
 import os
 import random
@@ -823,6 +824,8 @@ class MLXTrainingConfig:
     # Logging & output
     logging_steps: int = 1
     output_dir: str = "./outputs"
+    logging_dir: str | None = None
+    run_name: str | None = None
     report_to: str = "none"
     save_steps: int = 0  # 0 = only save at end
     save_total_limit: int = -1  # -1 = no limit
@@ -915,6 +918,21 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
+
+    def to_dict(self):
+        """Return a TrainingArguments-style dict for integration callbacks."""
+        output = {}
+        for key, value in vars(self).items():
+            if is_dataclass(value):
+                value = asdict(value)
+            elif hasattr(value, "to_dict"):
+                value = value.to_dict()
+            output[key] = value
+        return output
+
+    def to_json_string(self):
+        """Serialize this config like TrainingArguments.to_json_string()."""
+        return json.dumps(self.to_dict(), indent=2, default=str)
 
 
 class MLXTrainer:
@@ -1065,6 +1083,10 @@ class MLXTrainer:
             args.eval_delay = 0
         if not hasattr(args, "include_num_input_tokens_seen"):
             args.include_num_input_tokens_seen = False
+        if getattr(args, "logging_dir", None) is None:
+            args.logging_dir = os.path.join(args.output_dir, "runs")
+        if getattr(args, "run_name", None) is None:
+            args.run_name = args.output_dir
 
     def _default_callback_eval_strategy(self):
         """Return the MLX-derived eval strategy for callback compatibility."""
@@ -1107,7 +1129,6 @@ class MLXTrainer:
             "on_log",
             self.args, self.state, self.control, logs=logs,
         )
-        self._sync_callback_stop()
 
     def _call_callback_evaluate(self, metrics):
         """Dispatch a Hugging Face on_evaluate callback event."""
@@ -1117,7 +1138,6 @@ class MLXTrainer:
             "on_evaluate",
             self.args, self.state, self.control, metrics=metrics,
         )
-        self._sync_callback_stop()
 
     def _call_callback_save(self):
         """Dispatch a Hugging Face on_save callback event."""
@@ -1126,7 +1146,6 @@ class MLXTrainer:
             "on_save",
             self.args, self.state, self.control,
         )
-        self._sync_callback_stop()
 
     def _callback_batches_per_epoch(self, batches):
         """Return the finite micro-batch count for one callback epoch."""
@@ -2514,9 +2533,9 @@ class MLXTrainer:
                 "on_epoch_end",
                 args, self.state, self.control,
             )
-            self._sync_callback_stop()
             if self.control.should_log or self.control.should_evaluate or self.control.should_save:
                 _run_callback_control_actions(current_step, grad_norm)
+            self._sync_callback_stop()
 
         def _run_training_log(current_step, grad_norm):
             """Emit one MLX/HF training log from accumulated loss counters."""
@@ -2683,7 +2702,7 @@ class MLXTrainer:
             print(f"  Saved checkpoint to {ckpt_dir}")
             if checkpoint_complete:
                 _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
-            self._call_callback_save()
+                self._call_callback_save()
 
         def _run_callback_control_actions(current_step, grad_norm):
             """Run log/eval/save actions requested by callback control flags."""
@@ -2826,7 +2845,6 @@ class MLXTrainer:
                     "on_optimizer_step",
                     args, self.state, self.control,
                 )
-                self._sync_callback_stop()
             self.state.num_input_tokens_seen += int(toks.item())
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
@@ -2851,7 +2869,6 @@ class MLXTrainer:
                 "on_step_end",
                 args, self.state, self.control,
             )
-            self._sync_callback_stop()
 
             # Logging
             logging_steps = int(getattr(args, "logging_steps", 0) or 0)
@@ -2884,6 +2901,7 @@ class MLXTrainer:
                 _run_checkpoint(current_step)
 
             _maybe_callback_epoch_end(it, current_step, grad_norm)
+            self._sync_callback_stop()
             if self.stop_requested:
                 break
             microstep = it
@@ -2918,7 +2936,6 @@ class MLXTrainer:
             print(f"Unsloth: skipped final save ({e})")
         else:
             print(f"Unsloth: Saved final adapters to {args.output_dir}")
-            self._call_callback_save()
 
         self.control = self.callback_handler.call_event(
             "on_train_end",

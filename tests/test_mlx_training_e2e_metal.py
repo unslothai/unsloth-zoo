@@ -82,6 +82,7 @@ def _callback_trainer(
     max_steps=3,
     eval_steps=1,
     logging_steps=1,
+    save_steps=0,
     with_eval=False,
 ):
     """Create a minimal MLXTrainer with prebuilt batches for callback tests."""
@@ -109,6 +110,7 @@ def _callback_trainer(
             learning_rate=1e-4,
             logging_steps=logging_steps,
             eval_steps=eval_steps,
+            save_steps=save_steps,
             output_dir=str(tmp_path),
             use_cce=False,
             compile=False,
@@ -139,6 +141,11 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
             self.events.append(("init", state.global_step, args.eval_strategy))
 
         def on_train_begin(self, args, state, control, **kwargs):
+            config = args.to_dict()
+            assert config["output_dir"] == str(tmp_path)
+            assert args.logging_dir == os.path.join(str(tmp_path), "runs")
+            assert args.run_name == str(tmp_path)
+            assert '"output_dir"' in args.to_json_string()
             self.events.append((
                 "train_begin",
                 state.global_step,
@@ -186,7 +193,7 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
     names = {event[0] for event in recorder.events}
     assert {
         "init", "train_begin", "optimizer", "step_end", "log", "eval",
-        "save", "train_end", "epoch_begin", "epoch_end",
+        "train_end", "epoch_begin", "epoch_end",
     } <= names
     assert recorder.events[0] == ("init", 0, "steps")
     assert ("train_begin", 0, True) in recorder.events
@@ -194,6 +201,38 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
     assert ClassCallback.calls == [0]
     assert trainer._saved == [str(tmp_path)]
     assert output.global_step == 3
+
+
+@metal_only
+def test_hf_callback_on_save_only_fires_for_checkpoints(tmp_path, monkeypatch):
+    from pathlib import Path
+    from transformers import TrainerCallback
+    import unsloth_zoo.mlx.trainer as mlx_trainer
+
+    class SaveRecorder(TrainerCallback):
+        def __init__(self):
+            self.saves = []
+
+        def on_save(self, args, state, control, **_kwargs):
+            self.saves.append((state.global_step, Path(args.output_dir)))
+
+    def fake_save_trainable_adapters(_model, output_dir):
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        mlx_trainer, "save_trainable_adapters", fake_save_trainable_adapters,
+    )
+    monkeypatch.setattr(mlx_trainer, "save_optimizer_state", lambda *_args: None)
+    monkeypatch.setattr(mlx_trainer, "save_trainer_state", lambda *_args: None)
+
+    callback = SaveRecorder()
+    trainer = _callback_trainer(
+        tmp_path, [callback], max_steps=1, eval_steps=0, save_steps=1,
+    )
+    trainer.train()
+
+    assert callback.saves == [(1, tmp_path)]
+    assert trainer._saved == [str(tmp_path)]
 
 
 @metal_only
@@ -216,6 +255,36 @@ def test_hf_callback_control_can_stop_mlx_training(tmp_path):
     output = _callback_trainer(tmp_path, [callback], max_steps=5, eval_steps=0).train()
     assert output.global_step == 1
     assert ("step_end", 1) in callback.events
+
+
+@metal_only
+def test_hf_callback_stop_allows_same_step_eval(tmp_path):
+    from transformers import TrainerCallback
+
+    class StopAndEval(TrainerCallback):
+        def __init__(self):
+            self.evals = []
+
+        def on_step_end(self, args, state, control, **_kwargs):
+            control.should_evaluate = True
+            control.should_training_stop = True
+            return control
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.evals.append((state.global_step, metrics["eval_loss"]))
+
+    callback = StopAndEval()
+    output = _callback_trainer(
+        tmp_path,
+        [callback],
+        max_steps=1,
+        eval_steps=0,
+        with_eval=True,
+    ).train()
+
+    assert output.global_step == 1
+    assert len(callback.evals) == 1
+    assert callback.evals[0][0] == 1
 
 
 @metal_only
