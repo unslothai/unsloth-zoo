@@ -217,11 +217,25 @@ def health():
     return {"status": "ok", "model": MODEL_ID}
 
 
+def _tools_for_choice(tools, tool_choice):
+    # Honor tool_choice before advertising: "none" hides tools, a forced function
+    # narrows to just that one, anything else forwards all.
+    if isinstance(tool_choice, str) and tool_choice.lower() == "none":
+        return None
+    if isinstance(tool_choice, dict):
+        name = (tool_choice.get("function") or {}).get("name")
+        if name:
+            return [t for t in tools or []
+                    if isinstance(t, dict) and (t.get("function") or {}).get("name") == name] or None
+    return tools
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     body = await req.json()
     messages = body.get("messages", [])
-    tools = body.get("tools")  # forwarded to the visual server (rendered once the binary reads it)
+    # forwarded to the visual server (rendered once the binary reads it)
+    tools = _tools_for_choice(body.get("tools"), body.get("tool_choice"))
     stream = bool(body.get("stream", False))
     max_blocks = _max_blocks(body)
     seed = int(body.get("seed", 3407))
