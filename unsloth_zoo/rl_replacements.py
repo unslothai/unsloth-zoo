@@ -482,7 +482,8 @@ def grpo_compute_loss(
         loss_i = -torch.min(loss_1, loss_2)
     elif loss_type == "sapo":
         temperatures = torch.where(advantages > 0, sapo_temperature_pos, sapo_temperature_neg)
-        loss_i = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
+        soft_coef_1 = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
+        loss_i = -soft_coef_1 * advantages
     elif loss_type == "vespo":
         if get_gamma_weights is None:
             raise Exception("vespo is only available in TRL 0.26.0+")
