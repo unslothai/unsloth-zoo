@@ -2843,8 +2843,10 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
                 AutoTokenizer.from_pretrained(
                     source, token=token, trust_remote_code=trust_remote_code,
                 ).save_pretrained(tmpdir)
-            except Exception:
-                # Don't leak the multi-GB fp16 scratch copy on a mid-save error.
+            except BaseException:
+                # Don't leak the multi-GB fp16 scratch copy: BaseException,
+                # because a Ctrl-C during the long safetensors write is the
+                # likeliest abort and must clean up too.
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 raise
             # Release the fp16 model and bnb's MPS allocator cache so the caller's
@@ -4302,9 +4304,10 @@ class FastMLXModel:
             # dequant path only handles text models (mlx-lm), and mlx-vlm
             # dequant is not wired up. Reject with the clear, actionable error
             # instead of attempting an unverified VLM dequant + mlx-vlm load.
-            # DeepSeek-OCR is a VLM routed through mlx-vlm but carries a
-            # *ForCausalLM architecture, so `_is_vlm` short-circuits to False;
-            # detect it explicitly so it's rejected rather than mis-dequantized.
+            # DeepSeek-OCR is a VLM routed through mlx-vlm despite its
+            # *ForCausalLM architecture. Its config carries a top-level
+            # vision_config, so `_is_vlm` already flags it; the model_type
+            # check keeps the rejection from hinging on that one config key.
             if _is_vlm(config_data) or _deepseek_ocr_config_model_type(config_data):
                 raise ValueError(
                     f"Unsloth: '{model_name}' is a bitsandbytes-quantized VLM, "
