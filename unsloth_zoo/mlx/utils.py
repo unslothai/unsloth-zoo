@@ -3795,13 +3795,16 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
 
 
 def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
-    """Mask synthetic VLM eval padding rows so they do not affect metrics."""
+    """Mask synthetic VLM eval padding rows so they do not affect metrics.
+
+    Keep input_ids unchanged: VLM processors may have already attached row-
+    aligned image features, and blanking image tokens would desynchronize the
+    text/image counts expected by Qwen/Gemma-style VLM forwards.
+    """
     if not any(empty_rows):
         return batch_dict
     row_mask = np.asarray(empty_rows, dtype=bool)
-    pad_id = _vlm_pad_token_id(processor)
     for key, fill_value in (
-        ("input_ids", pad_id),
         ("attention_mask", 0),
         ("labels", -100),
     ):

@@ -72,6 +72,22 @@ class _ResponseMaskFilteringProcessor:
         }
 
 
+class _VisionFeatureProcessor:
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    chat_template = "{{ messages }}"
+
+    def __call__(self, text, **_kwargs):
+        rows = [[101, 200, 102, 0] for _ in text]
+        masks = [[1, 1, 1, 0] for _ in text]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+            "pixel_values": np.ones((len(text), 2), dtype=np.float32),
+            "image_grid_thw": np.ones((len(text), 3), dtype=np.int32),
+        }
+
+
 class _PromptCompletionProcessor:
     tokenizer = _FakeTokenizer()
     image_processor = object()
@@ -271,6 +287,32 @@ def test_vlm_response_mask_filters_before_batching_like_cuda():
         [-100, 12, 13, -100],
         [-100, 12, 13, -100],
     ]
+
+
+def test_vlm_empty_eval_padding_keeps_image_tokens_with_vision_features():
+    from unsloth_zoo.mlx.utils import create_vlm_batches
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    batches = create_vlm_batches(
+        dataset=[{"text": "0"}, {"text": "1"}, {"text": "2"}],
+        processor=_VisionFeatureProcessor(),
+        config={"image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        dataset_order="sequential",
+        comm_group=FakeWorld(),
+        distributed_pad_mode="empty",
+    )
+
+    empty_batch = batches[1]
+    assert empty_batch["input_ids"].tolist()[0] == [101, 200, 102, 0]
+    assert empty_batch["attention_mask"].tolist()[0] == [0, 0, 0, 0]
+    assert empty_batch["labels"].tolist()[0] == [-100, -100, -100, -100]
+    assert empty_batch["pixel_values"].shape[0] == 1
+    assert len(empty_batch["image_grid_thw"]) == 1
 
 
 def test_vlm_streaming_response_mask_skips_fully_masked_rows():
