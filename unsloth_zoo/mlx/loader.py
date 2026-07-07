@@ -404,9 +404,8 @@ def _materialize_mlx_vlm_config_override(
     ):
         patched_config = dict(config_data)
         patched_config["model_type"] = corrected_model_type
-        # mlx-vlm supplies the model/processor implementation locally. Keeping the
-        # Torch remote-code auto_map here makes AutoProcessor import incompatible
-        # DeepSeek OCR Torch modules during MLX loads.
+        # Drop the Torch remote-code auto_map so AutoProcessor doesn't import
+        # incompatible DeepSeek OCR Torch modules during MLX loads.
         patched_config.pop("auto_map", None)
         patched_files["config.json"] = patched_config
 
