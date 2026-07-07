@@ -20,15 +20,74 @@ __all__ = [
     "is_main_process",
     "is_distributed",
     "distributed_function",
+    "torch_distributed_get_rank",
 ]
 
 from packaging.version import Version as TrueVersion
+from importlib.metadata import version as importlib_version, PackageNotFoundError
 import torch
+import torch.distributed as dist
+import os
+import time
+import contextlib
+import re
+import pathlib
+from typing import Optional
+from filelock import FileLock
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        return TrueVersion(version)
+        if isinstance(version, TrueVersion):
+            return version
+
+        raw = None
+        package_name = None
+
+        if isinstance(version, str):
+            # Treat as a package name (e.g. "trl") if it matches the pattern,
+            # else as a literal version string.
+            if re.match(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$', version):
+                try:
+                    raw = importlib_version(version)
+                    package_name = version
+                except PackageNotFoundError:
+                    raw = version  # Fall back to treating as version string
+            else:
+                raw = version
+        else:
+            package_name = getattr(version, "__name__", None) or getattr(version, "__package__", None)
+            raw = getattr(version, "__version__", None)
+            if raw in (None, "", "unknown") and package_name:
+                try:
+                    raw = importlib_version(package_name)
+                except PackageNotFoundError:
+                    raw = None
+
+        if raw in (None, ""):
+            raw = str(version)
+
+        raw = str(raw)
+
+        if raw == "unknown" and package_name:
+            try:
+                raw = importlib_version(package_name)
+            except PackageNotFoundError:
+                pass
+
+        # First try matching from the start, then search anywhere in the string.
+        match = re.match(r"[0-9]+(?:\.[0-9]+)*", raw)
+        match_at_start = match is not None
+        if match is None:
+            match = re.search(r"[0-9]+(?:\.[0-9]+)*", raw)
+            match_at_start = False
+        if match is None:
+            raise ValueError(f"Invalid version format: {raw}")
+
+        new_version = match.group(0).rstrip(".")
+        if match_at_start and new_version != raw:
+            new_version += ".1" # for dev / alpha / beta / rc
+        return TrueVersion(new_version)
     except:
         from inspect import getframeinfo, stack
         caller = getframeinfo(stack()[1][0])
@@ -53,38 +112,93 @@ def _get_dtype(dtype):
         return __DTYPE_MAP[dtype]
     except:
         if type(dtype) is str:
-            try: dtype = eval(f"torch.{dtype.lower()}")
-            except: pass
-        if type(dtype) is torch.dtype: return dtype
+            dtype = dtype.lower()
+            return getattr(torch, dtype, None)
+        elif isinstance(dtype, torch.dtype):
+            return dtype
     return None
 pass
 
 
-def is_main_process():
-    is_initialized = torch.distributed.is_initialized()
-    return (not is_initialized) or (is_initialized and torch.distributed.get_rank() == 0)
-pass
+import functools
+# ROCm on Windows ships a stubbed torch.distributed missing these attributes
+# entirely (https://github.com/ROCm/TheRock/issues/3284). Bind the real
+# functions directly when present; only the stub hits the AttributeError path.
+# Avoids per-name getattr and the throwaway lambdas it builds on every other
+# platform.
+try:
+    torch_distributed_is_initialized = dist.is_initialized
+    torch_distributed_is_torchelastic_launched = dist.is_torchelastic_launched
+    torch_distributed_get_rank = dist.get_rank
+except AttributeError:
+    torch_distributed_is_initialized = lambda *args, **kwargs: False
+    torch_distributed_is_torchelastic_launched = lambda *args, **kwargs: False
+    torch_distributed_get_rank = lambda *args, **kwargs: 0
 
+def is_main_process():
+    if torch_distributed_is_initialized():
+        return torch_distributed_get_rank() == 0
+    elif torch_distributed_is_torchelastic_launched():
+        # accelerate launch calls init_process_group later
+        return os.environ.get("RANK", "0") == "0"
+    return True
+pass
 
 def is_distributed():
-    return torch.distributed.is_initialized()
+    return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
 pass
-
 
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            object_list = function(*args, **kwargs)
-            if n == 1: object_list = [object_list]
-        else:
-            object_list = [None for _ in range(n)]
-        # broadcast_object_list auto blocks so no need for barrier
-        torch.distributed.broadcast_object_list(object_list, src = 0, device = "cpu")
-        if n == 1: result = object_list[0]
+    assert function is not None
+
+    # Run independently when the process group isn't initialized: not
+    # distributed, or torchrun launched but init_process_group() not yet
+    # called (e.g. during module imports).
+    # Ref: https://github.com/unslothai/unsloth/issues/3703
+    if not torch_distributed_is_initialized():
+        out = function(*args, **kwargs)
+        return out if n == 1 else out
+
+    # Multi-process: only main executes the function
+    if is_main_process():
+        out = function(*args, **kwargs)
+        obj_list = [out] if n == 1 else list(out)
     else:
-        result = function(*args, **kwargs)
-    return result
+        obj_list = [None for _ in range(n)]
+
+    if torch_distributed_is_initialized():
+        dist.broadcast_object_list(obj_list, src = 0)
+        dist.barrier()  # wait until main is done
+
+    return obj_list[0] if n == 1 else obj_list
 pass
+
+def _lock_path_for(target: str) -> str:
+    """ str needs to be a valid file path """
+    locks_dir = pathlib.Path(target).parent / ".locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    return str(locks_dir / f".lock.{pathlib.Path(target).name}")
+
+def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
+    """Get a FileLock for `target`.
+
+    timeout defaults to env UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
+    """
+    lock_path = _lock_path_for(target)
+    if timeout is None:
+        timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
+    return FileLock(lock_path, timeout=timeout)
+
+
+def get_quant_type(config):
+    quant_config = getattr(config, 'quantization_config', None)
+    if quant_config:
+        from transformers.quantizers import AutoQuantizationConfig
+        if isinstance(quant_config, dict):
+            return quant_config.get('quant_method', None)
+        elif isinstance(quant_config, AutoQuantizationConfig):
+            return getattr(quant_config, 'quant_method', None)
+    return None
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

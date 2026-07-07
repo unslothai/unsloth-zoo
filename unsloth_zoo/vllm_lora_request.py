@@ -1,11 +1,15 @@
 # From https://github.com/vllm-project/vllm/pull/12609
 import warnings
-from typing import Optional
+from typing import Optional, Dict
 
 import msgspec
 import torch
 
-from vllm.adapter_commons.request import AdapterRequest
+try:
+    # vLLM removed this as part of https://github.com/vllm-project/vllm/pull/25045
+    from vllm.adapter_commons.request import AdapterRequest as adapter_request
+except ImportError:
+    adapter_request = None
 
 
 class LoRARequest(
@@ -23,17 +27,18 @@ class LoRARequest(
     lora_int_id must be globally unique for a given adapter.
     This is currently not enforced in vLLM.
     """
-    __metaclass__ = AdapterRequest
+    if adapter_request is not None:
+        __metaclass__ = adapter_request
 
     lora_name: str
     lora_int_id: int
     lora_path: str = ""
-    lora_tensors: Optional[dict[str, torch.Tensor]] = None
-    lora_config: Optional[dict] = None,
+    lora_tensors: Optional[Dict[str, torch.Tensor]] = None
+    lora_config: Optional[Dict] = None,
     lora_local_path: Optional[str] = msgspec.field(default=None)
     long_lora_max_len: Optional[int] = None
     base_model_name: Optional[str] = msgspec.field(default=None)
-    lora_embeddings: Optional[dict[str, torch.Tensor]] = None
+    lora_embeddings: Optional[Dict[str, torch.Tensor]] = None
 
     @property
     def adapter_id(self):

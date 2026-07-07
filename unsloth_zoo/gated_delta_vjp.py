@@ -1,0 +1,350 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+Memory-efficient custom VJP for GatedDeltaNet (Qwen3.5).
+
+Replaces the T-step Python loop in gated_delta_ops with an mx.custom_function
+that recomputes states during backward instead of keeping all T intermediate
+states in the autograd graph.
+
+Usage:
+    from gated_delta_vjp import patch_gated_delta
+    patch_gated_delta()  # monkey-patches mlx_lm's gated_delta module
+"""
+
+from typing import Optional, Tuple
+import mlx.core as mx
+import mlx.nn as nn
+
+
+def _gated_delta_step(q, k, v, g, beta, state, mask=None):
+    """Single recurrent step (no @mx.compile — we need it differentiable)."""
+    old_state = state
+    if g.ndim == 2:
+        decay = g[..., None, None]
+    elif g.ndim == 3:
+        decay = g[..., None, :]
+    else:
+        raise ValueError(f"Unsupported gating shape {g.shape}")
+
+    state = state * decay
+    kv_mem = (state * k[..., None, :]).sum(axis=-1)
+    delta = (v - kv_mem) * beta[..., None]
+    state = state + k[..., None, :] * delta[..., None]
+    y = (state * q[..., None, :]).sum(axis=-1)
+
+    if mask is not None:
+        mask = mx.expand_dims(mask, axis=(1, 2, 3))
+        state = mx.where(mask, state, old_state)
+
+    return y.astype(q.dtype), state
+
+
+def gated_delta_ops_efficient(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    """Memory-efficient GDN forward+backward via custom VJP.
+
+    Wraps the recurrence in mx.custom_function so backward recomputes states
+    on the fly during BPTT instead of keeping T graph nodes alive.
+    """
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[-2:]
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    if (repeat_factor := Hv // Hk) > 1:
+        q = mx.repeat(q, repeat_factor, -2)
+        k = mx.repeat(k, repeat_factor, -2)
+
+    # Chunk for checkpointed BPTT: each chunk's forward is recomputed during
+    # backward. Memory: O(num_chunks * state_size) instead of O(T * state_size).
+    CHUNK_SIZE = max(1, min(64, T))
+    num_chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    @mx.custom_function
+    def _chunked_forward(q_chunk, k_chunk, v_chunk, g_chunk, beta_chunk, state_in, mask_chunk):
+        """Process one chunk of timesteps."""
+        chunk_T = q_chunk.shape[1]
+        _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
+        ys = []
+        s = state_in
+        for t in range(chunk_T):
+            m = mask_chunk[:, t:t+1].squeeze(1) if _has_mask else None
+            y, s = _gated_delta_step(
+                q_chunk[:, t], k_chunk[:, t], v_chunk[:, t],
+                g_chunk[:, t], beta_chunk[:, t], s, m,
+            )
+            ys.append(y)
+        return mx.stack(ys, axis=1), s
+
+    @_chunked_forward.vjp
+    def _chunked_vjp(primals, cotangents, outputs):
+        q_c, k_c, v_c, g_c, beta_c, state_in, mask_chunk = primals
+        dy, d_state_out = cotangents
+        chunk_T = q_c.shape[1]
+        _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
+
+        # Recompute the chunk's RETURNED states (post-mask: where(mask,
+        # state_new, state_prev), so masked steps give states[t+1]==states[t]).
+        # Used only as each step's entry `state_prev`; the y-path backward needs
+        # state_new, recomputed below.
+        states = [state_in]
+        s = state_in
+        for t in range(chunk_T):
+            m = mask_chunk[:, t:t+1].squeeze(1) if _has_mask else None
+            _, s = _gated_delta_step(
+                q_c[:, t], k_c[:, t], v_c[:, t],
+                g_c[:, t], beta_c[:, t], s, m,
+            )
+            states.append(s)
+
+        # BPTT: `d_state` is the cotangent w.r.t. the RETURNED state at the
+        # current step (= input to step t+1). Starts at d_state_out, then
+        # propagates through the recurrence + mask.
+        # Per-step grads are collected in lists and stacked afterwards: each
+        # t is produced exactly once, and mx `.at[:, t].add` scatter-add
+        # reads the update tensor with a wrong batch stride (wrong grads for
+        # every batch row past the first; verified against plain autodiff on
+        # mlx 0.31).
+        # Fixed upstream in ml-explore/mlx#3483, not yet in any release.
+        d_q_steps = []
+        d_k_steps = []
+        d_v_steps = []
+        d_g_steps = []
+        d_beta_steps = []
+        d_state = d_state_out
+
+        for t in range(chunk_T - 1, -1, -1):
+            state_prev = states[t]
+            q_t = q_c[:, t]
+            k_t = k_c[:, t]
+            v_t = v_c[:, t]
+            g_t = g_c[:, t]
+            beta_t = beta_c[:, t]
+            dy_t = dy[:, t]
+
+            # Cotangent flowing into step t's output (state_returned).
+            d_state_returned = d_state
+
+            # Recompute state_new (pre-mask): y always depends on it, but
+            # states[t+1] equals state_prev when mask=False, so it can't be used.
+            if g_t.ndim == 2:
+                decay = g_t[..., None, None]
+            else:
+                decay = g_t[..., None, :]
+            state_decayed = state_prev * decay
+            kv_mem = (state_decayed * k_t[..., None, :]).sum(axis=-1)
+            delta = (v_t - kv_mem) * beta_t[..., None]
+            state_new = state_decayed + k_t[..., None, :] * delta[..., None]
+
+            # Forward: state_returned = where(mask, state_new, state_prev).
+            # Split d_state_returned: to d_state_new when mask=True, passthrough
+            # to d_state_prev when mask=False.
+            if _has_mask:
+                m = mask_chunk[:, t]
+                m_exp = mx.expand_dims(m, axis=(1, 2, 3))
+                zero = mx.zeros_like(d_state_returned)
+                d_state_new_from_returned = mx.where(m_exp, d_state_returned, zero)
+                d_state_prev_passthrough = mx.where(m_exp, zero, d_state_returned)
+            else:
+                d_state_new_from_returned = d_state_returned
+                d_state_prev_passthrough = mx.zeros_like(d_state_returned)
+
+            # y = (state_new * q).sum(-1) — y is unmasked, contributes always.
+            d_state_new = (
+                d_state_new_from_returned
+                + dy_t[..., None].astype(mx.float32) * q_t[..., None, :].astype(mx.float32)
+            )
+            d_q_t = (dy_t[..., None].astype(mx.float32) * state_new).sum(axis=-2)
+            d_q_steps.append(d_q_t.astype(q_c.dtype))
+
+            # state_new = state_decayed + k[..., None, :] * delta[..., None]
+            d_kd = d_state_new
+            d_state_decayed = mx.array(d_state_new)
+
+            # d_k / d_delta from the k*delta term
+            d_k_t_from_update = (d_kd * delta[..., None].astype(mx.float32)).sum(axis=-2)
+            d_delta = (d_kd * k_t[..., None, :].astype(mx.float32)).sum(axis=-1)
+
+            # delta = (v - kv_mem) * beta[..., None]
+            d_v_minus_kv = d_delta * beta_t[..., None].astype(mx.float32)
+            d_beta_t = (d_delta * (v_t.astype(mx.float32) - kv_mem)).sum(axis=-1)
+            d_v_t = d_v_minus_kv
+            d_kv_mem = -d_v_minus_kv
+
+            # kv_mem = (state_decayed * k[..., None, :]).sum(-1)
+            d_state_decayed = (
+                d_state_decayed
+                + d_kv_mem[..., None].astype(mx.float32) * k_t[..., None, :].astype(mx.float32)
+            )
+            d_k_t_from_kv = (d_kv_mem[..., None].astype(mx.float32) * state_decayed).sum(axis=-2)
+
+            # state_decayed = state_prev * decay
+            d_state_prev_via_recurrence = d_state_decayed * decay.astype(mx.float32)
+            d_decay = (d_state_decayed * state_prev).sum(axis=-2)
+            if g_t.ndim == 2:
+                d_g_t = d_decay.sum(axis=-1)
+            else:
+                d_g_t = d_decay
+
+            d_k_t = d_k_t_from_update + d_k_t_from_kv
+            d_k_steps.append(d_k_t.astype(k_c.dtype))
+            d_v_steps.append(d_v_t.astype(v_c.dtype))
+            d_g_steps.append(d_g_t.astype(g_c.dtype))
+            d_beta_steps.append(d_beta_t.astype(beta_c.dtype))
+
+            # d_state_prev = recurrence-derived gradient + mask passthrough.
+            d_state = d_state_prev_via_recurrence + d_state_prev_passthrough
+
+        for steps in (d_q_steps, d_k_steps, d_v_steps, d_g_steps, d_beta_steps):
+            steps.reverse()
+        d_q = mx.stack(d_q_steps, axis=1)
+        d_k = mx.stack(d_k_steps, axis=1)
+        d_v = mx.stack(d_v_steps, axis=1)
+        d_g = mx.stack(d_g_steps, axis=1)
+        d_beta = mx.stack(d_beta_steps, axis=1)
+        d_mask = mx.zeros_like(mask_chunk) if mask_chunk is not None else None
+        return d_q, d_k, d_v, d_g, d_beta, d_state, d_mask
+
+    # Run chunked forward
+    all_ys = []
+    s = state
+    for c in range(num_chunks):
+        t_start = c * CHUNK_SIZE
+        t_end = min(t_start + CHUNK_SIZE, T)
+        q_c = q[:, t_start:t_end]
+        k_c = k[:, t_start:t_end]
+        v_c = v[:, t_start:t_end]
+        g_c = g[:, t_start:t_end]
+        beta_c = beta[:, t_start:t_end]
+        # why: pass per-chunk mask as a primal so chunk-local t maps to the
+        # right timesteps. Closure-captured `mask[:, t]` read mask[:,0:CHUNK]
+        # for every chunk.
+        if mask is None:
+            mask_c = mx.ones((q_c.shape[0], q_c.shape[1]), dtype=mx.bool_)
+        else:
+            mask_c = mask[:, t_start:t_end]
+        chunk_y, s = _chunked_forward(q_c, k_c, v_c, g_c, beta_c, s, mask_c)
+        all_ys.append(chunk_y)
+
+    y = mx.concatenate(all_ys, axis=1)
+    return y, s
+
+
+def patch_gated_delta():
+    """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP."""
+    from mlx_lm.models import gated_delta
+
+    if getattr(gated_delta, "_unsloth_gated_delta_patched", False):
+        return
+
+    def patched_gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias,
+        state=None, mask=None, use_kernel=True,
+    ):
+        # Heuristic: training calls enter with state=None (no cache); inference
+        # passes the cached state in. Route training through the efficient ops
+        # so the custom VJP runs — gated_delta_kernel has none, so it would keep
+        # all T intermediate states alive and defeat this module.
+        is_training_call = state is None
+        beta = mx.sigmoid(b)
+        g = gated_delta.compute_g(A_log, a, dt_bias)
+        if state is None:
+            B, _, Hk, Dk = q.shape
+            Hv, Dv = v.shape[-2:]
+            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+        # No incoming state cache: use the memory-efficient ops path.
+        if is_training_call:
+            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+        # Cached state: prefer the kernel for speed, else efficient ops.
+        if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+        return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
+
+    gated_delta.gated_delta_update = patched_gated_delta_update
+    gated_delta._unsloth_gated_delta_patched = True
+    print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+
+
+def patch_gated_delta_vlm():
+    """Patch mlx_vlm's qwen3_5 gated_delta_update the same way.
+
+    mlx_vlm >= 0.6 ships its own copy that calls the non-differentiable
+    gated_delta_kernel directly, so patch_gated_delta() never intercepts
+    it; language.py also from-imports it, so patch both namespaces.
+    Older mlx_vlm (0.4.4 - 0.5.x) has no qwen3_5/gated_delta.py and
+    instead from-imports mlx_lm's gated_delta_update into language.py,
+    a by-value copy that patch_gated_delta() cannot rebind either.
+    """
+    try:
+        from mlx_lm.models import gated_delta
+        from mlx_vlm.models.qwen3_5 import language as vlm_language
+    except ImportError:
+        return
+
+    try:
+        from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+    except ImportError:
+        # Old layout: re-route language.py's stale by-value copy through the
+        # mlx_lm module attribute, which patch_gated_delta() keeps patched.
+        if getattr(vlm_language, "_unsloth_gated_delta_patched", False):
+            return
+
+        def forwarded_gated_delta_update(*args, **kwargs):
+            return gated_delta.gated_delta_update(*args, **kwargs)
+
+        vlm_language.gated_delta_update = forwarded_gated_delta_update
+        vlm_language._unsloth_gated_delta_patched = True
+        print("Unsloth: Patched mlx-vlm GatedDeltaNet (legacy mlx_lm import) with memory-efficient custom VJP.")
+        return
+
+    if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
+        return
+
+    original_update = vlm_gated_delta.gated_delta_update
+
+    def patched_gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias,
+        state=None, mask=None, use_kernel=True,
+    ):
+        # state=None means a training call; route it through the
+        # differentiable VJP. Inference (state provided) keeps the kernel.
+        if state is not None:
+            return original_update(
+                q, k, v, a, b, A_log, dt_bias,
+                state=state, mask=mask, use_kernel=use_kernel,
+            )
+        beta = mx.sigmoid(b)
+        g = gated_delta.compute_g(A_log, a, dt_bias)
+        B, _, Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+    vlm_gated_delta.gated_delta_update = patched_gated_delta_update
+    vlm_language.gated_delta_update = patched_gated_delta_update
+    vlm_gated_delta._unsloth_gated_delta_patched = True
+    print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")

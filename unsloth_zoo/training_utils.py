@@ -22,26 +22,31 @@ from transformers import get_scheduler as transformers_get_scheduler
 from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
-from packaging.version import Version
 import time
 from typing import Any, Optional, List, Dict, Tuple
-from .utils import _get_dtype
+from .utils import _get_dtype, Version
+from .hf_utils import dtype_from_config
+from .gradient_checkpointing import (
+    unpatch_unsloth_gradient_checkpointing,
+    unpatch_unsloth_smart_gradient_checkpointing,
+)
 import os
 import re
+import sys
+import functools
 
 __all__ = [
     "fix_zero_training_loss",
     "unsloth_train",
     "prepare_model_for_training",
+    "disable_use_cache",
+    "restore_use_cache",
 ]
 
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
-    """
-    Sometimes the labels get masked by all -100s, causing the loss
-    to be 0. We check for this!
-    """
+    """Warn/raise when labels are all -100 (masked), which zeroes the loss."""
     # All Unsloth Zoo code licensed under LGPLv3
     if isinstance(train_dataset, datasets.IterableDataset):
         # Skip the check since the code below assumes
@@ -73,17 +78,222 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
                 "Unsloth: All labels in your dataset are -100. Training losses will be all 0.\n"\
                 "For example, are you sure you used `train_on_responses_only` correctly?\n"\
                 "Or did you mask our tokens incorrectly? Maybe this is intended?\n"\
-                "Maybe you're using a Llama chat template on a non Llama model for example?"
+                "Maybe you're using a Llama chat template on a non Llama model for example?"\
+                "If you used `train_on_responses_only`, confirm your user and assistant parts are correct!"
             )
         elif seen_bad / (seen_bad + seen_good) >= 0.9:
             print(
                 "Unsloth: Nearly all labels in your dataset are -100. Training losses will be all 0.\n"\
                 "For example, are you sure you used `train_on_responses_only` correctly?\n"\
                 "Or did you mask our tokens incorrectly? Maybe this is intended?\n"\
-                "Maybe you're using a Llama chat template on a non Llama model for example?"
+                "Maybe you're using a Llama chat template on a non Llama model for example?"\
+                "If you used `train_on_responses_only`, confirm your user and assistant parts are correct!"
             )
     pass
 pass
+
+
+# Autocast subclasses cached by (base_class, compute_dtype) so pickle can resolve them.
+_BF16_AUTOCAST_SUBCLASSES = {}
+
+
+def _find_tensor_device_type(*values):
+    """Device type of the first tensor found in args/kwargs (recurses dict/list/tuple)."""
+    from collections.abc import Mapping
+    stack = list(values)
+    while stack:
+        value = stack.pop()
+        if torch.is_tensor(value):
+            return value.device.type
+        if isinstance(value, Mapping):
+            stack.extend(value.values())
+        elif isinstance(value, (tuple, list)):
+            stack.extend(value)
+    return None
+
+
+def _call_forward_with_bf16_autocast(forward, model, args, kwargs, compute_dtype):
+    """Run forward in autocast(compute_dtype); defer to an outer autocast or an
+    unsupported device (e.g. meta). Device sniffed from inputs, else params, else cuda."""
+    device_type = _find_tensor_device_type(*args, *kwargs.values())
+    if device_type is None:
+        try:
+            device_type = next(model.parameters()).device.type
+        except StopIteration:
+            device_type = "cuda"
+    # is_autocast_enabled raises on unsupported devices (meta), so check availability first.
+    if not torch.amp.is_autocast_available(device_type):
+        return forward(*args, **kwargs)
+    if torch.is_autocast_enabled(device_type):
+        return forward(*args, **kwargs)
+    with torch.amp.autocast(device_type=device_type, dtype=compute_dtype):
+        return forward(*args, **kwargs)
+
+
+def _reconstruct_bf16_autocast_model(base_cls, compute_dtype, instance_mode=False):
+    """Pickle/deepcopy reconstructor: rebuild the subclass from the importable base class
+    so unpickling works in a fresh interpreter."""
+    cls = _make_bf16_autocast_subclass(base_cls, compute_dtype, instance_mode)
+    return cls.__new__(cls)
+
+
+def _bf16_autocast_reduce(self):
+    """__reduce__: serialize via the base class + nn.Module state, so no generated symbol
+    is needed at unpickle."""
+    cls = type(self)
+    base_cls = cls.__dict__.get("_unsloth_autocast_base", cls.__mro__[1])
+    compute_dtype = cls.__dict__.get("_unsloth_autocast_dtype", torch.bfloat16)
+    instance_mode = cls.__dict__.get("_unsloth_autocast_instance_mode", False)
+    getstate = getattr(self, "__getstate__", None)
+    state = getstate() if getstate is not None else self.__dict__
+    return (_reconstruct_bf16_autocast_model,
+            (base_cls, compute_dtype, instance_mode), state)
+
+
+def _bf16_autocast_instance_forward(self, *args, **kwargs):
+    """Class-level forward (instance_mode): wrap the instance forward saved on
+    self._unsloth_autocast_orig_forward. Module-scoped so it pickles by import path."""
+    orig = self.__dict__["_unsloth_autocast_orig_forward"]
+    compute_dtype = type(self).__dict__.get(
+        "_unsloth_autocast_dtype", torch.bfloat16)
+    return _call_forward_with_bf16_autocast(orig, self, args, kwargs, compute_dtype)
+
+
+def _make_bf16_autocast_subclass(cls, compute_dtype, instance_forward=False):
+    """Build/fetch a cached subclass of cls whose forward runs in autocast(compute_dtype).
+    instance_forward=True wraps the per-instance forward instead of the base forward.
+    Registered as a module-level symbol with __reduce__ via the base class, so the model
+    pickles and torch.save loads in a fresh process."""
+    cached = _BF16_AUTOCAST_SUBCLASSES.get((cls, compute_dtype, instance_forward))
+    if cached is not None:
+        return cached
+
+    if instance_forward:
+        # Per-instance forward unknown at class creation, so this rare path keeps a
+        # generic signature (remove_unused_columns keeps all columns).
+        _wrapped = _bf16_autocast_instance_forward
+    else:
+        _orig_forward = cls.forward
+
+        @functools.wraps(_orig_forward)
+        def _wrapped(self, *args, **kwargs):
+            return _call_forward_with_bf16_autocast(
+                lambda *a, **k: _orig_forward(self, *a, **k),
+                self, args, kwargs, compute_dtype,
+            )
+
+    # Unique name for module-level registration; __name__ stays the base class so
+    # save_pretrained records the base in architectures.
+    pickle_name = cls.__name__ + "WithUnslothBf16Autocast"
+    module = sys.modules[__name__]
+    if hasattr(module, pickle_name) and getattr(module, pickle_name) is not None:
+        pickle_name = f"{pickle_name}_{len(_BF16_AUTOCAST_SUBCLASSES)}"
+
+    new_cls = type(pickle_name, (cls,), {
+        "forward": _wrapped,
+        "__module__": __name__,
+        "__reduce__": _bf16_autocast_reduce,
+        "_unsloth_autocast_base": cls,
+        "_unsloth_autocast_dtype": compute_dtype,
+        "_unsloth_autocast_instance_mode": instance_forward,
+    })
+    new_cls.__name__ = cls.__name__
+    new_cls.__qualname__ = pickle_name
+    setattr(module, pickle_name, new_cls)
+    _BF16_AUTOCAST_SUBCLASSES[(cls, compute_dtype, instance_forward)] = new_cls
+    return new_cls
+
+
+def _wrap_forward_in_bf16_autocast(model, compute_dtype):
+    """fp32 norm weights make the norm output fp32, tripping the next bf16 linear; wrap
+    forward in autocast(compute_dtype) so matmul inputs downcast at the op boundary.
+    Done by subclassing type(model) (not reassigning forward) so it survives
+    deepcopy/pickle/torch.save and keeps the forward signature. Idempotent."""
+    if compute_dtype in (None, torch.float32):
+        return model
+    if getattr(model, "_unsloth_bf16_autocast_wrapped", False):
+        return model
+
+    instance_forward = model.__dict__.get("forward")
+    if instance_forward is not None:
+        # An instance-level forward shadows a class override, so swapping __class__ alone
+        # would not intercept it; move it off the instance and route via instance_mode so
+        # forward stays a class attribute (picklable/deepcopy-safe).
+        model._unsloth_autocast_orig_forward = instance_forward
+        del model.__dict__["forward"]
+        model.__class__ = _make_bf16_autocast_subclass(
+            type(model), compute_dtype, instance_forward=True)
+    else:
+        model.__class__ = _make_bf16_autocast_subclass(type(model), compute_dtype)
+    model._unsloth_bf16_autocast_wrapped = True
+    return model
+
+
+def _unwrap_forward_in_bf16_autocast(model):
+    """Undo _wrap_forward_in_bf16_autocast so reusing a model across prepare modes
+    leaves no stale autocast."""
+    if not getattr(model, "_unsloth_bf16_autocast_wrapped", False):
+        return model
+    base_cls = getattr(type(model), "_unsloth_autocast_base", None)
+    orig_forward = model.__dict__.pop("_unsloth_autocast_orig_forward", None)
+    if base_cls is not None:
+        model.__class__ = base_cls
+    if orig_forward is not None:
+        model.forward = orig_forward
+    model._unsloth_bf16_autocast_wrapped = False
+    return model
+
+
+def _iter_configs(config):
+    """Yield config and every nested transformers config (composite models
+    like VLMs nest text_config / vision_config as attributes)."""
+    try:
+        from transformers import PreTrainedConfig
+    except ImportError:
+        from transformers import PretrainedConfig as PreTrainedConfig
+    seen = set()
+    stack = [config]
+    while stack:
+        cfg = stack.pop()
+        if cfg is None or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        yield cfg
+        for sub in vars(cfg).values():
+            if isinstance(sub, PreTrainedConfig):
+                stack.append(sub)
+
+
+def disable_use_cache(model):
+    """Set use_cache = False on every config of the model. KV cache is unused
+    under gradient checkpointing. Original values are remembered on the model
+    the first time so restore_use_cache can undo this for inference."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    originals = getattr(model, "_unsloth_use_cache_originals", None)
+    record = originals is None
+    if record:
+        originals = []
+    for cfg in _iter_configs(config):
+        if getattr(cfg, "use_cache", None):
+            if record:
+                originals.append((cfg, cfg.use_cache))
+            cfg.use_cache = False
+    if record and originals:
+        try:
+            model._unsloth_use_cache_originals = originals
+        except Exception:
+            pass
+
+
+def restore_use_cache(model):
+    """Undo disable_use_cache by restoring the recorded use_cache values,
+    e.g. when switching the model to inference. No-op if nothing was
+    disabled. The record is kept so disable_use_cache can re-disable
+    without re-recording when training resumes."""
+    for cfg, value in getattr(model, "_unsloth_use_cache_originals", None) or ():
+        cfg.use_cache = value
 
 
 @torch.no_grad
@@ -96,6 +306,7 @@ def prepare_model_for_training(
     train_embedding            : Optional[bool] = False,
     train_lm_head              : Optional[bool] = False,
     float32_mixed_precision    : Optional[bool] = True,
+    patch_modules_to_save      : Optional[bool] = False,
 ) -> Any:
     # All Unsloth Zoo code licensed under LGPLv3
     assert(use_gradient_checkpointing in (True, False, "unsloth",))
@@ -106,15 +317,23 @@ def prepare_model_for_training(
     assert(type(train_lm_head) is bool)
     assert(type(float32_mixed_precision) is bool)
 
-    dtype = _get_dtype(model.config.torch_dtype)
+    dtype = _get_dtype(dtype_from_config(model.config))
     mixed_precision_dtype = torch.float32
     if dtype == torch.float16:
         # We need to upcast to float32
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
+        # Full finetuning upcasts weights to float32; sync config dtype so the
+        # KV cache matches and generation avoids a dtype mismatch in index_copy_().
+        if full_finetuning:
+            model._unsloth_original_dtype = dtype
+            model.config.torch_dtype = torch.float32
     elif dtype == torch.bfloat16 and float32_mixed_precision:
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
+        if full_finetuning:
+            model._unsloth_original_dtype = dtype
+            model.config.torch_dtype = torch.float32
     elif dtype == torch.bfloat16:
         mixed_precision_dtype = torch.bfloat16
         os.environ["UNSLOTH_MIXED_PRECISION"] = "bfloat16"
@@ -122,28 +341,69 @@ def prepare_model_for_training(
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
     pass
+    # Defer to an external norm dtype policy (_pre_set_compute_dtype); skip those params.
+    _externally_managed_param_ids = set()
+    # Also detect norms by owning-module class name (catches custom norms whose param
+    # names lack a token, e.g. Gemma audio tower).
+    _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
+    _norm_param_ids = set()
+    for _, _module in model.named_modules():
+        if hasattr(_module, "_pre_set_compute_dtype"):
+            # External policy casts recursively, so all descendants are managed.
+            for _p in _module.parameters(recurse=True):
+                _externally_managed_param_ids.add(id(_p))
+        if _norm_class_re.search(type(_module).__name__):
+            for _, _p in _module.named_parameters(recurse=False):
+                _norm_param_ids.add(id(_p))
+    # Rollback switch (default off): 1 keeps norm weights at their loaded dtype (pre-fix).
+    _disable_float32_norm_upcast = (
+        os.environ.get("UNSLOTH_DISABLE_FLOAT32_UPCAST", "0") == "1")
+
+    def _is_norm_parameter(nm, p):
+        return (
+            id(p) in _norm_param_ids
+            or "norm." in nm
+            or "_layernorm" in nm
+            or "layer_norm" in nm
+            or "norm1." in nm
+            or "norm2." in nm
+        )
+
+    # Gate the bias branch to PEFT: non-PEFT nn.Linear biases default to
+    # requires_grad=True and would all stay trainable on the LoRA path (#2343 review).
+    _is_peft_model = hasattr(model, "peft_config")
+
     for name, param in model.named_parameters():
+        original_name = name
         upcast = False
         requires_grad = False
+        _keep_param_dtype = False
+        _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
             if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
                 upcast = True
                 requires_grad = True
+            elif (_is_peft_model and "bias" in name and param.requires_grad
+                    and ".modules_to_save." not in name):
+                # Respect PEFT's bias decision: bias="all"/"lora_only" marks biases
+                # trainable; freezing them here disabled bias training (#2343).
+                # _keep_param_dtype: keep the loaded dtype, since fp32 on a bf16/fp16
+                # Linear breaks the matmul. modules_to_save is excluded so a saved head
+                # with a frozen weight isn't partially trained via its bias (#2343 review).
+                requires_grad = True
+                _keep_param_dtype = True
             else:
                 requires_grad = False
         else:
-            if train_layernorms and ("norm." in name or "_layernorm" in name):
-                requires_grad = True
-                upcast = True # Must upcast layernorms to float32
-            if train_embedding and ("embed_tokens" in name or "embedding" in name):
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
-            if train_lm_head and ("lm_head" in name):
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
-            else:
-                requires_grad = True
-                upcast = False # Can leave in bfloat16
+            # Norms need fp32 for adam writeback (~60% of bf16 norm updates round to
+            # zero otherwise); a prior dangling else on train_lm_head had clobbered this.
+            requires_grad = True
+            upcast = False
+            if (train_layernorms
+                    and _is_norm
+                    and id(param) not in _externally_managed_param_ids
+                    and not _disable_float32_norm_upcast):
+                upcast = True
         pass
         # Set training or not
         if requires_grad:
@@ -151,27 +411,42 @@ def prepare_model_for_training(
         else:
             param.requires_grad_(False)
 
-        # Upcast to float32 if needed
-        if requires_grad:
-            name = name.replace("base_model", "model", 1)
-            layer_number = re.search(r"\.[\d]{1,}\.", name)
-            if layer_number is not None:
-                # Convert .0. to [0]
-                layer_number = layer_number.group(0)
-                name = name.replace(layer_number, f"[{layer_number[1:-1]}].")
-            pass
-            name = name.replace(".weight", "", 1)
+        # Cast storage in place (keeps Parameter identity so tied weights stay tied);
+        # skip externally-managed params (preserve their fp32 cast) and dtype-pinned
+        # params (trainable biases must match their Linear weight).
+        if (requires_grad
+                and not _keep_param_dtype
+                and id(param) not in _externally_managed_param_ids):
             dtype = torch.float32 if upcast else mixed_precision_dtype
-            try:
-                # Try original name
-                exec(f"{name}.to({str(dtype)})")
-            except:
-                # Maybe model.model
-                exec(f"model.{name}.to({str(dtype)})")
+            if param.dtype != dtype:
+                param.data = param.data.to(dtype)
         pass
+
+        # Legacy UNSLOTH_UPCAST_LAYERNORM path; fp32 norms it creates hit the wrapper gate below.
+        if (_is_norm
+                and id(param) not in _externally_managed_param_ids
+                and os.environ.get("UNSLOTH_UPCAST_LAYERNORM", "0") == "1"):
+            if param.dtype != torch.float32:
+                param.data = param.data.to(torch.float32)
     pass
 
-    # Gradient checkpointing
+    # Wrap only if fp32 norms actually exist (our upcast, legacy env, or external policy);
+    # gating on presence avoids wrapping a model that has none.
+    _has_fp32_norms = any(
+        _is_norm_parameter(nm, p) and p.dtype == torch.float32
+        for nm, p in model.named_parameters()
+    )
+    if (full_finetuning
+            and mixed_precision_dtype == torch.bfloat16
+            and _has_fp32_norms):
+        _wrap_forward_in_bf16_autocast(model, torch.bfloat16)
+    else:
+        _unwrap_forward_in_bf16_autocast(model)
+
+    # Vanilla GC (True/False) requires undoing any prior Unsloth patch.
+    if use_gradient_checkpointing != "unsloth":
+        unpatch_unsloth_gradient_checkpointing()
+        unpatch_unsloth_smart_gradient_checkpointing()
     m = model
     while hasattr(m, "model"):
         if use_gradient_checkpointing == "unsloth":
@@ -187,7 +462,17 @@ def prepare_model_for_training(
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
-        model._set_gradient_checkpointing()
+        if use_gradient_checkpointing in (True, "unsloth"):
+            model._set_gradient_checkpointing()
+        else:
+            # Ensure checkpointing stays disabled if explicitly requested.
+            for module in model.modules():
+                if hasattr(module, "gradient_checkpointing"):
+                    module.gradient_checkpointing = False
+
+    # KV cache is unused under gradient checkpointing; disable it on every config.
+    if use_gradient_checkpointing in (True, "unsloth"):
+        disable_use_cache(model)
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
@@ -197,6 +482,33 @@ def prepare_model_for_training(
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    pass
+
+    # Upcast modules_to_save
+    if patch_modules_to_save:
+        try:
+            from peft.utils import ModulesToSaveWrapper
+        except:
+            ModulesToSaveWrapper = None
+
+        for name, module in model.named_modules():
+            if type(module) is ModulesToSaveWrapper or "ModulesToSave" in name:
+                if getattr(module, "original_module", None) is not None:
+                    module.original_module.requires_grad_(False)
+                if getattr(module, "modules_to_save", None) is not None:
+                    for saved_module in module.modules_to_save.modules():
+                        if hasattr(saved_module, "weight"):
+                            if saved_module.weight.dtype == torch.float16:
+                                print(f"Unsloth: Upcasting `{name}` from float16 to float32 since it's in `modules_to_save`. Also allowing gradients.")
+                                saved_module.to(torch.float32)
+                                saved_module.requires_grad_(True)
+                            else:
+                                print(f"Unsloth: Allowing gradients for `{name}` since it's in `modules_to_save`.")
+                                saved_module.requires_grad_(True)
+                    pass
+                pass
+            pass
+        pass
     pass
 
     return model
@@ -229,7 +541,6 @@ pass
 
 
 def set_training(model):
-    # Start training
     model.training = True
     while hasattr(model, "model"):
         model = model.model
@@ -239,7 +550,6 @@ pass
 
 
 def unset_training(model):
-    # End training
     model.training = False
     while hasattr(model, "model"):
         model = model.model
@@ -256,10 +566,8 @@ pass
 
 def unsloth_train(trainer):
     """
-    Unsloth Trainer
-    1. Fixes gradient accumulation
-    2. Scaled down version of HF's trainer
-    3. Much less feature complete
+    Minimal trainer: a scaled-down HF Trainer that fixes gradient accumulation.
+    Much less feature complete.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(hasattr(trainer, "args"))
@@ -333,7 +641,8 @@ def unsloth_train(trainer):
 
     # Mixed precision scaling
     torch_version = torch.__version__
-    if model.config.torch_dtype == torch.float16:
+    config_dtype = dtype_from_config(model.config)
+    if config_dtype == torch.float16:
         mixed_precision = "fp16"
         mixed_dtype = torch.float16
         # torch.cuda.amp.autocast is deprecated >= 2.4

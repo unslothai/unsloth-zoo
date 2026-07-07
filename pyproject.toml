@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "setuptools-scm"]
+requires = ["setuptools==80.9.0", "setuptools-scm==9.2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,7 @@ name = "unsloth_zoo"
 dynamic = ["version"]
 description = "Utils for Unsloth"
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.9,<3.15"
 license = "LGPL-3.0-or-later"
 keywords = ["ai", "llm",]
 authors = [
@@ -22,27 +22,36 @@ classifiers = [
     "Programming Language :: Python",
 ]
 dependencies = [
-    "torch",
-    "triton ; platform_system == 'Linux'",
-    "triton_windows ; platform_system == 'Windows'",
+    # --- GPU-only deps (skipped on macOS arm64) ---
+    "torch>=2.4.0,<2.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "torchao>=0.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "triton>=3.0.0 ; ('linux' in sys_platform)",
+    "tyro ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "accelerate>=0.34.1 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "trl>=0.18.2,!=0.19.0,<=0.24.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "peft>=0.18.0,!=0.11.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "cut_cross_entropy ; python_version >= '3.10' and (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    # --- MLX-only deps (macOS arm64) ---
+    "mlx>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-lm>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-vlm>=0.4.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # --- Shared deps (all platforms) ---
     "packaging>=24.1",
-    "tyro",
-    "transformers>=4.46.1,!=4.47.0",
-    "datasets>=2.16.0",
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
+    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
     "wheel>=0.42.0",
     "numpy",
-    "accelerate>=0.34.1",
-    "trl>=0.7.9,!=0.9.0,!=0.9.1,!=0.9.2,!=0.9.3,!=0.15.0,<=0.15.2",
-    "peft>=0.7.1,!=0.11.0",
-    "protobuf<4.0.0",
-    "huggingface_hub",
+    "protobuf",
+    "huggingface_hub>=0.34.0",
     "hf_transfer",
-    "cut_cross_entropy",
     "pillow",
     "regex",
+    "msgspec",
+    "typing_extensions",
+    "filelock",
 ]
 
 [tool.setuptools.dynamic]
@@ -51,10 +60,64 @@ version = {attr = "unsloth_zoo.__init__.__version__"}
 [tool.setuptools]
 include-package-data = false
 
+[tool.setuptools.package-data]
+unsloth_zoo = ["diffusion_studio/*.html"]
+
 [tool.setuptools.packages.find]
 exclude = ["images*"]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.22.0",
+    "mlx-lm>=0.22.0",
+    "mlx-vlm>=0.4.4",
+]
+core = [
+    "packaging>=24.1",
+    "tyro",
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
+    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    "sentencepiece>=0.2.0",
+    "tqdm",
+    "psutil",
+    "wheel>=0.42.0",
+    "numpy",
+    "accelerate>=0.34.1",
+    "trl>=0.18.2,!=0.19.0,<=0.24.0",
+    "peft>=0.18.0,!=0.11.0",
+    "protobuf",
+    "huggingface_hub>=0.34.0",
+    "hf_transfer",
+    "cut_cross_entropy ; python_version >= '3.10'",
+    "pillow",
+    "regex",
+    "msgspec",
+    "typing_extensions",
+    "filelock",
+]
+huggingface = [
+    "unsloth_zoo[core]",
+    "triton-windows ; (sys_platform == 'win32') and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
+]
+base = [
+    "unsloth_zoo[huggingface]",
+]
+intelgpu = [
+    "torch>=2.4.0",
+    "triton>=3.0.0 ; ('linux' in sys_platform)",
+    "unsloth_zoo[core]",
+]
 
 [project.urls]
 homepage = "http://www.unsloth.ai"
 documentation = "https://github.com/unslothai/unsloth"
 repository = "https://github.com/unslothai/unsloth"
+
+[tool.pytest.ini_options]
+# Mirrors the same stanza added to unslothai/unsloth in PR #5397.
+# Scopes `pytest` discovery to ./tests so the GPU-heavy tests there
+# don't accidentally fire when a developer runs a bare `pytest` from
+# the repo root. CI jobs explicitly name the target subtree (e.g.
+# `pytest tests/security` for the hard-gate suite).
+testpaths = ["tests"]
+pythonpath = ["."]

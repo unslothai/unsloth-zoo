@@ -15,11 +15,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import torch
-from packaging.version import Version
+from .utils import Version
 import os
+import math
+import functools
+from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
-major, minor = torch.cuda.get_device_capability()
+from . import DEVICE_TYPE
+from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -30,15 +34,27 @@ if importlib.util.find_spec("unsloth_studio") is None:
 else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
-if UNSLOTH_STUDIO_ENABLED:
-    from unsloth_studio.losses import (
-        unsloth_efficient_ce_loss,
-    )
-pass
 
-if (Version(torch.__version__) >= Version("2.4.0")) and \
-    (not ((major <= 7) and (minor < 5))) and \
-    (not (Version(triton_version) < Version("3.0.0"))):
+if DEVICE_TYPE == "cuda":
+    major, minor = torch.cuda.get_device_capability()
+    if (Version(torch.__version__) >= Version("2.4.0")) and \
+        (not ((major <= 7) and (minor < 5))) and \
+        (not (Version(triton_version) < Version("3.0.0"))):
+        try:
+            from cut_cross_entropy import linear_cross_entropy
+            HAS_CUT_CROSS_ENTROPY = True
+        except:
+            HAS_CUT_CROSS_ENTROPY = False
+    else:
+        HAS_CUT_CROSS_ENTROPY = False
+    pass
+elif DEVICE_TYPE == "hip":
+    try:
+        from cut_cross_entropy import linear_cross_entropy
+        HAS_CUT_CROSS_ENTROPY = True
+    except:
+        HAS_CUT_CROSS_ENTROPY = False
+elif DEVICE_TYPE == "xpu":
     try:
         from cut_cross_entropy import linear_cross_entropy
         HAS_CUT_CROSS_ENTROPY = True
@@ -55,8 +71,10 @@ __all__ = [
     "fused_linear_cross_entropy",
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
+    "unsloth_fused_ce_loss",
 ]
 
+from .fused_losses import unsloth_fused_ce_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -83,7 +101,11 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
-            if reduction == "sum": loss = loss / num_items_in_batch
+            if reduction == "sum":
+                # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer
+                if torch.is_tensor(num_items_in_batch):
+                    num_items_in_batch = num_items_in_batch.to(loss.device)
+                loss = loss / num_items_in_batch
         return loss
     pass
     
@@ -104,13 +126,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
     elif torch_compile:
-        torch_compile_options = {
-            "epilogue_fusion"   : True,
-            "max_autotune"      : False,
-            "shape_padding"     : True,
-            "trace.enabled"     : os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1",
-            "triton.cudagraphs" : False,
-        }
         UnslothForCausalLMLoss = torch.compile(
             UnslothForCausalLMLoss,
             dynamic = True,
@@ -122,7 +137,14 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # Now patch the losses!
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
-    LOSS_MAPPING["ForCausalLM"] = UnslothForCausalLMLoss
+    # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
+    # resolves loss_type by regex on the class name, so e.g.
+    # Qwen3_5ForConditionalGeneration / CsmForConditionalGeneration land on keys
+    # pointing at the stock loss; without this sweep they keep the un-patched
+    # loss and OOM via logits.float() at large vocab sizes.
+    for _key, _fn in list(LOSS_MAPPING.items()):
+        if getattr(_fn, "__name__", "") == "ForCausalLMLoss":
+            LOSS_MAPPING[_key] = UnslothForCausalLMLoss
 
     # Remove @property and @lru_cache
     if hasattr(transformers.modeling_utils.PreTrainedModel.loss_function, "fget") and \
@@ -154,6 +176,7 @@ def post_patch_loss_function(model):
 pass
 
 
+current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -165,63 +188,53 @@ def fused_linear_cross_entropy(
     accuracy_threshold : str = "auto",
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
-    loss = linear_cross_entropy(
-        hidden_states.to(lm_weight.dtype),
-        lm_weight,
-        targets      = labels,
-        ignore_index = ignore_index,
-        softcap      = logit_softcapping,
-        reduction    = reduction,
-        shift        = True,
-        filter_eps   = accuracy_threshold,
-    )
+
+    with current_device(lm_weight.device):
+        loss = linear_cross_entropy(
+            hidden_states.to(lm_weight.dtype),
+            lm_weight,
+            targets      = labels,
+            ignore_index = ignore_index,
+            softcap      = logit_softcapping,
+            reduction    = reduction,
+            shift        = True,
+            filter_eps   = accuracy_threshold,
+        )
     if num_items_in_batch is not None: loss = loss / num_items_in_batch
     return loss
 pass
 
 
-def fast_linear_cross_entropy(
-    hidden_states        : torch.Tensor,
-    lm_head              : torch.nn.Linear,
-    labels               : torch.Tensor,
-    num_items_in_batch   : int = None,
-    ignore_index         : int = -100,
-    reduction            : str = "mean",
-    logit_softcapping    : float = 0,
-    logit_scale_multiply : float = 0,
-    logit_scale_divide   : float = 0,
-    attention_mask       : torch.Tensor = None,
-):
-    # All Unsloth Zoo code licensed under LGPLv3
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    if logit_softcapping == 0: logit_softcapping = None
-    if logit_scale_multiply != 0:
-        logit_scale = logit_scale_multiply
-    elif logit_scale_divide != 0:
-        logit_scale = 1.0 / logit_scale_divide
-    else:
-        logit_scale = None
-
-    loss = unsloth_efficient_ce_loss(
-        hidden_states = hidden_states,
-        lm_head = lm_head,
-        labels = labels,
-        shift = True,
-        reduction = reduction,
-        logit_scale = logit_scale,
-        logit_softcapping = logit_softcapping,
-        ignore_index = ignore_index,
-        chunk_size = 512,
-        attention_mask = attention_mask,
+def fast_linear_cross_entropy(*args, **kwargs):
+    raise RuntimeError(
+        "Unsloth: `fast_linear_cross_entropy` has been deprecated. "
+        "Please update Unsloth and Unsloth Zoo via:\n"
+        "pip install --upgrade --no-cache-dir --no-deps unsloth_zoo unsloth"
     )
-    if num_items_in_batch is not None: loss = loss / num_items_in_batch
-    return loss
 pass
+
 
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
+
+global TRAINING_ITERATIONS
+TRAINING_ITERATIONS = 0
+
+# ParallelMode distinguishes DataParallel (scatter/gather from one process)
+# from the faster DistributedDataParallel (one process per device).
+from transformers.training_args import ParallelMode
+
+# Cannot use sadly
+# import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+# torch_compiler_set_stance = torch.compiler.set_stance
+
+mark_static  = torch._dynamo.mark_static
+mark_dynamic = torch._dynamo.mark_dynamic
 
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -230,6 +243,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     # Check if model allows **kwargs
     m = self.model
+    if hasattr(m, "get_base_model"):
+        # Removes PeftModelForCausalLM and gets internal model
+        m = m.get_base_model()
     model_name = m.__class__.__name__
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
@@ -251,9 +267,13 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                         forward = __wrapped__
             pass
             name = forward.__qualname__
-            if "ForConditionalGeneration" in name or "VisionText2Text" in name:
+            # Fall back to the class name: patched forwards (temporary_patches)
+            # may have qualnames lacking identifiers like "CausalLM".
+            class_name = type(m).__name__
+            if "ForConditionalGeneration" in name or "ForConditionalGeneration" in class_name \
+                or "VisionText2Text" in name:
                 is_vlm = True
-            if is_vlm or "CausalLM" in name or "_fast_forward" in name:
+            if is_vlm or "CausalLM" in name or "CausalLM" in class_name or "_fast_forward" in name:
                 signature = inspect.signature(forward).parameters.values()
                 has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
                 break
@@ -276,25 +296,63 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
-            if not "attention_mask" in batch_samples[0]: is_vlm = False
-            if not is_vlm:
-                num_items_in_batch = sum(
-                    [(x["labels"][..., 1:] != -100)\
-                    .sum() for x in batch_samples]
-                )
-            else:
-                num_items_in_batch = sum(
-                    [((x["labels"][..., 1:] != -100) & (x["attention_mask"][..., 1:] != 0))\
-                    .sum() for x in batch_samples]
-                )
+            token_counts = []
+            for x in batch_samples:
+                labels = x["labels"]
+                token_count = (labels[..., 1:] != -100)
+                if "input_ids" in x:
+                    input_ids = x["input_ids"]
+                    mark_static (input_ids, 0)
+                    mark_dynamic(input_ids, 1)
+                if "attention_mask" in x:
+                    attention_mask = x["attention_mask"]
+                    mark_static (attention_mask, 0)
+                    mark_dynamic(attention_mask, 1)
+                    token_count &= (attention_mask[..., 1:] != 0)
+                if "token_type_ids" in x:
+                    token_type_ids = x["token_type_ids"]
+                    mark_static (token_type_ids, 0)
+                    mark_dynamic(token_type_ids, 1)
+                count = token_count.sum()
+                seq_lengths = x.get("packed_seq_lengths")
+                if seq_lengths is not None:
+                    # Packing N sequences has N-1 internal boundaries that
+                    # aren't valid training positions.
+                    count -= torch.count_nonzero(seq_lengths > 0).item() - 1
+                token_counts.append(count)
+            pass
+            num_items_in_batch = sum(token_counts)
 
             if self.args.average_tokens_across_devices:
                 num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-            if device is not None and torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(device)
+            if torch.is_tensor(num_items_in_batch):
+                if device is not None:
+                    num_items_in_batch = num_items_in_batch.to(device)
+                if getattr(self.args, "n_gpu", 1) > 1 and self.args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
+                    # Uses DataParallel scatter gather
+                    # So we have to scatter num_items_in_batch to each GPU
+                    num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
+    
+    # [TODO] Unfortunately skip_guard_eval_unsafe = True fails
+    # Increment counter and set compiler stance
+    # if not hasattr(self.model, "vllm_engine"):
+    #     # Only for non vLLM runs! Otherwise errors out
+    #     global TRAINING_ITERATIONS
+    #     if TRAINING_ITERATIONS == 16:
+    #         # Skip guards after 16 warmup runs
+    #         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = True)
+    #         if UNSLOTH_ENABLE_LOGGING:
+    #             logger.info(f"Unsloth: Skipping torch.compile guards after 16 steps at TRAINING_ITERATIONS = {TRAINING_ITERATIONS}")
+    #     elif torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe == False and TRAINING_ITERATIONS > 16:
+    #         # Reset TRAINING_ITERATIONS
+    #         torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+    #         TRAINING_ITERATIONS = 0
+    #     TRAINING_ITERATIONS += 1
     return batch_samples, num_items_in_batch
 pass
 

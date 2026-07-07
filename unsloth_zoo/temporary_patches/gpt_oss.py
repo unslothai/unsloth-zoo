@@ -1,0 +1,3358 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import os
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import torch.nn.functional as F
+import inspect
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    _torch_compile,
+    get_torch_compile_options,
+    UNSLOTH_ENABLE_LOGGING,
+    UNSLOTH_COMPILE_DISABLE,
+    logger,
+)
+from importlib.metadata import version as importlib_version
+from ..utils import Version
+transformers_version = Version(importlib_version("transformers"))
+has_static_cache = transformers_version >= Version("4.56.0.dev0")
+from .utils import (
+    patch_function,
+    patch_function_past_key_values,
+    dedent,
+    KWARGS_TYPE,
+    raise_error,
+    logger,
+    Cache,
+    process_return,
+)
+from ..hf_utils import dtype_from_config
+torch_cuda_device = torch.cuda.device
+
+# UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
+UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
+
+
+def _check_triton_kernels_available():
+    """Is OpenAI's triton_kernels package available for MXFP4."""
+    try:
+        from triton_kernels import matmul_ogs, swiglu
+
+        return True
+    except ImportError:
+        return False
+
+
+_TRITON_KERNELS_AVAILABLE = None
+
+
+def is_triton_kernels_available():
+    """Cached check for triton_kernels availability."""
+    global _TRITON_KERNELS_AVAILABLE
+    if _TRITON_KERNELS_AVAILABLE is None:
+        _TRITON_KERNELS_AVAILABLE = _check_triton_kernels_available()
+    return _TRITON_KERNELS_AVAILABLE
+
+
+@torch_compile(dynamic = True, fullgraph = True)
+def swiglu_torch_forward(a, alpha, limit, dtype = None):
+    a_gelu = a[..., ::2].to(torch.float32)
+    if limit is not None:
+        a_gelu = a_gelu.clamp(max=limit)
+    a_linear = a[..., 1::2].to(torch.float32)
+    if limit is not None:
+        a_linear = a_linear.clamp(min=-limit, max=limit)
+
+    out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
+    out = out_gelu * (a_linear + 1)
+    return out.to(a.dtype if dtype is None else dtype)
+pass
+
+
+@torch_compile(dynamic = True, fullgraph = True)
+def swiglu_torch_backward(pre_act, alpha, limit, g1):
+    g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
+
+    if limit is not None:
+        mask_g = g <= limit
+        mask_l = l.abs() <= limit
+        ḡ = torch.where(mask_g, g, limit)
+        l̄ = torch.where(mask_l, l, l.sign() * limit)
+    else:                                            # no clipping
+        mask_g = mask_l = torch.ones_like(g, dtype=bool)
+        ḡ, l̄ = g, l
+
+    σ   = torch.sigmoid(alpha * ḡ)
+    dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
+    dl  = ḡ * σ
+    dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
+    dl  = torch.where(mask_l, dl, 0.)
+
+    grad = torch.empty_like(pre_act)
+    grad[..., ::2], grad[..., 1::2] = dg, dl
+    return g1 * grad.to(g1.dtype)
+pass
+
+def patch_gpt_oss():
+    try:
+        import triton_kernels
+
+        HAS_TRITON_KERNELS = True
+    except Exception as e:
+        HAS_TRITON_KERNELS = False
+        # return raise_error("Please install triton_kernels", e)
+    try:
+        import transformers.quantizers.quantizer_mxfp4
+
+        # Always allow LoRA training (works with dequantized bf16 weights too)
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
+
+    if HAS_TRITON_KERNELS:
+        # Only override is_kernels_available when triton_kernels IS available
+        try:
+            def is_kernels_available(): return True
+
+            transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+        except Exception as e:
+            return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+        if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+            transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
+
+        try:
+            from triton_kernels import matmul_ogs, swiglu
+
+            FnSpecs, FusedActivation, matmul_ogs = (
+                matmul_ogs.FnSpecs,
+                matmul_ogs.FusedActivation,
+                matmul_ogs.matmul_ogs,
+            )
+            swiglu_fn = swiglu.swiglu_fn
+        except Exception as e:
+            return raise_error("triton_kernels", e)
+    else:
+        # Leave is_kernels_available intact so transformers' validate_environment()
+        # correctly sets dequantize=True, enabling bf16 fallback.
+        return
+
+    try:
+        import transformers.integrations.mxfp4
+    except Exception as e:
+        return raise_error("transformers.integrations.mxfp4", e)
+
+    def swizzle_mxfp4(w, w_scale, *args, **kwargs):
+        from triton_kernels import tensor, tensor_details
+        FP4, convert_layout, wrap_torch_tensor = (
+            tensor.FP4,
+            tensor.convert_layout,
+            tensor.wrap_torch_tensor,
+        )
+        layout = tensor_details.layout
+        StridedLayout = tensor_details.layout.StridedLayout
+
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
+        # TODO : add that when we are actually sure that it works on B200
+        # if torch.cuda.get_device_capability()[0] == 10:
+        #     constraints = {
+        #         "is_persistent": True,
+        #         "epilogue_subtile": 1,
+        #     }
+        #     opt_flags.update_opt_flags_constraints(constraints)
+        # # transpose the tensor so that the quantization axis is on dim1
+
+        # TODO: there is still an issue with the scales on hopper
+        # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
+        # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+        return w, w_scale
+    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
+
+    class Mxfp4GptOssExperts_Training(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            hidden_states,
+            self_class,
+            routing_data,
+            gather_idx,
+            scatter_idx,
+        ):
+            pre_activation = matmul_ogs(
+                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
+                self_class.gate_up_proj,
+                self_class.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                scatter_indx=None,
+                precision_config=self_class.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=None,
+            )
+            swiglu_output = swiglu_torch_forward(
+                pre_activation,
+                self_class.alpha,
+                self_class.limit,
+            )
+            out = matmul_ogs(
+                swiglu_output,
+                self_class.down_proj,
+                self_class.down_proj_bias,
+                routing_data,
+                gather_indx=None,
+                scatter_indx=scatter_idx,
+                precision_config=self_class.down_proj_precision_config,
+                gammas=routing_data.gate_scal,
+                fused_activation=None,
+            )
+            ctx.save_for_backward(
+                pre_activation,
+                routing_data.gate_scal,
+                gather_idx.src_indx,
+                gather_idx.dst_indx,
+                scatter_idx.src_indx,
+                scatter_idx.dst_indx,
+            )
+            ctx.self_class   = self_class
+            ctx.gather_idx   = gather_idx
+            ctx.scatter_idx  = scatter_idx
+            ctx.routing_data = routing_data
+            return out
+        pass
+
+        @staticmethod
+        def backward(ctx, grad_token):
+            raise NotImplementedError(
+                "Backwards pass using MXFP4 is still under construction!\n"
+                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"
+                "Or, use `load_in_4bit = True` which allows finetuning."
+            )
+            (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
+            self_class = ctx.self_class
+            limit = self_class.limit
+            alpha = self_class.alpha
+
+            # 1) token ➜ expert (reverse of forward scatter)
+            grad_exp = grad_token.index_select(0, scatter_src)
+            grad_exp.mul_(gamma.unsqueeze(-1))
+            # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
+            Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
+            g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
+            del Wd_T
+            # 3) activation derivative
+            g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
+            # 4) g1 · Wuᵀ
+            Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
+            dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
+            del Wu_T
+
+            # 5) expert ➜ token (reverse of forward gather)
+            dx_token = torch.zeros_like(grad_token)
+            dx_token.index_add_(0, gather_dst, dx_exp)
+            return (dx_token, None, None, None, None,)
+        pass
+
+    pass
+
+    class Mxfp4GptOssExperts(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+
+            self.num_experts = config.num_local_experts
+            self.intermediate_size = config.intermediate_size
+            self.hidden_size = config.hidden_size
+
+            # MXFP4 quantized format (blocks + scales)
+            self.gate_up_proj_blocks = nn.Parameter(
+                torch.zeros(
+                    self.num_experts,
+                    2 * self.intermediate_size,
+                    self.hidden_size // 32,
+                    16,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            self.gate_up_proj_scales = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False,
+            )
+
+            self.down_proj_blocks = nn.Parameter(
+                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8), requires_grad=False
+            )
+            self.down_proj_scales = nn.Parameter(
+                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8), requires_grad=False
+            )
+            self.down_proj_bias = nn.Parameter(
+                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
+            )
+
+            self.alpha = 1.702
+            self.limit = getattr(config, "swiglu_limit", 7.0)
+            self.gate_up_proj_precision_config = None
+            self.down_proj_precision_config = None
+
+        @property
+        def gate_up_proj(self):
+            """gate_up_proj tensor, from blocks/scales or stored directly."""
+            # Already set from checkpoint loading or previous dequantization
+            if "_gate_up_proj" in self.__dict__:
+                return self.__dict__["_gate_up_proj"]
+
+            # MXFP4 weights present when blocks/scales are not all zeros
+            blocks_valid = (
+                self.gate_up_proj_blocks.device.type != "meta"
+                and self.gate_up_proj_blocks.numel() > 0
+                and self.gate_up_proj_blocks.any()
+            )
+
+            if not blocks_valid:
+                raise AttributeError(
+                    f"Mxfp4GptOssExperts.gate_up_proj: No weights loaded. "
+                    f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
+                )
+
+            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+            try:
+                from transformers.integrations.mxfp4 import dequantize
+                dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
+                self.__dict__["_gate_up_proj"] = dequantized
+                return dequantized
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to dequantize MXFP4 gate_up_proj: {e}. "
+                    f"Ensure transformers.integrations.mxfp4.dequantize is available."
+                )
+
+        @gate_up_proj.setter
+        def gate_up_proj(self, value):
+            """Set gate_up_proj tensor (during checkpoint loading)."""
+            self.__dict__["_gate_up_proj"] = value
+
+        @property
+        def down_proj(self):
+            """down_proj tensor, from blocks/scales or stored directly."""
+            if "_down_proj" in self.__dict__:
+                return self.__dict__["_down_proj"]
+
+            blocks_valid = (
+                self.down_proj_blocks.device.type != "meta"
+                and self.down_proj_blocks.numel() > 0
+                and self.down_proj_blocks.any()
+            )
+
+            if not blocks_valid:
+                raise AttributeError(
+                    f"Mxfp4GptOssExperts.down_proj: No weights loaded."
+                )
+
+            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+            try:
+                from transformers.integrations.mxfp4 import dequantize
+                dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
+                self.__dict__["_down_proj"] = dequantized
+                return dequantized
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to dequantize MXFP4 down_proj: {e}"
+                )
+
+        @down_proj.setter
+        def down_proj(self, value):
+            """Set down_proj tensor (during checkpoint loading)."""
+            self.__dict__["_down_proj"] = value
+
+        def forward(
+            self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx
+        ) -> torch.Tensor:
+            with torch_cuda_device(hidden_states.device):
+                if not hasattr(self, "act"):
+                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
+                if not hidden_states.requires_grad:
+                    intermediate_cache1 = matmul_ogs(
+                        hidden_states.to(torch.bfloat16),  # tl.dot_scaled upcasts to BF16 for old hardware
+                        self.gate_up_proj,
+                        self.gate_up_proj_bias,
+                        routing_data,
+                        gather_indx=gather_idx,
+                        precision_config=self.gate_up_proj_precision_config,
+                        gammas=None,
+                        fused_activation=self.act,
+                    )
+                    intermediate_cache3 = matmul_ogs(
+                        intermediate_cache1,
+                        self.down_proj,
+                        self.down_proj_bias,
+                        routing_data,
+                        scatter_indx=scatter_idx,
+                        precision_config=self.down_proj_precision_config,
+                        gammas=routing_data.gate_scal if routing_data else None,
+                    )
+                else:
+                    intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
+                        hidden_states,
+                        self,
+                        routing_data,
+                        gather_idx,
+                        scatter_idx,
+                    )
+            return intermediate_cache3
+
+        pass
+
+    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
+
+    if HAS_TRITON_KERNELS:
+        try:
+            routing = triton_kernels.routing.routing
+            routing = torch.compiler.disable(routing)
+        except Exception as e:
+            return raise_error("triton_kernels.routing.routing", e)
+
+        def mlp_forward(self, hidden_states):
+            batch_size = hidden_states.shape[0]
+            hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
+            router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
+
+            with torch_cuda_device(router_logits.device):
+                routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
+
+            routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
+            routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+            return routed_out, router_logits
+
+        patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
+
+    if HAS_TRITON_KERNELS:
+        try:
+            PrecisionConfig, FlexCtx, InFlexData = (
+                triton_kernels.matmul_ogs.PrecisionConfig,
+                triton_kernels.matmul_ogs.FlexCtx,
+                triton_kernels.matmul_ogs.InFlexData,
+            )
+        except Exception as e:
+            return raise_error("triton_kernels.matmul_ogs", e)
+
+    try:
+        from transformers.integrations.tensor_parallel import shard_and_distribute_module
+    except Exception as e:
+        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+
+    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
+        model = kwargs.get("model", None)
+        empty_param = kwargs.get("empty_param", None)
+        casting_dtype = kwargs.get("casting_dtype", None)
+        to_contiguous = kwargs.get("to_contiguous", None)
+        rank = kwargs.get("rank", None)
+        device_mesh = kwargs.get("device_mesh", None)
+
+        for proj in ["gate_up_proj", "down_proj"]:
+            if proj in param_name:
+                if device_mesh is not None:
+                    shard_and_distribute_module(model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh)
+                else:
+                    setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
+                blocks_attr = f"{proj}_blocks"
+                scales_attr = f"{proj}_scales"
+                blocks = getattr(module, blocks_attr)
+                scales = getattr(module, scales_attr)
+                # Valid = blocks/scales off meta AND non-zero (all-zeros means init, not checkpoint)
+                blocks_valid = (
+                    blocks.device.type != "meta"
+                    and scales.device.type != "meta"
+                    and blocks.numel() > 0
+                    and blocks.any()  # At least some non-zero values
+                )
+                if blocks_valid:
+                    # need it for ep
+                    local_experts = blocks.size(0)
+                    if proj == "gate_up_proj":
+                        blocks = blocks.view(local_experts, module.intermediate_size * 2, -1)
+                    else:
+                        blocks = blocks.view(local_experts, -1, module.intermediate_size // 2)
+                    # TODO: we need to have the weights on cuda, refactor later
+                    if getattr(target_device, "type", target_device) == "cpu":
+                        target_device = "cuda"
+                    # TODO: check why we still do move the tensors despite the context manager
+                    blocks = blocks.to(target_device)
+                    scales = scales.to(target_device)
+                    with torch.cuda.device(target_device):
+                        triton_weight_tensor, weight_scale = swizzle_mxfp4(
+                            blocks.transpose(-2, -1), scales.transpose(-2, -1)
+                        )
+
+                    # need to overwrite the shapes for the kernels
+                    if proj == "gate_up_proj":
+                        triton_weight_tensor.shape = torch.Size(
+                            [local_experts, module.hidden_size, module.intermediate_size * 2]
+                        )
+                    else:
+                        triton_weight_tensor.shape = torch.Size(
+                            [local_experts, module.intermediate_size, module.hidden_size]
+                        )
+
+                    # triton_weight_tensor is what needs to be passed in oai kernels. It stores the data, the shapes and any more objects. It is like a subtensor
+                    setattr(module, proj, triton_weight_tensor)
+                    setattr(
+                        module,
+                        f"{proj}_precision_config",
+                        PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
+                    )
+
+                    # delete blocks and scales
+                    delattr(module, scales_attr)
+                    delattr(module, blocks_attr)
+                    # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
+                    del blocks
+
+    pass
+    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
+
+    try:
+        from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
+    except Exception as e:
+        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
+
+    def replace_with_mxfp4_linear(
+        model,
+        modules_to_not_convert=None,
+        current_key_name=None,
+        quantization_config=None,
+        config=None,
+    ):
+        if quantization_config.dequantize: return model
+        modules_to_not_convert = (["lm_head"] if modules_to_not_convert is None else modules_to_not_convert)
+        if quantization_config.modules_to_not_convert is not None:
+            modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
+        modules_to_not_convert = list(set(modules_to_not_convert))
+        model, has_been_replaced = _replace_with_mxfp4_linear(model, modules_to_not_convert, current_key_name, quantization_config, config=config)
+        if not has_been_replaced:
+            logger.warning_once(
+                "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
+                " Please double check your model architecture, or submit an issue on github if you think this is"
+                " a bug."
+            )
+
+        return model
+
+    patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss)
+
+
+class ParameterModule(nn.Linear):
+    """
+    Wraps a parameter as an nn.Linear for PEFT, managing 3D <-> 2D weight conversion.
+    Unsloth grouped_mm needs 3D weights (gate_up: (E, H, 2I); down: (E, I, H)); PEFT
+    Linear needs 2D (Out, In). Stored 2D for PEFT, reshaped for Unsloth via get_param().
+    """
+
+    def __init__(
+        self, in_features, out_features, shape_3d, permute_to_2d, permute_to_3d
+    ):
+        super().__init__(in_features, out_features, bias=False)
+        self.shape_3d = shape_3d
+        self.permute_to_2d = permute_to_2d
+        self.permute_to_3d = permute_to_3d
+        # Caller must overwrite the randomly initialized weight.
+
+    def extra_repr(self):
+        return f"in_features={self.in_features}, out_features={self.out_features}, shape_3d={self.shape_3d}"
+
+    def get_param(self):
+        """Restore the 3D weight for Unsloth computation."""
+        # 2D (Out, In) -> view to (E, 2I, H) [shape_3d permuted by permute_to_2d] -> permute -> 3D
+        unflattened_shape = [self.shape_3d[i] for i in self.permute_to_2d]
+        return self.weight.view(*unflattened_shape).permute(*self.permute_to_3d).contiguous()
+
+    def set_weight_from_3d(self, weight_3d):
+        """Set the 2D weight from a 3D tensor."""
+        weight_2d = weight_3d.permute(*self.permute_to_2d).reshape(self.out_features, self.in_features)
+        self.weight.data.copy_(weight_2d)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Checkpoint 'gate_up_proj' is 3D; load into 'gate_up_proj.weight' (2D)
+        key = prefix[:-1]
+
+        if key in state_dict:
+            val = state_dict[key]
+            val_2d = val.permute(*self.permute_to_2d).reshape(self.out_features, self.in_features)
+            state_dict[prefix + "weight"] = val_2d
+            del state_dict[key]
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
+def patch_gpt_oss_compiler_exports():
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+    if "gpt_oss" not in model_name:
+        return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+        return
+
+    # Export helpers so compiler-generated GPT-OSS modules can resolve symbols.
+    m = transformers.models.gpt_oss.modeling_gpt_oss
+    m.ParameterModule = ParameterModule
+    m.swiglu_torch_forward = swiglu_torch_forward
+    m.dtype_from_config = dtype_from_config
+    m.transformers_version = transformers_version
+    m.Version = Version
+TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
+
+
+class GptOssExperts(nn.Module):
+    """
+    GPT OSS MoE Experts layer with 3D stacked parameters; supports grouped_mm with split LoRA.
+    Same structure as transformers GptOssExperts:
+    - gate_up_proj: (num_experts, hidden_size, 2 * expert_dim)
+    - gate_up_proj_bias: (num_experts, 2 * expert_dim)
+    - down_proj: (num_experts, expert_dim, hidden_size)
+    - down_proj_bias: (num_experts, hidden_size)
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size
+        self.expert_dim = config.intermediate_size
+        self.intermediate_size = config.intermediate_size  # Alias for compatibility
+        self.alpha = 1.702
+        self.limit = getattr(config, "swiglu_limit", 7.0)
+        self.dtype = dtype_from_config(config)
+
+        # gate_up_proj: 3D (E, H, 2I) -> 2D (E*2I, H); permute (0,2,1), reverse (0,2,1)
+        self.gate_up_proj = ParameterModule(
+            in_features=self.hidden_size,
+            out_features=self.num_experts * 2 * self.expert_dim,
+            shape_3d=(self.num_experts, self.hidden_size, 2 * self.expert_dim),
+            permute_to_2d=(0, 2, 1),
+            permute_to_3d=(0, 2, 1),
+        )
+        self.gate_up_proj.set_weight_from_3d(
+            torch.zeros(
+                self.num_experts,
+                self.hidden_size,
+                2 * self.expert_dim,
+                dtype=self.dtype,
+            )
+        )
+
+        self.gate_up_proj_bias = nn.Parameter(torch.zeros(self.num_experts, 2 * self.expert_dim, dtype=self.dtype))
+
+        # down_proj: 3D (E, I, H) -> 2D (H, E*I); permute (2,0,1), reverse (1,2,0)
+        self.down_proj = ParameterModule(
+            in_features=self.num_experts * self.expert_dim,
+            out_features=self.hidden_size,
+            shape_3d=(self.num_experts, self.expert_dim, self.hidden_size),
+            permute_to_2d=(2, 0, 1),
+            permute_to_3d=(1, 2, 0),
+        )
+        self.down_proj.set_weight_from_3d(
+            torch.empty(
+                self.num_experts, self.expert_dim, self.hidden_size, dtype=self.dtype
+            )
+        )
+
+        self.down_proj_bias = nn.Parameter(torch.zeros(self.num_experts, self.hidden_size, dtype=self.dtype))
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """
+        Convert checkpoint 3D tensors (gate_up_proj, down_proj nn.Parameter) to the 2D
+        .weight format that ParameterModule (nn.Linear subclass) expects.
+        """
+        gate_up_key = prefix + "gate_up_proj"
+        gate_up_weight_key = prefix + "gate_up_proj.weight"
+        if gate_up_key in state_dict and gate_up_weight_key not in state_dict:
+            val_3d = state_dict.pop(gate_up_key)
+            # 3D (E, H, 2I) -> permute (0,2,1) -> (E, 2I, H) -> reshape (E*2I, H)
+            val_2d = val_3d.permute(0, 2, 1).reshape(self.num_experts * 2 * self.expert_dim, self.hidden_size)
+            state_dict[gate_up_weight_key] = val_2d
+
+        down_key = prefix + "down_proj"
+        down_weight_key = prefix + "down_proj.weight"
+        if down_key in state_dict and down_weight_key not in state_dict:
+            val_3d = state_dict.pop(down_key)
+            # 3D (E, I, H) -> permute (2,0,1) -> (H, E, I) -> reshape (H, E*I)
+            val_2d = val_3d.permute(2, 0, 1).reshape(self.hidden_size, self.num_experts * self.expert_dim)
+            state_dict[down_weight_key] = val_2d
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
+    ) -> torch.Tensor:
+        """Forward using grouped_mm or loop fallback with LoRA support."""
+        if _check_torch_grouped_mm_supported():
+            return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
+        return torch_native_forward(self, hidden_states, router_indices, routing_weights)
+
+
+pass
+
+
+class _RouterLinearParams(nn.Module):
+    """
+    weight/bias container like nn.Linear but NOT nn.Linear, so BitsAndBytes will NOT quantize it.
+    State dict keys linear.weight/linear.bias match BnB 4-bit checkpoints where the router was
+    saved via an nn.Linear submodule.
+    """
+    def __init__(self, in_features, out_features, dtype):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype))
+
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
+
+
+class GptOssTopKRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        # _RouterLinearParams (not nn.Linear) avoids BnB 4-bit quantization; keys
+        # router.linear.weight/bias match the BnB 4-bit checkpoint format.
+        self.linear = _RouterLinearParams(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
+
+    # transformers' _init_weights expects .weight and .bias
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @weight.setter
+    def weight(self, value):
+        self.linear.weight = value
+
+    @property
+    def bias(self):
+        return self.linear.bias
+
+    @bias.setter
+    def bias(self, value):
+        self.linear.bias = value
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = self.linear(hidden_states.to(self.linear.weight.dtype))  # (batch_size * seq_len, num_experts)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        router_scores = torch.zeros_like(router_logits, dtype=router_logits.dtype).scatter_(1, router_indices, router_top_value)
+        if transformers_version >= Version("5.0.0"):
+            return router_logits, router_scores, router_indices
+        else:
+            return router_scores, router_indices
+
+pass
+
+
+# BitsAndBytes 4bit compatible classes for loading pre-quantized models
+class GptOssExpertsBnb4bit(nn.Module):
+    """
+    GPT OSS MoE Experts using ModuleLists of nn.Linear (gate_up_projs, down_projs)
+    so BitsAndBytes can quantize them.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size
+        self.expert_dim = config.intermediate_size
+        self.intermediate_size = config.intermediate_size
+        self.alpha = 1.702
+        self.limit = getattr(config, "swiglu_limit", 7.0)
+        self.dtype = dtype_from_config(config)
+
+        self.gate_up_projs = nn.ModuleList([
+            nn.Linear(self.hidden_size, 2 * self.expert_dim, dtype=self.dtype)
+            for _ in range(self.num_experts)
+        ])
+        self.down_projs = nn.ModuleList([
+            nn.Linear(self.expert_dim, self.hidden_size, dtype=self.dtype)
+            for _ in range(self.num_experts)
+        ])
+
+        # Empty buffers for transformers _init_weights compat; avoid large bf16 alloc in 4-bit mode.
+        self.register_buffer(
+            "gate_up_proj", torch.empty(0, dtype=self.dtype), persistent=False
+        )
+        self.register_buffer(
+            "gate_up_proj_bias", torch.empty(0, dtype=self.dtype), persistent=False
+        )
+        self.register_buffer(
+            "down_proj", torch.empty(0, dtype=self.dtype), persistent=False
+        )
+        self.register_buffer(
+            "down_proj_bias", torch.empty(0, dtype=self.dtype), persistent=False
+        )
+
+    def _grouped_bnb4bit_ready(self):
+        """True when every expert is a plain (LoRA-free) bnb Linear4bit with a
+        populated quant_state, so the grouped torch._grouped_mm path is exact.
+
+        Self-contained (local imports, no module globals): the compiler can copy
+        this class's source into the standalone compiled cache, whose module
+        namespace lacks this file's globals."""
+        import os
+        if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
+            return False
+        # The grouped path materializes torch._grouped_mm stacks meant to run under the
+        # compiled cache; when the user disables compilation they have opted into the plain
+        # eager per-expert loop, so honor that and fall back.
+        if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+            return False
+        def _fail(reason):
+            if (
+                os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+                and not getattr(self, "_unsloth_grouped_logged", False)
+            ):
+                self._unsloth_grouped_logged = True
+                import logging
+                logging.getLogger("unsloth_zoo.temporary_patches").info(
+                    f"Unsloth: gpt-oss grouped path disabled: {reason}"
+                )
+            return False
+        try:
+            import bitsandbytes as bnb
+            from bitsandbytes.nn import Params4bit
+            from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
+            if not _check_torch_grouped_mm_supported():
+                return _fail("torch._grouped_mm unsupported")
+            blocksize = None
+            for lin in list(self.gate_up_projs) + list(self.down_projs):
+                if hasattr(lin, "lora_A") or hasattr(lin, "base_layer"):
+                    return _fail(f"LoRA-wrapped expert {type(lin).__name__}")
+                w = getattr(lin, "weight", None)
+                if not (isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None):
+                    return _fail(f"expert weight {type(w).__name__} without quant_state")
+                if w.requires_grad:
+                    return _fail("expert weight requires_grad")
+                qs = w.quant_state
+                # The grouped dequant concatenates packed bytes + absmax across
+                # experts, which is exact only when every expert tiles into whole
+                # blocks of one shared blocksize; a trailing partial block would
+                # shift scaling onto the next expert.
+                numel = 1
+                for s in qs.shape:
+                    numel *= int(s)
+                if not qs.blocksize or numel % int(qs.blocksize) != 0:
+                    return _fail(f"expert numel {numel} not a multiple of blocksize {qs.blocksize}")
+                if blocksize is None:
+                    blocksize = int(qs.blocksize)
+                elif int(qs.blocksize) != blocksize:
+                    return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
+                b = getattr(lin, "bias", None)
+                # Grouped path stacks per-expert biases, so a missing bias would
+                # break torch.stack; require all present and fall back otherwise.
+                if b is None:
+                    return _fail("expert bias is None")
+                if b.requires_grad:
+                    return _fail("expert bias requires_grad")
+        except Exception as e:
+            return _fail(f"{type(e).__name__}: {e}")
+        return True
+
+    def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
+                                 batch_size, num_tokens, num_experts, top_k):
+        """Grouped equivalent of the per-expert loop: one gather, two grouped_mm
+        calls over dequantized stacks (pinned or rebuilt in backward per the adaptive
+        _moe_recompute_default policy), grouped bias adds, fp32 index_add combine.
+
+        Self-contained (local imports, no module globals) for the standalone
+        compiled cache; see _grouped_bnb4bit_ready."""
+        import bitsandbytes as bnb
+        from unsloth_zoo.temporary_patches.moe_utils import _base_grouped_mm, _moe_recompute_default
+        from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
+
+        device = hidden_states.device
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()
+            token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            sorted_experts = flat_experts[sorted_idx]
+            counts = torch.bincount(flat_experts, minlength=num_experts)
+            offsets = counts.cumsum(0, dtype=torch.int32)
+            expert_ids = torch.repeat_interleave(
+                torch.arange(num_experts, device=device), counts
+            )
+
+        recompute = _moe_recompute_default()
+
+        cached = getattr(self, "_unsloth_grouped_qs", None)
+        if cached is None:
+            # One QuantState spanning all experts (packed NF4 is elementwise row-major,
+            # so per-expert byte + fp32 absmax concat is exact): one dequant launch per stack.
+            from bitsandbytes.functional import QuantState
+
+            def _absmax_fp32(qs):
+                # Materialize a QuantState's absmax as flat fp32 (denesting double-quant).
+                if getattr(qs, "nested", False):
+                    absmax = bnb.functional.dequantize_blockwise(qs.absmax, qs.state2)
+                    return (absmax + qs.offset).float()
+                return qs.absmax.float()
+
+            def build_qs(projs):
+                states = [l.weight.quant_state for l in projs]
+                absmax = torch.cat([_absmax_fp32(qs) for qs in states])
+                q0 = states[0]
+                return QuantState(
+                    absmax=absmax,
+                    shape=torch.Size((len(projs),) + tuple(q0.shape)),
+                    code=q0.code,
+                    blocksize=q0.blocksize,
+                    quant_type=q0.quant_type,
+                    dtype=q0.dtype,
+                )
+
+            cached = (
+                build_qs(self.gate_up_projs),
+                build_qs(self.down_projs),
+                torch.stack([l.bias for l in self.gate_up_projs]),  # (E, 2I)
+                torch.stack([l.bias for l in self.down_projs]),     # (E, H)
+            )
+            self._unsloth_grouped_qs = cached
+        gate_up_qs, down_qs, gate_up_bias, down_bias = cached
+
+        def _stack(projs, quant_state):
+            # One fused dequant gives (E, out, in); grouped_mm takes the transposed
+            # view. Cast to the input dtype (a no-op for the usual bf16-on-bf16
+            # case): torch._grouped_mm rejects mismatched dtypes, e.g. fp32 hidden
+            # states under the forced-float32 path against a bf16 quant state.
+            data = torch.cat([l.weight.data.reshape(-1, 1) for l in projs])
+            deq = bnb.functional.dequantize_4bit(data, quant_state)
+            return deq.to(hidden_states.dtype).transpose(1, 2)
+
+        xg = hidden_states[sorted_tokens]
+        gate_up = _base_grouped_mm(
+            xg, offsets, lambda: _stack(self.gate_up_projs, gate_up_qs), recompute)
+        gate_up = gate_up + gate_up_bias[expert_ids]
+        gated = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+        out = _base_grouped_mm(
+            gated, offsets, lambda: _stack(self.down_projs, down_qs), recompute)
+        out = out + down_bias[expert_ids]
+
+        weighted = out.to(torch.float32) * routing_weights[sorted_tokens, sorted_experts, None].to(torch.float32)
+        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=device)
+        next_states.index_add_(0, sorted_tokens, weighted)
+        # Grouped path only runs in training; mirror torch_native_forward's
+        # training branch, which returns fp32 (fp16 NaN protection).
+        return next_states.view(batch_size, -1, self.hidden_size).to(torch.float32)
+
+    def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        num_tokens = hidden_states.shape[0]
+        num_experts = routing_weights.shape[1]
+        top_k = router_indices.shape[1]
+
+        # fp16 keeps the loop path, whose fp32 swiglu + autocast-disabled down
+        # projection protect against fp16 overflow; grouped runs in model dtype.
+        if (
+            self.training
+            and hidden_states.dtype is not torch.float16
+            and self._grouped_bnb4bit_ready()
+        ):
+            try:
+                return self._forward_grouped_bnb4bit(
+                    hidden_states, router_indices, routing_weights,
+                    batch_size, num_tokens, num_experts, top_k,
+                )
+            except Exception:
+                import os as _os
+                if _os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                    import traceback; traceback.print_exc()
+                # fall through to the per-expert loop
+
+        if self.training:
+            with torch.no_grad():
+                flat_experts = router_indices.flatten()  # [tokens * topk]
+                token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+                
+                sorted_idx = flat_experts.argsort(stable=True)
+                sorted_tokens = token_ids[sorted_idx]
+                
+                counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+            
+            next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
+            offset = 0
+            
+            for expert_idx in range(num_experts):
+                count = counts[expert_idx]
+                if count == 0:
+                    continue
+                # Use pre-computed indices (no torch.where needed)
+                token_idx = sorted_tokens[offset:offset + count]
+                current_state = hidden_states[token_idx]
+
+                gate_up = self.gate_up_projs[expert_idx](current_state)
+                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                # gate = gate.clamp(min=None, max=self.limit)
+                # up = up.clamp(min=-self.limit, max=self.limit)
+                # glu = gate * torch.sigmoid(gate * self.alpha)
+                # gated_output = (up + 1) * glu
+                out = self.down_projs[expert_idx](gated_output)
+                
+                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                next_states.index_add_(0, token_idx, weighted_output)
+                
+                offset += count
+            
+            next_states = next_states.view(batch_size, -1, self.hidden_size)
+            return next_states.to(hidden_states.dtype)
+        else:
+            X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+            gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+            gate_up = torch.stack(gate_up_list, dim=0)
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
+            # gate = gate_up[..., ::2]
+            # up_h = gate_up[..., 1::2]
+            # gate = gate.clamp(max=self.limit)
+            # up_h = up_h.clamp(min=-self.limit, max=self.limit)
+            # glu = gate * torch.sigmoid(gate * self.alpha)
+            # fused = (up_h + 1) * glu
+            out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
+            outs = torch.stack(out_list, dim=0)
+            rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+            mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
+            return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+
+pass
+
+
+class GptOssTopKRouterBnb4bit(nn.Module):
+    """
+    GPT OSS Router with weight/bias as direct nn.Parameter (not nested Linear) for BnB 4bit.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.dtype = dtype_from_config(config)
+        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, dtype=self.dtype))
+        self.bias = nn.Parameter(torch.zeros(self.num_experts, dtype=self.dtype))
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Accept checkpoints that used a Linear router (linear.weight/bias)
+        linear_weight_key = prefix + "linear.weight"
+        linear_bias_key = prefix + "linear.bias"
+        weight_key = prefix + "weight"
+        bias_key = prefix + "bias"
+        moved_weight = False
+        moved_bias = False
+        if linear_weight_key in state_dict and weight_key not in state_dict:
+            state_dict[weight_key] = state_dict.pop(linear_weight_key)
+            moved_weight = True
+        if linear_bias_key in state_dict and bias_key not in state_dict:
+            state_dict[bias_key] = state_dict.pop(linear_bias_key)
+            moved_bias = True
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if moved_weight:
+            if linear_weight_key in unexpected_keys:
+                unexpected_keys.remove(linear_weight_key)
+            if weight_key in missing_keys:
+                missing_keys.remove(weight_key)
+        if moved_bias:
+            if linear_bias_key in unexpected_keys:
+                unexpected_keys.remove(linear_bias_key)
+            if bias_key in missing_keys:
+                missing_keys.remove(bias_key)
+        if self.weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            self.weight.data = self.weight.data.to(self.dtype)
+        if self.bias is not None and self.bias.dtype not in (
+            torch.float16, torch.bfloat16, torch.float32
+        ):
+            self.bias.data = self.bias.data.to(self.dtype)
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = torch.nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
+        dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+        router_scores = torch.zeros_like(router_logits, dtype=dtype).scatter_(1, router_indices, router_top_value)
+        if transformers_version >= Version("5.0.0"):
+            return router_logits, router_scores, router_indices
+        else:
+            return router_scores, router_indices
+
+
+pass
+
+
+def patch_gpt_oss_bnb4bit():
+    """
+    Patch transformers to use BnB 4bit compatible classes for pre-quantized models.
+    Call before loading models saved with BitsAndBytes (linear-based expert structure).
+
+    Usage:
+        from unsloth_zoo.temporary_patches.gpt_oss import patch_gpt_oss_bnb4bit
+        patch_gpt_oss_bnb4bit()  # Call before loading the model
+        model = FastLanguageModel.from_pretrained(...)
+    """
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    # Store original classes for restoration
+    if not hasattr(transformers.models.gpt_oss.modeling_gpt_oss, '_original_GptOssExperts'):
+        transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssExperts = \
+            transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+        transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter = \
+            transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
+
+    # Replace with BnB 4bit versions; preserve original symbol names for compiler-generated modules.
+    GptOssExpertsBnb4bit.__name__ = "GptOssExperts"
+    GptOssExpertsBnb4bit.__qualname__ = "GptOssExperts"
+
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
+    # Use unsloth GptOssTopKRouter (self.linear = nn.Linear): BnB 4-bit checkpoints store
+    # router.linear.weight/bias. GptOssTopKRouterBnb4bit remapped keys via _load_from_state_dict,
+    # but transformers v5 bypasses it (accelerate's set_module_tensor_to_device), so weights
+    # stayed randomly initialized -> high loss (~4-5).
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+
+    logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
+    os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
+
+    # Inject BnB helpers so compiler-generated modules can import them.
+    m = transformers.models.gpt_oss.modeling_gpt_oss
+    m._RouterLinearParams  = _RouterLinearParams
+    m.swiglu_torch_forward = swiglu_torch_forward
+    m.dtype_from_config    = dtype_from_config
+    m.transformers_version = transformers_version
+    m.Version              = Version
+
+    return True
+
+
+pass
+
+
+def restore_gpt_oss_original():
+    """
+    Restore original GPT-OSS classes (undo BnB 4bit patch).
+    """
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        if hasattr(transformers.models.gpt_oss.modeling_gpt_oss, '_original_GptOssExperts'):
+            transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = \
+                transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssExperts
+            transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = \
+                transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter
+            logger.info("Unsloth: Restored original GPT OSS classes")
+            return True
+    except Exception:
+        pass
+    return False
+
+def _normalized_unsloth_model_name() -> str:
+    return os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
+
+
+def _should_use_gpt_oss_bnb4bit() -> bool:
+    """
+    Use BnB-compatible 4-bit experts (default when load_in_4bit active).
+    UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 forces the BF16 path.
+    """
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return False
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name():
+        return False
+    return os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_DISABLE", "0") != "1"
+
+
+def _is_gpt_oss_4bit_load() -> bool:
+    return "_load_in_4bit_" in _normalized_unsloth_model_name()
+
+
+def _is_transformers_v5() -> bool:
+    return transformers_version >= Version("5.0.0.dev0")
+
+
+_GPT_OSS_COMPILED_MODULE = "unsloth_compiled_module_gpt_oss"
+_GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
+
+
+def _gpt_oss_cache_locations():
+    """Dirs that may hold the compiled gpt_oss module: the configured location and the
+    temp-fallback used when it is not writable. Resolved without the compiler so it never
+    triggers distributed coordination at patch time."""
+    locs = []
+    loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+    if loc:
+        locs.append(loc)
+        try:
+            import tempfile
+            locs.append(os.path.join(tempfile.gettempdir(), os.path.basename(loc)))
+        except Exception:
+            pass
+    # De-dup, preserve order (configured first = primary).
+    seen, out = set(), []
+    for _l in locs:
+        if _l and _l not in seen:
+            seen.add(_l); out.append(_l)
+    return out
+
+
+def _invalidate_gpt_oss_compiled_module():
+    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
+    rebuilt against the CURRENT router/experts classes. The single per-model-type file
+    hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
+    wrong classes. Cleans every candidate location."""
+    try:
+        import sys as _sys
+        import importlib, importlib.util
+        _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
+        for loc in _gpt_oss_cache_locations():
+            _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if os.path.isfile(_f):
+                try:
+                    os.remove(_f)
+                except OSError:
+                    pass
+                # Drop the .pyc too so a stale module isn't re-imported from __pycache__.
+                try:
+                    _pyc = importlib.util.cache_from_source(_f)
+                    if os.path.isfile(_pyc):
+                        os.remove(_pyc)
+                except Exception:
+                    pass
+        # Forget any cached finder/directory state for these paths.
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+    except Exception:
+        pass  # best-effort: cache invalidation must never break loading
+
+
+def _sync_gpt_oss_compiled_flavor(desired_flavor):
+    """Invalidate the on-disk compiled gpt_oss module when it was built for a DIFFERENT flavor
+    ("bnb4bit" vs "stock") than this load needs, independently of the in-process flag (unset in
+    a fresh process, so a fresh 16bit load after a 4bit one would import the stale BnB classes
+    and hit "weights not initialized"). A marker file records the built flavor; on a mismatch or
+    missing marker the stale module is dropped for the compiler to regenerate."""
+    try:
+        locations = _gpt_oss_cache_locations()
+        mismatch = False
+        for loc in locations:
+            module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if not os.path.isfile(module_path):
+                continue
+            on_disk = None
+            marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+            if os.path.isfile(marker_path):
+                try:
+                    with open(marker_path, "r", encoding = "utf-8") as f:
+                        on_disk = f.read().strip()
+                except Exception:
+                    on_disk = None
+            if on_disk != desired_flavor:
+                mismatch = True
+        if mismatch:
+            _invalidate_gpt_oss_compiled_module()
+        # Record this load's flavor; always at the primary location, the temp fallback only if used.
+        for idx, loc in enumerate(locations):
+            if idx != 0 and not os.path.isdir(loc):
+                continue
+            try:
+                os.makedirs(loc, exist_ok = True)
+                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
+                    f.write(desired_flavor)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def patch_gpt_oss_bnb4bit_auto():
+    """
+    Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
+    Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
+    """
+    # Cross-process safety: invalidate a stale on-disk module built for the other flavor (the
+    # in-process flag is unset in a fresh process). Sole cache invalidator: drops the file only
+    # on a real mismatch, so a matching cache is reused. Gated to gpt-oss loads.
+    if "gpt_oss" in _normalized_unsloth_model_name():
+        _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
+
+    if not _should_use_gpt_oss_bnb4bit():
+        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
+        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
+        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
+        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
+        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
+        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+            restore_gpt_oss_original()
+            os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
+        return
+    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols. A stale
+    # stock module is handled by _sync above; a matching bnb module is reused, not recompiled.
+    patch_gpt_oss_bnb4bit()
+    # Inference path avoids torch.compile for 4-bit
+    try:
+        global moe_forward_inference
+        moe_forward_inference = torch.compiler.disable(moe_forward_inference)
+    except Exception:
+        pass
+
+
+TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
+
+
+# Combo kernels uses too much VRAM for low memory GPUs
+from ..device_type import DEVICE_TYPE
+
+# UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
+# with is_available() like device_synchronize() does.
+if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+else:
+    device_memory = 0
+use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
+fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = use_combo_kernels,
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+no_combo_fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = False, # Breaks on attention
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+
+
+@_torch_compile(dynamic=None, fullgraph=True, options=fused_torch_compile_options)
+def moe_forward_inference(self, hidden_states):
+    """Torch compile for forward inference path only with CUDAGraphs"""
+    # Router
+    router_out = self.router(hidden_states)
+    if isinstance(router_out, tuple) and len(router_out) == 3:
+        _, router_scores, router_indices = router_out
+    else:
+        router_scores, router_indices = router_out
+    routing_weights = router_scores
+    moe = self.experts
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
+
+    num_experts = routing_weights.shape[1]
+    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+
+    # ModuleList (old style) vs 3D parameters (new style)
+    if hasattr(moe, "gate_up_projs"):
+        gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
+        gate_up = torch.stack(gate_up_list, dim=0)
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype=dtype)
+
+        fused = fused.to(dtype)
+        device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
+        outs = torch.stack(out_list, dim=0)
+    else:
+        # 3D parameter style: gate_up_proj (E, H, 2I); bmm (E, N, H) @ (E, H, 2I) -> (E, N, 2I)
+        gate_up = torch.bmm(X_rep, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype=dtype)
+
+        fused = fused.to(dtype)
+        device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            # down_proj (E, I, H); bmm (E, N, I) @ (E, I, H) -> (E, N, H)
+            outs = torch.bmm(fused.to(dtype), moe.down_proj) + moe.down_proj_bias[..., None, :]
+
+    rw = routing_weights.to(dtype).transpose(0, 1).unsqueeze(-1)
+    mixed = (outs * rw).sum(dim=0)
+    return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
+
+
+pass
+
+
+@torch_compile(dynamic=True, fullgraph=True)
+def moe_router_forward(self, hidden_states):
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)  # (seq_len, num_experts)
+    router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+    dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+    router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
+    return router_scores, router_indices
+
+
+pass
+
+
+# Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+@_torch_compile(
+    dynamic=None, fullgraph=True, options=no_combo_fused_torch_compile_options
+)
+def _moe_forward_inference_bf16_kernel(
+    hidden_states, routing_weights, gate_up_proj, gate_up_proj_bias, down_proj, down_proj_bias, limit, alpha, hidden_size
+):
+    """Inner compiled kernel for BF16 MoE inference - works with raw tensors only."""
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, hidden_size)
+    num_experts = routing_weights.shape[1]
+    hidden_states = hidden_states.repeat(num_experts, 1)
+    hidden_states = hidden_states.view(num_experts, -1, hidden_size)
+
+    gate_up = (
+        torch.bmm(hidden_states, gate_up_proj) + gate_up_proj_bias[..., None, :]
+    )
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate.to(torch.float32) * alpha).to(gate.dtype)
+    next_states = torch.bmm(((up + 1) * glu), down_proj)
+    next_states = next_states + down_proj_bias[..., None, :]
+    next_states = next_states.view(num_experts, batch_size, -1, hidden_size)
+    next_states = (
+        next_states
+        * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+    )
+    next_states = next_states.sum(dim=0)
+    return next_states
+
+
+def _unwrap_peft_experts(module):
+    """Unwrap PEFT ParamWrapper chain to get the actual experts module."""
+    while hasattr(module, 'base_layer'):
+        module = module.base_layer
+    return module
+
+
+def moe_forward_inference_bf16(self, hidden_states):
+    """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
+    router_scores, router_indices = moe_router_forward(self.router, hidden_states)
+    routing_weights = router_scores
+
+    moe = _unwrap_peft_experts(self.experts)
+
+    # Extract weights (ParameterModule wrapping nn.Linear vs direct 3D tensor) before compiled region
+    gate_up_proj = moe.gate_up_proj
+    if hasattr(gate_up_proj, "get_param"):
+        gate_up_proj = gate_up_proj.get_param()
+    elif hasattr(gate_up_proj, "weight"):
+        gate_up_proj = gate_up_proj.weight
+
+    down_proj = moe.down_proj
+    if hasattr(down_proj, "get_param"):
+        down_proj = down_proj.get_param()
+    elif hasattr(down_proj, "weight"):
+        down_proj = down_proj.weight
+
+    return _moe_forward_inference_bf16_kernel(
+        hidden_states,
+        routing_weights,
+        gate_up_proj,
+        moe.gate_up_proj_bias,
+        down_proj,
+        moe.down_proj_bias,
+        moe.limit,
+        moe.alpha,
+        moe.hidden_size,
+    )
+
+
+
+
+class GptOssMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.router = GptOssTopKRouter(config)
+        self.experts = GptOssExperts(config)
+
+    def forward(self, hidden_states):
+        bsz, qlen, hd = hidden_states.shape
+        if qlen == 1 and not self.training:
+            return moe_forward_inference(self, hidden_states), None
+        router_out = self.router(hidden_states)
+        if isinstance(router_out, tuple) and len(router_out) == 3:
+            _, router_scores, router_indices = router_out
+        else:
+            router_scores, router_indices = router_out
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        return routed_out, router_scores
+
+
+pass
+
+
+# ============================================================================
+# GPT OSS MoE LoRA Support using grouped GEMM kernels
+# ============================================================================
+
+# IMPORTS FROM MOE UTILS
+from .moe_utils import (
+    _check_grouped_gemm_available,
+    _TORCH_GROUPED_MM_AVAILABLE,
+    _check_torch_grouped_mm_supported,
+    native_moe_grouped_mm,
+    _get_moe_lora_weights,
+    _apply_lora_grouped_mm,
+    _get_lora_wrapper_for_param,
+    select_moe_backend,
+    patch_param_wrapper_for_moe,
+    forward_native_grouped_mm,
+    forward_native_moe_loop,
+    # torch_native_forward,
+)
+
+
+def patch_gpt_oss_moe_for_lora():
+    """
+    Patch GptOssExperts (3D parameter tensors) forward to use grouped GEMM kernels with LoRA.
+    Only patches forward, not the class itself, so original structure loads weights correctly.
+    """
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return
+    if _is_gpt_oss_4bit_load() or _should_use_gpt_oss_bnb4bit():
+        # 4-bit loads should keep quantized weights and use default PEFT LoRA.
+        return
+    if not _is_transformers_v5():
+        # Split-LoRA grouped_mm path is only needed for transformers v5+
+        return
+    patch_param_wrapper_for_moe()
+
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+
+        # Get the ORIGINAL class - don't replace it!
+        GptOssExpertsClass = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch GPT OSS MoE for LoRA: {e}")
+        return
+
+    if hasattr(GptOssExpertsClass, "_unsloth_lora_patched"):
+        return
+
+    backend = select_moe_backend()
+
+    if backend == "grouped_mm":
+        forward = forward_native_grouped_mm
+    else:
+        # torch_native_forward expects the bnb4bit ModuleList layout; the stock
+        # 3D GptOssExperts needs the generic loop, which handles gpt-oss
+        # activation, biases, and the separated LoRA stash.
+        forward = forward_native_moe_loop
+
+    # Store original forward and patch - but DON'T replace the class!
+    GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
+    GptOssExpertsClass.forward = forward
+    GptOssExpertsClass._unsloth_lora_patched = True
+
+    if UNSLOTH_ENABLE_LOGGING:
+        backend_desc = {
+            "grouped_mm": "torch._grouped_mm (batched, fastest)",
+            "unsloth_triton": "Triton kernels",
+            "native_torch": "loop fallback (slower)",
+        }.get(backend, backend)
+        logger.info(
+            f"Unsloth: Patched GPT OSS MoE for LoRA training using {backend_desc}"
+        )
+
+
+TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
+
+
+# ============================================================================
+# MXFP4 (4-bit) GPT OSS MoE LoRA Support
+# ============================================================================
+
+_MXFP4_LORA_PATH_LOGGED = False
+
+@torch.compiler.disable
+def forward_mxfp4_gpt_oss_with_lora(
+    self,
+    hidden_states: torch.Tensor,
+    routing_data,
+    gather_idx,
+    scatter_idx,
+) -> torch.Tensor:
+    """
+    MXFP4 GPT OSS MoE forward with LoRA: output = base_output (frozen MXFP4, no grad) + lora_delta.
+    Requires triton_kernels for native MXFP4 matmul; else load with Mxfp4Config(dequantize=True).
+    """
+    if not is_triton_kernels_available():
+        raise RuntimeError(
+            "triton_kernels is required for native MXFP4 GPT OSS forward pass. "
+            "Either:\n"
+            "  1. Install triton_kernels from OpenAI, OR\n"
+            "  2. Load model with dequantization: Mxfp4Config(dequantize=True), OR\n"
+            "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'\n"
+            "Set UNSLOTH_MXFP4_NO_DEQUANTIZE=0 (default) to auto-dequantize."
+        )
+
+    from triton_kernels import matmul_ogs, swiglu
+
+    matmul_ogs_fn = matmul_ogs.matmul_ogs
+    FnSpecs = matmul_ogs.FnSpecs
+    FusedActivation = matmul_ogs.FusedActivation
+    swiglu_fn = swiglu.swiglu_fn
+
+    gate_up_wrapper = _get_lora_wrapper_for_param(self, "gate_up_proj")
+    down_wrapper = _get_lora_wrapper_for_param(self, "down_proj")
+
+    has_lora = gate_up_wrapper is not None or down_wrapper is not None
+
+    # Log path info once
+    global _MXFP4_LORA_PATH_LOGGED
+    if not _MXFP4_LORA_PATH_LOGGED:
+        _MXFP4_LORA_PATH_LOGGED = True
+        logger.warning_once(
+            f"Unsloth: GPT-OSS MoE training path: MXFP4 + triton_kernels. "
+            f"LoRA={has_lora}, experts={self.num_experts}. "
+            f"Tip: Increase batch_size for better GPU utilization."
+        )
+
+    # If no LoRA, use the original MXFP4 forward (inference path)
+    if not has_lora:
+        with torch_cuda_device(hidden_states.device):
+            if not hasattr(self, "act"):
+                self.act = FusedActivation(
+                    FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+                    (self.alpha, self.limit),
+                    2,
+                )
+            intermediate_cache1 = matmul_ogs_fn(
+                hidden_states.to(torch.bfloat16),
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                precision_config=self.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=self.act,
+            )
+            intermediate_cache3 = matmul_ogs_fn(
+                intermediate_cache1,
+                self.down_proj,
+                self.down_proj_bias,
+                routing_data,
+                scatter_indx=scatter_idx,
+                precision_config=self.down_proj_precision_config,
+                gammas=routing_data.gate_scal if routing_data else None,
+            )
+        return intermediate_cache3
+
+    # With LoRA: base MXFP4 output (no grad) + LoRA delta (with grad)
+    with torch_cuda_device(hidden_states.device):
+        # 1. MXFP4 base output, no gradients for base weights
+        with torch.no_grad():
+            if not hasattr(self, "act"):
+                self.act = FusedActivation(
+                    FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+                    (self.alpha, self.limit),
+                    2,
+                )
+
+            pre_activation = matmul_ogs_fn(
+                hidden_states.to(torch.bfloat16),
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                precision_config=self.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=None,  # Don't fuse activation so we can add LoRA before
+            )
+
+        # 2. Add LoRA for gate_up_proj using grouped_mm
+        if gate_up_wrapper is not None:
+            lora_data = _get_moe_lora_weights(gate_up_wrapper)
+            if lora_data is not None:
+                lora_A, lora_B, scaling, num_experts = lora_data
+
+                # routing_data.exp_indx (expert index per token) -> grouped_mm offsets
+                gather_src = gather_idx.src_indx
+                permuted_input = hidden_states[gather_src].to(torch.bfloat16)
+
+                # Offsets = cumsum of per-expert token counts
+                expert_ids = routing_data.exp_indx
+                num_tokens_per_expert = torch.bincount(
+                    expert_ids.int(), minlength=num_experts
+                ).int()
+                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+                lora_delta = _apply_lora_grouped_mm(
+                    permuted_input,
+                    lora_A,
+                    lora_B,
+                    offsets,
+                    scaling,
+                    grouped_mm_func=native_moe_grouped_mm,
+                )
+                pre_activation = pre_activation + lora_delta
+
+        # 3. Apply SwiGLU activation
+        alpha = getattr(self, "alpha", 1.702)
+        limit = getattr(self, "limit", 7.0)
+        swiglu_output = swiglu_torch_forward(pre_activation, alpha, limit)
+
+        # 4. Down projection (MXFP4)
+        with torch.no_grad():
+            base_output = matmul_ogs_fn(
+                swiglu_output.detach(),  # Detach to prevent grad through MXFP4
+                self.down_proj,
+                self.down_proj_bias,
+                routing_data,
+                scatter_indx=scatter_idx,
+                precision_config=self.down_proj_precision_config,
+                gammas=routing_data.gate_scal if routing_data else None,
+            )
+
+        # 5. Add LoRA for down_proj using grouped_mm
+        if down_wrapper is not None:
+            lora_data = _get_moe_lora_weights(down_wrapper)
+            if lora_data is not None:
+                lora_A, lora_B, scaling, num_experts = lora_data
+
+                expert_ids = routing_data.exp_indx
+                num_tokens_per_expert = torch.bincount(
+                    expert_ids.int(), minlength=num_experts
+                ).int()
+                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+
+                lora_delta = _apply_lora_grouped_mm(
+                    swiglu_output,
+                    lora_A,
+                    lora_B,
+                    offsets,
+                    scaling,
+                    grouped_mm_func=native_moe_grouped_mm,
+                )
+
+                # Scatter LoRA delta back to output (apply routing weights)
+                scatter_dst = scatter_idx.dst_indx
+                gamma = routing_data.gate_scal.unsqueeze(-1)
+                base_output.index_add_(
+                    0, scatter_dst, (lora_delta * gamma).to(base_output.dtype)
+                )
+
+    return base_output
+
+
+def patch_mxfp4_gpt_oss_for_lora():
+    """
+    Patch MXFP4 GPT OSS experts for LoRA training (unsloth/gpt-oss-20b).
+    Requires triton_kernels for native MXFP4 matmul; else use Mxfp4Config(dequantize=True)
+    or the BF16 model 'unsloth/gpt-oss-20b-BF16'.
+    """
+    # ParamWrapper for MoE separated LoRA (v5 only)
+    if _is_transformers_v5():
+        patch_param_wrapper_for_moe()
+
+    try:
+        import transformers.integrations.mxfp4
+
+        Mxfp4GptOssExpertsClass = getattr(
+            transformers.integrations.mxfp4, "Mxfp4GptOssExperts", None
+        )
+        if Mxfp4GptOssExpertsClass is None:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(
+                    "Unsloth: Mxfp4GptOssExperts not found in transformers.integrations.mxfp4"
+                )
+            return
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch MXFP4 GPT OSS for LoRA: {e}")
+        return
+
+    if hasattr(Mxfp4GptOssExpertsClass, "_unsloth_mxfp4_lora_patched"):
+        return
+
+    # Without triton_kernels, MXFP4 weights cannot be used directly (need dequant or BF16 model)
+    if is_triton_kernels_available():
+        # Native MXFP4 + LoRA, keeps weights quantized
+        Mxfp4GptOssExpertsClass._original_forward = Mxfp4GptOssExpertsClass.forward
+        Mxfp4GptOssExpertsClass.forward = forward_mxfp4_gpt_oss_with_lora
+        Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched MXFP4 GPT OSS MoE for LoRA training")
+    else:
+        # No triton_kernels: don't patch; model errors helpfully if MXFP4 used without dequant
+        Mxfp4GptOssExpertsClass._unsloth_mxfp4_lora_patched = True
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(
+                "Unsloth: triton_kernels is not installed. MXFP4 GPT OSS will NOT be patched for LoRA.\n"
+                "To train GPT OSS with LoRA, either:\n"
+                "  1. Install triton_kernels from OpenAI (for native MXFP4), OR\n"
+                "  2. Use Mxfp4Config(dequantize=True) when loading (dequantizes to bf16), OR\n"
+                "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'"
+            )
+
+
+TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
+
+
+_MXFP4_DEQUANT_WARNED = False
+
+
+def should_dequantize_mxfp4():
+    """
+    Whether MXFP4 should be dequantized to bf16. False only when
+    UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available.
+    Memory for GPT-OSS 20B: ~10GB quantized vs ~40GB dequantized to bf16.
+    """
+    global _MXFP4_DEQUANT_WARNED
+
+    if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
+        # Default: dequantize to bf16
+        if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
+            _MXFP4_DEQUANT_WARNED = True
+            logger.warning(
+                "Unsloth: MXFP4 will be dequantized to bf16 (~4x memory increase). "
+                "To keep 4-bit: set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 and install triton_kernels."
+            )
+        return True
+
+    if not is_triton_kernels_available():
+        if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
+            _MXFP4_DEQUANT_WARNED = True
+            logger.warning(
+                "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels not available. "
+                "Will dequantize MXFP4 to bf16 (~4x memory increase). "
+                "Install triton_kernels to keep 4-bit quantized weights."
+            )
+        return True  # triton_kernels required for native MXFP4
+
+    if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
+        _MXFP4_DEQUANT_WARNED = True
+        logger.info("Unsloth: Keeping MXFP4 quantized (triton_kernels available)")
+    return False  # Keep MXFP4 quantized
+
+
+def torch_native_forward(
+    self,
+    hidden_states: torch.Tensor,
+    router_indices = None,
+    routing_weights = None
+) -> torch.Tensor:
+
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_tokens = hidden_states.shape[0]
+    num_experts = routing_weights.shape[1]
+    top_k = router_indices.shape[1]
+
+    # Grouped bnb-4bit fast path. The class dispatches this module-level
+    # function (forward is rebound below), so the gate must live here too.
+    # fp16 keeps the loop path below, whose fp32 swiglu + autocast-disabled
+    # down projection protect against fp16 overflow.
+    if (
+        self.training
+        and hidden_states.dtype is not torch.float16
+        and hasattr(self, "_grouped_bnb4bit_ready")
+        and self._grouped_bnb4bit_ready()
+    ):
+        try:
+            return self._forward_grouped_bnb4bit(
+                hidden_states, router_indices, routing_weights,
+                batch_size, num_tokens, num_experts, top_k,
+            )
+        except Exception:
+            if UNSLOTH_ENABLE_LOGGING:
+                import traceback; traceback.print_exc()
+            # fall through to the per-expert loop
+
+    if self.training:
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()  # [tokens * topk]
+            token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+            
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            
+            counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+        
+        next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
+        offset = 0
+        
+        for expert_idx in range(num_experts):
+            count = counts[expert_idx]
+            if count == 0:
+                continue
+            
+            # Use pre-computed indices (no torch.where needed)
+            token_idx = sorted_tokens[offset:offset + count]
+            current_state = hidden_states[token_idx]
+            
+            gate_up = self.gate_up_projs[expert_idx](current_state)
+            down_proj = self.down_projs[expert_idx]
+            gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
+
+            gated_output = gated_output.to(torch.float32)
+            device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
+            with torch.autocast(device_type=device_type, enabled=False): # Force float32
+                out = down_proj(gated_output)
+            
+            weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+            next_states.index_add_(0, token_idx, weighted_output)
+            
+            offset += count
+        next_states = next_states.view(batch_size, -1, self.hidden_size)
+        return next_states.to(torch.float32)
+    else:
+        X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+        gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+        gate_up = torch.stack(gate_up_list, dim=0)
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+        # gate = gate_up[..., ::2]
+        # up_h = gate_up[..., 1::2]
+        # gate = gate.clamp(max=self.limit)
+        # up_h = up_h.clamp(min=-self.limit, max=self.limit)
+        # glu = gate * torch.sigmoid(gate * self.alpha)
+        # fused = (up_h + 1) * glu
+
+        # Force float32 matrix multiply on down projection only
+        device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False): # Force float32
+            out_list = [
+                down_l(fused[e].to(dtype))
+                for e, down_l in enumerate(self.down_projs)
+            ]
+        outs = torch.stack(out_list, dim=0)
+        rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+        mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
+        return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+    pass
+pass
+
+# torch_native_forward has full float32 protection (swiglu in float32, autocast
+# disabled around down_proj) to prevent NaN in fp16 training.
+GptOssExpertsBnb4bit.forward = torch_native_forward
+
+def patch_gpt_oss_linearized():
+    """
+    Patch GPT OSS for 4bit loading with grouped_mm support.
+    Only patches GptOssExperts.forward; keeps original classes for proper weight loading.
+    """
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    if "_load_in_4bit_" not in _normalized_unsloth_model_name(): return
+    if _should_use_gpt_oss_bnb4bit(): return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    # Patch only GptOssExperts.forward (not the class) to keep 4-bit weight loading working
+    backend = select_moe_backend()
+
+    if backend == "grouped_mm":
+
+        def experts_forward(
+            self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
+        ) -> torch.Tensor:
+            return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts.forward = experts_forward
+    else:
+
+        def experts_forward(
+            self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
+        ) -> torch.Tensor:
+            return torch_native_forward(self, hidden_states, router_indices, routing_weights)
+
+        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+            transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts.forward = experts_forward
+
+    if UNSLOTH_ENABLE_LOGGING: logger.info(f"Unsloth: Patched GPT OSS MoE for 4bit loading (backend: {backend})")
+    return
+
+
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+
+
+def patch_GptOssAttention():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    # Uncompiled flex_attention backward has a dtype bug in PyTorch
+    # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
+    # fallback also uses out= matmul which is incompatible with autograd.
+    # Skip the patch and let stock transformers eager attention handle sinks.
+    if UNSLOTH_COMPILE_DISABLE: return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    try:
+        from ..flex_attention import (
+            flex_attention_with_sink,
+            is_flex_attention_decoding,
+            flex_attention_with_sink_decoding,
+            flex_attention_add_sinks,
+        )
+
+        assert flex_attention_with_sink is not None
+    except Exception as e:
+        return raise_error("flex_attention_with_sink", e)
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
+
+    torch._dynamo.config.cache_size_limit = 256
+
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        Equivalent to torch.repeat_interleave(x, dim=1, repeats=n_rep): (batch,
+        num_key_value_heads, seqlen, head_dim) -> (batch, num_attention_heads, seqlen, head_dim).
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    F_softmax = torch.nn.functional.softmax
+    F_dropout = nn.functional.dropout
+    matmul = torch.matmul
+    def _align_kv_to_mask(key_states, value_states, attention_mask):
+        # Eager `attn_weights += attention_mask` requires KV length == mask key dim. On some
+        # transformers/torch combos (e.g. transformers 5.x on torch < 2.11) the KV cache returns
+        # more positions than the mask covers (pre-allocated slots), crashing full-attention layers.
+        # Surplus positions are masked out anyway, so trim KV (and mask) to the shorter length.
+        if attention_mask is None or not hasattr(attention_mask, "shape"):
+            return key_states, value_states, attention_mask
+        kvlen = key_states.shape[-2]
+        masklen = attention_mask.shape[-1]
+        if masklen < kvlen:
+            key_states = key_states[:, :, :masklen, :]
+            value_states = value_states[:, :, :masklen, :]
+        elif masklen > kvlen:
+            attention_mask = attention_mask[:, :, :, :kvlen]
+        return key_states, value_states, attention_mask
+
+    def inplace_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
+
+        bsz, n_heads, qlen, _  = query.shape
+        bsz, n_heads, kvlen, _ = key_states.shape
+        out_dtype = torch.result_type(query, key_states)
+        combined_logits = key_states.new_empty((bsz, n_heads, qlen, kvlen + 1), dtype=out_dtype)
+
+        attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
+        attn_weights *= scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights += causal_mask
+
+        # sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        # combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+        combined_logits[:, :, :, -1] = module.sinks.reshape(1, -1, 1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_weights = attn_weights.to(value_states.dtype)
+        attn_output = matmul(attn_weights, value_states, out = query)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+
+    pass
+
+    def eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
+        attn_weights = matmul(query, key_states.transpose(2, 3))
+        attn_weights *= scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights += causal_mask
+
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_weights = attn_weights.to(value_states.dtype)
+        attn_output = matmul(attn_weights, value_states, out = query)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+
+    pass
+
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+    if False:  # Version(torch.__version__) >= Version("2.10.0"):
+        eager_attention_forward = torch_compile(eager_attention_forward, dynamic=None, fullgraph=True)
+    else:
+        # Too many recompilation failures on 2.8.0, 2.9.0
+        eager_attention_forward = inplace_eager_attention_forward
+
+    def forward_function(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_value is not None:
+            cache_dtype = getattr(past_key_value, "dtype", None)
+            if cache_dtype is None and hasattr(past_key_value, "layers"):
+                try:
+                    cache_layer = past_key_value.layers[self.layer_idx]
+                    if hasattr(cache_layer, "keys") and cache_layer.keys is not None:
+                        cache_dtype = cache_layer.keys.dtype
+                except Exception:
+                    cache_dtype = None
+            if cache_dtype is not None and key_states.dtype != cache_dtype:
+                key_states = key_states.to(cache_dtype)
+                value_states = value_states.to(cache_dtype)
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if key_states.dtype != query_states.dtype or value_states.dtype != query_states.dtype:
+            key_states = key_states.to(query_states.dtype)
+            value_states = value_states.to(query_states.dtype)
+
+        # flex_attention_with_sink only works for training since KV cache is wrong
+        # switch to flex_attention_with_sink which allows all to work
+        # if is_flex_attention_decoding(self, query_states) and has_static_cache:
+        #     attn_output, logsumexp = flex_attention_with_sink_decoding(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #     )
+        #     attn_output = flex_attention_add_sinks(
+        #         self,
+        #         attn_output,
+        #         logsumexp,
+        #     )
+        # else:
+        #     attn_output = flex_attention_with_sink(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         attention_mask,
+        #         has_static_cache = has_static_cache,
+        #     )
+        # attn_weights = None
+        if self.training:
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+            attn_weights = None
+        else:
+            # Weirdly for inference, flex attention returns gibberish
+            # Most likely due to left padding
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,  # diff with Llama
+                **kwargs,
+            )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+    pass
+
+    functions = []
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+
+    functions.append(forward)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+
+    functions.append(forward)
+
+    # Transformers >= 5.0 dropped `cache_position` from GptOssAttention.forward's
+    # signature, so the variants above fail the strict signature match and the
+    # attention patch silently does not apply (leaving stock attention, which
+    # then mismatches the sliding-window mask the model patch builds). Add a
+    # `past_key_values` variant without `cache_position` (it still arrives via
+    # **kwargs) so the patch installs on transformers 5.x too. Only the
+    # `past_key_values` spelling is needed: the singular `past_key_value` naming
+    # predates transformers dropping `cache_position`, so a singular + no
+    # `cache_position` signature does not exist in any transformers release.
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        cache_position = kwargs.pop("cache_position", None)
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+
+    functions.append(forward)
+    patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
+    # Set env variable for padding purposes
+    os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
+pass
+TEMPORARY_PATCHES.append(patch_GptOssAttention)
+
+
+def patch_GptOssModel():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if UNSLOTH_COMPILE_DISABLE: return
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
+        from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+    try:
+        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
+    except Exception as e:
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+        DynamicCache = lambda *args, **kwargs: None
+
+    torch._dynamo.config.cache_size_limit = 256
+
+    # Disable mask creations since we don't need them for GPT-OSS
+    import transformers.masking_utils
+    import transformers.generation.utils
+    def wrap(f):
+        def return_attention_mask(*args, **kwargs):
+            input_embeds = kwargs.get("input_embeds", None)
+            if input_embeds is None:
+                input_embeds = kwargs.get("inputs_embeds", None)
+            if input_embeds is None:
+                for arg in args:
+                    if type(arg) is torch.Tensor and arg.is_floating_point():
+                        input_embeds = arg
+                        break
+
+            if input_embeds is not None and input_embeds.requires_grad:
+                if "attention_mask" in kwargs:
+                    return kwargs["attention_mask"]
+                for arg in args:
+                    if (
+                        type(arg) is torch.Tensor and
+                        arg.dtype in (torch.int32, torch.int64, torch.bool)
+                    ):
+                        return arg
+                return f(*args, **kwargs)
+            else:
+                # Eager inference path. The config may still have
+                # _attn_implementation="flex_attention" (set for training), in
+                # which case the underlying mask factory returns a BlockMask.
+                # Unsloth uses eager attention for inference (flex with KV
+                # cache returns gibberish, see forward_function above), and
+                # the eager forward cannot index a BlockMask, raising
+                #   TypeError: unsupported operand type(s) for +=:
+                #       'Tensor' and 'BlockMask'
+                # Temporarily swap to eager so the factory returns a dense
+                # 4D float mask (0 / -inf) the eager path can consume.
+                config = kwargs.get("config", None)
+                if config is None:
+                    for arg in args:
+                        if hasattr(arg, "_attn_implementation"):
+                            config = arg
+                            break
+                if config is not None and getattr(
+                    config, "_attn_implementation", None
+                ) == "flex_attention":
+                    original_impl = config._attn_implementation
+                    config._attn_implementation = "eager"
+                    try:
+                        return f(*args, **kwargs)
+                    finally:
+                        config._attn_implementation = original_impl
+                return f(*args, **kwargs)
+            pass
+        return return_attention_mask
+    pass
+    create_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_causal_mask",
+        getattr(transformers.masking_utils, "create_causal_mask", None),
+    )
+    create_sliding_window_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_sliding_window_causal_mask",
+        getattr(transformers.masking_utils, "create_sliding_window_causal_mask", None),
+    )
+    if create_causal_mask is None:
+        return raise_error("transformers.masking_utils.create_causal_mask")
+    if create_sliding_window_causal_mask is None:
+        return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
+    if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
+        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
+        transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
+        transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
+        transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+        transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
+        transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
+        transformers.masking_utils.__patched_causal_mask__ = True
+    pass
+
+    # transformers 4.x uses `input_embeds` and accepts `cache_position`;
+    # transformers 5.x renamed to `inputs_embeds` and dropped `cache_position`.
+    # Inspect the mask factory signatures once and pass only the kwargs they
+    # actually accept so this patch works on both 4.x and 5.x.
+    import inspect as _inspect
+    _ccm_params = set(_inspect.signature(create_causal_mask).parameters)
+    _cswc_params = set(_inspect.signature(create_sliding_window_causal_mask).parameters)
+    _mask_params = _ccm_params | _cswc_params
+
+    def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):
+        mk = {
+            "config": config,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+        }
+        if "inputs_embeds" in _mask_params:
+            mk["inputs_embeds"] = inputs_embeds
+        if "input_embeds" in _mask_params:
+            mk["input_embeds"] = inputs_embeds
+        if "cache_position" in _mask_params:
+            mk["cache_position"] = cache_position
+        return mk
+
+    from ..flex_attention import (
+        is_flex_attention_decoding,
+        flex_attention_with_sink_decoding,
+        flex_attention_add_sinks,
+    )
+
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+    try:
+        from transformers.integrations.mxfp4 import mlp_forward
+    except:
+        mlp_forward = None
+
+    def pre_attention_decoding(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        return query_states, key_states, value_states, input_shape
+    pass
+
+    # Do flex_attention_with_sink_decoding with cannot be compiled
+    # attn_output, logsumexp = flex_attention_with_sink_decoding(
+    #     self,
+    #     query_states,
+    #     key_states,
+    #     value_states,
+    # )
+    def post_attention_decoding(self_attn, attn_output, logsumexp, input_shape):
+        attn_output = flex_attention_add_sinks(self_attn, attn_output, logsumexp)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self_attn.o_proj(attn_output)
+        return attn_output
+
+    pass
+
+    # RMSNorm forward
+    def rms_layernorm_forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.square().mean(-1, keepdim=True)
+        variance += self.variance_epsilon
+        hidden_states *= torch.rsqrt_(variance)
+        hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
+        return hidden_states.to(input_dtype)  # main diff with Llama
+    pass
+
+    # Re-compiling for each new sequence length which is NOT ideal
+    @_torch_compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
+    def pre_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+    ):
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
+        # Self Attention
+        query_states, key_states, value_states, input_shape = pre_attention_decoding(
+            self=self.self_attn,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        return query_states, key_states, value_states, input_shape
+    pass
+    fused_torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = True,
+        max_autotune = False, # Too slow
+        shape_padding = True,
+        cudagraphs = True,
+        coordinate_descent_tuning = False,
+        combo_kernels = False,
+        memory_planning = True,
+        multi_kernel = False, # Fails on torch 2.10 nightly
+        use_block_ptr = True,
+        logging = UNSLOTH_ENABLE_LOGGING,
+    )
+
+    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    def post_forward(
+        self,
+        residual: torch.Tensor,
+        attn_output: torch.Tensor,
+        logsumexp: torch.Tensor,
+        input_shape,
+    ):
+        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
+        hidden_states += residual
+
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
+        return hidden_states, residual
+    pass
+
+    def inference_forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        **kwargs,
+    ):
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states += residual.to(hidden_states.device)
+
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
+        return hidden_states, residual
+    pass
+    # if has_static_cache and Version(torch.__version__) >= Version("2.10.0"):
+    #     # torch 2.9.0 has excessive compilations
+    #     inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> MoeModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if inputs_embeds is None:
+            # Account for CPU offloaded embed_tokens
+            embed_device = self.embed_tokens.weight.device
+            inputs_embeds = self.embed_tokens(input_ids.to(embed_device, non_blocking=True)).to(input_ids.device)
+        if not self.training:
+            inputs_embeds.requires_grad_(False)
+
+        cache_position = kwargs.pop("cache_position", None)
+        if cache_position is None:
+            past_seen_tokens = (past_key_values.get_seq_length() if past_key_values is not None else 0)
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        try:
+            torch._dynamo.mark_static (hidden_states, 0)
+            torch._dynamo.mark_dynamic(hidden_states, 1)
+            torch._dynamo.mark_static (hidden_states, 2)
+        except:
+            pass
+
+        # It may already have been prepared by e.g. `generate`
+        if not self.training and not isinstance(attention_mask, dict):
+            # Inference uses eager attention. If the config still has
+            # _attn_implementation="flex_attention" (set for training), the
+            # mask factory returns a BlockMask which eager cannot consume.
+            # Temporarily swap to "eager" so a dense 4D float mask is built.
+            _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
+            _swap_attn_impl = _orig_attn_impl == "flex_attention"
+            if _swap_attn_impl:
+                self.config._attn_implementation = "eager"
+            try:
+                mask_kwargs = _build_mask_kwargs(
+                    config=self.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                )
+                attention_mask = {
+                    "full_attention": create_causal_mask(**{
+                        k: v for k, v in mask_kwargs.items() if k in _ccm_params
+                    }),
+                    "sliding_attention": create_sliding_window_causal_mask(**{
+                        k: v for k, v in mask_kwargs.items() if k in _cswc_params
+                    }),
+                }
+            finally:
+                if _swap_attn_impl:
+                    self.config._attn_implementation = _orig_attn_impl
+
+        # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
+        bsz, qlen, hd = hidden_states.shape
+        if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+            # Add hack since residuals need to clone outside of the torch.compile region??
+            # This forces it to free past residuals
+            torch.compiler.cudagraph_mark_step_begin()
+            # Initialize for common return path
+            all_hidden_states = None
+            for decoder_layer in self.layers:
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
+                hidden_states, residual = inference_forward(
+                    decoder_layer,
+                    hidden_states,
+                    mask,
+                    position_ids,
+                    past_key_values,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                    **kwargs,
+                )
+                _actual_experts = _unwrap_peft_experts(decoder_layer.mlp.experts)
+                if hasattr(_actual_experts, "gate_up_projs"):
+                    hidden_states = moe_forward_inference(
+                        decoder_layer.mlp, hidden_states
+                    )
+                elif (
+                    _actual_experts.__class__.__name__ == "Mxfp4GptOssExperts"
+                ):
+                    if mlp_forward is None:
+                        raise RuntimeError("Unsloth: MXFP4 forward is not found")
+                    hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
+                else:
+                    hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+                hidden_states += residual
+            pass
+            hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+        else:
+            # During training, flex_attention_with_sink creates its own sparse
+            # BlockMask and ignores the attention_mask argument entirely.
+            # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
+            # which causes OOM at long context lengths (e.g. 500K tokens).
+            if self.training:
+                attention_mask = None
+
+            # Accumulate hidden states if requested
+            output_hidden_states = kwargs.get(
+                "output_hidden_states", self.config.output_hidden_states
+            )
+            all_hidden_states = () if output_hidden_states else None
+
+            for decoder_layer in self.layers:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                _attn_type = getattr(decoder_layer, "attention_type", None)
+                if isinstance(attention_mask, dict):
+                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                else:
+                    mask = attention_mask
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    attention_mask=mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            pass
+            hidden_states = self.norm(hidden_states)
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+        # Fix float16 / float32 mismatching
+        hidden_states = hidden_states.to(inputs_embeds.dtype)
+        return process_return(MoeModelOutputWithPast, {
+                "last_hidden_state": hidden_states,
+                "past_key_values": past_key_values,
+                "hidden_states": all_hidden_states,
+            })
+
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_GptOssModel)
+
+encoding = None
+
+_HARMONY_SYMBOLS = (
+    "Author",
+    "Conversation",
+    "DeveloperContent",
+    "HarmonyEncodingName",
+    "Message",
+    "Role",
+    "SystemContent",
+    "ToolDescription",
+    "load_harmony_encoding",
+    "ReasoningEffort",
+)
+
+# Best-effort eager import; when openai_harmony is installed after this module was
+# imported, _ensure_harmony rebinds the symbols lazily at call time.
+# See https://github.com/unslothai/unsloth/issues/3361
+try:
+    from openai_harmony import (
+        Author,
+        Conversation,
+        DeveloperContent,
+        HarmonyEncodingName,
+        Message,
+        Role,
+        SystemContent,
+        ToolDescription,
+        load_harmony_encoding,
+        ReasoningEffort
+    )
+except Exception:
+    pass
+
+
+def _ensure_harmony():
+    g = globals()
+    if all(g.get(name) is not None for name in _HARMONY_SYMBOLS):
+        return
+    try:
+        import openai_harmony
+    except ModuleNotFoundError as e:
+        if not e.name or e.name == "openai_harmony":
+            raise ImportError("Please install openai_harmony via `pip install openai_harmony`") from e
+        if e.name.startswith("openai_harmony."):
+            raise ImportError(f"Unsloth: failed to import openai_harmony: {e}") from e
+        raise ImportError(f"Unsloth: failed to import openai_harmony; its dependency `{e.name}` is missing: {e}") from e
+    except Exception as e:
+        raise ImportError(f"Unsloth: failed to import openai_harmony: {e}") from e
+
+    missing = [name for name in _HARMONY_SYMBOLS if getattr(openai_harmony, name, None) is None]
+    if missing:
+        raise ImportError(
+            f"Unsloth: openai_harmony is installed but is missing required symbols ({', '.join(missing)}); "
+            f"please upgrade via `pip install --upgrade openai_harmony`"
+        )
+    for name in _HARMONY_SYMBOLS:
+        g[name] = getattr(openai_harmony, name)
+pass
+
+
+def _get_gpt_oss_harmony_encoding():
+    global encoding
+    _ensure_harmony()
+
+    if encoding is None:
+        try:
+            encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        except Exception as e:
+            raise RuntimeError(f"Unsloth: failed to load the gpt-oss harmony encoding: {e}") from e
+    return encoding
+pass
+
+
+def encode_conversations_with_harmony(
+    messages,
+    reasoning_effort = "medium",
+    add_generation_prompt = True,
+    tool_calls = None,
+    developer_instructions = None,
+    model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
+):
+    harmony_encoding = _get_gpt_oss_harmony_encoding()
+
+    assert reasoning_effort in ("low", "medium", "high")
+
+    match reasoning_effort:
+        case "low":     harmony_reasoning = ReasoningEffort.LOW
+        case "medium":  harmony_reasoning = ReasoningEffort.MEDIUM
+        case "high":    harmony_reasoning = ReasoningEffort.HIGH
+
+    convos = []
+
+    # Create system message
+    import datetime
+
+    today = datetime.datetime.today().strftime("%Y-%m-%d")
+    system = Message.from_role_and_content(Role.SYSTEM,
+        SystemContent.new()
+            .with_model_identity(model_identity)
+            .with_reasoning_effort(harmony_reasoning)
+            .with_conversation_start_date(today)
+            .with_knowledge_cutoff("2024-06")
+            .with_required_channels(["analysis", "commentary", "final"]),
+    )
+    convos.append(system)
+
+    # Developer message and tool calling
+    dev = DeveloperContent.new()
+    if developer_instructions is not None: dev = dev.with_instructions(developer_instructions)
+    if tool_calls is not None:
+        new_tools = []
+        for function in tool_calls:
+            function = function["function"]
+            name = function["name"]
+            description = function["description"]
+            parameters = function["parameters"]
+            tool = ToolDescription.new(name, description, parameters)
+            new_tools.append(tool)
+        dev = dev.with_function_tools(new_tools)
+    pass
+    if developer_instructions is not None or tool_calls is not None:
+        dev = Message.from_role_and_content(Role.DEVELOPER, dev)
+        convos.append(dev)
+
+    for message in messages:
+        if message["role"] == "user":
+            convos.append(Message.from_role_and_content(Role.USER, message["content"]))
+        elif message["role"] == "assistant":
+            # An assistant turn can independently carry reasoning, a tool call, and/or a
+            # final answer. Treat the parts separately so none silently suppresses another.
+            # Guard on truthiness (not key membership) so a nullable "thinking" column
+            # materialized as None or "" does not get passed into Harmony, which rejects it.
+            if message.get("thinking"):
+                x = Message.from_role_and_content(Role.ASSISTANT, message["thinking"])
+                x = x.with_channel("analysis")
+                convos.append(x)
+            if message.get("tool_calls"):
+                x = Message.from_role_and_content(Role.ASSISTANT, message["tool_calls"][0]["arguments"])
+                x = x.with_channel("commentary").with_recipient(f"functions.{message['tool_calls'][0]['name']}").with_content_type("json")
+                convos.append(x)
+            elif message.get("content"):
+                # A tool-call turn does not also emit a final answer (the answer comes
+                # after the tool result), so tool_calls and content stay mutually exclusive.
+                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = x.with_channel("final")
+                convos.append(x)
+            continue
+        elif message["role"] == "tool":
+            x = Message.from_author_and_content(Author.new(Role.TOOL, f"functions.{message['name']}"), message["content"])
+            x = x.with_recipient("assistant").with_channel("commentary")
+            convos.append(x)
+    pass
+
+    # Create Harmony conversations
+    convos = Conversation.from_messages(convos)
+    if add_generation_prompt:
+        harmony_input_ids = harmony_encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
+    else:
+        harmony_input_ids = harmony_encoding.render_conversation(convos)
+    harmony_decoded_text = harmony_encoding.decode(harmony_input_ids)
+    return harmony_decoded_text, harmony_input_ids
+pass
+
+
+# Fix https://github.com/huggingface/transformers/pull/40474
+# RuntimeError: Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.
+# AutoConfig error: 'GptOssConfig' object has no attribute 'max_position_embeddings'
+try:
+    from transformers.configuration_utils import layer_type_validation
+
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
+    from transformers.modeling_rope_utils import rope_config_validation
+
+    class Old_GptOssConfig(PretrainedConfig):
+        r"""
+        This will yield a configuration to that of the BERT
+        [google-bert/bert-base-uncased](https://huggingface.co/google-bert/bert-base-uncased) architecture.
+
+        """
+
+        model_type = "gpt_oss"
+        base_model_pp_plan = {
+            "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+            "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+            "norm": (["hidden_states"], ["hidden_states"]),
+        }
+        base_model_tp_plan = {
+            "layers.*.self_attn.q_proj": "colwise",
+            "layers.*.self_attn.k_proj": "colwise",
+            "layers.*.self_attn.v_proj": "colwise",
+            "layers.*.self_attn.o_proj": "rowwise",
+            "layers.*.self_attn.sinks": "local_rowwise",
+            "layers.*.mlp.experts": "gather",
+            "layers.*.mlp.router": "ep_router",
+            "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+            "layers.*.mlp.experts.gate_up_proj_bias": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj_bias": "grouped_gemm",
+        }
+
+        def __init__(
+            self,
+            num_hidden_layers: int = 36,
+            num_local_experts: int = 128,
+            vocab_size: int = 201088,
+            hidden_size: int = 2880,
+            intermediate_size: int = 2880,
+            head_dim: int = 64,
+            num_attention_heads: int = 64,
+            num_key_value_heads: int = 8,
+            sliding_window: int = 128,
+            rope_theta: float = 150000.0,
+            tie_word_embeddings=False,
+            hidden_act: str = "silu",
+            initializer_range: float = 0.02,
+            max_position_embeddings=131072,
+            rms_norm_eps: float = 1e-5,
+            rope_scaling={"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False},
+            attention_dropout: float = 0.0,
+            num_experts_per_tok=4,
+            router_aux_loss_coef: float = 0.9,
+            output_router_logits=False,
+            use_cache=True,
+            layer_types=None,
+            **kwargs,
+        ):
+            self.vocab_size = vocab_size
+            self.hidden_size = hidden_size
+            self.intermediate_size = intermediate_size
+            self.num_hidden_layers = num_hidden_layers
+            self.num_attention_heads = num_attention_heads
+            self.num_local_experts = num_local_experts
+            self.sliding_window = sliding_window
+            self.num_experts_per_tok = num_experts_per_tok
+            # for backward compatibility
+            if num_key_value_heads is None:
+                num_key_value_heads = num_attention_heads
+
+            self.num_key_value_heads = num_key_value_heads
+            self.hidden_act = hidden_act
+            self.initializer_range = initializer_range
+            self.rms_norm_eps = rms_norm_eps
+            self.rope_theta = rope_theta
+            self.rope_scaling = rope_scaling
+            self.attention_dropout = attention_dropout
+            self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+            self.layer_types = layer_types
+            if self.layer_types is None:
+                self.layer_types = ["sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)]
+            layer_type_validation(self.layer_types)
+
+            # Validate the correctness of rotary position embeddings parameters
+            # BC: if there is a 'type' field, copy it it to 'rope_type'.
+            if self.rope_scaling is not None and "type" in self.rope_scaling:
+                self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+            rope_config_validation(self)
+
+            self.attention_bias = True
+            self.max_position_embeddings = max_position_embeddings
+            self.router_aux_loss_coef = router_aux_loss_coef
+            self.output_router_logits = output_router_logits
+            self.use_cache = use_cache
+            super().__init__(
+                tie_word_embeddings=tie_word_embeddings,
+                **kwargs,
+            )
+
+    class GptOssConfig(PretrainedConfig):
+        r"""
+        This will yield a configuration to that of the BERT
+        [google-bert/bert-base-uncased](https://huggingface.co/google-bert/bert-base-uncased) architecture.
+
+        """
+
+        model_type = "gpt_oss"
+        base_model_pp_plan = {
+            "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+            "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+            "norm": (["hidden_states"], ["hidden_states"]),
+        }
+        base_model_tp_plan = {
+            "layers.*.self_attn.q_proj": "colwise",
+            "layers.*.self_attn.k_proj": "colwise",
+            "layers.*.self_attn.v_proj": "colwise",
+            "layers.*.self_attn.o_proj": "rowwise",
+            "layers.*.self_attn.sinks": "local_rowwise",
+            "layers.*.mlp.experts": "gather",
+            "layers.*.mlp.router": "ep_router",
+            "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+            "layers.*.mlp.experts.gate_up_proj_bias": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj_bias": "grouped_gemm",
+        }
+
+        def __init__(
+            self,
+            num_hidden_layers: int = 36,
+            num_local_experts: int = 128,
+            vocab_size: int = 201088,
+            hidden_size: int = 2880,
+            intermediate_size: int = 2880,
+            head_dim: int = 64,
+            num_attention_heads: int = 64,
+            num_key_value_heads: int = 8,
+            sliding_window: int = 128,
+            rope_theta: float = 150000.0,
+            tie_word_embeddings=False,
+            hidden_act: str = "silu",
+            initializer_range: float = 0.02,
+            max_position_embeddings=131072,
+            rms_norm_eps: float = 1e-5,
+            rope_scaling={"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False},
+            attention_dropout: float = 0.0,
+            num_experts_per_tok=4,
+            router_aux_loss_coef: float = 0.9,
+            output_router_logits=False,
+            use_cache=True,
+            layer_types=None,
+            **kwargs,
+        ):
+            self.vocab_size = vocab_size
+            self.hidden_size = hidden_size
+            self.intermediate_size = intermediate_size
+            self.num_hidden_layers = num_hidden_layers
+            self.num_attention_heads = num_attention_heads
+            self.num_local_experts = num_local_experts
+            self.sliding_window = sliding_window
+            self.num_experts_per_tok = num_experts_per_tok
+            # for backward compatibility
+            if num_key_value_heads is None:
+                num_key_value_heads = num_attention_heads
+
+            self.num_key_value_heads = num_key_value_heads
+            self.hidden_act = hidden_act
+            self.initializer_range = initializer_range
+            self.rms_norm_eps = rms_norm_eps
+            self.rope_theta = rope_theta
+            self.rope_scaling = rope_scaling
+            self.attention_dropout = attention_dropout
+            self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+            self.layer_types = layer_types
+            if self.layer_types is None:
+                self.layer_types = [
+                    "sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)
+                ]
+            layer_type_validation(self.layer_types)
+            self.attention_bias = True
+            self.max_position_embeddings = max_position_embeddings
+            self.router_aux_loss_coef = router_aux_loss_coef
+            self.output_router_logits = output_router_logits
+            self.use_cache = use_cache
+
+            # Validate the correctness of rotary position embeddings parameters
+            # BC: if there is a 'type' field, copy it it to 'rope_type'.
+            if self.rope_scaling is not None and "type" in self.rope_scaling:
+                self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+            rope_config_validation(self)
+
+            self.attention_bias = True
+            self.max_position_embeddings = max_position_embeddings
+            self.router_aux_loss_coef = router_aux_loss_coef
+            self.output_router_logits = output_router_logits
+            self.use_cache = use_cache
+            super().__init__(
+                tie_word_embeddings=tie_word_embeddings,
+                **kwargs,
+            )
+
+    def patch_gpt_oss_config():
+        try:
+            import transformers.models.gpt_oss.configuration_gpt_oss
+
+            transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig
+        except Exception as e:
+            return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
+
+        try:
+            current_class = dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
+            new_class = dedent(inspect.getsource(Old_GptOssConfig))
+            new_class = new_class.replace("Old_GptOssConfig", "GptOssConfig")
+            if new_class == current_class:
+                logger.info("Unsloth: Updating GPT OSS Config to fix missing `max_position_embeddings`")
+                patch_function(transformers.models.gpt_oss.configuration_gpt_oss, "GptOssConfig", GptOssConfig)
+        except Exception as e:
+            return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
+
+    pass
+    TEMPORARY_PATCHES.append(patch_gpt_oss_config)
+except Exception as e:
+    raise_error("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig", e)
+
+
+def patch_gpt_oss_init_weights_modulelist_fix():
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    GptOssPreTrainedModel = (
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel
+    )
+    GptOssExperts = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    GptOssTopKRouter = transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
+    if getattr(GptOssPreTrainedModel, "_unsloth_init_weights_fixed", False):
+        return
+    _original_init_weights = GptOssPreTrainedModel._init_weights
+
+    def _patched_init_weights(self, module):
+        if isinstance(module, GptOssExperts) and not hasattr(module, "gate_up_proj"):
+            std = self.config.initializer_range
+            for up in getattr(module, "gate_up_projs", []):
+                init.normal_(up.weight, mean=0.0, std=std)
+                if up.bias is not None:
+                    init.zeros_(up.bias)
+            for down in getattr(module, "down_projs", []):
+                init.normal_(down.weight, mean=0.0, std=std)
+                if down.bias is not None:
+                    init.zeros_(down.bias)
+            return
+        if isinstance(module, GptOssTopKRouter):
+            # Router weight/bias live under .weight (stock) or .linear (Unsloth BnB-4bit).
+            # Resolve whichever exists so stock _init_weights' module.weight access can't
+            # raise "GptOssTopKRouter object has no attribute 'weight'" (#3119).
+            std = self.config.initializer_range
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                weight = getattr(getattr(module, "linear", None), "weight", None)
+            bias = getattr(module, "bias", None)
+            if bias is None:
+                bias = getattr(getattr(module, "linear", None), "bias", None)
+            if weight is not None:
+                init.normal_(weight, mean=0.0, std=std)
+            if bias is not None:
+                init.normal_(bias, mean=0.0, std=std)
+            return
+        _original_init_weights(self, module)
+
+    patch_function(GptOssPreTrainedModel, "_init_weights", _patched_init_weights)
+    GptOssPreTrainedModel._unsloth_init_weights_fixed = True
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_init_weights_modulelist_fix)
+
+
+# ============================================================================
+# Patch GptOssForCausalLM.forward for GRPO training
+# When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
+# ============================================================================
+def patch_gpt_oss_for_grpo(phase="post_compile"):
+    """
+    Patch GptOssForCausalLM.forward for GRPO: when UNSLOTH_RETURN_HIDDEN_STATES=1, return
+    hidden_states instead of logits (fixes the GRPO matmul dimension mismatch).
+    Runs post-compile so the compiler can pattern-match cross-entropy and fuse loss (avoids OOM).
+    """
+    if phase != "post_compile":
+        return
+
+    if "gpt_oss" not in _normalized_unsloth_model_name():
+        return
+
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        from transformers.models.gpt_oss.modeling_gpt_oss import (
+            GptOssForCausalLM,
+            MoeCausalLMOutputWithPast,
+        )
+
+        if hasattr(GptOssForCausalLM, '_unsloth_grpo_patched'):
+            return
+
+        _original_causal_lm_forward = GptOssForCausalLM.forward
+
+        def _patched_causal_lm_forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            cache_position=None,
+            logits_to_keep=0,
+            **kwargs,
+        ):
+            # This Unsloth Zoo code section is licensed under AGPL3
+
+            RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+
+            if not RETURN_HIDDEN_STATES:
+                # Normal forward pass
+                return _original_causal_lm_forward(
+                    self,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    cache_position=cache_position,
+                    logits_to_keep=logits_to_keep,
+                    **kwargs,
+                )
+
+            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+
+            # Apply slice_indices to hidden_states (same indexing as for logits)
+            if logits_to_keep != 0:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                hidden_states = hidden_states[:, slice_indices, :]
+
+            # Return hidden_states as "logits" for GRPO to use
+            return MoeCausalLMOutputWithPast(
+                loss=None,
+                aux_loss=getattr(outputs, 'aux_loss', None),
+                logits=hidden_states,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                router_logits=getattr(outputs, 'router_logits', None),
+            )
+
+        # Preserve __qualname__ so _unsloth_get_batch_samples can detect
+        # this is a CausalLM forward and compute num_items_in_batch properly.
+        _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        GptOssForCausalLM.forward = _patched_causal_lm_forward
+        GptOssForCausalLM._unsloth_grpo_patched = True
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched GptOssForCausalLM.forward for GRPO hidden states.")
+
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch GptOssForCausalLM.forward: {e}")
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_for_grpo)

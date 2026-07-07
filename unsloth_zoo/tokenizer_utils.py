@@ -14,7 +14,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import torch
+try:
+    import torch
+except ImportError:
+    # MLX (Apple Silicon) is torch-free. Only the embedding-fix helpers below use
+    # torch and they are never called on MLX, so keep the module importable so the
+    # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
+    torch = None
+import functools
 import gc
 import numpy as np
 import itertools
@@ -26,15 +33,27 @@ __all__ = [
     "add_new_tokens",
     "fix_untrained_tokens",
     "patch_tokenizer",
+    "patch_processor_call",
 ]
 
 
-@torch.inference_mode
+def _maybe_inference_mode(func):
+    """torch.inference_mode when torch is present; a plain passthrough on torch-free
+    installs (MLX), where these torch-only helpers are never invoked."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch is None:
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+@_maybe_inference_mode
 def mean_of_trained_tokens(model, eps = 1e-16):
     """
-    Llama-3 for eg has untrained vectors in the base model.
-    These include <|eot_id|>, <|start_header_id|>, <|end_header_id|>
-    We reset them to the mean of the rest of the tokens
+    Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
+    in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     embedding_matrix = model.get_input_embeddings ().weight.clone()
@@ -68,7 +87,6 @@ def mean_of_trained_tokens(model, eps = 1e-16):
 pass
 
 
-@torch.inference_mode
 def add_new_tokens(
     model,
     tokenizer,
@@ -77,8 +95,8 @@ def add_new_tokens(
     interpolation = 0.5,
 ):
     """
-    Smartly resizes the tokenizer and adds new tokens to the model.
-    We also disregard untrained tokens by removing them from the mean calculation.
+    Resize the tokenizer and add new tokens to the model, excluding untrained
+    tokens from the mean calculation.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     assert(isinstance(new_tokens, (list, tuple)))
@@ -119,8 +137,9 @@ def add_new_tokens(
     # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
+    new_vocab_length = len(tokenizer)
     # Also resizes lm_head as well!
-    model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(new_vocab_length)
 
     # If we use interpolation, we interpolate between the mean embeddings and
     # the Word2Vec sum of the other vectors
@@ -128,15 +147,15 @@ def add_new_tokens(
     lm_head_matrix   = model.get_output_embeddings().weight
 
     # Confirm sizes are correct
-    if embedding_matrix.shape[0] != (old_input_length  + len(new_tokens)):
+    if embedding_matrix.shape[0] != new_vocab_length:
         raise RuntimeError(
             "Unsloth: Embedding matrix size did not get resized properly. Please file a bug report!"
         )
-    if lm_head_matrix.shape[0]   != (old_output_length + len(new_tokens)):
+    if lm_head_matrix.shape[0]   != new_vocab_length:
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != (old_config_size   + len(new_tokens)):
+    if model.config.vocab_size   != new_vocab_length:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )
@@ -157,13 +176,15 @@ def add_new_tokens(
             mean_lm_head_token   = mean_lm_head  *(1-interpolation) + mean_lm_head_token  *interpolation
 
             # Set the new vector
-            embedding_matrix[old_length+j] = mean_embedding_token
-            lm_head_matrix  [old_length+j] = mean_lm_head_token
+            with torch.no_grad():
+                embedding_matrix[old_length+j] = mean_embedding_token
+                lm_head_matrix  [old_length+j] = mean_lm_head_token
         pass
     else:
         # Now set the new tokens to the mean!
-        embedding_matrix[old_length:] = mean_embedding
-        lm_head_matrix  [old_length:] = mean_lm_head
+        with torch.no_grad():
+            embedding_matrix[old_length:] = mean_embedding
+            lm_head_matrix  [old_length:] = mean_lm_head
     pass
 
     # We set a flag to say we need to train embeddings
@@ -197,12 +218,11 @@ def add_new_tokens(
 pass
 
 
-@torch.inference_mode
+@_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
-    Llama-3 for eg has untrained vectors in the base model.
-    These include <|eot_id|>, <|start_header_id|>, <|end_header_id|>
-    We reset them to the mean of the rest of the tokens
+    Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
+    in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     embedding_matrix = model.get_input_embeddings ().weight
@@ -456,149 +476,127 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
 pass
 
 
-POSSIBLE_RESERVED_TOKENS = (
-    "<|finetune_right_pad_id|>", # Llama-3.1
-    "<pad>",                     # Mistral Nemo
-    "<|vision_pad|>",            # Qwen 2.5
-    "<|image_pad|>",             # Qwen 2.5
-    "<|video_pad|>",             # Qwen 2.5
-    "<|reserved",                # Llama-3
-    "<|placeholder",             # Phi-3
-    "[control",                  # Mistral type models
-    "|<EXTRA_TOKENS_",           # Molmo
-    "<SPECIAL_",                 # Pixtral
-    "<unused",                   # PaliGemma
+# Pad-token repair lives in the shared pad_token module (single source of truth
+# for unsloth + unsloth-zoo). Re-exported here for backwards compatibility.
+from .pad_token import (
+    fix_pad_token,
+    POSSIBLE_RESERVED_TOKENS,
+    VISION_RESERVED_TOKENS,
 )
 
-@torch.inference_mode
+@_maybe_inference_mode
 def patch_tokenizer(model, tokenizer):
     """
-        Phi3's pad_token isn't set. We set it to <|placeholder...
-        Llama-3 is <|reserved...
-        Llama-2 is <unk>
-        Check if pad_token is not the same as eos_token otherwise the loss will ignore it!!
+        Set a sensible pad_token when missing (Phi3 -> <|placeholder...,
+        Llama-3 -> <|reserved..., Llama-2 -> <unk>) and ensure it differs from
+        eos_token so the loss does not ignore it.
         Fixes https://github.com/unslothai/unsloth/issues/5
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    joiner = "\1\0=+=\0\1"
-    number_repetitions = 3 - 1 # Number of reserved tokens needed
+
+    # Guard against None tokenizer (e.g., some VLM processors without tokenizer)
+    if tokenizer is None:
+        return model, tokenizer
 
     original_tokenizer = tokenizer
-    if hasattr(tokenizer, "tokenizer"): tokenizer = tokenizer.tokenizer
 
-    bad_pad_token = False
-    if hasattr(tokenizer, "pad_token") and tokenizer.pad_token is not None:
-        # Check if pad_token is not the same as eos_token otherwise the loss will ignore it!!
-        bad_pad_token = tokenizer.eos_token == tokenizer.pad_token
-    elif hasattr(tokenizer, "pad_token") and tokenizer.pad_token is None:
-        bad_pad_token = True
-    else:
-        bad_pad_token = False
-    pass
+    # Auto-apply chat template when a conversation is passed instead of a string
+    if hasattr(tokenizer, "image_processor") and hasattr(tokenizer, "apply_chat_template"):
+        patch_processor_call(tokenizer)
 
-    if bad_pad_token:
-        # Find a better pad token
-        added_tokens = [str(x) for x in tokenizer.added_tokens_decoder.values()]
-        all_added_tokens = joiner.join(added_tokens[::-1])
-        all_added_tokens += joiner
+    if hasattr(tokenizer, "tokenizer"):
+        inner = tokenizer.tokenizer
+        if inner is None:
+            # Processor exists but inner tokenizer is None - return as-is
+            return model, original_tokenizer
+        tokenizer = inner
 
-        final_pad_token  = None
-        final_good_match = False
+    # Heal a bad/missing pad_token via the shared single source of truth: it picks
+    # a reserved pad-like token already in the vocab (text-only models never reuse
+    # a vision token), or adds one and raises if none exists, and stamps
+    # model.config / generation_config pad_token_id when it changes.
+    # Fixes https://github.com/unslothai/unsloth/issues/5 and #4104.
+    model_config = getattr(model, "config", None)
+    result = fix_pad_token(original_tokenizer, model = model, model_config = model_config)
 
-        for possible_reserved_token in POSSIBLE_RESERVED_TOKENS:
-            possible_reserved_token = re.escape(possible_reserved_token)
-            found = re.finditer(f"{possible_reserved_token}", all_added_tokens)
-            first_match = None
-            good_match  = False
-            for j, x in enumerate(found):
-                if j == 0: first_match = x
-                if j >= number_repetitions:
-                    good_match = True
-                    break
-                pass
-            pass
-
-            if first_match is None: continue
-
-            # If it ends with |> or > etc, then set it as a good pad token!
-            start = first_match.span(0)[0]
-            possible_pad_token = first_match.group(0)
-            end = all_added_tokens.find(joiner, start)
-            first_match = all_added_tokens[start:end]
-
-            if first_match is not None:
-                good_match = possible_pad_token.endswith((">", "|>", "]", ")"))
-            pass
-            possible_pad_token = first_match
-
-            # Replace current pad token if another exact match is found
-            if not final_good_match and good_match:
-                final_good_match = True
-                final_pad_token = possible_pad_token
-                break
-            else:
-                final_good_match = False
-                final_pad_token = possible_pad_token
-            pass
-        pass
-        possible_pad_token = final_pad_token
-
-        # Try unk_token
-        if possible_pad_token is None and hasattr(tokenizer, "unk_token"):
-            possible_pad_token = tokenizer.unk_token
-        pass
-
-        # Check pad token's id must be less than vocab size
-        if possible_pad_token is not None:
-            check_pad_token = tokenizer(possible_pad_token, add_special_tokens = False).input_ids
-            if len(check_pad_token) != 1:
-                possible_pad_token = None
-
-            if model is not None and \
-                hasattr(model.config, "vocab_size") and \
-                check_pad_token[0] >= model.config.vocab_size:
-
-                possible_pad_token = None
-        pass
-
-        if possible_pad_token is None:
-            # Failure to find a good replacement!! We shall manually add one!
-            new_pad_token = "<|PAD_TOKEN|>"
-            while new_pad_token in tokenizer.get_vocab():
-                new_pad_token = f"<{new_pad_token}>"
-            pass
-            possible_pad_token = new_pad_token
-        pass
-
-        name = model.config._name_or_path if model is not None else "Model"
-        print(
-            f"{name} does not have a padding token! Will use pad_token = {possible_pad_token}."
-        )
-        
-        # Edit pad_token
-        tokenizer.add_special_tokens({"pad_token" : possible_pad_token})
-        tokenizer.pad_token = possible_pad_token
-        if model is not None:
-            model.config.update({"pad_token_id" : tokenizer.pad_token_id})
-            if getattr(model, "generation_config") is not None:
-                model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
-    else:
-        if model is not None:
-            if model.config.pad_token_id is None:
-                model.config.update({"pad_token_id" : tokenizer.pad_token_id})
-                if getattr(model, "generation_config") is not None:
-                    model.generation_config.update(pad_token_id = tokenizer.pad_token_id)
-        pass
+    # No-op case: tokenizer already had a valid pad_token, but the model config
+    # may still be missing pad_token_id - mirror it across.
+    if not result["changed"] and model is not None and model_config is not None:
+        if getattr(model_config, "pad_token_id", None) is None:
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+            model.config.update({"pad_token_id" : pad_token_id})
+            if getattr(model, "generation_config", None) is not None:
+                model.generation_config.update(pad_token_id = pad_token_id)
     pass
 
     if model is not None:
-        if getattr(model, "generation_config") is not None:
+        if getattr(model, "generation_config", None) is not None:
             if hasattr(model.config, "max_position_embeddings"):
                 model.generation_config.update(max_length = model.config.max_position_embeddings)
     pass
 
     return model, original_tokenizer
 pass
+
+
+def _is_conversation_format(text):
+    """Return True if text is conversation format (list of dicts with 'role')."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not isinstance(text, list):
+        return False
+    if len(text) == 0:
+        return False
+    first = text[0]
+    if isinstance(first, dict) and "role" in first:
+        return True
+    return False
+pass
+
+
+def patch_processor_call(processor):
+    """
+    Patch processor's __call__ to auto-apply the chat template when text is in
+    conversation format. VLM processors (e.g. Qwen3VL) expect a string; passing
+    a list of dicts otherwise raises
+    `AttributeError: 'dict' object has no attribute 'replace'`.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not hasattr(processor, "apply_chat_template"):
+        return processor
+
+    if hasattr(processor, "_unsloth_patched_call"):
+        return processor
+
+    original_call = processor.__class__.__call__
+
+    def patched_call(self, images=None, text=None, videos=None, **kwargs):
+        if text is not None and _is_conversation_format(text):
+            add_generation_prompt = kwargs.pop("add_generation_prompt", True)
+            text = self.apply_chat_template(
+                text,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        return original_call(self, images=images, text=text, videos=videos, **kwargs)
+
+    # Patch via a dynamic subclass reusing the original class name so
+    # save_pretrained writes the correct processor_class (fixes issue #4085).
+    original_class = processor.__class__
+    patched_class = type(
+        original_class.__name__,
+        (original_class,),
+        {
+            "__call__": patched_call,
+            "__module__": original_class.__module__,
+            "__qualname__": original_class.__qualname__,
+        }
+    )
+    processor.__class__ = patched_class
+
+    processor._unsloth_patched_call = True
+    return processor
+pass
+
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

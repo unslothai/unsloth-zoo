@@ -3,22 +3,81 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Literal, Optional, Set, Type, Union
 
 import torch
+try:
+    from vllm.adapter_commons.utils import (add_adapter_worker,
+                                            apply_adapters_worker,
+                                            list_adapters_worker,
+                                            set_active_adapters_worker)
+except ImportError:
+    add_adapter_worker = apply_adapters_worker = list_adapters_worker = set_active_adapters_worker = None
+try:
+    from vllm.adapter_commons.worker_manager import AbstractWorkerManager
+except ImportError:
+    # Create a dummy base class when the import fails
+    # https://github.com/vllm-project/vllm/pull/25045/files
+    class AbstractWorkerManager:
+        def __init__(self, device):
+            self.device = device
 
-from vllm.adapter_commons.utils import (add_adapter_worker,
-                                        apply_adapters_worker,
-                                        list_adapters_worker,
-                                        set_active_adapters_worker)
-from vllm.adapter_commons.worker_manager import AbstractWorkerManager
-from vllm.config import LoRAConfig
-from vllm.logger import init_logger
-from vllm.lora.models import (LoRAModel, LoRAModelManager,
-                              LRUCacheLoRAModelManager, create_lora_manager)
-from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.request import LoRARequest
-from vllm.lora.utils import get_adapter_absolute_path
+# Guard vLLM imports so this module imports without vLLM (real LoRA work needs it).
+try:
+    from vllm.config import LoRAConfig, VllmConfig
+except ImportError:
+    class LoRAConfig: pass
+    class VllmConfig: pass
+try:
+    from vllm.logger import init_logger
+except ImportError:
+    import logging
+    def init_logger(name): return logging.getLogger(name)
+try:
+    from vllm.lora.models import (LoRAModel, LoRAModelManager,
+                                LRUCacheLoRAModelManager, create_lora_manager)
+except ImportError:
+    # Newer vLLM version moved/split lora methods
+    # https://github.com/vllm-project/vllm/pull/30253
+    try:
+        from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
+    except ImportError:
+        class LoRAModel: pass
+        class LoRAModelManager: pass
+        class LRUCacheLoRAModelManager: pass
+        def create_lora_manager(*args, **kwargs):
+            raise RuntimeError("vLLM is required for LoRA worker manager")
+try:
+    from vllm.lora.peft_helper import PEFTHelper
+except ImportError:
+    class PEFTHelper: pass
+try:
+    from vllm.lora.request import LoRARequest
+except ImportError:
+    class LoRARequest: pass
+try:
+    from vllm.lora.utils import get_adapter_absolute_path
+except ImportError:
+    def get_adapter_absolute_path(*args, **kwargs):
+        raise RuntimeError("vLLM is required for LoRA worker manager")
 
 logger = init_logger(__name__)
 
+import inspect
+import functools
+
+@functools.lru_cache(1)
+def dummy_lora_has_scaling_factor(create_dummy_lora):
+    # create_dummy_lora(self, lora_id, rank, scaling_factor, embedding_modules)
+    # create_dummy_lora(self, lora_id, rank, embedding_modules)
+    keys = inspect.signature(create_dummy_lora).parameters.keys()
+    return "scaling_factor" in keys
+pass
+
+def _call_create_lora_manager(model, vllm_config, **kwargs):
+    sig = inspect.signature(create_lora_manager)
+    if "vllm_config" in sig.parameters:
+        return create_lora_manager(model, vllm_config = vllm_config, **kwargs)
+    return create_lora_manager(model, **kwargs)
+pass
 
 class WorkerLoRAManager(AbstractWorkerManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
@@ -27,31 +86,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
     loaded), and every other LoRA will be unloaded."""
 
     _manager_cls: Type[LoRAModelManager] = LoRAModelManager
-
-    def __init__(
-        self,
-        max_num_seqs: int,
-        max_num_batched_tokens: int,
-        vocab_size: int,
-        lora_config: LoRAConfig,
-        device: torch.device,
-        embedding_modules: Dict[str, str],
-        embedding_padding_modules: List[str],
-        lora_model_cls: Type[LoRAModel] = LoRAModel,
-        max_position_embeddings: Optional[int] = None,
-    ):
-        self._lora_model_cls = lora_model_cls
-        self.embedding_modules = embedding_modules
-        self.embedding_padding_modules = embedding_padding_modules
-        self._cached_dummy_lora: Union[None, Literal[False], LoRAModel] = False
-        self.max_num_seqs = max_num_seqs
-        self.max_num_batched_tokens = max_num_batched_tokens
-        self.vocab_size = vocab_size
-        self.lora_config = lora_config
-        self.max_position_embeddings = max_position_embeddings
-        super().__init__(device)
-        # Lazily initialized by create_lora_manager.
-        self._adapter_manager: LoRAModelManager
 
     @contextmanager
     def dummy_lora_cache(self):
@@ -68,9 +102,13 @@ class WorkerLoRAManager(AbstractWorkerManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
+        vllm_config = None,
+        *args,
+        **kwargs,
     ) -> Any:
-        lora_manager = create_lora_manager(
+        lora_manager = _call_create_lora_manager(
             model,
+            vllm_config,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
             vocab_size=self.vocab_size,
@@ -110,9 +148,6 @@ class WorkerLoRAManager(AbstractWorkerManager):
             else:
                 lora_request.lora_config["vllm_max_position_embeddings"] = self.max_position_embeddings
                 peft_helper = PEFTHelper.from_dict(lora_request.config)
-    
-            # Validates the LoRA configuration against requirements before
-            # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
 
             # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
@@ -122,33 +157,34 @@ class WorkerLoRAManager(AbstractWorkerManager):
                     and model.hf_to_vllm_mapper is not None):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
-            if lora_request.lora_tensors is not None:
-                lora = self._lora_model_cls.from_lora_tensors(
-                    lora_model_id=lora_request.lora_int_id,
-                    tensors=lora_request.lora_tensors,
-                    peft_helper=peft_helper,
-                    device="cpu",
-                    dtype=self.lora_config.lora_dtype,
-                    embeddings=lora_request.lora_embeddings,
-                    target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                    embedding_modules=self.embedding_modules,
-                    embedding_padding_modules=self.embedding_padding_modules,
-                    weights_mapper=hf_to_vllm_mapper
-                )
+            lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
+            kwargs = {
+                "lora_model_id": lora_request.lora_int_id,
+                "peft_helper": peft_helper,
+                "dtype": self.lora_config.lora_dtype,
+                "weights_mapper": hf_to_vllm_mapper,
+            }
+
+            if getattr(lora_request, "lora_tensors", None) is not None:
+                load_method = self._lora_model_cls.from_lora_tensors
+                kwargs["tensors"] = lora_request.lora_tensors
+                kwargs["device"] = None # Keep whatever the original device was
             else:
-                lora = self._lora_model_cls.from_local_checkpoint(
-                    lora_path,
-                    expected_lora_modules,
-                    peft_helper=peft_helper,
-                    lora_model_id=lora_request.lora_int_id,
-                    device="cpu",
-                    dtype=self.lora_config.lora_dtype,
-                    target_embedding_padding=self.vocab_size +
-                    self.lora_config.lora_extra_vocab_size,
-                    embedding_modules=self.embedding_modules,
-                    embedding_padding_modules=self.embedding_padding_modules,
-                    weights_mapper=hf_to_vllm_mapper
-                )
+                load_method = self._lora_model_cls.from_local_checkpoint
+                kwargs["lora_dir"] = lora_path
+                kwargs["expected_lora_modules"] = expected_lora_modules
+                kwargs["device"] = "cpu" # Local checkpoint is CPU
+
+            # Check signature for backward compatibility
+            sig = inspect.signature(load_method)
+            if "model_vocab_size" in sig.parameters:
+                kwargs["model_vocab_size"] = self.vocab_size + lora_extra_vocab_size
+            else:
+                kwargs["target_embedding_padding"] = self.vocab_size + lora_extra_vocab_size
+                kwargs["embedding_modules"] = self.embedding_modules
+                kwargs["embedding_padding_modules"] = self.embedding_padding_modules
+
+            lora = load_method(**kwargs)
 
         except FileNotFoundError as e:
             # FileNotFoundError should be raised if both
@@ -163,10 +199,11 @@ class WorkerLoRAManager(AbstractWorkerManager):
             # For BadRequestError
             raise e
 
-        if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
+        if getattr(lora, 'extra_vocab_size', 0) > lora_extra_vocab_size:
             raise ValueError(f"LoRA added vocab size {lora.extra_vocab_size} "
                              f"is greater than lora_extra_vocab_size "
-                             f"{self.lora_config.lora_extra_vocab_size}.")
+                             f"{lora_extra_vocab_size}.")
+
         return lora
 
     def add_dummy_lora(self, lora_request: LoRARequest, rank: int) -> bool:
@@ -176,30 +213,89 @@ class WorkerLoRAManager(AbstractWorkerManager):
             dummy_lora = self._cached_dummy_lora.clone(
                 lora_request.lora_int_id)
         else:
-            dummy_lora = self._adapter_manager.create_dummy_lora(
-                lora_request.lora_int_id, rank, 1, self.embedding_modules)
+            f = self._adapter_manager.create_dummy_lora
+            if dummy_lora_has_scaling_factor(f):
+                dummy_lora = f(
+                    lora_id = lora_request.lora_int_id,
+                    rank = rank,
+                    scaling_factor = 1,
+                    embedding_modules = self.embedding_modules,
+                )
+            else:
+                dummy_lora = f(
+                    lora_id = lora_request.lora_int_id,
+                    rank = rank,
+                    # scaling_factor = 1,
+                    embedding_modules = self.embedding_modules,
+                )
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
         return self._adapter_manager.add_adapter(dummy_lora)
+
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # vLLM >= 0.23 queries this before LoRA warmup profiling; older vLLM has
+        # no such method on the model manager, so fall back to the given rank.
+        manager = getattr(self, "_adapter_manager", None)
+        inner = getattr(manager, "get_dummy_lora_warmup_rank", None)
+        return inner(default_rank) if inner is not None else default_rank
 
     def pin_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.pin_adapter(adapter_id)
 
     def set_active_adapters(self, requests: Set[Any],
                             mapping: Optional[Any]) -> None:
-        set_active_adapters_worker(requests, mapping, self._apply_adapters,
+        if set_active_adapters_worker:
+            set_active_adapters_worker(requests, mapping, self._apply_adapters,
                                    self._adapter_manager.set_adapter_mapping)
+        else:
+            self._apply_adapters(requests)
+            if mapping is not None:
+                self._adapter_manager.set_adapter_mapping(mapping)
+
+    def supports_tower_connector_lora(self) -> bool:
+        manager = getattr(self, '_adapter_manager', None)
+        if manager is None:
+            return False
+        return (
+            getattr(manager, 'supports_mm', False)
+            and getattr(manager, 'supports_tower_connector_lora', False)
+        )
 
     def _apply_adapters(self, adapter_requests: Set[Any]) -> None:
-        apply_adapters_worker(adapter_requests, self.list_adapters,
-                              self._adapter_manager.adapter_slots,
-                              self.remove_adapter, self.add_adapter)
+        if apply_adapters_worker:
+            apply_adapters_worker(adapter_requests, self.list_adapters,
+                                self._adapter_manager.adapter_slots,
+                                self.remove_adapter, self.add_adapter)
+        else:
+            existing_adapters = self.list_adapters()
+            models_map = {
+                adapter_request.adapter_id: adapter_request
+                for adapter_request in adapter_requests if adapter_request
+            }
+            if len(models_map) > self._adapter_manager.adapter_slots:
+                raise RuntimeError(
+                    f"Number of requested models ({len(models_map)}) is greater "
+                    "than the number of GPU model slots "
+                    f"({self._adapter_manager.adapter_slots}).")
+            requested_ids = set(models_map)
+            for adapter_id in existing_adapters - requested_ids:
+                self.remove_adapter(adapter_id)
+            for adapter_id in requested_ids - existing_adapters:
+                self.add_adapter(models_map[adapter_id])
 
     def add_adapter(self, adapter_request: Any) -> bool:
-        return add_adapter_worker(adapter_request, self.list_adapters,
-                                  self._load_adapter,
-                                  self._adapter_manager.add_adapter,
-                                  self._adapter_manager.activate_adapter)
+        if add_adapter_worker:
+            return add_adapter_worker(adapter_request, self.list_adapters,
+                                      self._load_adapter,
+                                      self._adapter_manager.add_adapter,
+                                      self._adapter_manager.activate_adapter)
+        else:
+            if adapter_request.adapter_id in self.list_adapters():
+                return False
+            loaded_adapter = self._load_adapter(adapter_request)
+            loaded = self._adapter_manager.add_adapter(loaded_adapter)
+            self._adapter_manager.activate_adapter(loaded_adapter.id)
+            return loaded
 
     def remove_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.remove_adapter(adapter_id)
@@ -208,7 +304,75 @@ class WorkerLoRAManager(AbstractWorkerManager):
         self._adapter_manager.remove_all_adapters()
 
     def list_adapters(self) -> Set[int]:
-        return list_adapters_worker(self._adapter_manager.list_adapters)
+        if list_adapters_worker:
+            return list_adapters_worker(self._adapter_manager.list_adapters)
+        else:
+            return set(self._adapter_manager.list_adapters())
+
+
+# from vllm try to import WorkerLoRAManager
+try:
+    from vllm.lora.worker_manager import WorkerLoRAManager as vllm_WorkerLoRAManager
+except:
+    vllm_WorkerLoRAManager = None
+pass
+
+def old_init(
+    self,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    vocab_size: int,
+    lora_config: LoRAConfig,
+    device: torch.device,
+    embedding_modules: Dict[str, str],
+    embedding_padding_modules: List[str],
+    lora_model_cls: Type[LoRAModel] = LoRAModel,
+    max_position_embeddings: Optional[int] = None,
+):
+    self._lora_model_cls = lora_model_cls
+    self.embedding_modules = embedding_modules
+    self.embedding_padding_modules = embedding_padding_modules
+    self._cached_dummy_lora: Union[None, Literal[False], LoRAModel] = False
+    self.max_num_seqs = max_num_seqs
+    self.max_num_batched_tokens = max_num_batched_tokens
+    self.vocab_size = vocab_size
+    self.lora_config = lora_config
+    self.max_position_embeddings = max_position_embeddings
+    AbstractWorkerManager.__init__(self, device)
+    # Lazily initialized by create_lora_manager.
+    self._adapter_manager: LoRAModelManager
+
+def new_init(
+    self,
+    vllm_config: VllmConfig,
+    device: torch.device,
+    embedding_modules: dict[str, str],
+    embedding_padding_modules: Optional[list[str]] = [],
+    lora_model_cls: type[LoRAModel] = LoRAModel,
+):
+
+    old_init(
+        self,
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs,
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens,
+        vocab_size = vllm_config.model_config.get_vocab_size(),
+        lora_config = vllm_config.lora_config,
+        device = device,
+        embedding_modules = embedding_modules,
+        embedding_padding_modules = embedding_padding_modules,
+        lora_model_cls = lora_model_cls,
+        max_position_embeddings = vllm_config.model_config.hf_config.get_text_config().max_position_embeddings,
+    )
+
+
+if vllm_WorkerLoRAManager is not None:
+    # get the signature and check if vllm_config is in the signature
+    vllm_WorkerLoRAManager_signature = inspect.signature(vllm_WorkerLoRAManager.__init__)
+    vllm_WorkerLoRAManager_signature_keys = vllm_WorkerLoRAManager_signature.parameters.keys()
+    if "vllm_config" in vllm_WorkerLoRAManager_signature_keys:
+        WorkerLoRAManager.__init__ = new_init
+    else:
+        WorkerLoRAManager.__init__ = old_init
 
 
 class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
@@ -223,9 +387,13 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
+        vllm_config = None,
+        *args,
+        **kwargs,
     ) -> Any:
-        lora_manager = create_lora_manager(
+        lora_manager = _call_create_lora_manager(
             model,
+            vllm_config,
             lora_manager_cls=self._manager_cls,
             max_num_seqs=self.max_num_seqs,
             vocab_size=self.vocab_size,
