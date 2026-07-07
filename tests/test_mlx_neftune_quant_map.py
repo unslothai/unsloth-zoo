@@ -129,7 +129,9 @@ def test_neftune_preserves_dora_name_detection():
     model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
     emb = _get_text_model(model).model.embed_tokens
     real_base = type(emb)
-    # Mimic what use_dora=True on the embedding produces: a DoRA-named class.
+    # A DoRA-named class exercises the name check. (Real DoRA wraps via
+    # composition instead; that topology is covered by the wrapped-embedding
+    # test below.)
     emb.__class__ = type("DoRAEmbedding", (real_base,), {})
     try:
         tr = MLXTrainer(
@@ -146,3 +148,42 @@ def test_neftune_preserves_dora_name_detection():
         assert type(emb).__name__ == "DoRAEmbedding"
     finally:
         emb.__class__ = real_base
+
+
+@metal_only
+def test_lora_wrapped_embedding_map_key_and_reload():
+    """A real LoRA/DoRA-wrapped quantized embedding (what target_modules
+    including embed_tokens produces) must keep its canonical ``embed_tokens``
+    key in both map scans, and a map saved from the wrapped model must
+    validate against the unwrapped base. Before the fix the wrapper leaked
+    the key as ``embed_tokens.embedding`` and reload failed with
+    missing/unexpected quantized modules."""
+    from mlx_lm.tuner.dora import DoRAEmbedding
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    from unsloth_zoo.mlx import loader as mlx_loader
+    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx.loader import FastMLXModel, _validate_mlx_adapter_base
+    from unsloth_zoo.mlx.utils import _get_text_model
+
+    for wrapper_cls in (LoRAEmbedding, DoRAEmbedding):
+        model, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
+        inner = _get_text_model(model).model
+        base_map = mlx_loader._effective_mlx_quantization_map(model)
+        assert "model.embed_tokens" in base_map, sorted(base_map)
+
+        inner.embed_tokens = wrapper_cls.from_base(inner.embed_tokens, r=8)
+        for _effective in (
+            mlx_utils._effective_mlx_quantization_map,
+            mlx_loader._effective_mlx_quantization_map,
+        ):
+            wrapped_map = _effective(model)
+            assert wrapped_map == base_map, (
+                f"{wrapper_cls.__name__} changed the map: "
+                f"{sorted(set(wrapped_map) ^ set(base_map))}"
+            )
+
+        # Reload validates the saved-while-wrapped map against a fresh base.
+        fresh, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
+        _validate_mlx_adapter_base(
+            fresh, {"base_resolved_quantization_map": wrapped_map}
+        )  # must not raise

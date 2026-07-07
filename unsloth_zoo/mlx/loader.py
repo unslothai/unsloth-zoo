@@ -1620,11 +1620,13 @@ def _quantization_config_to_path_map(config):
 
 
 def _canonical_mlx_quantization_path(path):
-    # mlx-lm LoRALinear stores the wrapped base layer under ".linear".
-    # Adapter metadata must describe the underlying base path so validation can
-    # run before load_adapters re-wraps the module.
-    if path.endswith(".linear"):
-        return path[:-len(".linear")]
+    # mlx-lm LoRA/DoRA wrappers store the wrapped base layer under ".linear"
+    # (LoRALinear) or ".embedding" (LoRAEmbedding/DoRAEmbedding). Adapter
+    # metadata must describe the underlying base path so validation can run
+    # before load_adapters re-wraps the module.
+    for suffix in (".linear", ".embedding"):
+        if path.endswith(suffix):
+            return path[:-len(suffix)]
     return path
 
 
