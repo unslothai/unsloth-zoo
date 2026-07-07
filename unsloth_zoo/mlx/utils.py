@@ -2630,8 +2630,8 @@ def _is_mlx_sft_conversational_row(item):
         return False
     if "prompt" in item or "completion" in item:
         return (
-            _is_mlx_sft_conversational_value(item.get("prompt"))
-            and _is_mlx_sft_conversational_value(item.get("completion"))
+            _looks_like_mlx_chat_value(item.get("prompt"))
+            and _looks_like_mlx_chat_value(item.get("completion"))
         )
     for key in ("prompt", "chosen", "rejected", "completion", "messages"):
         if _is_mlx_sft_conversational_value(item.get(key)):
@@ -2996,7 +2996,7 @@ def _prepare_pretokenized_text_dataset(
             if tokenized is not None:
                 saw_pretokenized = True
                 label_states.append(tokenized[1] is not None)
-                if tokenized[0]:
+                if len(tokenized[0]) >= 2:
                     formatted.append(tokenized)
             else:
                 saw_other = True
