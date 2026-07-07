@@ -76,6 +76,12 @@ def _callback_batch():
     return tokens, mx.array([[0, 4]], dtype=mx.int32), tokens
 
 
+def _short_callback_batch():
+    """Build a shorter labeled MLX batch for eval padding tests."""
+    tokens = mx.array([[4, 5, 0]], dtype=mx.int32)
+    return tokens, mx.array([[0, 2]], dtype=mx.int32), tokens
+
+
 def _callback_trainer(
     tmp_path,
     callbacks,
@@ -84,6 +90,8 @@ def _callback_trainer(
     logging_steps=1,
     save_steps=0,
     with_eval=False,
+    compute_metrics=None,
+    preprocess_logits_for_metrics=None,
 ):
     """Create a minimal MLXTrainer with prebuilt batches for callback tests."""
     import mlx.nn as nn
@@ -118,6 +126,8 @@ def _callback_trainer(
             report_to="none",
         ),
         callbacks=callbacks,
+        compute_metrics=compute_metrics,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
     trainer._batches = [_callback_batch()]
     if eval_steps or with_eval:
@@ -314,6 +324,79 @@ def test_hf_callback_add_remove_pop_support_class_and_instance(tmp_path):
 
     assert trainer.pop_callback(ClassCallback) is None
     trainer.remove_callback(instance)
+
+
+@metal_only
+def test_mlx_compute_metrics_runs_on_eval_payload(tmp_path):
+    import numpy as np
+
+    seen = {}
+
+    def preprocess(logits, labels):
+        seen["logits_shape"] = tuple(logits.shape)
+        seen["labels_shape"] = tuple(labels.shape)
+        return mx.argmax(logits, axis=-1)
+
+    def compute_metrics(prediction):
+        seen["prediction_type"] = type(prediction).__name__
+        seen["predictions_shape"] = prediction.predictions.shape
+        seen["label_ids_shape"] = prediction.label_ids.shape
+        seen["label_ids"] = prediction.label_ids.tolist()
+        mask = prediction.label_ids != -100
+        accuracy = np.asarray(
+            prediction.predictions[mask] == prediction.label_ids[mask]
+        ).mean()
+        seen["accuracy"] = float(accuracy)
+        return {"token_accuracy": accuracy, "loss": 123.0}
+
+    trainer = _callback_trainer(
+        tmp_path,
+        [],
+        max_steps=1,
+        eval_steps=1,
+        compute_metrics=compute_metrics,
+        preprocess_logits_for_metrics=preprocess,
+    )
+    trainer._eval_batches_labeled = [_callback_batch(), _short_callback_batch()]
+    trainer.train()
+
+    assert seen["prediction_type"] == "EvalPrediction"
+    assert seen["logits_shape"] == (1, 3, 8)
+    assert seen["labels_shape"] == (1, 3)
+    assert seen["predictions_shape"] == (2, 4)
+    assert seen["label_ids_shape"] == (2, 4)
+    assert seen["label_ids"] == [[0, 1, 2, 3], [4, 5, -100, -100]]
+    assert trainer._last_eval_metrics["eval_token_accuracy"] == seen["accuracy"]
+    assert trainer._last_eval_metrics["eval_loss"] != 123.0
+
+
+@metal_only
+def test_mlx_compute_metrics_prefixes_split_eval_metrics(tmp_path):
+    calls = []
+
+    def compute_metrics(prediction):
+        calls.append(prediction.label_ids.shape)
+        return {"rows": prediction.label_ids.shape[0], "loss": 123.0}
+
+    trainer = _callback_trainer(
+        tmp_path,
+        [],
+        max_steps=1,
+        eval_steps=1,
+        compute_metrics=compute_metrics,
+    )
+    trainer.eval_dataset = {"alpha": [{}], "beta": [{}]}
+    trainer._eval_batches_labeled = {
+        "alpha": [_callback_batch()],
+        "beta": [_callback_batch()],
+    }
+    trainer.train()
+
+    assert calls == [(1, 4), (1, 4)]
+    assert trainer._last_eval_metrics["eval_alpha_rows"] == 1
+    assert trainer._last_eval_metrics["eval_beta_rows"] == 1
+    assert trainer._last_eval_metrics["eval_alpha_loss"] != 123.0
+    assert trainer._last_eval_metrics["eval_beta_loss"] != 123.0
 
 
 @metal_only

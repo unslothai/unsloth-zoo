@@ -37,9 +37,11 @@ Usage mirrors TRL notebooks:
 """
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from collections.abc import Mapping
 import concurrent.futures
 import json
 import math
+import numpy as np
 import os
 import random
 import time
@@ -279,6 +281,7 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    _normalize_cce_label_dtype,
     _is_vlm_model,
     _get_text_model,
 )
@@ -952,6 +955,8 @@ class MLXTrainer:
         formatting_func=None,
         processor=None,
         callbacks=None,
+        compute_metrics=None,
+        preprocess_logits_for_metrics=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -960,6 +965,8 @@ class MLXTrainer:
         self._mlx_train_dataset_for_batches = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
+        self.compute_metrics = compute_metrics
+        self.preprocess_logits_for_metrics = preprocess_logits_for_metrics
         # Use args or defaults
         self.args = args or MLXTrainingConfig()
 
@@ -1533,10 +1540,156 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
-    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+    @staticmethod
+    def _metric_payload_to_numpy(value):
+        """Convert MLX metric payloads to NumPy arrays for HF-style metrics."""
+        if isinstance(value, mx.array):
+            mx.eval(value)
+            if value.dtype == mx.bfloat16:
+                value = value.astype(mx.float32)
+                mx.eval(value)
+            return np.array(value)
+        if isinstance(value, tuple):
+            return tuple(MLXTrainer._metric_payload_to_numpy(item) for item in value)
+        if isinstance(value, list):
+            return [MLXTrainer._metric_payload_to_numpy(item) for item in value]
+        return value
+
+    @classmethod
+    def _pad_and_concat_metric_chunks(cls, chunks, padding_index=-100):
+        """Pad variable-length per-batch metric payloads and concatenate rows."""
+        if not chunks:
+            return None
+        first = chunks[0]
+        if isinstance(first, Mapping):
+            return {
+                key: cls._pad_and_concat_metric_chunks(
+                    [chunk[key] for chunk in chunks],
+                    padding_index=padding_index,
+                )
+                for key in first
+            }
+        if isinstance(first, tuple):
+            return tuple(
+                cls._pad_and_concat_metric_chunks(
+                    [chunk[index] for chunk in chunks],
+                    padding_index=padding_index,
+                )
+                for index in range(len(first))
+            )
+        if isinstance(first, list):
+            return [
+                cls._pad_and_concat_metric_chunks(
+                    [chunk[index] for chunk in chunks],
+                    padding_index=padding_index,
+                )
+                for index in range(len(first))
+            ]
+
+        arrays = [cls._metric_payload_to_numpy(chunk) for chunk in chunks]
+        if arrays[0] is None:
+            return None
+        if arrays[0].ndim == 0:
+            return np.stack(arrays, axis=0)
+        if arrays[0].ndim < 2:
+            return np.concatenate(arrays, axis=0)
+
+        max_length = max(array.shape[1] for array in arrays)
+        padded = []
+        for array in arrays:
+            if array.shape[1] == max_length:
+                padded.append(array)
+                continue
+            pad_width = [(0, 0)] * array.ndim
+            pad_width[1] = (0, max_length - array.shape[1])
+            padded.append(
+                np.pad(array, pad_width, mode="constant", constant_values=padding_index)
+            )
+        return np.concatenate(padded, axis=0)
+
+    @staticmethod
+    def _prefix_metric_keys(metrics, metric_key_prefix):
+        """Apply HF Trainer's eval metric prefix convention."""
+        prefixed = {}
+        prefix = f"{metric_key_prefix}_"
+        for key, value in metrics.items():
+            target = key if key.startswith(prefix) else f"{prefix}{key}"
+            prefixed[target] = value
+        return prefixed
+
+    def _labels_for_text_metrics(self, batch, lengths, labels):
+        """Build full-sequence label_ids matching HF causal-LM metric inputs."""
+        metric_labels = labels if labels is not None else batch
+        metric_labels = _normalize_cce_label_dtype(metric_labels)
+        positions = mx.arange(batch.shape[1]).reshape(1, -1)
+        valid = mx.logical_and(
+            positions >= lengths[:, 0:1],
+            positions < lengths[:, 1:2],
+        )
+        ignore = metric_labels * 0 - 100
+        return mx.where(valid, metric_labels, ignore)
+
+    @staticmethod
+    def _extract_metric_logits(output):
+        """Return logits from common MLX model output shapes."""
+        if hasattr(output, "logits"):
+            return output.logits
+        if isinstance(output, Mapping):
+            if "logits" in output:
+                return output["logits"]
+            values = tuple(value for key, value in output.items() if key != "loss")
+            return values[0] if len(values) == 1 else values
+        if isinstance(output, (tuple, list)):
+            return output[0]
+        return output
+
+    def _text_metric_prediction_step(self, batch, lengths, labels):
+        """Run a text eval-only forward pass for compute_metrics payloads."""
+        metric_labels = self._labels_for_text_metrics(batch, lengths, labels)
+        logits = self._extract_metric_logits(self.model(batch))
+        preprocess = getattr(self, "preprocess_logits_for_metrics", None)
+        if preprocess is not None:
+            logits = preprocess(logits, metric_labels)
+        return logits, metric_labels
+
+    def _compute_metric_values(self, prediction_chunks, label_chunks, metric_key_prefix):
+        """Call compute_metrics with accumulated NumPy EvalPrediction payloads."""
+        compute_metrics = getattr(self, "compute_metrics", None)
+        if compute_metrics is None or not prediction_chunks:
+            return {}
+        from transformers.trainer_utils import EvalPrediction, denumpify_detensorize
+
+        predictions = self._pad_and_concat_metric_chunks(prediction_chunks)
+        label_ids = self._pad_and_concat_metric_chunks(label_chunks)
+        metrics = compute_metrics(
+            EvalPrediction(predictions=predictions, label_ids=label_ids)
+        )
+        if metrics is None:
+            metrics = {}
+        metrics = denumpify_detensorize(metrics)
+        return self._prefix_metric_keys(metrics, metric_key_prefix)
+
+    def _evaluate_batch_totals(
+        self,
+        eval_batches,
+        loss_fn,
+        is_vlm=False,
+        metric_key_prefix=None,
+    ):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        prediction_chunks = []
+        label_chunks = []
+        collect_metrics = (
+            getattr(self, "compute_metrics", None) is not None
+            and metric_key_prefix is not None
+        )
+        if collect_metrics and is_vlm:
+            raise NotImplementedError(
+                "Unsloth MLX: compute_metrics is currently implemented for text "
+                "MLXTrainer eval only; VLM metrics are not supported yet."
+            )
 
         for batch_data in eval_batches:
             if self.stop_requested:
@@ -1546,11 +1699,22 @@ class MLXTrainer:
             else:
                 batch, lengths, labels = batch_data
                 loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                if collect_metrics:
+                    predictions, label_ids = self._text_metric_prediction_step(
+                        batch, lengths, labels,
+                    )
+                    prediction_chunks.append(predictions)
+                    label_chunks.append(label_ids)
             all_losses += loss * ntoks
             ntokens += ntoks
             mx.eval(all_losses, ntokens)
 
-        return all_losses, ntokens
+        metric_values = self._compute_metric_values(
+            prediction_chunks,
+            label_chunks,
+            metric_key_prefix,
+        )
+        return all_losses, ntokens, metric_values
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
@@ -1564,8 +1728,10 @@ class MLXTrainer:
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
             for split_name, split_batches in eval_batches.items():
-                split_losses, split_tokens = self._evaluate_batch_totals(
+                split_prefix = f"eval_{split_name}"
+                split_losses, split_tokens, split_metric_values = self._evaluate_batch_totals(
                     split_batches, loss_fn, is_vlm=is_vlm,
+                    metric_key_prefix=split_prefix,
                 )
                 all_losses += split_losses
                 ntokens += split_tokens
@@ -1575,19 +1741,22 @@ class MLXTrainer:
                     if split_tokens.item() > 0 else 0.0
                 )
                 split_ppl = math.exp(min(split_loss, 100))
-                split_prefix = f"eval_{split_name}"
+                metrics.update(split_metric_values)
                 metrics[f"{split_prefix}_loss"] = split_loss
                 metrics[f"{split_prefix}_perplexity"] = split_ppl
                 if self.stop_requested:
                     break
         else:
-            all_losses, ntokens = self._evaluate_batch_totals(
-                eval_batches, loss_fn, is_vlm=is_vlm,
+            all_losses, ntokens, metric_values = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm, metric_key_prefix="eval",
             )
+            metrics.update(metric_values)
 
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
         perplexity = math.exp(min(avg_loss, 100))
+        # Match HF Trainer ordering: trainer-owned loss metrics win over
+        # user-returned metric names such as "loss".
         metrics["eval_loss"] = avg_loss
         metrics["eval_perplexity"] = perplexity
         self._last_eval_metrics = metrics
