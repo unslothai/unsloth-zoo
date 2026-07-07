@@ -124,7 +124,7 @@ def test_compiler_forwarding_parameters_follow_emitted_definition():
     from pathlib import Path
 
     compiler_path = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "compiler.py"
-    tree = ast.parse(compiler_path.read_text())
+    tree = ast.parse(compiler_path.read_text(encoding="utf-8"))
     wanted = {
         "_build_forwarding_parameters",
         "_build_forwarding_parameters_from_definition",
