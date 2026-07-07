@@ -144,9 +144,7 @@ class _MLXCallbackHandler:
 
     def remove_callback(self, callback):
         """Remove a callback class or instance."""
-        removed = self.pop_callback(callback)
-        if removed is None and not isinstance(callback, type):
-            self.callbacks.remove(callback)
+        self.pop_callback(callback)
 
     def call_event(self, event, args, state, control, **kwargs):
         """Dispatch one callback event and return the latest control object."""

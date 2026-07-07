@@ -219,6 +219,35 @@ def test_hf_callback_control_can_stop_mlx_training(tmp_path):
 
 
 @metal_only
+def test_hf_callback_add_remove_pop_support_class_and_instance(tmp_path):
+    from transformers import TrainerCallback
+
+    class ClassCallback(TrainerCallback):
+        pass
+
+    class InstanceCallback(TrainerCallback):
+        pass
+
+    trainer = _callback_trainer(tmp_path, [])
+    instance = InstanceCallback()
+
+    trainer.add_callback(ClassCallback)
+    trainer.add_callback(instance)
+    assert any(isinstance(cb, ClassCallback) for cb in trainer.callback_handler.callbacks)
+    assert instance in trainer.callback_handler.callbacks
+
+    removed_class = trainer.pop_callback(ClassCallback)
+    assert isinstance(removed_class, ClassCallback)
+    assert not any(isinstance(cb, ClassCallback) for cb in trainer.callback_handler.callbacks)
+
+    trainer.remove_callback(instance)
+    assert instance not in trainer.callback_handler.callbacks
+
+    assert trainer.pop_callback(ClassCallback) is None
+    trainer.remove_callback(instance)
+
+
+@metal_only
 def test_hf_callback_control_can_force_log_and_eval(tmp_path):
     from transformers import TrainerCallback
 
