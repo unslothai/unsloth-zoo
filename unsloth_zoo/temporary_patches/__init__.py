@@ -34,6 +34,7 @@ from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .gemma4_moe import *
 from .lfm2_moe import *
+from .mixtral_moe import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
