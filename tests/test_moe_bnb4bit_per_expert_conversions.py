@@ -18,10 +18,24 @@ import types
 import pytest
 import torch
 
-pytest.importorskip(
+_core_model_loading = pytest.importorskip(
     "transformers.core_model_loading",
     reason="requires transformers v5 core_model_loading",
 )
+
+# On transformers < v5 the real `core_model_loading` module does not exist, but
+# unsloth injects an inert compat stub of the same name into `sys.modules` so
+# peft LoRA reloads keep working. That stub's `WeightConverter` accepts any
+# arguments and stores nothing, so `importorskip` above finds the module and
+# does not skip. Skip unless the real v5 API is present (its `WeightConverter`
+# exposes `target_patterns`, a `__slots__` descriptor inherited from
+# `WeightTransform`), so these tests only run against genuine transformers v5.
+if not hasattr(_core_model_loading.WeightConverter, "target_patterns"):
+    pytest.skip(
+        "transformers.core_model_loading is a transformers<5 compat stub, "
+        "not the v5 API",
+        allow_module_level=True,
+    )
 
 from transformers.core_model_loading import ConversionOps, WeightConverter
 
