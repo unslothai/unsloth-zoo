@@ -892,6 +892,7 @@ class MLXTrainer:
         # each train() so a reused trainer starts clean); callbacks and
         # pre-created batches persist across runs and stay here.
         self._reset_run_state()
+        self.stop_requested = False  # Set True to stop training early
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
@@ -899,18 +900,29 @@ class MLXTrainer:
     def _reset_run_state(self):
         """Per-run training/metric state. Reset from __init__ and at the start
         of each train() so reusing a trainer for a second run starts clean;
-        stop_requested left False so a run-1 early stop doesn't block run 2.
-        Callbacks and pre-created batches persist across runs and aren't reset."""
+        _early_stopped cleared so a run-1 early stop doesn't block run 2.
+        stop_requested is deliberately not reset: it is externally owned (a
+        controller thread may set it at any moment, including during train()
+        setup and batch prep), so clearing it here would silently drop an
+        in-flight cancel. Callbacks and pre-created batches persist across
+        runs and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
         self._tokens_per_second_history = []
         self._peak_memory_history = []
         self._step_times = []
-        self.stop_requested = False
+        self._early_stopped = False
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
+
+    def _resolved_best_metric_name(self):
+        """metric_for_best_model as it is looked up in eval metrics, mirroring
+        HF Trainer: a present-but-None value falls back to eval_loss, and a
+        bare name ("loss") gets the eval_ prefix eval metric keys carry."""
+        name = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
+        return name if name.startswith("eval_") else f"eval_{name}"
 
     def _train_dataset_for_batches(self):
         """Return the internal dataset used for MLX batch construction."""
@@ -1840,6 +1852,22 @@ class MLXTrainer:
                 self._best_metric = ts.get("best_metric", None)
                 self._best_step = ts.get("best_step", None)
                 self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
+                # best/ lives in output_dir, not in the checkpoint dir, so a
+                # checkpoint resumed elsewhere (copied dir, new output_dir) can
+                # carry best-model state whose weights aren't present. Keep the
+                # state only when they are: an unloadable "best" would suppress
+                # best-saves and early-stop against a model that
+                # load_best_model_at_end can't restore.
+                _best_path = f"{args.output_dir}/best/adapters.safetensors"
+                if self._best_step is not None and not os.path.exists(_best_path):
+                    print(
+                        f"Unsloth: checkpoint carries best-model state (step "
+                        f"{self._best_step}) but {args.output_dir}/best has no "
+                        f"saved weights; restarting best-model tracking."
+                    )
+                    self._best_metric = None
+                    self._best_step = None
+                    self._es_patience_counter = 0
                 print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
@@ -2283,8 +2311,9 @@ class MLXTrainer:
                     ) from None
 
         for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
-            if self.stop_requested:
-                print("Unsloth: Stop requested — ending training early.")
+            if self.stop_requested or self._early_stopped:
+                if self.stop_requested:
+                    print("Unsloth: Stop requested — ending training early.")
                 break
 
             tic = time.perf_counter()
@@ -2449,17 +2478,16 @@ class MLXTrainer:
                     except Exception as e:
                         print(f"Unsloth: eval callback error: {e}")
 
-                # Best-model tracking + early stopping (Item-5).
-                _track = getattr(args, "load_best_model_at_end", False) or \
-                    int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                # Best-model tracking + early stopping (Item-5). Skipped after
+                # a stop request: an aborted eval leaves partial metrics (a
+                # truncated eval_loss can beat any real best) and may lack the
+                # tracked key entirely.
+                _track = not self.stop_requested and (
+                    getattr(args, "load_best_model_at_end", False)
+                    or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                )
                 if _track:
-                    # `or "eval_loss"`: a present-but-None config value (HF treats
-                    # None as "fall back to loss") must not reach `.startswith`.
-                    _metric_name = getattr(args, "metric_for_best_model", None) or "eval_loss"
-                    # Mirror HF Trainer: a bare "loss"/"accuracy" is looked up as
-                    # "eval_loss"/"eval_accuracy", since eval metrics are eval_-prefixed.
-                    if not _metric_name.startswith("eval_"):
-                        _metric_name = f"eval_{_metric_name}"
+                    _metric_name = self._resolved_best_metric_name()
                     _em = self._last_eval_metrics or {}
                     if _metric_name not in _em:
                         raise ValueError(
@@ -2491,7 +2519,7 @@ class MLXTrainer:
                                 f"Unsloth: early stopping at step {current_step} "
                                 f"(no {_metric_name} improvement in {_pat} evals)."
                             )
-                            self.stop_requested = True
+                            self._early_stopped = True
 
             # Checkpointing
             if args.save_steps > 0 and current_step % args.save_steps == 0:
@@ -2548,7 +2576,7 @@ class MLXTrainer:
                 try:
                     model.load_weights(_best_path, strict=False)
                     print(f"Unsloth: Restored best model from step {self._best_step} "
-                          f"({args.metric_for_best_model}={self._best_metric:.4f}).")
+                          f"({self._resolved_best_metric_name()}={self._best_metric:.4f}).")
                 except Exception as e:
                     print(f"Unsloth: failed to restore best model ({e}).")
 
