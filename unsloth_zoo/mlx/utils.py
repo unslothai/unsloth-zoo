@@ -3954,6 +3954,8 @@ def save_trainer_state(trainer_state, path):
     ``trainer_state`` is a plain dict (JSON-serializable). Currently:
       - ``global_step``: int, the step the checkpoint represents
       - ``train_loss_history``: list[float], for UI continuity
+      - ``best_metric``/``best_step``: best-model tracking (may be null)
+      - ``es_patience_counter``: int, early-stopping no-improve count
     Kept separate from the safetensors blob because these are scalars/lists,
     not tensors, and JSON is easier to inspect.
     """
@@ -4019,7 +4021,10 @@ def _effective_mlx_quantization_map(model):
     for name, module in model.named_modules():
         if not name:
             continue
-        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+        # isinstance, not an exact class-name match: a training-time subclass of
+        # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
+        # recognised, else embed_tokens is silently dropped from the map.
+        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
             continue
         name = _canonical_mlx_quantization_path(name)
         entry = {}
@@ -4068,8 +4073,9 @@ def _quantization_config_to_path_map(config):
 
 
 def _canonical_mlx_quantization_path(path):
-    if path.endswith(".linear"):
-        return path[:-len(".linear")]
+    for suffix in (".linear", ".embedding"):
+        if path.endswith(suffix):
+            return path[:-len(suffix)]
     return path
 
 
