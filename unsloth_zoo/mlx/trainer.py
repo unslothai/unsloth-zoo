@@ -1504,8 +1504,7 @@ class MLXTrainer:
                 self._restore_memory_limits()
             except Exception:
                 pass
-            # Restore the process-global norm class patch state that existed
-            # before this trainer run, even if setup failed mid-patch.
+            # Restore the pre-run norm class patch state, even if setup raised.
             try:
                 restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
             except Exception:
