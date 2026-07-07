@@ -89,13 +89,26 @@ def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name
             batch_size = 1
             sequence_length = total_tokens
 
+        input_dtype = hidden_states.dtype
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+
+        # The router (gate) weight can be stored at a different dtype than the
+        # hidden states, e.g. an FP8 checkpoint whose router is kept in higher
+        # precision. Match the router input to the gate weight dtype so the gate
+        # matmul, the routing weights, and the expert inputs stay consistent,
+        # then restore the original dtype on the way out. When the dtypes already
+        # match (the common bf16 / 4bit case) router_input is hidden_states_reshaped
+        # and behaviour is unchanged.
+        router_input = hidden_states_reshaped
+        gate_weight = getattr(self.gate, "weight", None)
+        if gate_weight is not None and router_input.dtype != gate_weight.dtype:
+            router_input = router_input.to(gate_weight.dtype)
 
         shared_expert_output = None
         if use_shared_expert:
             shared_expert_output = self.shared_expert(hidden_states_reshaped)
 
-        gate_output = self.gate(hidden_states_reshaped)
+        gate_output = self.gate(router_input)
         if isinstance(gate_output, tuple):
             _, routing_weights, selected_experts = gate_output
         else:
@@ -107,14 +120,15 @@ def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name
             routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
             if norm_topk_prob:
                 routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-            routing_weights = routing_weights.to(hidden_states.dtype)
+        routing_weights = routing_weights.to(router_input.dtype)
 
-        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        final_hidden_states = self.experts(router_input, selected_experts, routing_weights)
 
         if use_shared_expert:
             shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
             final_hidden_states = final_hidden_states + shared_expert_output
 
+        final_hidden_states = final_hidden_states.to(input_dtype)
         if hidden_states.dim() == 3:
             return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states
