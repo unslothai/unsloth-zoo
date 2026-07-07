@@ -4001,7 +4001,8 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
 
 
 def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
-                              formatting_func=None, append_eos=True):
+                              formatting_func=None, append_eos=True,
+                              max_seq_length=None):
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
     for item in dataset:
         if formatting_func is not None:
@@ -4016,7 +4017,9 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
             ids = encode_mlx_text(tokenizer, text)
             if eos_id is not None and (not ids or ids[-1] != eos_id):
                 ids = list(ids) + [int(eos_id)]
-            if ids:
+            if max_seq_length is not None:
+                ids = list(ids)[:max_seq_length]
+            if len(ids) >= 2:
                 yield (ids, 0)
 
 
@@ -4052,9 +4055,12 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
             append_eos=append_eos,
+            max_seq_length=max_seq_length,
         ))
         if not tokenized:
-            raise ValueError("Unsloth MLX: streaming dataset produced no text rows.")
+            raise ValueError(
+                "Unsloth MLX: streaming dataset produced no trainable text rows."
+            )
         epoch = 0
         while True:
             indices = list(range(len(tokenized)))
@@ -4108,6 +4114,7 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
             append_eos=append_eos,
+            max_seq_length=max_seq_length,
         ):
             pending.append(row)
             if len(pending) >= global_batch_size:
@@ -4123,7 +4130,7 @@ def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
                 yield batch
         if not yielded:
             raise ValueError(
-                "Unsloth MLX: streaming dataset produced no text rows. "
+                "Unsloth MLX: streaming dataset produced no trainable text rows. "
                 "If resuming, use a replayable iterable rather than a one-shot iterator."
             )
 

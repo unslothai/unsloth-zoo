@@ -145,6 +145,18 @@ def test_ordered_text_batches_raise_clear_error_when_all_rows_drop():
         )
 
 
+def test_ordered_streaming_batches_drop_one_token_rows():
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    stream = ({"text": text} for text in ["1", "2 3"])
+    batch, lengths, _labels = next(iterate_training_batches(
+        stream, _TinyTokenizer(), 1, 4,
+        dataset_order="sequential", append_eos=False,
+    ))
+
+    assert (batch.tolist()[0][:2], lengths.tolist()[0]) == ([2, 3], [0, 2])
+
+
 def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_ordered_batches

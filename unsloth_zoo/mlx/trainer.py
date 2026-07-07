@@ -1192,6 +1192,18 @@ class MLXTrainer:
             self.stop_requested = True
         return should_stop
 
+    def _distributed_eval_status(self, failed=False):
+        """Synchronize eval stop/failure state with one rank-wide collective."""
+        status_base = self.distributed_world_size + 1
+        status = self._distributed_status_mask(
+            int(bool(self.stop_requested)) + status_base * int(bool(failed))
+        )
+        should_stop = (status % status_base) > 0
+        failed_any = (status // status_base) > 0
+        if should_stop:
+            self.stop_requested = True
+        return should_stop, failed_any
+
     def _validate_distributed_resume_checkpoint(self, resume_path):
         """Ensure DDP ranks agree on a complete resume checkpoint."""
         world = self._ensure_distributed()
@@ -1599,26 +1611,41 @@ class MLXTrainer:
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
-        failed = False
-        error = None
+        iterator = iter(eval_batches)
 
-        try:
-            for batch_data in eval_batches:
-                if self._distributed_should_stop():
-                    break
-                if is_vlm:
-                    loss, ntoks = loss_fn(self.model, batch_data)
-                else:
-                    batch, lengths, labels = batch_data
-                    loss, ntoks = loss_fn(self.model, batch, lengths, labels)
-                all_losses += loss * ntoks
-                ntokens += ntoks
-                mx.eval(all_losses, ntokens)
-        except Exception as exc:
-            failed = True
-            error = exc
+        while True:
+            failed = False
+            error = None
+            try:
+                batch_data = next(iterator)
+            except StopIteration:
+                break
+            except Exception as exc:
+                failed = True
+                error = exc
 
-        self._raise_distributed_failure(failed, "evaluation", error)
+            if not failed and not self.stop_requested:
+                try:
+                    if is_vlm:
+                        loss, ntoks = loss_fn(self.model, batch_data)
+                    else:
+                        batch, lengths, labels = batch_data
+                        loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                    all_losses += loss * ntoks
+                    ntokens += ntoks
+                    mx.eval(all_losses, ntokens)
+                except Exception as exc:
+                    failed = True
+                    error = exc
+
+            should_stop, failed_any = self._distributed_eval_status(failed)
+            self._raise_distributed_failure_from_any(
+                failed_any,
+                "evaluation",
+                error,
+            )
+            if should_stop:
+                break
 
         return all_losses, ntokens
 

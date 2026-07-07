@@ -618,6 +618,17 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     assert trainer.model.modes == ["eval", "train"]
 
 
+def test_evaluate_batch_totals_uses_single_eval_status_collective():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._evaluate_batch_totals)
+    assert "_distributed_eval_status" in source
+    assert "_distributed_should_stop" not in source
+    assert "_raise_distributed_failure(" not in source
+
+
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
