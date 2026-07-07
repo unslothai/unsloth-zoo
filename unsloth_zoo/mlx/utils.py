@@ -3023,11 +3023,9 @@ def _ensure_reiterable_text_dataset(dataset):
 
 
 def _labeled_row_has_supervision(labels, max_seq_length):
-    # A labeled row supervises loss only on labels[1:length] (causal shift);
-    # length is capped at max_seq_length by the batch builder. Rows that are
-    # entirely -100 there contribute zero supervised tokens; once length
-    # sorting clusters them they can form a fully masked batch that aborts
-    # training. Plain-LM rows (labels is None) are always kept.
+    # Keep rows with any supervised token in labels[1:max_seq_length] (causal
+    # shift, length-capped); all-masked rows can cluster into a fully masked
+    # batch that aborts training. Plain-LM rows (labels is None) are always kept.
     if labels is None:
         return True
     return any(int(x) != -100 for x in labels[1:max_seq_length])
