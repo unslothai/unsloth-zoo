@@ -161,6 +161,35 @@ def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("accepts_backend", [True, False])
+def test_mlx_trainer_distributed_state_selects_jaccl_backend(monkeypatch, accepts_backend):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    calls = []
+    def fake_init(**kwargs):
+        calls.append(kwargs)
+        if kwargs and not accepts_backend:
+            raise TypeError("init() got an unexpected keyword argument 'backend'")
+        return FakeWorld()
+
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", "127.0.0.1:12345")
+    monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/mlx-devices.json")
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    if accepts_backend:
+        assert calls == [{"backend": "jaccl"}]
+    else:
+        assert calls == [{"backend": "jaccl"}, {}]
+
+
 def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
     import numpy as np
     from unsloth_zoo.mlx.utils import _create_distributed_text_batches

@@ -56,6 +56,13 @@ SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 
+def _mlx_distributed_backend_from_env():
+    """Return an explicit distributed backend implied by MLX launch env."""
+    if os.environ.get("MLX_JACCL_COORDINATOR") and os.environ.get("MLX_IBV_DEVICES"):
+        return "jaccl"
+    return None
+
+
 class MLXTrainOutput(dict):
     """Dict-compatible train() result with HF Trainer-style attributes."""
 
@@ -935,7 +942,14 @@ class MLXTrainer:
         distributed = getattr(mx, "distributed", None)
         init = getattr(distributed, "init", None) if distributed is not None else None
         if callable(init):
-            world = init()
+            backend = _mlx_distributed_backend_from_env()
+            if backend is None:
+                world = init()
+            else:
+                try:
+                    world = init(backend=backend)
+                except TypeError:
+                    world = init()
             if world is not None:
                 rank = int(world.rank())
                 world_size = int(world.size())
