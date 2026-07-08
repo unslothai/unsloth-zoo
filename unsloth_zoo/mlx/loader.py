@@ -279,6 +279,43 @@ def _message_matches_known_fallback(message, rule):
     return all(token in message for token in rule.get("message_tokens", ()))
 
 
+def _raise_if_qk_norm_version_gap(model_type, message, error):
+    """A strict mlx load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too
+    old (or regressed, e.g. 0.31.3 - mlx-lm #1242) for a QK-norm arch; dropping
+    those weights breaks the model, so raise a clear error instead."""
+    if "parameters not in model" not in message:
+        return
+    if not any(marker in message for marker in ("k_norm", "q_norm")):
+        return
+    # gemma4/gemma3n KV-sharing tails ship DEAD k_proj/v_proj/k_norm (never
+    # q_norm); dropping them via strict=False is safe (mlx-lm #1242). A real gap
+    # rejects q_norm/k_norm WITHOUT the paired projections - raise only then.
+    kv_sharing_dead_tail = (
+        "self_attn.k_proj" in message
+        and "self_attn.v_proj" in message
+        and "q_norm" not in message
+    )
+    if kv_sharing_dead_tail:
+        return
+    versions = []
+    for pkg in ("mlx-lm", "mlx-vlm"):
+        try:
+            from importlib.metadata import version as _dist_version
+
+            versions.append(f"{pkg}={_dist_version(pkg)}")
+        except Exception:
+            # Best-effort hint; omit a missing dist.
+            pass
+    installed = f" Installed: {', '.join(versions)}." if versions else ""
+    raise ValueError(
+        f"Unsloth: cannot load MLX {model_type or 'model'} - the installed "
+        f"mlx-lm / mlx-vlm rejects its QK-norm (q_norm/k_norm) weights, so it is "
+        f"too old or regressed for this architecture (mlx-lm 0.31.3 broke "
+        f"gemma4 / qwen3_5). Reinstall an arch-complete build, e.g. "
+        f'`pip install -U "mlx-lm>=0.22.0,!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
+    ) from error
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Let DeepSeek-OCR remote config imports survive newer Transformers.
 
@@ -388,6 +425,9 @@ def _load_mlx_lm_with_strict_fallback(
         )
     except ValueError as error:
         message = str(error)
+        # Active-layer QK-norm weights are load-bearing: never strict=False past
+        # them (the dead KV-sharing tail still falls through to the fallback).
+        _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
             raise
@@ -428,6 +468,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
             return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
+        # QK-norm weights are load-bearing: check before the extra-weight filter.
+        _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
             raise
@@ -455,6 +497,11 @@ def _load_mlx_vlm_with_extra_weight_filter(
             try:
                 with _temporary_hf_token_env(hf_token):
                     return vlm_load(model_name, **vlm_kwargs)
+            except ValueError as retry_error:
+                # Filtering the extras can unmask a q_norm/k_norm version gap on
+                # the retry; surface the actionable error instead of the raw one.
+                _raise_if_qk_norm_version_gap(model_type, str(retry_error), retry_error)
+                raise
             finally:
                 nn.Module.load_weights = original_load_weights
 
@@ -4837,12 +4884,18 @@ class FastMLXModel:
                 _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
-                    model, processor = vlm_load(
-                        vlm_load_target,
-                        lazy=True,
-                        revision=revision,
-                        **extra_kwargs,
-                    )
+                    try:
+                        model, processor = vlm_load(
+                            vlm_load_target,
+                            lazy=True,
+                            revision=revision,
+                            **extra_kwargs,
+                        )
+                    except ValueError as error:
+                        # Pre-quantize load bypasses the extra-weight filter, so
+                        # surface the QK-norm version gap here too.
+                        _raise_if_qk_norm_version_gap(model_type, str(error), error)
+                        raise
                     vlm_cfg = _vlm_load_config(vlm_load_target)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
