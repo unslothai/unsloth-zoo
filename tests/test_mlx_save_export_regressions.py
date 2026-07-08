@@ -459,7 +459,9 @@ def test_adapter_bnb_base_remap_defaults_to_mlx_4bit_quantization(
     class StopAdapterLoad(RuntimeError):
         pass
 
-    def fake_download(model_name, revision=None):
+    # Accept allow_patterns: from_pretrained's config download now forwards it,
+    # so the shim must match the real _download signature.
+    def fake_download(model_name, revision=None, allow_patterns=None):
         assert model_name == str(adapter_dir)
         return adapter_dir
 
