@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.6.5"
+__version__ = "2026.7.1"
 
 import os
 import warnings
@@ -134,12 +134,17 @@ if _is_mlx_only:
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
-    _SKIP_GPU_INIT = False
+    # Opt-in: a download-only helper child (e.g. hf_xet_fallback) sets
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT=1 to skip the heavy torch/transformers/device
+    # init it never uses. Off by default, so normal CUDA/CPU runs are unchanged.
+    # The HF cache redirect above still runs, so the child shares the parent's cache.
+    _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
 
-# Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
-# CUDA-only imports don't error at startup. _SKIP_GPU_INIT is True only on
-# Darwin/arm64 with mlx installed (the exact case stubs are needed).
+# Inject triton & bitsandbytes stubs whenever GPU init is skipped (MLX host or the
+# opt-in download child), so unsloth's CUDA-only imports resolve to a loud no-op stub
+# instead of a hard ImportError. Inert in the download child, which never touches them.
+# On a normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
 if _SKIP_GPU_INIT:
     from .stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()

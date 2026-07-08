@@ -82,8 +82,8 @@ TEMPORARY_PATCHES.append(patch_tokenizer_convert_added_tokens)
 
 
 def patch_tokenizer_extra_special_tokens():
-    # Some Mistral tokenizer configs store extra_special_tokens as a list, but
-    # transformers expects a dict.
+    # why: old transformers crash on a list extra_special_tokens; v5 accepts it,
+    # so only coerce on failure (coercing v5 would drop those tokens).
     try:
         from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     except Exception as e:
@@ -93,14 +93,19 @@ def patch_tokenizer_extra_special_tokens():
     if hasattr(original_init, "_unsloth_extra_special_tokens_patched"):
         return
 
-    def patched_init(self, **kwargs):
-        extra_special_tokens = kwargs.get("extra_special_tokens", {})
-        if isinstance(extra_special_tokens, list):
-            # Coerce list to empty dict; the tokens remain in added_tokens_decoder.
+    def patched_init(*args, **kwargs):
+        if not isinstance(kwargs.get("extra_special_tokens"), list):
+            return original_init(*args, **kwargs)
+        try:
+            return original_init(*args, **kwargs)
+        except AttributeError as e:
+            if "keys" not in str(e):
+                raise
             kwargs["extra_special_tokens"] = {}
-        return original_init(self, **kwargs)
+            return original_init(*args, **kwargs)
 
     patched_init._unsloth_extra_special_tokens_patched = True
+    patched_init._unsloth_original_init = original_init
     PreTrainedTokenizerBase.__init__ = patched_init
 pass
 TEMPORARY_PATCHES.append(patch_tokenizer_extra_special_tokens)
@@ -1644,3 +1649,23 @@ def patch_qwen2vl_image_processor_pixel_attrs():
         pass
 pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
+
+
+def patch_deepseek_v2_moe_alias():
+    # transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code
+    # models (e.g. DeepSeek-OCR) still import the old name. Alias it back when
+    # absent. Skip on 4.x (rename does not exist) to avoid eagerly importing the
+    # deepseek_v2 module on every startup.
+    try:
+        import importlib, transformers
+        from unsloth_zoo.utils import Version
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+        m = importlib.import_module(
+            "transformers.models.deepseek_v2.modeling_deepseek_v2")
+    except Exception:
+        return
+    if not hasattr(m, "DeepseekV2MoE") and hasattr(m, "DeepseekV2Moe"):
+        m.DeepseekV2MoE = m.DeepseekV2Moe
+pass
+TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)

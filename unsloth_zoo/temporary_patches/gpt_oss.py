@@ -28,6 +28,7 @@ from .common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
     UNSLOTH_COMPILE_DISABLE,
+    logger,
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -848,13 +849,184 @@ class GptOssExpertsBnb4bit(nn.Module):
             "down_proj_bias", torch.empty(0, dtype=self.dtype), persistent=False
         )
 
+    def _grouped_bnb4bit_ready(self):
+        """True when every expert is a plain (LoRA-free) bnb Linear4bit with a
+        populated quant_state, so the grouped torch._grouped_mm path is exact.
+
+        Self-contained (local imports, no module globals): the compiler can copy
+        this class's source into the standalone compiled cache, whose module
+        namespace lacks this file's globals."""
+        import os
+        if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
+            return False
+        # The grouped path materializes torch._grouped_mm stacks meant to run under the
+        # compiled cache; when the user disables compilation they have opted into the plain
+        # eager per-expert loop, so honor that and fall back.
+        if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+            return False
+        def _fail(reason):
+            if (
+                os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+                and not getattr(self, "_unsloth_grouped_logged", False)
+            ):
+                self._unsloth_grouped_logged = True
+                import logging
+                logging.getLogger("unsloth_zoo.temporary_patches").info(
+                    f"Unsloth: gpt-oss grouped path disabled: {reason}"
+                )
+            return False
+        try:
+            import bitsandbytes as bnb
+            from bitsandbytes.nn import Params4bit
+            from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
+            if not _check_torch_grouped_mm_supported():
+                return _fail("torch._grouped_mm unsupported")
+            blocksize = None
+            for lin in list(self.gate_up_projs) + list(self.down_projs):
+                if hasattr(lin, "lora_A") or hasattr(lin, "base_layer"):
+                    return _fail(f"LoRA-wrapped expert {type(lin).__name__}")
+                w = getattr(lin, "weight", None)
+                if not (isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None):
+                    return _fail(f"expert weight {type(w).__name__} without quant_state")
+                if w.requires_grad:
+                    return _fail("expert weight requires_grad")
+                qs = w.quant_state
+                # The grouped dequant concatenates packed bytes + absmax across
+                # experts, which is exact only when every expert tiles into whole
+                # blocks of one shared blocksize; a trailing partial block would
+                # shift scaling onto the next expert.
+                numel = 1
+                for s in qs.shape:
+                    numel *= int(s)
+                if not qs.blocksize or numel % int(qs.blocksize) != 0:
+                    return _fail(f"expert numel {numel} not a multiple of blocksize {qs.blocksize}")
+                if blocksize is None:
+                    blocksize = int(qs.blocksize)
+                elif int(qs.blocksize) != blocksize:
+                    return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
+                b = getattr(lin, "bias", None)
+                # Grouped path stacks per-expert biases, so a missing bias would
+                # break torch.stack; require all present and fall back otherwise.
+                if b is None:
+                    return _fail("expert bias is None")
+                if b.requires_grad:
+                    return _fail("expert bias requires_grad")
+        except Exception as e:
+            return _fail(f"{type(e).__name__}: {e}")
+        return True
+
+    def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
+                                 batch_size, num_tokens, num_experts, top_k):
+        """Grouped equivalent of the per-expert loop: one gather, two grouped_mm
+        calls over dequantized stacks (pinned or rebuilt in backward per the adaptive
+        _moe_recompute_default policy), grouped bias adds, fp32 index_add combine.
+
+        Self-contained (local imports, no module globals) for the standalone
+        compiled cache; see _grouped_bnb4bit_ready."""
+        import bitsandbytes as bnb
+        from unsloth_zoo.temporary_patches.moe_utils import _base_grouped_mm, _moe_recompute_default
+        from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
+
+        device = hidden_states.device
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()
+            token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            sorted_experts = flat_experts[sorted_idx]
+            counts = torch.bincount(flat_experts, minlength=num_experts)
+            offsets = counts.cumsum(0, dtype=torch.int32)
+            expert_ids = torch.repeat_interleave(
+                torch.arange(num_experts, device=device), counts
+            )
+
+        recompute = _moe_recompute_default()
+
+        cached = getattr(self, "_unsloth_grouped_qs", None)
+        if cached is None:
+            # One QuantState spanning all experts (packed NF4 is elementwise row-major,
+            # so per-expert byte + fp32 absmax concat is exact): one dequant launch per stack.
+            from bitsandbytes.functional import QuantState
+
+            def _absmax_fp32(qs):
+                # Materialize a QuantState's absmax as flat fp32 (denesting double-quant).
+                if getattr(qs, "nested", False):
+                    absmax = bnb.functional.dequantize_blockwise(qs.absmax, qs.state2)
+                    return (absmax + qs.offset).float()
+                return qs.absmax.float()
+
+            def build_qs(projs):
+                states = [l.weight.quant_state for l in projs]
+                absmax = torch.cat([_absmax_fp32(qs) for qs in states])
+                q0 = states[0]
+                return QuantState(
+                    absmax=absmax,
+                    shape=torch.Size((len(projs),) + tuple(q0.shape)),
+                    code=q0.code,
+                    blocksize=q0.blocksize,
+                    quant_type=q0.quant_type,
+                    dtype=q0.dtype,
+                )
+
+            cached = (
+                build_qs(self.gate_up_projs),
+                build_qs(self.down_projs),
+                torch.stack([l.bias for l in self.gate_up_projs]),  # (E, 2I)
+                torch.stack([l.bias for l in self.down_projs]),     # (E, H)
+            )
+            self._unsloth_grouped_qs = cached
+        gate_up_qs, down_qs, gate_up_bias, down_bias = cached
+
+        def _stack(projs, quant_state):
+            # One fused dequant gives (E, out, in); grouped_mm takes the transposed
+            # view. Cast to the input dtype (a no-op for the usual bf16-on-bf16
+            # case): torch._grouped_mm rejects mismatched dtypes, e.g. fp32 hidden
+            # states under the forced-float32 path against a bf16 quant state.
+            data = torch.cat([l.weight.data.reshape(-1, 1) for l in projs])
+            deq = bnb.functional.dequantize_4bit(data, quant_state)
+            return deq.to(hidden_states.dtype).transpose(1, 2)
+
+        xg = hidden_states[sorted_tokens]
+        gate_up = _base_grouped_mm(
+            xg, offsets, lambda: _stack(self.gate_up_projs, gate_up_qs), recompute)
+        gate_up = gate_up + gate_up_bias[expert_ids]
+        gated = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+        out = _base_grouped_mm(
+            gated, offsets, lambda: _stack(self.down_projs, down_qs), recompute)
+        out = out + down_bias[expert_ids]
+
+        weighted = out.to(torch.float32) * routing_weights[sorted_tokens, sorted_experts, None].to(torch.float32)
+        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=device)
+        next_states.index_add_(0, sorted_tokens, weighted)
+        # Grouped path only runs in training; mirror torch_native_forward's
+        # training branch, which returns fp32 (fp16 NaN protection).
+        return next_states.view(batch_size, -1, self.hidden_size).to(torch.float32)
+
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_tokens = hidden_states.shape[0]
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
-        
+
+        # fp16 keeps the loop path, whose fp32 swiglu + autocast-disabled down
+        # projection protect against fp16 overflow; grouped runs in model dtype.
+        if (
+            self.training
+            and hidden_states.dtype is not torch.float16
+            and self._grouped_bnb4bit_ready()
+        ):
+            try:
+                return self._forward_grouped_bnb4bit(
+                    hidden_states, router_indices, routing_weights,
+                    batch_size, num_tokens, num_experts, top_k,
+                )
+            except Exception:
+                import os as _os
+                if _os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                    import traceback; traceback.print_exc()
+                # fall through to the per-expert loop
+
         if self.training:
             with torch.no_grad():
                 flat_experts = router_indices.flatten()  # [tokens * topk]
@@ -1082,14 +1254,125 @@ def _is_transformers_v5() -> bool:
     return transformers_version >= Version("5.0.0.dev0")
 
 
+_GPT_OSS_COMPILED_MODULE = "unsloth_compiled_module_gpt_oss"
+_GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
+
+
+def _gpt_oss_cache_locations():
+    """Dirs that may hold the compiled gpt_oss module: the configured location and the
+    temp-fallback used when it is not writable. Resolved without the compiler so it never
+    triggers distributed coordination at patch time."""
+    locs = []
+    loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+    if loc:
+        locs.append(loc)
+        try:
+            import tempfile
+            locs.append(os.path.join(tempfile.gettempdir(), os.path.basename(loc)))
+        except Exception:
+            pass
+    # De-dup, preserve order (configured first = primary).
+    seen, out = set(), []
+    for _l in locs:
+        if _l and _l not in seen:
+            seen.add(_l); out.append(_l)
+    return out
+
+
+def _invalidate_gpt_oss_compiled_module():
+    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
+    rebuilt against the CURRENT router/experts classes. The single per-model-type file
+    hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
+    wrong classes. Cleans every candidate location."""
+    try:
+        import sys as _sys
+        import importlib, importlib.util
+        _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
+        for loc in _gpt_oss_cache_locations():
+            _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if os.path.isfile(_f):
+                try:
+                    os.remove(_f)
+                except OSError:
+                    pass
+                # Drop the .pyc too so a stale module isn't re-imported from __pycache__.
+                try:
+                    _pyc = importlib.util.cache_from_source(_f)
+                    if os.path.isfile(_pyc):
+                        os.remove(_pyc)
+                except Exception:
+                    pass
+        # Forget any cached finder/directory state for these paths.
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+    except Exception:
+        pass  # best-effort: cache invalidation must never break loading
+
+
+def _sync_gpt_oss_compiled_flavor(desired_flavor):
+    """Invalidate the on-disk compiled gpt_oss module when it was built for a DIFFERENT flavor
+    ("bnb4bit" vs "stock") than this load needs, independently of the in-process flag (unset in
+    a fresh process, so a fresh 16bit load after a 4bit one would import the stale BnB classes
+    and hit "weights not initialized"). A marker file records the built flavor; on a mismatch or
+    missing marker the stale module is dropped for the compiler to regenerate."""
+    try:
+        locations = _gpt_oss_cache_locations()
+        mismatch = False
+        for loc in locations:
+            module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
+            if not os.path.isfile(module_path):
+                continue
+            on_disk = None
+            marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+            if os.path.isfile(marker_path):
+                try:
+                    with open(marker_path, "r", encoding = "utf-8") as f:
+                        on_disk = f.read().strip()
+                except Exception:
+                    on_disk = None
+            if on_disk != desired_flavor:
+                mismatch = True
+        if mismatch:
+            _invalidate_gpt_oss_compiled_module()
+        # Record this load's flavor; always at the primary location, the temp fallback only if used.
+        for idx, loc in enumerate(locations):
+            if idx != 0 and not os.path.isdir(loc):
+                continue
+            try:
+                os.makedirs(loc, exist_ok = True)
+                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
+                    f.write(desired_flavor)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def patch_gpt_oss_bnb4bit_auto():
     """
     Auto-patch GPT-OSS for BnB 4-bit when load_in_4bit is active.
     Set UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 to opt out.
     """
+    # Cross-process safety: invalidate a stale on-disk module built for the other flavor (the
+    # in-process flag is unset in a fresh process). Sole cache invalidator: drops the file only
+    # on a real mismatch, so a matching cache is reused. Gated to gpt-oss loads.
+    if "gpt_oss" in _normalized_unsloth_model_name():
+        _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
+
     if not _should_use_gpt_oss_bnb4bit():
+        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
+        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
+        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
+        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
+        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
+        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+            restore_gpt_oss_original()
+            os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
         return
-    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols.
+    # patch_gpt_oss_bnb4bit() injects BnB helpers so the compiler resolves all symbols. A stale
+    # stock module is handled by _sync above; a matching bnb module is reused, not recompiled.
     patch_gpt_oss_bnb4bit()
     # Inference path avoids torch.compile for 4-bit
     try:
@@ -1657,7 +1940,27 @@ def torch_native_forward(
     num_tokens = hidden_states.shape[0]
     num_experts = routing_weights.shape[1]
     top_k = router_indices.shape[1]
-    
+
+    # Grouped bnb-4bit fast path. The class dispatches this module-level
+    # function (forward is rebound below), so the gate must live here too.
+    # fp16 keeps the loop path below, whose fp32 swiglu + autocast-disabled
+    # down projection protect against fp16 overflow.
+    if (
+        self.training
+        and hidden_states.dtype is not torch.float16
+        and hasattr(self, "_grouped_bnb4bit_ready")
+        and self._grouped_bnb4bit_ready()
+    ):
+        try:
+            return self._forward_grouped_bnb4bit(
+                hidden_states, router_indices, routing_weights,
+                batch_size, num_tokens, num_experts, top_k,
+            )
+        except Exception:
+            if UNSLOTH_ENABLE_LOGGING:
+                import traceback; traceback.print_exc()
+            # fall through to the per-expert loop
+
     if self.training:
         with torch.no_grad():
             flat_experts = router_indices.flatten()  # [tokens * topk]
@@ -2902,6 +3205,7 @@ def patch_gpt_oss_init_weights_modulelist_fix():
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssPreTrainedModel
     )
     GptOssExperts = transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
+    GptOssTopKRouter = transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
     if getattr(GptOssPreTrainedModel, "_unsloth_init_weights_fixed", False):
         return
     _original_init_weights = GptOssPreTrainedModel._init_weights
@@ -2917,6 +3221,22 @@ def patch_gpt_oss_init_weights_modulelist_fix():
                 init.normal_(down.weight, mean=0.0, std=std)
                 if down.bias is not None:
                     init.zeros_(down.bias)
+            return
+        if isinstance(module, GptOssTopKRouter):
+            # Router weight/bias live under .weight (stock) or .linear (Unsloth BnB-4bit).
+            # Resolve whichever exists so stock _init_weights' module.weight access can't
+            # raise "GptOssTopKRouter object has no attribute 'weight'" (#3119).
+            std = self.config.initializer_range
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                weight = getattr(getattr(module, "linear", None), "weight", None)
+            bias = getattr(module, "bias", None)
+            if bias is None:
+                bias = getattr(getattr(module, "linear", None), "bias", None)
+            if weight is not None:
+                init.normal_(weight, mean=0.0, std=std)
+            if bias is not None:
+                init.normal_(bias, mean=0.0, std=std)
             return
         _original_init_weights(self, module)
 

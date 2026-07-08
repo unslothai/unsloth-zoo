@@ -35,6 +35,8 @@ import sys
 import shutil
 import tempfile
 import threading
+import warnings
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -50,6 +52,327 @@ def _safe_token_denominator(ntoks):
 
 def _normalize_seed(seed, default=3407):
     return default if seed is None else int(seed)
+
+
+class _MLXNormOutputCastState:
+    __slots__ = ("patched_classes", "missing", "lock")
+
+    def __init__(self):
+        self.patched_classes = set()
+        self.missing = object()
+        self.lock = threading.RLock()
+
+
+_MLX_NORM_OUTPUT_CAST_STATE = _MLXNormOutputCastState()
+
+
+def _mlx_norm_path_part_is_norm(part: str) -> bool:
+    # "norm" matches RMSNorm/LayerNorm/input_layernorm; ln_* covers GPT-2/GPT-OSS.
+    return "norm" in part or part.startswith("ln_") or part == "ln_f"
+
+
+def is_mlx_norm_parameter_path(path) -> bool:
+    parts = str(path).lower().split(".")
+    return any(_mlx_norm_path_part_is_norm(part) for part in parts[:-1])
+
+
+def is_mlx_norm_module_path(path) -> bool:
+    return any(
+        _mlx_norm_path_part_is_norm(part)
+        for part in str(path).lower().split(".")
+    )
+
+
+def _join_mlx_parameter_path(module_path, parameter_path):
+    if module_path and parameter_path:
+        return f"{module_path}.{parameter_path}"
+    return module_path or parameter_path
+
+
+def _mlx_norm_runtime():
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten as _tree_flatten
+
+    return _mx, _nn, _tree_flatten
+
+
+def _has_mlx_norm_selected_floating_parameter(module_path, module) -> bool:
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    module_path_selected = is_mlx_norm_module_path(module_path)
+    try:
+        for parameter_path, value in tree_flatten(parameters):
+            if (
+                hasattr(value, "dtype")
+                and _mx.issubdtype(value.dtype, _mx.floating)
+                and (
+                    module_path_selected
+                    or is_mlx_norm_parameter_path(parameter_path)
+                    or is_mlx_norm_parameter_path(
+                        _join_mlx_parameter_path(module_path, parameter_path)
+                    )
+                )
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_mlx_floating_parameter(module) -> bool:
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    try:
+        for _, value in tree_flatten(parameters):
+            if hasattr(value, "dtype") and _mx.issubdtype(value.dtype, _mx.floating):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_mlx_parameterized_non_norm_children(module) -> bool:
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    try:
+        children = module.children()
+    except Exception:
+        return False
+
+    try:
+        is_module = getattr(_nn.Module, "is_module", None)
+        child_items = (
+            tree_flatten(children, is_leaf=is_module)
+            if is_module is not None else tree_flatten(children)
+        )
+        for _, child in child_items:
+            if (
+                isinstance(child, _nn.Module)
+                and "norm" not in type(child).__name__.lower()
+                and _has_mlx_floating_parameter(child)
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def is_mlx_norm_output_cast_candidate(module_path, module) -> bool:
+    """Return whether a custom module itself produces norm-like output."""
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    base_norm_classes = tuple(
+        cls for cls in (getattr(_nn, "RMSNorm", None), getattr(_nn, "LayerNorm", None))
+        if isinstance(cls, type)
+    )
+    norm_cls = type(module)
+    if base_norm_classes and issubclass(norm_cls, base_norm_classes):
+        return True
+    if "norm" not in norm_cls.__name__.lower():
+        return False
+    if _has_mlx_parameterized_non_norm_children(module):
+        return False
+    if not _has_mlx_norm_selected_floating_parameter(module_path, module):
+        return False
+    return True
+
+
+def mlx_norm_input_dtype(args, kwargs):
+    for value in args:
+        if hasattr(value, "dtype"):
+            return value.dtype
+    for value in kwargs.values():
+        if hasattr(value, "dtype"):
+            return value.dtype
+    return None
+
+
+def iter_mlx_norm_output_cast_classes(model=None):
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    norm_classes = []
+    seen = set()
+
+    for norm_cls in (getattr(_nn, "RMSNorm", None), getattr(_nn, "LayerNorm", None)):
+        if isinstance(norm_cls, type):
+            norm_classes.append(norm_cls)
+            seen.add(norm_cls)
+
+    if model is not None:
+        try:
+            named_modules = model.named_modules()
+        except Exception:
+            named_modules = ()
+        for module_path, module in named_modules:
+            if is_mlx_norm_output_cast_candidate(module_path, module):
+                norm_cls = type(module)
+                if norm_cls not in seen:
+                    norm_classes.append(norm_cls)
+                    seen.add(norm_cls)
+
+    return tuple(norm_classes)
+
+
+def _set_mlx_norm_output_cast_classes(enabled: bool, norm_classes) -> None:
+    patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+    for norm_cls in norm_classes:
+        patched = norm_cls in patched_classes
+        if enabled:
+            original_call = norm_cls.__call__
+            current_is_wrapper = getattr(
+                original_call, "_unsloth_norm_output_cast_wrapper", False
+            )
+            if patched and not current_is_wrapper:
+                patched_classes.discard(norm_cls)
+                patched = False
+            if (
+                patched
+                or current_is_wrapper
+            ):
+                continue
+
+            def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):
+                input_dtype = mlx_norm_input_dtype(args, kwargs)
+                out = _original_call(self, *args, **kwargs)
+                if (
+                    input_dtype is not None
+                    and hasattr(out, "dtype")
+                    and out.dtype != input_dtype
+                ):
+                    return out.astype(input_dtype)
+                return out
+
+            norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
+            norm_call_cast_output._unsloth_original_call = original_call
+            norm_cls._unsloth_original_call = original_call
+            norm_cls.__call__ = norm_call_cast_output
+            norm_cls._unsloth_cast_output_to_input_dtype = True
+            patched_classes.add(norm_cls)
+        elif patched:
+            if not getattr(norm_cls.__call__, "_unsloth_norm_output_cast_wrapper", False):
+                patched_classes.discard(norm_cls)
+                continue
+            original_call = getattr(norm_cls, "_unsloth_original_call", None)
+            if original_call is not None:
+                norm_cls.__call__ = original_call
+            norm_cls._unsloth_original_call = None
+            norm_cls._unsloth_cast_output_to_input_dtype = False
+            patched_classes.discard(norm_cls)
+
+
+def mlx_norm_output_cast_patched_classes():
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        return tuple(_MLX_NORM_OUTPUT_CAST_STATE.patched_classes)
+
+
+def snapshot_mlx_norm_output_cast_state(norm_classes=None):
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+        missing = _MLX_NORM_OUTPUT_CAST_STATE.missing
+        snapshot_classes = []
+        seen = set()
+        for norm_cls in patched_classes:
+            snapshot_classes.append(norm_cls)
+            seen.add(norm_cls)
+        for norm_cls in norm_classes or ():
+            if isinstance(norm_cls, type) and norm_cls not in seen:
+                snapshot_classes.append(norm_cls)
+                seen.add(norm_cls)
+
+        return tuple(
+            (
+                norm_cls,
+                norm_cls in patched_classes,
+                norm_cls.__dict__.get("__call__", missing),
+                norm_cls.__dict__.get(
+                    "_unsloth_original_call",
+                    missing,
+                ),
+                norm_cls.__dict__.get(
+                    "_unsloth_cast_output_to_input_dtype",
+                    missing,
+                ),
+            )
+            for norm_cls in snapshot_classes
+        )
+
+
+def _restore_mlx_norm_output_cast_attr(norm_cls, attr_name, value) -> None:
+    if value is _MLX_NORM_OUTPUT_CAST_STATE.missing:
+        try:
+            delattr(norm_cls, attr_name)
+        except AttributeError:
+            pass
+    else:
+        setattr(norm_cls, attr_name, value)
+
+
+def restore_mlx_norm_output_cast_state(snapshot) -> None:
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+        desired = {}
+        for entry in snapshot:
+            try:
+                norm_cls, was_patched, call, original_call, cast_output = entry
+            except (TypeError, ValueError):
+                continue
+            if isinstance(norm_cls, type):
+                desired[norm_cls] = (was_patched, call, original_call, cast_output)
+
+        for norm_cls, (was_patched, call, original_call, cast_output) in desired.items():
+            current_call = getattr(norm_cls, "__call__", None)
+            current_is_wrapper = getattr(
+                current_call, "_unsloth_norm_output_cast_wrapper", False
+            )
+            if not was_patched and not current_is_wrapper:
+                patched_classes.discard(norm_cls)
+                continue
+            _restore_mlx_norm_output_cast_attr(norm_cls, "__call__", call)
+            _restore_mlx_norm_output_cast_attr(
+                norm_cls, "_unsloth_original_call", original_call
+            )
+            _restore_mlx_norm_output_cast_attr(
+                norm_cls, "_unsloth_cast_output_to_input_dtype", cast_output
+            )
+            if was_patched:
+                patched_classes.add(norm_cls)
+            else:
+                patched_classes.discard(norm_cls)
+
+
+def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
+    """Control whether MLX norm outputs are cast back to activation dtype.
+
+    MLX training can keep norm parameters in fp32 for stability, but letting
+    fp32 norm outputs flow through the rest of the graph promotes downstream
+    intermediates and materially increases LoRA/QLoRA memory. Casting the
+    result back keeps bf16/fp16 downstream activations.
+
+    This patches norm classes process-wide, not per model. Use
+    snapshot_mlx_norm_output_cast_state() and restore_mlx_norm_output_cast_state()
+    to bracket temporary changes; overlapping trainer/inference runs in the
+    same process are still not safe because the patched classes are shared.
+    """
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        try:
+            from . import compile as _mlx_compile
+            _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
+        except Exception:
+            pass
+
+        norm_classes = list(iter_mlx_norm_output_cast_classes(model))
+        if not enabled:
+            norm_classes.extend(
+                norm_cls for norm_cls in mlx_norm_output_cast_patched_classes()
+                if norm_cls not in norm_classes
+            )
+        _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
 def _get_transformer_layers(model):
@@ -521,7 +844,7 @@ def make_baseline_loss_fn():
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = nn.losses.cross_entropy(logits, targets) * mask
             ntoks = mask.sum()
-            ce = ce.astype(mx.float32).sum() / ntoks
+            ce = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
@@ -552,28 +875,11 @@ def make_baseline_loss_fn():
 # VLM helpers
 # ---------------------------------------------------------------------------
 
-# Image/vision special tokens that should never contribute to loss.
-# Mirrors unsloth's IMAGE_TOKENS list in vision_utils.py.
-_IMAGE_TOKEN_STRINGS = (
-    "<|image|>",           # Llama 3.2 Vision, Phi 3.5, Gemma4
-    "<|vision_start|>",    # Qwen
-    "<|vision_end|>",      # Qwen
-    "<|vision_pad|>",      # Qwen
-    "<|image_pad|>",       # Qwen
-    "<|video_pad|>",       # Qwen
-    "<image>",             # PaliGemma, Llava, InternVL
-    "</image>",            # InternVL
-    "[IMG]",               # Mistral
-    "[IMG_BREAK]",         # Mistral
-    "[IMG_END]",           # Mistral
-    "<image_soft_token>",  # Gemma 3
-    "<start_of_image>",    # Gemma 3
-    "<end_of_image>",      # Gemma 3
-    "<|START_OF_IMG|>",    # Cohere
-    "<|END_OF_IMG|>",      # Cohere
-    "<|IMG_LINE_BREAK|>",  # Cohere
-    "<|IMG_PATCH|>",       # Cohere
-)
+# Image/vision/audio special tokens that should never contribute to loss.
+# Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
+# so the two backends cannot drift apart.
+from ..vlm_tokens import VLM_PLACEHOLDER_TOKENS
+_IMAGE_TOKEN_STRINGS = tuple(VLM_PLACEHOLDER_TOKENS)
 
 
 def _append_unique_int(ids, value):
@@ -1943,6 +2249,22 @@ def _get_vlm_image_size(config, processor):
     return 512
 
 
+def _is_vlm_no_resize_image_size(image_size):
+    """Return True when a VLM image-size override means preserve full size."""
+    return image_size is None or (
+        isinstance(image_size, str) and image_size.lower() == "max"
+    )
+
+
+def _resolve_vlm_image_size(image_size, config, processor):
+    """Resolve omitted VLM image size while preserving explicit no-resize."""
+    if isinstance(image_size, str) and image_size.lower() == "max":
+        return None
+    if image_size is None:
+        return _get_vlm_image_size(config, processor)
+    return image_size
+
+
 def _has_chat_template(obj):
     template = getattr(obj, "chat_template", None)
     return isinstance(template, str) and len(template.strip()) > 0
@@ -2068,6 +2390,19 @@ def normalize_vlm_processor_chat_template(
         is_vlm=True,
         strict=strict,
     )
+
+
+def encode_mlx_text(tokenizer, text):
+    """Tokenize text while mirroring Unsloth's double-BOS guard."""
+    add_special_tokens = True
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if bos_token is not None and text.startswith(bos_token):
+        add_special_tokens = False
+
+    try:
+        return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    except TypeError:
+        return tokenizer.encode(text)
 
 
 def _raise_mlx_chat_template_error(target, *, is_vlm=False):
@@ -2210,28 +2545,24 @@ def _collapse_vlm_assistant_content(messages):
 
 
 def _flatten_vlm_content_for_text_template(messages):
+    """Render list-style VLM content as text for text-only chat templates."""
     flattened = copy.deepcopy(messages)
     for message in flattened:
         content = message.get("content", "")
-        if isinstance(content, list):
-            texts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(str(part.get("text", "")))
-                elif isinstance(part, str):
-                    texts.append(part)
-            message["content"] = "".join(texts)
+        if not isinstance(content, list):
+            continue
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                texts.append(part)
+        message["content"] = "".join(texts)
     return flattened
 
 
 def _flatten_vlm_messages_to_content_parts(messages):
-    """Flatten role messages for processors whose template expects content parts.
-
-    Some mlx-vlm base processors ship a VLM token template, not a chat template.
-    For example Qwen2-VL base templates iterate directly over content parts like
-    {"type": "image"} / {"type": "text"}, and render an empty string when given
-    role-wrapped messages.
-    """
+    """Flatten role messages for mlx-vlm processors with content-part templates."""
     parts = []
     for message in messages:
         content = message.get("content", "")
@@ -2309,7 +2640,12 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
-def _render_vlm_messages(processor, messages):
+def _render_vlm_messages(
+    processor,
+    messages,
+    *,
+    add_generation_prompt=False,
+):
     normalize_vlm_processor_chat_template(processor, strict=True)
     if isinstance(messages, str):
         return messages
@@ -2318,47 +2654,45 @@ def _render_vlm_messages(processor, messages):
     if not _processor_accepts_assistant_list_content(processor):
         render_messages = _collapse_vlm_assistant_content(render_messages)
 
+    first_error = None
+    second_error = None
+    third_error = None
+
     try:
         text = processor.apply_chat_template(
             render_messages,
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
         text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
-    except Exception as first_exc:
-        first_error = first_exc
-    else:
-        first_error = None
+    except Exception as exc:
+        first_error = exc
 
     try:
         text = processor.apply_chat_template(
             _flatten_vlm_messages_to_content_parts(messages),
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
         text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
-    except Exception as second_exc:
-        second_error = second_exc
-    else:
-        second_error = None
+    except Exception as exc:
+        second_error = exc
 
     try:
         text = processor.apply_chat_template(
             _flatten_vlm_content_for_text_template(render_messages),
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
         text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
         if isinstance(text, str) and text.strip():
             return text
-    except Exception as third_exc:
-        third_error = third_exc
-    else:
-        third_error = None
+    except Exception as exc:
+        third_error = exc
 
     if first_error is not None:
         raise RuntimeError(
@@ -2476,6 +2810,677 @@ def collect_mlx_texts(target, item, *, dataset_text_field="text", is_vlm=False):
     return [text] if text else []
 
 
+def _render_mlx_prompt_completion_texts(
+    target,
+    item,
+    *,
+    dataset_text_field="text",
+    is_vlm=False,
+):
+    """Render prompt and completion parts separately for text label masking."""
+    if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
+        return None
+    prompt = render_mlx_chat_example(
+        target,
+        item.get("prompt"),
+        dataset_text_field=dataset_text_field,
+        is_vlm=is_vlm,
+    )
+    completion = render_mlx_chat_example(
+        target,
+        item.get("completion"),
+        dataset_text_field=dataset_text_field,
+        is_vlm=is_vlm,
+    )
+    if prompt is None and completion is None:
+        return None
+    return prompt or "", completion or ""
+
+
+def _looks_like_mlx_chat_value(value):
+    """Return True for one chat message or a list of chat messages."""
+    return (
+        _looks_like_mlx_chat_messages(value)
+        or (
+            isinstance(value, dict)
+            and "role" in value
+            and "content" in value
+        )
+    )
+
+
+def _flatten_mlx_chat_template_ids(value):
+    """Flatten tokenizer chat-template output to a single token-id list."""
+    if isinstance(value, Mapping):
+        value = value["input_ids"]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if len(value) > 0 and isinstance(value[0], list):
+        value = value[0]
+    return list(value)
+
+
+def _flatten_mlx_chat_template_field(value, field_name):
+    """Flatten one field from tokenizer chat-template output."""
+    if isinstance(value, Mapping):
+        value = value[field_name]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if len(value) > 0 and isinstance(value[0], list):
+        value = value[0]
+    return list(value)
+
+
+def _apply_mlx_chat_template_ids(tokenizer, messages, **kwargs):
+    """Tokenize messages through apply_chat_template with a HF-compatible fallback."""
+    try:
+        return _flatten_mlx_chat_template_ids(
+            tokenizer.apply_chat_template(messages, **kwargs)
+        )
+    except TypeError:
+        kwargs.pop("return_dict", None)
+        return _flatten_mlx_chat_template_ids(
+            tokenizer.apply_chat_template(messages, **kwargs)
+        )
+
+
+def _apply_mlx_chat_template_dict(tokenizer, messages, **kwargs):
+    """Tokenize messages through apply_chat_template and preserve returned masks."""
+    try:
+        value = tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        if kwargs.get("return_assistant_tokens_mask"):
+            raise
+        kwargs.pop("return_assistant_tokens_mask", None)
+        kwargs.pop("return_dict", None)
+        value = tokenizer.apply_chat_template(messages, **kwargs)
+    if isinstance(value, Mapping):
+        return value
+    return {"input_ids": value}
+
+
+def _apply_mlx_text_label_masks(input_ids, *, completion_mask=None, assistant_mask=None):
+    """Build labels from input_ids, applying completion then assistant masks."""
+    labels = list(input_ids)
+    if completion_mask is not None:
+        labels = [
+            int(label) if int(mask) != 0 else -100
+            for label, mask in zip(labels, completion_mask)
+        ]
+    if assistant_mask is not None:
+        labels = [
+            int(label) if int(mask) != 0 else -100
+            for label, mask in zip(labels, assistant_mask)
+        ]
+    return labels
+
+
+def _validate_mlx_assistant_mask(input_ids, assistant_mask, *, source):
+    """Validate one assistant mask and mirror TRL's no-assistant-token error."""
+    if len(assistant_mask) != len(input_ids):
+        raise ValueError(
+            f"Unsloth MLX: {source} assistant_masks must match input_ids length."
+        )
+    if not any(int(mask) == 1 for mask in assistant_mask):
+        raise RuntimeError(
+            "You're using `assistant_only_loss=True`, but at least one example has "
+            "no assistant tokens. This usually means the tokenizer's chat template "
+            "doesn't generate assistant masks — it may be missing the "
+            "`{% generation %}` keyword. Please check the template and ensure "
+            "it's correctly configured to support assistant masking."
+        )
+
+
+def _is_mlx_sft_conversational_value(value):
+    """Return True for ChatML values accepted by SFT assistant-only loss."""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and isinstance(value[0], Mapping)
+        and "role" in value[0]
+        and "content" in value[0]
+    )
+
+
+def _is_mlx_sft_conversational_row(item):
+    """Return whether one row can support SFT assistant-only loss."""
+    if _is_mlx_sft_conversational_value(item):
+        return True
+    if not isinstance(item, Mapping):
+        return False
+    if "prompt" in item or "completion" in item:
+        return (
+            _looks_like_mlx_chat_value(item.get("prompt"))
+            and _looks_like_mlx_chat_value(item.get("completion"))
+        )
+    for key in ("prompt", "chosen", "rejected", "completion", "messages"):
+        if _is_mlx_sft_conversational_value(item.get(key)):
+            return True
+    return False
+
+
+def _validate_mlx_text_assistant_only_dataset(dataset):
+    """Reject first-sample non-conversational datasets like SFTTrainer."""
+    for item in dataset:
+        if not _is_mlx_sft_conversational_row(item):
+            raise ValueError(
+                "You set `assistant_only_loss=True`, but the dataset is not "
+                "conversational. This option is only supported for "
+                "conversational datasets."
+            )
+        return
+
+
+def _tokenize_mlx_conversational_prompt_completion(
+    tokenizer,
+    prompt,
+    completion,
+    *,
+    tools=None,
+    chat_template_kwargs=None,
+    assistant_only_loss=False,
+    completion_only_loss=None,
+):
+    """Tokenize conversational prompt/completion rows using TRL's split."""
+    prompt_messages = _normalize_mlx_messages(prompt, is_vlm=False)
+    completion_messages = _normalize_mlx_messages(completion, is_vlm=False)
+    template_kwargs = dict(chat_template_kwargs or {})
+    prompt_ids = _apply_mlx_chat_template_ids(
+        tokenizer,
+        prompt_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        tools=tools,
+        **template_kwargs,
+    )
+    prompt_completion_processed = _apply_mlx_chat_template_dict(
+        tokenizer,
+        prompt_messages + completion_messages,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=bool(assistant_only_loss),
+        tools=tools,
+        **template_kwargs,
+    )
+    input_ids = _flatten_mlx_chat_template_field(
+        prompt_completion_processed, "input_ids"
+    )
+    assistant_mask = None
+    if "assistant_masks" in prompt_completion_processed:
+        assistant_mask = _flatten_mlx_chat_template_field(
+            prompt_completion_processed, "assistant_masks"
+        )
+        _validate_mlx_assistant_mask(
+            input_ids, assistant_mask, source="conversational"
+        )
+    elif assistant_only_loss:
+        _validate_mlx_assistant_mask(
+            input_ids, [0] * len(input_ids), source="conversational"
+        )
+    return _mask_mlx_prompt_completion_labels(
+        tokenizer,
+        prompt_ids,
+        input_ids,
+        append_eos=False,
+        completion_only_loss=completion_only_loss,
+        assistant_mask=assistant_mask,
+    )
+
+
+def _tokenize_mlx_prompt_completion(
+    tokenizer,
+    prompt,
+    completion,
+    *,
+    append_eos=True,
+    completion_only_loss=None,
+):
+    """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
+    prompt_ids = list(encode_mlx_text(tokenizer, prompt))
+    input_ids = list(encode_mlx_text(tokenizer, prompt + completion))
+    return _mask_mlx_prompt_completion_labels(
+        tokenizer,
+        prompt_ids,
+        input_ids,
+        append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
+    )
+
+
+def _mask_mlx_prompt_completion_labels(
+    tokenizer,
+    prompt_ids,
+    input_ids,
+    *,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_mask=None,
+):
+    """Build labels by masking the prompt prefix from prompt/completion ids."""
+    if input_ids[:len(prompt_ids)] != prompt_ids:
+        warnings.warn(
+            "Mismatch between tokenized prompt and tokenized prompt+completion; "
+            "completion_only_loss masking will use the prompt token length.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    if eos_id is not None and (not input_ids or input_ids[-1] != eos_id):
+        input_ids.append(int(eos_id))
+        if assistant_mask is not None:
+            assistant_mask.append(0)
+    completion_mask = None
+    if completion_only_loss is not False:
+        completion_mask = [0] * min(len(prompt_ids), len(input_ids))
+        completion_mask.extend([1] * (len(input_ids) - len(completion_mask)))
+    labels = _apply_mlx_text_label_masks(
+        input_ids,
+        completion_mask=completion_mask,
+        assistant_mask=assistant_mask,
+    )
+    return input_ids, labels
+
+
+def _tokenize_mlx_prompt_completion_row(
+    tokenizer,
+    item,
+    *,
+    dataset_text_field="text",
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+):
+    """Tokenize one text prompt/completion row, including conversational rows."""
+    if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
+        return None
+    prompt = item.get("prompt")
+    completion = item.get("completion")
+    if _looks_like_mlx_chat_value(prompt) and _looks_like_mlx_chat_value(completion):
+        return _tokenize_mlx_conversational_prompt_completion(
+            tokenizer,
+            prompt,
+            completion,
+            tools=item.get("tools"),
+            chat_template_kwargs=item.get("chat_template_kwargs"),
+            assistant_only_loss=assistant_only_loss,
+            completion_only_loss=completion_only_loss,
+        )
+    pair = _render_mlx_prompt_completion_texts(
+        tokenizer,
+        item,
+        dataset_text_field=dataset_text_field,
+        is_vlm=False,
+    )
+    if pair is None:
+        return None
+    return _tokenize_mlx_prompt_completion(
+        tokenizer,
+        pair[0],
+        pair[1],
+        append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
+    )
+
+
+def _tokenize_mlx_assistant_messages_row(tokenizer, item):
+    """Tokenize one conversational row with chat-template assistant masks."""
+    messages = (
+        item if _looks_like_mlx_chat_messages(item)
+        else _select_mlx_messages_or_raw(item)
+    )
+    if messages is item and not _looks_like_mlx_chat_messages(messages):
+        return None
+    messages = _normalize_mlx_messages(messages, is_vlm=False)
+    if isinstance(messages, str):
+        return None
+    template_kwargs = (
+        dict(item.get("chat_template_kwargs", {}))
+        if isinstance(item, Mapping) else {}
+    )
+    processed = _apply_mlx_chat_template_dict(
+        tokenizer,
+        messages,
+        return_dict=True,
+        tokenize=True,
+        return_assistant_tokens_mask=True,
+        tools=item.get("tools") if isinstance(item, Mapping) else None,
+        **template_kwargs,
+    )
+    input_ids = _flatten_mlx_chat_template_field(processed, "input_ids")
+    assistant_mask = None
+    if "assistant_masks" in processed:
+        assistant_mask = _flatten_mlx_chat_template_field(processed, "assistant_masks")
+        _validate_mlx_assistant_mask(input_ids, assistant_mask, source="text")
+    else:
+        _validate_mlx_assistant_mask(input_ids, [0] * len(input_ids), source="text")
+    labels = (
+        _apply_mlx_text_label_masks(input_ids, assistant_mask=assistant_mask)
+        if assistant_mask is not None else None
+    )
+    return input_ids, labels
+
+
+def _prepare_labeled_text_dataset(
+    dataset,
+    tokenizer,
+    dataset_text_field="text",
+    formatting_func=None,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+):
+    """Materialize text rows that need explicit labels into token ids."""
+    formatted = []
+    for item in dataset:
+        source = formatting_func(item) if formatting_func is not None else item
+        sources = source if (
+            isinstance(source, list) and not _looks_like_mlx_chat_messages(source)
+        ) else [source]
+        for row in sources:
+            tokenized = _tokenize_mlx_prompt_completion_row(
+                tokenizer,
+                row,
+                dataset_text_field=dataset_text_field,
+                append_eos=append_eos,
+                completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
+            )
+            if tokenized is None and assistant_only_loss:
+                tokenized = _tokenize_mlx_assistant_messages_row(tokenizer, row)
+            if tokenized is None and assistant_only_loss:
+                raise ValueError(
+                    "You set `assistant_only_loss=True`, but the dataset is not "
+                    "conversational. This option is only supported for "
+                    "conversational datasets."
+                )
+            if tokenized is not None and tokenized[0]:
+                formatted.append(tokenized)
+    return formatted
+
+
+def _coerce_mlx_token_list(value, field_name):
+    """Convert one token-id field from a pretokenized row to a Python list."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Unsloth MLX: pretokenized '{field_name}' must be a sequence.")
+    if value and isinstance(value[0], (list, tuple)):
+        raise ValueError(f"Unsloth MLX: pretokenized '{field_name}' must be one sequence.")
+    return [int(token) for token in value]
+
+
+def _mlx_text_pad_id(tokenizer):
+    """Return the tokenizer pad id used by TRL's text data collator."""
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return int(pad_id) if pad_id is not None else 0
+
+
+def _resolve_mlx_pretokenized_completion_only_loss(dataset, completion_only_loss):
+    """Resolve SFTTrainer's default loss mode from the first raw text row."""
+    if completion_only_loss is not None:
+        return completion_only_loss
+    for item in dataset:
+        return isinstance(item, Mapping) and "prompt" in item and "completion" in item
+    return False
+
+
+def _prompt_completion_formatter_conflict(
+    dataset, formatting_func, completion_only_loss
+):
+    """Detect a formatter that erases a prompt/completion boundary under the default.
+
+    SFTTrainer resolves the completion_only_loss default to True for prompt/completion
+    datasets and then rejects a formatting_func as incompatible, because formatting
+    collapses the row into free text and drops the completion boundary. We only reach
+    this after formatting produced no labeled rows, so raising here mirrors that
+    guardrail instead of silently training on the full formatted sequence. A formatter
+    that keeps prompt/completion keys still yields labeled rows and never lands here.
+    """
+    if formatting_func is None or completion_only_loss is not None:
+        return False
+    for item in dataset:
+        return isinstance(item, Mapping) and "prompt" in item and "completion" in item
+    return False
+
+
+def _tokenize_mlx_pretokenized_row(
+    item,
+    *,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+):
+    """Read input_ids plus optional labels/completion_mask from one text row."""
+    if not isinstance(item, Mapping) or "input_ids" not in item:
+        return None
+
+    input_ids = _coerce_mlx_token_list(item["input_ids"], "input_ids")
+    labels = None
+    if item.get("labels") is not None:
+        labels = _coerce_mlx_token_list(item["labels"], "labels")
+        if len(labels) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX: pretokenized 'labels' must match 'input_ids' length."
+            )
+
+    if completion_only_loss is True and item.get("completion_mask") is not None:
+        completion_mask = _coerce_mlx_token_list(
+            item["completion_mask"], "completion_mask"
+        )
+        if len(completion_mask) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX: pretokenized 'completion_mask' must match "
+                "'input_ids' length."
+            )
+        labels = labels if labels is not None else list(input_ids)
+        labels = [
+            int(label) if int(mask) != 0 else -100
+            for label, mask in zip(labels, completion_mask)
+        ]
+
+    assistant_masks = item.get("assistant_masks")
+    if assistant_only_loss and assistant_masks is None and labels is None:
+        raise ValueError(
+            "Unsloth MLX: pretokenized assistant_only_loss=True rows must "
+            "include 'assistant_masks' or explicit 'labels'."
+        )
+
+    # Match TRL's collator: pretokenized assistant_masks are labels metadata.
+    if assistant_masks is not None:
+        assistant_mask = _coerce_mlx_token_list(
+            assistant_masks, "assistant_masks"
+        )
+        if len(assistant_mask) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX: pretokenized 'assistant_masks' must match "
+                "'input_ids' length."
+            )
+        if assistant_only_loss:
+            _validate_mlx_assistant_mask(
+                input_ids, assistant_mask, source="pretokenized",
+            )
+        labels = labels if labels is not None else list(input_ids)
+        labels = _apply_mlx_text_label_masks(
+            labels,
+            assistant_mask=assistant_mask,
+        )
+
+    return input_ids, labels
+
+
+def _prepare_pretokenized_text_dataset(
+    dataset,
+    *,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+):
+    """Materialize pretokenized text rows and report whether input_ids appeared."""
+    completion_only_loss = _resolve_mlx_pretokenized_completion_only_loss(
+        dataset,
+        completion_only_loss,
+    )
+    formatted = []
+    saw_pretokenized = False
+    saw_other = False
+    label_states = []
+    for item in dataset:
+        sources = item if (
+            isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
+        ) else [item]
+        for row in sources:
+            tokenized = _tokenize_mlx_pretokenized_row(
+                row,
+                completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
+            )
+            if tokenized is not None:
+                saw_pretokenized = True
+                label_states.append(tokenized[1] is not None)
+                if len(tokenized[0]) >= 2:
+                    formatted.append(tokenized)
+            else:
+                saw_other = True
+    if saw_pretokenized and saw_other:
+        raise ValueError(
+            "Unsloth MLX: pretokenized text datasets with 'input_ids' cannot "
+            "be mixed with rows that need text formatting/tokenization."
+        )
+    if label_states:
+        has_labels = label_states[0]
+        if any(has_labels != state for state in label_states):
+            raise ValueError(
+                "Unsloth MLX: pretokenized rows with labels/completion_mask "
+                "must not be mixed with rows that do not provide labels."
+            )
+    return formatted, saw_pretokenized
+
+
+def _ensure_reiterable_text_dataset(dataset):
+    """Materialize one-shot text iterables before probing for labeled rows."""
+    if hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
+        return dataset
+    return list(dataset)
+
+
+def _labeled_row_has_supervision(labels, max_seq_length):
+    # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift,
+    # length-capped); an all-masked batch aborts training. labels=None always kept.
+    if labels is None:
+        return True
+    return any(int(x) != -100 for x in labels[1:max_seq_length])
+
+
+def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
+    """Pad pretokenized ids plus optional labels for one MLX text batch."""
+    lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
+    max_length = max(lengths)
+    batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
+    has_labels = batch_items[0][1] is not None
+    if any((labels is not None) != has_labels for _ids, labels in batch_items):
+        raise ValueError(
+            "Unsloth MLX: pretokenized rows with labels/completion_mask must "
+            "not be batched with rows that do not provide labels."
+        )
+    batch_labels = (
+        np.full((len(batch_items), max_length), -100, dtype=np.int64)
+        if has_labels else None
+    )
+    for row_idx, (ids, labels) in enumerate(batch_items):
+        length = lengths[row_idx]
+        batch_ids[row_idx, :length] = ids[:length]
+        if batch_labels is not None:
+            batch_labels[row_idx, :length] = labels[:length]
+    lengths_info = [[0, length] for length in lengths]
+    labels_array = mx.array(batch_labels) if batch_labels is not None else None
+    return mx.array(batch_ids), mx.array(lengths_info), labels_array
+
+
+def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
+    """Pad token ids and labels for one labeled MLX text batch."""
+    return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
+
+
+def _create_tokenized_text_batches(tokenized, batch_size, max_seq_length,
+                                   num_batches=None, seed=42, pad_id=0):
+    """Batch pretokenized text rows with mlx-lm's sorting and shuffle contract."""
+    batch_iter = _iterate_tokenized_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        seed=seed,
+        loop=(num_batches is not None),
+        pad_id=pad_id,
+    )
+    batch_pairs = []
+    for batch_pair in batch_iter:
+        batch_pairs.append(batch_pair)
+        if num_batches is not None and len(batch_pairs) >= num_batches:
+            break
+
+    mx.eval(
+        [b for b, lengths, labels in batch_pairs]
+        + [lengths for _, lengths, labels in batch_pairs]
+        + [labels for _, lengths, labels in batch_pairs if labels is not None]
+    )
+    return batch_pairs
+
+
+def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                 num_batches=None, seed=42, pad_id=0):
+    """Batch labeled text rows with mlx-lm's default sorting and shuffle contract."""
+    return _create_tokenized_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        pad_id=pad_id,
+    )
+
+
+def _iterate_tokenized_text_batches(tokenized, batch_size, max_seq_length,
+                                    seed=42, loop=False, pad_id=0):
+    """Yield pretokenized text batches with the same grouping used by materialization."""
+    tokenized = [
+        row for row in tokenized
+        if _labeled_row_has_supervision(row[1], max_seq_length)
+    ]
+    if len(tokenized) < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size}"
+            f" examples but only has {len(tokenized)}."
+        )
+
+    idx = sorted(range(len(tokenized)), key=lambda i: len(tokenized[i][0]))
+    batch_idx = [
+        idx[i : i + batch_size]
+        for i in range(0, len(idx) - batch_size + 1, batch_size)
+    ]
+    if seed is not None:
+        np.random.seed(int(seed))
+
+    while True:
+        for batch_group_idx in np.random.permutation(len(batch_idx)):
+            batch_items = [tokenized[i] for i in batch_idx[batch_group_idx]]
+            yield _create_tokenized_text_batch(
+                batch_items, max_seq_length, pad_id=pad_id
+            )
+        if not loop:
+            break
+
+
+def _iterate_labeled_text_batches(tokenized, batch_size, max_seq_length,
+                                  seed=42, loop=False, pad_id=0):
+    """Yield labeled text batches with the same grouping used by materialization."""
+    yield from _iterate_tokenized_text_batches(
+        tokenized,
+        batch_size,
+        max_seq_length,
+        seed=seed,
+        loop=loop,
+        pad_id=pad_id,
+    )
+
+
 def _resize_vlm_images(images, image_size):
     from PIL import Image
 
@@ -2484,7 +3489,9 @@ def _resize_vlm_images(images, image_size):
     for image in images:
         if isinstance(image, Image.Image):
             image = image.convert("RGB")
-            if isinstance(image_size, int):
+            if _is_vlm_no_resize_image_size(image_size):
+                pass
+            elif isinstance(image_size, int):
                 # Match UnslothVisionDataCollator resize="min": shrink large
                 # images to the model limit, but let processors handle upscaling.
                 # Scale on the larger side so tall portrait images (e.g.
@@ -2504,10 +3511,16 @@ def _resize_vlm_images(images, image_size):
     return resized
 
 
-def _extract_vlm_images(item, messages, image_size):
+def _extract_vlm_images(
+    item,
+    messages,
+    image_size,
+    *,
+    suppress_process_errors=False,
+):
     images = []
     if isinstance(item, dict):
-        image = item.get("image", item.get("images"))
+        image = item.get("images")
         if image is not None:
             images = image if isinstance(image, list) else [image]
 
@@ -2532,9 +3545,43 @@ def _extract_vlm_images(item, messages, image_size):
                 if maybe_images is not None:
                     images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
         except Exception:
-            pass
+            if not suppress_process_errors:
+                raise
 
     return _resize_vlm_images(images, image_size)
+
+
+def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_size):
+    """Extract VLM PC images with CUDA's embedded-then-top-level preference."""
+    messages = (prompt_messages or []) + (completion_messages or [])
+    if messages:
+        images = _extract_vlm_images(
+            {},
+            messages,
+            image_size,
+            suppress_process_errors=True,
+        )
+        if images:
+            return images
+        return []
+
+    if isinstance(item, dict) and "images" in item:
+        try:
+            from ..vision_utils import process_vision_info
+
+            raw_images = item["images"]
+            vision_infos = [{"image": raw_images[i]} for i in range(len(raw_images))]
+            extracted = process_vision_info(vision_infos, return_video_kwargs=True)
+            images = extracted[0] if isinstance(extracted, tuple) and extracted else None
+            if images is None:
+                images = []
+            elif not isinstance(images, list):
+                images = [images]
+        except Exception:
+            images = []
+        return _resize_vlm_images(images, image_size)
+
+    return []
 
 
 def _flatten_vlm_images(all_images):
@@ -2618,6 +3665,12 @@ def _to_mx_vlm_batch(inputs):
         else:
             batch[key] = value
 
+    for key in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"):
+        if key in batch and not isinstance(batch[key], mx.array):
+            batch[key] = mx.array(batch[key])
+        if key in batch and len(batch[key].shape) == 1:
+            batch[key] = batch[key].reshape((1, -1))
+
     if "input_ids" in batch:
         # Preserve raw input_ids under a private key BEFORE the int32 narrow
         # so labels-free / response-mask paths can derive labels from the
@@ -2643,15 +3696,27 @@ def _to_mx_vlm_batch(inputs):
     return batch
 
 
-def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes=None):
+def _processor_vlm_inputs(
+    processor,
+    texts,
+    all_images,
+    max_seq_length,
+    suffixes=None,
+    truncation=True,
+    padding_side=None,
+):
     base_kwargs = dict(
         text=texts,
         padding=True,
-        truncation=True,
-        max_length=max_seq_length,
         return_tensors="np",
         add_special_tokens=False,
     )
+    if truncation:
+        base_kwargs["truncation"] = True
+        if max_seq_length is not None:
+            base_kwargs["max_length"] = max_seq_length
+    if padding_side is not None:
+        base_kwargs["padding_side"] = padding_side
     images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
         image_layouts = (
@@ -2698,6 +3763,16 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
                     if len(image_layouts) == 1:
                         raise
                     continue
+            if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
+                proc_kwargs.pop("padding_side", None)
+                try:
+                    return processor(**proc_kwargs)
+                except Exception as retry_exc:
+                    if first_error is None:
+                        first_error = retry_exc
+                    if len(image_layouts) == 1:
+                        raise
+                    continue
             if first_error is None:
                 first_error = exc
             if len(image_layouts) == 1:
@@ -2710,77 +3785,227 @@ def _processor_vlm_inputs(processor, texts, all_images, max_seq_length, suffixes
     raise first_error
 
 
-def _collate_vlm_prompt_completion_batch(items, processor, max_seq_length, image_size,
-                                         ignore_token_ids=None):
+def _as_numpy_vlm_field(inputs, key):
+    """Return a processor output field as a 2-D numpy array."""
+    value = inputs[key]
+    arr = np.asarray(value)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    return arr
+
+
+def _common_text_prefix(left, right):
+    """Return CUDA's shared rendered prompt prefix for VLM PC rows."""
+    end = 0
+    for lhs, rhs in zip(left, right):
+        if lhs != rhs:
+            break
+        end += 1
+    return left[:end]
+
+
+def _vlm_tokenizer_padding_side(processor):
+    """Resolve the tokenizer padding side used by CUDA's VLM collator."""
+    tokenizer = _get_processor_tokenizer(processor)
+    side = getattr(tokenizer, "padding_side", "right")
+    return "left" if side == "left" else "right"
+
+
+def _vlm_pad_token_id(processor):
+    """Return the processor tokenizer pad id required for PC collation."""
+    tokenizer = _get_processor_tokenizer(processor)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        raise ValueError(
+            "Tokenizer must define `pad_token_id` for prompt-completion collation."
+        )
+    return int(pad_id)
+
+
+def _concat_vlm_token_type_ids(prompt_inputs, completion_inputs, p_ids, c_ids):
+    """Concatenate token-type metadata the same way CUDA's collator does."""
+    for key in ("token_type_ids", "mm_token_type_ids"):
+        if key not in prompt_inputs and key not in completion_inputs:
+            continue
+        p_tt = (
+            _as_numpy_vlm_field(prompt_inputs, key)
+            if key in prompt_inputs else np.zeros_like(p_ids)
+        )
+        c_tt = (
+            _as_numpy_vlm_field(completion_inputs, key)
+            if key in completion_inputs else np.zeros_like(c_ids)
+        )
+        return key, np.concatenate((p_tt, c_tt), axis=1)
+    return None, None
+
+
+def _flush_vlm_arrays_to_side(input_ids, attention_mask, side, pad_id, extras):
+    """Move non-pad VLM PC tokens to the tokenizer padding side."""
+    keep = attention_mask.astype(bool)
+    if keep.all():
+        return input_ids, attention_mask, extras
+
+    batch, seq_len = input_ids.shape
+    counts = keep.sum(axis=1)
+    ranks = np.cumsum(keep, axis=1) - 1
+    if side == "left":
+        dst = (seq_len - counts)[:, None] + ranks
+    else:
+        dst = ranks
+
+    row_idx, col_src = np.nonzero(keep)
+    col_dst = dst[row_idx, col_src].astype(np.int64)
+
+    new_ids = np.full(input_ids.shape, pad_id, dtype=input_ids.dtype)
+    new_mask = np.zeros(attention_mask.shape, dtype=attention_mask.dtype)
+    new_ids[row_idx, col_dst] = input_ids[row_idx, col_src]
+    new_mask[row_idx, col_dst] = 1
+
+    new_extras = {}
+    for key, values in extras.items():
+        out = np.zeros(values.shape, dtype=values.dtype)
+        out[row_idx, col_dst] = values[row_idx, col_src]
+        new_extras[key] = out
+
+    max_count = int(counts.max()) if counts.size else 0
+    if 0 < max_count < seq_len:
+        sl = slice(seq_len - max_count, seq_len) if side == "left" else slice(0, max_count)
+        new_ids = new_ids[:, sl]
+        new_mask = new_mask[:, sl]
+        new_extras = {key: value[:, sl] for key, value in new_extras.items()}
+
+    return new_ids, new_mask, new_extras
+
+
+def _truncate_vlm_arrays_by_side(input_ids, attention_mask, side, max_seq_length, extras):
+    """Truncate VLM PC arrays from the same side as CUDA."""
+    if max_seq_length is None or max_seq_length <= 0 or input_ids.shape[1] <= max_seq_length:
+        return input_ids, attention_mask, extras
+    sl = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
+    return (
+        input_ids[:, sl],
+        attention_mask[:, sl],
+        {key: value[:, sl] for key, value in extras.items()},
+    )
+
+
+def _collate_vlm_prompt_completion_batch(
+    items,
+    processor,
+    max_seq_length,
+    image_size,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+):
     prompt_texts = []
-    combined_texts = []
+    completion_texts = []
     all_images = []
 
     for item in items:
-        prompt = _normalize_vlm_messages(item.get("prompt", ""))
-        completion = _normalize_vlm_messages(item.get("completion", ""))
+        prompt_raw = item.get("prompt", "")
+        completion_raw = item.get("completion", "")
+        prompt = _normalize_vlm_messages(prompt_raw)
+        completion = _normalize_vlm_messages(completion_raw)
+        # Coerce a raw prompt to a chat message when the completion is chat-style so
+        # both render through one template and split cleanly (avoids None + list).
+        if isinstance(completion, list) and isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
 
-        if prompt_messages is not None and completion_messages is not None:
-            combined = prompt_messages + completion_messages
-            images = _extract_vlm_images(item, combined, image_size)
-            prompt_text = _render_vlm_messages(processor, prompt_messages)
-            combined_text = _render_vlm_messages(processor, combined)
+        if prompt_messages is not None:
+            prompt_text = _render_vlm_messages(
+                processor,
+                prompt_messages,
+                add_generation_prompt=True,
+            )
         else:
-            images = _extract_vlm_images(item, prompt_messages or [], image_size)
-            prompt_text = _render_vlm_messages(processor, prompt)
-            completion_text = _render_vlm_messages(processor, completion)
-            combined_text = prompt_text + completion_text
+            prompt_text = str(prompt)
+
+        if completion_messages is not None:
+            combined = prompt_messages + completion_messages
+            prompt_completion_text = _render_vlm_messages(processor, combined)
+            images = _extract_vlm_pc_images(
+                item, prompt_messages, completion_messages, image_size,
+            )
+            prompt_text = _common_text_prefix(
+                prompt_text, prompt_completion_text,
+            )
+            completion_text = prompt_completion_text[len(prompt_text):]
+        else:
+            images = _extract_vlm_pc_images(
+                item, prompt_messages, completion_messages, image_size,
+            )
+            completion_text = str(completion)
 
         prompt_texts.append(prompt_text)
-        combined_texts.append(combined_text)
+        completion_texts.append(completion_text)
         all_images.append(images)
 
-    combined_inputs = _processor_vlm_inputs(
-        processor, combined_texts, all_images, max_seq_length
-    )
     prompt_inputs = _processor_vlm_inputs(
-        processor, prompt_texts, all_images, max_seq_length
+        processor,
+        prompt_texts,
+        all_images,
+        max_seq_length,
+        truncation=False,
+        padding_side="left",
+    )
+    completion_inputs = _processor_vlm_inputs(
+        processor,
+        completion_texts,
+        [[] for _ in completion_texts],
+        max_seq_length,
+        truncation=False,
+        padding_side="right",
     )
 
-    # Build labels BEFORE _to_mx_vlm_batch narrows to int32 so wide invalid
-    # ids (e.g. uint32 wrap) reach the runtime CCE validity check intact.
-    # A direct int64 cast of uint64 would wrap 2**64-100 onto -100; saturate
-    # those rows to a positive out-of-vocab sentinel instead.
-    _raw_input_ids = np.asarray(combined_inputs["input_ids"])
-    if _raw_input_ids.dtype == np.uint64:
-        labels_np = np.where(
-            _raw_input_ids > np.uint64((1 << 63) - 1),
-            np.int64(1 << 62),
-            _raw_input_ids.astype(np.int64),
-        ).copy()
-    else:
-        labels_np = _raw_input_ids.astype(np.int64, copy=True)
+    p_ids = _as_numpy_vlm_field(prompt_inputs, "input_ids")
+    c_ids = _as_numpy_vlm_field(completion_inputs, "input_ids")
+    p_mask = _as_numpy_vlm_field(prompt_inputs, "attention_mask")
+    c_mask = _as_numpy_vlm_field(completion_inputs, "attention_mask")
+    input_ids = np.concatenate((p_ids, c_ids), axis=1)
+    attention_mask = np.concatenate((p_mask, c_mask), axis=1)
+    completion_mask = np.concatenate((np.zeros_like(p_mask), c_mask), axis=1)
+    token_type_key, token_type_ids = _concat_vlm_token_type_ids(
+        prompt_inputs, completion_inputs, p_ids, c_ids,
+    )
+
+    extras = {"completion_mask": completion_mask}
+    if token_type_key is not None:
+        extras[token_type_key] = token_type_ids
+
+    flush_side = _vlm_tokenizer_padding_side(processor)
+    pad_id = _vlm_pad_token_id(processor)
+    input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
+        input_ids, attention_mask, flush_side, pad_id, extras,
+    )
+    input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
+        input_ids, attention_mask, flush_side, max_seq_length, extras,
+    )
+
+    combined_inputs = dict(prompt_inputs)
+    combined_inputs["input_ids"] = input_ids
+    combined_inputs["attention_mask"] = attention_mask
+    if token_type_key is not None:
+        combined_inputs[token_type_key] = extras[token_type_key]
     batch = _to_mx_vlm_batch(combined_inputs)
     batch["labels"] = _apply_vlm_label_masks(
         batch,
         ignore_token_ids=ignore_token_ids,
     )
 
-    # Read masked labels back (image + attention already applied by
-    # _apply_vlm_label_masks); int64 preserves wide invalid ids for CCE.
-    labels_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
-    prompt_batch = _to_mx_vlm_batch(prompt_inputs)
-    prompt_mask = prompt_batch.get("attention_mask")
-    prompt_ids = prompt_batch["input_ids"]
-    for row in range(labels_np.shape[0]):
-        if prompt_mask is not None:
-            prompt_len = int(mx.sum(prompt_mask[row]).item())
-        else:
-            prompt_len = int(mx.sum(prompt_ids[row] != 0).item())
-        labels_np[row, :prompt_len] = -100
-    batch["labels"] = mx.array(labels_np)
+    completion_only_loss_enabled = True if completion_only_loss is None else bool(completion_only_loss)
+    if completion_only_loss_enabled:
+        labels_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
+        labels_np[np.asarray(extras["completion_mask"]) == 0] = -100
+        batch["labels"] = mx.array(labels_np)
     return batch
 
 
 def _collate_vlm_batch(items, processor, max_seq_length, image_size,
-                       formatting_func=None, ignore_token_ids=None):
+                       formatting_func=None, ignore_token_ids=None,
+                       completion_only_loss=None,
+                       return_prompt_completion=False):
     """Collate a batch of VLM samples using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator: extract images, resize
@@ -2800,10 +4025,12 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         and "prompt" in formatted_items[0]
         and "completion" in formatted_items[0]
     ):
-        return _collate_vlm_prompt_completion_batch(
+        batch = _collate_vlm_prompt_completion_batch(
             formatted_items, processor, max_seq_length, image_size,
             ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
         )
+        return (batch, True) if return_prompt_completion else batch
 
     all_texts = []
     all_images = []
@@ -2836,15 +4063,15 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         batch,
         ignore_token_ids=ignore_token_ids,
     )
-    return batch
+    return (batch, False) if return_prompt_completion else batch
 
 
 def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None):
     """Apply response masking to a VLM batch dict, adding 'labels' key.
 
     Converts input_ids to plain lists, runs the masking closure from
-    dataset_utils.train_on_responses_only, and stores the result as
-    an mx.array in batch_dict["labels"].
+    dataset_utils.train_on_responses_only with the current VLM labels, and
+    stores the result as an mx.array in batch_dict["labels"].
     """
     # Prefer the raw (pre-int32-narrowing) input_ids so the masking closure
     # sees original processor ids; wide invalid ids like uint32(2**32-100)
@@ -2852,7 +4079,15 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
     raw_input_ids = batch_dict.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
     input_ids = raw_input_ids if raw_input_ids is not None else batch_dict["input_ids"]
     ids_list = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
-    result = mask_fn({"input_ids": ids_list})
+    mask_batch = {"input_ids": ids_list}
+    existing_labels = batch_dict.get("labels")
+    if existing_labels is not None:
+        labels_list = (
+            existing_labels.tolist()
+            if hasattr(existing_labels, "tolist") else existing_labels
+        )
+        mask_batch["labels"] = _normalize_numpy_cce_labels(labels_list)
+    result = mask_fn(mask_batch)
     labels_list = result["labels"]
     if hasattr(labels_list, "tolist"):
         labels_list = labels_list.tolist()
@@ -2870,10 +4105,103 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
     return batch_dict
 
 
+def _vlm_trainable_label_rows(batch_dict):
+    """Return per-row trainability from VLM labels after response masking."""
+    labels = batch_dict.get("labels")
+    if labels is None:
+        return None
+    labels_np = np.asarray(labels.tolist() if hasattr(labels, "tolist") else labels)
+    if labels_np.ndim == 1:
+        labels_np = labels_np.reshape(1, -1)
+    # Loss supervises labels[:, 1:] (causal shift), so the first column never trains.
+    return [bool(np.any(row[1:] != -100)) for row in labels_np]
+
+
+def _build_response_masked_vlm_batch(
+    items,
+    processor,
+    config,
+    max_seq_length,
+    image_size,
+    response_mask_fn=None,
+    formatting_func=None,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+    return_prompt_completion=False,
+):
+    """Collate VLM rows and apply the CUDA response-mask closure."""
+    batch_dict, is_prompt_completion = _collate_vlm_batch(
+        items, processor, max_seq_length, image_size,
+        formatting_func=formatting_func,
+        ignore_token_ids=ignore_token_ids,
+        completion_only_loss=completion_only_loss,
+        return_prompt_completion=True,
+    )
+    batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
+    if response_mask_fn is not None and not is_prompt_completion:
+        batch_dict = _apply_response_mask_to_vlm_batch(
+            batch_dict,
+            response_mask_fn,
+            ignore_token_ids=ignore_token_ids,
+        )
+    if return_prompt_completion:
+        return batch_dict, is_prompt_completion
+    return batch_dict
+
+
+def _filter_trainable_vlm_indices(
+    dataset,
+    indices,
+    processor,
+    config,
+    max_seq_length,
+    image_size,
+    response_mask_fn,
+    formatting_func=None,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+):
+    """Filter VLM rows before batching, matching CUDA dataset.filter order."""
+    kept_indices = []
+    formatted_items = {} if formatting_func is not None else None
+    removed = 0
+    for idx in indices:
+        item = dataset[idx]
+        if formatting_func is not None:
+            item = formatting_func(item)
+        batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+            [item],
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=None,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+            return_prompt_completion=True,
+        )
+        if is_prompt_completion:
+            kept_indices.append(idx)
+            if formatted_items is not None:
+                formatted_items[idx] = item
+            continue
+        valid_rows = _vlm_trainable_label_rows(batch_dict)
+        if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+            removed += 1
+            continue
+        kept_indices.append(idx)
+        if formatted_items is not None:
+            formatted_items[idx] = item
+    return kept_indices, removed, formatted_items
+
+
 def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
-                       num_epochs=None):
+                       num_epochs=None, completion_only_loss=None,
+                       image_size=None, comm_group=None,
+                       distributed_pad_mode="cycle"):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -2881,23 +4209,61 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     """
     import numpy as np
 
-    image_size = _get_vlm_image_size(config, processor)
+    image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
     batch_list = []
     seen = 0
     epoch = 0
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     base_seed = _normalize_seed(seed)
     target_epochs = 1 if num_batches is None and num_epochs is None else num_epochs
-    indices = list(range(len(dataset)))
-    if dataset_order == "torch_randperm":
-        indices = _torch_randperm_order(len(dataset), base_seed)
-    elif dataset_order in (None, "default"):
-        if num_batches is not None:
-            np.random.seed(base_seed)
-            np.random.shuffle(indices)
-    elif dataset_order != "sequential":
+    base_indices = list(range(len(dataset)))
+    total_removed = 0
+    formatted_items = None
+    if response_mask_fn is not None:
+        base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+            dataset,
+            base_indices,
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn,
+            formatting_func=formatting_func,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+        )
+        if not base_indices and total_removed > 0:
+            raise ValueError(
+                "Unsloth MLX VLM: no trainable rows remain after "
+                "train_on_responses_only masking. Check instruction_part / "
+                "response_part and max_seq_length."
+            )
+    batch_formatting_func = None if formatted_items is not None else formatting_func
+
+    def _item(idx):
+        return formatted_items[idx] if formatted_items is not None else dataset[idx]
+
+    if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+    if not base_indices:
+        return []
+
+    def _epoch_indices(epoch_idx):
+        """Return CUDA-style sampler order over the filtered VLM dataset."""
+        if dataset_order == "torch_randperm":
+            order = _torch_randperm_order(len(base_indices), base_seed + epoch_idx)
+            return [base_indices[i] for i in order]
+        indices = list(base_indices)
+        if dataset_order in (None, "default") and (
+            num_batches is not None or epoch_idx > 0
+        ):
+            rng = np.random.RandomState(base_seed + epoch_idx)
+            rng.shuffle(indices)
+        return indices
+
+    indices = _epoch_indices(epoch)
 
     while num_batches is None or len(batch_list) < num_batches:
         if seen >= len(indices):
@@ -2905,31 +4271,54 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                 break
             epoch += 1
             seen = 0
-            indices = list(range(len(dataset)))
-            if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
-            elif dataset_order in (None, "default"):
-                np.random.seed(base_seed + epoch)
-                np.random.shuffle(indices)
+            indices = _epoch_indices(epoch)
 
-        bi = indices[seen : seen + batch_size]
-        seen += len(bi)
+        global_indices = indices[seen : seen + global_batch_size]
+        seen += len(global_indices)
+        if not global_indices:
+            break
+        bi = _rank_slice_distributed_batch(
+            global_indices,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=indices,
+            pad_mode=distributed_pad_mode,
+        )
         if not bi:
             break
-        items = [dataset[idx] for idx in bi]
-        batch_dict = _collate_vlm_batch(
-            items, processor, max_seq_length, image_size,
-            formatting_func=formatting_func,
+        empty_rows = [idx is None for idx in bi]
+        if any(empty_rows):
+            pad_idx = next((idx for idx in bi if idx is not None), None)
+            if pad_idx is None:
+                pad_idx = global_indices[0]
+            batch_items = [
+                _item(pad_idx if idx is None else idx)
+                for idx in bi
+            ]
+        else:
+            batch_items = [_item(idx) for idx in bi]
+        batch_dict = _build_response_masked_vlm_batch(
+            batch_items,
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
         )
-        batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
-        if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(
-                batch_dict,
-                response_mask_fn,
-                ignore_token_ids=ignore_token_ids,
+        if any(empty_rows):
+            batch_dict = _mask_empty_vlm_padding_rows(
+                batch_dict, empty_rows, processor=processor,
             )
         batch_list.append(batch_dict)
+
+    if total_removed > 0:
+        print(
+            f"Unsloth: Removed {total_removed} VLM samples where all labels "
+            f"were -100 after train_on_responses_only masking."
+        )
 
     # Evaluate all tensors
     all_tensors = []
@@ -2947,7 +4336,9 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   max_seq_length, seed=42,
                                   response_mask_fn=None,
                                   formatting_func=None,
-                                  dataset_order="default"):
+                                  dataset_order="default",
+                                  completion_only_loss=None,
+                                  image_size=None, comm_group=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -2955,78 +4346,177 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     """
     import numpy as np
 
-    image_size = _get_vlm_image_size(config, processor)
+    image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
     base_seed = _normalize_seed(seed)
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
 
-    def _emit(items):
-        batch_dict = _collate_vlm_batch(
-            items, processor, max_seq_length, image_size,
-            formatting_func=formatting_func,
+    def _build_batch(items, batch_formatting_func):
+        """Build one VLM batch with the selected formatting function."""
+        return _build_response_masked_vlm_batch(
+            items,
+            processor,
+            config,
+            max_seq_length,
+            image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
         )
-        batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
-        if response_mask_fn is not None:
-            batch_dict = _apply_response_mask_to_vlm_batch(
-                batch_dict,
-                response_mask_fn,
-                ignore_token_ids=ignore_token_ids,
-            )
-        return batch_dict
 
     if hasattr(dataset, "__len__"):
         if len(dataset) <= 0:
             raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+        base_indices = list(range(len(dataset)))
+        total_removed = 0
+        formatted_items = None
+        if response_mask_fn is not None:
+            base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+                dataset,
+                base_indices,
+                processor,
+                config,
+                max_seq_length,
+                image_size,
+                response_mask_fn,
+                formatting_func=formatting_func,
+                ignore_token_ids=ignore_token_ids,
+                completion_only_loss=completion_only_loss,
+            )
+            if not base_indices and total_removed > 0:
+                raise ValueError(
+                    "Unsloth MLX VLM: no trainable rows remain after "
+                    "train_on_responses_only masking. Check instruction_part / "
+                    "response_part and max_seq_length."
+                )
+            if total_removed > 0:
+                print(
+                    f"Unsloth: Removed {total_removed} VLM samples where all "
+                    f"labels were -100 after train_on_responses_only masking."
+                )
+        if not base_indices:
+            raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+
+        def _item(idx):
+            return formatted_items[idx] if formatted_items is not None else dataset[idx]
+
+        batch_formatting_func = None if formatted_items is not None else formatting_func
         epoch = 0
         while True:
             if dataset_order == "torch_randperm":
-                indices = _torch_randperm_order(len(dataset), base_seed + epoch)
+                order = _torch_randperm_order(len(base_indices), base_seed + epoch)
+                indices = [base_indices[i] for i in order]
             elif dataset_order == "sequential":
-                indices = list(range(len(dataset)))
+                indices = list(base_indices)
             elif dataset_order in (None, "default"):
-                indices = list(range(len(dataset)))
+                indices = list(base_indices)
                 batch_indices = [
-                    indices[i : i + batch_size]
-                    for i in range(0, len(indices), batch_size)
+                    indices[i : i + global_batch_size]
+                    for i in range(0, len(indices), global_batch_size)
                 ]
                 # Local RNG keeps order reproducible under `seed`; reseed per epoch.
                 rng = np.random.default_rng(base_seed + epoch)
                 order = rng.permutation(len(batch_indices))
                 for b in order:
-                    items = [dataset[idx] for idx in batch_indices[b]]
-                    yield _emit(items)
+                    local_indices = _rank_slice_distributed_batch(
+                        batch_indices[b],
+                        batch_size,
+                        comm_group=comm_group,
+                        pad_source=indices,
+                    )
+                    if local_indices:
+                        yield _build_batch(
+                            [_item(idx) for idx in local_indices],
+                            batch_formatting_func,
+                        )
                 epoch += 1
                 continue
             else:
                 raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
-            for start in range(0, len(indices), batch_size):
-                items = [dataset[idx] for idx in indices[start : start + batch_size]]
-                yield _emit(items)
+            for start in range(0, len(indices), global_batch_size):
+                local_indices = _rank_slice_distributed_batch(
+                    indices[start : start + global_batch_size],
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=indices,
+                )
+                if local_indices:
+                    yield _build_batch(
+                        [_item(idx) for idx in local_indices],
+                        batch_formatting_func,
+                    )
             epoch += 1
     else:
-        # Streaming has no index space; refuse rather than silently misorder.
-        if dataset_order not in (None, "default"):
+        # Streaming has no index space to permute; torch_randperm needs sized epochs.
+        if dataset_order == "torch_randperm":
             raise ValueError(
                 "Unsloth MLX VLM: preserve_dataset_order / "
-                f"dataset_order={dataset_order!r} requires a sized "
-                "(`__len__`) dataset. Materialize the dataset (e.g. "
-                "via `dataset.to_iterable_dataset()` -> list) or drop "
-                "the order request."
+                "dataset_order='torch_randperm' requires a sized "
+                "(`__len__`) dataset."
             )
+        if dataset_order not in (None, "default", "sequential"):
+            raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+        def _filter_stream_item(item):
+            """Return a formatted trainable streaming row, or None to skip it."""
+            if response_mask_fn is None:
+                return item
+            if formatting_func is not None:
+                item = formatting_func(item)
+            batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+                [item],
+                processor,
+                config,
+                max_seq_length,
+                image_size,
+                response_mask_fn=response_mask_fn,
+                formatting_func=None,
+                ignore_token_ids=ignore_token_ids,
+                completion_only_loss=completion_only_loss,
+                return_prompt_completion=True,
+            )
+            if is_prompt_completion:
+                return item
+            valid_rows = _vlm_trainable_label_rows(batch_dict)
+            if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+                return None
+            return item
+
+        batch_formatting_func = None if response_mask_fn is not None else formatting_func
         while True:
             pending = []
             yielded = False
             for item in dataset:
+                item = _filter_stream_item(item)
+                if item is None:
+                    continue
                 pending.append(item)
-                if len(pending) >= batch_size:
-                    yielded = True
-                    yield _emit(pending)
+                if len(pending) >= global_batch_size:
+                    local_items = _rank_slice_distributed_batch(
+                        pending,
+                        batch_size,
+                        comm_group=comm_group,
+                        pad_source=pending,
+                    )
+                    if local_items:
+                        yielded = True
+                        yield _build_batch(local_items, batch_formatting_func)
                     pending = []
             if pending:
-                yielded = True
-                yield _emit(pending)
+                local_items = _rank_slice_distributed_batch(
+                    pending,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=pending,
+                )
+                if local_items:
+                    yielded = True
+                    yield _build_batch(local_items, batch_formatting_func)
             if not yielded:
-                raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
+                raise ValueError(
+                    "Unsloth MLX VLM: streaming dataset produced no rows. "
+                    "If resuming, use a replayable iterable rather than a one-shot iterator."
+                )
 
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
@@ -3100,7 +4590,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
             self._eos_id = eos_id
 
         def process(self, item):
-            encoded = self.tokenizer.encode(item[self.text_key])
+            encoded = encode_mlx_text(self.tokenizer, item[self.text_key])
             if (
                 self._eos_id is not None
                 and (not encoded or encoded[-1] != self._eos_id)
@@ -3122,7 +4612,9 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
 def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                    num_batches=None, seed=42, dataset_text_field="text",
                    formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None, append_eos=True):
+                   model_name=None, model_type=None, append_eos=True,
+                   completion_only_loss=None, assistant_only_loss=False,
+                   comm_group=None, distributed_pad_mode="cycle"):
     """Pre-tokenize and batch a HuggingFace dataset for MLX training.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
@@ -3133,12 +4625,82 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     Tokenization is delegated to mlx_lm's TextDataset (appends EOS, etc.)
     so behaviour matches ``mlx_lm.lora`` exactly.
 
+    In DDP, ``batch_size`` remains the local per-rank micro-batch size. The
+    optional ``comm_group`` is used only to derive a global batch for sharding,
+    then tail global batches are padded so every rank yields the same number
+    of local batches.
+
     Returns:
         List of (batch, lengths) tuples, where batch has shape
         (batch_size, padded_length) and lengths has shape (batch_size, 2)
         with [offset, length] per sequence (from iterate_batches).
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    dataset = _ensure_reiterable_text_dataset(dataset)
+    tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
+        dataset,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+    )
+    if saw_pretokenized:
+        return _create_tokenized_text_batches(
+            tokenized,
+            batch_size,
+            max_seq_length,
+            num_batches=num_batches,
+            seed=seed,
+            pad_id=_mlx_text_pad_id(tokenizer),
+        )
+    if assistant_only_loss:
+        _validate_mlx_text_assistant_only_dataset(dataset)
+
+    if completion_only_loss is not False or assistant_only_loss:
+        normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        tokenized = _prepare_labeled_text_dataset(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+        )
+        if tokenized:
+            return _create_labeled_text_batches(
+                tokenized,
+                batch_size,
+                max_seq_length,
+                num_batches=num_batches,
+                seed=seed,
+                pad_id=_mlx_text_pad_id(tokenizer),
+            )
+        if assistant_only_loss:
+            raise ValueError(
+                "Unsloth MLX: assistant_only_loss=True produced no "
+                "assistant-labeled text rows."
+            )
+        if completion_only_loss is True:
+            raise ValueError(
+                "Unsloth MLX: text completion_only_loss=True requires "
+                "prompt/completion rows."
+            )
+        if _prompt_completion_formatter_conflict(
+            dataset, formatting_func, completion_only_loss
+        ):
+            raise ValueError(
+                "Unsloth MLX: a formatting_func was provided for a prompt/completion "
+                "dataset, which drops the completion boundary needed for the default "
+                "completion-only loss. Apply your formatting before passing the "
+                "dataset, or set completion_only_loss=False."
+            )
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
@@ -3148,22 +4710,235 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         append_eos=append_eos,
     )
 
-    batch_pairs = []
-    for batch, lengths_info in iterate_batches(
-        ds, batch_size, max_seq_length,
-        loop=(num_batches is not None),
-        seed=seed,
-    ):
-        max_length = int(mx.max(lengths_info[:, 1]).item())
-        batch = batch[:, :max_length]
-        batch_pairs.append((batch, lengths_info, None))
-        if num_batches is not None and len(batch_pairs) >= num_batches:
-            break
+    if _distributed_rank_size(comm_group)[1] > 1:
+        batch_pairs = _create_distributed_text_batches(
+            ds, batch_size, max_seq_length,
+            num_batches=num_batches,
+            seed=seed,
+            comm_group=comm_group,
+            distributed_pad_mode=distributed_pad_mode,
+            tokenizer=tokenizer,
+        )
+    else:
+        batch_pairs = []
+        for batch, lengths_info in iterate_batches(
+            ds, batch_size, max_seq_length,
+            loop=(num_batches is not None),
+            seed=seed,
+        ):
+            max_length = int(mx.max(lengths_info[:, 1]).item())
+            batch = batch[:, :max_length]
+            batch_pairs.append((batch, lengths_info, None))
+            if num_batches is not None and len(batch_pairs) >= num_batches:
+                break
 
     mx.eval(
         [b for b, lengths, _ in batch_pairs]
         + [lengths for _, lengths, _ in batch_pairs]
     )
+    return batch_pairs
+
+
+def _distributed_rank_size(comm_group=None):
+    """Return ``(rank, world_size)`` for an optional MLX distributed group."""
+    if comm_group is None:
+        return 0, 1
+    rank = int(comm_group.rank())
+    world_size = int(comm_group.size())
+    if world_size < 1:
+        raise ValueError(f"Invalid MLX distributed world_size={world_size}.")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Invalid MLX distributed rank={rank} for world_size={world_size}."
+        )
+    return rank, world_size
+
+
+def _distributed_global_batch_size(local_batch_size, comm_group=None):
+    """Return the global micro-batch size implied by local batch and world."""
+    _, world_size = _distributed_rank_size(comm_group)
+    return int(local_batch_size) * world_size
+
+
+def _rank_slice_distributed_batch(
+    items,
+    local_batch_size,
+    comm_group=None,
+    pad_source=None,
+    pad_mode="cycle",
+):
+    """Return this rank's local slice from one global DDP micro-batch.
+
+    Tail global batches are padded so every rank executes the same number of
+    micro-batches and collectives stay aligned. Training uses ``cycle`` to keep
+    full batches; eval can use ``empty`` so padded rows do not contribute tokens.
+    """
+    rank, world_size = _distributed_rank_size(comm_group)
+    items = list(items)
+    if world_size <= 1:
+        return items
+
+    target_size = int(local_batch_size) * world_size
+    if target_size <= 0:
+        raise ValueError("local_batch_size must be positive for distributed batching.")
+    if pad_mode not in ("cycle", "empty"):
+        raise ValueError(f"Unsupported distributed pad mode: {pad_mode!r}.")
+    if len(items) > target_size:
+        items = items[:target_size]
+    if len(items) < target_size:
+        if not items:
+            return []
+        if pad_mode == "empty":
+            items.extend([None] * (target_size - len(items)))
+        else:
+            source = list(pad_source) if pad_source is not None else list(items)
+            if not source:
+                return []
+            pad_pos = 0
+            while len(items) < target_size:
+                items.append(source[pad_pos % len(source)])
+                pad_pos += 1
+    return items[rank:target_size:world_size]
+
+
+def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
+    """Build a text training batch from tokenized items."""
+    valid_items = [item for item in batch_items if item is not None]
+    with_offsets = bool(
+        valid_items
+        and isinstance(valid_items[0], tuple)
+        and len(valid_items[0]) == 2
+    )
+    batch = []
+    offsets = []
+    lengths = []
+    for item in batch_items:
+        if item is None:
+            batch.append([])
+            offsets.append(0)
+            lengths.append(0)
+        elif with_offsets:
+            ids, offset = item
+            batch.append(ids)
+            offsets.append(offset)
+            lengths.append(len(ids))
+        else:
+            batch.append(item)
+            offsets.append(0)
+            lengths.append(len(item))
+    if max(lengths) > max_seq_length:
+        print(
+            f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
+            f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
+            "Consider pre-splitting your data to save memory."
+        )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    pad_id = 0 if pad_id is None else int(pad_id)
+    pad_to = 32
+    max_length = max(2, 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to))
+    max_length = min(max_length, max_seq_length)
+    batch_ids = []
+    truncated_lengths = []
+    for ids, length in zip(batch, lengths):
+        truncated_length = min(length, max_seq_length)
+        truncated_lengths.append(truncated_length)
+        batch_ids.append(
+            list(ids)[:truncated_length]
+            + [pad_id] * (max_length - truncated_length)
+        )
+    return (
+        mx.array(np.asarray(batch_ids, dtype=np.int32)),
+        mx.array(np.asarray(list(zip(offsets, truncated_lengths)), dtype=np.int32)),
+        None,
+    )
+
+
+def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
+    """Mask synthetic VLM eval padding labels so they do not affect metrics.
+
+    Keep input_ids and attention_mask unchanged: VLM processors may have
+    already attached row-aligned image features, and the forward still needs a
+    valid text/vision row. Labels alone exclude the row from eval loss.
+    """
+    if not any(empty_rows):
+        return batch_dict
+    row_mask = np.asarray(empty_rows, dtype=bool)
+    value = batch_dict.get("labels")
+    if value is None or not hasattr(value, "shape"):
+        return batch_dict
+    if int(value.shape[0]) != int(row_mask.shape[0]):
+        return batch_dict
+    arr = np.asarray(
+        value.tolist() if hasattr(value, "tolist") else value,
+        dtype=np.int64,
+    )
+    arr[row_mask] = -100
+    batch_dict["labels"] = mx.array(arr)
+    return batch_dict
+
+
+def _create_distributed_text_batches(
+    dataset,
+    batch_size,
+    max_seq_length,
+    *,
+    num_batches=None,
+    seed=42,
+    comm_group=None,
+    distributed_pad_mode="cycle",
+    tokenizer=None,
+):
+    """Distributed variant of mlx-lm's length-sorted text batch iterator."""
+    # Length is measured on the tokenized row. CacheDataset.itemlen returns
+    # len(raw_row), which for the {"text": ...} rows _prepare_dataset produces
+    # is the dict key count (1), not the token count, so it cannot gate the
+    # two-token minimum below. Reading dataset[idx][0] yields the processed
+    # token ids (mirroring _iter_tokenized_text_rows) and caches the processed
+    # row on the CacheDataset, so the batch build below reuses it.
+    len_fn = lambda idx: len(dataset[idx][0])
+    # Drop rows with fewer than two tokens (no causal target). Length sorting
+    # places these shortest rows first, so without this filter an all-short
+    # first global microbatch would sum to zero supervised tokens and trip the
+    # zero-supervised-token abort in trainer.py.
+    idx = sorted((i for i in range(len(dataset)) if len_fn(i) >= 2), key=len_fn)
+    if not idx:
+        raise ValueError(
+            "Unsloth MLX: distributed text dataset has no rows with at least 2 "
+            "tokens (need an input and a causal target)."
+        )
+
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+    batch_idx = [
+        idx[i : i + global_batch_size]
+        for i in range(0, len(idx), global_batch_size)
+    ]
+    rng = np.random.RandomState(_normalize_seed(seed))
+
+    batch_pairs = []
+    while True:
+        indices = rng.permutation(len(batch_idx))
+        for i in indices:
+            local_idx = _rank_slice_distributed_batch(
+                batch_idx[i],
+                batch_size,
+                comm_group=comm_group,
+                pad_source=idx,
+                pad_mode=distributed_pad_mode,
+            )
+            if not local_idx:
+                continue
+            batch = [None if j is None else dataset[j] for j in local_idx]
+            batch_pairs.append(
+                _make_text_batch_from_items(
+                    batch,
+                    tokenizer=tokenizer,
+                    max_seq_length=max_seq_length,
+                )
+            )
+            if num_batches is not None and len(batch_pairs) >= num_batches:
+                return batch_pairs
+        if num_batches is None:
+            break
     return batch_pairs
 
 
@@ -3185,27 +4960,95 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True):
+                           num_epochs=None, append_eos=True,
+                           completion_only_loss=None, assistant_only_loss=False,
+                           comm_group=None):
     """Create text batches with an explicit dataset order.
 
     Studio uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
+
+    In DDP, ``batch_size`` remains local to each rank. ``comm_group`` expands
+    the ordered stream into global micro-batches, pads the final global batch
+    if needed, and returns only this rank's local slice.
     """
 
-    ds = _prepare_dataset(
-        dataset, tokenizer, dataset_text_field, formatting_func,
-        chat_template=chat_template,
-        model_name=model_name,
-        model_type=model_type,
-        append_eos=append_eos,
-    )
-
+    labeled = False
     tokenized = []
-    for row in ds:
-        ids = row[0] if isinstance(row, (tuple, list)) else row
-        ids = list(ids)[:max_seq_length]
-        if len(ids) >= 2:
-            tokenized.append(ids)
+    dataset = _ensure_reiterable_text_dataset(dataset)
+    tokenized_pairs, saw_pretokenized = _prepare_pretokenized_text_dataset(
+        dataset,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+    )
+    if saw_pretokenized:
+        for ids, labels in tokenized_pairs:
+            ids = list(ids)[:max_seq_length]
+            labels = list(labels)[:max_seq_length] if labels is not None else None
+            if len(ids) >= 2:
+                tokenized.append((ids, labels))
+        labeled = True
+    elif assistant_only_loss:
+        _validate_mlx_text_assistant_only_dataset(dataset)
+
+    if not labeled and (completion_only_loss is not False or assistant_only_loss):
+        normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        for ids, labels in _prepare_labeled_text_dataset(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+        ):
+            ids = list(ids)[:max_seq_length]
+            labels = list(labels)[:max_seq_length]
+            if len(ids) >= 2:
+                tokenized.append((ids, labels))
+        labeled = bool(tokenized)
+        if completion_only_loss is True and not labeled:
+            raise ValueError(
+                "Unsloth MLX: text completion_only_loss=True requires "
+                "prompt/completion rows."
+            )
+        if not labeled and _prompt_completion_formatter_conflict(
+            dataset, formatting_func, completion_only_loss
+        ):
+            raise ValueError(
+                "Unsloth MLX: a formatting_func was provided for a prompt/completion "
+                "dataset, which drops the completion boundary needed for the default "
+                "completion-only loss. Apply your formatting before passing the "
+                "dataset, or set completion_only_loss=False."
+            )
+
+    if not labeled:
+        ds = _prepare_dataset(
+            dataset, tokenizer, dataset_text_field, formatting_func,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+        )
+
+        for row in ds:
+            ids = row[0] if isinstance(row, (tuple, list)) else row
+            ids = list(ids)[:max_seq_length]
+            if len(ids) >= 2:
+                tokenized.append(ids)
+
+    if labeled:
+        tokenized = [
+            row for row in tokenized
+            if _labeled_row_has_supervision(row[1], max_seq_length)
+        ]
 
     if not tokenized:
         raise ValueError(
@@ -3226,6 +5069,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     order = make_order(epoch)
     order_pos = 0
     seen = 0
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     target_items = (
         len(tokenized) * (1 if num_epochs is None else int(num_epochs))
         if num_batches is None else None
@@ -3244,7 +5088,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             order = make_order(epoch)
             order_pos = 0
 
-        chunk = order[order_pos : order_pos + batch_size]
+        chunk = order[order_pos : order_pos + global_batch_size]
         if not chunk:
             break
         order_pos += len(chunk)
@@ -3252,21 +5096,34 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is None and target_items is not None and seen > target_items:
             chunk = chunk[: len(chunk) - (seen - target_items)]
             seen = target_items
+        chunk = _rank_slice_distributed_batch(
+            chunk,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=order,
+        )
+        if not chunk:
+            break
         batch_items = [tokenized[i] for i in chunk]
 
-        max_length = max(len(ids) for ids in batch_items)
+        max_length = max(len(item[0] if labeled else item) for item in batch_items)
         # mlx-lm iterate_batches pad convention; raw 0 only if no pad_token_id.
         _pad_id = getattr(tokenizer, "pad_token_id", None)
         if _pad_id is None:
             _pad_id = 0
         _pad_id = int(_pad_id)
-        batch_ids = []
-        lengths = []
-        for ids in batch_items:
-            length = len(ids)
-            batch_ids.append(ids + [_pad_id] * (max_length - length))
-            lengths.append([0, length])
-        batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
+        if labeled:
+            batch_pairs.append(
+                _create_labeled_text_batch(batch_items, max_seq_length, pad_id=_pad_id)
+            )
+        else:
+            batch_ids = []
+            lengths = []
+            for ids in batch_items:
+                length = len(ids)
+                batch_ids.append(ids + [_pad_id] * (max_length - length))
+                lengths.append([0, length])
+            batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
 
         if num_batches is None and target_items is not None and seen >= target_items:
             break
@@ -3274,41 +5131,271 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
     mx.eval(
         [b for b, lengths, _ in batch_pairs]
         + [lengths for _, lengths, _ in batch_pairs]
+        + [labels for _, _, labels in batch_pairs if labels is not None]
     )
     return batch_pairs
+
+
+def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
+                              formatting_func=None, append_eos=True,
+                              max_seq_length=None):
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    for item in dataset:
+        if formatting_func is not None:
+            item = formatting_func(item)
+        texts = collect_mlx_texts(
+            tokenizer,
+            item,
+            dataset_text_field=dataset_text_field,
+            is_vlm=False,
+        )
+        for text in texts:
+            ids = encode_mlx_text(tokenizer, text)
+            if eos_id is not None and (not ids or ids[-1] != eos_id):
+                ids = list(ids) + [int(eos_id)]
+            if max_seq_length is not None:
+                ids = list(ids)[:max_seq_length]
+            if len(ids) >= 2:
+                yield (ids, 0)
+
+
+def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
+                                           max_seq_length, seed=42,
+                                           dataset_text_field="text",
+                                           formatting_func=None,
+                                           dataset_order="default",
+                                           append_eos=True,
+                                           comm_group=None):
+    base_seed = _normalize_seed(seed)
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+
+    def _yield_local_batch(chunk, pad_source):
+        local_items = _rank_slice_distributed_batch(
+            chunk,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=pad_source,
+        )
+        if local_items:
+            return _make_text_batch_from_items(
+                local_items,
+                tokenizer,
+                max_seq_length,
+            )
+        return None
+
+    if hasattr(dataset, "__len__"):
+        tokenized = list(_iter_tokenized_text_rows(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+            max_seq_length=max_seq_length,
+        ))
+        if not tokenized:
+            raise ValueError(
+                "Unsloth MLX: streaming dataset produced no trainable text rows."
+            )
+        epoch = 0
+        while True:
+            indices = list(range(len(tokenized)))
+            if dataset_order == "torch_randperm":
+                order = _torch_randperm_order(len(tokenized), base_seed + epoch)
+            elif dataset_order == "sequential":
+                order = indices
+            elif dataset_order in (None, "default"):
+                indices = sorted(indices, key=lambda i: len(tokenized[i][0]))
+                chunks = [
+                    indices[i : i + global_batch_size]
+                    for i in range(0, len(indices), global_batch_size)
+                ]
+                rng = np.random.default_rng(base_seed + epoch)
+                for chunk_idx in rng.permutation(len(chunks)):
+                    batch = _yield_local_batch(
+                        [tokenized[i] for i in chunks[chunk_idx]],
+                        tokenized,
+                    )
+                    if batch is not None:
+                        yield batch
+                epoch += 1
+                continue
+            else:
+                raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+            for start in range(0, len(order), global_batch_size):
+                chunk = order[start : start + global_batch_size]
+                batch = _yield_local_batch(
+                    [tokenized[i] for i in chunk],
+                    tokenized,
+                )
+                if batch is not None:
+                    yield batch
+            epoch += 1
+        return
+
+    if dataset_order == "torch_randperm":
+        raise ValueError(
+            "Unsloth MLX: dataset_order='torch_randperm' requires a sized "
+            "streaming dataset so each epoch can be replayed deterministically."
+        )
+    if dataset_order not in (None, "default", "sequential"):
+        raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+
+    while True:
+        pending = []
+        yielded = False
+        for row in _iter_tokenized_text_rows(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+            max_seq_length=max_seq_length,
+        ):
+            pending.append(row)
+            if len(pending) >= global_batch_size:
+                batch = _yield_local_batch(pending, pending)
+                if batch is not None:
+                    yielded = True
+                    yield batch
+                pending = []
+        if pending:
+            batch = _yield_local_batch(pending, pending)
+            if batch is not None:
+                yielded = True
+                yield batch
+        if not yielded:
+            raise ValueError(
+                "Unsloth MLX: streaming dataset produced no trainable text rows. "
+                "If resuming, use a replayable iterable rather than a one-shot iterator."
+            )
 
 
 def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              seed=42, dataset_text_field="text",
                              formatting_func=None, chat_template=None,
                              model_name=None, model_type=None,
-                             append_eos=True):
+                             append_eos=True, completion_only_loss=None,
+                             assistant_only_loss=False, dataset_order="default",
+                             comm_group=None):
     """Streaming batch generator for MLX training.
 
     Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
     materializing all batches in memory at once. Useful for large datasets.
 
     Yields:
-        (batch, lengths) tuples — same format as create_batches.
+        (batch, lengths, labels) tuples — same format as create_batches.
+        ``labels`` is ``None`` unless text prompt/completion masking is active.
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
-    ds = _prepare_dataset(
-        dataset, tokenizer, dataset_text_field, formatting_func,
+    dataset = _ensure_reiterable_text_dataset(dataset)
+    tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
+        dataset,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+    )
+    if saw_pretokenized:
+        yield from _iterate_tokenized_text_batches(
+            tokenized,
+            batch_size,
+            max_seq_length,
+            seed=seed,
+            loop=True,
+            pad_id=_mlx_text_pad_id(tokenizer),
+        )
+        return
+    if assistant_only_loss:
+        _validate_mlx_text_assistant_only_dataset(dataset)
+
+    # Normalize once (capturing the return, which may swap the tokenizer) so
+    # both the labeled path below and the default/ordered path share it and we
+    # never double-normalize a plain-text dataset (completion_only_loss=None
+    # enters the labeled block, finds no prompt/completion rows, and falls
+    # through here).
+    tokenizer = normalize_mlx_chat_template(
+        tokenizer,
         chat_template=chat_template,
         model_name=model_name,
         model_type=model_type,
-        append_eos=append_eos,
+        is_vlm=False,
+        strict=False,
     )
 
-    for batch, lengths_info in iterate_batches(
-        ds, batch_size, max_seq_length,
-        loop=True,
-        seed=seed,
+    if completion_only_loss is not False or assistant_only_loss:
+        tokenized = _prepare_labeled_text_dataset(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+        )
+        if tokenized:
+            yield from _iterate_labeled_text_batches(
+                tokenized,
+                batch_size,
+                max_seq_length,
+                seed=seed,
+                loop=True,
+                pad_id=_mlx_text_pad_id(tokenizer),
+            )
+            return
+        if assistant_only_loss:
+            raise ValueError(
+                "Unsloth MLX: assistant_only_loss=True produced no "
+                "assistant-labeled text rows."
+            )
+        if completion_only_loss is True:
+            raise ValueError(
+                "Unsloth MLX: text completion_only_loss=True requires "
+                "prompt/completion rows for streaming text training."
+            )
+        if _prompt_completion_formatter_conflict(
+            dataset, formatting_func, completion_only_loss
+        ):
+            raise ValueError(
+                "Unsloth MLX: a formatting_func was provided for a prompt/completion "
+                "dataset, which drops the completion boundary needed for the default "
+                "completion-only loss. Apply your formatting before passing the "
+                "dataset, or set completion_only_loss=False."
+            )
+
+    if (
+        _distributed_rank_size(comm_group)[1] <= 1
+        and dataset_order in (None, "default")
     ):
-        max_length = int(mx.max(lengths_info[:, 1]).item())
-        batch = batch[:, :max_length]
-        yield batch, lengths_info, None
+        ds = _prepare_dataset(
+            dataset, tokenizer, dataset_text_field, formatting_func,
+            chat_template=None,
+            model_name=model_name,
+            model_type=model_type,
+            append_eos=append_eos,
+        )
+
+        for batch, lengths_info in iterate_batches(
+            ds, batch_size, max_seq_length,
+            loop=True,
+            seed=seed,
+        ):
+            max_length = int(mx.max(lengths_info[:, 1]).item())
+            batch = batch[:, :max_length]
+            yield batch, lengths_info, None
+        return
+
+    yield from _iterate_ordered_text_training_batches(
+        dataset,
+        tokenizer,
+        batch_size,
+        max_seq_length,
+        seed=seed,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+        dataset_order=dataset_order,
+        append_eos=append_eos,
+        comm_group=comm_group,
+    )
 
 
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
@@ -3516,6 +5603,8 @@ def save_trainer_state(trainer_state, path):
     ``trainer_state`` is a plain dict (JSON-serializable). Currently:
       - ``global_step``: int, the step the checkpoint represents
       - ``train_loss_history``: list[float], for UI continuity
+      - ``best_metric``/``best_step``: best-model tracking (may be null)
+      - ``es_patience_counter``: int, early-stopping no-improve count
     Kept separate from the safetensors blob because these are scalars/lists,
     not tensors, and JSON is easier to inspect.
     """
@@ -3581,7 +5670,10 @@ def _effective_mlx_quantization_map(model):
     for name, module in model.named_modules():
         if not name:
             continue
-        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+        # isinstance, not an exact class-name match: a training-time subclass of
+        # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
+        # recognised, else embed_tokens is silently dropped from the map.
+        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
             continue
         name = _canonical_mlx_quantization_path(name)
         entry = {}
@@ -3630,8 +5722,9 @@ def _quantization_config_to_path_map(config):
 
 
 def _canonical_mlx_quantization_path(path):
-    if path.endswith(".linear"):
-        return path[:-len(".linear")]
+    for suffix in (".linear", ".embedding"):
+        if path.endswith(suffix):
+            return path[:-len(suffix)]
     return path
 
 
@@ -4960,12 +7053,41 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
 
-    if not os.path.exists(llama_cpp_folder):
+    def _clone():
         print("Unsloth: Cloning llama.cpp...")
         subprocess.run(
             ["git", "clone", "https://github.com/ggml-org/llama.cpp", llama_cpp_folder],
             check=True,
         )
+
+    if not os.path.exists(llama_cpp_folder):
+        _clone()
+    elif not os.path.isfile(os.path.join(llama_cpp_folder, "CMakeLists.txt")):
+        # The folder exists but is not a llama.cpp source tree -- e.g. a prior
+        # prebuilt install left binaries + a marker (and no CMakeLists.txt). cmake
+        # would fail against it, so replace it with a fresh source checkout before
+        # building. A real source tree (CMakeLists.txt present) is kept and rebuilt.
+        #
+        # Only ever delete a directory we recognise as our own managed prebuilt
+        # install (carries UNSLOTH_PREBUILT_INFO.json) AND that lives in a
+        # safe-to-delete location (under ~/.unsloth or the legacy ./llama.cpp).
+        # Reuse the same guards the generic installer uses so a user-pointed
+        # UNSLOTH_LLAMA_CPP_PATH that happens to be a non-source directory is
+        # never wiped out from under the caller.
+        from ..llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
+        is_prebuilt_install = os.path.isfile(
+            os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
+        )
+        if not (is_prebuilt_install and _is_safe_to_delete(llama_cpp_folder)):
+            raise RuntimeError(
+                f"Unsloth: '{llama_cpp_folder}' exists but is not a llama.cpp source "
+                f"tree, and is not a recognised Unsloth prebuilt install in a managed "
+                f"location, so it will not be removed.\n"
+                f"Please point the build at a fresh directory or manually remove it."
+            )
+        print("Unsloth: Existing prebuilt llama.cpp install is not a source tree; re-cloning for the source build...")
+        shutil.rmtree(llama_cpp_folder, ignore_errors=True)
+        _clone()
 
     # Install deps; prefer gguf from the cloned repo to stay in sync
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
@@ -4985,10 +7107,31 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     # Build with cmake (Metal support on macOS)
     build_dir = os.path.join(llama_cpp_folder, "build")
     print("Unsloth: Building llama.cpp with cmake...")
-    subprocess.run(
+
+    def _run_build_step(cmd, description):
+        # capture_output keeps a successful build quiet, but on failure cmake's
+        # stdout/stderr would be swallowed inside CalledProcessError and the user
+        # would see a bare non-zero exit with no build log. Surface the captured
+        # output in the RuntimeError so macOS build failures are debuggable (this
+        # mirrors how the Linux source-build path in llama_cpp.py reports errors).
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            details = ""
+            if exc.stdout: details += f"\n--- stdout ---\n{exc.stdout}"
+            if exc.stderr: details += f"\n--- stderr ---\n{exc.stderr}"
+            raise RuntimeError(
+                f"Unsloth: {description} failed (exit {exc.returncode}).{details}"
+            ) from exc
+
+    _run_build_step(
         ["cmake", llama_cpp_folder, "-B", build_dir,
+         # macOS uses a single-config generator, so the build type must be set
+         # at configure time; --config Release on the build step is ignored and
+         # the binaries would otherwise be built unoptimized (very slow).
+         "-DCMAKE_BUILD_TYPE=Release",
          "-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"],
-        check=True, capture_output=True,
+        "llama.cpp cmake configure",
     )
 
     import psutil
@@ -4998,10 +7141,10 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     for t in targets:
         target_args += ["--target", t]
 
-    subprocess.run(
+    _run_build_step(
         ["cmake", "--build", build_dir, "--config", "Release",
          f"-j{n_jobs}", "--clean-first"] + target_args,
-        check=True, capture_output=True,
+        "llama.cpp cmake build",
     )
 
     # Copy binaries to llama.cpp root
@@ -5049,6 +7192,7 @@ def save_pretrained_gguf(
         convert_to_gguf,
         quantize_gguf,
         check_llama_cpp,
+        install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
@@ -5100,33 +7244,70 @@ def save_pretrained_gguf(
                     f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
                 )
 
-        # Step 2: Ensure llama.cpp is installed and gguf package is available
+        # Strip MTP/nextn config keys so llama.cpp converter
+        # doesn't inflate block_count / inject nextn_predict_layers.
+        # Also restore architectures from the original HF config since
+        # mlx-vlm's save_config strips that key.
+        _config_path = tmp_path / "config.json"
+        if _config_path.exists():
+            _cfg = json.loads(_config_path.read_text())
+            _changed = False
+            for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
+                if _cfg.pop(_key, None) is not None:
+                    _changed = True
+                _tc = _cfg.get("text_config")
+                if _tc and _tc.pop(_key, None) is not None:
+                    _changed = True
+            # Restore architectures from the original HF config
+            if "architectures" not in _cfg:
+                _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
+                if _orig_cfg_path:
+                    _orig_cfg_file = os.path.join(_orig_cfg_path, "config.json")
+                    if os.path.exists(_orig_cfg_file):
+                        _orig_cfg = json.load(open(_orig_cfg_file))
+                        if "architectures" in _orig_cfg:
+                            _cfg["architectures"] = _orig_cfg["architectures"]
+                            _changed = True
+            if _changed:
+                _config_path.write_text(json.dumps(_cfg, indent=2))
+
+        # Step 2: Ensure llama.cpp is installed.
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         except Exception:
             print("Unsloth: Installing llama.cpp (this only happens once)...")
-            quantizer_location, converter_location = install_llama_cpp(llama_cpp_folder)
+            try:
+                # Prefer the shared installer on every platform: it tries a
+                # prebuilt llama.cpp archive first and only then compiles.
+                # gpu_support=False everywhere: GGUF export only needs the CPU-only
+                # llama-quantize, so no GPU/CUDA build is required. On macOS the
+                # flag is moot anyway -- the installer returns the same universal
+                # unslothai/llama.cpp macOS/Metal bundle regardless, and the macOS
+                # source-build fallback below compiles with Metal on its own.
+                # install_llama_cpp also creates ~/.unsloth before cloning, so a
+                # fresh machine is fine.
+                quantizer_location, converter_location = install_llama_cpp(
+                    llama_cpp_folder,
+                    gpu_support = False,
+                )
+            except RuntimeError as exc:
+                # The source-build fallback resolves missing system build-deps via
+                # apt-get, which does not exist on macOS. Both raise sites for that
+                # (do_we_need_sudo and install_package) end with the same phrase
+                # "Is this NOT a Linux / Mac based computer?", so match on that shared
+                # suffix rather than one variant. Only when the prebuilt was
+                # unavailable AND we hit that macOS-only failure do we build from
+                # source with cmake + Metal via the macOS helper, then re-probe for
+                # the freshly built binaries.
+                if (
+                    sys.platform != "darwin"
+                    or "Is this NOT a Linux / Mac based computer?" not in str(exc)
+                ):
+                    raise
+                _install_llama_cpp_macos(llama_cpp_folder)
+                quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
-
-        # Ensure gguf is installed (may be missing if llama.cpp was built
-        # in a different venv)
-        try:
-            import gguf  # noqa: F401
-        except ImportError:
-            import subprocess
-            gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
-            if os.path.exists(gguf_py_dir):
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", gguf_py_dir],
-                    check=True, capture_output=True,
-                )
-            else:
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "gguf"],
-                    check=True, capture_output=True,
-                )
-            print("Unsloth: Installed gguf Python package.")
 
         # Step 3: Download and patch convert_hf_to_gguf.py.
         # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
@@ -5174,7 +7355,23 @@ def save_pretrained_gguf(
         if supported_text_archs is not None:
             kwargs["supported_text_archs"] = supported_text_archs
             kwargs["supported_vision_archs"] = supported_vision_archs
-        convert_to_gguf(**kwargs)
+        gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
+        has_local_gguf = os.path.isdir(gguf_py_dir)
+        original_pythonpath = os.environ.get("PYTHONPATH")
+        if has_local_gguf:
+            os.environ["PYTHONPATH"] = (
+                gguf_py_dir
+                if not original_pythonpath
+                else gguf_py_dir + os.pathsep + original_pythonpath
+            )
+        try:
+            convert_to_gguf(**kwargs)
+        finally:
+            if has_local_gguf:
+                if original_pythonpath is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = original_pythonpath
 
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:

@@ -216,14 +216,18 @@ class VisualServer:
             pass
         self._spawn()
 
-    def _send(self, messages, n_blocks, seed):
+    def _send(self, messages, n_blocks, seed, tools=None):
         # A previous turn may have crashed the decoder; respawn before writing so a dead child does not
         # strand this and every later turn with a broken pipe.
         if self.p is None or self.p.poll() is not None:
             self.restart()
-        with open(self.req, "w") as f:
-            json.dump({"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}, f,
-                      ensure_ascii=False)
+        req = {"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}
+        # Forward tools so the server renders them into the chat template (inputs.tools)
+        # for schema-correct <|tool_call> args.
+        if tools:
+            req["tools"] = tools
+        with open(self.req, "w", encoding="utf-8") as f:
+            json.dump(req, f, ensure_ascii=False)
         try:
             self.p.stdin.write(self.req + "\n")
             self.p.stdin.flush()
@@ -256,7 +260,7 @@ def _parse_stats(line):
     return stats
 
 
-def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None):
+def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None, tools=None):
     """Stream one turn through the optimized visual server.
 
     on_frame(block, step, total, text): a denoising frame (the current argmax canvas, already decoded).
@@ -282,7 +286,7 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
 
     for attempt in (0, 1):
         try:
-            return _generate_visual_once(server, messages, seed, max_blocks, _frame, _commit, on_stats)
+            return _generate_visual_once(server, messages, seed, max_blocks, _frame, _commit, on_stats, tools)
         except VisualServerCrashed:
             server.restart()  # always bring a fresh server up so the next turn works regardless
             if attempt == 1 or progressed["emitted"]:
@@ -290,8 +294,8 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
             # nothing emitted yet -> safe to transparently resend on the fresh server
 
 
-def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commit, on_stats):
-    server._send(messages, max_blocks, seed)
+def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commit, on_stats, tools=None):
+    server._send(messages, max_blocks, seed, tools)
 
     full_text = ""
     while True:

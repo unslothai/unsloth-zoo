@@ -17,6 +17,7 @@ paths that only real Metal training can prove:
    label masking, CCE loss, and adapter save pipeline.
 """
 
+import gc
 import glob
 import json
 import os
@@ -228,3 +229,110 @@ def test_vlm_lora_training_e2e(tmp_path):
     _assert_finite(hist)
     saved = glob.glob(os.path.join(str(tmp_path), "**", "*.safetensors"), recursive=True)
     assert saved, "no adapter safetensors saved at end of VLM training"
+
+
+def _color_square_dataset(colors):
+    """Synthetic VLM dataset: one solid-color 64x64 square per message."""
+    from PIL import Image
+    return [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "What color is this square?"},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"This square is {color}."}],
+                },
+            ],
+            "images": [Image.new("RGB", (64, 64), color)],
+        }
+        for color in colors
+    ]
+
+
+def _make_vlm_trainer(tmp_path, dataset, **config_overrides):
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    model, processor = FastMLXModel.from_pretrained(VLM_MODEL, max_seq_length=512)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
+    config = dict(
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        max_steps=4,
+        warmup_steps=1,
+        learning_rate=1e-4,
+        logging_steps=1,
+        output_dir=str(tmp_path),
+        seed=3407,
+        report_to="none",
+    )
+    config.update(config_overrides)
+    return MLXTrainer(
+        model=model,
+        tokenizer=processor,
+        train_dataset=dataset,
+        args=MLXTrainingConfig(**config),
+    )
+
+
+@metal_only
+def test_vlm_resume_from_checkpoint_matches_fresh_run(tmp_path):
+    """VLM stop+resume reproduces the fresh run's losses step for step.
+
+    Mirrors test_resume_from_checkpoint_matches_fresh_run for a VLM model
+    so the resume code path (optimizer state restore, batch fast-forward,
+    LR schedule offset) is exercised through the multimodal collator and
+    image processor in addition to the text-only path.
+    """
+    fresh_dir = tmp_path / "fresh"
+    resume_dir = tmp_path / "resume"
+
+    colors = ["red", "green", "blue", "yellow", "purple", "orange"]
+    dataset = _color_square_dataset(colors)
+
+    trainer = _make_vlm_trainer(
+        fresh_dir, dataset, max_steps=6, save_steps=3,
+    )
+    assert trainer._is_vlm, f"{VLM_MODEL} was not detected as a VLM"
+    trainer.train()
+    fresh_hist = list(trainer._train_loss_history)
+    assert len(fresh_hist) == 6, f"fresh run logged {len(fresh_hist)} losses"
+    _assert_finite(fresh_hist)
+
+    ckpt_dir = fresh_dir / "checkpoint-3"
+    assert (ckpt_dir / "adapters.safetensors").is_file()
+    assert (ckpt_dir / "optimizer_state.safetensors").is_file()
+    assert (ckpt_dir / "trainer_state.json").is_file()
+    with open(ckpt_dir / "trainer_state.json") as f:
+        saved_state = json.load(f)
+    assert saved_state["global_step"] == 3
+    ckpt = str(ckpt_dir)
+
+    # Free the fresh trainer before loading the second 2B model (memory-tight runners).
+    del trainer
+    gc.collect()
+
+    # Fresh process state: new base model, same seeds, resume from step 3.
+    resumed = _make_vlm_trainer(
+        resume_dir, _color_square_dataset(colors), max_steps=6, save_steps=0,
+    )
+    resumed.train(resume_from_checkpoint=ckpt)
+    resumed_hist = list(resumed._train_loss_history)
+    assert len(resumed_hist) == 6, f"resumed run logged {len(resumed_hist)} losses"
+    _assert_finite(resumed_hist)
+
+    # Restored prefix is the checkpointed history; post-resume steps must
+    # track the fresh run. Same seeds + restored Adam moments mean the only
+    # tolerated difference is float accumulation noise.
+    for i, (a, b) in enumerate(zip(fresh_hist, resumed_hist), start=1):
+        assert abs(a - b) <= 1e-5 * max(1.0, abs(a)), (
+            f"step {i}: fresh={a!r} resumed={b!r}\n"
+            f"fresh={fresh_hist}\nresumed={resumed_hist}"
+        )
+

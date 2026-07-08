@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import types
 
 import pytest
 import torch
@@ -30,8 +31,31 @@ import torch
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
+    import sys
+    shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+    real_mlx_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+    }
     from mlx_simulation import simulate_mlx_on_torch
+    from mlx_simulation.mlx_stub import _MLXFinder
     simulate_mlx_on_torch()
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
+    yield
+    for name in list(sys.modules):
+        if (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        ):
+            sys.modules.pop(name, None)
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path
+        if not isinstance(finder, _MLXFinder)
+    ]
+    sys.modules.update(real_mlx_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -41,12 +65,14 @@ def _install_shim():
 def test_mlx_training_config_is_dataclass_with_all_fields():
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     assert dataclasses.is_dataclass(MLXTrainingConfig)
-    fields = {f.name for f in dataclasses.fields(MLXTrainingConfig)}
+    field_names = [f.name for f in dataclasses.fields(MLXTrainingConfig)]
+    fields = set(field_names)
     # Required SFT-compat fields
     for must_have in (
         "per_device_train_batch_size",
         "gradient_accumulation_steps",
         "max_steps",
+        "warmup_ratio",
         "learning_rate",
         "lr_scheduler_type",
         "optim",
@@ -62,8 +88,237 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "gradient_checkpointing",
         "dataset_order",
         "preserve_dataset_order",
+        "completion_only_loss",
+        "assistant_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
+    # dataset_text_field follows the eval block; newer eval knobs (eg load_best_model_at_end)
+    # may sit between them, so assert relative order rather than strict adjacency.
+    assert field_names.index("dataset_text_field") > field_names.index("eval_steps")
+    assert field_names[field_names.index("append_eos") + 1] == "train_on_completions"
+    assert field_names.index("per_device_eval_batch_size") > field_names.index("vlm_chat_template")
+    assert field_names.index("image_size") > field_names.index("vlm_chat_template")
+
+
+def test_mlx_training_config_exposes_completion_only_loss():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _text_assistant_only_loss_arg,
+        _text_completion_only_loss_arg,
+    )
+
+    assert _text_completion_only_loss_arg(
+        MLXTrainingConfig(completion_only_loss=False)
+    ) is False
+    assert _text_completion_only_loss_arg(
+        MLXTrainingConfig(completion_only_loss=True)
+    ) is True
+    assert _text_completion_only_loss_arg(
+        MLXTrainingConfig(train_on_completions=True)
+    ) is True
+    assert _text_assistant_only_loss_arg(
+        MLXTrainingConfig(assistant_only_loss=True)
+    ) is True
+    assert _text_assistant_only_loss_arg(MLXTrainingConfig()) is False
+
+
+def test_mlx_trainer_distributed_defaults_world_size_one():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self): return {}
+
+    trainer = MLXTrainer(DummyModel(), None, [], args=MLXTrainingConfig())
+
+    assert trainer._distributed_initialized is False
+    assert trainer.distributed_rank == 0
+    assert trainer.distributed_world_size == 1
+    assert trainer.is_main_process is True
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 1,
+        "distributed_rank": 0,
+        "distributed_is_main_process": True,
+    }
+
+
+def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    calls = []
+    def fake_init():
+        calls.append("init")
+        return FakeWorld()
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert calls == ["init"]
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    assert trainer.is_main_process is False
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 2,
+        "distributed_rank": 1,
+        "distributed_is_main_process": False,
+    }
+
+
+@pytest.mark.parametrize("accepts_backend", [True, False])
+def test_mlx_trainer_distributed_state_selects_jaccl_backend(monkeypatch, accepts_backend):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    calls = []
+    def fake_init(**kwargs):
+        calls.append(kwargs)
+        if kwargs and not accepts_backend:
+            raise TypeError("init() got an unexpected keyword argument 'backend'")
+        return FakeWorld()
+
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", "127.0.0.1:12345")
+    monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/mlx-devices.json")
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    if accepts_backend:
+        assert calls == [{"backend": "jaccl"}]
+    else:
+        assert calls == [{"backend": "jaccl"}, {}]
+
+
+def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
+    import numpy as np
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    # Shortest row has 2 tokens so it survives the sub-two-token filter while
+    # still being padded out to the block length, exercising the pad id path.
+    dataset = [([5, 6], 0), ([7, 8, 9], 0)]
+    np.random.seed(123)
+    expected = np.random.random(3)
+    np.random.seed(123)
+
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert np.random.random(3) == pytest.approx(expected)
+    rows = batches[0][0].tolist()
+    assert rows[0][:2] == [5, 6]
+    assert rows[0][2:] == [99] * (len(rows[0]) - 2)
+
+
+def test_distributed_text_batches_filter_sub_two_token_rows():
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    # The length-1 row (token 5) has no causal target and must be filtered, so
+    # every batch is drawn only from the length-2 row (tokens 6, 7).
+    dataset = [([5], 0), ([6, 7], 0)]
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=3,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert len(batches) == 3
+    for batch in batches:
+        for row in batch[0].tolist():
+            content = [tok for tok in row if tok != 99]
+            assert content == [6, 7]
+
+
+def test_distributed_text_batches_use_token_length_not_cache_itemlen(monkeypatch):
+    # Regression: real mlx_lm CacheDataset.itemlen returns len(raw_row); for the
+    # {"text": ...} rows _prepare_dataset builds that is the dict key count (1),
+    # so an itemlen-based sub-two-token filter would drop every row and raise.
+    # The filter must measure the processed token length instead.
+    import sys
+
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    class CacheDataset:
+        def __init__(self, rows):
+            self._rows = rows
+            self._proc = {}
+
+        def __len__(self):
+            return len(self._rows)
+
+        def itemlen(self, idx):
+            # Matches real mlx_lm: length of the RAW row (dict key count == 1).
+            return len(self._rows[idx])
+
+        def __getitem__(self, idx):
+            if idx not in self._proc:
+                self._proc[idx] = (self._rows[idx]["ids"], 0)
+            return self._proc[idx]
+
+    monkeypatch.setattr(
+        sys.modules["mlx_lm.tuner.datasets"], "CacheDataset", CacheDataset
+    )
+
+    dataset = CacheDataset([{"ids": [5, 6]}, {"ids": [7, 8, 9]}])
+    # itemlen reports 1 for each row; an itemlen-based filter would drop both.
+    assert dataset.itemlen(0) == 1
+
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=2,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert len(batches) == 2
+    content = {
+        tuple(tok for tok in row if tok != 99)
+        for batch in batches
+        for row in batch[0].tolist()
+    }
+    # Rows survived the >=2-token filter (token length, not itemlen).
+    assert (5, 6) in content or (7, 8, 9) in content
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
@@ -103,6 +358,54 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     trainer._set_optimizer_lr_for_step(optimizer, 1)
     second_lr = float(optimizer.learning_rate)
     assert second_lr > first_lr
+
+    ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    ratio_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_ratio=0.1,
+    )
+    ratio_schedule = ratio_trainer._build_schedule(total_steps=8)
+    assert ratio_trainer._resolve_warmup_steps(total_steps=8) == 1
+    assert ratio_schedule(0).item() < ratio_trainer.args.learning_rate
+    assert ratio_schedule(1).item() == pytest.approx(
+        ratio_trainer.args.learning_rate,
+    )
+
+    copied_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    copied_ratio_trainer.args = dataclasses.replace(
+        MLXTrainingConfig(learning_rate=5e-5, lr_scheduler_type="linear"),
+        warmup_ratio=0.1,
+    )
+    assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
+    explicit_default_trainer = MLXTrainer.__new__(MLXTrainer)
+    explicit_default_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_steps=5,
+        warmup_ratio=0.1,
+    )
+    assert explicit_default_trainer._resolve_warmup_steps(total_steps=8) == 5
+
+    clamped_trainer = MLXTrainer.__new__(MLXTrainer)
+    clamped_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_ratio=2.0,
+    )
+    assert clamped_trainer._resolve_warmup_steps(total_steps=8) == 8
+
+    # Explicit warmup_steps=0 must not disable a positive warmup_ratio (HF parity):
+    # a zero step count means "use the ratio", not "no warmup".
+    zero_steps_ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+    zero_steps_ratio_trainer.args = MLXTrainingConfig(
+        learning_rate=5e-5,
+        lr_scheduler_type="linear",
+        warmup_steps=0,
+        warmup_ratio=0.1,
+    )
+    assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
@@ -294,12 +597,745 @@ def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
     assert dataset_default[0] == ([1, 2, 3, 99], 0)
 
 
+def test_encode_mlx_text_keeps_raw_text_bos_when_template_has_bos():
+    from unsloth_zoo.mlx.utils import encode_mlx_text
+
+    class Tokenizer:
+        bos_token = "<s>"
+        chat_template = "{{ bos_token }}{{ messages }}"
+
+        def __init__(self):
+            self.add_special_tokens_seen = []
+
+        def encode(self, text, add_special_tokens=True):
+            self.add_special_tokens_seen.append(add_special_tokens)
+            return [1, 2, 3]
+
+    tokenizer = Tokenizer()
+
+    encode_mlx_text(tokenizer, "raw text")
+    encode_mlx_text(tokenizer, "<s>rendered text")
+
+    assert tokenizer.add_special_tokens_seen == [True, False]
+
+
+def _make_mlx_text_trainer(**config_kwargs):
+    """Build the smallest MLXTrainer shell needed for data-routing tests."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    class Tokenizer:
+        chat_template = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2]
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(**config_kwargs)
+    trainer.model = types.SimpleNamespace(_config={})
+    trainer.tokenizer = Tokenizer()
+    trainer.train_dataset = []
+    trainer.formatting_func = None
+    trainer._batches = None
+    return MLXTrainer, trainer
+
+
+def test_text_prompt_completion_create_batches_masks_prompt_labels_and_eos():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=99,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+
+    batch, _, labels = create_batches(
+        dataset=[{"prompt": "1 2", "completion": " 3 4"}],
+        tokenizer=tokenizer,
+        batch_size=1,
+        max_seq_length=8,
+        seed=0,
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3, 4, 99]]
+    assert labels.tolist() == [[-100, -100, 3, 4, 99]]
+
+
+def test_text_conversational_prompt_completion_uses_generation_boundary():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class BatchEncoding(dict): pass
+
+    class Tokenizer:
+        chat_template = "{{ messages }}"
+        eos_token_id = 99
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            return_dict=False,
+            tools=None,
+            extra_token=0,
+        ):
+            ids = ([30] if tools else []) + ([extra_token] if extra_token else [])
+            for message in messages:
+                ids.append(10 if message["role"] == "user" else 20)
+                ids.extend(int(part) for part in message["content"].split())
+            if add_generation_prompt:
+                ids.append(20)
+            return BatchEncoding(input_ids=ids) if return_dict else ids
+
+    batch, _, labels = create_batches(
+        dataset=[
+            {
+                "prompt": [{"role": "user", "content": "1 2"}],
+                "completion": [{"role": "assistant", "content": "3 4"}],
+                "tools": [{"type": "function"}],
+                "chat_template_kwargs": {"extra_token": 5},
+            }
+        ],
+        tokenizer=Tokenizer(),
+        batch_size=1,
+        max_seq_length=10,
+        seed=0,
+        append_eos=False,
+    )[0]
+
+    assert batch.tolist() == [[30, 5, 10, 1, 2, 20, 3, 4]]
+    assert labels.tolist() == [[-100, -100, -100, -100, -100, -100, 3, 4]]
+
+
+class _AssistantMaskTokenizer:
+    chat_template = "{{ messages }}"
+    eos_token_id = None
+    pad_token_id = 7
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        return_dict=False,
+        return_assistant_tokens_mask=False,
+        tools=None,
+        add_generation_prompt=False,
+        **_kwargs,
+    ):
+        ids = []
+        masks = []
+        if tools:
+            ids.append(30)
+            masks.append(0)
+        for message in messages:
+            is_assistant = message["role"] == "assistant"
+            ids.append(20 if is_assistant else 10)
+            masks.append(0)
+            ids.extend(int(part) for part in message["content"].split())
+            masks.extend([1 if is_assistant else 0] * len(message["content"].split()))
+        output = {"input_ids": ids}
+        if return_assistant_tokens_mask:
+            output["assistant_masks"] = masks
+        return output if return_dict else ids
+
+
+class _NoAssistantMaskTokenizer(_AssistantMaskTokenizer):
+    def apply_chat_template(self, *args, **kwargs):
+        kwargs["return_assistant_tokens_mask"] = False
+        return super().apply_chat_template(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "extra_kwargs"),
+    [
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2 3"},
+                    ],
+                }
+            ],
+            {},
+        ),
+        (
+            [
+                {
+                    "prompt": [{"role": "user", "content": "1"}],
+                    "completion": [{"role": "assistant", "content": "2 3"}],
+                }
+            ],
+            {"append_eos": False},
+        ),
+    ],
+)
+def test_text_assistant_only_loss_masks_non_assistant_tokens(dataset, extra_kwargs):
+    from unsloth_zoo.mlx.utils import create_batches
+
+    batch, _, labels = create_batches(
+        dataset=dataset,
+        tokenizer=_AssistantMaskTokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        assistant_only_loss=True,
+        completion_only_loss=False,
+        **extra_kwargs,
+    )[0]
+
+    assert batch.tolist() == [[10, 1, 20, 2, 3]]
+    assert labels.tolist() == [[-100, -100, -100, 2, 3]]
+
+
+@pytest.mark.parametrize(
+    ("dataset", "tokenizer", "match"),
+    [
+        ([{"prompt": "Question: ", "completion": "Answer"}], _AssistantMaskTokenizer(), "not conversational"),
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                },
+                {"text": "plain text"},
+            ],
+            _AssistantMaskTokenizer(),
+            "not conversational",
+        ),
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                }
+            ],
+            _NoAssistantMaskTokenizer(),
+            "no assistant tokens",
+        ),
+        ([{"input_ids": [1, 2, 3]}], types.SimpleNamespace(), "assistant_masks"),
+    ],
+)
+def test_text_assistant_only_loss_rejects_unsupported_inputs(dataset, tokenizer, match):
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        create_batches(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            batch_size=1,
+            max_seq_length=8,
+            assistant_only_loss=True,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_assistant_masks_build_labels():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    _, _, labels = create_batches(
+        dataset=[
+            {
+                "input_ids": [1, 2, 3, 4],
+                "assistant_masks": [0, 1, 0, 1],
+            }
+        ],
+        tokenizer=types.SimpleNamespace(),
+        batch_size=1,
+        max_seq_length=8,
+        assistant_only_loss=True,
+        completion_only_loss=False,
+    )[0]
+
+    assert labels.tolist() == [[-100, 2, -100, 4]]
+
+
+def test_text_completion_probe_keeps_one_shot_iterables_reusable():
+    from unsloth_zoo.mlx.utils import _ensure_reiterable_text_dataset
+    def rows():
+        yield {"text": "1 2"}
+
+    dataset = _ensure_reiterable_text_dataset(rows())
+    assert list(dataset) == [{"text": "1 2"}]
+    assert list(dataset) == [{"text": "1 2"}]
+
+
+def test_text_pretokenized_create_batches_preserves_input_ids():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    def formatting_func(_item):
+        raise AssertionError("formatting_func should be ignored for input_ids rows")
+
+    tokenizer = types.SimpleNamespace(
+        pad_token_id=9,
+        encode=lambda *_args, **_kwargs: pytest.fail("should not tokenize input_ids")
+    )
+
+    batch, lengths, labels = create_batches(
+        dataset=[
+            {"input_ids": [1, 2, 3]},
+            {"input_ids": [4, 5]},
+        ],
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=8,
+        completion_only_loss=False,
+        formatting_func=formatting_func,
+    )[0]
+
+    assert batch.tolist() == [[4, 5, 9], [1, 2, 3]]
+    assert lengths.tolist() == [[0, 2], [0, 3]]
+    assert labels is None
+
+
+def test_text_pretokenized_rejects_mixed_raw_rows():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises(ValueError, match="cannot be mixed"):
+        create_batches(
+            dataset=[
+                {"input_ids": [1, 2, 3]},
+                {"text": "4 5 6"},
+            ],
+            tokenizer=types.SimpleNamespace(),
+            batch_size=1,
+            max_seq_length=8,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_rejects_mixed_label_presence():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises(ValueError, match="must not be mixed"):
+        create_batches(
+            dataset=[
+                {"input_ids": [1, 2, 3]},
+                {"input_ids": [4, 5, 6], "labels": [-100, 5, 6]},
+            ],
+            tokenizer=types.SimpleNamespace(),
+            batch_size=2,
+            max_seq_length=8,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_completion_mask_requires_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    tokenizer = types.SimpleNamespace()
+    kwargs = dict(tokenizer=tokenizer, batch_size=1, max_seq_length=8)
+    row = {
+        "input_ids": [1, 2, 3, 4],
+        "labels": [11, 12, 13, 14],
+        "completion_mask": [0, 1, 0, 1],
+    }
+
+    _, _, default_labels = create_batches(dataset=[row], **kwargs)[0]
+    batch, _, masked_labels = create_batches(
+        dataset=[row],
+        completion_only_loss=True,
+        **kwargs,
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3, 4]]
+    assert default_labels.tolist() == [[11, 12, 13, 14]]
+    assert masked_labels.tolist() == [[-100, 12, -100, 14]]
+
+
+def test_text_pretokenized_ordered_and_streaming_batches_emit_labels():
+    from unsloth_zoo.mlx.utils import create_ordered_batches, iterate_training_batches
+
+    tokenizer = types.SimpleNamespace(pad_token_id=7)
+    dataset = [
+        {"input_ids": [1, 2], "labels": [-100, 2]},
+        {"input_ids": [3, 4, 5], "labels": [-100, 4, 5]},
+    ]
+
+    batches = [
+        create_ordered_batches(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            batch_size=2,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0],
+        next(
+            iterate_training_batches(
+                dataset=dataset,
+                tokenizer=tokenizer,
+                batch_size=2,
+                max_seq_length=8,
+                seed=0,
+            )
+        ),
+    ]
+
+    for batch, _, labels in batches:
+        assert batch.tolist() == [[1, 2, 7], [3, 4, 5]]
+        assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+
+def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeypatch):
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+
+    received = {}
+
+    def fake_create_batches(**kwargs):
+        received.update(kwargs)
+        return [("batch", "lengths", "labels")]
+
+    monkeypatch.setattr(mlx_trainer, "create_batches", fake_create_batches)
+
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        assistant_only_loss=True,
+    )
+    batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches == [("batch", "lengths", "labels")]
+    assert received["completion_only_loss"] is True
+    assert received["assistant_only_loss"] is True
+
+
+def test_text_prepare_data_ordered_batches_emit_completion_only_labels():
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        dataset_order="sequential",
+        per_device_train_batch_size=2,
+    )
+    trainer.tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        pad_token_id=7,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+    trainer.train_dataset = [
+        {"prompt": "1", "completion": " 2"},
+        {"prompt": "3", "completion": " 4 5"},
+    ]
+    batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    batch, _, labels = batches[0]
+    assert batch.tolist() == [[1, 2, 7], [3, 4, 5]]
+    assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+
+def test_text_prepare_data_streaming_batches_emit_completion_only_labels():
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        streaming=True,
+        per_device_train_batch_size=2,
+    )
+    trainer.tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+    trainer.train_dataset = [
+        {"prompt": "1", "completion": " 2"},
+        {"prompt": "3", "completion": " 4 5"},
+    ]
+
+    batches, batch_iter = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches is None
+    batch, _, labels = next(batch_iter)
+    assert batch.tolist() == [[1, 2, 0], [3, 4, 5]]
+    assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+    trainer.train_dataset = [{"text": "1 2"}, {"text": "3 4"}]
+    with pytest.raises(ValueError, match="completion_only_loss=True"):
+        next(MLXTrainer._prepare_data(trainer, is_vlm=False)[1])
+
+
 def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
     source = inspect.getsource(mlx_utils.make_baseline_loss_fn)
     assert "steps < lengths[:, 1:]" in source
+
+
+def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    class CallableTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+    received = {}
+
+    def fake_hf(trainer, *, instruction_part=None, response_part=None,
+                force_match=True, tokenizer=None, return_function=False,
+                num_proc=None, last_response_only=False):
+        received["last_response_only"] = last_response_only
+        return lambda batch: batch
+
+    monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    train_on_responses_only(
+        None,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        tokenizer=CallableTokenizer(),
+        return_function=True,
+        last_response_only=True,
+    )
+
+    assert received["last_response_only"] is True
+
+
+def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
+    from unsloth_zoo.mlx.trainer import _resolve_response_mask_tokenizer
+
+    class EncodeOnlyTokenizer:
+        def encode(self, text):
+            return [1, 2, 3]
+
+        def convert_tokens_to_ids(self, token):
+            return 1
+
+    with pytest.raises(TypeError, match="requires a callable"):
+        _resolve_response_mask_tokenizer(EncodeOnlyTokenizer())
+
+
+def test_vlm_eval_batches_define_completion_only_loss_before_use():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._train_inner)
+    definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
+    eval_use = source.index("completion_only_loss=text_completion_only_loss")
+    text_eval_start = source.index("return create_batches(")
+    text_eval_end = source.index("if isinstance(self.eval_dataset, dict)")
+    text_eval_block = source[text_eval_start:text_eval_end]
+    assert definition < eval_use
+    assert "completion_only_loss=text_completion_only_loss" in text_eval_block
+
+
+def test_evaluate_dict_eval_datasets_records_split_metrics():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def __init__(self):
+            self.modes = []
+
+        def eval(self):
+            self.modes.append("eval")
+
+        def train(self):
+            self.modes.append("train")
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+
+    def loss_fn(_model, name, _lengths, _labels):
+        if name == "small":
+            return mx.array(1.0), mx.array(2)
+        return mx.array(3.0), mx.array(6)
+
+    loss, ppl = trainer._evaluate(
+        {"small": [("small", None, None)], "large": [("large", None, None)]},
+        loss_fn,
+        is_vlm=False,
+    )
+
+    assert loss == pytest.approx(2.5)
+    assert ppl == pytest.approx(__import__("math").exp(2.5))
+    assert trainer._last_eval_metrics["eval_small_loss"] == pytest.approx(1.0)
+    assert trainer._last_eval_metrics["eval_large_loss"] == pytest.approx(3.0)
+    assert trainer._last_eval_metrics["eval_loss"] == pytest.approx(2.5)
+    assert trainer.model.modes == ["eval", "train"]
+
+
+def test_evaluate_batch_totals_uses_single_eval_status_collective():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._evaluate_batch_totals)
+    assert "_distributed_eval_status" in source
+    assert "_distributed_should_stop" not in source
+    assert "_raise_distributed_failure(" not in source
+
+
+def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):
+    # In DDP each rank only sees its own shard. A rank whose shard happens to be
+    # entirely masked must not raise alone (that would hang peers at the next
+    # collective); the bad/good counts are all-summed first so the raise/warn
+    # decision is global and identical on every rank.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import _check_all_masked
+
+    def fake_all_sum(value, group=None, stream=None):
+        # Simulate a peer rank that contributed trainable (good) rows.
+        return value + mx.array([0, 5], dtype=mx.int32)
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    all_bad = [("ids", None, mx.array([[-100, -100]]))]
+    # Local shard is fully masked, but the global reduction sees good rows, so
+    # no rank raises. (Would raise ZeroDivisionError without the reduction.)
+    _check_all_masked(all_bad, comm_group=object(), world_size=2)
+
+
+def test_check_all_masked_single_process_still_raises_when_all_masked():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import _check_all_masked
+
+    all_bad = [("ids", None, mx.array([[-100, -100]]))]
+    with pytest.raises(ZeroDivisionError):
+        _check_all_masked(all_bad)
+
+
+def test_eval_callback_stop_request_synced_before_best_model_track():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    cb_idx = src.index("for cb in self._eval_callbacks")
+    track_idx = src.index("_track = not self.stop_requested")
+    assert cb_idx < track_idx
+    # A rank-wide stop sync must sit between the rank-0-only eval callbacks and
+    # the divergent best-model / early-stopping branch, else a callback that
+    # sets stop_requested on rank 0 alone makes _track diverge and hangs peers
+    # at the rank-0-guarded best-model save collective.
+    assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
+
+
+def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
+    # VLM mirror of the text-path mask check: a fully-masked local shard must
+    # not raise alone in DDP; counts are all-summed before deciding.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array([0, 5], dtype=mx.int32)
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    all_bad = [{"labels": mx.array([[-100, -100]])}]
+    _check_vlm_all_masked(all_bad, comm_group=object(), world_size=2)
+
+
+def test_check_vlm_all_masked_single_process_still_raises():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    all_bad = [{"labels": mx.array([[-100, -100]])}]
+    with pytest.raises(ZeroDivisionError):
+        _check_vlm_all_masked(all_bad)
+
+
+def test_reset_run_state_clears_last_eval_metrics():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    # A prior run's eval metrics must not leak into a reused trainer that then
+    # runs without eval (eval_steps=0 or no eval dataset).
+    trainer._last_eval_metrics = {"eval_loss": 1.23, "eval_perplexity": 4.5}
+    trainer._reset_run_state()
+    assert trainer._last_eval_metrics == {}
+
+
+def test_distributed_diagnostics_per_rank_tokens_use_local_history():
+    import inspect
+    import re
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._distributed_training_diagnostics)
+    # per_rank_tokens must be gathered from this rank's LOCAL token total, not
+    # the all-reduced global trained_tokens (which would inflate by world_size).
+    m = re.search(
+        r"per_rank_tokens\s*=\s*self\._distributed_rank_vector\(\s*([A-Za-z_]+)",
+        src,
+    )
+    assert m is not None and m.group(1) == "local_trained_tokens"
+    assert "_local_token_count_history" in src
+
+
+def test_reset_run_state_preserves_external_stop_request():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    # An externally-set cancel (e.g. a controller thread firing during train()
+    # setup or batch prep) must survive the per-run reset.
+    trainer.stop_requested = True
+    trainer._reset_run_state()
+    assert trainer.stop_requested is True
+    assert trainer._early_stopped is False
+
+    # A run-1 early stop must not block run 2 on a reused trainer.
+    trainer.stop_requested = False
+    trainer._early_stopped = True
+    trainer._reset_run_state()
+    assert trainer._early_stopped is False
+    assert trainer.stop_requested is False
+
+
+def test_reset_run_state_preserves_callbacks_and_batches():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    # Callbacks registered via add_step_callback / add_eval_callback before
+    # train() (and the report_to callbacks set up inside train() before
+    # _train_inner) must survive the per-run reset that _train_inner runs, else
+    # user eval hooks never fire and W&B / TensorBoard logging is dropped.
+    step_cb, eval_cb = object(), object()
+    prebuilt = ["batch"]
+    trainer._batches = prebuilt
+    trainer._step_callbacks = [step_cb]
+    trainer._eval_callbacks = [eval_cb]
+
+    trainer._reset_run_state()
+
+    assert trainer._batches is prebuilt
+    assert trainer._step_callbacks == [step_cb]
+    assert trainer._eval_callbacks == [eval_cb]
+
+
+def test_resolved_best_metric_name_mirrors_hf_lookup():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    class Args:
+        pass
+
+    trainer.args = Args()
+    for value, expected in [
+        (None, "eval_loss"),
+        ("loss", "eval_loss"),
+        ("eval_loss", "eval_loss"),
+        ("perplexity", "eval_perplexity"),
+        ("eval_val_loss", "eval_val_loss"),
+    ]:
+        trainer.args.metric_for_best_model = value
+        assert trainer._resolved_best_metric_name() == expected
 
 
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
@@ -399,6 +1435,116 @@ def test_mlx_loader_keeps_norm_parameters_float32():
     )
 
 
+def test_mlx_trainer_upcasts_norms_and_restores_prior_norm_output_cast_state(monkeypatch):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import set_mlx_norm_output_cast_to_input_dtype
+
+    class LoaderOnlyNorm(nn.Module):
+        def __init__(self, dtype=mx.float32):
+            super().__init__()
+            self.weight = mx.ones((4,), dtype=dtype)
+
+        def __call__(self, x):
+            return x.astype(mx.float32) * self.weight
+
+        def parameters(self):
+            return {"weight": self.weight}
+
+    class LoadedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = LoaderOnlyNorm()
+
+    class TrainerModel(nn.Module):
+        _config = {}
+
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = LoaderOnlyNorm(mx.bfloat16)
+
+    set_mlx_norm_output_cast_to_input_dtype(False)
+    loaded_model = LoadedModel()
+    x = mx.ones((2, 4), dtype=mx.bfloat16)
+    try:
+        set_mlx_norm_output_cast_to_input_dtype(True, loaded_model)
+        assert loaded_model.input_layernorm(x).dtype == x.dtype
+        patched_state = (
+            LoaderOnlyNorm.__call__,
+            getattr(LoaderOnlyNorm, "_unsloth_original_call"),
+            getattr(LoaderOnlyNorm, "_unsloth_cast_output_to_input_dtype"),
+        )
+
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.model = TrainerModel()
+        assert trainer.model.parameters()["input_layernorm.weight"].dtype == mx.bfloat16
+        trainer.args = MLXTrainingConfig(
+            cast_norm_output_to_input_dtype=False,
+            gradient_checkpointing=False,
+            compile=False,
+            compile_auto_tune=False,
+            compile_trace=False,
+            disable_memory_limits=True,
+        )
+        trainer._is_vlm = False
+        monkeypatch.setattr(MLXTrainer, "_configure_memory_limits", lambda self: {})
+        monkeypatch.setattr(MLXTrainer, "_restore_memory_limits", lambda self: None)
+
+        def train_inner(self):
+            assert self.model.parameters()["input_layernorm.weight"].dtype == mx.float32
+            assert loaded_model.input_layernorm(x).dtype == mx.float32
+            return {"ok": True}
+
+        monkeypatch.setattr(MLXTrainer, "_train_inner", train_inner)
+
+        assert trainer.train() == {"ok": True}
+        assert loaded_model.input_layernorm(x).dtype == x.dtype
+        assert (
+            LoaderOnlyNorm.__call__,
+            getattr(LoaderOnlyNorm, "_unsloth_original_call"),
+            getattr(LoaderOnlyNorm, "_unsloth_cast_output_to_input_dtype"),
+        ) == patched_state
+
+        class FailingNorm:
+            weight = mx.ones((4,), dtype=mx.float32)
+
+            def __call__(self, x):
+                return x.astype(mx.float32)
+
+            def parameters(self):
+                return {"weight": self.weight}
+
+        failing_norm = FailingNorm()
+
+        class FailingModel:
+            _config = {}
+
+            def parameters(self):
+                return {}
+
+            def named_modules(self):
+                return [("input_layernorm", failing_norm)]
+
+        def raising_set_norm_output_cast(enabled, model=None):
+            set_mlx_norm_output_cast_to_input_dtype(enabled, model)
+            raise RuntimeError("setup failed")
+
+        monkeypatch.setattr(
+            "unsloth_zoo.mlx.trainer._set_norm_output_cast_to_input_dtype",
+            raising_set_norm_output_cast,
+        )
+
+        failing_trainer = MLXTrainer.__new__(MLXTrainer)
+        failing_trainer.model = FailingModel()
+        failing_trainer.args = MLXTrainingConfig(cast_norm_output_to_input_dtype=True)
+        with pytest.raises(RuntimeError, match="setup failed"):
+            failing_trainer.train()
+        assert not getattr(FailingNorm.__call__, "_unsloth_norm_output_cast_wrapper", False)
+    finally:
+        set_mlx_norm_output_cast_to_input_dtype(False)
+
+
 def test_mlx_loader_fixes_gemma3_vision_post_layernorm_eps():
     from types import SimpleNamespace
 
@@ -434,11 +1580,14 @@ def test_mlx_loader_patches_gemma3_vision_attention_fp32_sdpa():
     assert "output.astype(orig_dtype)" in source
 
 
-def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32():
+def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32(monkeypatch):
     import inspect
+    from types import SimpleNamespace
 
+    import mlx.core as mx
     import unsloth_zoo.mlx.loader as loader
     from unsloth_zoo.mlx.loader import _fix_gemma3_text_rmsnorm_fp32
+    from unsloth_zoo.mlx.utils import set_mlx_norm_output_cast_to_input_dtype
 
     patched = _fix_gemma3_text_rmsnorm_fp32()
     assert patched in {True, False}
@@ -448,6 +1597,49 @@ def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32():
     assert "mx.rsqrt(mx.mean(x_f * x_f" in source
     assert "return y.astype(orig_dtype)" in source
     assert "_unsloth_fp32_rmsnorm_patched" in source
+
+    class FakeRMSNorm:
+        def __init__(self):
+            self.weight = mx.ones((4,), dtype=mx.float32)
+
+        def __call__(self, x):
+            return x.astype(mx.float32)
+
+        def parameters(self):
+            return {"weight": self.weight}
+
+    class TinyModel:
+        def __init__(self):
+            self.norm = FakeRMSNorm()
+
+        def named_modules(self):
+            return [("language_model.input_layernorm", self.norm)]
+
+    real_import_module = loader.importlib.import_module
+
+    def fake_import_module(name, *args, **kwargs):
+        if name == "mlx_vlm.models.gemma3.language":
+            return SimpleNamespace(RMSNorm=FakeRMSNorm)
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(loader.importlib, "import_module", fake_import_module)
+    model = TinyModel()
+    set_mlx_norm_output_cast_to_input_dtype(False)
+    try:
+        set_mlx_norm_output_cast_to_input_dtype(True, model)
+        assert _fix_gemma3_text_rmsnorm_fp32(model) is True
+        gemma_call = FakeRMSNorm.__call__
+
+        set_mlx_norm_output_cast_to_input_dtype(False, model)
+        assert FakeRMSNorm.__call__ is gemma_call
+
+        set_mlx_norm_output_cast_to_input_dtype(True, model)
+        assert getattr(FakeRMSNorm, "_unsloth_original_call") is gemma_call
+
+        set_mlx_norm_output_cast_to_input_dtype(False, model)
+        assert FakeRMSNorm.__call__ is gemma_call
+    finally:
+        set_mlx_norm_output_cast_to_input_dtype(False)
 
 
 def test_vlm_hidden_stack_preserves_inputs_embed_dtype():
@@ -553,6 +1745,41 @@ def test_qwen3_vl_vision_rotary_uses_transformers_fp32_math():
     assert "return rotated.astype(orig_dtype)" in source
     assert "q = _qwen3_vision_rotary_fp32(q, rotary_pos_emb)" in source
     assert "k = _qwen3_vision_rotary_fp32(k, rotary_pos_emb)" in source
+
+
+def test_qwen3_vl_vision_block_mlp_fp32_guard_for_fp16():
+    """Pin the fp16 MLP overflow guard in patched_qwen3_vision_block_call.
+
+    On M1/M2 Macs (no native bf16), MLX defaults to float16 for the vision
+    tower. The vision block's MLP linear_fc1 (up-projection) produces output
+    magnitudes that exceed fp16's 65504 ceiling for some inputs; downcasting
+    to fp16 saturates to inf and cascades to NaN in the backward.
+
+    Fix: when activation dtype is fp16, upcast the MLP input to fp32 so the
+    entire MLP (fc1, GELU, fc2) runs in fp32. The output is cast back to
+    source dtype at the residual add. bf16/fp32 keep the original path.
+    """
+    import inspect
+    import unsloth_zoo.mlx.compile as mc
+
+    source = inspect.getsource(mc._install_qwen3_family_compile_patches)
+
+    # Guard is present
+    assert "linear_fc1 (up-projection) overflows fp16" in source, (
+        "Missing comment documenting the fp16 overflow rationale"
+    )
+    # Dtype-conditional branch keys on residual_dtype (the activation dtype)
+    assert "if residual_dtype == mx.float16:" in source, (
+        "MLP fp32 guard must be gated on residual_dtype == mx.float16"
+    )
+    # fp16 path: upcast input to fp32 before calling self.mlp
+    assert "self.mlp(mlp_norm_out.astype(mx.float32))" in source, (
+        "fp16 branch must upcast mlp input to fp32"
+    )
+    # non-fp16 path: original (cheaper) cast-only flow preserved
+    assert "self.mlp(mlp_norm_out)" in source, (
+        "bf16/fp32 path must keep the original self.mlp(...) call"
+    )
 
 
 def test_qwen3_vl_training_compile_verified():

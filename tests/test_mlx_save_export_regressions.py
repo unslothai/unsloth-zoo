@@ -32,6 +32,7 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_torch_shim():
+    pytest.importorskip("torch")
     from mlx_simulation import simulate_mlx_on_torch
 
     simulate_mlx_on_torch()
@@ -217,6 +218,272 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
             "token": "hf_token",
             "private": True,
         },
+    }
+
+
+def test_text_generate_honors_do_sample_false(monkeypatch):
+    import mlx_lm
+    import mlx_lm.sample_utils as sample_utils
+    import torch
+    from transformers.tokenization_utils_base import to_py_obj
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = {}
+
+    class Tokenizer:
+        bos_token = None
+        eos_token_ids = {2}
+
+        def encode(self, prompt, add_special_tokens=True):
+            return [1, 2, 3]
+
+    def fake_make_sampler(**kwargs):
+        calls["sampler"] = kwargs
+        return "sampler"
+
+    def fake_stream_generate(_model, tokenizer, prompt, max_tokens=None, **kwargs):
+        calls["prompt"] = prompt
+        calls["max_tokens"] = max_tokens
+        calls["stream_sampler"] = kwargs["sampler"]
+        calls["eos_during_stream"] = set(tokenizer.eos_token_ids)
+        yield types.SimpleNamespace(token=9, finish_reason=None)
+        yield types.SimpleNamespace(token=5, finish_reason="stop")
+
+    monkeypatch.setattr(sample_utils, "make_sampler", fake_make_sampler)
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+
+    tokenizer = Tokenizer()
+    model = types.SimpleNamespace(_tokenizer=tokenizer, _is_vlm_model=False)
+    out = loader._mlx_generate(
+        model,
+        input_ids=[[0, 1, 2, 0]],
+        attention_mask=[[0, 1, 1, 0]],
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=32,
+        eos_token_id=5,
+        max_length=4,
+    )
+
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
+    assert out.tolist() == [[1, 2, 9, 5]]
+    assert out.shape == (1, 4)
+    assert out[:, 2:].tolist() == [[9, 5]]
+    assert to_py_obj(out) == [[1, 2, 9, 5]]
+    assert calls["sampler"] == {
+        "temp": 0.0,
+        "top_p": 0.0,
+        "min_p": 0.0,
+        "top_k": 0,
+    }
+    assert calls["prompt"] == [1, 2]
+    assert calls["max_tokens"] == 2
+    assert calls["stream_sampler"] == "sampler"
+    assert calls["eos_during_stream"] == {5}
+    assert tokenizer.eos_token_ids == {2}
+
+
+def test_mlx_generate_output_numpy_fallback_without_torch(monkeypatch):
+    import builtins
+    import numpy as np
+    import unsloth_zoo.mlx.loader as loader
+
+    # torch is installed here (the sim needs it), so force `import torch` to fail
+    # inside _mlx_generate_output to cover the numpy int64 fallback branch. Test
+    # both a missing torch (ImportError) and an installed-but-broken torch
+    # (OSError) -- the broadened except must degrade to numpy in both cases.
+    real_import = builtins.__import__
+
+    def failing_import(exc):
+        def _fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise exc
+            return real_import(name, *args, **kwargs)
+        return _fake_import
+
+    for exc in (ImportError("no torch"), OSError("broken torch native lib")):
+        monkeypatch.setattr(builtins, "__import__", failing_import(exc))
+        out = loader._mlx_generate_output([1, 2], [9, 5])
+        monkeypatch.undo()
+        assert isinstance(out, np.ndarray)
+        assert out.dtype == np.int64
+        assert out.shape == (1, 4)
+        assert out.tolist() == [[1, 2, 9, 5]]
+        assert out[:, 2:].tolist() == [[9, 5]]
+
+
+def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
+    import unsloth_zoo.mlx.loader as loader
+
+    class InnerTokenizer:
+        def __call__(self, *args, **kwargs):
+            return {"called": True}
+
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            if tokenize and kwargs.get("return_dict", False):
+                return {
+                    "input_ids": [1, 2, 3],
+                    "attention_mask": [1, 1, 1],
+                }
+            return [1, 2, 3] if tokenize else "rendered"
+
+    class TokenizerWrapper:
+        def __init__(self):
+            self._tokenizer = InnerTokenizer()
+
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            return [1, 2, 3] if tokenize else "rendered"
+
+    tokenizer = TokenizerWrapper()
+    loader._patch_mlx_tokenizer_call(tokenizer)
+
+    encoded = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        tokenize=True,
+        return_dict=True,
+    )
+
+    def expand_generate_inputs(**kwargs):
+        return kwargs
+
+    assert expand_generate_inputs(**encoded) == {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 1],
+    }
+    assert encoded.to("cpu")["input_ids"] == [1, 2, 3]
+    assert tokenizer.apply_chat_template([], tokenize=False, return_dict=True) == "rendered"
+    assert tokenizer("hi") == {"called": True}
+
+
+def test_vlm_generate_hf_kwargs(monkeypatch):
+    import torch
+    from transformers.tokenization_utils_base import to_py_obj
+    import unsloth_zoo.mlx.loader as loader
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    calls = []
+
+    def fake_stream_generate(_model, _processor, _prompt, max_tokens=None, **batch):
+        calls.append((max_tokens, batch))
+        return iter(())
+
+    fake_mlx_vlm.stream_generate = fake_stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    model = types.SimpleNamespace(
+        _tokenizer=types.SimpleNamespace(tokenizer=object()),
+        _is_vlm_model=True,
+        config=types.SimpleNamespace(eos_token_id=None),
+    )
+    out = loader._mlx_generate(
+        model,
+        input_ids=[1, 2],
+        attention_mask=[1, 1],
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+        max_new_tokens=1,
+    )
+
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
+    assert out.tolist() == [[1, 2]]
+    assert out.shape == (1, 2)
+    assert to_py_obj(out) == [[1, 2]]
+    assert calls[0][0] == 1
+    assert tuple(calls[0][1]["input_ids"].shape) == (1, 2)
+    assert tuple(calls[0][1]["mask"].shape) == (1, 2)
+    assert calls[0][1]["temperature"] == 0.0
+    assert "top_p" not in calls[0][1]
+
+
+def test_bound_save_pretrained_defaults_to_full_save_without_lora(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+
+    def fake_save_pretrained_merged(model, tokenizer, save_directory, **kwargs):
+        calls["tokenizer"] = tokenizer
+        calls["save_directory"] = Path(save_directory)
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(mutils, "collect_mlx_lora_adapter_tensors", lambda model: {})
+    monkeypatch.setattr(mutils, "save_pretrained_merged", fake_save_pretrained_merged)
+
+    tokenizer = object()
+    model = types.SimpleNamespace(_tokenizer=tokenizer)
+    loader._mlx_save_pretrained_merged(
+        model,
+        tmp_path,
+        safe_serialization=True,
+        save_peft_format=True,
+        save_embedding_layers="auto",
+        path_initial_model_for_weight_conversion="/tmp/base",
+        token="hf_token",
+    )
+
+    assert calls == {
+        "tokenizer": tokenizer,
+        "save_directory": tmp_path,
+        "kwargs": {"save_method": "merged_16bit", "token": "hf_token"},
+    }
+
+
+def test_adapter_bnb_base_remap_defaults_to_mlx_4bit_quantization(
+    monkeypatch,
+    tmp_path,
+):
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": "unsloth/tinyllama-bnb-4bit",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {}
+    original_from_pretrained = loader.FastMLXModel.from_pretrained
+
+    class StopAdapterLoad(RuntimeError):
+        pass
+
+    def fake_download(model_name, revision=None):
+        assert model_name == str(adapter_dir)
+        return adapter_dir
+
+    def fake_recursive_from_pretrained(model_name, **kwargs):
+        calls["model_name"] = model_name
+        calls["kwargs"] = kwargs
+        raise StopAdapterLoad("Unsloth: stop after recursive adapter base load")
+
+    monkeypatch.setattr(mlx_lm_utils, "_download", fake_download)
+    monkeypatch.setattr(
+        loader.FastMLXModel,
+        "from_pretrained",
+        staticmethod(fake_recursive_from_pretrained),
+    )
+
+    with pytest.raises(StopAdapterLoad):
+        original_from_pretrained(str(adapter_dir))
+
+    assert calls["model_name"] == "unsloth/tinyllama"
+    assert calls["kwargs"]["load_in_4bit"] is False
+    assert calls["kwargs"]["mlx_quantization_config"] == {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
     }
 
 
@@ -818,6 +1085,141 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == old_scripts_dir
 
 
+@pytest.mark.parametrize(
+    "platform_name, install_behavior, expect_macos_helper",
+    [
+        ("darwin", "prebuilt_ok", False),    # prebuilt-first: no clone/compile
+        ("darwin", "apt_get_error", True),   # prebuilt unavailable -> macOS cmake+Metal helper
+        ("linux", "prebuilt_ok", False),     # unchanged Linux path
+    ],
+)
+def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
+    monkeypatch, tmp_path, platform_name, install_behavior, expect_macos_helper
+):
+    """When llama.cpp is missing, the install fallback must try the shared
+    install_llama_cpp() (prebuilt-first) on every platform, and only drop to the
+    macOS cmake+Metal source helper when that prebuilt path hit the apt-get
+    failure that is macOS-specific."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setitem(sys.modules, "gguf", types.ModuleType("gguf"))
+    monkeypatch.setattr(mutils.sys, "platform", platform_name)
+
+    llama_root = tmp_path / "llama.cpp"
+    llama_root.mkdir()
+    converter = llama_root / "convert_hf_to_gguf.py"
+    converter.write_text("# converter", encoding="utf-8")
+    quantizer = llama_root / "llama-quantize"
+    quantizer.write_text("# quantizer", encoding="utf-8")
+    (llama_root / "unsloth_convert_hf_to_gguf.py").write_text("# patched", encoding="utf-8")
+
+    calls = []
+    check_state = {"n": 0}
+    gpu_support_seen = {"value": None}
+
+    def fake_check(folder):
+        # First probe fails (forces the install fallback); the re-probe after the
+        # macOS helper succeeds.
+        check_state["n"] += 1
+        calls.append("check")
+        if check_state["n"] == 1:
+            raise RuntimeError("llama.cpp not found")
+        return (str(quantizer), str(converter))
+
+    def fake_install(folder, gpu_support=False):
+        calls.append("install_llama_cpp")
+        gpu_support_seen["value"] = gpu_support
+        if install_behavior == "prebuilt_ok":
+            return (str(quantizer), str(converter))
+        # Mirror the real macOS-only source-build failure (no apt-get).
+        raise RuntimeError(
+            "[FAIL] Unsloth: apt-get does not exist? Is this NOT a Linux / Mac based computer?"
+        )
+
+    def fake_macos(folder):
+        calls.append("_install_llama_cpp_macos")
+
+    monkeypatch.setattr(
+        mutils, "save_merged_model",
+        lambda model, tokenizer, path, dequantize=False: Path(path).mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(mutils, "_install_llama_cpp_macos", fake_macos)
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(llama_root))
+    monkeypatch.setattr(llama_cpp, "check_llama_cpp", fake_check)
+    monkeypatch.setattr(llama_cpp, "install_llama_cpp", fake_install)
+    monkeypatch.setattr(
+        llama_cpp, "_download_convert_hf_to_gguf",
+        lambda: (str(llama_root / "unsloth_convert_hf_to_gguf.py"), {"Qwen3ForCausalLM"}, set()),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "convert_to_gguf",
+        lambda **kw: Path(
+            f"{kw['model_name']}.{kw['quantization_type'].upper()}.gguf"
+        ).write_bytes(b"GGUF"),
+    )
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", lambda **kw: None)
+
+    model = types.SimpleNamespace(_hf_repo="org/TestModel")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=tmp_path / "out",
+        quantization_method="not_quantized",
+        first_conversion="f16",
+    )
+
+    # Prebuilt-first is attempted on every platform.
+    assert "install_llama_cpp" in calls
+    # Export only needs the CPU-only llama-quantize, so gpu_support=False on every
+    # platform. On macOS this still resolves the universal unslothai/llama.cpp
+    # Metal bundle (same archive from the CPU selector), and the Metal source build
+    # is handled by the macOS helper below, not by this flag.
+    assert gpu_support_seen["value"] is False
+    # The macOS source helper is reached only on the darwin apt-get path.
+    assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
+
+
+def test_gguf_install_fallback_reraises_non_aptget_runtimeerror(monkeypatch, tmp_path):
+    """A non-apt-get RuntimeError from install_llama_cpp must propagate, not get
+    silently swallowed into the macOS source build."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setitem(sys.modules, "gguf", types.ModuleType("gguf"))
+    monkeypatch.setattr(mutils.sys, "platform", "darwin")
+
+    monkeypatch.setattr(
+        mutils, "save_merged_model",
+        lambda model, tokenizer, path, dequantize=False: Path(path).mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(
+        mutils, "_install_llama_cpp_macos",
+        lambda folder: pytest.fail("_install_llama_cpp_macos must not run for an unrelated error"),
+    )
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "llama.cpp"))
+    monkeypatch.setattr(
+        llama_cpp, "check_llama_cpp",
+        lambda folder: (_ for _ in ()).throw(RuntimeError("not found")),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "install_llama_cpp",
+        lambda folder, gpu_support=False: (_ for _ in ()).throw(RuntimeError("disk full while downloading prebuilt")),
+    )
+
+    model = types.SimpleNamespace(_hf_repo="org/TestModel")
+    with pytest.raises(RuntimeError, match="disk full"):
+        mutils.save_pretrained_gguf(
+            model,
+            tokenizer=object(),
+            save_directory=tmp_path / "out",
+            quantization_method="not_quantized",
+            first_conversion="f16",
+        )
+
+
 def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -886,3 +1288,98 @@ def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
         "private": True,
     }
     assert calls["upload"]["path_in_repo"] == "model.F16.gguf"
+
+
+def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
+    # A stale prebuilt install (binaries + marker, no CMakeLists.txt) left in the
+    # llama.cpp folder must be replaced before the macOS source build, or cmake runs
+    # against a directory with no CMakeLists.txt and the source fallback fails. The
+    # prebuilt-first export path reaches this helper exactly that way on macOS.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    import unsloth_zoo.llama_cpp as lcpp
+
+    # The helper only deletes a recognised managed prebuilt install (marker present)
+    # that lives in a safe-to-delete location, so anchor UNSLOTH_HOME at tmp_path.
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path), raising=False)
+
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    (folder / "llama-quantize").write_text("broken prebuilt binary")
+    (folder / "UNSLOTH_PREBUILT_INFO.json").write_text("{}")
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        if list(cmd[:2]) == ["git", "clone"]:
+            dest = Path(cmd[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "CMakeLists.txt").write_text("# source tree")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    assert any(list(c[:2]) == ["git", "clone"] for c in cmds), "expected a re-clone of the non-source dir"
+    assert (folder / "CMakeLists.txt").is_file(), "folder should be a source tree after the re-clone"
+
+
+def test_macos_helper_refuses_unmanaged_non_source_dir(monkeypatch, tmp_path):
+    # A non-source directory that is NOT a recognised Unsloth prebuilt install
+    # (no UNSLOTH_PREBUILT_INFO.json marker) must never be deleted -- a caller may
+    # point UNSLOTH_LLAMA_CPP_PATH at a directory full of their own files. The
+    # helper must raise instead of wiping it, mirroring the generic installer's
+    # _is_safe_to_delete / prebuilt-marker guard.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path), raising=False)
+
+    folder = tmp_path / "user_data"
+    folder.mkdir()
+    (folder / "important.txt").write_text("precious user file")  # no marker, no CMakeLists
+
+    def fake_run(cmd, *a, **k):
+        if list(cmd[:2]) == ["git", "clone"]:
+            pytest.fail("must not re-clone (and therefore delete) an unmanaged directory")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    with pytest.raises(RuntimeError, match="will not be removed"):
+        mutils._install_llama_cpp_macos(str(folder))
+
+    # The user's directory and its contents must be left fully intact.
+    assert folder.is_dir()
+    assert (folder / "important.txt").read_text() == "precious user file"
+
+
+def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
+    # A real source checkout (CMakeLists.txt present) is kept and rebuilt, never
+    # re-cloned -- only non-source dirs are replaced.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    (folder / "CMakeLists.txt").write_text("# existing source tree")
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), "must not re-clone an existing source tree"
+    assert (folder / "CMakeLists.txt").is_file()
