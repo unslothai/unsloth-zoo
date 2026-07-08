@@ -32,9 +32,12 @@ import sys
 import tempfile
 import types
 import warnings
+import weakref
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
+from pathlib import Path
 
 from .compile import (
     explain_compile_support,
@@ -48,6 +51,7 @@ from .compile import (
 
 _vlm_model_types_cache = None
 _SAFE_TEXT_SANITIZE_PATCHED: set[str] = set()
+_AUDIO_CONV_SANITIZE_PATCHED: set[str] = set()
 _MULTIMODAL_STRIP_KEYS = (
     "vision_tower",
     "audio_tower",
@@ -274,6 +278,43 @@ def _message_matches_known_fallback(message, rule):
     return all(token in message for token in rule.get("message_tokens", ()))
 
 
+def _raise_if_qk_norm_version_gap(model_type, message, error):
+    """A strict mlx load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too
+    old (or regressed, e.g. 0.31.3 - mlx-lm #1242) for a QK-norm arch; dropping
+    those weights breaks the model, so raise a clear error instead."""
+    if "parameters not in model" not in message:
+        return
+    if not any(marker in message for marker in ("k_norm", "q_norm")):
+        return
+    # gemma4/gemma3n KV-sharing tails ship DEAD k_proj/v_proj/k_norm (never
+    # q_norm); dropping them via strict=False is safe (mlx-lm #1242). A real gap
+    # rejects q_norm/k_norm WITHOUT the paired projections - raise only then.
+    kv_sharing_dead_tail = (
+        "self_attn.k_proj" in message
+        and "self_attn.v_proj" in message
+        and "q_norm" not in message
+    )
+    if kv_sharing_dead_tail:
+        return
+    versions = []
+    for pkg in ("mlx-lm", "mlx-vlm"):
+        try:
+            from importlib.metadata import version as _dist_version
+
+            versions.append(f"{pkg}={_dist_version(pkg)}")
+        except Exception:
+            # Best-effort hint; omit a missing dist.
+            pass
+    installed = f" Installed: {', '.join(versions)}." if versions else ""
+    raise ValueError(
+        f"Unsloth: cannot load MLX {model_type or 'model'} - the installed "
+        f"mlx-lm / mlx-vlm rejects its QK-norm (q_norm/k_norm) weights, so it is "
+        f"too old or regressed for this architecture (mlx-lm 0.31.3 broke "
+        f"gemma4 / qwen3_5). Reinstall an arch-complete build, e.g. "
+        f'`pip install -U "mlx-lm>=0.22.0,!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
+    ) from error
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Let DeepSeek-OCR remote config imports survive newer Transformers.
 
@@ -313,16 +354,26 @@ def _deepseek_ocr_config_model_type(config_data):
     return None
 
 
-def _materialize_mlx_vlm_config_override(local_path, config_data):
-    """Return a load path whose config routes known repos to the right mlx-vlm class."""
-    if not local_path:
-        return local_path, config_data
+def _materialize_mlx_vlm_config_data(local_path, config_data):
+    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
+    for name in os.listdir(local_path):
+        src = os.path.join(local_path, name)
+        dst = os.path.join(override_dir, name)
+        if name == "config.json":
+            continue
+        _link_or_copy_path(src, dst)
+    with open(os.path.join(override_dir, "config.json"), "w") as f:
+        json.dump(config_data, f, indent=2)
+    return override_dir
+
+
+def _mlx_vlm_config_override_data(config_data):
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     if (
         corrected_model_type is None
         or config_data.get("model_type") == corrected_model_type
     ):
-        return local_path, config_data
+        return None
 
     patched_config = dict(config_data)
     patched_config["model_type"] = corrected_model_type
@@ -330,22 +381,35 @@ def _materialize_mlx_vlm_config_override(local_path, config_data):
     # Torch remote-code auto_map here makes AutoProcessor import incompatible
     # DeepSeek OCR Torch modules during MLX loads.
     patched_config.pop("auto_map", None)
-    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name == "config.json":
-            continue
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            pass
-    with open(os.path.join(override_dir, "config.json"), "w") as f:
-        json.dump(patched_config, f, indent=2)
     print(
         "Unsloth: Routing DeepSeek OCR checkpoint through "
         f"mlx-vlm model_type={corrected_model_type!r}."
     )
+    return patched_config
+
+
+def _keep_mlx_vlm_config_view_alive(model, override_dir):
+    override_dir = str(override_dir)
+    paths = list(getattr(model, "_unsloth_mlx_config_view_paths", ()))
+    paths.append(override_dir)
+    model._unsloth_mlx_config_view_paths = paths
+    try:
+        finalizers = list(getattr(model, "_unsloth_mlx_config_view_finalizers", ()))
+        finalizers.append(weakref.finalize(model, shutil.rmtree, override_dir, ignore_errors=True))
+        model._unsloth_mlx_config_view_finalizers = finalizers
+    except TypeError:
+        pass
+
+
+def _materialize_mlx_vlm_config_override(local_path, config_data):
+    """Return a load path whose config routes known repos to the right mlx-vlm class."""
+    if not local_path:
+        return local_path, config_data
+    patched_config = _mlx_vlm_config_override_data(config_data)
+    if patched_config is None:
+        return local_path, config_data
+
+    override_dir = _materialize_mlx_vlm_config_data(local_path, patched_config)
     return override_dir, patched_config
 
 
@@ -383,6 +447,9 @@ def _load_mlx_lm_with_strict_fallback(
         )
     except ValueError as error:
         message = str(error)
+        # Active-layer QK-norm weights are load-bearing: never strict=False past
+        # them (the dead KV-sharing tail still falls through to the fallback).
+        _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_MLX_LM_STRICT_FALLBACKS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
             raise
@@ -404,6 +471,269 @@ def _load_mlx_lm_with_strict_fallback(
     return model, tokenizer
 
 
+def _mlx_lm_metadata_allow_patterns():
+    return [
+        "*.json",
+        "*.py",
+        "tokenizer.model",
+        "*.tiktoken",
+        "tiktoken.model",
+        "*.txt",
+        "*.jsonl",
+        "*.jinja",
+    ]
+
+
+def _link_or_copy_path(src, dst):
+    try:
+        os.symlink(src, dst)
+        return
+    except FileExistsError:
+        return
+    except OSError:
+        pass
+
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            os.link(src, dst)
+        return
+    except FileExistsError:
+        return
+    except OSError:
+        pass
+
+    if os.path.isdir(src):
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dst)
+
+
+def _mlx_lm_snapshot_view(model_path, *, weight_files=()):
+    src_root = Path(model_path).resolve()
+    dst_root = Path(tempfile.mkdtemp(prefix="unsloth_mlx_dist_view_"))
+    allowed_weights = {str(file) for file in (weight_files or ())}
+    for root, dirs, files in os.walk(src_root):
+        rel_root = os.path.relpath(root, src_root)
+        dst_dir = dst_root if rel_root == "." else dst_root / rel_root
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for directory in dirs:
+            (dst_dir / directory).mkdir(exist_ok=True)
+        for name in files:
+            rel_file = name if rel_root == "." else os.path.join(rel_root, name)
+            is_weight = name.endswith(".safetensors")
+            if (
+                is_weight
+                and rel_file not in allowed_weights
+                and name not in allowed_weights
+            ):
+                continue
+            src = os.path.join(root, name)
+            dst = dst_dir / name
+            _link_or_copy_path(src, dst)
+    return dst_root
+
+
+@contextmanager
+def _temporary_mlx_lm_snapshot_view(model_path, *, weight_files=()):
+    view_path = _mlx_lm_snapshot_view(model_path, weight_files=weight_files)
+    try:
+        yield view_path
+    finally:
+        shutil.rmtree(view_path, ignore_errors=True)
+
+
+def _load_mlx_lm_distributed(
+    model_name,
+    model_type,
+    mlx_load_kwargs,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    hf_token=None,
+):
+    """Load text models following mlx-lm's sharded_load ordering.
+
+    Pipeline placement must happen before downloading/loading local weight
+    shards; post-load sharding defeats the memory behavior of pipeline
+    parallelism.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import _download, load_model, load_tokenizer
+
+    pipeline_group, tensor_group = _mlx_active_distributed_groups(
+        pipeline_group,
+        tensor_group,
+    )
+    tokenizer_config = mlx_load_kwargs.get("tokenizer_config") or {}
+    model_config = mlx_load_kwargs.get("model_config") or {}
+    revision = mlx_load_kwargs.get("revision")
+    want_config = mlx_load_kwargs.get("return_config", False)
+
+    with _temporary_hf_token_env(hf_token):
+        model_path = _download(
+            model_name,
+            revision=revision,
+            allow_patterns=_mlx_lm_metadata_allow_patterns(),
+        )
+        with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
+            model, config = load_model(
+                metadata_model_path,
+                lazy=True,
+                strict=False,
+                model_config=model_config,
+            )
+
+            mode = _mlx_distributed_sharding_mode(
+                model,
+                pipeline_group=pipeline_group,
+                tensor_group=tensor_group,
+                model_name=model_name,
+            )
+            if mode == "tensor":
+                tensor_load_kwargs = dict(mlx_load_kwargs)
+                tensor_load_kwargs["lazy"] = True
+                tensor_load_kwargs["return_config"] = True
+                model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
+                    model_name,
+                    model_type,
+                    None,
+                    tensor_load_kwargs,
+                    hf_token=hf_token,
+                )
+                _apply_mlx_distributed_sharding(
+                    model,
+                    tensor_group=tensor_group,
+                    model_name=model_name,
+                )
+                mx.eval(model.parameters())
+                mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+                if want_config:
+                    return model, tokenizer, config
+                return model, tokenizer
+
+            if mode == "pipeline":
+                _apply_mlx_distributed_sharding(
+                    model,
+                    pipeline_group=pipeline_group,
+                    model_name=model_name,
+                )
+                try:
+                    with open(
+                        metadata_model_path / "model.safetensors.index.json",
+                        "r",
+                    ) as file:
+                        index_data = json.load(file)
+                        weight_index = index_data.get("weight_map")
+                        if not isinstance(weight_index, dict):
+                            raise ValueError(
+                                "Unsloth: MLX pipeline distributed loading requires a "
+                                "valid 'weight_map' in model.safetensors.index.json."
+                            )
+                except FileNotFoundError as error:
+                    raise ValueError(
+                        "Unsloth: MLX pipeline distributed loading requires a "
+                        "converted MLX checkpoint with model.safetensors.index.json."
+                    ) from error
+
+                local_files = set()
+                for key, _value in tree_flatten(model.parameters()):
+                    for indexed_key in _mlx_pipeline_index_keys_for_parameter(
+                        key,
+                        weight_index,
+                    ):
+                        file_name = weight_index.get(indexed_key)
+                        if file_name is None:
+                            raise ValueError(
+                                "Unsloth: MLX pipeline distributed loading is only "
+                                "supported for converted MLX models with indexed weights."
+                            )
+                        local_files.add(file_name)
+
+        _download(model_name, revision=revision, allow_patterns=sorted(local_files))
+        final_model_path = _mlx_lm_snapshot_view(model_path, weight_files=local_files)
+        cleanup_final_model_path = True
+
+        try:
+            tokenizer = load_tokenizer(
+                final_model_path,
+                tokenizer_config,
+                eos_token_ids=config.get("eos_token_id", None),
+            )
+            model, _config = load_model(
+                final_model_path,
+                lazy=True,
+                strict=False,
+                model_config=model_config,
+            )
+            config = _config
+            _apply_mlx_distributed_sharding(
+                model,
+                pipeline_group=pipeline_group,
+                tensor_group=tensor_group,
+                model_name=model_name,
+            )
+            mx.eval(model.parameters())
+
+            if pipeline_group is not None or tensor_group is not None:
+                mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+        finally:
+            if cleanup_final_model_path:
+                shutil.rmtree(final_model_path, ignore_errors=True)
+
+    if want_config:
+        return model, tokenizer, config
+    return model, tokenizer
+
+
+def _resolve_distributed_runtime_quantization(
+    model_name,
+    quantization_spec,
+    *,
+    distributed_requested,
+    want_runtime_quant,
+):
+    if not distributed_requested or not want_runtime_quant:
+        return quantization_spec, want_runtime_quant
+    if quantization_spec.source == "load_in_4bit":
+        warnings.warn(
+            "Unsloth: distributed MLX inference does not support runtime "
+            f"quantization for '{model_name}'. Loading the full-precision MLX "
+            "checkpoint instead of applying the default load_in_4bit=True. "
+            "Use a pre-quantized MLX repo for distributed quantized inference.",
+            stacklevel=3,
+        )
+        return (
+            _MLXQuantizationSpec(
+                enabled=False,
+                source="distributed_full_precision",
+                quantize_modules=quantization_spec.quantize_modules,
+                has_callable_predicate=quantization_spec.has_callable_predicate,
+                force_requantize=quantization_spec.force_requantize,
+            ),
+            False,
+        )
+    raise ValueError(
+        "Unsloth: distributed MLX inference requires a pre-quantized "
+        "or full-precision MLX repo. Runtime MLX quantization while "
+        "sharding is unsupported; use an mlx-community *-4bit/*-8bit "
+        "repo or load without quantized load flags."
+    )
+
+
+def _mlx_pipeline_index_keys_for_parameter(key, weight_index):
+    yield key
+    if not key.endswith(".weight"):
+        return
+    prefix = key[:-len(".weight")]
+    for suffix in (".scales", ".biases", ".bias"):
+        sibling = f"{prefix}{suffix}"
+        if sibling in weight_index:
+            yield sibling
+
+
 def _load_mlx_vlm_with_extra_weight_filter(
     model_name,
     model_type,
@@ -423,6 +753,8 @@ def _load_mlx_vlm_with_extra_weight_filter(
             return vlm_load(model_name, **vlm_kwargs)
     except ValueError as error:
         message = str(error)
+        # QK-norm weights are load-bearing: check before the extra-weight filter.
+        _raise_if_qk_norm_version_gap(model_type, message, error)
         rule = _KNOWN_VLM_EXTRA_WEIGHT_FILTERS.get(model_type)
         if rule is None or not _message_matches_known_fallback(message, rule):
             raise
@@ -450,8 +782,88 @@ def _load_mlx_vlm_with_extra_weight_filter(
             try:
                 with _temporary_hf_token_env(hf_token):
                     return vlm_load(model_name, **vlm_kwargs)
+            except ValueError as retry_error:
+                # Filtering the extras can unmask a q_norm/k_norm version gap on
+                # the retry; surface the actionable error instead of the raw one.
+                _raise_if_qk_norm_version_gap(model_type, str(retry_error), retry_error)
+                raise
             finally:
                 nn.Module.load_weights = original_load_weights
+
+
+def _load_mlx_vlm_distributed(
+    model_name,
+    model_type,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    hf_token=None,
+    revision=None,
+    config_override_data=None,
+):
+    pipeline_group, tensor_group = _mlx_active_distributed_groups(
+        pipeline_group,
+        tensor_group,
+    )
+    mode = "tensor" if tensor_group is not None else "pipeline"
+    model_label = f"'{model_name}'"
+    if model_type:
+        model_label = f"{model_label} (model_type={model_type!r})"
+
+    try:
+        from mlx_vlm.utils import get_model_path, sharded_load
+    except ImportError as error:
+        raise ImportError(
+            "Unsloth: distributed MLX VLM inference requires mlx-vlm with "
+            "sharded_load support. Install or upgrade mlx-vlm on Apple Silicon."
+        ) from error
+
+    try:
+        with _temporary_hf_token_env(hf_token):
+            load_target = get_model_path(model_name, revision=revision)
+            if config_override_data is not None:
+                load_target = _materialize_mlx_vlm_config_data(
+                    str(load_target),
+                    config_override_data,
+                )
+                try:
+                    model, processor = sharded_load(
+                        load_target,
+                        tensor_group=tensor_group,
+                        pipeline_group=pipeline_group,
+                    )
+                except Exception:
+                    shutil.rmtree(load_target, ignore_errors=True)
+                    raise
+                _keep_mlx_vlm_config_view_alive(model, load_target)
+                return model, processor
+            return sharded_load(
+                load_target,
+                tensor_group=tensor_group,
+                pipeline_group=pipeline_group,
+            )
+    except ValueError as error:
+        message = str(error)
+        lower_message = message.lower()
+        support_error = (
+            "does not support" in lower_message
+            or "not supported" in lower_message
+            or "unsupported model type" in lower_message
+        )
+        if not support_error:
+            raise
+        raise ValueError(
+            f"Unsloth: {model_label} does not support MLX {mode} parallel "
+            f"VLM inference through mlx-vlm. {message}"
+        ) from error
+    except TypeError as error:
+        message = str(error)
+        if "tensor_group" not in message and "pipeline_group" not in message:
+            raise
+        raise ImportError(
+            "Unsloth: distributed MLX VLM inference requires a newer mlx-vlm "
+            "with sharded_load(repo, tensor_group=..., pipeline_group=...) support."
+        ) from error
 
 
 def _read_json_file(path):
@@ -1284,6 +1696,118 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     _SAFE_TEXT_SANITIZE_PATCHED.add(model_type)
 
 
+def _resolve_mlx_vlm_model_class(model_type):
+    """Resolve the mlx_vlm ``Model`` class for a model_type (honoring remaps)."""
+    if not model_type:
+        return None
+    module_type = str(model_type).replace("-", "_")
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        remapped = MODEL_REMAPPING.get(model_type, MODEL_REMAPPING.get(module_type))
+        if remapped:
+            module_type = str(remapped).replace("-", "_")
+    except Exception:
+        pass
+    for candidate in (
+        f"mlx_vlm.models.{module_type}.{module_type}",
+        f"mlx_vlm.models.{module_type}",
+    ):
+        try:
+            module = importlib.import_module(candidate)
+        except Exception:
+            continue
+        cls = getattr(module, "Model", None)
+        if cls is not None:
+            return cls
+    return None
+
+
+def _lookup_module_array(root, dotted_key):
+    """Resolve a parameter (mx.array) by its checkpoint dotted key, else None."""
+    obj = root
+    for part in dotted_key.split("."):
+        if isinstance(obj, Mapping):
+            if part not in obj:
+                return None
+            obj = obj[part]
+        elif isinstance(obj, (list, tuple)):
+            if not part.isdigit() or int(part) >= len(obj):
+                return None
+            obj = obj[int(part)]
+        else:
+            obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+# Inverse of the unconditional PyTorch->MLX conv transpose mlx-vlm applies in
+# sanitize(): Conv1d transpose(0, 2, 1) is self-inverse, Conv2d transpose(
+# 0, 2, 3, 1) inverts to (0, 3, 1, 2).
+_MLX_CONV_TRANSPOSE_INVERSE = {3: (0, 2, 1), 4: (0, 3, 1, 2)}
+
+
+def _ensure_audio_conv_sanitize(model_type: str) -> None:
+    """Guard mlx-vlm audio-tower conv sanitize against a double transpose.
+
+    Pre-converted MLX checkpoints (e.g. mlx-community/gemma-4-e2b-it-4bit) store
+    the audio SubSampleConvProjection Conv2d weights and Conformer depthwise
+    Conv1d weights already in MLX channel-last layout. mlx-vlm's ``sanitize``
+    unconditionally re-applies the PyTorch->MLX transpose, corrupting the shape
+    and failing the load with an HTTP 500 shape mismatch (e.g. "Expected shape
+    (128, 3, 3, 1) but received shape (128, 3, 1, 3)").
+
+    When a checkpoint weight already matches the instantiated module's
+    channel-last target shape, pre-apply the inverse permutation so the upstream
+    transpose round-trips to the correct layout instead of double transposing.
+    We only intervene on an exact target-shape match, so raw PyTorch checkpoints
+    (which genuinely need the transpose) are untouched. Patched by behavior
+    (sanitize source signature), not by hardcoding a single family.
+    """
+    if not model_type or model_type in _AUDIO_CONV_SANITIZE_PATCHED:
+        return
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if cls is None:
+        return
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None:
+        return
+    source = _safe_getsource(sanitize)
+    if not source:
+        return
+    compact = re.sub(r"\s+", "", source)
+    conv2d_transpose = "subsample_conv_projection" in source and "transpose(0,2,3,1)" in compact
+    conv1d_transpose = "depthwise_conv1d.weight" in source and "transpose(0,2,1)" in compact
+    if not (conv2d_transpose or conv1d_transpose):
+        return
+
+    original_sanitize = sanitize
+
+    def _is_audio_conv_key(key, ndim):
+        if ndim == 4 and "subsample_conv_projection" in key and "conv.weight" in key:
+            return conv2d_transpose
+        if ndim == 3 and "depthwise_conv1d.weight" in key:
+            return conv1d_transpose
+        return False
+
+    def patched_sanitize(self, weights):
+        prepared = {}
+        for key, value in weights.items():
+            ndim = getattr(value, "ndim", 0)
+            inverse = _MLX_CONV_TRANSPOSE_INVERSE.get(ndim)
+            if inverse is not None and _is_audio_conv_key(key, ndim):
+                target = _lookup_module_array(self, key)
+                target_shape = tuple(getattr(target, "shape", ()) or ())
+                if target_shape and target_shape == tuple(value.shape):
+                    # Already channel-last: undo the upcoming upstream transpose.
+                    value = value.transpose(*inverse)
+            prepared[key] = value
+        return original_sanitize(self, prepared)
+
+    cls.sanitize = patched_sanitize
+    _AUDIO_CONV_SANITIZE_PATCHED.add(model_type)
+
+
 def _fp16_needs_bf16_modules(model):
     """Modules that should stay bf16 under fp16 training.
 
@@ -1552,6 +2076,7 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
+    import mlx.nn as nn
     quantized = {}
     quantized.update(_quantization_config_to_path_map(
         _get_existing_mlx_quantization(getattr(model, "_config", None))
@@ -1562,7 +2087,10 @@ def _effective_mlx_quantization_map(model):
     for path, module in model.named_modules():
         if not path:
             continue
-        if type(module).__name__ not in {"QuantizedLinear", "QuantizedEmbedding"}:
+        # isinstance, not an exact class-name match: a training-time subclass of
+        # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
+        # recognised, else embed_tokens is silently dropped from the map.
+        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
             continue
         path = _canonical_mlx_quantization_path(path)
         entry = {}
@@ -1611,11 +2139,13 @@ def _quantization_config_to_path_map(config):
 
 
 def _canonical_mlx_quantization_path(path):
-    # mlx-lm LoRALinear stores the wrapped base layer under ".linear".
-    # Adapter metadata must describe the underlying base path so validation can
-    # run before load_adapters re-wraps the module.
-    if path.endswith(".linear"):
-        return path[:-len(".linear")]
+    # mlx-lm LoRA/DoRA wrappers store the wrapped base layer under ".linear"
+    # (LoRALinear) or ".embedding" (LoRAEmbedding/DoRAEmbedding). Adapter
+    # metadata must describe the underlying base path so validation can run
+    # before load_adapters re-wraps the module.
+    for suffix in (".linear", ".embedding"):
+        if path.endswith(suffix):
+            return path[:-len(suffix)]
     return path
 
 
@@ -2743,6 +3273,10 @@ def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, pre
 # twice, so it must be imported once per process and reused — re-importing
 # after purging it from sys.modules raises "Tried to register an operator".
 _REAL_BITSANDBYTES_MODULES = {}
+# Serialize the stub swap in _dequantize_bnb_to_tempdir: concurrent callers
+# would race the lifted-stub window and each other's sys.modules restore (and
+# two multi-GB dequants at once risks OOM on Apple Silicon).
+_BNB_IMPORT_LOCK = threading.Lock()
 
 
 def _bnb_module_names():
@@ -2763,110 +3297,94 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
     is unavailable so the caller can fall back to the clear bnb-unsupported error.
     """
     global _REAL_BITSANDBYTES_MODULES
-    saved_meta = list(sys.meta_path)
-    stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
-    sys.meta_path[:] = [
-        finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
-    ]
-    for name in _bnb_module_names():
-        del sys.modules[name]
-    # Reuse the already-initialized real bnb if we imported it earlier; only a
-    # cold process re-imports (and re-registers torch ops) for the first time.
-    sys.modules.update(_REAL_BITSANDBYTES_MODULES)
-    try:
-        import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
-        import torch
-        from transformers import AutoConfig, AutoTokenizer
-
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-
-        # Pick the right auto class: VLMs have a vision_config attribute or are
-        # explicitly listed in transformers' image-text-to-text mapping.
-        # AutoModelForCausalLM is text-only and rejects Qwen3VLConfig etc.
-        cfg = AutoConfig.from_pretrained(
-            source, token=token, trust_remote_code=trust_remote_code,
-        )
-        _is_vlm = (
-            hasattr(cfg, "vision_config")
-            or getattr(cfg, "model_type", "").endswith("_vl")
-            or getattr(cfg, "model_type", "") in (
-                "qwen3_vl", "qwen2_vl", "qwen2_5_vl", "llava", "llava_next",
-                "idefics2", "idefics3", "paligemma", "gemma3", "mllama",
-                "smolvlm", "internvl",
-            )
-        )
-        if _is_vlm:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
-            auto_cls = AutoModelForImageTextToText
-        else:
-            from transformers import AutoModelForCausalLM
-            auto_cls = AutoModelForCausalLM
-
-        model = auto_cls.from_pretrained(
-            source,
-            dtype=torch.float16,
-            device_map={"": device},
-            token=token,
-            trust_remote_code=trust_remote_code,
-        ).dequantize()
-        # After dequantize, the model config still carries bnb's
-        # quantization_config plus _pre_quantization_dtype (a torch.dtype).
-        # For VLMs these also live in sub-configs (vision_config, text_config,
-        # etc.). The dtype is not JSON-serializable and breaks save_pretrained.
-        # The dequantized weights no longer need any of this metadata.
-        def _strip_quant_meta(cfg):
-            if cfg is None:
-                return
-            for _attr in ("quantization_config", "_pre_quantization_dtype"):
-                if hasattr(cfg, _attr):
-                    try:
-                        delattr(cfg, _attr)
-                    except Exception:
-                        pass
-            # Walk known sub-config attrs that VLMs use to nest configs.
-            for _sub in (
-                "vision_config", "text_config", "audio_config",
-                "speech_config", "image_config", "encoder_config",
-                "decoder_config",
-            ):
-                _strip_quant_meta(getattr(cfg, _sub, None))
-        _strip_quant_meta(model.config)
-        tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
-        # transformers 5.x: the dequantized model still carries weight-name
-        # conversions with no reverse op, so save_pretrained's
-        # revert_weight_conversion raises NotImplementedError. The dequantized
-        # weights need no conversion; clear it. No-op on 4.x (attr absent).
-        try:
-            model._weight_conversions = []
-        except Exception:
-            pass
-        model.save_pretrained(tmpdir, safe_serialization=True)
-        # VLMs need the full processor (image preprocessor + tokenizer); text
-        # models only need the tokenizer. Use the right class so downstream
-        # mlx-vlm / mlx-lm loads can read the saved artifacts.
-        if _is_vlm:
-            AutoProcessor.from_pretrained(
-                source, token=token, trust_remote_code=trust_remote_code,
-            ).save_pretrained(tmpdir)
-        else:
-            AutoTokenizer.from_pretrained(
-                source, token=token, trust_remote_code=trust_remote_code,
-            ).save_pretrained(tmpdir)
-        # Release the fp16 model and bnb's MPS allocator cache so the caller's
-        # MLX re-quantization (and any later loads) aren't starved of memory.
-        del model
-        gc.collect()
-        if device == "mps":
-            torch.mps.empty_cache()
-        return tmpdir
-    finally:
-        _REAL_BITSANDBYTES_MODULES = {
-            name: sys.modules[name] for name in _bnb_module_names()
-        }
+    with _BNB_IMPORT_LOCK:
+        saved_meta = list(sys.meta_path)
+        stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
+        sys.meta_path[:] = [
+            finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
+        ]
         for name in _bnb_module_names():
             del sys.modules[name]
-        sys.modules.update(stub_modules)
-        sys.meta_path[:] = saved_meta
+        # Reuse the already-initialized real bnb if we imported it earlier; only a
+        # cold process re-imports (and re-registers torch ops) for the first time.
+        sys.modules.update(_REAL_BITSANDBYTES_MODULES)
+        try:
+            import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+            # Only text bnb repos reach here; VLM bnb repos are rejected by the
+            # caller (mlx-vlm dequant is not wired up yet). AutoModelForCausalLM
+            # dequantizes the NF4 weights to fp16. Pass torch_dtype, not dtype:
+            # the supported transformers 4.x range only accepts torch_dtype (a
+            # `dtype` kwarg raises TypeError there), and 5.x still accepts it.
+            model = AutoModelForCausalLM.from_pretrained(
+                source,
+                torch_dtype=torch.float16,
+                device_map={"": device},
+                token=token,
+                trust_remote_code=trust_remote_code,
+            ).dequantize()
+            # After dequantize, the model config still carries bnb's
+            # quantization_config plus _pre_quantization_dtype (a torch.dtype).
+            # The dtype is not JSON-serializable and breaks save_pretrained; the
+            # dequantized weights no longer need any of this metadata.
+            def _strip_quant_meta(cfg):
+                if cfg is None:
+                    return
+                for _attr in ("quantization_config", "_pre_quantization_dtype"):
+                    if hasattr(cfg, _attr):
+                        try:
+                            delattr(cfg, _attr)
+                        except Exception:
+                            pass
+                # Walk known sub-config attrs that models use to nest configs.
+                for _sub in (
+                    "vision_config", "text_config", "audio_config",
+                    "speech_config", "image_config", "encoder_config",
+                    "decoder_config",
+                ):
+                    _strip_quant_meta(getattr(cfg, _sub, None))
+            _strip_quant_meta(model.config)
+            tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
+            try:
+                # transformers 5.x: the dequantized model still carries
+                # weight-name conversions that can't be reversed for quantized
+                # weights, so save_pretrained's revert_weight_conversion raises.
+                # The dequantized weights need no conversion; clear it. No-op on
+                # 4.x, where the attribute doesn't exist.
+                try:
+                    model._weight_conversions = []
+                except Exception:
+                    pass
+                model.save_pretrained(tmpdir, safe_serialization=True)
+                # Save the tokenizer so the downstream mlx-lm load can read it.
+                AutoTokenizer.from_pretrained(
+                    source, token=token, trust_remote_code=trust_remote_code,
+                ).save_pretrained(tmpdir)
+            except BaseException:
+                # Don't leak the multi-GB fp16 scratch copy: BaseException,
+                # because a Ctrl-C during the long safetensors write is the
+                # likeliest abort and must clean up too.
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
+            # Release the fp16 model and bnb's MPS allocator cache so the caller's
+            # MLX re-quantization (and any later loads) aren't starved of memory.
+            del model
+            gc.collect()
+            if device == "mps":
+                torch.mps.empty_cache()
+            return tmpdir
+        finally:
+            _REAL_BITSANDBYTES_MODULES = {
+                name: sys.modules[name] for name in _bnb_module_names()
+            }
+            for name in _bnb_module_names():
+                del sys.modules[name]
+            sys.modules.update(stub_modules)
+            sys.meta_path[:] = saved_meta
 
 
 def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
@@ -2922,6 +3440,107 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
     model._unsloth_quantization_policy = spec.to_metadata()
     model._unsloth_quantized_source = "runtime"
     return model, updated_config
+
+
+def _mlx_distributed_rank_size(group=None):
+    """Return ``(rank, world_size)`` for an optional MLX distributed group."""
+    if group is None:
+        return 0, 1
+    rank = int(group.rank())
+    world_size = int(group.size())
+    if world_size < 1:
+        raise ValueError(f"Invalid MLX distributed world_size={world_size}.")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"Invalid MLX distributed rank={rank} for world_size={world_size}."
+        )
+    return rank, world_size
+
+
+def _mlx_distributed_group_size(group):
+    return _mlx_distributed_rank_size(group)[1]
+
+
+def _mlx_group_is_distributed(group) -> bool:
+    size = _mlx_distributed_group_size(group)
+    return group is not None and size != 1
+
+
+def _mlx_active_distributed_groups(pipeline_group=None, tensor_group=None):
+    active_pipeline = pipeline_group if _mlx_group_is_distributed(pipeline_group) else None
+    active_tensor = tensor_group if _mlx_group_is_distributed(tensor_group) else None
+    if active_pipeline is not None and active_tensor is not None:
+        raise ValueError(
+            "Unsloth: MLX distributed loading accepts only one parallel mode. "
+            "Pass either pipeline_group or tensor_group, not both."
+        )
+    return active_pipeline, active_tensor
+
+
+def _mlx_distributed_requested(pipeline_group=None, tensor_group=None) -> bool:
+    return any(
+        _mlx_group_is_distributed(group)
+        for group in (pipeline_group, tensor_group)
+    )
+
+
+def _mlx_distributed_sharding_mode(
+    model,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    model_name="model",
+):
+    pipeline_group, tensor_group = _mlx_active_distributed_groups(
+        pipeline_group,
+        tensor_group,
+    )
+    if pipeline_group is None and tensor_group is None:
+        return None
+
+    has_pipelining = hasattr(getattr(model, "model", None), "pipeline")
+    has_tensor_parallel = hasattr(model, "shard")
+
+    if tensor_group is not None:
+        if has_tensor_parallel:
+            return "tensor"
+        else:
+            raise ValueError(
+                f"Unsloth: '{model_name}' does not support MLX tensor "
+                "parallelism. The model must expose shard(group)."
+            )
+    else:
+        if has_pipelining:
+            return "pipeline"
+        else:
+            raise ValueError(
+                f"Unsloth: '{model_name}' does not support MLX pipeline "
+                "parallelism. The model must expose model.pipeline(group)."
+            )
+
+
+def _apply_mlx_distributed_sharding(
+    model,
+    *,
+    pipeline_group=None,
+    tensor_group=None,
+    model_name="model",
+):
+    mode = _mlx_distributed_sharding_mode(
+        model,
+        pipeline_group=pipeline_group,
+        tensor_group=tensor_group,
+        model_name=model_name,
+    )
+    if mode is None:
+        return None
+
+    if mode == "tensor":
+        model.shard(tensor_group)
+    else:
+        model.model.pipeline(pipeline_group)
+    model._unsloth_mlx_distributed_parallel_mode = mode
+    return mode
 
 
 def _content_has_structured_multimodal_markers(content):
@@ -3433,6 +4052,20 @@ def _mlx_apply_attention_mask(prompt_ids, attention_mask):
     return [token for token, keep in zip(prompt_ids, mask) if keep != 0]
 
 
+def _mlx_generate_output(prompt_ids, generated_ids):
+    """Build a Transformers-friendly batched generate return value."""
+    sequences = [list(prompt_ids) + list(generated_ids)]
+    try:
+        # Broad except: a torch that is installed but broken (bad native libs)
+        # raises OSError/RuntimeError, not ImportError; fall back to numpy so
+        # MLX generation keeps working instead of failing hard.
+        import torch
+        return torch.tensor(sequences, dtype=torch.long)
+    except Exception:
+        import numpy as np
+        return np.asarray(sequences, dtype=np.int64)
+
+
 def _mlx_eos_token_id_set(eos_token_id):
     """Normalize HF-style eos_token_id values into a set of token ids."""
     if eos_token_id is None:
@@ -3495,7 +4128,6 @@ def _mlx_token_to_int(token):
 
 def _mlx_generate_vlm(self, *args, **kwargs):
     """HF-style VLM generate() shim backed by mlx-vlm stream_generate."""
-    import mlx.core as mx
     from mlx_vlm import stream_generate
     from .utils import _to_mx_vlm_batch
 
@@ -3610,12 +4242,11 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     if streamer is not None:
         streamer.end()
-    return mx.array([prompt_ids + generated_ids])
+    return _mlx_generate_output(prompt_ids, generated_ids)
 
 
 def _mlx_generate(self, *args, **kwargs):
     """HF-style text generate() shim backed by mlx-lm stream_generate."""
-    import mlx.core as mx
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
@@ -3732,24 +4363,72 @@ def _mlx_generate(self, *args, **kwargs):
 
     if streamer is not None:
         streamer.end()
-    return mx.array([prompt_ids + generated_ids])
+    return _mlx_generate_output(prompt_ids, generated_ids)
+
+
+def _mlx_chat_template_batch_encoding(output):
+    """Wrap tokenized chat-template output in a HF mapping when requested."""
+    from transformers import BatchEncoding
+
+    if isinstance(output, BatchEncoding):
+        return output
+    if isinstance(output, Mapping):
+        return BatchEncoding(dict(output))
+    return BatchEncoding({"input_ids": output})
 
 
 def _patch_mlx_tokenizer_call(tokenizer):
-    """Make mlx-lm TokenizerWrapper callable like its wrapped HF tokenizer."""
+    """Patch mlx-lm TokenizerWrapper to match HF notebook tokenizer APIs."""
     if tokenizer is None:
         return
     cls = type(tokenizer)
-    if cls.__name__ != "TokenizerWrapper" or "__call__" in cls.__dict__:
+    if cls.__name__ != "TokenizerWrapper":
         return
-    if not hasattr(tokenizer, "_tokenizer") or not callable(tokenizer._tokenizer):
+    if "__call__" not in cls.__dict__:
+        if hasattr(tokenizer, "_tokenizer") and callable(tokenizer._tokenizer):
+            def tokenizer_wrapper_call(self, *args, **kwargs):
+                return self._tokenizer(*args, **kwargs)
+
+            tokenizer_wrapper_call._unsloth_mlx_call = True
+            cls.__call__ = tokenizer_wrapper_call
+
+    if getattr(cls, "_unsloth_mlx_apply_chat_template", False):
+        return
+    original_apply_chat_template = getattr(cls, "apply_chat_template", None)
+    if original_apply_chat_template is None:
         return
 
-    def tokenizer_wrapper_call(self, *args, **kwargs):
-        return self._tokenizer(*args, **kwargs)
+    def tokenizer_wrapper_apply_chat_template(self, *args, tokenize=True, **kwargs):
+        return_dict = bool(kwargs.get("return_dict", False))
+        inner_tokenizer = getattr(self, "_tokenizer", None)
+        if (
+            tokenize
+            and return_dict
+            and getattr(self, "_chat_template", None) is None
+            and hasattr(inner_tokenizer, "apply_chat_template")
+        ):
+            if "enable_thinking" not in kwargs:
+                kwargs["enable_thinking"] = getattr(self, "has_thinking", False)
+            output = inner_tokenizer.apply_chat_template(
+                *args,
+                tokenize=tokenize,
+                **kwargs,
+            )
+            return _mlx_chat_template_batch_encoding(output)
 
-    tokenizer_wrapper_call._unsloth_mlx_call = True
-    cls.__call__ = tokenizer_wrapper_call
+        output = original_apply_chat_template(
+            self,
+            *args,
+            tokenize=tokenize,
+            **kwargs,
+        )
+        if tokenize and return_dict:
+            return _mlx_chat_template_batch_encoding(output)
+        return output
+
+    tokenizer_wrapper_apply_chat_template._unsloth_mlx_call = True
+    cls.apply_chat_template = tokenizer_wrapper_apply_chat_template
+    cls._unsloth_mlx_apply_chat_template = True
 
 
 def _patch_mlx_saving(model, tokenizer):
@@ -4045,6 +4724,8 @@ class FastMLXModel:
         revision=None,
         random_state=3407,
         float32_mixed_precision=None,
+        pipeline_group=None,
+        tensor_group=None,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -4069,8 +4750,13 @@ class FastMLXModel:
                 None  — auto-detect from config (default)
                 True  — force text-only via mlx-lm
                 False — force VLM via mlx-vlm
+            pipeline_group: Optional MLX distributed group for pipeline
+                parallel text or VLM inference.
+            tensor_group: Optional MLX distributed group for tensor parallel
+                text or VLM inference.
         """
         _coerce_list_extra_special_tokens()
+        _mlx_active_distributed_groups(pipeline_group, tensor_group)
 
         model_name, revision, _bnb_remapped_from = _remap_unsloth_bnb_hub_id_for_mlx(
             model_name, revision
@@ -4188,6 +4874,7 @@ class FastMLXModel:
             quantize_modules=quantize_modules,
             force_requantize=force_requantize,
         )
+        distributed_requested = _mlx_distributed_requested(pipeline_group, tensor_group)
 
         # Seed mlx random state so construction-time randomness (e.g. runtime
         # quant layer init) is reproducible.
@@ -4197,10 +4884,22 @@ class FastMLXModel:
         # clear local_path: LoRA-adapter dirs have adapter_config.json but no
         # config.json, and the adapter branch needs local_path.
         local_path = None
+        vlm_config_override_data = None
         try:
             with _temporary_hf_token_env(token):
-                local_path = str(_download(model_name, revision=revision))
+                config_allow_patterns = None
+                if distributed_requested:
+                    config_allow_patterns = _mlx_lm_metadata_allow_patterns()
+                local_path = str(
+                    _download(
+                        model_name,
+                        revision=revision,
+                        allow_patterns=config_allow_patterns,
+                    )
+                )
         except Exception:
+            if distributed_requested:
+                raise
             local_path = None
 
         config_data = {}
@@ -4212,10 +4911,20 @@ class FastMLXModel:
                         config_data = json.load(f)
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
-            local_path, config_data = _materialize_mlx_vlm_config_override(
-                local_path,
-                config_data,
-            )
+            original_local_path = local_path
+            original_config_data = dict(config_data)
+            if distributed_requested:
+                patched_config_data = _mlx_vlm_config_override_data(config_data)
+                if patched_config_data is not None:
+                    config_data = patched_config_data
+                    vlm_config_override_data = dict(config_data)
+            else:
+                local_path, config_data = _materialize_mlx_vlm_config_override(
+                    local_path,
+                    config_data,
+                )
+                if local_path != original_local_path or config_data != original_config_data:
+                    vlm_config_override_data = dict(config_data)
 
         # bitsandbytes-quantized repos store NF4 weights MLX cannot read. When
         # the real bitsandbytes wheel is importable, let bnb dequantize to fp16
@@ -4223,8 +4932,15 @@ class FastMLXModel:
         # re-quantizes it (the user gets an MLX 4-bit model, never seeing bnb).
         # If bitsandbytes is unavailable, fall back to a clear, actionable error.
         _existing_quant = _get_existing_mlx_quantization(config_data)
+        # A LoRA adapter dir can carry a copied base config.json (bitsandbytes
+        # when the base was a bnb repo). It must take the adapter branch below,
+        # not be dequantized as a full model, so skip the bnb path for it.
+        _is_adapter_dir = bool(local_path) and os.path.exists(
+            os.path.join(local_path, "adapter_config.json")
+        )
         if (
-            isinstance(_existing_quant, dict)
+            not _is_adapter_dir
+            and isinstance(_existing_quant, dict)
             and _existing_quant.get("quant_method") == "bitsandbytes"
         ):
             _suggested = re.sub(
@@ -4236,6 +4952,20 @@ class FastMLXModel:
                 else "  - Try the non-bnb variant of this model (drop the "
                      "'-bnb-4bit' suffix)\n"
             )
+            # VLM bitsandbytes repos are out of scope on the MLX path: the
+            # dequant path only handles text models (mlx-lm), and mlx-vlm
+            # dequant is not wired up. Reject with the clear, actionable error
+            # instead of attempting an unverified VLM dequant + mlx-vlm load.
+            # DeepSeek-OCR is a VLM routed through mlx-vlm despite its
+            # *ForCausalLM architecture. Its config carries a top-level
+            # vision_config, so `_is_vlm` already flags it; the model_type
+            # check keeps the rejection from hinging on that one config key.
+            if _is_vlm(config_data) or _deepseek_ocr_config_model_type(config_data):
+                raise ValueError(
+                    f"Unsloth: '{model_name}' is a bitsandbytes-quantized VLM, "
+                    "which isn't supported on the MLX path yet.\n"
+                    f"{_suggestion_line}"
+                )
             try:
                 _dequant_dir = _dequantize_bnb_to_tempdir(
                     local_path or model_name,
@@ -4302,6 +5032,11 @@ class FastMLXModel:
                         if mlx_quantization_config is not None
                         else {}
                     ),
+                    **(
+                        {"quantization_config": quantization_config}
+                        if quantization_config is not None
+                        else {}
+                    ),
                 )
             finally:
                 # MLX has materialized its weights by now; the fp16 scratch copy
@@ -4341,6 +5076,16 @@ class FastMLXModel:
                 base_model_id = adapter_cfg.get("base_model_name_or_path", "")
                 if base_model_id:
                     print(f"Unsloth: Detected LoRA adapter, loading base model '{base_model_id}'...")
+                    active_pipeline_group, active_tensor_group = _mlx_active_distributed_groups(
+                        pipeline_group,
+                        tensor_group,
+                    )
+                    if active_pipeline_group is not None or active_tensor_group is not None:
+                        raise ValueError(
+                            "Unsloth: MLX distributed loading for LoRA adapter "
+                            "repos is not supported yet. Merge/export the adapter "
+                            "into an MLX model before distributed inference."
+                        )
                     adapter_quant_policy = adapter_cfg.get("base_quantization_policy") or {}
                     adapter_quant_map = (
                         adapter_cfg.get("base_resolved_quantization_map")
@@ -4468,6 +5213,8 @@ class FastMLXModel:
                         revision=adapter_base_revision,
                         random_state=random_state,
                         float32_mixed_precision=float32_mixed_precision,
+                        pipeline_group=pipeline_group,
+                        tensor_group=tensor_group,
                         **(
                             {"mlx_quantization_config": adapter_mlx_quant_config}
                             if adapter_mlx_quant_config is not None
@@ -4616,7 +5363,16 @@ class FastMLXModel:
                     processor = getattr(model, "_processor", None)
 
                     with _temporary_hf_token_env(token):
-                        base_local = str(_download(base_model_id, revision=adapter_base_revision))
+                        base_allow_patterns = None
+                        if _mlx_distributed_requested(pipeline_group, tensor_group):
+                            base_allow_patterns = _mlx_lm_metadata_allow_patterns()
+                        base_local = str(
+                            _download(
+                                base_model_id,
+                                revision=adapter_base_revision,
+                                allow_patterns=base_allow_patterns,
+                            )
+                        )
                     base_config_path = os.path.join(base_local, "config.json")
                     if os.path.exists(base_config_path):
                         with open(base_config_path, "r") as f:
@@ -4730,11 +5486,18 @@ class FastMLXModel:
             if patch_mode == "patched":
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
                 config_data, quantization_spec, model_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
+            quantization_spec, want_runtime_quant = _resolve_distributed_runtime_quantization(
+                model_name,
+                quantization_spec,
+                distributed_requested=distributed_requested,
+                want_runtime_quant=want_runtime_quant,
+            )
 
             if quantization_spec.enabled and quant_state == "compatible":
                 warnings.warn(
@@ -4751,12 +5514,18 @@ class FastMLXModel:
                 _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
-                    model, processor = vlm_load(
-                        vlm_load_target,
-                        lazy=True,
-                        revision=revision,
-                        **extra_kwargs,
-                    )
+                    try:
+                        model, processor = vlm_load(
+                            vlm_load_target,
+                            lazy=True,
+                            revision=revision,
+                            **extra_kwargs,
+                        )
+                    except ValueError as error:
+                        # Pre-quantize load bypasses the extra-weight filter, so
+                        # surface the QK-norm version gap here too.
+                        _raise_if_qk_norm_version_gap(model_type, str(error), error)
+                        raise
                     vlm_cfg = _vlm_load_config(vlm_load_target)
                 model, vlm_cfg = _apply_mlx_quantization(
                     model, vlm_cfg, quantization_spec,
@@ -4764,6 +5533,28 @@ class FastMLXModel:
                 )
                 model._config = vlm_cfg
                 mx.eval(model.parameters())
+            elif distributed_requested:
+                if text_only is False and not _is_vlm(config_data):
+                    raise ValueError(
+                        "Unsloth: distributed MLX VLM inference requires a "
+                        f"supported mlx-vlm architecture. '{model_name}' does "
+                        f"not appear to be a VLM (model_type={model_type!r})."
+                    )
+                active_pipeline_group, active_tensor_group = _mlx_active_distributed_groups(
+                    pipeline_group,
+                    tensor_group,
+                )
+                mode = "tensor" if active_tensor_group is not None else "pipeline"
+                print(f"Unsloth: Loading {model_name} via mlx-vlm (distributed {mode} VLM)...")
+                model, processor = _load_mlx_vlm_distributed(
+                    model_name,
+                    model_type,
+                    pipeline_group=active_pipeline_group,
+                    tensor_group=active_tensor_group,
+                    hf_token=token,
+                    revision=revision,
+                    config_override_data=vlm_config_override_data,
+                )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
                 # Lazy-load when converting dtype so weights materialize once.
@@ -4862,6 +5653,12 @@ class FastMLXModel:
                 config_data, quantization_spec, model_name,
             )
             want_runtime_quant = quantization_spec.enabled and quant_state != "compatible"
+            quantization_spec, want_runtime_quant = _resolve_distributed_runtime_quantization(
+                model_name,
+                quantization_spec,
+                distributed_requested=distributed_requested,
+                want_runtime_quant=want_runtime_quant,
+            )
 
             if want_runtime_quant:
                 print(
@@ -4885,13 +5682,24 @@ class FastMLXModel:
             )
             if target_dtype is not None or want_runtime_quant:
                 mlx_load_kwargs["lazy"] = True
-            model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
-                model_name,
-                model_type,
-                mlx_load,
-                mlx_load_kwargs,
-                hf_token=token,
-            )
+            if _mlx_distributed_requested(pipeline_group, tensor_group):
+                mlx_load_kwargs["lazy"] = True
+                model, tokenizer, config = _load_mlx_lm_distributed(
+                    model_name,
+                    model_type,
+                    mlx_load_kwargs,
+                    pipeline_group=pipeline_group,
+                    tensor_group=tensor_group,
+                    hf_token=token,
+                )
+            else:
+                model, tokenizer, config = _load_mlx_lm_with_strict_fallback(
+                    model_name,
+                    model_type,
+                    mlx_load,
+                    mlx_load_kwargs,
+                    hf_token=token,
+                )
 
             if want_runtime_quant:
                 model, config = _apply_mlx_quantization(

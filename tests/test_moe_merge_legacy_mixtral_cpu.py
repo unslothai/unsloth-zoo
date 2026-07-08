@@ -31,7 +31,10 @@ from safetensors.torch import load_file, save_file
 from unsloth_zoo.saving_utils import (
     LoraStats,
     _MOE_MERGE_STATE,
+    _collect_fp8_weight_keys,
+    _drop_resolved_fp8_scales_after_rewrite,
     _merge_and_overwrite_lora,
+    _merge_and_overwrite_lora_fp8,
     _reset_moe_merge_state,
 )
 
@@ -418,4 +421,90 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
     assert min_delta_ratio > 0.8, (
         f"LoRA delta not applied through the quant-aware path (ratio={min_delta_ratio:.2f})"
     )
+    _reset_moe_merge_state()
+
+
+def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
+    """Option C two-phase: dequantize an FP8 legacy-Mixtral shard to 16bit (no LoRA), then
+    merge the expert LoRA via the standard 16bit path. Output is genuine bf16 (not FP8), all
+    scales dropped, and the per-expert delta matches the analytic reference. Mirrors what the
+    orchestrator does for an FP8 MoE merged_16bit export."""
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
+        _fp8_dequant_blockwise, _fp8_requant_blockwise,
+    )
+    num_layers, num_experts, rank_per = 1, 2, 4
+    hidden, intermediate = 12, 8
+    alpha = 2.0
+    path = str(tmp_path / "model.safetensors")
+
+    torch.manual_seed(SEED + 21)
+    hp = {}      # dequantized base each merge starts from
+    tensors = {}
+    for L in range(num_layers):
+        for e in range(num_experts):
+            p = f"model.layers.{L}.block_sparse_moe.experts.{e}"
+            for w_name, shape in (("w1", (intermediate, hidden)),
+                                  ("w3", (intermediate, hidden)),
+                                  ("w2", (hidden, intermediate))):
+                W_hp = torch.randn(*shape, dtype=torch.float32)
+                W_fp8, scale = _fp8_requant_blockwise(W_hp, shape, torch.float32)
+                tensors[f"{p}.{w_name}.weight"] = W_fp8
+                tensors[f"{p}.{w_name}.weight_scale_inv"] = scale
+                hp[f"{p}.{w_name}.weight"] = _fp8_dequant_blockwise(W_fp8, scale)
+    save_file(tensors, path)
+
+    # Phase 1: dequantize to 16bit (no LoRA), then drop the now-resolved scales.
+    prerewrite_fp8 = _collect_fp8_weight_keys(str(tmp_path), ["model.safetensors"])
+    _merge_and_overwrite_lora_fp8(
+        str(tmp_path), "model.safetensors",
+        collections.defaultdict(lambda: None), torch.bfloat16, "MixtralForCausalLM",
+    )
+    _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), ["model.safetensors"], prerewrite_fp8)
+    dq = load_file(path)
+    assert not any(k.endswith(("weight_scale", "weight_scale_inv")) for k in dq), "scales not dropped"
+    assert all(v.dtype == torch.bfloat16 for k, v in dq.items() if k.endswith(".weight")), "not 16bit"
+
+    # Phase 2: standard (non-quantized) 16bit MoE merge of the expert LoRA.
+    TR = num_experts * rank_per
+    lw = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    for L in range(num_layers):
+        prefix = f"model.layers.{L}.mlp.experts"
+        A_gu = torch.randn(TR, hidden, dtype=torch.float32) * 0.3
+        B_gu = torch.randn(2 * intermediate, TR, dtype=torch.float32) * 0.3
+        A_dn = torch.randn(TR, intermediate, dtype=torch.float32) * 0.3
+        B_dn = torch.randn(hidden, TR, dtype=torch.float32) * 0.3
+        lw[prefix + ".base_layer"] = LoraStats(_InnerMoE(num_experts), A_gu, B_gu, alpha)
+        lw[prefix] = LoraStats(_InnerMoE(num_experts), A_dn, B_dn, alpha)
+
+    _reset_moe_merge_state()
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors",
+        lora_weights=lw, output_dtype=torch.bfloat16,
+        model_class_name="MixtralForCausalLM",
+        base_model_is_quantized=False, quant_type=None,
+    )
+    merged = load_file(path)
+    assert _MOE_MERGE_STATE["fallback"] == 0
+    # Genuine 16bit output (no FP8, no scales) with the LoRA delta applied.
+    assert all(v.dtype == torch.bfloat16 for k, v in merged.items() if k.endswith(".weight"))
+    assert not any(k.endswith(("weight_scale", "weight_scale_inv")) for k in merged)
+
+    max_err = 0.0
+    for L in range(num_layers):
+        prefix = f"model.layers.{L}.mlp.experts"
+        A_gu, B_gu = lw[prefix + ".base_layer"].lora_A, lw[prefix + ".base_layer"].lora_B
+        A_dn, B_dn = lw[prefix].lora_A, lw[prefix].lora_B
+        for e in range(num_experts):
+            dp = f"model.layers.{L}.block_sparse_moe.experts.{e}"
+            gu_delta = _delta(A_gu, B_gu, alpha, e, num_experts)
+            refs = {
+                "w1": hp[f"{dp}.w1.weight"].to(torch.float64) + gu_delta[:intermediate],
+                "w3": hp[f"{dp}.w3.weight"].to(torch.float64) + gu_delta[intermediate:],
+                "w2": hp[f"{dp}.w2.weight"].to(torch.float64) + _delta(A_dn, B_dn, alpha, e, num_experts),
+            }
+            for w_name, ref in refs.items():
+                got = merged[f"{dp}.{w_name}.weight"].to(torch.float64)
+                denom = ref.abs().max().item() or 1.0
+                max_err = max(max_err, (got - ref).abs().max().item() / denom)
+    assert max_err < 0.05, f"dequant-then-merge delta error too large: {max_err:.2e}"
     _reset_moe_merge_state()

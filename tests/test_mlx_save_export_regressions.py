@@ -32,6 +32,7 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_torch_shim():
+    pytest.importorskip("torch")
     from mlx_simulation import simulate_mlx_on_torch
 
     simulate_mlx_on_torch()
@@ -223,6 +224,8 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
 def test_text_generate_honors_do_sample_false(monkeypatch):
     import mlx_lm
     import mlx_lm.sample_utils as sample_utils
+    import torch
+    from transformers.tokenization_utils_base import to_py_obj
     import unsloth_zoo.mlx.loader as loader
 
     calls = {}
@@ -263,7 +266,12 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
         max_length=4,
     )
 
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
     assert out.tolist() == [[1, 2, 9, 5]]
+    assert out.shape == (1, 4)
+    assert out[:, 2:].tolist() == [[9, 5]]
+    assert to_py_obj(out) == [[1, 2, 9, 5]]
     assert calls["sampler"] == {
         "temp": 0.0,
         "top_p": 0.0,
@@ -277,7 +285,81 @@ def test_text_generate_honors_do_sample_false(monkeypatch):
     assert tokenizer.eos_token_ids == {2}
 
 
+def test_mlx_generate_output_numpy_fallback_without_torch(monkeypatch):
+    import builtins
+    import numpy as np
+    import unsloth_zoo.mlx.loader as loader
+
+    # torch is installed here (the sim needs it), so force `import torch` to fail
+    # inside _mlx_generate_output to cover the numpy int64 fallback branch. Test
+    # both a missing torch (ImportError) and an installed-but-broken torch
+    # (OSError) -- the broadened except must degrade to numpy in both cases.
+    real_import = builtins.__import__
+
+    def failing_import(exc):
+        def _fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise exc
+            return real_import(name, *args, **kwargs)
+        return _fake_import
+
+    for exc in (ImportError("no torch"), OSError("broken torch native lib")):
+        monkeypatch.setattr(builtins, "__import__", failing_import(exc))
+        out = loader._mlx_generate_output([1, 2], [9, 5])
+        monkeypatch.undo()
+        assert isinstance(out, np.ndarray)
+        assert out.dtype == np.int64
+        assert out.shape == (1, 4)
+        assert out.tolist() == [[1, 2, 9, 5]]
+        assert out[:, 2:].tolist() == [[9, 5]]
+
+
+def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
+    import unsloth_zoo.mlx.loader as loader
+
+    class InnerTokenizer:
+        def __call__(self, *args, **kwargs):
+            return {"called": True}
+
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            if tokenize and kwargs.get("return_dict", False):
+                return {
+                    "input_ids": [1, 2, 3],
+                    "attention_mask": [1, 1, 1],
+                }
+            return [1, 2, 3] if tokenize else "rendered"
+
+    class TokenizerWrapper:
+        def __init__(self):
+            self._tokenizer = InnerTokenizer()
+
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            return [1, 2, 3] if tokenize else "rendered"
+
+    tokenizer = TokenizerWrapper()
+    loader._patch_mlx_tokenizer_call(tokenizer)
+
+    encoded = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        tokenize=True,
+        return_dict=True,
+    )
+
+    def expand_generate_inputs(**kwargs):
+        return kwargs
+
+    assert expand_generate_inputs(**encoded) == {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 1],
+    }
+    assert encoded.to("cpu")["input_ids"] == [1, 2, 3]
+    assert tokenizer.apply_chat_template([], tokenize=False, return_dict=True) == "rendered"
+    assert tokenizer("hi") == {"called": True}
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
+    import torch
+    from transformers.tokenization_utils_base import to_py_obj
     import unsloth_zoo.mlx.loader as loader
 
     fake_mlx_vlm = types.ModuleType("mlx_vlm")
@@ -305,7 +387,11 @@ def test_vlm_generate_hf_kwargs(monkeypatch):
         max_new_tokens=1,
     )
 
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
     assert out.tolist() == [[1, 2]]
+    assert out.shape == (1, 2)
+    assert to_py_obj(out) == [[1, 2]]
     assert calls[0][0] == 1
     assert tuple(calls[0][1]["input_ids"].shape) == (1, 2)
     assert tuple(calls[0][1]["mask"].shape) == (1, 2)
