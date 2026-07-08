@@ -470,7 +470,7 @@ def grpo_compute_loss(
     if loss_type == "cispo":
         clamped_ratios = torch.clamp(coef_1, max=epsilon_high).detach()
         loss_i = -clamped_ratios * advantages * new
-    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
         coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
         if delta is not None:
@@ -481,20 +481,9 @@ def grpo_compute_loss(
         loss_2 = coef_2 * advantages
         loss_i = -torch.min(loss_1, loss_2)
     elif loss_type == "sapo":
-        if get_sapo_token_loss is None:
-            raise Exception(f"sapo is only available in TRL 0.26.0+")
-        loss_i = torch.empty_like(coef_1)
-        positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
-        # With n_chunks some tensors may be empty; guard the indexing.
-        if coef_1[positive_advantages_mask].numel() != 0:
-            loss_i[positive_advantages_mask] = get_sapo_token_loss(
-                coef_1[positive_advantages_mask], sapo_temperature_pos
-            )
-        if coef_1[~positive_advantages_mask].numel() != 0:
-            loss_i[~positive_advantages_mask] = get_sapo_token_loss(
-                coef_1[~positive_advantages_mask], sapo_temperature_neg
-            )
-        loss_i = -loss_i * advantages
+        temperatures = torch.where(advantages > 0, sapo_temperature_pos, sapo_temperature_neg)
+        soft_coef_1 = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
+        loss_i = -soft_coef_1 * advantages
     elif loss_type == "vespo":
         if get_gamma_weights is None:
             raise Exception("vespo is only available in TRL 0.26.0+")
@@ -544,6 +533,10 @@ def grpo_compute_loss(
     elif loss_type in ["cispo", "dapo", "vespo"]:
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
+    elif loss_type == "luspo":
+        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        normalizer = current_gradient_accumulation_steps
+        loss = loss / normalizer
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
