@@ -16,6 +16,7 @@
 
 __all__ = [
     "train_on_responses_only",
+    "get_chat_template_parts",
     "sft_prepare_dataset",
     "standardize_data_formats",
     "patch_torchcodec_audio_decoder",
@@ -161,6 +162,158 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 pass
 
 
+def get_chat_template_parts(tokenizer):
+    """Auto-detect (instruction_part, response_part) from the tokenizer's chat
+    template, so train_on_responses_only needs no manual markers."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    import re
+    from collections import Counter
+
+    tok = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+    # Render with the processor's template when it has one (that is what VLM batching renders
+    # through, and it can differ from the inner tokenizer's text template); validate token ids
+    # with the inner tokenizer. Fall back to the inner template for plain / processor-less cases.
+    render_tok = tokenizer if getattr(tokenizer, "chat_template", None) is not None else tok
+    if getattr(render_tok, "chat_template", None) is None:
+        raise ValueError("Unsloth: No chat_template to auto-detect from - pass instruction_part and response_part.")
+
+    # Sentinels survive Jinja |trim and never collide with real tokens
+    U, A = "⁠USERPROBE7q⁠", "⁠ASSTPROBE4z⁠"
+    render = lambda msgs, gen: render_tok.apply_chat_template(msgs, tokenize = False, add_generation_prompt = gen)
+    starts = lambda text, n: [m.start() for m in re.finditer(re.escape(n), text)]
+    ends   = lambda text, n: [m.end()   for m in re.finditer(re.escape(n), text)]
+    eos = getattr(tok, "eos_token", "") or ""
+    bos = getattr(tok, "bos_token", "") or ""
+    try:    added = set(tok.get_added_vocab().keys())
+    except Exception: added = set()
+    # Keep only non-empty string tokens: "" would make strip_shared loop forever
+    # and None would break sorting by len.
+    specials = sorted({str(s) for s in (set(getattr(tok, "all_special_tokens", []) or []) | added) if s}, key = len, reverse = True)
+
+    def strip_lead(s, *prefixes):
+        # Remove any of the given leading strings, repeatedly
+        changed = True
+        while changed:
+            changed = False
+            for p in prefixes:
+                if p and s.startswith(p): s, changed = s[len(p):], True
+        return s
+
+    def strip_shared(a, b):
+        # Drop leading special-tokens/whitespace common to both until roles differ
+        while True:
+            wa, wb = re.match(r"\s+", a), re.match(r"\s+", b)
+            if wa and wb and wa.group() == wb.group():
+                a, b = a[wa.end():], b[wb.end():]
+                continue
+            t = next((s for s in specials if a.startswith(s)), None)
+            if t and b.startswith(t):
+                a, b = a[len(t):], b[len(t):]
+                continue
+            break
+        return a, b
+
+    def gap_mode(from_ends, to_starts):
+        # Most common text between adjacent content blocks
+        out = []
+        for e in from_ends:
+            nxt = [s for s in to_starts if s >= e]
+            if nxt: out.append(full[e : min(nxt)])
+        return Counter(out).most_common(1)[0][0] if out else ""
+
+    # Render a 3-turn probe; read markers off the gaps between content blocks. VLM processors
+    # differ on content shape: some want plain strings, some structured parts, and some want the
+    # user as parts but the assistant collapsed to a string. Probe those shapes (per-role) and
+    # keep whichever renders our sentinels, matching what VLM batching would render.
+    _str, _lst = (lambda s: s), (lambda s: [{"type": "text", "text": s}])
+    def _convo(uwrap, awrap):
+        return [{"role": "user", "content": uwrap(U)}, {"role": "assistant", "content": awrap(A)}] * 3
+    uwrap, awrap, full = None, None, ""
+    for _uw, _aw in ((_str, _str), (_lst, _lst), (_lst, _str)):
+        try: rendered = render(_convo(_uw, _aw), False)
+        except Exception: continue
+        if starts(rendered, U) and starts(rendered, A):
+            uwrap, awrap, full = _uw, _aw, rendered; break
+    if uwrap is None:
+        raise ValueError("Unsloth: Could not auto-detect chat template structure - pass instruction_part and response_part.")
+    convo = _convo(uwrap, awrap)
+    instr_gap = gap_mode(ends(full, A), starts(full, U))
+    resp_gap  = gap_mode(ends(full, U), starts(full, A))
+
+    # Clean assistant header = generation prompt. Diff the tails after the last user
+    # turn; shared leading special-tokens are the turn terminator, so drop them.
+    # A headerless template (e.g. Mistral [INST]) leaves add_generation_prompt a no-op, so the
+    # two renders match and there is no header: force it empty to reach the headerless fallback
+    # (otherwise the shared tail like [/INST] is mistaken for a header and pulls eos into the marker).
+    end_user = convo[:-1]
+    tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
+    _gen_on, _gen_off = render(end_user, True), render(end_user, False)
+    asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
+
+    if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
+        # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
+        response_part, instruction_part = asst_header, strip_lead(instr_gap, resp_gap[:-len(asst_header)])
+    elif asst_header and asst_header == resp_gap:
+        # Terminator leaked into the gen-diff (Phi-3): strip shared separators, then strip the
+        # assistant turn terminator (eos/bos) off the instruction marker so a non-final assistant
+        # turn's eos stays trainable, matching explicit markers.
+        response_part, instruction_part = strip_shared(asst_header, instr_gap)
+        instruction_part = strip_lead(instruction_part, " ", "\t", eos, bos)
+    else:
+        # Headerless template (Mistral [INST]/[/INST]): strip bos/eos separators here.
+        # Strip eos alone, never eos+"\n": a turn-delimiting newline stays as the marker
+        # anchor (e.g. "\n### Human:") instead of being glued to eos and dropped, which
+        # left a bare marker that could match inside message content. strip_lead skips
+        # empty prefixes, so an unset eos never strips a bare "\n".
+        response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
+        instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
+
+    # Reasoning templates inject thinking-block scaffolding into the generation prompt
+    # that a real assistant turn ("<think>...</think>answer") does not carry right after
+    # the header, so a marker holding it would miss the turn. Two shapes:
+    #   paired empty tag - "<|im_start|>assistant\n<think></think>" (Qwen3-Thinking)
+    #   lone close tag   - "<|assistant|></think>"                  (GLM-4.x)
+    # Re-probe with a reasoning-filled turn and drop the scaffold only when confirmed gone
+    # (templates that always emit it keep it). Dropping only shortens the marker to the
+    # assistant header, so it can never unmask user content.
+    mt = re.search(r"<([^\s/>]+)>\s*</\1>\s*$", response_part) or \
+         re.search(r"</([^\s/>]+)>\s*$", response_part)
+    if mt and mt.start() > 0:
+        tag = mt.group(1)
+        scaffold = response_part[mt.start():]
+        header = response_part[:mt.start()]
+        try:
+            filled = render([{"role": "user", "content": uwrap(U)},
+                             {"role": "assistant", "content": awrap(f"<{tag}>rZ9</{tag}>{A}")}], False)
+            pos = filled.rfind(header)
+            after = filled[pos + len(header):] if pos != -1 else ""
+            if pos != -1 and not after.startswith(scaffold):
+                response_part = header
+        except Exception:
+            pass
+
+    # Only strip whitespace from header markers: do NOT strip bos here, since for some
+    # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
+    # stripping it would leave an unanchored marker that matches inside user content.
+    instruction_part = strip_lead(instruction_part, " ", "\t").rstrip(" \t")
+    response_part    = strip_lead(response_part, " ", "\t").rstrip(" \t")
+    if not instruction_part or not response_part:
+        raise ValueError("Unsloth: Auto-detection produced an empty marker - pass instruction_part and response_part.")
+
+    # Each marker must tokenize to a core present in a tokenized probe, else masking would
+    # silently train on nothing (role tags that are not atomic tokens, or whose ids shift by
+    # context). Some SentencePiece tokenizers need a leading space, so try that variant too.
+    probe_ids = tok(full, add_special_tokens = False).input_ids
+    def validate(part, part_name):
+        for cand in (part, " " + part):
+            core = _find_common_token_ids(cand, tok, True)[0]
+            if core and any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
+                return cand
+        raise ValueError(f"Unsloth: Could not reliably auto-detect {part_name} (detected {repr(part)}) - pass instruction_part and response_part.")
+    return validate(instruction_part, "instruction_part"), validate(response_part, "response_part")
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -178,16 +331,43 @@ def train_on_responses_only(
     old_labels).
     """
     # All Unsloth Zoo code licensed under LGPLv3
+    if trainer is not None:
+        try:
+            from .mlx.trainer import (
+                MLXTrainer,
+                train_on_responses_only as _mlx_train_on_responses_only,
+            )
+        except ImportError:
+            MLXTrainer = None
+        if MLXTrainer is not None and isinstance(trainer, MLXTrainer):
+            return _mlx_train_on_responses_only(
+                trainer,
+                instruction_part=instruction_part,
+                response_part=response_part,
+                force_match=force_match,
+                tokenizer=tokenizer,
+                return_function=return_function,
+                num_proc=num_proc,
+                last_response_only=last_response_only,
+            )
+
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    # Keep the original object (may be a VLM processor) so auto-detect can read a
+    # chat template that lives only on the processor; the matcher uses the inner one.
+    processor = tokenizer
     # Get non vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
         not hasattr(tokenizer, "_unsloth_output_part"):
-        
-        if instruction_part is None or response_part is None:
-            raise ValueError("Unsloth: instruction_part and response_part must be given!")
+
+        if instruction_part is None and response_part is None:
+            # Neither given: auto-detect both from the chat template
+            instruction_part, response_part = get_chat_template_parts(processor)
+            print(f"Unsloth: Auto-detected instruction_part = {repr(instruction_part)} and response_part = {repr(response_part)}")
+        elif instruction_part is None or response_part is None:
+            raise ValueError("Unsloth: Give both instruction_part and response_part, or neither to auto-detect!")
         pass
     elif (instruction_part is not None or response_part is not None) and \
         (hasattr(tokenizer, "_unsloth_input_part") or hasattr(tokenizer, "_unsloth_output_part")):
@@ -316,7 +496,8 @@ def train_on_responses_only(
         return _train_on_responses_only
 
     import multiprocessing as _mp
-    if num_proc is None or type(num_proc) is not int:
+    _num_proc_was_auto = num_proc is None or type(num_proc) is not int
+    if _num_proc_was_auto:
         if _mp.get_start_method() != 'fork':
             num_proc = None
         else:
@@ -328,6 +509,19 @@ def train_on_responses_only(
                 num_proc = 1
             else:
                 num_proc = min(num_proc, int(memory_gb_left))
+
+    # Single-process small datasets (workers cost more than they save, and large auto
+    # num_proc caused Windows spawn loops #3211/#3397); keep explicit user values.
+    _MIN_ROWS_FOR_MULTIPROC = 5_000
+    def _effective_num_proc(dataset):
+        if num_proc is None or num_proc == 1: return num_proc
+        if not _num_proc_was_auto: return num_proc  # honor explicit user value
+        try:
+            if len(dataset) < _MIN_ROWS_FOR_MULTIPROC: return None
+        except TypeError:
+            return None  # unknown length (e.g. IterableDataset)
+        return num_proc
+    pass
 
     # transformers 5.0+ VLMs skip dataset prep in SFTTrainer.__init__
     # (skip_prepare_dataset=True when _is_vlm), so tokenize before masking.
@@ -348,7 +542,7 @@ def train_on_responses_only(
         def _tokenize_fn(examples):
             texts = examples.get(text_field) or examples.get("text", [])
             return _tok(texts, truncation=True, max_length=max_length, padding=False)
-        _map_kwargs = {"batched": True, "num_proc": num_proc}
+        _map_kwargs = {"batched": True, "num_proc": _effective_num_proc(dataset)}
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
         import warnings as _w
@@ -368,20 +562,132 @@ def train_on_responses_only(
         return any(l != -100 for l in labels)
     pass
 
+    def _diagnose_truncation(dataset, dropped, fatal):
+        # When (nearly) the whole dataset is masked away, the usual cause is
+        # truncation: max_length cut off the response marker before masking found
+        # it. Raise when nothing is left to train on, otherwise just warn so the
+        # surviving rows still train (matching the old filter behaviour).
+        if getattr(trainer.args, "packing", False): return
+        max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", None)
+        # Truncation evidence is a row sitting at the length cap (max_length cut its
+        # tail, including the response marker). Without a known cap, or for short rows,
+        # a fully masked row is a wrong template / response_part, not truncation, so we
+        # keep the generic error instead of telling users to raise max_length.
+        if max_length is None: return
+        n_sampled = 0; n_trunc = 0
+        for i in dropped[:100]:
+            input_ids = dataset[int(i)].get("input_ids")
+            if input_ids is None: continue
+            if getattr(input_ids, "tolist", None): input_ids = input_ids.tolist()
+            n_sampled += 1
+            if len(input_ids) >= max_length: n_trunc += 1
+        if n_sampled == 0 or n_trunc / n_sampled < 0.9: return
+        ml = max_length
+        message = (
+            "Unsloth: train_on_responses_only masked all/most labels to -100.\n"
+            f"The most likely cause is truncation: max_length={ml} cut off the response marker "
+            f"{repr(response_part)} before masking could find it.\n"
+            "Increase max_length to fit your responses, for example SFTConfig(max_length = max_seq_length).\n"
+            "If your sequences are genuinely longer, raise max_seq_length when loading the model."
+        )
+        if fatal: raise ValueError(message)
+        print("Unsloth: Warning: " + message)
+    pass
+
     def _filter_fully_masked(dataset, dataset_name="dataset"):
         if isinstance(dataset, IterableDataset):
             return dataset  # Cannot filter IterableDataset efficiently
+        if "labels" not in dataset.column_names:
+            return dataset
+        # filter rewrites the whole Arrow table even when it drops nothing, so scan the
+        # labels column cheaply first; the common case (0 fully masked) returns as-is.
         n_before = len(dataset)
-        dataset = dataset.filter(_has_valid_labels, num_proc=num_proc)
-        n_after = len(dataset)
-        n_removed = n_before - n_after
+        # Track only the fully masked rows, so a huge clean corpus builds no per-row list.
+        dropped = []
+        try:
+            idx = 0
+            for batch in dataset.select_columns(["labels"]).iter(batch_size = 1000):
+                for labels in batch["labels"]:
+                    if labels is not None:
+                        if getattr(labels, "tolist", None): labels = labels.tolist()
+                        if not any(l != -100 for l in labels): dropped.append(idx)
+                    idx += 1
+        except Exception:
+            # Datasets with a custom transform may need other columns; fall back.
+            return dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        if not dropped:
+            return dataset  # nothing fully masked
+        # Most rows masked away across the WHOLE dataset usually means truncation.
+        # Only fatal when no rows survive; otherwise warn and keep the valid rows.
+        if len(dropped) / n_before >= 0.9:
+            _diagnose_truncation(dataset, dropped, fatal = len(dropped) == n_before)
+        # Everything masked and not from truncation: the markers do not match the
+        # template at all, so fail clearly instead of returning an empty dataset.
+        if len(dropped) == n_before:
+            raise ValueError(
+                f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}, "
+                f"so there is nothing to train on. The response marker {repr(response_part)} was not "
+                "found in any sample - check that instruction_part and response_part match your chat template."
+            )
+        # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
+        # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
+        # exact inverse of `dropped`, so survivors are identical.
+        dataset = dataset.filter(_has_valid_labels, num_proc = _effective_num_proc(dataset))
+        n_removed = n_before - len(dataset)
         if n_removed > 0:
             print(
                 f"Unsloth: Removed {n_removed} out of {n_before} samples from {dataset_name} "
-                f"where all labels were -100 (no response found after truncation). "
+                f"where all labels were -100 (no response marker found, usually truncation). "
                 f"This prevents NaN loss during training."
             )
         return dataset
+    pass
+
+    # Vision/processor collators (e.g. UnslothVisionDataCollator) rebuild labels
+    # from the processor at collate time, so dataset-level masking is ignored and
+    # replacing the collator would break image handling. Enable response masking on
+    # the collator itself and skip the text dataset path.
+    def _is_vision_collator(collator):
+        if collator is None: return False
+        if any(b.__name__ == "UnslothVisionDataCollator" for b in type(collator).__mro__): return True
+        # A vision collator may hold the processor under .processor or the common .tokenizer field
+        # (e.g. DataCollatorForSeq2Seq(tokenizer=processor)); either exposing image_processor marks it.
+        for attr in ("processor", "tokenizer"):
+            obj = getattr(collator, attr, None)
+            if obj is not None and hasattr(obj, "image_processor"): return True
+        return hasattr(collator, "image_processor")
+    pass
+
+    data_collator = getattr(trainer, "data_collator", None)
+    if _is_vision_collator(data_collator):
+        masking = getattr(data_collator, "train_on_responses_only", None)
+        if callable(masking):
+            return trainer  # collator already masks responses; nothing to do
+        is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
+        if not is_unsloth:
+            # A processor-style collator we cannot reliably configure: do not return as
+            # if masking were applied (it would leave responses unmasked silently).
+            raise ValueError(
+                "Unsloth: Detected a vision data collator that does not support response-only "
+                "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+                "instruction_part = ..., response_part = ...) so masking runs at collate time."
+            )
+        # If the collator's tokenizer already carries the parts, let the nested call
+        # read them; passing them explicitly would hit the "already set" guard.
+        coll_proc = getattr(data_collator, "processor", tokenizer)
+        coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
+        parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
+            dict(instruction_part = instruction_part, response_part = response_part)
+        data_collator.train_on_responses_only = train_on_responses_only(
+            None,
+            force_match        = force_match,
+            tokenizer          = coll_proc,
+            return_function    = True,
+            last_response_only = last_response_only,
+            **parts,
+        )
+        print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
+        return trainer
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -391,7 +697,7 @@ def train_on_responses_only(
         if isinstance(trainer.train_dataset, IterableDataset):
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
         else:
-            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.train_dataset))
         trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
     pass
 
@@ -405,7 +711,7 @@ def train_on_responses_only(
                 if isinstance(value, IterableDataset):
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
                 else:
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
                 trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
@@ -414,12 +720,13 @@ def train_on_responses_only(
             if isinstance(trainer.eval_dataset, IterableDataset):
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
             else:
-                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = num_proc)
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.eval_dataset))
             trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
         pass
     pass
 
-    # Edit data collator as well if not DataCollatorForSeq2Seq
+    # Edit data collator to DataCollatorForSeq2Seq (vision collators were handled
+    # earlier and returned, so trainer.data_collator here is a text collator).
     from transformers import DataCollatorForSeq2Seq
     packing_enabled = getattr(trainer.args, "packing", False)
     if (
