@@ -3941,7 +3941,19 @@ class MLXGRPOTrainer(MLXTrainer):
                     if v is not None:
                         total[i] += float(v)
             rewards = mx.array(total)
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+            # TRL standardizes grouped rewards with the sample (Bessel-corrected)
+            # std: torch.std defaults to unbiased=True. mx.std defaults to the
+            # population std (ddof=0), which is systematically smaller and inflates
+            # the advantage magnitude by sqrt(N/(N-1)) (~1.41x at num_generations=2,
+            # ~1.15x at 4), mis-scaling the objective the PPO clip epsilon and KL
+            # beta are calibrated against. Compute the ddof=1 std explicitly from
+            # primitives (rather than mx.std(ddof=1)) so the expression is identical
+            # under real mlx and the torch-backed test shim, whose std() signatures
+            # differ. num_generations >= 2 is enforced above so N - 1 >= 1, and the
+            # all-equal-rewards (std==0) case is still absorbed by the +1e-4.
+            _mean = rewards.mean()
+            _std = (((rewards - _mean) ** 2).sum() / (rewards.shape[0] - 1)) ** 0.5
+            advantages = (rewards - _mean) / (_std + 1e-4)
             # build the concatenated group batch
             pe = len(pids)
             rows, lengths = [], []
@@ -3951,7 +3963,22 @@ class MLXGRPOTrainer(MLXTrainer):
                     # by the sampled completion ids. This makes pe a true prefix
                     # length by construction and avoids the decode->re-encode
                     # roundtrip corrupting the tokens the policy generated.
-                    full = (pids + [int(t) for t in comp_ids[i]])[: args.max_seq_length]
+                    comp = [int(t) for t in comp_ids[i]]
+                    # mlx-lm's batch_generate strips the terminal EOS from the
+                    # returned ids for a normally-terminating row (finish_reason
+                    # == "stop"), keeping all max_completion_length tokens only
+                    # when it truncated on length. TRL's GRPO completion mask is
+                    # inclusive of that EOS (sequence_indices <= eos_idx), so the
+                    # stop action gets advantage-weighted gradient/KL. Re-add the
+                    # EOS when the row stopped normally (shorter than the cap) so
+                    # the loss scores the model's probability of stopping and does
+                    # not bias completion-length/EOS behavior. A row at the cap was
+                    # truncated (no EOS emitted) and is left as-is, mirroring TRL's
+                    # default mask_truncated_completions=False.
+                    _eos_id = getattr(hf, "eos_token_id", None)
+                    if _eos_id is not None and len(comp) < args.max_completion_length:
+                        comp = comp + [int(_eos_id)]
+                    full = (pids + comp)[: args.max_seq_length]
                 else:
                     # Fallback (older mlx-lm without generated-id surfacing):
                     # guard the prompt+completion tokenization against the same

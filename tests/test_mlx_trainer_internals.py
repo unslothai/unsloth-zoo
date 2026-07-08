@@ -1608,8 +1608,101 @@ def test_grpo_rollout_scores_generated_token_ids_not_reencoded_text(monkeypatch)
     pe = lens[0][0]
     assert pe == 3
     assert rows[0][:pe] == [1, 2, 3]
+    # Row 0 filled max_completion_length (4) ids -> truncated on length, no EOS
+    # was emitted, so the ids are scored as-is.
     assert rows[0][pe:lens[0][1]] == [7, 8, 9, 9]
+    # Row 1 stopped early (2 < 4 ids): mlx-lm stripped the terminal EOS, which
+    # the rollout re-appends (eos_token_id == 0) so the stop action is scored.
+    assert rows[1][pe:lens[1][1]] == [7, 8, 0]
+
+
+def test_grpo_rollout_appends_sampled_eos_on_normal_stop(monkeypatch):
+    # mlx-lm's batch_generate strips the terminal EOS from the returned ids for a
+    # normally-terminating row (finish_reason == "stop") and keeps all
+    # max_completion_length ids only when it truncated on length. TRL's GRPO
+    # completion mask is inclusive of that EOS (sequence_indices <= eos_idx), so
+    # the model's probability of stopping gets advantage-weighted gradient/KL.
+    # The rollout must therefore re-append the EOS for a stopped row (ids shorter
+    # than the cap) and leave a truncated row (ids == cap) untouched.
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=3,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2, 0.3]],
+        batch_texts=["a", "b", "c"],
+    )
+    # eos_token_id == 0 (see _Tok); max_completion_length == 4.
+    def _gen(model, tokenizer, prompts=None, max_tokens=None,
+             sampler=None, verbose=False, return_token_ids=False):
+        assert return_token_ids is True
+        return types.SimpleNamespace(
+            texts=["a", "b", "c"],
+            # row0: stopped early (1 < 4) -> EOS re-appended
+            # row1: stopped early (3 < 4) -> EOS re-appended
+            # row2: filled the cap (4 == 4) -> truncated, no EOS
+            token_ids=[[7], [7, 8, 9], [7, 8, 9, 9]],
+        )
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _adv = next(gen)
+    rows = batch.tolist()
+    lens = lengths.tolist()
+    pe = lens[0][0]
+    assert rows[0][pe:lens[0][1]] == [7, 0]
+    assert rows[1][pe:lens[1][1]] == [7, 8, 9, 0]
+    assert rows[2][pe:lens[2][1]] == [7, 8, 9, 9]
+
+
+def test_grpo_rollout_appends_no_eos_when_tokenizer_lacks_eos_id(monkeypatch):
+    # Guard the EOS re-append against tokenizers with no eos_token_id: a None id
+    # must be skipped (no crash, no bogus token) rather than appended.
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    trainer.tokenizer.eos_token_id = None
+
+    def _gen(model, tokenizer, prompts=None, max_tokens=None,
+             sampler=None, verbose=False, return_token_ids=False):
+        return types.SimpleNamespace(texts=["a", "b"], token_ids=[[7], [7, 8]])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _adv = next(gen)
+    rows = batch.tolist()
+    lens = lengths.tolist()
+    pe = lens[0][0]
+    assert rows[0][pe:lens[0][1]] == [7]
     assert rows[1][pe:lens[1][1]] == [7, 8]
+
+
+def test_grpo_advantages_use_unbiased_group_std(monkeypatch):
+    # TRL standardizes grouped rewards with the sample (Bessel-corrected) std
+    # (torch.std default unbiased=True); the population std (mx.std default) is
+    # smaller and inflates advantages by sqrt(N/(N-1)). For a 2-element group with
+    # rewards {0, 1}: mean 0.5, unbiased std sqrt(0.5) ~= 0.7071 -> |adv| ~= 0.707,
+    # whereas the population std 0.5 would give |adv| ~= 1.0. Assert the unbiased
+    # scale so a regression back to population std is caught.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.0, 1.0]],
+        batch_texts=["a", "b"],
+    )
+    gen = trainer._grpo_rollout_generator()
+    _batch, _lengths, advantages = next(gen)
+    adv = [float(x) for x in advantages.tolist()]
+    assert abs(abs(adv[0]) - 0.7071) < 0.01, adv
+    assert abs(abs(adv[1]) - 0.7071) < 0.01, adv
+    # Sign: the below-mean sample is penalized, the above-mean sample rewarded.
+    assert adv[0] < 0 < adv[1]
 
 
 def test_grpo_rollout_falls_back_to_reencode_without_token_ids(monkeypatch):
