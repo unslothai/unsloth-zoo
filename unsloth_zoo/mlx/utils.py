@@ -3454,8 +3454,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     )
             epoch += 1
     else:
-        # Streaming has no random-access index space; deterministic stream
-        # order is replayable, but torch_randperm needs sized epochs.
+        # Streaming has no index space to permute; torch_randperm needs sized epochs.
         if dataset_order == "torch_randperm":
             raise ValueError(
                 "Unsloth MLX VLM: preserve_dataset_order / "

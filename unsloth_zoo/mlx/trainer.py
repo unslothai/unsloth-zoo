@@ -1929,8 +1929,7 @@ class MLXTrainer:
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
-        # Only rank 0 opens W&B / TensorBoard; other ranks would each start a
-        # duplicate run under the same output_dir (HF Trainer gates this too).
+        # Only rank 0 opens W&B / TensorBoard to avoid duplicate runs (HF gates this too).
         if self.is_main_process:
             self._setup_report_to_callbacks()
         self._install_neftune()
@@ -2455,8 +2454,8 @@ class MLXTrainer:
             (lvalue, toks), grad = _loss_and_grad(batch_data)
             toks_f = toks.astype(mx.float32)
             grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
-            # The accumulated gradient is carried as state across Python loop
-            # iterations or reduced eagerly outside mx.compile in DDP mode.
+            # Carried as state across loop iterations, or reduced eagerly
+            # outside mx.compile under DDP.
             grad = tree_map(mx.stop_gradient, grad)
             toks_f = mx.stop_gradient(toks_f)
             return lvalue, toks, (grad, toks_f)
@@ -3082,12 +3081,10 @@ class MLXTrainer:
                         self._best_metric = _cur
                         self._best_step = current_step
                         self._es_patience_counter = 0
-                        # Bookkeeping above runs on every rank so early-stopping
-                        # stays in lockstep; only rank 0 writes output_dir/best to
-                        # avoid concurrent writes. Sync any save failure across
-                        # ranks (mirrors the checkpoint path) so a rank-0 disk or
-                        # permission error does not leave peers hanging at the next
-                        # collective.
+                        # Bookkeeping runs on every rank to keep early-stopping
+                        # in lockstep; only rank 0 writes output_dir/best. Sync
+                        # save failures across ranks so a rank-0 error does not
+                        # hang peers at the next collective.
                         best_save_error = None
                         if is_main_process:
                             try:
@@ -3127,11 +3124,9 @@ class MLXTrainer:
                             _main_print(f"  Unsloth: skipped checkpoint ({e})")
                         else:
                             # Also write optimizer + trainer state so
-                            # resume_from_checkpoint can restore Adam moments,
-                            # step counter, and loss history. Adapter save was
-                            # successful -- treat the extra writes as
-                            # best-effort: log on failure but don't undo the
-                            # adapter save.
+                            # resume_from_checkpoint restores Adam moments, step
+                            # counter, and loss history. Best-effort: the adapter
+                            # save already succeeded, so log failures but keep it.
                             checkpoint_complete = False
                             try:
                                 save_optimizer_state(optimizer, ckpt_dir)
