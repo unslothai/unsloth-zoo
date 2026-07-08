@@ -120,18 +120,28 @@ def get_forward_moe_backend():
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """Grouped matmul via torch._grouped_mm with contiguous inputs.
+    """Grouped matmul; passes the weight as a transposed view (no copy) when safe.
 
-    Some low-rank LoRA weights are contiguous but still have row strides below
-    the kernel alignment requirement, so keep a narrow fallback for those cases.
+    Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
+    ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
+    but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
+    copy when a one-time probe proves the view path matches the contiguous one; else we keep the
+    always-correct copy. Falls back to a per-group matmul on the 16-byte stride error. Bit-exact
+    vs the always-contiguous path in forward and backward.
     """
     inputs = inputs.contiguous()
+    if not _transposed_view_grouped_mm_is_safe():
+        weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
+    try:
+        return torch._grouped_mm(inputs, weight, offs=offsets)
+    except RuntimeError as exc:
+        if "strides should be multiple of 16 bytes" not in str(exc):
+            raise
     weight = weight.contiguous()
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
-        message = str(exc)
-        if "strides should be multiple of 16 bytes" not in message:
+        if "strides should be multiple of 16 bytes" not in str(exc):
             raise
         return _manual_grouped_mm(inputs, weight, offsets)
 
@@ -149,6 +159,128 @@ def _manual_grouped_mm(
     if outputs:
         return torch.cat(outputs, dim=0)
     return inputs.new_empty((0, weight.shape[-1]))
+
+
+# Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
+# is rebuilt from the 4-bit Params4bit in backward (dX only; the base is frozen and
+# LoRA is a separate additive grouped_mm) instead of being pinned on the tape. Output
+# is unchanged. See _moe_recompute_enabled for the pin-vs-recompute policy.
+
+
+def _base_is_recomputable(source) -> bool:
+    """True iff the base expert weight can be rebuilt in backward (frozen and
+    grouped-mm capable). A trainable or unsupported base must use the pinned path."""
+    try:
+        if not _should_use_separated_lora():          # merged LoRA folds the delta into base
+            return False
+        if not _check_torch_grouped_mm_supported():
+            return False
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
+            if getattr(param, "quant_state", None) is None:
+                return False
+            return not param.requires_grad
+        if isinstance(param, torch.Tensor):
+            return (not param.requires_grad) and param.dtype in (
+                torch.bfloat16, torch.float16, torch.float32,
+            )
+    except Exception:
+        return False
+    return False
+
+
+def _moe_recompute_default(prefer_memory: bool = False) -> bool:
+    """Pin-vs-recompute decision independent of the source weight.
+
+    Adaptive by default: pin (return False) inside a gradient-checkpoint recompute
+    pass, where the stack is rebuilt immediately before the layer's own backward so
+    the pin is momentary and cheap; otherwise recompute (return True), so a
+    non-checkpointed forward does not hold every layer's dense stack across the whole
+    backward. UNSLOTH_MOE_RECOMPUTE overrides it: "1" forces recompute (max memory
+    saving), "0" forces pinning (max speed for memory-rich runs).
+
+    ``prefer_memory`` biases the no-override case toward recompute even inside a GC
+    recompute pass. It is set for bases whose pinned form is a large dense dequant of
+    a compressed weight (bnb 4-bit MoE experts): there the "momentary" pin still
+    materializes the full bf16 expert stack the 4-bit storage exists to avoid, which
+    can be several GiB per layer on large MoEs, so recompute is the better default
+    when the model is already memory-constrained (4-bit + gradient checkpointing).
+
+    The GC branch reads a thread-local; under torch.compile of the MoE forward that
+    read can be traced away and frozen at the first trace, so the adaptive choice may
+    not re-evaluate per GC pass. That only trades memory for speed (pin and recompute
+    are dX-identical), never correctness, and the grouped GEMM path generally runs
+    eager anyway; set UNSLOTH_MOE_RECOMPUTE explicitly to pin the choice if needed."""
+    override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    if prefer_memory:
+        return True
+    try:
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        return not in_gradient_checkpoint_recompute()
+    except Exception:
+        return True  # safe default: recompute rather than pin across a full backward
+
+
+def _source_pins_large_dequant(source) -> bool:
+    """True iff pinning this base means holding a large dense dequant of a compressed
+    weight (a frozen bnb 4-bit MoE expert). For these the pinned path materializes the
+    full bf16 expert stack, so recompute is the memory-preserving default under
+    gradient checkpointing; a plain bf16/fp16/fp32 base pins its own storage (no
+    extra dequant) and keeps the speed-oriented adaptive policy."""
+    if not (HAS_BNB and Params4bit is not None):
+        return False
+    try:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        return isinstance(param, Params4bit) and getattr(param, "quant_state", None) is not None
+    except Exception:
+        return False
+
+
+def _moe_recompute_enabled(source) -> bool:
+    """Whether to recompute the dequantized base stack in backward (True) or pin it
+    for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
+    everything else the pinned eager path is used. A bnb 4-bit base prefers recompute
+    even under gradient checkpointing so the momentary pin never holds the full bf16
+    expert dequant (see _source_pins_large_dequant)."""
+    return _base_is_recomputable(source) and _moe_recompute_default(
+        prefer_memory = _source_pins_large_dequant(source)
+    )
+
+
+class _GroupedMMRecompute(torch.autograd.Function):
+    """grouped_mm(inputs, W) for a frozen W from weight_provider(): saves only offsets and rebuilds
+    W in backward (dX only) instead of pinning the dense stack."""
+
+    @staticmethod
+    def forward(ctx, inputs, offsets, weight_provider):
+        ctx.weight_provider = weight_provider
+        ctx.save_for_backward(offsets)   # inputs is unused in backward (frozen base -> dX only)
+        with torch.no_grad():
+            out = _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (offsets,) = ctx.saved_tensors
+        with torch.no_grad():
+            weight_t = ctx.weight_provider().transpose(-2, -1).contiguous()
+            grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
+        return grad_input, None, None
+
+
+def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
+    """recompute -> rebuild W in backward; else the prior eager grouped_mm."""
+    if recompute:
+        return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
+    return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
 _GROUPED_GEMM_AVAILABLE = None
@@ -188,6 +320,51 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
 
     return _TORCH_GROUPED_MM_SUPPORTED
+
+
+# Some CUDA builds silently miscompute torch._grouped_mm for a transposed bf16 view preceded by a
+# broadcast op (pytorch/pytorch#186365, Blackwell + torch 2.11/2.13). This probe checks the view
+# matches the contiguous copy so _grouped_mm_with_backward_fix can skip the copy only when safe.
+_TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
+
+
+def _transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+
+    safe = False
+    try:
+        if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            E, N, K, M = 4, 64, 32, 32
+            # local generator: never touch the process-wide RNG (manual_seed would shift training)
+            gen = torch.Generator(device=device).manual_seed(0)
+            A = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=gen)
+            w = torch.randn(E, N, K, dtype=torch.bfloat16, device=device, generator=gen)
+            w_t = w.transpose(-2, -1)
+            w_tc = w_t.contiguous()
+            per = M // E
+            offs = torch.arange(per, M + 1, per, dtype=torch.int32, device=device)[:E]
+            offs[-1] = M
+            ok, ref = True, None
+            for _ in range(6):
+                row_wise_max = A.abs().amax(dim=-1, keepdim=True)
+                _ = A / (row_wise_max / 448.0)     # the #186365 trigger (result discarded)
+                r_view = torch._grouped_mm(A, w_t, offs=offs)
+                r_contig = torch._grouped_mm(A, w_tc, offs=offs)
+                if (r_view - r_contig).abs().max().item() > 1e-2:   # view disagrees with contiguous
+                    ok = False; break
+                if ref is None:
+                    ref = r_view
+                elif (r_view - ref).abs().max().item() > 1e-2:      # view not stable across calls
+                    ok = False; break
+            safe = ok
+    except Exception:
+        safe = False   # anything unexpected -> keep the safe contiguous copy
+
+    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = safe
+    return safe
 
 
 _TRITON_ALLOCATOR_INITIALIZED = False
@@ -611,8 +788,9 @@ def _extract_lora_weights(
     return result[0], result[1], result[2]
 
 
-def _get_base_weight(param):
-    """Get base weight from a potentially wrapped parameter or module."""
+def _get_base_weight(param, target_dtype=None):
+    """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
+    providers) restores the packed Params4bit to its logical shape and casts."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
@@ -627,7 +805,13 @@ def _get_base_weight(param):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        return bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        original_shape = getattr(param, "_original_shape", None)
+        if original_shape is not None and weight.shape != original_shape:
+            weight = weight.reshape(original_shape)
+        if target_dtype is not None:
+            weight = weight.to(target_dtype)
+        return weight
 
     if hasattr(param, "get_param"):
         return param.get_param()
@@ -1001,6 +1185,72 @@ def patch_param_wrapper_for_moe():
         return False
 
 
+# Gate gradient via the inner-product identity dGate = <A, dA> / gate, instead of
+# <dOut, Y> which pins the down-projection output Y on the tape solely for that
+# gradient. Output unchanged; on by default to save memory. The runtime gate below
+# still auto-disables it for fp16, down-bias models and frozen routers. Set
+# UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
+
+
+@lru_cache(maxsize=1)
+def _moe_gategrad_enabled() -> bool:
+    """Whether the MoE gate-gradient identity path is active (on by default).
+
+    Cached with maxsize=1 since UNSLOTH_MOE_GATEGRAD is read once per process. Any
+    code or test that toggles the env var at runtime must call
+    _moe_gategrad_enabled.cache_clear() afterwards for the change to take effect.
+    """
+    return os.environ.get("UNSLOTH_MOE_GATEGRAD", "1") != "0"
+
+
+class _MoEGateGradIdentity(torch.autograd.Function):
+    """Identity over the pre-down activation ``inter``; backward derives the gate
+    gradient as ``dGate = <inter, dA> / gate`` instead of ``<dOut, Y>``.
+
+    The incoming dA equals ``gate * (dOut @ W2_eff.T)`` for the effective down
+    weight (base + LoRA), so ``<inter, dA> / gate`` is exactly ``<Y, dOut>``
+    without ever materialising Y for the gradient. The caller passes a
+    sign-floored gate and multiplies Y by that same value, so the identity holds
+    for any routing weight, including exact zeros. Exact for any linear down
+    projection; NOT valid with a post-matmul down bias, so callers must
+    disable it when one is present.
+    """
+
+    @staticmethod
+    def forward(ctx, inter, permuted_weights):
+        ctx.save_for_backward(inter, permuted_weights)
+        return inter
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_inter):
+        # once_differentiable: the reconstruction is first-order exact but its
+        # graph is not the original one, so create_graph must raise, not
+        # silently return wrong second derivatives.
+        # grad_inter is None when nothing downstream needs inter's gradient
+        # (e.g. a frozen down projection); there is nothing to propagate then.
+        if grad_inter is None:
+            return None, None
+        inter, gate = ctx.saved_tensors
+        grad_gate = None
+        # Skip the gate gradient when the routing weight is frozen (e.g. a frozen
+        # router under LoRA), where its gradient is never consumed.
+        if ctx.needs_input_grad[1]:
+            dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
+            # The call site multiplies Y by this same sign-floored gate, so the
+            # floor cancels exactly and the quotient equals <Y, dOut> for any
+            # gate, including exact zeros. The re-clamp is a no-op for the safe
+            # gate passed by forward_native_grouped_mm; it only protects direct
+            # callers from dividing by a raw zero.
+            gate_f = gate.to(torch.float32)
+            safe_gate = torch.where(
+                gate_f >= 0, gate_f.clamp_min(1e-12), gate_f.clamp_max(-1e-12)
+            )
+            grad_gate = (dgate / safe_gate).to(gate.dtype)
+        # inter passes through unchanged, so its gradient is grad_inter.
+        return grad_inter, grad_gate
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -1052,12 +1302,16 @@ def forward_native_grouped_mm(
         )
 
     if hasattr(self, "gate_up_proj"):
-        gate_up_base = _get_base_weight(self.gate_up_proj)
         model_type = getattr(self, "_unsloth_model_type", None)
+        _gate_up_src = self.gate_up_proj
 
-        # grouped_mm backward needs contiguous weights; preprocess may return a transposed view.
-        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
-        mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
+        # Provider re-derives the base weight on demand so Fix 3 can recompute it in
+        # backward instead of pinning it (grouped_mm needs contiguous weights).
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
+            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt)
+        mm1_out = _base_grouped_mm(
+            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
+        )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -1171,6 +1425,42 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
+    # Env-gated gate-grad identity; disabled when a down bias exists (identity
+    # assumes a linear down), the router is frozen (nothing to synthesize, and
+    # the Function would needlessly keep inter saved), or inter is float16. For
+    # fp16, the gradient into the identity carries the tiny floored gate as a
+    # factor (grad_inter = gate * (W2 @ dOut)); with a near-zero gate that product
+    # underflows fp16 to 0 before backward runs, dropping the router gradient for
+    # near-zero routes. fp16 therefore keeps the standard multiply (correct
+    # gradient, saves Y); bf16/fp32 hold the tiny value and are unaffected.
+    _gategrad = (
+        _moe_gategrad_enabled()
+        and getattr(self, "down_proj_bias", None) is None
+        and top_k_weights.requires_grad
+        and inter.dtype != torch.float16
+    )
+    permuted_weights = None
+    if _gategrad:
+        raw_weights = top_k_weights.reshape(-1)[sorted_indices]
+        # Sign-floor the gate away from zero (straight-through, so the synthesized
+        # gradient still reaches top_k_weights). The multiply below and the
+        # identity's divide use the SAME floored value, so they cancel exactly and
+        # the gate gradient <Y, dOut> survives even a routing weight of exactly
+        # zero. An fp16 gate cannot represent eps=1e-12 (its smallest normal is
+        # ~6e-5), so upcast it to float32; inter is non-fp16 here, so the floored
+        # value survives in grad_inter. The forward then changes by at most
+        # 1e-12 * |Y| for |gate| < 1e-12.
+        if raw_weights.dtype == torch.float16:
+            raw_weights = raw_weights.to(torch.float32)
+        eps = 1e-12
+        floored = torch.where(
+            raw_weights >= 0,
+            raw_weights.clamp(min=eps),
+            raw_weights.clamp(max=-eps),
+        )
+        permuted_weights = raw_weights + (floored - raw_weights).detach()
+        inter = _MoEGateGradIdentity.apply(inter, permuted_weights)
+
     # Down projection with optional separated LoRA (default).
     down_lora = None
 
@@ -1185,10 +1475,13 @@ def forward_native_grouped_mm(
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if hasattr(self, "down_proj"):
-        down_base = _get_base_weight(self.down_proj)
         model_type = getattr(self, "_unsloth_model_type", None)
-        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
-        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
+        _down_src = self.down_proj
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
+            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt)
+        mm2_out = _base_grouped_mm(
+            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
+        )
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora
@@ -1244,9 +1537,13 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
     # Apply routing weights and scatter-add (reduce).
-    flat_weights = top_k_weights.view(-1)
-    permuted_weights = flat_weights[sorted_indices]
-    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+    if _gategrad:
+        # Gate grad comes from the identity; detach so the multiply does not pin Y.
+        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+    else:
+        flat_weights = top_k_weights.reshape(-1)
+        permuted_weights = flat_weights[sorted_indices]
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
     final_hidden_states = torch.zeros(
         (batch_size * sequence_length, hidden_dim),

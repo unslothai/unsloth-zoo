@@ -16,12 +16,17 @@
 
 
 from .common import *
+from .fla_vendor import *
 from .gemma import *
 from .misc import *
 from .gemma3n import *
 from .gemma4 import *
+from .gemma4_float32 import *
+from .gemma4_banded_attention import *
+from .gemma4_flash_sliding import *
 from .gpt_oss import *
 from .qwen3_moe import *
+from .qwen3_moe_float32 import *
 from .qwen3_vl_moe import *
 from .qwen3_next_moe import *
 from .qwen3_5_moe import *
@@ -29,11 +34,13 @@ from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .gemma4_moe import *
 from .lfm2_moe import *
+from .mixtral_moe import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
 from .mxfp4 import *
 from .bitsandbytes import *
 from .moe_utils_bnb4bit import *
+from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .flex_attention_bwd import *
