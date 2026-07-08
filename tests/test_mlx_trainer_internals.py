@@ -1276,31 +1276,67 @@ def test_distributed_diagnostics_per_rank_tokens_use_local_history():
     assert "_local_token_count_history" in src
 
 
-def test_reset_run_state_clears_stop_request_for_reuse():
-    # Regression for "Keep callback stops from poisoning trainer reuse".
+def test_train_entry_clears_stale_stop_before_setup():
+    # Regression for "Keep callback stops from poisoning trainer reuse" +
+    # "Preserve external stop requests during setup".
     # stop_requested is a persistent instance flag; a run whose callback latched
-    # should_training_stop leaves it True. _reset_run_state runs at the start of
-    # each train(), so it must clear stop_requested (and _early_stopped) or the
-    # next trainer.train() on the same instance exits at the top of the loop with
-    # 0 steps. A new train() call is a fresh run: an in-flight cancel targets the
-    # run active when it is set (that run's loop), not a not-yet-started one.
+    # should_training_stop leaves it True. The clear that unblocks a reused
+    # trainer must happen at train() ENTRY, before any long setup (data prep /
+    # optimizer build), so a stale PRIOR-run stop is gone before setup begins
+    # while an external cancel raised DURING this run's setup still survives.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer.train)
+    reset_idx = src.index("self.stop_requested = False")
+    # The clear must precede the _train_inner() call (and the data prep it
+    # drives), else a stale stop would only be cleared after setup (or not).
+    inner_idx = src.index("self._train_inner()")
+    assert reset_idx < inner_idx
+    # It must be the FIRST executable statement (only the docstring + comments
+    # precede it), so no long work runs before the stale stop is cleared.
+    body = src[src.index('"""', src.index('"""') + 3) + 3:]
+    first_stmt = next(
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    assert first_stmt == "self.stop_requested = False"
+
+
+def test_reset_run_state_preserves_in_setup_stop_request():
+    # Regression for "Preserve external stop requests during setup".
+    # _train_inner calls _reset_run_state AFTER _prepare_data / _build_optimizer.
+    # An external controller (e.g. a Studio cancel button) may set stop_requested
+    # while those long setup steps run; the post-setup _reset_run_state must NOT
+    # clear that in-flight cancel, or training proceeds despite the cancel. So
+    # _reset_run_state no longer owns stop_requested at all.
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     trainer = MLXTrainer.__new__(MLXTrainer)
 
-    # A callback-latched stop from a prior run must not survive into the reset
-    # that a reused train() performs, else run 2 exits at step 0.
+    # An external cancel set after the train()-entry clear but during setup must
+    # survive _reset_run_state so the loop's _distributed_should_stop() sees it.
     trainer.stop_requested = True
     trainer._reset_run_state()
-    assert trainer.stop_requested is False
-    assert trainer._early_stopped is False
+    assert trainer.stop_requested is True
 
-    # A run-1 early stop must not block run 2 on a reused trainer either.
-    trainer.stop_requested = True
+    # _reset_run_state still clears _early_stopped so a run-1 early stop doesn't
+    # block run 2 on a reused trainer.
     trainer._early_stopped = True
     trainer._reset_run_state()
     assert trainer._early_stopped is False
-    assert trainer.stop_requested is False
+
+
+def test_reset_run_state_does_not_own_stop_requested_attr():
+    # _reset_run_state must not touch stop_requested at all: with the attribute
+    # absent, the reset leaves it absent (train() entry is the sole owner).
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer._reset_run_state()
+    assert not hasattr(trainer, "stop_requested")
 
 
 def test_reset_run_state_preserves_callbacks_and_batches():

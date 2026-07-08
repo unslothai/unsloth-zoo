@@ -857,8 +857,13 @@ class MLXTrainer:
         self._ensure_lora_frozen(model)
 
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
-        # each train() so a reused trainer starts clean, including stop_requested);
-        # callbacks and pre-created batches persist across runs and stay here.
+        # each train() so a reused trainer starts clean); callbacks and
+        # pre-created batches persist across runs and stay here.
+        # stop_requested is cleared once at train() entry (before setup) rather
+        # than in _reset_run_state, so an external cancel raised during THIS
+        # run's data prep / optimizer build survives; initialize it here so a
+        # trainer inspected before train() still has the attribute.
+        self.stop_requested = False
         self._reset_run_state()
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
@@ -883,16 +888,15 @@ class MLXTrainer:
         )
 
     def _reset_run_state(self):
-        """Per-run training/metric state. Reset from __init__ and at the start
-        of each train() so reusing a trainer for a second run starts clean;
-        _early_stopped cleared so a run-1 early stop doesn't block run 2, and
-        stop_requested cleared so a run-1 stop (a callback that latched
-        should_training_stop, or a prior external cancel) does not make a reused
-        trainer.train() exit at step 0. A new train() call is a fresh run: an
-        in-flight cancel targets whichever run is active when it is set (during
-        that run's loop), not a not-yet-started one, so clearing it at run start
-        is correct. Callbacks and pre-created batches persist across runs and
-        aren't reset."""
+        """Per-run training/metric state. Reset from __init__ and inside
+        _train_inner (after setup) so reusing a trainer for a second run starts
+        clean; _early_stopped cleared so a run-1 early stop doesn't block run 2.
+        stop_requested is deliberately NOT reset here: train() clears it once at
+        entry (before any data prep / optimizer build), so an external cancel
+        raised DURING this run's setup survives to the loop's top-of-loop
+        _distributed_should_stop() check instead of being clobbered by this
+        post-setup reset. Callbacks and pre-created batches persist across runs
+        and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
@@ -906,10 +910,6 @@ class MLXTrainer:
         # eval_loss/perplexity in its result. Repopulated by _evaluate.
         self._last_eval_metrics = {}
         self._early_stopped = False
-        # Cleared each run so a run-1 stop (callback-latched or a prior external
-        # cancel) does not exit a reused trainer.train() at step 0; set True to
-        # stop training early.
-        self.stop_requested = False
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
@@ -2138,6 +2138,14 @@ class MLXTrainer:
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
+        # Clear a stale stop from a PRIOR run at the EARLIEST point, before any
+        # data prep / optimizer build / _train_inner, so a reused trainer starts
+        # un-stopped. _reset_run_state (post-setup) no longer touches this, so an
+        # external cancel raised DURING this run's setup (e.g. a Studio cancel on
+        # a large dataset materializing in _prepare_data) survives to the loop's
+        # top-of-loop _distributed_should_stop() check. Local assignment only, no
+        # DDP collective.
+        self.stop_requested = False
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
