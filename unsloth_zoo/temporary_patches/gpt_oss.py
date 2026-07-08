@@ -2460,9 +2460,10 @@ def patch_GptOssModel():
     pass
 
     # transformers 4.x uses `input_embeds` and accepts `cache_position`;
-    # transformers 5.x renamed to `inputs_embeds` and dropped `cache_position`.
-    # Inspect the mask factory signatures once and pass only the kwargs they
-    # actually accept so this patch works on both 4.x and 5.x.
+    # transformers 5.x renamed it to `inputs_embeds` and later dropped
+    # `cache_position` (deprecated then removed by 5.13). Inspect the mask factory
+    # signatures once and pass only the kwargs they actually accept so this patch
+    # works across 4.x and the whole 5.x line.
     import inspect as _inspect
     def _mask_factory_params(fn, name):
         # The factory may be wrapped (see misc.py) or torch-compiled, which
@@ -2485,16 +2486,21 @@ def patch_GptOssModel():
                 return params
         # Introspection failed on every candidate (should not happen: misc.py saves
         # the pristine factory and torch.compile exposes __wrapped__). Fall back to
-        # the parameter set for the running transformers, choosing the embeds arg
-        # name by major version (4.x uses input_embeds, 5.x uses inputs_embeds) so a
-        # reached fallback never passes an unexpected keyword to the real factory.
+        # the parameter set for the running transformers, choosing the kwargs by
+        # major version so a reached fallback never passes an unexpected keyword to
+        # the real factory: 4.x uses `input_embeds` and accepts `cache_position`,
+        # while 5.x uses `inputs_embeds` and dropped `cache_position` (optional and
+        # defaulting to None on early 5.x, removed entirely by 5.13), so omitting it
+        # on 5.x is safe across the whole line.
         try:
             _tf_major = int(str(transformers.__version__).split(".", 1)[0])
         except (ValueError, AttributeError, IndexError):
             _tf_major = 5
-        _embeds_name = "input_embeds" if _tf_major < 5 else "inputs_embeds"
-        return {"config", _embeds_name, "attention_mask",
-                "cache_position", "past_key_values", "position_ids"}
+        if _tf_major < 5:
+            return {"config", "input_embeds", "attention_mask",
+                    "cache_position", "past_key_values", "position_ids"}
+        return {"config", "inputs_embeds", "attention_mask",
+                "past_key_values", "position_ids"}
     _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
     _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
     _mask_params = _ccm_params | _cswc_params
