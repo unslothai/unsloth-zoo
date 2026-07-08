@@ -682,6 +682,28 @@ def test_reset_run_state_preserves_external_stop_request():
     assert trainer.stop_requested is False
 
 
+def test_reset_run_state_preserves_callbacks_and_batches():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    # Callbacks registered via add_step_callback / add_eval_callback before
+    # train() (and the report_to callbacks set up inside train() before
+    # _train_inner) must survive the per-run reset that _train_inner runs, else
+    # user eval hooks never fire and W&B / TensorBoard logging is dropped.
+    step_cb, eval_cb = object(), object()
+    prebuilt = ["batch"]
+    trainer._batches = prebuilt
+    trainer._step_callbacks = [step_cb]
+    trainer._eval_callbacks = [eval_cb]
+
+    trainer._reset_run_state()
+
+    assert trainer._batches is prebuilt
+    assert trainer._step_callbacks == [step_cb]
+    assert trainer._eval_callbacks == [eval_cb]
+
+
 def test_resolved_best_metric_name_mirrors_hf_lookup():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 

@@ -926,9 +926,6 @@ class MLXTrainer:
         self._step_times = []
         self._local_token_count_history = []
         self._global_token_count_history = []
-        self._batches = None  # Pre-created batches (skips internal batch creation)
-        self._step_callbacks = []  # Callbacks called after each logged step
-        self._eval_callbacks = []  # Callbacks called after each eval
         self._early_stopped = False
         self._best_metric = None
         self._best_step = None
@@ -1976,9 +1973,6 @@ class MLXTrainer:
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
-        # Only rank 0 opens W&B / TensorBoard to avoid duplicate runs (HF gates this too).
-        if self.is_main_process:
-            self._setup_report_to_callbacks()
         self._install_neftune()
         is_main_process = self.is_main_process
 
@@ -2078,7 +2072,9 @@ class MLXTrainer:
             # Register W&B/TensorBoard reporters after arg auto-tuning so the
             # W&B config snapshot reflects the settings actually used (e.g. VLM
             # compile auto-tune can flip gradient_checkpointing before training).
-            self._setup_report_to_callbacks()
+            # Only rank 0 opens W&B / TensorBoard so DDP runs don't double-log.
+            if self.is_main_process:
+                self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
             _handles = getattr(self, "_report_to_handles", (None, None))
