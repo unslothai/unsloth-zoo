@@ -1252,6 +1252,144 @@ def test_grpo_reward_aggregation_skips_none_values():
     assert total == [1.0, 0.5, 2.0]
 
 
+# ---------------------------------------------------------------------------
+# PR #832 round-2 review fixes: GRPO group-size / reward-length validation and
+# preference-reference non-LoRA-trainable guard.
+# ---------------------------------------------------------------------------
+
+def _make_grpo_trainer_for_rollout(monkeypatch, num_generations, reward_funcs,
+                                   batch_texts=None):
+    """Minimal MLXGRPOTrainer wired just enough to drive one rollout."""
+    import types
+    import mlx_lm
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    class _Tok:
+        eos_token_id = 0
+        def encode(self, s):
+            return [1, 2, 3]
+
+    if batch_texts is None:
+        batch_texts = ["gen"] * num_generations
+    resp = types.SimpleNamespace(texts=batch_texts)
+    monkeypatch.setattr(mlx_lm, "batch_generate",
+                        lambda *a, **k: resp, raising=False)
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = object()
+    trainer.tokenizer = _Tok()
+    trainer.train_dataset = [{"prompt": "hello", "answer": "x"}]
+    trainer.reward_funcs = list(reward_funcs)
+    args = types.SimpleNamespace(
+        num_generations=num_generations,
+        temperature=1.0,
+        max_completion_length=4,
+        max_seq_length=32,
+    )
+    trainer.args = args
+    return trainer
+
+
+def test_grpo_rollout_rejects_single_generation(monkeypatch):
+    # num_generations=1 gives a one-element group: mean == reward and std == 0,
+    # so every group-relative advantage is exactly 0 and the policy receives no
+    # reward gradient (a silent no-op GRPO objective). Fail fast instead.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=1,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.0]],
+    )
+    gen = trainer._grpo_rollout_generator()
+    with pytest.raises(ValueError, match="num_generations >= 2"):
+        next(gen)
+
+
+def test_grpo_rollout_rejects_wrong_length_reward_vector(monkeypatch):
+    # A reward func returning fewer scores than completions would leave the
+    # unfilled slots at 0.0 (silently fabricated rewards -> corrupted
+    # advantages); a longer one would index out of range. Fail fast.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=3,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [1.0]],
+        batch_texts=["a", "b", "c"],
+    )
+    gen = trainer._grpo_rollout_generator()
+    with pytest.raises(ValueError, match="returned 1 scores for 3 completions"):
+        next(gen)
+
+
+def test_grpo_rollout_accepts_matching_length_reward_vector(monkeypatch):
+    # The length guard must not false-positive on a correct reward func: one
+    # score per completion advances past both guards and yields a rollout tuple.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=3,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2, 0.3]],
+        batch_texts=["a", "b", "c"],
+    )
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, advantages = next(gen)
+    assert batch.shape[0] == 3
+    assert advantages.shape[0] == 3
+
+
+def test_model_has_non_lora_trainable_params_detects_full_module():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import model_has_non_lora_trainable_params
+
+    class _LoRAMod:
+        def __init__(self):
+            self.lora_a = mx.zeros((4, 2))
+            self.lora_b = mx.zeros((2, 4))
+            self.scale = 1.0
+
+    class _Model:
+        def __init__(self, extra):
+            self._lora = _LoRAMod()
+            self._extra = extra  # "none" | "lm_head" | "wrapped_base"
+
+        def named_modules(self):
+            return [("", self), ("q_proj", self._lora)]
+
+        def parameters(self):
+            params = {"q_proj": {
+                "lora_a": self._lora.lora_a, "lora_b": self._lora.lora_b,
+            }}
+            if self._extra == "lm_head":
+                params["lm_head"] = {"weight": mx.zeros((8, 4))}
+            elif self._extra == "wrapped_base":
+                # A base weight INSIDE the LoRA module must be excluded.
+                params["q_proj"]["weight"] = mx.zeros((4, 4))
+            return params
+
+        def trainable_parameters(self):
+            return self.parameters()
+
+    # A directly-trained non-LoRA module (lm_head) is detected: such a tensor
+    # keeps moving so a LoRA-disable reference would not be the frozen policy.
+    assert model_has_non_lora_trainable_params(_Model("lm_head")) is True
+    # Pure LoRA (only adapter tensors trainable): reference is safe.
+    assert model_has_non_lora_trainable_params(_Model("none")) is False
+    # A wrapped base weight inside a LoRA module is not a non-LoRA trainable.
+    assert model_has_non_lora_trainable_params(_Model("wrapped_base")) is False
+
+
+def test_preference_reference_guards_reject_non_lora_trainables():
+    # The DPO and GRPO loss setup must refuse a LoRA reference when non-LoRA
+    # params are also trainable, otherwise the reference (LoRA-disable) silently
+    # keeps the moving non-LoRA weights and the gradient is wrong.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert src.count("model_has_non_lora_trainable_params(model)") >= 2
+    dpo_builder = src.index("make_dpo_loss_fn")
+    grpo_builder = src.index("make_grpo_loss_fn")
+    # The DPO guard precedes the DPO loss builder; the GRPO guard sits between
+    # the DPO and GRPO loss builders (i.e. before the GRPO one).
+    assert src.index("model_has_non_lora_trainable_params(model)") < dpo_builder
+    assert src.index("model_has_non_lora_trainable_params(model)", dpo_builder) \
+        < grpo_builder
+
+
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
     import inspect
 

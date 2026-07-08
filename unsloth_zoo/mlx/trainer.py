@@ -190,6 +190,7 @@ from .utils import (
     save_trainer_state,
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
+    model_has_non_lora_trainable_params,
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
@@ -2059,6 +2060,18 @@ class MLXTrainer:
                 _db = getattr(args, "dpo_beta", 0.1)
                 _rf = bool(getattr(args, "reference_free", False))
                 _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
+                if (_lora_mods and not _rf
+                        and model_has_non_lora_trainable_params(model)):
+                    raise ValueError(
+                        "Unsloth: DPO with a LoRA reference is not supported when "
+                        "non-LoRA parameters (e.g. a directly-trained lm_head / "
+                        "embed_tokens) are also trainable. The reference is obtained "
+                        "by disabling LoRA adapters, but those non-LoRA tensors keep "
+                        "moving during training, so the reference would no longer be "
+                        "the frozen initial policy and the DPO gradient would be "
+                        "wrong. Train LoRA adapters only, or pass "
+                        "reference_free=True to train without a reference."
+                    )
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
@@ -2067,6 +2080,19 @@ class MLXTrainer:
                 _ge = getattr(args, "grpo_epsilon", 0.2)
                 _grf = bool(getattr(args, "reference_free", False))
                 _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
+                if (_lora_mods and _gb != 0.0 and not _grf
+                        and model_has_non_lora_trainable_params(model)):
+                    raise ValueError(
+                        "Unsloth: GRPO KL regularization with a LoRA reference is "
+                        "not supported when non-LoRA parameters (e.g. a "
+                        "directly-trained lm_head / embed_tokens) are also "
+                        "trainable. The KL reference is obtained by disabling LoRA "
+                        "adapters, but those non-LoRA tensors keep moving during "
+                        "training, so the reference would no longer be the frozen "
+                        "initial policy and the KL term would be wrong. Train LoRA "
+                        "adapters only, or set grpo_beta=0 (equivalently "
+                        "reference_free=True) to train without the KL term."
+                    )
                 loss_fn = make_grpo_loss_fn(beta=_gb, lora_mods=_lora_mods,
                     reference_free=_grf, epsilon_low=_ge, epsilon_high=_ge)
                 print("Unsloth: Using GRPO loss (beta=" + str(_gb) + ").")
@@ -3590,24 +3616,7 @@ class MLXTrainer:
             # module; drop wrapped base weights INSIDE one (else q_proj.weight
             # under a LoRA-wrapped q_proj re-leaks the Studio reload bug). Uses
             # the shared filter to match save_trainable_adapters / _merged.
-            trainable = dict(tree_flatten(self.model.trainable_parameters()))
-            adapter_keys = set(adapter_tensors)
-            lora_module_prefixes = tuple(
-                f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
-                if name
-            )
-            from .utils import _is_base_tensor_inside_lora_module
-            has_root_lora_module = any(
-                name == "" for name, _ in iter_mlx_lora_modules(self.model)
-            )
-            has_non_lora_trainable = any(
-                key not in adapter_keys
-                and not _is_base_tensor_inside_lora_module(
-                    key, lora_module_prefixes, has_root_lora_module,
-                )
-                for key in trainable
-            )
-            if has_non_lora_trainable:
+            if model_has_non_lora_trainable_params(self.model):
                 save_trainable_adapters(
                     self.model, output_dir, adapter_config=adapter_config,
                 )
@@ -3810,6 +3819,19 @@ class MLXGRPOTrainer(MLXTrainer):
         hf = _hf_encoding_tokenizer(self.tokenizer)
         pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
         N = args.num_generations
+        # GRPO advantages are group-relative: (r - mean) / (std + eps). With a
+        # single generation per prompt the group has one element, so mean == r
+        # and std == 0, making every advantage exactly 0. The run would appear
+        # to train but receive no reward-policy gradient (a silent no-op GRPO
+        # objective). TRL's GRPOTrainer requires a group of at least 2 for the
+        # same reason; fail fast instead of training a no-op.
+        if N < 2:
+            raise ValueError(
+                "Unsloth: GRPO requires num_generations >= 2 (got "
+                f"{N}). A single generation per prompt yields a zero-variance "
+                "group, so every group-relative advantage is 0 and the policy "
+                "receives no reward gradient. Set num_generations to 2 or more."
+            )
         sampler = make_sampler(temp=getattr(args, "temperature", 1.0))
         prompts = self._grpo_prompts()
         # Full dataset rows, in the same order as prompts, so reward_kwargs can
@@ -3846,6 +3868,19 @@ class MLXGRPOTrainer(MLXTrainer):
             total = [0.0] * N
             for rf in self.reward_funcs:
                 vals = rf(completions=comps, prompts=[prompt] * N, **reward_kwargs)
+                # TRL's reward-function contract is one score per completion:
+                # len(vals) must equal N. A shorter list would leave the unfilled
+                # positions at their initial 0.0 (silently fabricating rewards and
+                # corrupting the group-relative advantages); a longer one would
+                # index out of range below. Fail fast with a clear message.
+                if len(vals) != N:
+                    _rf_name = getattr(rf, "__name__", type(rf).__name__)
+                    raise ValueError(
+                        f"Unsloth: GRPO reward function {_rf_name!r} returned "
+                        f"{len(vals)} scores for {N} completions. Each reward "
+                        "function must return exactly one score per completion "
+                        "(len(completions) == num_generations)."
+                    )
                 for i, v in enumerate(vals):
                     # TRL-style reward funcs may return None to skip a sample
                     # (multi-task rewards); TRL maps None to NaN and drops it

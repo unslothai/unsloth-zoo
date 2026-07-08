@@ -5798,6 +5798,33 @@ def _is_base_tensor_inside_lora_module(
     return False
 
 
+def model_has_non_lora_trainable_params(model):
+    """True when the model has trainable tensors outside any LoRA module.
+
+    Mirrors the exact predicate the checkpoint saver uses to pick
+    ``save_trainable_adapters`` over ``save_lora_adapters``: a trainable
+    tensor that is neither a LoRA adapter tensor nor a wrapped base weight
+    INSIDE a LoRA module (e.g. a directly-trained ``lm_head`` / ``embed_tokens``
+    module, or a trainable bias on a non-LoRA linear). Such tensors move during
+    training, so the DPO/GRPO reference obtained by only zeroing LoRA scales
+    would still carry them and would not be the frozen initial policy.
+    """
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    if not trainable:
+        return False
+    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+    _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
+    lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
+    has_root_lora_module = any(name == "" for name in _lora_module_names)
+    return any(
+        key not in adapter_tensors
+        and not _is_base_tensor_inside_lora_module(
+            key, lora_module_prefixes, has_root_lora_module,
+        )
+        for key in trainable
+    )
+
+
 def save_trainable_adapters(model, path, adapter_config=None):
     """Save the current trainable parameter tree for training checkpoints.
 
