@@ -354,6 +354,77 @@ def _deepseek_ocr_config_model_type(config_data):
     return None
 
 
+def _tokenizer_supports_list_extra_special_tokens():
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception:
+        return True
+    init = PreTrainedTokenizerBase.__init__
+    original_init = getattr(init, "_unsloth_original_init", init)
+
+    class _ProbeTokenizer(PreTrainedTokenizerBase):
+        model_input_names = ["input_ids"]
+        padding_side = "right"
+        truncation_side = "right"
+
+        def _add_tokens(self, new_tokens, special_tokens=False):
+            return len(new_tokens)
+
+        def get_vocab(self):
+            return {}
+
+        @property
+        def vocab_size(self):
+            return 0
+
+    try:
+        probe = _ProbeTokenizer.__new__(_ProbeTokenizer)
+        original_init(probe, extra_special_tokens=["<|unsloth_probe|>"])
+    except AttributeError as error:
+        if "keys" in str(error):
+            return False
+        return True
+    except TypeError as error:
+        if "extra_special_tokens" in str(error):
+            return False
+        return True
+    except Exception:
+        return True
+    return True
+
+
+def _normalize_tokenizer_config_extra_special_tokens(
+    tokenizer_config,
+    *,
+    supports_list_extra_special_tokens=None,
+):
+    extra_special_tokens = tokenizer_config.get("extra_special_tokens")
+    if not isinstance(extra_special_tokens, list):
+        return tokenizer_config, False
+    if supports_list_extra_special_tokens is None:
+        supports_list_extra_special_tokens = (
+            _tokenizer_supports_list_extra_special_tokens()
+        )
+    if supports_list_extra_special_tokens:
+        return tokenizer_config, False
+
+    patched_config = dict(tokenizer_config)
+    additional_special_tokens = patched_config.get("additional_special_tokens")
+    merged_additional = []
+    if isinstance(additional_special_tokens, list):
+        merged_additional.extend(additional_special_tokens)
+    for token in extra_special_tokens:
+        if token not in merged_additional:
+            merged_additional.append(token)
+    patched_config["additional_special_tokens"] = merged_additional
+
+    model_specific_tokens = patched_config.get("model_specific_special_tokens")
+    patched_config["extra_special_tokens"] = (
+        dict(model_specific_tokens) if isinstance(model_specific_tokens, dict) else {}
+    )
+    return patched_config, True
+
+
 def _materialize_mlx_vlm_config_data(local_path, config_data):
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
     for name in os.listdir(local_path):
@@ -401,15 +472,65 @@ def _keep_mlx_vlm_config_view_alive(model, override_dir):
         pass
 
 
-def _materialize_mlx_vlm_config_override(local_path, config_data):
-    """Return a load path whose config routes known repos to the right mlx-vlm class."""
+def _materialize_mlx_vlm_config_override(
+    local_path,
+    config_data,
+    *,
+    normalize_tokenizer_config=False,
+    supports_list_extra_special_tokens=None,
+):
+    """Return a load path whose sidecars are compatible with mlx-vlm loaders."""
     if not local_path:
         return local_path, config_data
-    patched_config = _mlx_vlm_config_override_data(config_data)
-    if patched_config is None:
+    patched_files = {}
+
+    corrected_model_type = _deepseek_ocr_config_model_type(config_data)
+    patched_config = config_data
+    if (
+        corrected_model_type is not None
+        and config_data.get("model_type") != corrected_model_type
+    ):
+        patched_config = dict(config_data)
+        patched_config["model_type"] = corrected_model_type
+        # Drop the Torch remote-code auto_map so AutoProcessor doesn't import
+        # incompatible DeepSeek OCR Torch modules during MLX loads.
+        patched_config.pop("auto_map", None)
+        patched_files["config.json"] = patched_config
+
+    if normalize_tokenizer_config:
+        tokenizer_config = _read_json_file(
+            os.path.join(local_path, "tokenizer_config.json")
+        )
+        patched_tokenizer_config, patched_tokenizer = (
+            _normalize_tokenizer_config_extra_special_tokens(
+                tokenizer_config,
+                supports_list_extra_special_tokens=supports_list_extra_special_tokens,
+            )
+        )
+        if patched_tokenizer:
+            patched_files["tokenizer_config.json"] = patched_tokenizer_config
+
+    if not patched_files:
         return local_path, config_data
 
-    override_dir = _materialize_mlx_vlm_config_data(local_path, patched_config)
+    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
+    for name in os.listdir(local_path):
+        src = os.path.join(local_path, name)
+        dst = os.path.join(override_dir, name)
+        if name in patched_files:
+            continue
+        try:
+            os.symlink(src, dst)
+        except FileExistsError:
+            pass
+    for name, data in patched_files.items():
+        with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    if corrected_model_type is not None and "config.json" in patched_files:
+        print(
+            "Unsloth: Routing DeepSeek OCR checkpoint through "
+            f"mlx-vlm model_type={corrected_model_type!r}."
+        )
     return override_dir, patched_config
 
 
@@ -4688,6 +4809,7 @@ def _coerce_list_extra_special_tokens():
             return init(*args, **kwargs)
 
     patched_init._unsloth_extra_special_tokens_patched = True
+    patched_init._unsloth_original_init = init
     PreTrainedTokenizerBase.__init__ = patched_init
 
 
@@ -4884,6 +5006,7 @@ class FastMLXModel:
         # clear local_path: LoRA-adapter dirs have adapter_config.json but no
         # config.json, and the adapter branch needs local_path.
         local_path = None
+        original_local_path = None
         vlm_config_override_data = None
         try:
             with _temporary_hf_token_env(token):
@@ -4897,6 +5020,7 @@ class FastMLXModel:
                         allow_patterns=config_allow_patterns,
                     )
                 )
+                original_local_path = local_path
         except Exception:
             if distributed_requested:
                 raise
@@ -5483,6 +5607,13 @@ class FastMLXModel:
                     stacklevel=2,
                 )
 
+            if local_path:
+                local_path, config_data = _materialize_mlx_vlm_config_override(
+                    local_path,
+                    config_data,
+                    normalize_tokenizer_config=True,
+                )
+
             if patch_mode == "patched":
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
@@ -5616,9 +5747,16 @@ class FastMLXModel:
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
-            model._src_path = local_path
+            model._src_path = original_local_path or local_path
+            # _src_path is the original snapshot (for commit inference); sidecar
+            # saving needs the mlx-vlm patched dir when one was materialized
+            # (e.g. DeepSeek OCR), else saved adapters copy the unpatched
+            # model_type/auto_map the override drops.
+            model._config_src_path = local_path or original_local_path
             model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(
+                original_local_path or local_path
+            )
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
@@ -5733,9 +5871,14 @@ class FastMLXModel:
 
             model._config = config
             model._hf_repo = model_name
-            model._src_path = local_path
+            model._src_path = original_local_path or local_path
+            # Mirror the VLM branch: sidecar-saving uses the patched dir when one
+            # was materialized (no-op for text, where local_path == original).
+            model._config_src_path = local_path or original_local_path
             model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
+            model._unsloth_base_commit_hash = _infer_snapshot_commit(
+                original_local_path or local_path
+            )
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
