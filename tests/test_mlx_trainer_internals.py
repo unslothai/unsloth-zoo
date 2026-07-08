@@ -1315,8 +1315,18 @@ def _make_grpo_trainer_for_rollout(monkeypatch, num_generations, reward_funcs,
     monkeypatch.setattr(mlx_lm, "batch_generate",
                         lambda *a, **k: resp, raising=False)
 
+    class _Model:
+        # Minimal stand-in for an mlx nn.Module: tracks training mode so the
+        # rollout's eval()/train() dropout guard has something to toggle.
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
     trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
-    trainer.model = object()
+    trainer.model = _Model()
     trainer.tokenizer = _Tok()
     trainer.train_dataset = [{"prompt": "hello", "answer": "x"}]
     trainer.reward_funcs = list(reward_funcs)
@@ -1369,6 +1379,50 @@ def test_grpo_rollout_accepts_matching_length_reward_vector(monkeypatch):
     batch, lengths, advantages = next(gen)
     assert batch.shape[0] == 3
     assert advantages.shape[0] == 3
+
+
+def test_grpo_rollout_generates_with_dropout_disabled(monkeypatch):
+    # GRPO rollouts are autoregressive sampling used to score completions. The
+    # training loop puts the model in train() mode before the rollout runs, and
+    # mlx-lm's batch_generate never toggles eval, so LoRA/DoRA dropout would be
+    # active during generation: the sampled tokens (and the log-probs the loss
+    # later scores them with) would come from a randomly masked sub-network,
+    # corrupting the advantages. The rollout must generate in eval() and restore
+    # the prior training mode afterwards.
+    import types
+    import mlx_lm
+
+    class _Model:
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    model = _Model()
+    trainer.model = model
+
+    seen = {}
+
+    def _capture_generate(m, tok, **kwargs):
+        seen["training_during_generate"] = m.training
+        return types.SimpleNamespace(texts=["a", "b"])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _capture_generate, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    next(gen)
+
+    # Dropout must be inert while sampling the rollout ...
+    assert seen["training_during_generate"] is False
+    # ... and the prior training mode must be restored for the grad step.
+    assert model.training is True
 
 
 # ---------------------------------------------------------------------------
@@ -1458,8 +1512,18 @@ def test_grpo_rollout_guards_double_bos_on_chat_prompts(monkeypatch):
     monkeypatch.setattr(mlx_lm, "batch_generate",
                         lambda *a, **k: resp, raising=False)
 
+    class _Model:
+        # Minimal mlx nn.Module stand-in so the rollout dropout guard can toggle
+        # eval()/train() around generation.
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
     trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
-    trainer.model = object()
+    trainer.model = _Model()
     tok = _Tok()
     trainer.tokenizer = tok
     trainer.train_dataset = [

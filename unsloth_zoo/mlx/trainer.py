@@ -3860,10 +3860,26 @@ class MLXGRPOTrainer(MLXTrainer):
             # add_special_tokens when the rendered text already starts with the
             # BOS token); plain-string prompts still get their single BOS.
             pids = encode_mlx_text(hf, rendered)
-            resp = batch_generate(
-                self.model, self.tokenizer, prompts=[pids] * N,
-                max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
-            )
+            # Rollout generation must sample from the deterministic policy, not a
+            # dropout-perturbed one. The training loop has already put the model in
+            # train() mode, so any LoRA/DoRA dropout layers are active, and mlx-lm's
+            # batch_generate never toggles eval. Without this guard the sampled
+            # completions -- and the log-probs the GRPO loss later scores them with
+            # -- would come from a randomly masked sub-network, so the advantages
+            # and the policy gradient would be computed for a different stochastic
+            # policy than the one that generated the tokens. Generate in eval mode
+            # and restore the prior training mode (mirrors _grpo_mean_kl /
+            # _grpo_ref_kl). Dropout=0 models are unaffected (eval is a no-op there).
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                resp = batch_generate(
+                    self.model, self.tokenizer, prompts=[pids] * N,
+                    max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
+                )
+            finally:
+                if was_training:
+                    self.model.train()
             comps = resp.texts
             # rewards: sum across reward functions (TRL-style). Pass through the
             # dataset row's other columns as kwargs (repeated per generation to
