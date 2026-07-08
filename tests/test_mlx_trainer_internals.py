@@ -30,8 +30,31 @@ import torch
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
+    import sys
+    shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+    real_mlx_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+    }
     from mlx_simulation import simulate_mlx_on_torch
+    from mlx_simulation.mlx_stub import _MLXFinder
     simulate_mlx_on_torch()
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
+    yield
+    for name in list(sys.modules):
+        if (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        ):
+            sys.modules.pop(name, None)
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path
+        if not isinstance(finder, _MLXFinder)
+    ]
+    sys.modules.update(real_mlx_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +113,205 @@ def test_mlx_training_config_exposes_completion_only_loss():
     assert _text_completion_only_loss_arg(
         MLXTrainingConfig(train_on_completions=True)
     ) is True
+
+
+def test_mlx_trainer_distributed_defaults_world_size_one():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self): return {}
+
+    trainer = MLXTrainer(DummyModel(), None, [], args=MLXTrainingConfig())
+
+    assert trainer._distributed_initialized is False
+    assert trainer.distributed_rank == 0
+    assert trainer.distributed_world_size == 1
+    assert trainer.is_main_process is True
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 1,
+        "distributed_rank": 0,
+        "distributed_is_main_process": True,
+    }
+
+
+def test_mlx_trainer_distributed_state_uses_cached_group(monkeypatch):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    calls = []
+    def fake_init():
+        calls.append("init")
+        return FakeWorld()
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert calls == ["init"]
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    assert trainer.is_main_process is False
+    assert trainer._distributed_result_fields() == {
+        "distributed_world_size": 2,
+        "distributed_rank": 1,
+        "distributed_is_main_process": False,
+    }
+
+
+@pytest.mark.parametrize("accepts_backend", [True, False])
+def test_mlx_trainer_distributed_state_selects_jaccl_backend(monkeypatch, accepts_backend):
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+
+    calls = []
+    def fake_init(**kwargs):
+        calls.append(kwargs)
+        if kwargs and not accepts_backend:
+            raise TypeError("init() got an unexpected keyword argument 'backend'")
+        return FakeWorld()
+
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", "127.0.0.1:12345")
+    monkeypatch.setenv("MLX_IBV_DEVICES", "/tmp/mlx-devices.json")
+    monkeypatch.setattr(trainer_mod.mx.distributed, "init", fake_init)
+    trainer = trainer_mod.MLXTrainer.__new__(trainer_mod.MLXTrainer)
+
+    assert trainer.distributed_world is trainer.distributed_world
+    assert trainer.distributed_rank == 1
+    assert trainer.distributed_world_size == 2
+    if accepts_backend:
+        assert calls == [{"backend": "jaccl"}]
+    else:
+        assert calls == [{"backend": "jaccl"}, {}]
+
+
+def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
+    import numpy as np
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    # Shortest row has 2 tokens so it survives the sub-two-token filter while
+    # still being padded out to the block length, exercising the pad id path.
+    dataset = [([5, 6], 0), ([7, 8, 9], 0)]
+    np.random.seed(123)
+    expected = np.random.random(3)
+    np.random.seed(123)
+
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert np.random.random(3) == pytest.approx(expected)
+    rows = batches[0][0].tolist()
+    assert rows[0][:2] == [5, 6]
+    assert rows[0][2:] == [99] * (len(rows[0]) - 2)
+
+
+def test_distributed_text_batches_filter_sub_two_token_rows():
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    # The length-1 row (token 5) has no causal target and must be filtered, so
+    # every batch is drawn only from the length-2 row (tokens 6, 7).
+    dataset = [([5], 0), ([6, 7], 0)]
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=3,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert len(batches) == 3
+    for batch in batches:
+        for row in batch[0].tolist():
+            content = [tok for tok in row if tok != 99]
+            assert content == [6, 7]
+
+
+def test_distributed_text_batches_use_token_length_not_cache_itemlen(monkeypatch):
+    # Regression: real mlx_lm CacheDataset.itemlen returns len(raw_row); for the
+    # {"text": ...} rows _prepare_dataset builds that is the dict key count (1),
+    # so an itemlen-based sub-two-token filter would drop every row and raise.
+    # The filter must measure the processed token length instead.
+    import sys
+
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    class CacheDataset:
+        def __init__(self, rows):
+            self._rows = rows
+            self._proc = {}
+
+        def __len__(self):
+            return len(self._rows)
+
+        def itemlen(self, idx):
+            # Matches real mlx_lm: length of the RAW row (dict key count == 1).
+            return len(self._rows[idx])
+
+        def __getitem__(self, idx):
+            if idx not in self._proc:
+                self._proc[idx] = (self._rows[idx]["ids"], 0)
+            return self._proc[idx]
+
+    monkeypatch.setattr(
+        sys.modules["mlx_lm.tuner.datasets"], "CacheDataset", CacheDataset
+    )
+
+    dataset = CacheDataset([{"ids": [5, 6]}, {"ids": [7, 8, 9]}])
+    # itemlen reports 1 for each row; an itemlen-based filter would drop both.
+    assert dataset.itemlen(0) == 1
+
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=2,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert len(batches) == 2
+    content = {
+        tuple(tok for tok in row if tok != 99)
+        for batch in batches
+        for row in batch[0].tolist()
+    }
+    # Rows survived the >=2-token filter (token length, not itemlen).
+    assert (5, 6) in content or (7, 8, 9) in content
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])
@@ -490,6 +712,120 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     assert trainer.model.modes == ["eval", "train"]
 
 
+def test_evaluate_batch_totals_uses_single_eval_status_collective():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._evaluate_batch_totals)
+    assert "_distributed_eval_status" in source
+    assert "_distributed_should_stop" not in source
+    assert "_raise_distributed_failure(" not in source
+
+
+def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):
+    # In DDP each rank only sees its own shard. A rank whose shard happens to be
+    # entirely masked must not raise alone (that would hang peers at the next
+    # collective); the bad/good counts are all-summed first so the raise/warn
+    # decision is global and identical on every rank.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import _check_all_masked
+
+    def fake_all_sum(value, group=None, stream=None):
+        # Simulate a peer rank that contributed trainable (good) rows.
+        return value + mx.array([0, 5], dtype=mx.int32)
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    all_bad = [("ids", None, mx.array([[-100, -100]]))]
+    # Local shard is fully masked, but the global reduction sees good rows, so
+    # no rank raises. (Would raise ZeroDivisionError without the reduction.)
+    _check_all_masked(all_bad, comm_group=object(), world_size=2)
+
+
+def test_check_all_masked_single_process_still_raises_when_all_masked():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import _check_all_masked
+
+    all_bad = [("ids", None, mx.array([[-100, -100]]))]
+    with pytest.raises(ZeroDivisionError):
+        _check_all_masked(all_bad)
+
+
+def test_eval_callback_stop_request_synced_before_best_model_track():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    cb_idx = src.index("for cb in self._eval_callbacks")
+    track_idx = src.index("_track = not self.stop_requested")
+    assert cb_idx < track_idx
+    # A rank-wide stop sync must sit between the rank-0-only eval callbacks and
+    # the divergent best-model / early-stopping branch, else a callback that
+    # sets stop_requested on rank 0 alone makes _track diverge and hangs peers
+    # at the rank-0-guarded best-model save collective.
+    assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
+
+
+def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
+    # VLM mirror of the text-path mask check: a fully-masked local shard must
+    # not raise alone in DDP; counts are all-summed before deciding.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array([0, 5], dtype=mx.int32)
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    all_bad = [{"labels": mx.array([[-100, -100]])}]
+    _check_vlm_all_masked(all_bad, comm_group=object(), world_size=2)
+
+
+def test_check_vlm_all_masked_single_process_still_raises():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    all_bad = [{"labels": mx.array([[-100, -100]])}]
+    with pytest.raises(ZeroDivisionError):
+        _check_vlm_all_masked(all_bad)
+
+
+def test_reset_run_state_clears_last_eval_metrics():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    # A prior run's eval metrics must not leak into a reused trainer that then
+    # runs without eval (eval_steps=0 or no eval dataset).
+    trainer._last_eval_metrics = {"eval_loss": 1.23, "eval_perplexity": 4.5}
+    trainer._reset_run_state()
+    assert trainer._last_eval_metrics == {}
+
+
+def test_distributed_diagnostics_per_rank_tokens_use_local_history():
+    import inspect
+    import re
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._distributed_training_diagnostics)
+    # per_rank_tokens must be gathered from this rank's LOCAL token total, not
+    # the all-reduced global trained_tokens (which would inflate by world_size).
+    m = re.search(
+        r"per_rank_tokens\s*=\s*self\._distributed_rank_vector\(\s*([A-Za-z_]+)",
+        src,
+    )
+    assert m is not None and m.group(1) == "local_trained_tokens"
+    assert "_local_token_count_history" in src
+
+
 def test_reset_run_state_preserves_external_stop_request():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -508,6 +844,28 @@ def test_reset_run_state_preserves_external_stop_request():
     trainer._reset_run_state()
     assert trainer._early_stopped is False
     assert trainer.stop_requested is False
+
+
+def test_reset_run_state_preserves_callbacks_and_batches():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    # Callbacks registered via add_step_callback / add_eval_callback before
+    # train() (and the report_to callbacks set up inside train() before
+    # _train_inner) must survive the per-run reset that _train_inner runs, else
+    # user eval hooks never fire and W&B / TensorBoard logging is dropped.
+    step_cb, eval_cb = object(), object()
+    prebuilt = ["batch"]
+    trainer._batches = prebuilt
+    trainer._step_callbacks = [step_cb]
+    trainer._eval_callbacks = [eval_cb]
+
+    trainer._reset_run_state()
+
+    assert trainer._batches is prebuilt
+    assert trainer._step_callbacks == [step_cb]
+    assert trainer._eval_callbacks == [eval_cb]
 
 
 def test_resolved_best_metric_name_mirrors_hf_lookup():
