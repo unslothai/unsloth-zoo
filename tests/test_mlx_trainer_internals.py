@@ -408,6 +408,46 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
+def test_preference_configs_preserve_explicit_default_warmup_steps():
+    # The preference subclasses (ORPO/DPO/GRPO) must keep MLXTrainingConfig's
+    # custom __init__ so an explicitly-passed warmup_steps that equals the
+    # default (5) is still recorded as explicit and wins over a positive
+    # warmup_ratio (HF get_warmup_steps parity: warmup_steps > 0 overrides the
+    # ratio). A dataclass-generated __init__ would skip
+    # _unsloth_mlx_warmup_steps_explicit and silently switch to the ratio,
+    # changing the LR schedule.
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXORPOConfig,
+        MLXDPOConfig,
+        MLXGRPOConfig,
+    )
+
+    for config_cls in (MLXORPOConfig, MLXDPOConfig, MLXGRPOConfig):
+        cfg = config_cls(
+            learning_rate=5e-5,
+            lr_scheduler_type="linear",
+            warmup_steps=5,
+            warmup_ratio=0.1,
+        )
+        assert cfg._unsloth_mlx_warmup_steps_explicit is True, config_cls.__name__
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = cfg
+        # Explicit warmup_steps=5 must win over the ratio (0.1 * 8 -> 1).
+        assert trainer._resolve_warmup_steps(total_steps=8) == 5, config_cls.__name__
+
+    # The GRPO subclass must still register and honour its extra fields through
+    # the inherited __init__ (init=False keeps them in fields()).
+    grpo = MLXGRPOConfig(num_generations=8, warmup_ratio=0.2)
+    assert grpo.num_generations == 8
+    assert grpo.loss_type == "grpo"
+    assert grpo._unsloth_mlx_warmup_steps_explicit is False
+    # An unset warmup_steps still lets the ratio drive the schedule.
+    grpo_trainer = MLXTrainer.__new__(MLXTrainer)
+    grpo_trainer.args = grpo
+    assert grpo_trainer._resolve_warmup_steps(total_steps=100) == 20
+
+
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 

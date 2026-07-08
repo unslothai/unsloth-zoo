@@ -676,21 +676,28 @@ class MLXTrainingConfig:
         )
 
 
-@dataclass
+# init=False so the subclass keeps MLXTrainingConfig's custom __init__ rather
+# than getting a dataclass-generated one. The base __init__ is the only place
+# that records _unsloth_mlx_warmup_steps_explicit (and does the kwargs coercion
+# / unknown-argument checks); a generated __init__ would skip it and silently
+# treat an explicit warmup_steps that happens to equal the default as implicit,
+# dropping it in favour of warmup_ratio. init=False still registers the new
+# fields below in fields(), which the inherited __init__ iterates over.
+@dataclass(init=False)
 class MLXORPOConfig(MLXTrainingConfig):
     """ORPO config mirroring TRL's ORPOConfig. Presets loss_type='orpo';
     tune orpo_beta (inherited). Use with MLXORPOTrainer."""
     loss_type: str = "orpo"
 
 
-@dataclass
+@dataclass(init=False)
 class MLXDPOConfig(MLXTrainingConfig):
     """DPO config mirroring TRL's DPOConfig. Presets loss_type='dpo';
     tune dpo_beta / reference_free (inherited). Use with MLXDPOTrainer."""
     loss_type: str = "dpo"
 
 
-@dataclass
+@dataclass(init=False)
 class MLXGRPOConfig(MLXTrainingConfig):
     """GRPO config mirroring TRL's GRPOConfig. Presets loss_type='grpo'.
     Use with MLXGRPOTrainer (pass reward_funcs to the trainer)."""
