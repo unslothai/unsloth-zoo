@@ -368,6 +368,11 @@ def _text_completion_only_loss_arg(args):
     return None
 
 
+def _text_assistant_only_loss_arg(args):
+    """Resolve SFT-compatible assistant-only loss setting."""
+    return bool(getattr(args, "assistant_only_loss", False))
+
+
 def _normalize_mlx_optimizer_name(name):
     if hasattr(name, "value"):
         name = name.value
@@ -607,6 +612,7 @@ class MLXTrainingConfig:
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
     completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
+    assistant_only_loss: bool = False  # Mask non-assistant tokens with chat-template assistant masks
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
@@ -2570,6 +2576,7 @@ class MLXTrainer:
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        text_assistant_only_loss = _text_assistant_only_loss_arg(args)
         if args.eval_steps > 0 and self.eval_dataset is not None:
             eval_batch_size = (
                 getattr(args, "per_device_eval_batch_size", None)
@@ -2616,6 +2623,8 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
+                        completion_only_loss=text_completion_only_loss,
+                        assistant_only_loss=text_assistant_only_loss,
                         comm_group=self.distributed_world,
                         distributed_pad_mode="empty",
                     )
@@ -3255,9 +3264,16 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
+        text_assistant_only_loss = _text_assistant_only_loss_arg(args)
         comm_group = self.distributed_world
 
         if is_vlm:
+            if text_assistant_only_loss:
+                raise ValueError(
+                    "Unsloth MLX VLM: assistant_only_loss=True is not supported for "
+                    "vision-language models. Set assistant_only_loss=False, or use "
+                    "train_on_responses_only for response masking."
+                )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
             vlm_dataset_order = (
                 "sequential"
@@ -3333,6 +3349,8 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=text_completion_only_loss,
+                    assistant_only_loss=text_assistant_only_loss,
                     dataset_order=text_dataset_order,
                     comm_group=comm_group,
                 )
@@ -3350,6 +3368,7 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
+                    assistant_only_loss=text_assistant_only_loss,
                     comm_group=comm_group,
                 )
                 if (
@@ -3369,8 +3388,10 @@ class MLXTrainer:
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
                         self._prepared_batches_include_epochs = True
+                    batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = create_ordered_batches(**batch_kwargs)
                 else:
+                    batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = create_batches(**batch_kwargs)
                 return batches, None
 

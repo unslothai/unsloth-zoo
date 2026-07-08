@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import types
 
 import pytest
 import torch
@@ -88,6 +89,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
         "dataset_order",
         "preserve_dataset_order",
         "completion_only_loss",
+        "assistant_only_loss",
     ):
         assert must_have in fields, f"missing field: {must_have}"
     # dataset_text_field follows the eval block; newer eval knobs (eg load_best_model_at_end)
@@ -101,6 +103,7 @@ def test_mlx_training_config_is_dataclass_with_all_fields():
 def test_mlx_training_config_exposes_completion_only_loss():
     from unsloth_zoo.mlx.trainer import (
         MLXTrainingConfig,
+        _text_assistant_only_loss_arg,
         _text_completion_only_loss_arg,
     )
 
@@ -113,6 +116,10 @@ def test_mlx_training_config_exposes_completion_only_loss():
     assert _text_completion_only_loss_arg(
         MLXTrainingConfig(train_on_completions=True)
     ) is True
+    assert _text_assistant_only_loss_arg(
+        MLXTrainingConfig(assistant_only_loss=True)
+    ) is True
+    assert _text_assistant_only_loss_arg(MLXTrainingConfig()) is False
 
 
 def test_mlx_trainer_distributed_defaults_world_size_one():
@@ -612,6 +619,445 @@ def test_encode_mlx_text_keeps_raw_text_bos_when_template_has_bos():
     assert tokenizer.add_special_tokens_seen == [True, False]
 
 
+def _make_mlx_text_trainer(**config_kwargs):
+    """Build the smallest MLXTrainer shell needed for data-routing tests."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    class Tokenizer:
+        chat_template = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2]
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(**config_kwargs)
+    trainer.model = types.SimpleNamespace(_config={})
+    trainer.tokenizer = Tokenizer()
+    trainer.train_dataset = []
+    trainer.formatting_func = None
+    trainer._batches = None
+    return MLXTrainer, trainer
+
+
+def test_text_prompt_completion_create_batches_masks_prompt_labels_and_eos():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=99,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+
+    batch, _, labels = create_batches(
+        dataset=[{"prompt": "1 2", "completion": " 3 4"}],
+        tokenizer=tokenizer,
+        batch_size=1,
+        max_seq_length=8,
+        seed=0,
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3, 4, 99]]
+    assert labels.tolist() == [[-100, -100, 3, 4, 99]]
+
+
+def test_text_conversational_prompt_completion_uses_generation_boundary():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    class BatchEncoding(dict): pass
+
+    class Tokenizer:
+        chat_template = "{{ messages }}"
+        eos_token_id = 99
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            return_dict=False,
+            tools=None,
+            extra_token=0,
+        ):
+            ids = ([30] if tools else []) + ([extra_token] if extra_token else [])
+            for message in messages:
+                ids.append(10 if message["role"] == "user" else 20)
+                ids.extend(int(part) for part in message["content"].split())
+            if add_generation_prompt:
+                ids.append(20)
+            return BatchEncoding(input_ids=ids) if return_dict else ids
+
+    batch, _, labels = create_batches(
+        dataset=[
+            {
+                "prompt": [{"role": "user", "content": "1 2"}],
+                "completion": [{"role": "assistant", "content": "3 4"}],
+                "tools": [{"type": "function"}],
+                "chat_template_kwargs": {"extra_token": 5},
+            }
+        ],
+        tokenizer=Tokenizer(),
+        batch_size=1,
+        max_seq_length=10,
+        seed=0,
+        append_eos=False,
+    )[0]
+
+    assert batch.tolist() == [[30, 5, 10, 1, 2, 20, 3, 4]]
+    assert labels.tolist() == [[-100, -100, -100, -100, -100, -100, 3, 4]]
+
+
+class _AssistantMaskTokenizer:
+    chat_template = "{{ messages }}"
+    eos_token_id = None
+    pad_token_id = 7
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        return_dict=False,
+        return_assistant_tokens_mask=False,
+        tools=None,
+        add_generation_prompt=False,
+        **_kwargs,
+    ):
+        ids = []
+        masks = []
+        if tools:
+            ids.append(30)
+            masks.append(0)
+        for message in messages:
+            is_assistant = message["role"] == "assistant"
+            ids.append(20 if is_assistant else 10)
+            masks.append(0)
+            ids.extend(int(part) for part in message["content"].split())
+            masks.extend([1 if is_assistant else 0] * len(message["content"].split()))
+        output = {"input_ids": ids}
+        if return_assistant_tokens_mask:
+            output["assistant_masks"] = masks
+        return output if return_dict else ids
+
+
+class _NoAssistantMaskTokenizer(_AssistantMaskTokenizer):
+    def apply_chat_template(self, *args, **kwargs):
+        kwargs["return_assistant_tokens_mask"] = False
+        return super().apply_chat_template(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "extra_kwargs"),
+    [
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2 3"},
+                    ],
+                }
+            ],
+            {},
+        ),
+        (
+            [
+                {
+                    "prompt": [{"role": "user", "content": "1"}],
+                    "completion": [{"role": "assistant", "content": "2 3"}],
+                }
+            ],
+            {"append_eos": False},
+        ),
+    ],
+)
+def test_text_assistant_only_loss_masks_non_assistant_tokens(dataset, extra_kwargs):
+    from unsloth_zoo.mlx.utils import create_batches
+
+    batch, _, labels = create_batches(
+        dataset=dataset,
+        tokenizer=_AssistantMaskTokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        assistant_only_loss=True,
+        completion_only_loss=False,
+        **extra_kwargs,
+    )[0]
+
+    assert batch.tolist() == [[10, 1, 20, 2, 3]]
+    assert labels.tolist() == [[-100, -100, -100, 2, 3]]
+
+
+@pytest.mark.parametrize(
+    ("dataset", "tokenizer", "match"),
+    [
+        ([{"prompt": "Question: ", "completion": "Answer"}], _AssistantMaskTokenizer(), "not conversational"),
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                },
+                {"text": "plain text"},
+            ],
+            _AssistantMaskTokenizer(),
+            "not conversational",
+        ),
+        (
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "1"},
+                        {"role": "assistant", "content": "2"},
+                    ],
+                }
+            ],
+            _NoAssistantMaskTokenizer(),
+            "no assistant tokens",
+        ),
+        ([{"input_ids": [1, 2, 3]}], types.SimpleNamespace(), "assistant_masks"),
+    ],
+)
+def test_text_assistant_only_loss_rejects_unsupported_inputs(dataset, tokenizer, match):
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        create_batches(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            batch_size=1,
+            max_seq_length=8,
+            assistant_only_loss=True,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_assistant_masks_build_labels():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    _, _, labels = create_batches(
+        dataset=[
+            {
+                "input_ids": [1, 2, 3, 4],
+                "assistant_masks": [0, 1, 0, 1],
+            }
+        ],
+        tokenizer=types.SimpleNamespace(),
+        batch_size=1,
+        max_seq_length=8,
+        assistant_only_loss=True,
+        completion_only_loss=False,
+    )[0]
+
+    assert labels.tolist() == [[-100, 2, -100, 4]]
+
+
+def test_text_completion_probe_keeps_one_shot_iterables_reusable():
+    from unsloth_zoo.mlx.utils import _ensure_reiterable_text_dataset
+    def rows():
+        yield {"text": "1 2"}
+
+    dataset = _ensure_reiterable_text_dataset(rows())
+    assert list(dataset) == [{"text": "1 2"}]
+    assert list(dataset) == [{"text": "1 2"}]
+
+
+def test_text_pretokenized_create_batches_preserves_input_ids():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    def formatting_func(_item):
+        raise AssertionError("formatting_func should be ignored for input_ids rows")
+
+    tokenizer = types.SimpleNamespace(
+        pad_token_id=9,
+        encode=lambda *_args, **_kwargs: pytest.fail("should not tokenize input_ids")
+    )
+
+    batch, lengths, labels = create_batches(
+        dataset=[
+            {"input_ids": [1, 2, 3]},
+            {"input_ids": [4, 5]},
+        ],
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=8,
+        completion_only_loss=False,
+        formatting_func=formatting_func,
+    )[0]
+
+    assert batch.tolist() == [[4, 5, 9], [1, 2, 3]]
+    assert lengths.tolist() == [[0, 2], [0, 3]]
+    assert labels is None
+
+
+def test_text_pretokenized_rejects_mixed_raw_rows():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises(ValueError, match="cannot be mixed"):
+        create_batches(
+            dataset=[
+                {"input_ids": [1, 2, 3]},
+                {"text": "4 5 6"},
+            ],
+            tokenizer=types.SimpleNamespace(),
+            batch_size=1,
+            max_seq_length=8,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_rejects_mixed_label_presence():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    with pytest.raises(ValueError, match="must not be mixed"):
+        create_batches(
+            dataset=[
+                {"input_ids": [1, 2, 3]},
+                {"input_ids": [4, 5, 6], "labels": [-100, 5, 6]},
+            ],
+            tokenizer=types.SimpleNamespace(),
+            batch_size=2,
+            max_seq_length=8,
+            completion_only_loss=False,
+        )
+
+
+def test_text_pretokenized_completion_mask_requires_completion_only_loss():
+    from unsloth_zoo.mlx.utils import create_batches
+
+    tokenizer = types.SimpleNamespace()
+    kwargs = dict(tokenizer=tokenizer, batch_size=1, max_seq_length=8)
+    row = {
+        "input_ids": [1, 2, 3, 4],
+        "labels": [11, 12, 13, 14],
+        "completion_mask": [0, 1, 0, 1],
+    }
+
+    _, _, default_labels = create_batches(dataset=[row], **kwargs)[0]
+    batch, _, masked_labels = create_batches(
+        dataset=[row],
+        completion_only_loss=True,
+        **kwargs,
+    )[0]
+
+    assert batch.tolist() == [[1, 2, 3, 4]]
+    assert default_labels.tolist() == [[11, 12, 13, 14]]
+    assert masked_labels.tolist() == [[-100, 12, -100, 14]]
+
+
+def test_text_pretokenized_ordered_and_streaming_batches_emit_labels():
+    from unsloth_zoo.mlx.utils import create_ordered_batches, iterate_training_batches
+
+    tokenizer = types.SimpleNamespace(pad_token_id=7)
+    dataset = [
+        {"input_ids": [1, 2], "labels": [-100, 2]},
+        {"input_ids": [3, 4, 5], "labels": [-100, 4, 5]},
+    ]
+
+    batches = [
+        create_ordered_batches(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            batch_size=2,
+            max_seq_length=8,
+            dataset_order="sequential",
+        )[0],
+        next(
+            iterate_training_batches(
+                dataset=dataset,
+                tokenizer=tokenizer,
+                batch_size=2,
+                max_seq_length=8,
+                seed=0,
+            )
+        ),
+    ]
+
+    for batch, _, labels in batches:
+        assert batch.tolist() == [[1, 2, 7], [3, 4, 5]]
+        assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+
+def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeypatch):
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+
+    received = {}
+
+    def fake_create_batches(**kwargs):
+        received.update(kwargs)
+        return [("batch", "lengths", "labels")]
+
+    monkeypatch.setattr(mlx_trainer, "create_batches", fake_create_batches)
+
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        assistant_only_loss=True,
+    )
+    batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches == [("batch", "lengths", "labels")]
+    assert received["completion_only_loss"] is True
+    assert received["assistant_only_loss"] is True
+
+
+def test_text_prepare_data_ordered_batches_emit_completion_only_labels():
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        dataset_order="sequential",
+        per_device_train_batch_size=2,
+    )
+    trainer.tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        pad_token_id=7,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+    trainer.train_dataset = [
+        {"prompt": "1", "completion": " 2"},
+        {"prompt": "3", "completion": " 4 5"},
+    ]
+    batches, _ = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    batch, _, labels = batches[0]
+    assert batch.tolist() == [[1, 2, 7], [3, 4, 5]]
+    assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+
+def test_text_prepare_data_streaming_batches_emit_completion_only_labels():
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=1,
+        completion_only_loss=True,
+        streaming=True,
+        per_device_train_batch_size=2,
+    )
+    trainer.tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+    trainer.train_dataset = [
+        {"prompt": "1", "completion": " 2"},
+        {"prompt": "3", "completion": " 4 5"},
+    ]
+
+    batches, batch_iter = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches is None
+    batch, _, labels = next(batch_iter)
+    assert batch.tolist() == [[1, 2, 0], [3, 4, 5]]
+    assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
+
+    trainer.train_dataset = [{"text": "1 2"}, {"text": "3 4"}]
+    with pytest.raises(ValueError, match="completion_only_loss=True"):
+        next(MLXTrainer._prepare_data(trainer, is_vlm=False)[1])
+
+
 def test_mlx_text_loss_masks_exclude_position_at_sequence_length():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
@@ -671,7 +1117,11 @@ def test_vlm_eval_batches_define_completion_only_loss_before_use():
     source = inspect.getsource(MLXTrainer._train_inner)
     definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
     eval_use = source.index("completion_only_loss=text_completion_only_loss")
+    text_eval_start = source.index("return create_batches(")
+    text_eval_end = source.index("if isinstance(self.eval_dataset, dict)")
+    text_eval_block = source[text_eval_start:text_eval_end]
     assert definition < eval_use
+    assert "completion_only_loss=text_completion_only_loss" in text_eval_block
 
 
 def test_evaluate_dict_eval_datasets_records_split_metrics():
