@@ -926,6 +926,10 @@ class MLXTrainer:
         self._step_times = []
         self._local_token_count_history = []
         self._global_token_count_history = []
+        # Per-run eval metrics: cleared so a reused trainer that runs without
+        # eval (eval_steps=0 or no eval dataset) does not report a prior run's
+        # eval_loss/perplexity in its result. Repopulated by _evaluate.
+        self._last_eval_metrics = {}
         self._early_stopped = False
         self._best_metric = None
         self._best_step = None
@@ -1096,8 +1100,15 @@ class MLXTrainer:
         peak_memory = mx.get_peak_memory() / 1e9
         per_rank_peak_memory = self._distributed_rank_vector(peak_memory)
         per_rank_runtime = self._distributed_rank_vector(total_time)
+        # trained_tokens is the all-reduced global total, so gathering it would
+        # report the same world_size-inflated figure for every rank. Use this
+        # rank's local accumulated tokens (same logging cadence) so the
+        # per-rank field reflects true per-rank work.
+        local_trained_tokens = int(
+            sum(getattr(self, "_local_token_count_history", []))
+        )
         per_rank_tokens = self._distributed_rank_vector(
-            trained_tokens, as_int=True,
+            local_trained_tokens, as_int=True,
         )
         host_rank_map = [
             {
@@ -3464,7 +3475,11 @@ class MLXTrainer:
                     comm_group=comm_group,
                 )
                 if _vlm_mask_fn is not None and batches:
-                    _check_vlm_all_masked(batches)
+                    _check_vlm_all_masked(
+                        batches,
+                        comm_group=comm_group,
+                        world_size=self.distributed_world_size,
+                    )
                 return batches, None
         else:
             chat_tmpl = getattr(args, "chat_template", None)
@@ -3931,8 +3946,13 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
         )
 
 
-def _check_vlm_all_masked(batches, max_check=100):
-    """_check_all_masked for VLM batch dicts (a "labels" key, not a 3-tuple)."""
+def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1):
+    """_check_all_masked for VLM batch dicts (a "labels" key, not a 3-tuple).
+
+    As in the text path, in DDP ``batches`` is only this rank's shard, so the
+    per-rank bad/good counts are all-summed before deciding. Otherwise a rank
+    whose shard is entirely masked would raise ZeroDivisionError alone while
+    peers advance to the first collective and hang."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -3952,6 +3972,16 @@ def _check_vlm_all_masked(batches, max_check=100):
                 break
         if checked >= max_check:
             break
+
+    # Reduce across ranks before deciding so every rank raises/warns together
+    # (all ranks reach this collective; the early return below is post-reduce).
+    if comm_group is not None and world_size > 1:
+        counts = mx.distributed.all_sum(
+            mx.array([seen_bad, seen_good], dtype=mx.int32),
+            group=comm_group, stream=mx.cpu,
+        )
+        mx.eval(counts)
+        seen_bad, seen_good = int(counts[0].item()), int(counts[1].item())
 
     if seen_bad == 0 and seen_good == 0:
         return

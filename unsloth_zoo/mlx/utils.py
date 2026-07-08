@@ -3829,16 +3829,17 @@ def _create_distributed_text_batches(
     tokenizer=None,
 ):
     """Distributed variant of mlx-lm's length-sorted text batch iterator."""
-    from mlx_lm.tuner.datasets import CacheDataset
-
-    if isinstance(dataset, CacheDataset):
-        len_fn = lambda idx: dataset.itemlen(idx)
-    else:
-        len_fn = lambda idx: len(dataset[idx][0])
-    # Mirror _iter_tokenized_text_rows and drop rows with fewer than two tokens
-    # (no causal target). Length sorting places these shortest rows first, so
-    # without this filter an all-short first global microbatch would sum to zero
-    # supervised tokens and trip the zero-supervised-token abort in trainer.py.
+    # Length is measured on the tokenized row. CacheDataset.itemlen returns
+    # len(raw_row), which for the {"text": ...} rows _prepare_dataset produces
+    # is the dict key count (1), not the token count, so it cannot gate the
+    # two-token minimum below. Reading dataset[idx][0] yields the processed
+    # token ids (mirroring _iter_tokenized_text_rows) and caches the processed
+    # row on the CacheDataset, so the batch build below reuses it.
+    len_fn = lambda idx: len(dataset[idx][0])
+    # Drop rows with fewer than two tokens (no causal target). Length sorting
+    # places these shortest rows first, so without this filter an all-short
+    # first global microbatch would sum to zero supervised tokens and trip the
+    # zero-supervised-token abort in trainer.py.
     idx = sorted((i for i in range(len(dataset)) if len_fn(i) >= 2), key=len_fn)
     if not idx:
         raise ValueError(
