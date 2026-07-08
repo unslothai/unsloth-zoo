@@ -234,7 +234,7 @@ def _tools_for_choice(tools, tool_choice):
 async def chat(req: Request):
     body = await req.json()
     messages = body.get("messages", [])
-    # forwarded to the visual server (rendered once the binary reads it)
+    # forwarded to the visual server, honoring tool_choice
     tools = _tools_for_choice(body.get("tools"), body.get("tool_choice"))
     stream = bool(body.get("stream", False))
     max_blocks = _max_blocks(body)
