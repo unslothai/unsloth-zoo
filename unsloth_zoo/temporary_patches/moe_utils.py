@@ -1185,6 +1185,72 @@ def patch_param_wrapper_for_moe():
         return False
 
 
+# Gate gradient via the inner-product identity dGate = <A, dA> / gate, instead of
+# <dOut, Y> which pins the down-projection output Y on the tape solely for that
+# gradient. Output unchanged; on by default to save memory. The runtime gate below
+# still auto-disables it for fp16, down-bias models and frozen routers. Set
+# UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
+
+
+@lru_cache(maxsize=1)
+def _moe_gategrad_enabled() -> bool:
+    """Whether the MoE gate-gradient identity path is active (on by default).
+
+    Cached with maxsize=1 since UNSLOTH_MOE_GATEGRAD is read once per process. Any
+    code or test that toggles the env var at runtime must call
+    _moe_gategrad_enabled.cache_clear() afterwards for the change to take effect.
+    """
+    return os.environ.get("UNSLOTH_MOE_GATEGRAD", "1") != "0"
+
+
+class _MoEGateGradIdentity(torch.autograd.Function):
+    """Identity over the pre-down activation ``inter``; backward derives the gate
+    gradient as ``dGate = <inter, dA> / gate`` instead of ``<dOut, Y>``.
+
+    The incoming dA equals ``gate * (dOut @ W2_eff.T)`` for the effective down
+    weight (base + LoRA), so ``<inter, dA> / gate`` is exactly ``<Y, dOut>``
+    without ever materialising Y for the gradient. The caller passes a
+    sign-floored gate and multiplies Y by that same value, so the identity holds
+    for any routing weight, including exact zeros. Exact for any linear down
+    projection; NOT valid with a post-matmul down bias, so callers must
+    disable it when one is present.
+    """
+
+    @staticmethod
+    def forward(ctx, inter, permuted_weights):
+        ctx.save_for_backward(inter, permuted_weights)
+        return inter
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_inter):
+        # once_differentiable: the reconstruction is first-order exact but its
+        # graph is not the original one, so create_graph must raise, not
+        # silently return wrong second derivatives.
+        # grad_inter is None when nothing downstream needs inter's gradient
+        # (e.g. a frozen down projection); there is nothing to propagate then.
+        if grad_inter is None:
+            return None, None
+        inter, gate = ctx.saved_tensors
+        grad_gate = None
+        # Skip the gate gradient when the routing weight is frozen (e.g. a frozen
+        # router under LoRA), where its gradient is never consumed.
+        if ctx.needs_input_grad[1]:
+            dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
+            # The call site multiplies Y by this same sign-floored gate, so the
+            # floor cancels exactly and the quotient equals <Y, dOut> for any
+            # gate, including exact zeros. The re-clamp is a no-op for the safe
+            # gate passed by forward_native_grouped_mm; it only protects direct
+            # callers from dividing by a raw zero.
+            gate_f = gate.to(torch.float32)
+            safe_gate = torch.where(
+                gate_f >= 0, gate_f.clamp_min(1e-12), gate_f.clamp_max(-1e-12)
+            )
+            grad_gate = (dgate / safe_gate).to(gate.dtype)
+        # inter passes through unchanged, so its gradient is grad_inter.
+        return grad_inter, grad_gate
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -1359,6 +1425,42 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
+    # Env-gated gate-grad identity; disabled when a down bias exists (identity
+    # assumes a linear down), the router is frozen (nothing to synthesize, and
+    # the Function would needlessly keep inter saved), or inter is float16. For
+    # fp16, the gradient into the identity carries the tiny floored gate as a
+    # factor (grad_inter = gate * (W2 @ dOut)); with a near-zero gate that product
+    # underflows fp16 to 0 before backward runs, dropping the router gradient for
+    # near-zero routes. fp16 therefore keeps the standard multiply (correct
+    # gradient, saves Y); bf16/fp32 hold the tiny value and are unaffected.
+    _gategrad = (
+        _moe_gategrad_enabled()
+        and getattr(self, "down_proj_bias", None) is None
+        and top_k_weights.requires_grad
+        and inter.dtype != torch.float16
+    )
+    permuted_weights = None
+    if _gategrad:
+        raw_weights = top_k_weights.reshape(-1)[sorted_indices]
+        # Sign-floor the gate away from zero (straight-through, so the synthesized
+        # gradient still reaches top_k_weights). The multiply below and the
+        # identity's divide use the SAME floored value, so they cancel exactly and
+        # the gate gradient <Y, dOut> survives even a routing weight of exactly
+        # zero. An fp16 gate cannot represent eps=1e-12 (its smallest normal is
+        # ~6e-5), so upcast it to float32; inter is non-fp16 here, so the floored
+        # value survives in grad_inter. The forward then changes by at most
+        # 1e-12 * |Y| for |gate| < 1e-12.
+        if raw_weights.dtype == torch.float16:
+            raw_weights = raw_weights.to(torch.float32)
+        eps = 1e-12
+        floored = torch.where(
+            raw_weights >= 0,
+            raw_weights.clamp(min=eps),
+            raw_weights.clamp(max=-eps),
+        )
+        permuted_weights = raw_weights + (floored - raw_weights).detach()
+        inter = _MoEGateGradIdentity.apply(inter, permuted_weights)
+
     # Down projection with optional separated LoRA (default).
     down_lora = None
 
@@ -1435,9 +1537,13 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
     # Apply routing weights and scatter-add (reduce).
-    flat_weights = top_k_weights.view(-1)
-    permuted_weights = flat_weights[sorted_indices]
-    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+    if _gategrad:
+        # Gate grad comes from the identity; detach so the multiply does not pin Y.
+        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+    else:
+        flat_weights = top_k_weights.reshape(-1)
+        permuted_weights = flat_weights[sorted_indices]
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
     final_hidden_states = torch.zeros(
         (batch_size * sequence_length, hidden_dim),

@@ -360,7 +360,11 @@ def assert_same_keys(model, new_state_dict):
     (base_layer, modules_to_save, original_module) and LoRA suffixes so they
     don't trigger false mismatches.
     """
-    inner_model = model.base_model.model if hasattr(model, "base_model") else model
+    # Resolve the base model the same way create_lora_statistics built new_state_dict
+    # (find_lora_base_model, below). The shared helper guards each level, so a PEFT base
+    # whose base_model has no ".model" (e.g. Phi-3 / Phi-4-mini) no longer raises here, and
+    # the key comparison stays like-for-like. (#95)
+    inner_model = find_lora_base_model(model)
 
     def _should_ignore(key: str) -> bool:
         # Ignore helper wrappers and raw LoRA adapter tensors; the merged
@@ -2021,6 +2025,16 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 if scales_key not in safetensor_keys:
                     warnings.warn(f"Found mxfp4 tensor {key} but missing its scales tensor {scales_key}. Skipping.")
                     continue
+
+                # Refuse DoRA on packed MoE experts BEFORE the dequant below. GPT-OSS
+                # gate_up_proj/down_proj experts take this packed path (not the dense
+                # _merge_moe_*_expert helpers), and for a use_dora adapter the dequant +
+                # _merge_lora would otherwise fail with an opaque 3D shape error instead of
+                # the clear refuse. Mirrors the dense helpers' guard; the late call below is
+                # now unreachable for DoRA but kept as a defensive backstop.
+                _mxfp4_lora_stats = converted_lora_weights.get(base_name, None)
+                if _mxfp4_lora_stats is not None and getattr(_mxfp4_lora_stats, "lora_A", None) is not None:
+                    _refuse_dora_on_moe(_mxfp4_lora_stats)
 
                 blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 

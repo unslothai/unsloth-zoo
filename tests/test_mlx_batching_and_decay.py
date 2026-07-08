@@ -145,6 +145,18 @@ def test_ordered_text_batches_raise_clear_error_when_all_rows_drop():
         )
 
 
+def test_ordered_streaming_batches_drop_one_token_rows():
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    stream = ({"text": text} for text in ["1", "2 3"])
+    batch, lengths, _labels = next(iterate_training_batches(
+        stream, _TinyTokenizer(), 1, 4,
+        dataset_order="sequential", append_eos=False,
+    ))
+
+    assert (batch.tolist()[0][:2], lengths.tolist()[0]) == ([2, 3], [0, 2])
+
+
 def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_ordered_batches
@@ -215,6 +227,10 @@ def test_norm_output_cast_discovers_custom_norms_from_loaded_model():
     fastvlm_vision = pytest.importorskip("mlx_vlm.models.fastvlm.vision")
     import unsloth_zoo.mlx.trainer as trainer_mod
 
+    class StableScale(nn.RMSNorm):
+        def __call__(self, x):
+            return x.astype(mx.float32)
+
     class TinyModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -223,6 +239,7 @@ def test_norm_output_cast_discovers_custom_norms_from_loaded_model():
                 head_dim=4, num_heads=2, eps=1e-5
             )
             self.norm = fastvlm_vision.LayerNormChannel(num_features=4)
+            self.scale = StableScale(4)
 
     trainer_mod._set_norm_output_cast_to_input_dtype(False)
     model = TinyModel()
@@ -236,6 +253,7 @@ def test_norm_output_cast_discovers_custom_norms_from_loaded_model():
             model.norm,
             mx.ones((1, 2, 2, 4), dtype=mx.bfloat16),
         ),
+        (model.scale, mx.ones((2, 4), dtype=mx.bfloat16)),
     ]
 
     norm_classes = trainer_mod._iter_norm_output_cast_classes(model)
@@ -257,6 +275,7 @@ def test_norm_output_cast_does_not_double_patch_inherited_norm_call():
     _skip_if_mlx_core_was_replaced()
     import mlx.nn as nn
     import unsloth_zoo.mlx.trainer as trainer_mod
+    import unsloth_zoo.mlx.utils as utils_mod
 
     class CustomRMSNorm(nn.RMSNorm):
         pass
@@ -272,14 +291,23 @@ def test_norm_output_cast_does_not_double_patch_inherited_norm_call():
 
     try:
         trainer_mod._set_norm_output_cast_to_input_dtype(True, model)
-        assert nn.RMSNorm in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
-        assert CustomRMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+        patched_classes = utils_mod.mlx_norm_output_cast_patched_classes()
+        assert nn.RMSNorm in patched_classes
+        assert CustomRMSNorm not in patched_classes
         assert model.input_layernorm(x).dtype == x.dtype
+
+        state = utils_mod.snapshot_mlx_norm_output_cast_state(
+            trainer_mod._iter_norm_output_cast_classes(model)
+        )
+        trainer_mod._set_norm_output_cast_to_input_dtype(False, model)
+        utils_mod.restore_mlx_norm_output_cast_state(state)
+        assert "__call__" not in CustomRMSNorm.__dict__
     finally:
         trainer_mod._set_norm_output_cast_to_input_dtype(False)
 
-    assert nn.RMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
-    assert CustomRMSNorm not in trainer_mod._NORM_OUTPUT_CAST_PATCHED_CLASSES
+    patched_classes = utils_mod.mlx_norm_output_cast_patched_classes()
+    assert nn.RMSNorm not in patched_classes
+    assert CustomRMSNorm not in patched_classes
     assert not getattr(
         CustomRMSNorm.__call__,
         "_unsloth_norm_output_cast_wrapper",

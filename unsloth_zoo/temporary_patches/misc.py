@@ -105,6 +105,7 @@ def patch_tokenizer_extra_special_tokens():
             return original_init(*args, **kwargs)
 
     patched_init._unsloth_extra_special_tokens_patched = True
+    patched_init._unsloth_original_init = original_init
     PreTrainedTokenizerBase.__init__ = patched_init
 pass
 TEMPORARY_PATCHES.append(patch_tokenizer_extra_special_tokens)
