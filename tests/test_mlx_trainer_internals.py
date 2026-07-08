@@ -2297,3 +2297,195 @@ def test_init_callback_state_seeds_best_from_restored_resume_state():
     # A genuine improvement still updates it.
     resumed._update_callback_best_metric({"eval_loss": 0.3})
     assert resumed.state.best_metric == 0.3
+
+
+def test_run_best_tracking_not_skipped_by_callback_stop():
+    # Regression for "Defer callback stop until after best tracking". HF's
+    # _maybe_log_save_evaluate runs _determine_best_metric and writes the
+    # checkpoint for the current step BEFORE the loop honors should_training_stop,
+    # so a callback that requests a stop on on_step_end / on_evaluate must not
+    # skip the best-model save for this step's (valid, possibly improving) eval.
+    # _run_eval must therefore NOT copy the callback stop into stop_requested
+    # before _run_best_tracking (whose _track guard is `not self.stop_requested`);
+    # only an external cancel is OR-reduced there, and the callback stop is
+    # applied by the caller's tail _sync_stop().
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    eval_def = src.index("def _run_eval(current_step):")
+    eval_body = src[eval_def:src.index("def _run_best_tracking(", eval_def)]
+
+    # Strip comments so the prose describing the deferral is not mistaken for the
+    # code that performs it.
+    code = "\n".join(
+        line for line in eval_body.splitlines()
+        if not line.strip().startswith("#")
+    )
+    # The callback stop must NOT be latched inside _run_eval (it would make
+    # _run_best_tracking skip a valid eval's best-model save).
+    assert "_sync_callback_stop()" not in code
+    # An external cancel is still OR-reduced before the divergent best-model
+    # branch so peers do not hang at the rank-0-guarded best save collective.
+    assert "self._distributed_should_stop()" in code
+
+    # The main loop applies the deferred callback stop only after best tracking
+    # and the same-step save (the loop-tail _sync_stop()).
+    best_call = src.index("_run_best_tracking(current_step)", src.index("if should_eval:"))
+    tail_stop = src.index("if _sync_stop():", best_call)
+    assert tail_stop > best_call
+
+
+def test_run_best_tracking_runs_after_callback_stop_ddp(monkeypatch):
+    # world_size == 2 lockstep: a callback stop deferred past best tracking still
+    # leaves _track rank-consistent (every rank reads the same stop_requested,
+    # which reflects only external cancels), so the rank-0-guarded best-model save
+    # in _run_best_tracking never diverges. Model the two ranks independently.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
+
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    def make_trainer(rank, external_stop=False):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        t.stop_requested = external_stop
+        t.control = _MLXTrainerControl()
+        return t
+
+    # Rank 0's on_evaluate requested a stop but the eval was valid; no external
+    # cancel is pending on either rank. The end-of-_run_eval OR-reduce sees only
+    # external stops (none), so stop_requested stays False and _track proceeds.
+    rank0 = make_trainer(rank=0)
+    rank0.control.should_training_stop = True
+    peer["value"] = 0
+    rank0._distributed_should_stop()
+    assert rank0.stop_requested is False  # callback stop NOT latched -> best runs
+
+    rank1 = make_trainer(rank=1)
+    peer["value"] = 0
+    rank1._distributed_should_stop()
+    assert rank1.stop_requested is False  # peer agrees: best tracking runs on both
+
+    # A genuine external cancel on rank 0 mid-eval still OR-reduces onto the peer
+    # so _track is skipped in lockstep (a garbage aborted eval is never "best").
+    rank0c = make_trainer(rank=0, external_stop=True)
+    peer["value"] = 0
+    assert rank0c._distributed_should_stop() is True
+    rank1c = make_trainer(rank=1)
+    peer["value"] = 1  # rank 0 contributes its external cancel into the OR
+    assert rank1c._distributed_should_stop() is True
+    assert rank1c.stop_requested is True
+
+
+def test_on_save_fires_only_after_checkpoint_written():
+    # Regression for "Fire on_save only after writing a checkpoint". HF calls
+    # callback_handler.on_save only after _save_checkpoint writes to disk. Here
+    # save_trainable_adapters raises ValueError for a fully frozen / no-adapter
+    # model and the write is skipped; firing on_save anyway makes integrations
+    # (hub uploaders, checkpoint trackers) record a checkpoint-N that never
+    # existed. on_save must be gated on the actual write, broadcast from rank 0.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    ckpt_def = src.index("def _run_checkpoint(current_step):")
+    ckpt_body = src[ckpt_def:src.index(
+        "def _run_callback_control_actions(", ckpt_def)]
+
+    # The write outcome is tracked and only set after save_trainable_adapters
+    # succeeds (inside the try/except-ValueError else branch).
+    assert "checkpoint_written = False" in ckpt_body
+    assert "checkpoint_written = True" in ckpt_body
+    # on_save is dispatched only under the written guard, not unconditionally...
+    guard = ckpt_body.index("if checkpoint_written_any:")
+    assert guard < ckpt_body.index('_fire("on_save")')
+    # ...and the rank-0-only write outcome is broadcast so every rank fires (or
+    # skips) on_save together, or the skipping rank strands peers at the _fire
+    # consensus collective.
+    assert "_distributed_status_mask" in ckpt_body
+
+
+def test_on_save_skip_broadcasts_to_peer_ddp(monkeypatch):
+    # world_size == 2: when rank 0 skipped the checkpoint write (no trainable
+    # adapter), the broadcast written flag is 0 on every rank, so no rank fires
+    # on_save alone; when rank 0 wrote, the flag reaches the peer so both fire.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    def make_trainer(rank):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        return t
+
+    # Rank 0 skipped the write; both ranks contribute 0 -> neither fires on_save.
+    rank0 = make_trainer(0)
+    peer["value"] = 0
+    assert (rank0._distributed_status_mask(0) > 0) is False
+    rank1 = make_trainer(1)
+    peer["value"] = 0  # rank 0 also contributed 0
+    assert (rank1._distributed_status_mask(0) > 0) is False
+
+    # Rank 0 wrote a checkpoint; the flag broadcasts to the peer so both fire.
+    rank0w = make_trainer(0)
+    peer["value"] = 0
+    assert (rank0w._distributed_status_mask(1) > 0) is True
+    rank1w = make_trainer(1)
+    peer["value"] = 1  # rank 0 contributes its written flag into the reduction
+    assert (rank1w._distributed_status_mask(0) > 0) is True
+
+
+def test_epoch_end_fires_on_substep_boundary():
+    # Regression for "Fire epoch-end callbacks before substep continue". When
+    # batches-per-epoch is not a multiple of grad_accum, the epoch-boundary
+    # microstep is a non-update (substep). The substep branch must fire
+    # on_epoch_end (via _maybe_callback_epoch_end) before `continue`, or the
+    # event and any log/eval/save/stop it requests are dropped for that epoch.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    substep = src.index("if not do_update:")
+    branch = src[substep:src.index("continue", substep)]
+    assert '_fire("on_substep_end")' in branch
+    assert "_maybe_callback_epoch_end(" in branch
+
+
+def test_epoch_boundary_can_land_on_substep():
+    # Prove the boundary is reachable on a non-update microstep: replicate the
+    # loop's accumulation cadence for grad_accum=2, batches_per_epoch=3. The
+    # microstep at the epoch boundary (it % batches_per_epoch == 0) is a substep,
+    # so on_epoch_end would be dropped without the substep-branch dispatch.
+    grad_accum = 2
+    batches_per_epoch = 3
+    accum_progress = 0
+    boundary_is_update = None
+    for it in range(1, batches_per_epoch + 1):
+        do_update = (accum_progress + 1 >= grad_accum)
+        if it % batches_per_epoch == 0:
+            boundary_is_update = do_update
+        accum_progress = 0 if do_update else accum_progress + 1
+    assert boundary_is_update is False
