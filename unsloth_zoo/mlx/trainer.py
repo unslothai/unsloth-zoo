@@ -673,14 +673,14 @@ class MLXTrainingConfig:
         )
 
 
-@dataclass
+@dataclass(init=False)
 class MLXORPOConfig(MLXTrainingConfig):
     """ORPO config mirroring TRL's ORPOConfig. Presets loss_type='orpo';
     tune orpo_beta (inherited). Use with MLXORPOTrainer."""
     loss_type: str = "orpo"
 
 
-@dataclass
+@dataclass(init=False)
 class MLXDPOConfig(MLXTrainingConfig):
     """DPO config mirroring TRL's DPOConfig. Presets loss_type='dpo';
     tune dpo_beta / reference_free (inherited). Use with MLXDPOTrainer."""

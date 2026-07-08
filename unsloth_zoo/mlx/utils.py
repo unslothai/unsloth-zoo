@@ -1056,9 +1056,14 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                 f"columns; got {sorted(ex.keys())}."
             )
         prompt = ex[prompt_key]
-        p_ids = hf.encode(prompt)
-        c_ids = _with_eos(hf.encode(prompt + ex[chosen_key]))
-        r_ids = _with_eos(hf.encode(prompt + ex[rejected_key]))
+        # Use the shared text encoder (same as the SFT path) so a prompt that
+        # was already rendered with the chat template's leading BOS does not get
+        # a second BOS from encode()'s default add_special_tokens=True. Raw
+        # hf.encode here would train ORPO/DPO on duplicated special tokens and
+        # diverge from the rest of the MLX trainer for identical rendered text.
+        p_ids = encode_mlx_text(hf, prompt)
+        c_ids = _with_eos(encode_mlx_text(hf, prompt + ex[chosen_key]))
+        r_ids = _with_eos(encode_mlx_text(hf, prompt + ex[rejected_key]))
         pe = min(len(p_ids), len(c_ids), len(r_ids))
         rows.append((pe, c_ids, r_ids))
 

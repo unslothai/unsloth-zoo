@@ -408,6 +408,37 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
+def test_preference_config_subclasses_record_explicit_warmup_steps():
+    # Regression: MLXORPOConfig / MLXDPOConfig were plain @dataclass subclasses,
+    # so Python generated a fresh __init__ that bypassed
+    # MLXTrainingConfig.__init__ and never set
+    # _unsloth_mlx_warmup_steps_explicit. An explicit warmup_steps equal to the
+    # default alongside a positive warmup_ratio was then treated as implicit,
+    # silently switching to the ratio schedule for these new trainers.
+    # @dataclass(init=False) keeps the shared base initializer.
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXDPOConfig,
+        MLXORPOConfig,
+    )
+
+    for cls, loss in ((MLXORPOConfig, "orpo"), (MLXDPOConfig, "dpo")):
+        cfg = cls(warmup_steps=5, warmup_ratio=0.1)
+        # Preset loss_type still comes through the shared initializer.
+        assert cfg.loss_type == loss
+        assert cfg._unsloth_mlx_warmup_steps_explicit is True
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = cfg
+        # Explicit positive warmup_steps wins over the ratio (parity with
+        # MLXTrainingConfig), instead of resolving via the ratio to 1.
+        assert trainer._resolve_warmup_steps(total_steps=8) == 5
+
+        ratio_trainer = MLXTrainer.__new__(MLXTrainer)
+        ratio_trainer.args = cls(warmup_ratio=0.1)
+        # Ratio-only (no explicit warmup_steps) still resolves via the ratio.
+        assert ratio_trainer._resolve_warmup_steps(total_steps=8) == 1
+
+
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
@@ -2011,6 +2042,51 @@ def test_create_preference_batches_runs_with_plain_fast_tokenizer():
     # 2 pairs -> 4 rows (chosen block then rejected block).
     assert batch.shape[0] == 4
     assert lengths.shape[0] == 4
+
+
+def test_preference_tokenizer_avoids_double_bos_on_rendered_prompt():
+    # Regression: create_preference_batches tokenized prompt/chosen/rejected with
+    # raw hf.encode(...), whose default add_special_tokens=True prepends a BOS.
+    # For a prompt already rendered with the chat template's leading BOS this
+    # produced a SECOND BOS. The SFT path guards against this via encode_mlx_text
+    # (double-BOS guard), so ORPO/DPO must go through the same encoder to emit the
+    # same ids for identical rendered text.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    BOS_ID = 100
+
+    class _BosTokenizer:
+        # Not a PreTrainedTokenizerBase and no _tokenizer attr, so
+        # _hf_encoding_tokenizer uses it directly.
+        bos_token = "<s>"
+        eos_token_id = None  # skip EOS append; isolate the BOS behavior
+
+        def encode(self, text, add_special_tokens=True):
+            ids = [
+                BOS_ID if tok == "<s>" else (ord(tok[0]) % 40) + 1
+                for tok in text.split()
+            ]
+            if add_special_tokens:
+                ids = [BOS_ID] + ids
+            return ids
+
+    dataset = [{"prompt": "<s> hello", "chosen": "world", "rejected": "bye"}]
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=_BosTokenizer(),
+        batch_size=1,
+        max_seq_length=64,
+        pad_to_multiple=1,
+        dataset_order="sequential",
+    )
+    batch, _lengths, _extra = batches[0]
+    chosen = [int(t) for t in batch[0].tolist()]
+    rejected = [int(t) for t in batch[1].tolist()]
+    # Exactly one leading BOS (the one from the rendered "<s>"), not two.
+    assert chosen[0] == BOS_ID
+    assert chosen[1] != BOS_ID, f"double BOS in chosen row: {chosen[:3]}"
+    assert rejected[0] == BOS_ID
+    assert rejected[1] != BOS_ID, f"double BOS in rejected row: {rejected[:3]}"
 
 
 def test_dpo_reference_collects_nested_lora_modules():
