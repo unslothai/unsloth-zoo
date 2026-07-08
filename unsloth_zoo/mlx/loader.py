@@ -4226,11 +4226,10 @@ class FastMLXModel:
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
             model._src_path = original_local_path or local_path
-            # Provenance (_src_path) points at the original snapshot for commit
-            # inference, but sidecar-saving must use the mlx-vlm patched dir when
-            # one was materialized (e.g. DeepSeek OCR routed through
-            # _materialize_mlx_vlm_config_override): otherwise saved adapters copy
-            # the unpatched model_type/auto_map the override exists to avoid.
+            # _src_path is the original snapshot (for commit inference); sidecar
+            # saving needs the mlx-vlm patched dir when one was materialized
+            # (e.g. DeepSeek OCR), else saved adapters copy the unpatched
+            # model_type/auto_map the override drops.
             model._config_src_path = local_path or original_local_path
             model._unsloth_base_revision = revision
             model._unsloth_base_commit_hash = _infer_snapshot_commit(
