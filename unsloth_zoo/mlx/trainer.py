@@ -2379,8 +2379,16 @@ class MLXTrainer:
             if not _processor_saves_tokenizer:
                 self.tokenizer.save_pretrained(output_dir)
 
-            # Copy base model's config.json so the checkpoint is loadable
-            src_path = getattr(self.model, "_src_path", None)
+            # Copy base model's config.json so the checkpoint is loadable.
+            # Prefer the mlx-vlm patched config dir when one was materialized
+            # (e.g. DeepSeek OCR): _src_path holds provenance (the original
+            # snapshot) whose config.json still carries the unpatched
+            # model_type/auto_map the override drops, so copying that would make
+            # the saved adapter fail the same mlx-vlm routing on reload.
+            src_path = (
+                getattr(self.model, "_config_src_path", None)
+                or getattr(self.model, "_src_path", None)
+            )
             if src_path is not None:
                 import shutil
                 from pathlib import Path
