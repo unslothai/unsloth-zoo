@@ -217,10 +217,25 @@ def health():
     return {"status": "ok", "model": MODEL_ID}
 
 
+def _tools_for_choice(tools, tool_choice):
+    # Honor tool_choice before advertising: "none" hides tools, a forced function
+    # narrows to just that one, anything else forwards all.
+    if isinstance(tool_choice, str) and tool_choice.lower() == "none":
+        return None
+    if isinstance(tool_choice, dict):
+        name = (tool_choice.get("function") or {}).get("name")
+        if name:
+            return [t for t in tools or []
+                    if isinstance(t, dict) and (t.get("function") or {}).get("name") == name] or None
+    return tools
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     body = await req.json()
     messages = body.get("messages", [])
+    # forwarded to the visual server, honoring tool_choice
+    tools = _tools_for_choice(body.get("tools"), body.get("tool_choice"))
     stream = bool(body.get("stream", False))
     max_blocks = _max_blocks(body)
     seed = int(body.get("seed", 3407))
@@ -234,7 +249,7 @@ async def chat(req: Request):
         def work():
             with _LOCK:
                 return V.generate_visual(srv, messages, seed=seed, max_blocks=max_blocks,
-                                         on_stats=stats_box.update)
+                                         on_stats=stats_box.update, tools=tools)
         try:
             text = await loop.run_in_executor(None, work)
         except V.ContextOverflow as exc:
@@ -276,7 +291,7 @@ async def chat(req: Request):
                 with _LOCK:
                     full = V.generate_visual(srv, messages, seed=seed, max_blocks=max_blocks,
                                              on_frame=on_frame, on_commit=on_commit,
-                                             on_stats=stats_box.update)
+                                             on_stats=stats_box.update, tools=tools)
                 loop.call_soon_threadsafe(q.put_nowait, ("done", full))
             except V.ContextOverflow as exc:  # context budget exceeded -> clean user-facing message
                 loop.call_soon_threadsafe(q.put_nowait, ("overflow", exc))
