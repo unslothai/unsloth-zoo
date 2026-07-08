@@ -809,22 +809,45 @@ _FP8_E4M3_MAX = 448.0
 _MOE_QUANT_UNSAFE = object()
 
 
-def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
-    """Block-wise dequant of float8_e4m3fn weight via per-block weight_scale_inv.
+def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_size = None) -> torch.Tensor:
+    """Dequant a 2-D float8_e4m3fn weight: W_real = decode_fp8(W) * scale_broadcast.
 
-    Inverse of compressed-tensors / DeepSeek-style FP8 quantization:
-        W_real = decode_fp8(W) * scale_inv_broadcast(block_size)
-    where scale_inv has shape (rows/bm, cols/bn) and each scalar tiles its
-    bm x bn block of the dequantized weight.
+    Inverse of compressed-tensors / DeepSeek FP8. Handles every dense scale layout
+    (per-tensor, 1-D per-row/col, 2-D per-channel, 2-D block). block_size (bm, bn) is
+    the configured weight_block_size; without it bm/bn are inferred from the scale grid,
+    which is only exact when rows/cols are block multiples.
     """
     rows, cols = W_fp8.shape
+    out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
+    W = W_fp8.to(out_dtype)
+    if scale_inv.numel() == 1:
+        return W * scale_inv.reshape(()).to(out_dtype)
+    if scale_inv.ndim == 1:
+        if scale_inv.shape[0] == rows:
+            return W * scale_inv.view(-1, 1).to(out_dtype)
+        if scale_inv.shape[0] == cols:
+            return W * scale_inv.view(1, -1).to(out_dtype)
+        raise RuntimeError(
+            f"Unsloth: FP8 1-D scale length {scale_inv.shape[0]} matches neither "
+            f"rows ({rows}) nor cols ({cols}); cannot dequantize."
+        )
     srows, scols = scale_inv.shape
-    bm, bn = rows // srows, cols // scols
-    W_bf16 = W_fp8.to(scale_inv.dtype)
-    return (
-        W_bf16.reshape(srows, bm, scols, bn)
-        * scale_inv.unsqueeze(-1).unsqueeze(1)
-    ).reshape(rows, cols)
+    bm = bn = None
+    # Use the configured block size only when the scale grid tiles the weight by it;
+    # per-channel 2-D scales (e.g. (rows, 1)) fall back to inference.
+    if block_size is not None and len(block_size) == 2:
+        cand_bm, cand_bn = block_size
+        if srows == -(-rows // cand_bm) and scols == -(-cols // cand_bn):
+            bm, bn = cand_bm, cand_bn
+    if bm is None:
+        bm = -(-rows // srows)  # ceil(rows / srows)
+        bn = -(-cols // scols)  # ceil(cols / scols)
+    scale = scale_inv.to(out_dtype)
+    if bm > 1:
+        scale = scale.repeat_interleave(bm, dim = 0)[:rows]
+    if bn > 1:
+        scale = scale.repeat_interleave(bn, dim = 1)[:, :cols]
+    return W * scale
 
 
 def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: torch.dtype):
@@ -833,21 +856,28 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
     Per (bm, bn) block: scale_inv = max_abs / 448, W_fp8 = clamp(W / scale_inv, ±448).
     Zero-blocks clamp scale_inv to 1e-12 (avoids div-by-zero; the encoded fp8
     is 0 either way, so on reload `0 * 1e-12 == 0` round-trips cleanly).
+    A partial final block (dim not a multiple of bm/bn) is zero-padded to the block
+    grid and truncated back, so the scale grid matches the original ceil-tiled layout.
     """
     rows, cols = W.shape
     bm, bn = block_shape
-    srows, scols = rows // bm, cols // bn
-    W_blocks = W.to(torch.float32).reshape(srows, bm, scols, bn)
+    srows, scols = -(-rows // bm), -(-cols // bn)  # ceil
+    Wf = W.to(torch.float32)
+    if srows * bm != rows or scols * bn != cols:
+        Wpad = Wf.new_zeros(srows * bm, scols * bn)
+        Wpad[:rows, :cols] = Wf
+        Wf = Wpad
+    W_blocks = Wf.reshape(srows, bm, scols, bn)
     block_max = W_blocks.abs().amax(dim=(1, 3))
     scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
     W_scaled = (
         W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)
     ).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    W_fp8 = W_scaled.reshape(rows, cols).to(torch.float8_e4m3fn)
+    W_fp8 = W_scaled.reshape(srows * bm, scols * bn)[:rows, :cols].to(torch.float8_e4m3fn)
     return W_fp8, scale_inv.to(scale_dtype)
 
 
-def _fp8_save_handler(file, header_metadata, weight_key):
+def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
     """MoE-quant save handler for FP8 base weights.
 
     Returns:
@@ -862,12 +892,19 @@ def _fp8_save_handler(file, header_metadata, weight_key):
         the new scale alongside it.
     """
     dtype_str = header_metadata.get(weight_key, {}).get("dtype")
+    _e5m2 = getattr(torch, "float8_e5m2", None)
+    # e5m2 is FP8 but this requant path only encodes e4m3; refuse (UNSAFE) so the merge is
+    # skipped and logged rather than writing raw FP8 back with a stale scale.
+    if dtype_str == "F8_E5M2":
+        return _MOE_QUANT_UNSAFE, None
     # Cheap probe: skip non-FP8 keys without paying for a tensor read.
     if dtype_str not in ("F8_E4M3",):
         # Only FP8 keys are our concern; let the generic loader handle the rest.
         if dtype_str is None:
             # Unknown layout — fall back to full read to learn the dtype.
             W = file.get_tensor(weight_key)
+            if _e5m2 is not None and W.dtype == _e5m2:
+                return _MOE_QUANT_UNSAFE, None
             if W.dtype != torch.float8_e4m3fn:
                 return None
         else:
@@ -887,12 +924,21 @@ def _fp8_save_handler(file, header_metadata, weight_key):
         return _MOE_QUANT_UNSAFE, None
     rows, cols = W.shape
     srows, scols = scale_inv.shape
-    if rows % srows != 0 or cols % scols != 0:
-        return _MOE_QUANT_UNSAFE, None
-    bm, bn = rows // srows, cols // scols
-    block_shape = (bm, bn)
+    # Prefer the configured block size when its grid tiles the weight (handles partial
+    # final blocks, e.g. 130x256 with 128x128 blocks). Otherwise fall back to exact-division
+    # inference, which also covers per-channel scales like (rows, 1) that a global block size
+    # does not tile.
+    block_shape = None
+    if block_size is not None and len(block_size) == 2:
+        cand_bm, cand_bn = block_size
+        if srows == -(-rows // cand_bm) and scols == -(-cols // cand_bn):
+            block_shape = (cand_bm, cand_bn)
+    if block_shape is None:
+        if rows % srows != 0 or cols % scols != 0:
+            return _MOE_QUANT_UNSAFE, None
+        block_shape = (rows // srows, cols // scols)
     scale_dtype = scale_inv.dtype
-    W_bf16 = _fp8_dequant_blockwise(W, scale_inv)
+    W_bf16 = _fp8_dequant_blockwise(W, scale_inv, block_size = block_shape)
 
     def _requant(merged_W):
         W_fp8, new_scale = _fp8_requant_blockwise(merged_W, block_shape, scale_dtype)
@@ -905,7 +951,7 @@ def _fp8_save_handler(file, header_metadata, weight_key):
 _MOE_QUANT_HANDLERS = [_fp8_save_handler]
 
 
-def apply_moe_quant_load(file, header_metadata, key):
+def apply_moe_quant_load(file, header_metadata, key, block_size = None):
     """Public entry point used by saving_utils._merge_moe_experts_file.
 
     Returns one of:
@@ -913,7 +959,7 @@ def apply_moe_quant_load(file, header_metadata, key):
       - `(_MOE_QUANT_UNSAFE, None)`
     """
     for handler in _MOE_QUANT_HANDLERS:
-        result = handler(file, header_metadata, key)
+        result = handler(file, header_metadata, key, block_size = block_size)
         if result is not None:
             return result
     return file.get_tensor(key), None
