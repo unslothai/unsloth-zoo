@@ -85,6 +85,7 @@ class _MLXTrainerControl:
     """Torch-free subset of Hugging Face TrainerControl used by callbacks."""
 
     should_training_stop: bool = False
+    should_epoch_stop: bool = False
     should_save: bool = False
     should_evaluate: bool = False
     should_log: bool = False
@@ -908,7 +909,19 @@ class MLXTrainer:
             optimizer=None,
             lr_scheduler=None,
         )
-        self.state = _MLXTrainerState()
+        # Seed the real per-rank process-zero flags BEFORE dispatching
+        # on_init_end (HF does the same). In DDP every rank constructs the
+        # trainer, so a callback that gates file I/O on
+        # state.is_world_process_zero during on_init_end would otherwise run once
+        # per rank (the default True-on-every-rank flags were only corrected later
+        # in _init_callback_state). self.is_main_process resolves the true rank
+        # (it triggers _ensure_distributed); each rank sets its own flag, so there
+        # is no lockstep concern.
+        _is_main = bool(self.is_main_process)
+        self.state = _MLXTrainerState(
+            is_local_process_zero=_is_main,
+            is_world_process_zero=_is_main,
+        )
         self.control = _MLXTrainerControl()
         self.control = self.callback_handler.call_event(
             "on_init_end",
@@ -941,6 +954,9 @@ class MLXTrainer:
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
+        # Restored from a checkpoint's saved num_input_tokens_seen by the resume
+        # block; 0 on a fresh run so a reused trainer starts the counter clean.
+        self._resume_num_input_tokens_seen = 0
         self._distributed_world = None
         self._distributed_initialized = False
         self._distributed_rank = 0
@@ -1388,6 +1404,9 @@ class MLXTrainer:
             save_steps=int(getattr(args, "save_steps", 0) or 0),
             train_batch_size=int(getattr(args, "per_device_train_batch_size", 0) or 0),
             num_train_epochs=max(0, int(getattr(args, "num_train_epochs", 0) or 0)),
+            num_input_tokens_seen=int(
+                getattr(self, "_resume_num_input_tokens_seen", 0) or 0
+            ),
             log_history=[],
             is_local_process_zero=is_main_process,
             is_world_process_zero=is_main_process,
@@ -1449,6 +1468,30 @@ class MLXTrainer:
             epochs = int(getattr(self.args, "num_train_epochs", 0) or 0)
             if epochs > 0 and total % epochs == 0:
                 return max(1, total // epochs)
+            return total
+        # max_steps>0 path: `batches` is the whole cycled/truncated run
+        # (max_steps * grad_accum micro-batches), NOT one dataset pass, so using
+        # it as the epoch length makes state.epoch climb to 1.0 across the entire
+        # run and fires on_epoch_begin/end exactly once, starving epoch-based HF
+        # callbacks on small finite datasets. Approximate the true per-epoch
+        # micro-batch count from the dataset size and the global batch (each
+        # micro-batch consumes per_device_train_batch_size * world_size rows),
+        # matching HF's len(dataloader)-based epoch accounting for max_steps. This
+        # only affects the callback-visible epoch value/cadence, never the
+        # training data or gradient steps, and is clamped into [1, total].
+        if int(getattr(self.args, "max_steps", 0) or 0) > 0:
+            per_device = int(getattr(self.args, "per_device_train_batch_size", 0) or 0)
+            world = int(getattr(self, "_distributed_world_size", 1) or 1)
+            ds = getattr(self, "_mlx_train_dataset_for_batches", None)
+            if ds is None:
+                ds = self.train_dataset
+            try:
+                n_examples = len(ds)
+            except TypeError:
+                n_examples = 0
+            if per_device > 0 and n_examples > 0:
+                one_pass = math.ceil(n_examples / (per_device * max(1, world)))
+                return max(1, min(one_pass, total))
         return total
 
     def _metric_for_best_model_name(self, metrics=None, require=False):
@@ -2459,6 +2502,13 @@ class MLXTrainer:
                 self._best_metric = ts.get("best_metric", None)
                 self._best_step = ts.get("best_step", None)
                 self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
+                # Restore the callback-visible input-token counter so a
+                # token-budget stopping callback resumes from the accumulated
+                # count rather than 0. .get default keeps pre-fix checkpoints
+                # (no num_input_tokens_seen key) resumable.
+                self._resume_num_input_tokens_seen = int(
+                    ts.get("num_input_tokens_seen", 0) or 0
+                )
                 # best/ lives in output_dir, not in the checkpoint dir, so a
                 # checkpoint resumed elsewhere (copied dir, new output_dir) can
                 # carry best-model state whose weights aren't present. Keep the
@@ -3071,6 +3121,13 @@ class MLXTrainer:
             self._sync_callback_stop()
             return self._distributed_should_stop()
 
+        def _sync_epoch_stop():
+            """OR-reduce control.should_epoch_stop across ranks (the epoch-scoped
+            analogue of _sync_stop). Every rank sees the same result, so when the
+            honoring below skips the rest of the epoch each rank skips the same
+            micro-batches and DDP stays in lockstep."""
+            return self._distributed_any_flag(self.control.should_epoch_stop)
+
         self.callback_handler.train_dataloader = batches if batches is not None else batch_iter
         self.control.should_training_stop = False
         _fire("on_train_begin")
@@ -3129,6 +3186,9 @@ class MLXTrainer:
         def _run_callback_epoch_begin(epoch_value):
             """Dispatch one epoch-begin event at a dataset boundary (rank 0)."""
             self.state.epoch = epoch_value
+            # HF resets should_epoch_stop at on_epoch_begin so a per-epoch stop
+            # from a prior epoch does not leak into this one.
+            self.control.should_epoch_stop = False
             _fire("on_epoch_begin")
             _sync_stop()
 
@@ -3389,6 +3449,13 @@ class MLXTrainer:
                                     "best_metric": self._best_metric,
                                     "best_step": self._best_step,
                                     "es_patience_counter": self._es_patience_counter,
+                                    # Persist the callback-visible input-token
+                                    # counter so a token-budget stopping callback
+                                    # does not restart at 0 on resume (HF saves
+                                    # num_input_tokens_seen in trainer_state.json).
+                                    "num_input_tokens_seen": int(
+                                        self.state.num_input_tokens_seen
+                                    ),
                                 },
                                 ckpt_dir,
                             )
@@ -3792,6 +3859,37 @@ class MLXTrainer:
                 _run_checkpoint(current_step)
 
             _maybe_callback_epoch_end(it, current_step, grad_norm)
+            # Honor a callback that ended the current epoch early
+            # (control.should_epoch_stop), mirroring HF's `if should_epoch_stop:
+            # break` of the per-epoch step loop: end this epoch now and skip its
+            # remaining micro-batches so the next iteration begins a fresh epoch.
+            # Applied only here, at a clean optimizer-step boundary (accum_progress
+            # was just reset to 0), so no partial gradient accumulation is
+            # abandoned, and only for materialized batches (batch_idx is an index
+            # we can advance) -- a streaming iterator cannot be index-skipped, so
+            # it keeps the flag until the next epoch begin resets it, without a
+            # data skip. The skip is rank-consistent arithmetic gated on the
+            # all-reduced flag (_sync_epoch_stop), and its on_epoch_end reuses the
+            # same lockstep collectives as _maybe_callback_epoch_end, so DDP stays
+            # in lockstep.
+            if (batches_per_epoch and batch_iter is None
+                    and _sync_epoch_stop()):
+                if it % batches_per_epoch != 0:
+                    # Mid-epoch: fire the truncated epoch's on_epoch_end (a natural
+                    # boundary already fired it via _maybe_callback_epoch_end above)
+                    # and its synced log/eval/save, then skip to the next boundary.
+                    self.state.epoch = float(math.ceil(it / batches_per_epoch))
+                    _fire("on_epoch_end")
+                    self._distributed_sync_control_actions()
+                    if (self.control.should_log or self.control.should_evaluate
+                            or self.control.should_save):
+                        _run_callback_control_actions(current_step, grad_norm)
+                    next_boundary = (
+                        (it // batches_per_epoch) + 1
+                    ) * batches_per_epoch
+                    batch_idx += next_boundary - it
+                    it = next_boundary
+                self.control.should_epoch_stop = False
             # Propagate any stop set by the tail callbacks (on_step_end / on_log /
             # on_evaluate / on_save / on_epoch_end) to every rank before breaking,
             # so no rank is left waiting at the next collective.

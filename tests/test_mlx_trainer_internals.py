@@ -130,7 +130,11 @@ def test_mlx_trainer_distributed_defaults_world_size_one():
 
     trainer = MLXTrainer(DummyModel(), None, [], args=MLXTrainingConfig())
 
-    assert trainer._distributed_initialized is False
+    # Seeding the on_init_end process-zero flags resolves the rank at
+    # construction (mirroring HF, which knows its rank via the accelerator at
+    # Trainer.__init__), so distributed metadata is initialized here. The shim's
+    # mx.distributed.init() returns None, so this stays rank 0 / world size 1.
+    assert trainer._distributed_initialized is True
     assert trainer.distributed_rank == 0
     assert trainer.distributed_world_size == 1
     assert trainer.is_main_process is True
@@ -1321,6 +1325,103 @@ def test_mlx_batch_input_token_count_counts_all_positions():
     # no input ids present -> 0, never raises
     assert _mlx_batch_input_token_count({"pixel_values": mx.zeros((2, 3))}) == 0
     assert _mlx_batch_input_token_count(None) == 0
+
+
+def test_on_init_end_receives_seeded_process_zero_flags():
+    # on_init_end must see the real per-rank process-zero flags (not the default
+    # True-on-every-rank), so a DDP callback gating file I/O on
+    # is_world_process_zero during on_init_end runs once, not once per rank.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    seen = {}
+
+    class RecCb:
+        def on_init_end(self, args, state, control, **kw):
+            seen["wpz"] = state.is_world_process_zero
+            seen["lpz"] = state.is_local_process_zero
+
+    trainer = MLXTrainer(
+        DummyModel(), None, None,
+        callbacks=[RecCb()], args=MLXTrainingConfig(),
+    )
+    # The state passed to on_init_end must carry the resolved rank flags, equal
+    # to is_main_process (rank 0 -> True in the single-process shim).
+    assert seen["wpz"] == trainer.is_main_process
+    assert seen["lpz"] == trainer.is_main_process
+
+
+def test_num_input_tokens_seen_persisted_and_restored_across_resume():
+    # HF saves num_input_tokens_seen in trainer_state.json and restores it on
+    # resume; the MLX loop increments it every step, so it must be checkpointed
+    # and restored into the callback-visible state (else a token-budget callback
+    # restarts at 0 after resume and overruns).
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    ti = inspect.getsource(MLXTrainer._train_inner)
+    # Saved in the checkpoint state dict ...
+    assert '"num_input_tokens_seen": int(' in ti
+    # ... and restored from it on resume into the resume attr.
+    assert 'ts.get("num_input_tokens_seen"' in ti
+    assert "_resume_num_input_tokens_seen = int(" in ti
+    # ... then seeded into the callback-visible TrainerState.
+    ics = inspect.getsource(MLXTrainer._init_callback_state)
+    assert "num_input_tokens_seen=int(" in ics
+    assert "_resume_num_input_tokens_seen" in ics
+
+
+def test_callback_batches_per_epoch_uses_single_pass_for_max_steps():
+    # With max_steps>0, `batches` is the whole cycled run (max_steps*grad_accum
+    # micro-batches), so the per-epoch count must be the single-pass
+    # approximation ceil(dataset_len / (per_device_batch * world)), NOT
+    # len(batches); otherwise state.epoch climbs to 1.0 across the run and epoch
+    # callbacks fire once instead of per dataset pass.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    t = MLXTrainer.__new__(MLXTrainer)
+    t.args = MLXTrainingConfig(max_steps=50, per_device_train_batch_size=2)
+    t._distributed_world_size = 1
+    t._mlx_train_dataset_for_batches = list(range(8))  # 8 examples
+    t.train_dataset = t._mlx_train_dataset_for_batches
+    t._prepared_batches_include_epochs = False
+    # One pass = ceil(8 / (2*1)) = 4 micro-batches, not the 100-batch run length.
+    assert t._callback_batches_per_epoch(list(range(100))) == 4
+    # Clamp: if the whole run is shorter than one pass, cap at the run length.
+    assert t._callback_batches_per_epoch(list(range(3))) == 3
+
+    # The epoch-based path (max_steps<=0, num_train_epochs>0) is unchanged.
+    t2 = MLXTrainer.__new__(MLXTrainer)
+    t2.args = MLXTrainingConfig(num_train_epochs=3, max_steps=-1)
+    t2._prepared_batches_include_epochs = True
+    assert t2._callback_batches_per_epoch(list(range(12))) == 4  # 12 // 3
+
+
+def test_should_epoch_stop_field_reset_and_honored():
+    # HF's TrainerControl.should_epoch_stop must (1) exist so a callback reading
+    # it does not AttributeError, (2) be reset at on_epoch_begin, and (3) be
+    # honored by ending the current epoch early -- skipping its remaining
+    # micro-batches to the next epoch boundary, rank-synced for DDP lockstep.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
+
+    # (1) Field exists and defaults False.
+    assert _MLXTrainerControl().should_epoch_stop is False
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    # (2) Reset at epoch begin.
+    assert "self.control.should_epoch_stop = False" in src
+    # (3) Rank-synced honoring: an all-reduced flag drives an epoch-boundary skip.
+    assert "def _sync_epoch_stop" in src
+    assert "_distributed_any_flag(self.control.should_epoch_stop)" in src
+    assert "_sync_epoch_stop()" in src
+    # The honor fast-forwards the batch cursor to the next epoch boundary, and
+    # only for materialized batches (a streaming iterator can't be index-skipped).
+    assert "batch_idx += next_boundary - it" in src
+    assert "batch_iter is None" in src
 
 
 def test_train_entry_clears_stale_stop_before_setup():
