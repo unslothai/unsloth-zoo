@@ -1022,9 +1022,16 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     ``append_eos`` (default True, matching TRL) appends the tokenizer's EOS id
     to each chosen/rejected completion, guarded to avoid a double EOS (mirrors
     TRL's ``add_eos_token_if_needed``). EOS is appended before truncation to
-    ``max_seq_length`` (same contract as the SFT path). Because EOS lands after
-    the prompt boundary it falls inside the ``[response_start, seq_end)`` loss
-    span, so it is trained on — as in TRL.
+    ``max_seq_length``. Because EOS lands after the prompt boundary it falls
+    inside the ``[response_start, seq_end)`` loss span, so it is trained on — as
+    in TRL.
+
+    Rows longer than ``max_seq_length`` are truncated PROMPT-FIRST (keeping the
+    END of the prompt, TRL's default ``truncation_mode="keep_end"``) so the
+    completion is preserved; a plain right-truncation would drop the response
+    tail on a long prompt and leave an empty ``[response_start, seq_end)`` span
+    with no preference signal. Both rows in a pair share the same truncated
+    prompt prefix, so they keep a single ``response_start``.
 
     Returns a list of ``(batch, lengths, None)`` tuples:
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
@@ -1046,7 +1053,40 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         # matching the SFT path's append-then-truncate contract.
         if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
             ids = ids + [eos_id]
-        return ids[:max_seq_length]
+        return ids
+
+    def _truncate_preference_pair(p_ids, c_full, r_full):
+        # Fit the concatenated prompt+completion rows into max_seq_length while
+        # PRESERVING the completion, mirroring TRL's ORPO/DPO tokenize_row
+        # (truncate the prompt first, then the response only if still too long).
+        # A plain right-truncation (``ids[:max_seq_length]``) drops the response
+        # tail whenever the prompt is long, so a legitimate long-prompt row would
+        # collapse to prompt-only tokens and the [response_start, seq_end) span
+        # would be empty -> no ORPO/DPO preference signal for that pair.
+        #
+        # ``p_len`` is the shared prompt boundary. The min() guards the rare case
+        # where concatenated tokenization merges the boundary token so the prompt
+        # prefix is shorter than len(p_ids) (same contract as the untruncated pe).
+        p_len = min(len(p_ids), len(c_full), len(r_full))
+        resp_c = c_full[p_len:]
+        resp_r = r_full[p_len:]
+        longer_resp = max(len(resp_c), len(resp_r))
+        if p_len + longer_resp <= max_seq_length:
+            # Whole pair already fits; both rows are unchanged. This is identical
+            # to the previous append-then-right-truncate result for such rows.
+            return p_len, c_full[:max_seq_length], r_full[:max_seq_length]
+        # Reserve room for the (longer) response, then keep the END of the prompt
+        # (TRL's default truncation_mode="keep_end"). Both rows share the same
+        # prompt prefix, so they keep a single response_start. If the response
+        # alone exceeds the budget, the prompt is dropped and the response is
+        # right-truncated (still leaving a non-empty response span with signal).
+        keep_prompt = max(0, max_seq_length - longer_resp)
+        prompt_prefix = c_full[:p_len]  # == r_full[:p_len]
+        prompt_kept = prompt_prefix[p_len - keep_prompt:]
+        c_ids = (prompt_kept + resp_c)[:max_seq_length]
+        r_ids = (prompt_kept + resp_r)[:max_seq_length]
+        pe = min(keep_prompt, len(c_ids), len(r_ids))
+        return pe, c_ids, r_ids
 
     rows = []
     for ex in dataset:
@@ -1062,9 +1102,9 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         # hf.encode here would train ORPO/DPO on duplicated special tokens and
         # diverge from the rest of the MLX trainer for identical rendered text.
         p_ids = encode_mlx_text(hf, prompt)
-        c_ids = _with_eos(encode_mlx_text(hf, prompt + ex[chosen_key]))
-        r_ids = _with_eos(encode_mlx_text(hf, prompt + ex[rejected_key]))
-        pe = min(len(p_ids), len(c_ids), len(r_ids))
+        c_full = _with_eos(encode_mlx_text(hf, prompt + ex[chosen_key]))
+        r_full = _with_eos(encode_mlx_text(hf, prompt + ex[rejected_key]))
+        pe, c_ids, r_ids = _truncate_preference_pair(p_ids, c_full, r_full)
         rows.append((pe, c_ids, r_ids))
 
     # rows are collected in dataset order above; reorder per the requested mode.

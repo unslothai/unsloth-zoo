@@ -2089,6 +2089,60 @@ def test_preference_tokenizer_avoids_double_bos_on_rendered_prompt():
     assert rejected[1] != BOS_ID, f"double BOS in rejected row: {rejected[:3]}"
 
 
+def test_preference_long_prompt_preserves_response_span():
+    # Regression: create_preference_batches right-truncated the concatenated
+    # prompt+completion to max_seq_length. For a prompt near/over max_seq_length
+    # that dropped the response tail, so [response_start, seq_end) was empty and
+    # ORPO/DPO got no preference signal for the pair. Truncation must preserve
+    # the response (truncate the prompt side, TRL keep_end).
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    EOS_ID = 500
+
+    class _WordTokenizer:
+        # Not a PreTrainedTokenizerBase and no _tokenizer attr -> used directly.
+        bos_token = None
+        eos_token_id = EOS_ID
+
+        def encode(self, text, add_special_tokens=True):
+            # One id per whitespace token; no special tokens. ord(first char)
+            # keeps the prompt words (a..l), "yes"/"no" distinct and != EOS_ID.
+            return [ord(tok[0]) for tok in text.split()]
+
+    # 12-token prompt (trailing space so prompt+response concatenation splits
+    # cleanly), short 1-token responses. max_seq_length=8 forces truncation.
+    prompt = "a b c d e f g h i j k l "
+    dataset = [{"prompt": prompt, "chosen": "yes", "rejected": "no"}]
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=_WordTokenizer(),
+        batch_size=1,
+        max_seq_length=8,
+        pad_to_multiple=1,
+        dataset_order="sequential",
+    )
+    batch, lengths, _extra = batches[0]
+    # rows[0:B] chosen, [B:2B] rejected; B == 1 here.
+    chosen = [int(t) for t in batch[0].tolist()]
+    rejected = [int(t) for t in batch[1].tolist()]
+    c_start, c_end = int(lengths[0][0]), int(lengths[0][1])
+    r_start, r_end = int(lengths[1][0]), int(lengths[1][1])
+
+    # The response span must be non-empty (the bug made c_start == c_end).
+    assert c_start < c_end, f"empty chosen response span: {(c_start, c_end)}"
+    assert r_start < r_end, f"empty rejected response span: {(r_start, r_end)}"
+    # Chosen and rejected keep a single shared response_start.
+    assert c_start == r_start
+    # The completion tokens survive intact at the response span: "yes"/"no" id
+    # followed by the appended EOS.
+    assert chosen[c_start:c_end] == [ord("y"), EOS_ID]
+    assert rejected[r_start:r_end] == [ord("n"), EOS_ID]
+    # Rows fit the budget and the response start is inside the prompt-truncated
+    # window (prompt was truncated from the front, not the response tail).
+    assert c_end <= 8 and r_end <= 8
+    assert c_start > 0
+
+
 def test_dpo_reference_collects_nested_lora_modules():
     # Regression: the DPO reference collected adapters with
     #   tree_flatten(model, is_leaf=lambda x: isinstance(x, LoRALinear)),
