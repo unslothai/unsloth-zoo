@@ -1256,8 +1256,13 @@ class MLXTrainer:
         # parameters the additional scheduler types need.
         warmup = self._resolve_warmup_steps(total_steps)
         min_lr_rate = float(getattr(self.args, "lr_scheduler_min_lr_rate", 0.0) or 0.0)
-        num_cycles = float(getattr(self.args, "lr_scheduler_num_cycles", 1.0) or 1.0)
-        power = float(getattr(self.args, "lr_scheduler_power", 1.0) or 1.0)
+        # HF parity: an explicit 0.0 is a meaningful value (WSD zero decay
+        # fraction / cosine_with_restarts zero cycles), so only a missing/None
+        # value falls back to the 1.0 default -- never an `or 1.0` truthiness cast.
+        num_cycles_attr = getattr(self.args, "lr_scheduler_num_cycles", 1.0)
+        num_cycles = float(1.0 if num_cycles_attr is None else num_cycles_attr)
+        power_attr = getattr(self.args, "lr_scheduler_power", 1.0)
+        power = float(1.0 if power_attr is None else power_attr)
         sched_type = _normalize_mlx_scheduler_type(self.args.lr_scheduler_type)
 
         if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
@@ -1277,7 +1282,16 @@ class MLXTrainer:
             # HF Trainer LR parity; `step` is zero-based optimizer-step index.
             step = mx.array(step).astype(mx.float32)
             if warmup > 0:
-                warm = lr * warmup_multiplier(step)
+                warm_factor = warmup_multiplier(step)
+                if sched_type == "warmup_stable_decay":
+                    # HF get_wsd_schedule offsets the warmup ramp by min_lr_rate
+                    # (factor * (1 - min_lr_rate) + min_lr_rate), so the first
+                    # update starts at lr*min_lr_rate rather than zero. Other
+                    # schedules keep the plain 0 -> 1 warmup ramp (HF parity).
+                    warm_factor = warm_factor * mx.array(
+                        1.0 - min_lr_rate, dtype=mx.float32
+                    ) + mx.array(min_lr_rate, dtype=mx.float32)
+                warm = mx.array(lr, dtype=mx.float32) * warm_factor
             else:
                 warm = mx.array(lr, dtype=mx.float32)
 
@@ -1308,17 +1322,25 @@ class MLXTrainer:
                 )
                 decay = mx.power(base, mx.array(power, dtype=mx.float32))
             elif sched_type == "inverse_sqrt":
-                # HF parity: 1 / sqrt(max(1, step / warmup)) post-warmup;
-                # equivalent to sqrt(warmup / step) when step >= warmup.
-                # Express it via progress to reuse the existing warmup math:
-                # post_warmup_step = warmup + progress * (total - warmup)
+                # HF get_inverse_sqrt_schedule parity. The timescale defaults to
+                # num_warmup_steps, or 10_000 when warmup is zero, so zero-warmup
+                # recipes hold the LR near base early instead of collapsing.
+                # decay = 1 / sqrt((step + shift) / timescale) with
+                # shift = timescale - warmup; post_warmup_step ==
+                # warmup + progress * (total - warmup) == step.
+                timescale = warmup if warmup > 0 else 10000
+                shift = timescale - warmup
                 post = mx.array(warmup, dtype=mx.float32) + progress * mx.array(
                     max(total_steps - warmup, 1), dtype=mx.float32
                 )
-                denom = mx.maximum(post, mx.array(max(warmup, 1), dtype=mx.float32))
-                decay = mx.sqrt(
-                    mx.array(max(warmup, 1), dtype=mx.float32) / denom
+                # Floor the argument so the dead pre-warmup branch stays finite
+                # before mx.where selects the warmup value instead.
+                arg = mx.maximum(
+                    (post + mx.array(shift, dtype=mx.float32))
+                    / mx.array(timescale, dtype=mx.float32),
+                    mx.array(1e-8, dtype=mx.float32),
                 )
+                decay = mx.array(1.0, dtype=mx.float32) / mx.sqrt(arg)
             elif sched_type == "warmup_stable_decay":
                 # HF parity: constant until decay_start = 1 - lr_scheduler_num_cycles
                 # of the decay window, then linear-decay through the remainder.
