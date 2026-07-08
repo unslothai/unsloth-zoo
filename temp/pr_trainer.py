@@ -38,13 +38,10 @@ Usage mirrors TRL notebooks:
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 import concurrent.futures
-import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import random
-import socket
 import time
 
 import mlx.core as mx
@@ -55,13 +52,6 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
-
-
-def _mlx_distributed_backend_from_env():
-    """Return an explicit distributed backend implied by MLX launch env."""
-    if os.environ.get("MLX_JACCL_COORDINATOR") and os.environ.get("MLX_IBV_DEVICES"):
-        return "jaccl"
-    return None
 
 
 class MLXTrainOutput(dict):
@@ -290,20 +280,12 @@ from .utils import (
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
-    _mlx_norm_path_part_is_norm,
-    iter_mlx_norm_output_cast_classes,
-    restore_mlx_norm_output_cast_state,
-    set_mlx_norm_output_cast_to_input_dtype,
-    snapshot_mlx_norm_output_cast_state,
     _get_text_model,
-    _distributed_global_batch_size,
-    _rank_slice_distributed_batch,
 )
 from .compile import (
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
-    model_has_gated_delta_layers,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -470,11 +452,6 @@ def _text_completion_only_loss_arg(args):
     return None
 
 
-def _text_assistant_only_loss_arg(args):
-    """Resolve SFT-compatible assistant-only loss setting."""
-    return bool(getattr(args, "assistant_only_loss", False))
-
-
 def _normalize_mlx_optimizer_name(name):
     if hasattr(name, "value"):
         name = name.value
@@ -503,9 +480,184 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
-_part_is_norm = _mlx_norm_path_part_is_norm
-_iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
-_set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
+_NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
+_NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
+
+
+def _part_is_norm(part: str) -> bool:
+    # "norm" matches RMSNorm/LayerNorm/input_layernorm; ln_* covers GPT-2/GPT-OSS.
+    return "norm" in part or part.startswith("ln_") or part == "ln_f"
+
+
+def _is_norm_parameter_path(path) -> bool:
+    parts = str(path).lower().split(".")
+    return any(_part_is_norm(part) for part in parts[:-1])
+
+
+def _is_norm_module_path(path) -> bool:
+    return any(_part_is_norm(part) for part in str(path).lower().split("."))
+
+
+def _has_norm_selected_floating_parameter(module_path, module) -> bool:
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    module_path_selected = _is_norm_module_path(module_path)
+    try:
+        for parameter_path, value in tree_flatten(parameters):
+            if (
+                hasattr(value, "dtype")
+                and mx.issubdtype(value.dtype, mx.floating)
+                and (
+                    module_path_selected
+                    or _is_norm_parameter_path(parameter_path)
+                )
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_floating_parameter(module) -> bool:
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    try:
+        for _, value in tree_flatten(parameters):
+            if hasattr(value, "dtype") and mx.issubdtype(value.dtype, mx.floating):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_parameterized_non_norm_children(module) -> bool:
+    try:
+        children = module.children()
+    except Exception:
+        return False
+
+    try:
+        for _, child in tree_flatten(children, is_leaf=nn.Module.is_module):
+            if (
+                isinstance(child, nn.Module)
+                and "norm" not in type(child).__name__.lower()
+                and _has_floating_parameter(child)
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _norm_output_cast_input_dtype(args, kwargs):
+    for value in args:
+        if hasattr(value, "dtype"):
+            return value.dtype
+    for value in kwargs.values():
+        if hasattr(value, "dtype"):
+            return value.dtype
+    return None
+
+
+def _is_norm_output_cast_candidate(module_path, module) -> bool:
+    """Return whether a custom module itself produces norm-like output."""
+    norm_cls = type(module)
+    if norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
+        return True
+    if "norm" not in norm_cls.__name__.lower():
+        return False
+    if _has_parameterized_non_norm_children(module):
+        return False
+    if not _has_norm_selected_floating_parameter(module_path, module):
+        return False
+    return True
+
+
+def _iter_norm_output_cast_classes(model=None):
+    norm_classes = []
+    seen = set()
+
+    for norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
+        norm_classes.append(norm_cls)
+        seen.add(norm_cls)
+
+    if model is not None:
+        try:
+            named_modules = model.named_modules()
+        except Exception:
+            named_modules = ()
+        for module_path, module in named_modules:
+            if _is_norm_output_cast_candidate(module_path, module):
+                norm_cls = type(module)
+                if norm_cls not in seen:
+                    norm_classes.append(norm_cls)
+                    seen.add(norm_cls)
+
+    return tuple(norm_classes)
+
+
+def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
+    """Control whether norm outputs are cast back to activation dtype.
+
+    Norm parameters can stay in fp32 for stability, but letting fp32 norm
+    outputs flow through the rest of the graph promotes downstream
+    intermediates and materially increases LoRA/QLoRA memory. Casting the
+    result back matches PyTorch autocast behavior more closely: fp32 norm math,
+    bf16/fp16 downstream activations.
+    """
+    # Sync Qwen3-VL vision-block patch with generic patcher (lazy import: cycle).
+    try:
+        from . import compile as _mlx_compile
+        _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
+    except Exception:
+        pass
+
+    norm_classes = list(_iter_norm_output_cast_classes(model))
+    if not enabled:
+        norm_classes.extend(
+            norm_cls for norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
+            if norm_cls not in norm_classes
+        )
+
+    for norm_cls in norm_classes:
+        patched = norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
+        if enabled:
+            original_call = norm_cls.__call__
+            if (
+                patched
+                or getattr(original_call, "_unsloth_norm_output_cast_wrapper", False)
+            ):
+                continue
+
+            def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):
+                input_dtype = _norm_output_cast_input_dtype(args, kwargs)
+                out = _original_call(self, *args, **kwargs)
+                if (
+                    input_dtype is not None
+                    and hasattr(out, "dtype")
+                    and out.dtype != input_dtype
+                ):
+                    return out.astype(input_dtype)
+                return out
+
+            norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
+            norm_cls._unsloth_original_call = original_call
+            norm_cls.__call__ = norm_call_cast_output
+            norm_cls._unsloth_cast_output_to_input_dtype = True
+            _NORM_OUTPUT_CAST_PATCHED_CLASSES.add(norm_cls)
+        elif patched:
+            original_call = getattr(norm_cls, "_unsloth_original_call", None)
+            if original_call is not None:
+                norm_cls.__call__ = original_call
+            norm_cls._unsloth_original_call = None
+            norm_cls._unsloth_cast_output_to_input_dtype = False
+            _NORM_OUTPUT_CAST_PATCHED_CLASSES.discard(norm_cls)
 
 
 def _normalize_mlx_scheduler_type(name):
@@ -716,7 +868,6 @@ class MLXTrainingConfig:
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
     completion_only_loss: bool | None = None  # None = SFT/VLM default; False trains on prompt+completion
-    assistant_only_loss: bool = False  # Mask non-assistant tokens with chat-template assistant masks
     assistant_token_id: int = 0  # Token ID marking start of assistant response
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
@@ -856,22 +1007,16 @@ class MLXTrainer:
         # 1D second-moment init is numerically unstable).
         self._ensure_lora_frozen(model)
 
-        # Training state. Per-run tracking lives in _reset_run_state (re-run at
-        # each train() so a reused trainer starts clean); callbacks and
-        # pre-created batches persist across runs and stay here.
-        # stop_requested is cleared once at train() entry (before setup) rather
-        # than in _reset_run_state, so an external cancel raised during THIS
-        # run's data prep / optimizer build survives; initialize it here so a
-        # trainer inspected before train() still has the attribute.
-        self.stop_requested = False
-        self._reset_run_state()
+        # Training state
+        self._global_step = 0
+        self._train_loss_history = []
+        self._grad_norm_history = []
+        self._tokens_per_second_history = []
+        self._peak_memory_history = []
+        self._step_times = []
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
-
-        # Hugging Face TrainerCallback support. The handler and TrainerState/
-        # TrainerControl persist across train() runs (callbacks are not reset
-        # in _reset_run_state); _init_callback_state re-seeds state at each run.
         self._ensure_callback_args_compat()
         self.callback_handler = _MLXCallbackHandler(
             callbacks or [],
@@ -886,407 +1031,14 @@ class MLXTrainer:
             "on_init_end",
             self.args, self.state, self.control,
         )
-
-    def _reset_run_state(self):
-        """Per-run training/metric state. Reset from __init__ and inside
-        _train_inner (after setup) so reusing a trainer for a second run starts
-        clean; _early_stopped cleared so a run-1 early stop doesn't block run 2.
-        stop_requested is deliberately NOT reset here: train() clears it once at
-        entry (before any data prep / optimizer build), so an external cancel
-        raised DURING this run's setup survives to the loop's top-of-loop
-        _distributed_should_stop() check instead of being clobbered by this
-        post-setup reset. Callbacks and pre-created batches persist across runs
-        and aren't reset."""
-        self._global_step = 0
-        self._train_loss_history = []
-        self._grad_norm_history = []
-        self._tokens_per_second_history = []
-        self._peak_memory_history = []
-        self._step_times = []
-        self._local_token_count_history = []
-        self._global_token_count_history = []
-        # Per-run eval metrics: cleared so a reused trainer that runs without
-        # eval (eval_steps=0 or no eval dataset) does not report a prior run's
-        # eval_loss/perplexity in its result. Repopulated by _evaluate.
-        self._last_eval_metrics = {}
-        self._early_stopped = False
+        self.stop_requested = False  # Set True to stop training early
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
-        self._distributed_world = None
-        self._distributed_initialized = False
-        self._distributed_rank = 0
-        self._distributed_world_size = 1
-        self._distributed_is_main_process = True
-
-    def _resolved_best_metric_name(self):
-        """metric_for_best_model as it is looked up in eval metrics, mirroring
-        HF Trainer: a present-but-None value falls back to eval_loss, and a
-        bare name ("loss") gets the eval_ prefix eval metric keys carry."""
-        name = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
-        return name if name.startswith("eval_") else f"eval_{name}"
 
     def _train_dataset_for_batches(self):
         """Return the internal dataset used for MLX batch construction."""
         return getattr(self, "_mlx_train_dataset_for_batches", self.train_dataset)
-
-    def _ensure_distributed(self):
-        """Initialize and cache MLX distributed metadata.
-
-        MLX distributed collectives are no-ops at world size 1. The torch-backed
-        MLX test shim returns ``None`` from ``mx.distributed.init()``, so keep a
-        rank-0/world-size-1 fallback for non-real distributed runtimes.
-        """
-        if getattr(self, "_distributed_initialized", False):
-            return getattr(self, "_distributed_world", None)
-
-        world = None
-        rank = 0
-        world_size = 1
-        distributed = getattr(mx, "distributed", None)
-        init = getattr(distributed, "init", None) if distributed is not None else None
-        if callable(init):
-            backend = _mlx_distributed_backend_from_env()
-            if backend is None:
-                world = init()
-            else:
-                try:
-                    world = init(backend=backend)
-                except TypeError:
-                    world = init()
-            if world is not None:
-                rank = int(world.rank())
-                world_size = int(world.size())
-
-        self._distributed_world = world
-        self._distributed_rank = rank
-        self._distributed_world_size = world_size
-        self._distributed_is_main_process = rank == 0
-        self._distributed_initialized = True
-        return world
-
-    @property
-    def distributed_world(self):
-        """Return the cached MLX distributed group, initializing it if needed."""
-        return self._ensure_distributed()
-
-    @property
-    def distributed_rank(self):
-        """Return this process rank in the MLX distributed group."""
-        self._ensure_distributed()
-        return self._distributed_rank
-
-    @property
-    def distributed_world_size(self):
-        """Return the number of processes in the MLX distributed group."""
-        self._ensure_distributed()
-        return self._distributed_world_size
-
-    @property
-    def is_main_process(self):
-        """Return whether this process should own user-visible side effects."""
-        self._ensure_distributed()
-        return self._distributed_is_main_process
-
-    def _distributed_result_fields(self):
-        """Fields included in training results for DDP inspection."""
-        self._ensure_distributed()
-        return {
-            "distributed_world_size": self._distributed_world_size,
-            "distributed_rank": self._distributed_rank,
-            "distributed_is_main_process": self._distributed_is_main_process,
-        }
-
-    def _distributed_rank_vector(self, value, *, as_int=False):
-        """Collect one scalar per rank into a rank-indexed list."""
-        world = self._ensure_distributed()
-        if as_int:
-            local_value = int(value)
-            dtype = mx.int64
-        else:
-            local_value = float(value)
-            dtype = mx.float32
-        if world is None or self._distributed_world_size <= 1:
-            return [local_value]
-        values = [0 for _ in range(self._distributed_world_size)]
-        values[self._distributed_rank] = local_value
-        gathered = self._distributed_all_sum(
-            mx.array(values, dtype=dtype), stream=mx.cpu,
-        )
-        mx.eval(gathered)
-        if as_int:
-            return [int(item) for item in gathered.tolist()]
-        return [float(item) for item in gathered.tolist()]
-
-    def _distributed_rank_history(self, values, *, as_int=False):
-        """Collect a scalar history from every rank without string/object gather."""
-        world = self._ensure_distributed()
-        values = list(values or [])
-        lengths = self._distributed_rank_vector(len(values), as_int=True)
-        max_len = max(lengths) if lengths else len(values)
-        sentinel = -1 if as_int else -1.0
-        if world is None or self._distributed_world_size <= 1:
-            history = [[int(value) if as_int else float(value)] for value in values]
-            return {
-                "lengths": lengths,
-                "values": history,
-            }
-
-        padded = [
-            values[index] if index < len(values) else sentinel
-            for index in range(max_len)
-        ]
-        empty = [0 for _ in range(max_len)]
-        rank_rows = [
-            padded if rank == self._distributed_rank else empty
-            for rank in range(self._distributed_world_size)
-        ]
-        dtype = mx.int64 if as_int else mx.float32
-        gathered = self._distributed_all_sum(
-            mx.array(rank_rows, dtype=dtype), stream=mx.cpu,
-        )
-        mx.eval(gathered)
-        per_rank = gathered.tolist()
-        history = [
-            [
-                None if per_rank[rank][index] == sentinel else per_rank[rank][index]
-                for rank in range(self._distributed_world_size)
-            ]
-            for index in range(max_len)
-        ]
-        return {
-            "lengths": lengths,
-            "values": history,
-        }
-
-    def _distributed_training_diagnostics(
-        self,
-        *,
-        total_time,
-        trained_tokens,
-        compile_scope,
-        compile_fallback_reason,
-    ):
-        """Return DDP diagnostics after training while all ranks are still live."""
-        self._ensure_distributed()
-        hostname = socket.gethostname()
-        host_digest = int.from_bytes(
-            hashlib.blake2b(hostname.encode("utf-8"), digest_size=7).digest(),
-            "little",
-        )
-        host_digests = self._distributed_rank_vector(host_digest, as_int=True)
-        pids = self._distributed_rank_vector(os.getpid(), as_int=True)
-        peak_memory = mx.get_peak_memory() / 1e9
-        per_rank_peak_memory = self._distributed_rank_vector(peak_memory)
-        per_rank_runtime = self._distributed_rank_vector(total_time)
-        # trained_tokens is the all-reduced global total, so gathering it would
-        # report the same world_size-inflated figure for every rank. Use this
-        # rank's local accumulated tokens (same logging cadence) so the
-        # per-rank field reflects true per-rank work.
-        local_trained_tokens = int(
-            sum(getattr(self, "_local_token_count_history", []))
-        )
-        per_rank_tokens = self._distributed_rank_vector(
-            local_trained_tokens, as_int=True,
-        )
-        host_rank_map = [
-            {
-                "rank": rank,
-                "host_digest": digest,
-                "hostname": hostname if digest == host_digest else None,
-                "pid": pids[rank] if rank < len(pids) else None,
-                "is_local_host": digest == host_digest,
-            }
-            for rank, digest in enumerate(host_digests)
-        ]
-        return {
-            "distributed_local_hostname": hostname,
-            "distributed_host_rank_map": host_rank_map,
-            "distributed_train_runtime_per_rank": per_rank_runtime,
-            "distributed_train_runtime_max": max(per_rank_runtime),
-            "distributed_train_runtime_min": min(per_rank_runtime),
-            "distributed_trained_tokens_per_rank": per_rank_tokens,
-            "distributed_global_token_count_history": [
-                int(value) for value in getattr(
-                    self, "_global_token_count_history", []
-                )
-            ],
-            "distributed_per_rank_token_count_history": (
-                self._distributed_rank_history(
-                    getattr(self, "_local_token_count_history", []),
-                    as_int=True,
-                )
-            ),
-            "distributed_tokens_per_second_history": [
-                float(value) for value in getattr(
-                    self, "_tokens_per_second_history", []
-                )
-            ],
-            "distributed_per_rank_tokens_per_second_history": (
-                self._distributed_rank_history(
-                    getattr(self, "_tokens_per_second_history", []),
-                )
-            ),
-            "distributed_step_time_history": [
-                float(value) for value in getattr(self, "_step_times", [])
-            ],
-            "distributed_per_rank_step_time_history": (
-                self._distributed_rank_history(
-                    getattr(self, "_step_times", []),
-                )
-            ),
-            "distributed_peak_memory_gb": max(per_rank_peak_memory),
-            "distributed_peak_memory_gb_per_rank": per_rank_peak_memory,
-            "eval_metrics": dict(getattr(self, "_last_eval_metrics", {})),
-            "compile_fallback": compile_scope == "fallback_eager",
-            "compile_fallback_reason": compile_fallback_reason or "",
-        }
-
-    def _distributed_all_sum(self, value, stream=None):
-        """All-sum a scalar/array on the trainer's distributed group."""
-        world = self._ensure_distributed()
-        if world is None or self._distributed_world_size <= 1:
-            return value
-        return mx.distributed.all_sum(value, group=world, stream=stream)
-
-    def _distributed_any_flag(self, flag):
-        """Return whether any rank reported ``flag``."""
-        return self._distributed_status_mask(int(bool(flag))) > 0
-
-    def _distributed_status_mask(self, mask):
-        """All-sum a small integer status code across ranks."""
-        local = mx.array(int(mask), dtype=mx.int32)
-        total = self._distributed_all_sum(local, stream=mx.cpu)
-        mx.eval(total)
-        return int(total.item())
-
-    def _raise_distributed_failure_from_any(self, failed_any, context, exc=None):
-        """Abort this rank after a rank-wide failure consensus."""
-        if not failed_any:
-            return
-        self.stop_requested = True
-        if exc is not None:
-            raise RuntimeError(
-                f"Unsloth MLX DDP: rank {self.distributed_rank} failed during "
-                f"{context}: {exc}"
-            ) from exc
-        raise RuntimeError(
-            f"Unsloth MLX DDP: a peer rank failed during {context}; "
-            "aborting all ranks."
-        )
-
-    def _raise_distributed_failure(self, failed, context, exc=None):
-        """Abort all ranks if any rank failed before the next collective section."""
-        self._raise_distributed_failure_from_any(
-            self._distributed_any_flag(failed),
-            context,
-            exc,
-        )
-
-    def _distributed_sum_gradient_tree(self, grad):
-        """All-sum a gradient tree while preserving MLX's grouped all-reduce."""
-        world = self._ensure_distributed()
-        if world is None or self._distributed_world_size <= 1:
-            return grad
-        averaged = nn.average_gradients(grad, group=world)
-        return tree_map(
-            lambda value: value * mx.array(
-                self._distributed_world_size, dtype=value.dtype,
-            ),
-            averaged,
-        )
-
-    def _distributed_should_stop(self):
-        """Synchronize stop requests so all ranks leave loops together."""
-        should_stop = self._distributed_any_flag(self.stop_requested)
-        if should_stop:
-            self.stop_requested = True
-        return should_stop
-
-    def _distributed_sync_control_actions(self):
-        """OR the callback log/eval/save requests across ranks.
-
-        HF callbacks are dispatched on rank 0 only, so a callback that flips
-        control.should_log / should_evaluate / should_save sets it on rank 0
-        alone. Those actions run collective code (metric all-reduce, eval, and
-        rank-0-guarded saves), so every rank must agree before entering them or
-        the peers deadlock at the collective. One packed all-sum keeps the flags
-        in lockstep; a no-op at world size 1.
-        """
-        world = self._ensure_distributed()
-        if world is None or self._distributed_world_size <= 1:
-            return
-        base = self._distributed_world_size + 1
-        code = (
-            int(bool(self.control.should_log))
-            + base * int(bool(self.control.should_evaluate))
-            + base * base * int(bool(self.control.should_save))
-        )
-        total = self._distributed_status_mask(code)
-        self.control.should_log = (total % base) > 0
-        self.control.should_evaluate = ((total // base) % base) > 0
-        self.control.should_save = ((total // (base * base)) % base) > 0
-
-    def _distributed_eval_status(self, failed=False):
-        """Synchronize eval stop/failure state with one rank-wide collective."""
-        status_base = self.distributed_world_size + 1
-        status = self._distributed_status_mask(
-            int(bool(self.stop_requested)) + status_base * int(bool(failed))
-        )
-        should_stop = (status % status_base) > 0
-        failed_any = (status // status_base) > 0
-        if should_stop:
-            self.stop_requested = True
-        return should_stop, failed_any
-
-    def _validate_distributed_resume_checkpoint(self, resume_path):
-        """Ensure DDP ranks agree on a complete resume checkpoint."""
-        world = self._ensure_distributed()
-        if world is None or self._distributed_world_size <= 1:
-            return resume_path
-
-        local_resume = mx.array(int(bool(resume_path)), dtype=mx.int32)
-        resume_count = self._distributed_all_sum(local_resume, stream=mx.cpu)
-        mx.eval(resume_count)
-        if int(resume_count.item()) == 0:
-            return None
-        if int(resume_count.item()) != self._distributed_world_size:
-            raise RuntimeError(
-                "Unsloth MLX DDP: all ranks must either resume from the same "
-                "checkpoint or all start fresh."
-            )
-
-        path = Path(resume_path).expanduser().resolve(strict=False)
-        digest = int.from_bytes(
-            hashlib.blake2b(str(path).encode("utf-8"), digest_size=7).digest(),
-            "little",
-        )
-        digests = self._distributed_rank_vector(digest, as_int=True)
-        required = (
-            "adapters.safetensors",
-            "optimizer_state.safetensors",
-            "trainer_state.json",
-        )
-        missing = sum(
-            0 if (path / filename).is_file() else 1
-            for filename in required
-        )
-        missing_total = self._distributed_all_sum(
-            mx.array(missing, dtype=mx.int32), stream=mx.cpu,
-        )
-        mx.eval(missing_total)
-        if any(int(item) != digest for item in digests):
-            raise RuntimeError(
-                "Unsloth MLX DDP: all ranks must use the same "
-                "resume_from_checkpoint path."
-            )
-        if int(missing_total.item()) > 0:
-            raise RuntimeError(
-                "Unsloth MLX DDP: resume checkpoint is incomplete or not "
-                "visible on every rank. Expected adapters.safetensors, "
-                "optimizer_state.safetensors, and trainer_state.json."
-            )
-        return str(path)
 
     def add_step_callback(self, fn):
         """Register a callback called after each logged step.
@@ -1348,10 +1100,6 @@ class MLXTrainer:
         """Initialize TrainerState for HF callback lifecycle events."""
         args = self.args
         eval_steps = int(getattr(args, "eval_steps", 0) or 0)
-        # Reflect the real MLX rank so HF callbacks (loggers, savers) gate their
-        # own I/O correctly. MLX distributed is single-node, so local and world
-        # process-zero both track rank 0.
-        is_main_process = self.is_main_process
         self.state = _MLXTrainerState(
             global_step=int(resume_step),
             max_steps=int(total_steps),
@@ -1361,20 +1109,9 @@ class MLXTrainer:
             train_batch_size=int(getattr(args, "per_device_train_batch_size", 0) or 0),
             num_train_epochs=max(0, int(getattr(args, "num_train_epochs", 0) or 0)),
             log_history=[],
-            is_local_process_zero=is_main_process,
-            is_world_process_zero=is_main_process,
+            is_local_process_zero=True,
+            is_world_process_zero=True,
         )
-        # Seed the callback-visible best-model fields from the restored native
-        # best state (set by the resume block before this call; None on a fresh
-        # run). Otherwise a resumed run starts with state.best_metric=None, so
-        # _update_callback_best_metric and HF callbacks like EarlyStoppingCallback
-        # treat the first post-resume eval as the new best and can overwrite the
-        # real best with a worse metric, diverging from the native best-model
-        # tracking in _run_best_tracking (which uses the restored self._best_metric).
-        self.state.best_metric = self._best_metric
-        self.state.best_global_step = self._best_step
-        if self._best_step is not None:
-            self.state.best_model_checkpoint = f"{args.output_dir}/best"
         self.control = _MLXTrainerControl()
 
     def _sync_callback_stop(self):
@@ -1800,41 +1537,18 @@ class MLXTrainer:
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
-        iterator = iter(eval_batches)
 
-        while True:
-            failed = False
-            error = None
-            try:
-                batch_data = next(iterator)
-            except StopIteration:
+        for batch_data in eval_batches:
+            if self.stop_requested:
                 break
-            except Exception as exc:
-                failed = True
-                error = exc
-
-            if not failed and not self.stop_requested:
-                try:
-                    if is_vlm:
-                        loss, ntoks = loss_fn(self.model, batch_data)
-                    else:
-                        batch, lengths, labels = batch_data
-                        loss, ntoks = loss_fn(self.model, batch, lengths, labels)
-                    all_losses += loss * ntoks
-                    ntokens += ntoks
-                    mx.eval(all_losses, ntokens)
-                except Exception as exc:
-                    failed = True
-                    error = exc
-
-            should_stop, failed_any = self._distributed_eval_status(failed)
-            self._raise_distributed_failure_from_any(
-                failed_any,
-                "evaluation",
-                error,
-            )
-            if should_stop:
-                break
+            if is_vlm:
+                loss, ntoks = loss_fn(self.model, batch_data)
+            else:
+                batch, lengths, labels = batch_data
+                loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+            all_losses += loss * ntoks
+            ntokens += ntoks
+            mx.eval(all_losses, ntokens)
 
         return all_losses, ntokens
 
@@ -1853,8 +1567,6 @@ class MLXTrainer:
                 split_losses, split_tokens = self._evaluate_batch_totals(
                     split_batches, loss_fn, is_vlm=is_vlm,
                 )
-                split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
-                split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
                 all_losses += split_losses
                 ntokens += split_tokens
                 mx.eval(all_losses, ntokens)
@@ -1866,14 +1578,12 @@ class MLXTrainer:
                 split_prefix = f"eval_{split_name}"
                 metrics[f"{split_prefix}_loss"] = split_loss
                 metrics[f"{split_prefix}_perplexity"] = split_ppl
-                if self._distributed_should_stop():
+                if self.stop_requested:
                     break
         else:
             all_losses, ntokens = self._evaluate_batch_totals(
                 eval_batches, loss_fn, is_vlm=is_vlm,
             )
-            all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
-            ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
 
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
@@ -1982,13 +1692,6 @@ class MLXTrainer:
             return
         targets = raw if isinstance(raw, (list, tuple)) else [raw]
         targets = {str(t).lower() for t in targets}
-        # "all" mirrors HF: enable every backend we support on MLX.
-        if "all" in targets:
-            targets |= {"wandb", "tensorboard"}
-        unsupported = targets - {"wandb", "tensorboard", "all", "none"}
-        if unsupported:
-            print(f"Unsloth: report_to target(s) {sorted(unsupported)} are not "
-                  f"supported on MLX; only 'wandb' and 'tensorboard' are logged.")
 
         wandb_run = None
         if "wandb" in targets:
@@ -2013,12 +1716,8 @@ class MLXTrainer:
                 except ImportError:
                     SummaryWriter = None
             if SummaryWriter is not None:
-                try:
-                    tb_writer = SummaryWriter(
-                        log_dir=os.path.join(self.args.output_dir, "runs"))
-                except Exception as e:
-                    print(f"Unsloth: tensorboard init failed: {e}")
-                    tb_writer = None
+                tb_writer = SummaryWriter(
+                    log_dir=os.path.join(self.args.output_dir, "runs"))
 
         if wandb_run is None and tb_writer is None:
             return
@@ -2074,9 +1773,7 @@ class MLXTrainer:
         unchanged -- .weight stays readable for tied LM-head models, and
         __call__ resolves on the subtype so interception actually fires."""
         alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
-        # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison
-        # every embedding with nan/inf noise from step 0.
-        if not math.isfinite(alpha) or alpha <= 0:
+        if alpha <= 0:
             return
         if self._is_vlm:
             print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
@@ -2108,16 +1805,6 @@ class MLXTrainer:
                     return out + noise
                 return out
 
-        # Report the base class's name so the save-window DoRA detection
-        # (`type(module).__name__.startswith("DoRA")` in mlx/utils.py) sees
-        # through this transparent stand-in. An embedding-only DoRA adapter
-        # (use_dora=True targets embed_tokens) is what NEFTune subclasses here,
-        # so a bare "_NEFTuneEmbed" name would fail that check and silently
-        # demote the DoRA adapter to plain LoRA on save. The quantization-map
-        # scan is safe without this: it already keys on isinstance, not name.
-        _NEFTuneEmbed.__name__ = _Base.__name__
-        _NEFTuneEmbed.__qualname__ = getattr(_Base, "__qualname__", _Base.__name__)
-
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
         emb.__class__ = _NEFTuneEmbed
@@ -2138,30 +1825,13 @@ class MLXTrainer:
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
-        # Clear a stale stop from a PRIOR run at the EARLIEST point, before any
-        # data prep / optimizer build / _train_inner, so a reused trainer starts
-        # un-stopped. _reset_run_state (post-setup) no longer touches this, so an
-        # external cancel raised DURING this run's setup (e.g. a Studio cancel on
-        # a large dataset materializing in _prepare_data) survives to the loop's
-        # top-of-loop _distributed_should_stop() check. Local assignment only, no
-        # DDP collective.
-        self.stop_requested = False
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
-        self._ensure_distributed()
+        self._setup_report_to_callbacks()
         self._install_neftune()
-        is_main_process = self.is_main_process
-
-        def _main_print(*print_args, **print_kwargs):
-            if is_main_process:
-                print(*print_args, **print_kwargs)
-
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
-        _prev_norm_output_cast_state = snapshot_mlx_norm_output_cast_state(
-            iter_mlx_norm_output_cast_classes(model)
-        )
         # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
@@ -2172,12 +1842,12 @@ class MLXTrainer:
         except Exception:
             pass
         # Patch INSIDE try/finally so any raise during setup still restores globals.
+        _norm_cast_applied = False
         try:
-            from .loader import _keep_norm_parameters_float32
-            _keep_norm_parameters_float32(model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
+            _norm_cast_applied = True
             if cast_norm_output:
-                _main_print("Unsloth: Casting MLX norm outputs back to activation dtype.")
+                print("Unsloth: Casting MLX norm outputs back to activation dtype.")
             args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
             model._unsloth_patch_mode = args.patch_mode
 
@@ -2202,7 +1872,7 @@ class MLXTrainer:
                         args, self._compile_decision
                     )
                     for setting, value, reason in self._compile_auto_tune_applied:
-                        _main_print(
+                        print(
                             f"Unsloth: Auto-tuned {setting}={value!r} for MLX compile "
                             f"({reason})"
                         )
@@ -2222,7 +1892,7 @@ class MLXTrainer:
                     parts.append(
                         f"wired_limit={self._memory_limits_applied['wired_limit_gb']:.2f} GB"
                     )
-                _main_print(
+                print(
                     "Unsloth: MLX Metal memory guard enabled "
                     f"({', '.join(parts)})."
                 )
@@ -2230,12 +1900,11 @@ class MLXTrainer:
             # Apply gradient checkpointing if requested
             if args.gradient_checkpointing:
                 apply_gradient_checkpointing(model)
-                _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
+                print("Unsloth: Using gradient checkpointing to reduce memory.")
 
             # Qwen3.5-specific fixes
             config = getattr(model, "_config", {})
             model_type = config.get("model_type", "") if isinstance(config, dict) else ""
-            gated_delta_patched = False
             if "qwen3_5" in model_type:
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
@@ -2243,23 +1912,12 @@ class MLXTrainer:
                 from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
                 patch_gated_delta()
                 patch_gated_delta_vlm()
-                gated_delta_patched = True
-            # Structural check: qwen3_next / kimi_linear also need the VJP.
-            if not gated_delta_patched and model_has_gated_delta_layers(model):
-                from ..gated_delta_vjp import patch_gated_delta
-                patch_gated_delta()
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
                 from .loader import _disable_fused_mrope
                 _disable_fused_mrope(model)
 
-            # Register W&B/TensorBoard reporters after arg auto-tuning so the
-            # W&B config snapshot reflects the settings actually used (e.g. VLM
-            # compile auto-tune can flip gradient_checkpointing before training).
-            # Only rank 0 opens W&B / TensorBoard so DDP runs don't double-log.
-            if self.is_main_process:
-                self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
             _handles = getattr(self, "_report_to_handles", (None, None))
@@ -2285,11 +1943,12 @@ class MLXTrainer:
                 self._restore_memory_limits()
             except Exception:
                 pass
-            # Restore the pre-run process-global norm patch state, even if setup failed mid-patch.
-            try:
-                restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
-            except Exception:
-                pass
+            if _norm_cast_applied and cast_norm_output:
+                # Undo the global norm-class patch; tolerate partial state.
+                try:
+                    _set_norm_output_cast_to_input_dtype(False, model)
+                except Exception:
+                    pass
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
@@ -2304,12 +1963,6 @@ class MLXTrainer:
         args = self.args
         model = self.model
         is_vlm = self._is_vlm
-        distributed_world_size = self.distributed_world_size
-        is_main_process = self.is_main_process
-
-        def _main_print(*print_args, **print_kwargs):
-            if is_main_process:
-                print(*print_args, **print_kwargs)
 
         # Pick loss function (returns (loss, ntoks))
         use_cce = args.use_cce
@@ -2330,28 +1983,22 @@ class MLXTrainer:
                     ignore_token_ids=_vlm_ignore_token_ids,
                 )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                _main_print(
-                    f"Unsloth: Using VLM CCE loss ({cce_backend}) "
-                    "for memory-efficient training."
-                )
+                print(f"Unsloth: Using VLM CCE loss ({cce_backend}) for memory-efficient training.")
             else:
                 loss_fn = make_vlm_baseline_loss_fn(
                     model,
                     assistant_token_id=_atid,
                     ignore_token_ids=_vlm_ignore_token_ids,
                 )
-                _main_print("Unsloth: Using VLM standard cross-entropy loss.")
+                print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                _main_print(
-                    f"Unsloth: Using CCE loss ({cce_backend}) "
-                    "for memory-efficient training."
-                )
+                print(f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training.")
             else:
                 loss_fn = make_baseline_loss_fn()
-                _main_print("Unsloth: Using standard cross-entropy loss.")
+                print("Unsloth: Using standard cross-entropy loss.")
 
         # Prepare data, determine total_steps first. Keep any prebuilt flag
         # from train_on_responses_only; _prepare_data returns self._batches
@@ -2398,14 +2045,8 @@ class MLXTrainer:
         # was called, so we only handle optimizer and trainer state here.
         # The step offset is applied below at loop start so the LR scheduler
         # and dataloader fast-forward to the right position.
-        # Reset per-run state so reusing a trainer for a second train() without
-        # resume starts clean (else run-1's early-stop flag breaks the loop at
-        # step 0). The resume block below re-seeds the persisted fields.
-        self._reset_run_state()
-
         _resume_step = 0
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
-        _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
         if _resume_from:
             try:
                 # 1. Load trained adapter weights into the model. The model
@@ -2417,37 +2058,11 @@ class MLXTrainer:
                 )
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
-                # 3. Restore trainer scalars (step counter, loss history, and
-                #    best-model / early-stopping tracking). .get defaults keep
-                #    pre-fix checkpoints (which lack these keys) resumable.
+                # 3. Restore trainer scalars (step counter, loss history).
                 ts = load_trainer_state(_resume_from)
                 _resume_step = int(ts.get("global_step", 0))
-                # Seed the live step counter from the checkpoint so a no-op
-                # resume (checkpoint already at max_steps, loop body never runs)
-                # still reports the reached step instead of the initial 0. The
-                # loop overwrites this on every optimizer step of a real resume.
-                self._global_step = _resume_step
                 self._train_loss_history = list(ts.get("train_loss_history", []))
-                self._best_metric = ts.get("best_metric", None)
-                self._best_step = ts.get("best_step", None)
-                self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
-                # best/ lives in output_dir, not in the checkpoint dir, so a
-                # checkpoint resumed elsewhere (copied dir, new output_dir) can
-                # carry best-model state whose weights aren't present. Keep the
-                # state only when they are: an unloadable "best" would suppress
-                # best-saves and early-stop against a model that
-                # load_best_model_at_end can't restore.
-                _best_path = f"{args.output_dir}/best/adapters.safetensors"
-                if self._best_step is not None and not os.path.exists(_best_path):
-                    _main_print(
-                        f"Unsloth: checkpoint carries best-model state (step "
-                        f"{self._best_step}) but {args.output_dir}/best has no "
-                        f"saved weights; restarting best-model tracking."
-                    )
-                    self._best_metric = None
-                    self._best_step = None
-                    self._es_patience_counter = 0
-                _main_print(
+                print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
                 )
@@ -2471,7 +2086,7 @@ class MLXTrainer:
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
-            _main_print(f"Unsloth: LoRA+ enabled (ratio={lora_plus_ratio}).")
+            print(f"Unsloth: LoRA+ enabled (ratio={lora_plus_ratio}).")
 
         embedding_lr = args.embedding_learning_rate
         main_lr = args.learning_rate
@@ -2479,10 +2094,8 @@ class MLXTrainer:
         use_embedding_lr = embedding_lr > 0 and main_lr > 0
         embedding_lr_ratio = embedding_lr / main_lr if use_embedding_lr else 1.0
         if use_embedding_lr:
-            _main_print(
-                f"Unsloth: Embedding LR = {embedding_lr:.2e} "
-                f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e})."
-            )
+            print(f"Unsloth: Embedding LR = {embedding_lr:.2e} "
+                  f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e}).")
 
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
         _warned_skip_optimizer_state_grad_norm = False
@@ -2505,7 +2118,7 @@ class MLXTrainer:
             if _raw_mgln is not None and float(_raw_mgln or 0.0) > 0:
                 conflicts.append("max_grad_leaf_norm")
             if conflicts:
-                _main_print(
+                print(
                     "Unsloth: max_grad_value is elementwise and overrides "
                     f"{', '.join(conflicts)}."
                 )
@@ -2513,7 +2126,7 @@ class MLXTrainer:
             max_grad_leaf_norm > 0
             and float(getattr(args, "max_grad_norm", 0.0) or 0.0) > 0
         ):
-            _main_print(
+            print(
                 "Unsloth: max_grad_leaf_norm is enabled; ignoring "
                 "max_grad_norm to avoid double clipping."
             )
@@ -2524,7 +2137,6 @@ class MLXTrainer:
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
             grad_accum == 1 and
-            distributed_world_size <= 1 and
             not _needs_grad_scaling and
             max_grad_norm <= 0 and
             not _clip_grad_value and
@@ -2636,11 +2248,6 @@ class MLXTrainer:
             its norm; non-global modes report after update from Adam state to
             keep the backward graph single-consumer.
             """
-            if distributed_world_size > 1:
-                grad = self._distributed_sum_gradient_tree(grad)
-                toks_f = self._distributed_all_sum(toks_f)
-                if int(toks_f.item()) == 0:
-                    return None
             safe_toks_f = mx.maximum(
                 toks_f, mx.array(1.0, dtype=mx.float32)
             )
@@ -2689,15 +2296,22 @@ class MLXTrainer:
             _restore_trainable_storage_dtypes()
             return grad_norm
 
-        def _loss_and_grad(batch_data):
+        # Unified step for VLM (dict batch) and text (tuple batch) training.
+        def step_fn(batch_data, prev_state, do_update):
             if isinstance(batch_data, dict):
-                return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(
-                model, batch_data[0], batch_data[1], batch_data[2]
-            )
+                (lvalue, toks), grad = loss_and_grad_fn(model, batch_data)
+            else:
+                (lvalue, toks), grad = loss_and_grad_fn(model, batch_data[0], batch_data[1], batch_data[2])
 
-        def _accumulate_weighted_grad(grad, toks_f, prev_state):
-            """Accumulate token-weighted grads without distributed collectives."""
+            if _direct_single_step_update:
+                grad_norm = _apply_update_direct(grad)
+                return lvalue, toks, None, grad_norm
+
+            toks_f = toks.astype(mx.float32)
+            grad_norm = mx.array(0.0, dtype=mx.float32)
+
+            # Scale-and-accumulate per micro-batch, casting the scalar to each
+            # leaf's dtype so bf16/fp16 grad trees avoid fp32 promotion.
             if prev_state is not None:
                 prev_grad, prev_toks = prev_state
                 # stop_gradient: accumulated grads are state, not something to
@@ -2715,30 +2329,6 @@ class MLXTrainer:
                     lambda g: g * toks_f.astype(g.dtype),
                     grad,
                 )
-            return grad, toks_f
-
-        def _local_grad_step(batch_data, prev_state):
-            """Local loss/grad accumulation step, safe to compile under DDP."""
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
-            toks_f = toks.astype(mx.float32)
-            grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
-            # Carried as state across loop iterations, or reduced eagerly
-            # outside mx.compile under DDP.
-            grad = tree_map(mx.stop_gradient, grad)
-            toks_f = mx.stop_gradient(toks_f)
-            return lvalue, toks, (grad, toks_f)
-
-        # Unified step for VLM (dict batch) and text (tuple batch) training.
-        def step_fn(batch_data, prev_state, do_update):
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
-
-            if _direct_single_step_update:
-                grad_norm = _apply_update_direct(grad)
-                return lvalue, toks, None, grad_norm
-
-            toks_f = toks.astype(mx.float32)
-            grad_norm = mx.array(0.0, dtype=mx.float32)
-            grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
 
             if do_update:
                 grad_norm = _apply_update(grad, toks_f)
@@ -2751,14 +2341,8 @@ class MLXTrainer:
         compile_policy = build_compile_policy(args=args)
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
-        _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
-        if (
-            _use_compile
-            and not _ddp_compile_local_grad
-            and max_grad_norm > 0
-            and grad_accum > 1
-        ):
-            _main_print(
+        if _use_compile and max_grad_norm > 0 and grad_accum > 1:
+            print(
                 "Unsloth: mx.compile disabled because MLX global norm "
                 "clipping is enabled with gradient accumulation."
             )
@@ -2789,144 +2373,26 @@ class MLXTrainer:
                     f"({_compile_decision.reason})."
                 )
             if not _compile_decision.enabled:
-                _main_print(
+                print(
                     f"Unsloth: mx.compile disabled for VLM arch "
                     f"'{_compile_decision.arch}' during training; using eager mode "
                     f"({_compile_decision.reason})."
                 )
                 if getattr(model, "_unsloth_compile_explain", None):
-                    _main_print("Unsloth: Compile trace summary:")
+                    print("Unsloth: Compile trace summary:")
                     for line in model._unsloth_compile_explain.splitlines():
-                        _main_print(f"  {line}")
+                        print(f"  {line}")
                 _use_compile = False
-        _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
-        _compile_scope = "none"
-        _compile_fallback_reason = None
-        _compile_state = state
-        class _DDPCompiledLocalGradError(RuntimeError):
-            """Marks failures from the compiled DDP local-gradient graph."""
-
-        def _is_compile_exception(exc):
-            msg = str(exc).lower()
-            return (
-                "compile" in msg
-                or "primitive" in msg
-                or "trace" in msg
-            )
-
-        def _compile_fallback_allowed():
-            return (
-                _compile_decision.fallback_allowed
-                if _compile_decision is not None
-                else compile_policy.mode != "strict"
-            )
-
-        def _strict_compile_error(exc=None, peer=False):
-            peer_text = " on a peer rank" if peer else ""
-            error = RuntimeError(
-                "Unsloth: strict mx.compile was enabled "
-                f"and runtime fallback is disabled{peer_text}."
-            )
-            if exc is not None:
-                raise error from exc
-            raise error
-
-        _ddp_update_outside_step = distributed_world_size > 1
-
-        def _ddp_eager_local_step_fn(batch_data, prev_state, do_update):
-            lvalue, toks, local_state = _local_grad_step(batch_data, prev_state)
-            return lvalue, toks, local_state, None
-
         if _use_compile:
             _uncompiled_step_fn = step_fn
-            if _ddp_compile_local_grad:
-                _compile_state = [model.state, mx.random.state]
-                _main_print(
-                    "Unsloth: mx.compile enabled for MLX DDP local "
-                    "loss/gradient accumulation; distributed collectives "
-                    "remain eager."
-                )
-                _compiled_local_grad_step = None
-                _compile_setup_error = None
-                try:
-                    _compiled_local_grad_step = mx.compile(
-                        _local_grad_step,
-                        inputs=_compile_state,
-                        outputs=_compile_state,
-                    )
-                except Exception as e:
-                    _compile_setup_error = e
-                if self._distributed_any_flag(_compile_setup_error is not None):
-                    if not _compile_fallback_allowed():
-                        _strict_compile_error(
-                            _compile_setup_error,
-                            peer=_compile_setup_error is None,
-                        )
-                    _main_print(
-                        "Unsloth: mx.compile failed during setup; "
-                        "falling back to eager mode."
-                    )
-                    _use_compile = False
-                    _compile_scope = "fallback_eager"
-                    _compile_fallback_reason = "setup_error"
-                    step_fn = _uncompiled_step_fn
-                    _ddp_compile_local_grad = False
-                    _compiled_local_grad_step = None
-
-                def _ddp_compiled_step_fn(batch_data, prev_state, do_update):
-                    try:
-                        lvalue, toks, local_state = _compiled_local_grad_step(
-                            batch_data, prev_state,
-                        )
-                        mx.eval(
-                            _compile_state,
-                            lvalue,
-                            toks,
-                            local_state[0],
-                            local_state[1],
-                        )
-                    except Exception as e:
-                        if _is_compile_exception(e):
-                            raise _DDPCompiledLocalGradError(str(e)) from e
-                        raise
-                    return lvalue, toks, local_state, None
-
-                if _use_compile:
-                    step_fn = _ddp_compiled_step_fn
-                    _compile_scope = "ddp_local_grad"
-            else:
-                try:
-                    step_fn = mx.compile(step_fn, inputs=state, outputs=state)
-                except (ValueError, RuntimeError, TypeError) as e:
-                    if not _compile_fallback_allowed():
-                        _strict_compile_error(e)
-                    _main_print(
-                        "Unsloth: mx.compile failed during setup; "
-                        "falling back to eager mode."
-                    )
-                    step_fn = _uncompiled_step_fn
-                    _use_compile = False
-                    _compile_scope = "fallback_eager"
-                    _compile_fallback_reason = "setup_error"
-                else:
-                    _compile_scope = "full_step"
-
-        if _ddp_update_outside_step and not _ddp_compile_local_grad:
-            step_fn = _ddp_eager_local_step_fn
+            step_fn = mx.compile(step_fn, inputs=state, outputs=state)
 
         # Prepare eval batches
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
-        text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
         def _prepare_eval_batches():
-            """Materialize eval batches the first time evaluation is requested.
-
-            Deferred so a callback can request evaluation even when the static
-            eval cadence is off. Every rank enters this together (the eval
-            control flag is rank-synced), so the collective create_batches call
-            stays in lockstep.
-            """
+            """Materialize eval batches the first time evaluation is requested."""
             nonlocal eval_batches
             if eval_batches is not None or self.eval_dataset is None:
                 return eval_batches
@@ -2956,8 +2422,6 @@ class MLXTrainer:
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
                             completion_only_loss=text_completion_only_loss,
-                            comm_group=self.distributed_world,
-                            distributed_pad_mode="empty",
                         )
                     return create_batches(
                         dataset=eval_dataset,
@@ -2975,10 +2439,6 @@ class MLXTrainer:
                             else None
                         ),
                         append_eos=bool(getattr(args, "append_eos", True)),
-                        completion_only_loss=text_completion_only_loss,
-                        assistant_only_loss=text_assistant_only_loss,
-                        comm_group=self.distributed_world,
-                        distributed_pad_mode="empty",
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2994,59 +2454,17 @@ class MLXTrainer:
                     sum(len(value) for value in eval_batches.values())
                     if isinstance(eval_batches, dict) else len(eval_batches)
                 )
-                _main_print(
-                    f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                    f"({eval_batch_count} eval batches)."
-                )
+                print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                      f"({eval_batch_count} eval batches).")
             return eval_batches
-
-        def _fire(event, **kwargs):
-            """Dispatch an HF callback event on rank 0 only.
-
-            Callbacks perform host I/O (logging, saving, printing) and must not
-            run on every rank. Any resulting control-flag change is propagated
-            to the peer ranks by the caller (_sync_stop for the stop flag, or
-            _distributed_sync_control_actions for log/eval/save).
-
-            A callback that raises on rank 0 (an integration/logging error) must
-            not unwind rank 0 alone: the peers, which never enter this branch,
-            would return here and hang at the next collective while rank 0
-            aborts. Route the rank-0 failure through the distributed consensus
-            path (all ranks call _fire in lockstep) so every rank aborts with
-            the original error surfaced. Single-process keeps re-raising the
-            original exception unchanged.
-            """
-            call_error = None
-            if is_main_process:
-                try:
-                    self.control = self.callback_handler.call_event(
-                        event, args, self.state, self.control, **kwargs,
-                    )
-                except Exception as e:
-                    call_error = e
-            if distributed_world_size > 1:
-                self._raise_distributed_failure(
-                    call_error is not None,
-                    f"{event} callback",
-                    call_error,
-                )
-            elif call_error is not None:
-                raise call_error
-
-        def _sync_stop():
-            """Propagate a callback stop request to every rank in lockstep.
-
-            _sync_callback_stop copies control.should_training_stop into
-            stop_requested on rank 0; _distributed_should_stop all-reduces the
-            OR of stop_requested so no rank is left spinning while rank 0 exits.
-            """
-            self._sync_callback_stop()
-            return self._distributed_should_stop()
 
         self.callback_handler.train_dataloader = batches if batches is not None else batch_iter
         self.control.should_training_stop = False
-        _fire("on_train_begin")
-        _sync_stop()
+        self.control = self.callback_handler.call_event(
+            "on_train_begin",
+            args, self.state, self.control,
+        )
+        self._sync_callback_stop()
 
         features = []
         if is_vlm:
@@ -3056,11 +2474,7 @@ class MLXTrainer:
         if args.gradient_checkpointing:
             features.append("GC")
         if _use_compile:
-            features.append(
-                "compile"
-                if _compile_scope == "full_step"
-                else f"compile={_compile_scope}"
-            )
+            features.append("compile")
         elif _compile_decision is not None:
             features.append(f"compile={_compile_decision.support_state}")
         if use_lora_plus:
@@ -3072,19 +2486,15 @@ class MLXTrainer:
         else:
             features.append(f"opt={args.optim}")
 
-        _main_print(
-            f"Unsloth: Training for {total_steps} steps, "
-            f"BS={args.per_device_train_batch_size}, "
-            f"grad_accum={grad_accum}, "
-            f"seq_len={args.max_seq_length}"
-        )
-        _main_print(f"Unsloth: Features: {', '.join(features)}")
+        print(f"Unsloth: Training for {total_steps} steps, "
+              f"BS={args.per_device_train_batch_size}, "
+              f"grad_accum={grad_accum}, "
+              f"seq_len={args.max_seq_length}")
+        print(f"Unsloth: Features: {', '.join(features)}")
         if _compile_decision is not None and _compile_decision.setting_recommendations:
-            _main_print("Unsloth: Compile recommendations:")
+            print("Unsloth: Compile recommendations:")
             for rec in _compile_decision.setting_recommendations:
-                _main_print(
-                    f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}"
-                )
+                print(f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}")
 
         # Training loop — mlx-lm pattern
         model.train()
@@ -3099,10 +2509,13 @@ class MLXTrainer:
         batches_per_epoch = self._callback_batches_per_epoch(batches)
 
         def _run_callback_epoch_begin(epoch_value):
-            """Dispatch one epoch-begin event at a dataset boundary (rank 0)."""
+            """Dispatch one epoch-begin event at the requested epoch value."""
             self.state.epoch = epoch_value
-            _fire("on_epoch_begin")
-            _sync_stop()
+            self.control = self.callback_handler.call_event(
+                "on_epoch_begin",
+                args, self.state, self.control,
+            )
+            self._sync_callback_stop()
 
         def _maybe_callback_epoch_begin(microstep):
             """Dispatch epoch-begin at finite dataset boundaries."""
@@ -3116,31 +2529,22 @@ class MLXTrainer:
             if not batches_per_epoch or microstep % batches_per_epoch != 0:
                 return
             self.state.epoch = microstep / batches_per_epoch
-            _fire("on_epoch_end")
-            # on_epoch_end fires on rank 0 only; sync the log/eval/save requests
-            # before the collective control actions so peers stay in lockstep.
-            self._distributed_sync_control_actions()
+            self.control = self.callback_handler.call_event(
+                "on_epoch_end",
+                args, self.state, self.control,
+            )
             if self.control.should_log or self.control.should_evaluate or self.control.should_save:
                 _run_callback_control_actions(current_step, grad_norm)
-            _sync_stop()
+            self._sync_callback_stop()
 
         def _run_training_log(current_step, grad_norm):
-            """Emit one MLX/HF training log from accumulated loss counters.
-
-            The loss/token totals are all-reduced so every rank logs the same
-            global figures; host I/O (printing, step callbacks, on_log) runs on
-            rank 0 only.
-            """
+            """Emit one MLX/HF training log from accumulated loss counters."""
             nonlocal losses, n_tokens, steps, train_time, trained_tokens
-            metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
-            metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
-            mx.eval(metric_losses, metric_tokens)
-            train_loss = (
-                (metric_losses / metric_tokens).item()
-                if metric_tokens.item() > 0 else 0.0
-            )
-            local_tok_count = int(n_tokens.item())
-            tok_count = int(metric_tokens.item())
+            tok_count = n_tokens.item() if hasattr(n_tokens, "item") else n_tokens
+            if int(tok_count) == 0:
+                self.control.should_log = False
+                return
+            train_loss = (losses / n_tokens).item()
             trained_tokens += tok_count
             lr_val = optimizer.learning_rate.item()
             tokens_sec = tok_count / train_time if train_time > 0 else 0
@@ -3156,8 +2560,6 @@ class MLXTrainer:
             self._tokens_per_second_history.append(tokens_sec)
             self._peak_memory_history.append(peak_mem)
             self._step_times.append(train_time / steps if steps > 0 else 0)
-            self._local_token_count_history.append(local_tok_count)
-            self._global_token_count_history.append(tok_count)
 
             reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
             if reset_after > 0 and current_step == reset_after:
@@ -3169,7 +2571,7 @@ class MLXTrainer:
                 f"Grad: {grad_norm_val:.4f} | "
                 if grad_norm_val is not None else ""
             )
-            _main_print(
+            print(
                 f"  Step {current_step}/{total_steps} | "
                 f"Loss: {train_loss:.4f} | "
                 f"{grad_text}"
@@ -3178,16 +2580,15 @@ class MLXTrainer:
                 f"Peak: {peak_mem:.2f} GB"
             )
 
-            if is_main_process:
-                for cb in self._step_callbacks:
-                    try:
-                        cb(
-                            current_step, total_steps, train_loss, lr_val,
-                            tokens_sec, peak_mem, elapsed_total, trained_tokens,
-                            grad_norm_val,
-                        )
-                    except Exception as e:
-                        _main_print(f"Unsloth: step callback error: {e}")
+            for cb in self._step_callbacks:
+                try:
+                    cb(
+                        current_step, total_steps, train_loss, lr_val,
+                        tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                        grad_norm_val,
+                    )
+                except Exception as e:
+                    print(f"Unsloth: step callback error: {e}")
 
             logs = {
                 "loss": train_loss,
@@ -3198,19 +2599,7 @@ class MLXTrainer:
             }
             if grad_norm_val is not None:
                 logs["grad_norm"] = grad_norm_val
-            self.control.should_log = False
-            if is_main_process:
-                record = dict(logs)
-                record["step"] = self.state.global_step
-                self.state.log_history.append(record)
-            _fire("on_log", logs=logs)
-            # on_log fires on rank 0 only and may itself request an eval or save
-            # (HF checks should_evaluate/should_save after logging in the same
-            # step). Sync those flags now: the caller's should_eval / should_save
-            # branches run collective eval + rank-0-guarded saves, so a request
-            # set on rank 0 alone would make rank 0 enter _run_eval/_run_checkpoint
-            # while peers skip them and hang at the collective. No-op at world 1.
-            self._distributed_sync_control_actions()
+            self._call_callback_log(logs)
 
             losses = 0
             n_tokens = 0
@@ -3218,7 +2607,7 @@ class MLXTrainer:
             train_time = 0
 
         def _run_eval(current_step):
-            """Run eval and dispatch MLX/HF eval callbacks in DDP lockstep."""
+            """Run eval and dispatch MLX/HF eval callbacks."""
             current_eval_batches = _prepare_eval_batches()
             if not current_eval_batches:
                 self.control.should_evaluate = False
@@ -3226,72 +2615,41 @@ class MLXTrainer:
             val_loss, ppl = self._evaluate(
                 current_eval_batches, loss_fn, is_vlm=is_vlm)
             model.train()
-            _main_print(
+            print(
                 f"  Eval  {current_step}/{total_steps} | "
                 f"Val Loss: {val_loss:.4f} | "
                 f"Perplexity: {ppl:.2f}"
             )
-            if is_main_process:
-                for cb in self._eval_callbacks:
-                    try:
-                        cb(current_step, val_loss, ppl)
-                    except Exception as e:
-                        _main_print(f"Unsloth: eval callback error: {e}")
+            for cb in self._eval_callbacks:
+                try:
+                    cb(current_step, val_loss, ppl)
+                except Exception as e:
+                    print(f"Unsloth: eval callback error: {e}")
 
-            metrics = self._last_eval_metrics or {}
-            self.control.should_evaluate = False
-            if is_main_process:
-                record = dict(metrics)
-                record["step"] = self.state.global_step
-                self.state.log_history.append(record)
-            _fire("on_log", logs=dict(metrics))
-            _fire("on_evaluate", metrics=metrics)
-            # on_log/on_evaluate fire on rank 0 only, and either may itself
-            # request a log/eval/save (HF checks should_save after on_evaluate in
-            # the same step). Sync those flags now, before the caller reads
-            # should_log / should_save: those branches run collective code
-            # (metric all-reduce, rank-0-guarded checkpoint save + on_save), so a
-            # request set on rank 0 alone would make rank 0 enter
-            # _run_training_log/_run_checkpoint while peers skip them and hang at
-            # the collective. Mirrors the on_log sync in _run_training_log; no-op
-            # at world size 1.
-            self._distributed_sync_control_actions()
-            self._update_callback_best_metric(metrics)
-            # An external cancel arriving before/during eval is OR-reduced here so
-            # every rank agrees on stop_requested before the divergent best-model /
-            # early-stopping branch in _run_best_tracking (its rank-0-guarded best
-            # save would otherwise hang peers). A callback stop requested during
-            # on_step_end / on_evaluate is deliberately NOT copied into
-            # stop_requested yet: HF (_maybe_log_save_evaluate) runs
-            # _determine_best_metric and writes the checkpoint for this step BEFORE
-            # the loop honors should_training_stop, so latching the callback stop
-            # here would make _run_best_tracking (gated on not stop_requested) skip
-            # a valid, improving eval, leaving load_best_model_at_end to restore a
-            # stale model. The callback stop is applied by the caller's tail
-            # _sync_stop(), after best tracking and the same-step save. No-op at
-            # world size 1.
-            self._distributed_should_stop()
+            self._call_callback_evaluate(self._last_eval_metrics or {})
+            self._update_callback_best_metric(self._last_eval_metrics or {})
             return True
 
         def _run_best_tracking(current_step):
-            """Update native best-model + early-stopping state in DDP lockstep."""
-            _track = not self.stop_requested and (
-                getattr(args, "load_best_model_at_end", False)
-                or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
-            )
+            """Update MLX native best-model and early-stopping state."""
+            _track = getattr(args, "load_best_model_at_end", False) or \
+                int(getattr(args, "early_stopping_patience", 0) or 0) > 0
             if not _track:
                 return
-            _metric_name = self._resolved_best_metric_name()
-            _em = self._last_eval_metrics or {}
-            if _metric_name not in _em:
+            _metric_name = self._metric_for_best_model_name(
+                self._last_eval_metrics or {},
+                require=True,
+            )
+            if _metric_name is None:
                 raise ValueError(
-                    f"metric_for_best_model={_metric_name!r} not in eval "
-                    f"metrics; available: {sorted(_em)}"
+                    "metric_for_best_model must be set when best-model "
+                    "tracking or early stopping is enabled."
                 )
+            _em = self._last_eval_metrics or {}
             _cur = _em[_metric_name]
             _greater = bool(getattr(args, "greater_is_better", False))
             _improved = (
-                _cur == _cur  # reject NaN: a diverged eval must never be "best"
+                _cur == _cur
                 and (
                     self._best_metric is None
                     or (_cur > self._best_metric if _greater else _cur < self._best_metric)
@@ -3304,107 +2662,50 @@ class MLXTrainer:
                 self.state.best_global_step = current_step
                 self.state.best_model_checkpoint = f"{args.output_dir}/best"
                 self._es_patience_counter = 0
-                # Bookkeeping runs on every rank to keep early-stopping in
-                # lockstep; only rank 0 writes output_dir/best. Sync save
-                # failures so a rank-0 error does not hang peers at the next
-                # collective.
-                best_save_error = None
-                if is_main_process:
-                    try:
-                        save_trainable_adapters(model, f"{args.output_dir}/best")
-                    except ValueError as e:
-                        _main_print(f"  Unsloth: skipped best-model save ({e})")
-                    except Exception as e:
-                        best_save_error = e
-                self._raise_distributed_failure(
-                    best_save_error is not None,
-                    "best-model save",
-                    best_save_error,
-                )
+                try:
+                    save_trainable_adapters(model, f"{args.output_dir}/best")
+                except ValueError as e:
+                    print(f"  Unsloth: skipped best-model save ({e})")
             else:
                 self._es_patience_counter += 1
                 _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
                 if _pat > 0 and self._es_patience_counter >= _pat:
-                    _main_print(
+                    print(
                         f"Unsloth: early stopping at step {current_step} "
                         f"(no {_metric_name} improvement in {_pat} evals)."
                     )
-                    self._early_stopped = True
+                    self.stop_requested = True
 
         def _run_checkpoint(current_step):
-            """Save a step checkpoint (rank 0) and dispatch HF on_save."""
-            checkpoint_error = None
-            checkpoint_written = False
-            if is_main_process:
-                ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                try:
-                    try:
-                        save_trainable_adapters(model, ckpt_dir)
-                    except ValueError as e:
-                        _main_print(f"  Unsloth: skipped checkpoint ({e})")
-                    else:
-                        checkpoint_written = True
-                        # Also write optimizer + trainer state so
-                        # resume_from_checkpoint restores Adam moments, step
-                        # counter, loss history, and best-model / early-stopping
-                        # tracking. Best-effort: the adapter save already
-                        # succeeded, so log failures but keep it.
-                        checkpoint_complete = False
-                        try:
-                            save_optimizer_state(optimizer, ckpt_dir)
-                            save_trainer_state(
-                                {
-                                    "global_step": current_step,
-                                    "train_loss_history": list(
-                                        self._train_loss_history
-                                    ),
-                                    "best_metric": self._best_metric,
-                                    "best_step": self._best_step,
-                                    "es_patience_counter": self._es_patience_counter,
-                                },
-                                ckpt_dir,
-                            )
-                            checkpoint_complete = True
-                        except Exception as e:
-                            _main_print(
-                                "  Unsloth: checkpoint saved without "
-                                f"resume state ({e})"
-                            )
-                        _main_print(f"  Saved checkpoint to {ckpt_dir}")
-                        if checkpoint_complete:
-                            _prune_stale_checkpoints(
-                                args.output_dir,
-                                args.save_total_limit,
-                            )
-                except Exception as e:
-                    checkpoint_error = e
-            self._raise_distributed_failure(
-                checkpoint_error is not None,
-                "checkpoint save",
-                checkpoint_error,
-            )
-            self.control.should_save = False
-            # HF fires callback_handler.on_save only after _save_checkpoint writes
-            # to disk. save_trainable_adapters raises ValueError for a fully frozen
-            # / no-adapter model, skipping the write; firing on_save anyway would
-            # make integrations that react to it (hub uploaders, checkpoint
-            # trackers) record a checkpoint-N directory that was never created.
-            # The write happens on rank 0 only, so broadcast the outcome (all-sum
-            # of a rank-0 flag; peers contribute 0) and fire on_save on every rank
-            # together, or the rank that skips it strands its peers at the _fire
-            # consensus collective. No-op at world size 1.
-            checkpoint_written_any = self._distributed_status_mask(
-                1 if (is_main_process and checkpoint_written) else 0
-            ) > 0
-            if checkpoint_written_any:
-                _fire("on_save")
+            """Save a step checkpoint and dispatch HF save callbacks on success."""
+            ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
+            try:
+                save_trainable_adapters(model, ckpt_dir)
+            except ValueError as e:
+                print(f"  Unsloth: skipped checkpoint ({e})")
+                self.control.should_save = False
+                return
+
+            checkpoint_complete = False
+            try:
+                save_optimizer_state(optimizer, ckpt_dir)
+                save_trainer_state(
+                    {
+                        "global_step": current_step,
+                        "train_loss_history": list(self._train_loss_history),
+                    },
+                    ckpt_dir,
+                )
+                checkpoint_complete = True
+            except Exception as e:
+                print(f"  Unsloth: checkpoint saved without resume state ({e})")
+            print(f"  Saved checkpoint to {ckpt_dir}")
+            if checkpoint_complete:
+                _prune_stale_checkpoints(args.output_dir, args.save_total_limit)
+                self._call_callback_save()
 
         def _run_callback_control_actions(current_step, grad_norm):
-            """Run log/eval/save actions requested by callback control flags.
-
-            Callers sync the control action flags across ranks before invoking
-            this so the collective log/eval/save paths run in lockstep.
-            """
+            """Run log/eval/save actions requested by callback control flags."""
             if self.control.should_log:
                 _run_training_log(current_step, grad_norm)
             if self.control.should_evaluate:
@@ -3433,129 +2734,40 @@ class MLXTrainer:
                         f"Dataset may be shorter than the killed run consumed."
                     ) from None
 
-        def _run_ddp_local_step(batch_data, prev_state, do_update):
-            """Run local DDP work, then synchronize failures before collectives."""
-            nonlocal step_fn, _use_compile, _compile_scope, _ddp_compile_local_grad, state
-            nonlocal _compile_fallback_reason
-
-            def _eval_local_result(step_result):
-                lvalue, toks, local_state, _grad_norm = step_result
-                if local_state is not None:
-                    mx.eval(lvalue, toks, local_state[0], local_state[1])
-                else:
-                    mx.eval(lvalue, toks)
-
-            local_error = None
-            compile_error = None
-            result = None
-            rng_state_before = None
-            if _ddp_compile_local_grad:
-                rng_state_before = mx.array(
-                    mx.random.state[0].tolist(),
-                    dtype=mx.uint32,
-                )
-            try:
-                result = step_fn(batch_data, prev_state, do_update)
-                _eval_local_result(result)
-            except Exception as e:
-                if isinstance(e, _DDPCompiledLocalGradError):
-                    compile_error = e
-                else:
-                    local_error = e
-
-            status_base = distributed_world_size + 1
-            status = self._distributed_status_mask(
-                (1 if local_error is not None else 0)
-                + status_base * (1 if compile_error is not None else 0)
-            )
-            local_error_any = (status % status_base) > 0
-            compile_error_any = (status // status_base) > 0
-            self._raise_distributed_failure_from_any(
-                local_error_any,
-                "training step",
-                local_error,
-            )
-
-            if compile_error_any:
-                if not _compile_fallback_allowed():
-                    _strict_compile_error(
-                        compile_error,
-                        peer=compile_error is None,
-                    )
-                if rng_state_before is not None:
-                    mx.random.state[0] = rng_state_before
-                _main_print(
-                    "Unsloth: mx.compile failed at runtime; "
-                    "falling back to eager mode on all DDP ranks."
-                )
-                step_fn = _ddp_eager_local_step_fn
-                _use_compile = False
-                _compile_scope = "fallback_eager"
-                _compile_fallback_reason = "runtime_error"
-                _ddp_compile_local_grad = False
-                state = [model.state, optimizer.state, mx.random.state]
-                local_error = None
-                try:
-                    result = step_fn(batch_data, prev_state, do_update)
-                    _eval_local_result(result)
-                except Exception as e:
-                    local_error = e
-                self._raise_distributed_failure(
-                    local_error is not None,
-                    "training step after compile fallback",
-                    local_error,
-                )
-
-            return result
-
-        # DDP-lockstep microstep loop. global_step advances only on optimizer
-        # updates; _distributed_should_stop() OR-reduces stop_requested at the
-        # top so an early stop (external cancel or an HF stop callback that ran
-        # on rank 0 only) drains every rank together before the next collective.
         microstep = _resume_step * grad_accum
         self._global_step = _resume_step
         while self._global_step < total_steps:
             it = microstep + 1
-            if self._distributed_should_stop() or self._early_stopped:
-                if self.stop_requested:
-                    _main_print("Unsloth: Stop requested - ending training early.")
+            if self.stop_requested:
+                print("Unsloth: Stop requested — ending training early.")
                 break
 
             if _maybe_callback_epoch_begin(it):
                 if self.stop_requested:
-                    _main_print("Unsloth: Stop requested - ending training early.")
+                    print("Unsloth: Stop requested — ending training early.")
                     break
 
             if accum_progress == 0:
                 self.control.should_log = False
                 self.control.should_evaluate = False
                 self.control.should_save = False
-                _fire("on_step_begin")
-                if _sync_stop():
-                    _main_print("Unsloth: Stop requested - ending training early.")
+                self.control = self.callback_handler.call_event(
+                    "on_step_begin",
+                    args, self.state, self.control,
+                )
+                self._sync_callback_stop()
+                if self.stop_requested:
+                    print("Unsloth: Stop requested — ending training early.")
                     break
 
             tic = time.perf_counter()
 
             # Get next batch
-            batch_error = None
-            batch_data = None
-            try:
-                if batch_iter is not None:
-                    batch_data = next(batch_iter)
-                else:
-                    batch_data = batches[batch_idx % len(batches)]
-                    batch_idx += 1
-            except Exception as e:
-                batch_error = e
-            if distributed_world_size > 1:
-                self._raise_distributed_failure(
-                    batch_error is not None,
-                    "fetching training batch",
-                    batch_error,
-                )
-            elif batch_error is not None:
-                raise batch_error
+            if batch_iter is not None:
+                batch_data = next(batch_iter)
+            else:
+                batch_data = batches[batch_idx % len(batches)]
+                batch_idx += 1
 
             do_update = (accum_progress + 1 >= grad_accum)
             if do_update:
@@ -3563,42 +2775,36 @@ class MLXTrainer:
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, self._global_step)
 
-            if _ddp_update_outside_step:
-                lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
+            try:
+                lvalue, toks, grad_accum_state, grad_norm = step_fn(
                     batch_data, grad_accum_state, do_update,
                 )
-                if do_update:
-                    grad, toks_f = grad_accum_state
-                    grad_norm = _apply_update(grad, toks_f)
-                    grad_accum_state = None
-            else:
-                try:
+            except (ValueError, RuntimeError) as e:
+                _msg = str(e).lower()
+                _is_compile_failure = _use_compile and (
+                    "compile" in _msg
+                    or "primitive" in _msg
+                    or "trace" in _msg
+                    or "eval" in _msg
+                )
+                if _is_compile_failure:
+                    if _compile_decision is not None and not _compile_decision.fallback_allowed:
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile was enabled for this VLM "
+                            "and runtime fallback is disabled."
+                        ) from e
+                    print(
+                        "Unsloth: mx.compile failed at runtime; "
+                        "falling back to eager mode."
+                    )
+                    step_fn = _uncompiled_step_fn
+                    _use_compile = False
+                    state = [model.state, optimizer.state, mx.random.state]
                     lvalue, toks, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
                     )
-                except (ValueError, RuntimeError, TypeError) as e:
-                    _is_compile_failure = (
-                        _use_compile
-                        and not _ddp_compile_local_grad
-                        and _is_compile_exception(e)
-                    )
-                    if _is_compile_failure:
-                        if not _compile_fallback_allowed():
-                            _strict_compile_error(e)
-                        _main_print(
-                            "Unsloth: mx.compile failed at runtime; "
-                            "falling back to eager mode."
-                        )
-                        step_fn = _uncompiled_step_fn
-                        _use_compile = False
-                        _compile_scope = "fallback_eager"
-                        _compile_fallback_reason = "runtime_error"
-                        state = [model.state, optimizer.state, mx.random.state]
-                        lvalue, toks, grad_accum_state, grad_norm = step_fn(
-                            batch_data, grad_accum_state, do_update,
-                        )
-                    else:
-                        raise
+                else:
+                    raise
 
             losses += lvalue * toks
             n_tokens += toks
@@ -3623,41 +2829,23 @@ class MLXTrainer:
                 and not _can_report_optimizer_state_norm()
                 and not _warned_skip_optimizer_state_grad_norm
             ):
-                _main_print(
+                print(
                     "Unsloth: skipping grad norm reporting for this MLX "
                     "optimizer/mode to avoid materializing the gradient graph."
                 )
                 _warned_skip_optimizer_state_grad_norm = True
-            global_toks = self._distributed_all_sum(toks, stream=mx.cpu)
-            mx.eval(global_toks)
-            if int(global_toks.item()) == 0:
+            if int(toks.item()) == 0:
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
             if do_update:
-                _fire("on_optimizer_step")
-                # Do NOT latch a callback should_training_stop into stop_requested
-                # here. HF fires on_optimizer_step, then on_step_end, then
-                # _maybe_log_save_evaluate (log+eval+save) for this step, and only
-                # breaks on should_training_stop AFTER that block (transformers
-                # trainer.py _inner_training_loop: on_optimizer_step -> on_step_end
-                # -> _maybe_log_save_evaluate -> the should_epoch_stop/
-                # should_training_stop break). Latching the stop now would make
-                # this step's _evaluate_batch_totals skip every eval batch (it is
-                # gated on not stop_requested), reporting 0.0 loss and corrupting
-                # best-model / early-stopping state. OR-reduce only an external
-                # cancel here; the callback stop is applied by the tail
-                # _sync_stop() after the same-step log/eval/save, mirroring the
-                # on_step_end deferral below.
-                self._distributed_should_stop()
-            # HF's TrainerState.num_input_tokens_seen is a global (all-rank
-            # gathered) count; callbacks that report or stop on a token budget
-            # read it directly. global_toks was already all-reduced and eval'd
-            # above for the zero-token guard, so reuse it here instead of the
-            # rank-local toks, which would undercount by ~world_size under DDP.
-            self.state.num_input_tokens_seen += int(global_toks.item())
+                self.control = self.callback_handler.call_event(
+                    "on_optimizer_step",
+                    args, self.state, self.control,
+                )
+            self.state.num_input_tokens_seen += int(toks.item())
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
             train_time += time.perf_counter() - tic
@@ -3665,35 +2853,11 @@ class MLXTrainer:
             # Only log/eval on actual optimizer steps
             if not do_update:
                 accum_progress += 1
-                _fire("on_substep_end")
-                # Do NOT latch a callback should_training_stop into stop_requested
-                # yet. When this non-update microstep is also an epoch boundary,
-                # _maybe_callback_epoch_end below fires on_epoch_end and may run a
-                # same-epoch eval; latching the stop now would make that eval's
-                # _evaluate_batch_totals skip every batch (it is gated on not
-                # stop_requested), reporting 0.0 loss and corrupting best-model /
-                # early-stopping state. OR-reduce only an external cancel here; the
-                # callback stop is applied by the tail _sync_stop() below after the
-                # epoch-end log/eval/save, mirroring the on_step_end / on_optimizer_
-                # step deferrals in the update branch.
-                self._distributed_should_stop()
-                # An epoch boundary can fall on a non-update microstep when
-                # batches-per-epoch is not a multiple of grad_accum (for example
-                # 3 micro-batches with grad_accum=2). HF always fires on_epoch_end
-                # once per epoch (its final batch forces an optimizer step), so
-                # fire it here too; otherwise on_epoch_end and any log/eval/save/
-                # stop it requests are dropped for that epoch. _maybe_callback_
-                # epoch_end is a no-op away from a boundary and runs the same
-                # collectives on every rank (it/batches_per_epoch are rank-
-                # consistent), so DDP stays in lockstep.
-                _maybe_callback_epoch_end(it, self._global_step, grad_norm)
-                # Apply any deferred callback stop (from on_substep_end or the
-                # epoch-end callbacks) now that the epoch-end eval has run. This
-                # tail _sync_stop() runs on every rank in the same order as the
-                # update branch's tail, so DDP stays in lockstep; the continue then
-                # routes to the top-of-loop _distributed_should_stop(), which drains
-                # the stop on every rank before the next collective.
-                _sync_stop()
+                self.control = self.callback_handler.call_event(
+                    "on_substep_end",
+                    args, self.state, self.control,
+                )
+                self._sync_callback_stop()
                 microstep = it
                 continue
 
@@ -3701,25 +2865,12 @@ class MLXTrainer:
             self._global_step = current_step
             self.state.global_step = current_step
             accum_progress = 0
-            _fire("on_step_end")
-            # on_step_end runs on rank 0 only and may request log/eval/save or a
-            # stop. Sync those decisions across ranks before the collective
-            # log/eval/save paths so every rank makes the same choice.
-            self._distributed_sync_control_actions()
-            # Do NOT copy a callback should_training_stop into stop_requested yet.
-            # HF runs this step's log/evaluate/save before the loop breaks, so a
-            # stop requested on on_step_end must not pre-empt a same-step eval:
-            # _evaluate_batch_totals skips every eval batch while stop_requested
-            # is set, which would report 0.0 loss and corrupt best-model /
-            # early-stopping state. Only OR-reduce any external cancel here (a
-            # rank-consistent hard stop); the callback stop is applied after the
-            # same-step actions by the tail _sync_stop() below.
-            self._distributed_should_stop()
+            self.control = self.callback_handler.call_event(
+                "on_step_end",
+                args, self.state, self.control,
+            )
 
-            # Logging. logging_steps is guarded against 0 to avoid a modulo-by-zero;
-            # the callback control flag (synced across ranks above) can also force
-            # a log. _run_training_log all-reduces the loss/token totals so every
-            # rank stays in lockstep.
+            # Logging
             logging_steps = int(getattr(args, "logging_steps", 0) or 0)
             should_log = (
                 (logging_steps > 0 and current_step % logging_steps == 0)
@@ -3729,9 +2880,7 @@ class MLXTrainer:
             if should_log:
                 _run_training_log(current_step, grad_norm)
 
-            # Eval (cadence or a synced callback request). _run_eval builds eval
-            # batches lazily on every rank, runs the collective eval, then fires
-            # on_evaluate on rank 0 and syncs any stop before best tracking.
+            # Eval
             should_eval = (
                 self.eval_dataset is not None
                 and (
@@ -3743,8 +2892,7 @@ class MLXTrainer:
                 if _run_eval(current_step):
                     _run_best_tracking(current_step)
 
-            # Checkpointing (cadence or a synced callback request). _run_checkpoint
-            # writes on rank 0 and syncs save failures across ranks.
+            # Checkpointing
             should_save = (
                 (args.save_steps > 0 and current_step % args.save_steps == 0)
                 or self.control.should_save
@@ -3753,30 +2901,22 @@ class MLXTrainer:
                 _run_checkpoint(current_step)
 
             _maybe_callback_epoch_end(it, current_step, grad_norm)
-            # Propagate any stop set by the tail callbacks (on_step_end / on_log /
-            # on_evaluate / on_save / on_epoch_end) to every rank before breaking,
-            # so no rank is left waiting at the next collective.
-            if _sync_stop():
+            self._sync_callback_stop()
+            if self.stop_requested:
                 break
             microstep = it
+
+        total_time = time.perf_counter() - start_time
         avg_loss = (
             sum(self._train_loss_history) / len(self._train_loss_history)
             if self._train_loss_history else 0.0
         )
-        # Total wall-clock training time, consumed by the summary line and the
-        # distributed diagnostics / train_runtime metrics below.
-        total_time = time.perf_counter() - start_time
 
-        # Report the step actually reached, which is < total_steps after an
-        # early stop (self._global_step == total_steps on a full run).
-        completed_steps = self._global_step
-        _main_print(
-            f"\nUnsloth: Training complete! "
-            f"Avg loss: {avg_loss:.4f} | "
-            f"Total time: {total_time:.1f}s | "
-            f"Steps: {completed_steps} | "
-            f"Tokens: {trained_tokens}"
-        )
+        print(f"\nUnsloth: Training complete! "
+              f"Avg loss: {avg_loss:.4f} | "
+              f"Total time: {total_time:.1f}s | "
+              f"Steps: {total_steps} | "
+              f"Tokens: {trained_tokens}")
 
         # load_best_model_at_end: restore best adapters before the final save.
         if getattr(args, "load_best_model_at_end", False) and self._best_step is not None:
@@ -3784,44 +2924,29 @@ class MLXTrainer:
             if os.path.exists(_best_path):
                 try:
                     model.load_weights(_best_path, strict=False)
-                    _main_print(
-                        f"Unsloth: Restored best model from step {self._best_step} "
-                        f"({self._resolved_best_metric_name()}={self._best_metric:.4f})."
-                    )
+                    print(f"Unsloth: Restored best model from step {self._best_step} "
+                          f"({args.metric_for_best_model}={self._best_metric:.4f}).")
                 except Exception as e:
-                    _main_print(f"Unsloth: failed to restore best model ({e}).")
-
-        distributed_diagnostics = self._distributed_training_diagnostics(
-            total_time=total_time,
-            trained_tokens=trained_tokens,
-            compile_scope=_compile_scope,
-            compile_fallback_reason=_compile_fallback_reason,
-        )
+                    print(f"Unsloth: failed to restore best model ({e}).")
 
         # Honor the documented save_steps=0 contract: save at end of training.
-        final_save_error = None
-        if is_main_process:
-            try:
-                self.save_model()
-            except ValueError as e:
-                _main_print(f"Unsloth: skipped final save ({e})")
-            except Exception as e:
-                final_save_error = e
-            else:
-                _main_print(f"Unsloth: Saved final adapters to {args.output_dir}")
-        self._raise_distributed_failure(
-            final_save_error is not None,
-            "final save",
-            final_save_error,
-        )
+        try:
+            self.save_model()
+        except ValueError as e:
+            print(f"Unsloth: skipped final save ({e})")
+        else:
+            print(f"Unsloth: Saved final adapters to {args.output_dir}")
 
-        _fire("on_train_end")
-        _sync_stop()
+        self.control = self.callback_handler.call_event(
+            "on_train_end",
+            args, self.state, self.control,
+        )
+        self._sync_callback_stop()
 
         return MLXTrainOutput({
             "train_loss": avg_loss,
             "train_runtime": total_time,
-            "train_steps": completed_steps,
+            "train_steps": self._global_step,
             "total_train_steps": total_steps,
             "trained_tokens": trained_tokens,
             "train_samples_per_second": (
@@ -3837,7 +2962,6 @@ class MLXTrainer:
             "compile_policy_mode": (
                 _compile_decision.policy_mode if _compile_decision is not None else compile_policy.mode
             ),
-            "compile_scope": _compile_scope,
             "patch_mode": getattr(self.args, "patch_mode", "patched"),
             "compile_trace": (
                 asdict(self._compile_trace)
@@ -3855,8 +2979,6 @@ class MLXTrainer:
             "base_quantized_source": getattr(
                 self.model, "_unsloth_quantized_source", None,
             ),
-            **distributed_diagnostics,
-            **self._distributed_result_fields(),
         })
 
     def _resolve_vlm_processor(self):
@@ -3921,16 +3043,8 @@ class MLXTrainer:
             if args.max_steps > 0 else None
         )
         text_completion_only_loss = _text_completion_only_loss_arg(args)
-        text_assistant_only_loss = _text_assistant_only_loss_arg(args)
-        comm_group = self.distributed_world
 
         if is_vlm:
-            if text_assistant_only_loss:
-                raise ValueError(
-                    "Unsloth MLX VLM: assistant_only_loss=True is not supported for "
-                    "vision-language models. Set assistant_only_loss=False, or use "
-                    "train_on_responses_only for response masking."
-                )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
             vlm_dataset_order = (
                 "sequential"
@@ -3959,7 +3073,6 @@ class MLXTrainer:
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
                     completion_only_loss=text_completion_only_loss,
-                    comm_group=comm_group,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -3977,23 +3090,23 @@ class MLXTrainer:
                     dataset_order=vlm_dataset_order,
                     num_epochs=vlm_num_epochs,
                     completion_only_loss=text_completion_only_loss,
-                    comm_group=comm_group,
                 )
                 if _vlm_mask_fn is not None and batches:
-                    _check_vlm_all_masked(
-                        batches,
-                        comm_group=comm_group,
-                        world_size=self.distributed_world_size,
-                    )
+                    _check_vlm_all_masked(batches)
                 return batches, None
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                text_dataset_order = (
-                    "sequential"
-                    if getattr(args, "preserve_dataset_order", False)
-                    else getattr(args, "dataset_order", "default")
-                )
+                # Streaming has no index space; refuse explicit order requests.
+                if (
+                    getattr(args, "preserve_dataset_order", False)
+                    or getattr(args, "dataset_order", "default") != "default"
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: preserve_dataset_order / dataset_order is not "
+                        "supported with streaming=True for text training. Disable "
+                        "streaming or materialize batches."
+                    )
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -4006,10 +3119,6 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
-                    completion_only_loss=text_completion_only_loss,
-                    assistant_only_loss=text_assistant_only_loss,
-                    dataset_order=text_dataset_order,
-                    comm_group=comm_group,
                 )
             else:
                 batch_kwargs = dict(
@@ -4025,8 +3134,6 @@ class MLXTrainer:
                     model_name=model_name,
                     model_type=model_type,
                     append_eos=bool(getattr(args, "append_eos", True)),
-                    assistant_only_loss=text_assistant_only_loss,
-                    comm_group=comm_group,
                 )
                 if (
                     getattr(args, "preserve_dataset_order", False)
@@ -4045,10 +3152,8 @@ class MLXTrainer:
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
                         self._prepared_batches_include_epochs = True
-                    batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = create_ordered_batches(**batch_kwargs)
                 else:
-                    batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = create_batches(**batch_kwargs)
                 return batches, None
 
@@ -4168,14 +3273,8 @@ class MLXTrainer:
             if not _processor_saves_tokenizer:
                 self.tokenizer.save_pretrained(output_dir)
 
-            # Copy base config.json so the checkpoint is loadable. Prefer the
-            # mlx-vlm patched dir when materialized (e.g. DeepSeek OCR): _src_path
-            # holds the original snapshot, whose unpatched model_type/auto_map
-            # would break mlx-vlm routing on the saved adapter's reload.
-            src_path = (
-                getattr(self.model, "_config_src_path", None)
-                or getattr(self.model, "_src_path", None)
-            )
+            # Copy base model's config.json so the checkpoint is loadable
+            src_path = getattr(self.model, "_src_path", None)
             if src_path is not None:
                 import shutil
                 from pathlib import Path
@@ -4198,8 +3297,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             model_name=None, model_type=None,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
-                            num_epochs=None, return_dataset=False,
-                            comm_group=None, distributed_pad_mode="cycle"):
+                            num_epochs=None, return_dataset=False):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -4207,7 +3305,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     Returns:
         List of (batch, lengths, labels) tuples where:
-        - batch: mx.array (BS, padded_len) — input_ids padded with pad_token_id
+        - batch: mx.array (BS, padded_len) — input_ids padded with 0
         - lengths: mx.array of shape (BS, 2) holding [1, actual_len]
           per sequence. Right-half-open `[start, end)` matching the
           exclusive-end loss masks in `utils.py:360`, `:393`, `:429`,
@@ -4223,8 +3321,6 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         is_vlm=False,
         strict=False,
     )
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    pad_id = 0 if pad_id is None else int(pad_id)
 
     # 1. Gather all text strings (serial, fast)
     all_texts = []
@@ -4329,23 +3425,14 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     )
     rng = random.Random(seed)
     batches = []
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     for epoch_idx in range(_n_epochs_materialize):
         epoch_items = _order_samples_for_epoch(all_items, epoch_idx)
         epoch_batches = []
-        for start in range(0, len(epoch_items), global_batch_size):
-            batch_items = epoch_items[start:start + global_batch_size]
-            batch_items = _rank_slice_distributed_batch(
-                batch_items,
-                batch_size,
-                comm_group=comm_group,
-                pad_source=epoch_items,
-                pad_mode=distributed_pad_mode,
-            )
+        for start in range(0, len(epoch_items), batch_size):
+            batch_items = epoch_items[start:start + batch_size]
             if not batch_items:
                 continue
-            valid_items = [item for item in batch_items if item is not None]
-            max_len = max((len(ids) for ids, _ in valid_items), default=2)
+            max_len = max(len(ids) for ids, _ in batch_items)
             # +1 for autoregressive shift (mlx-lm iterate_batches parity).
             padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
             padded_len = min(padded_len, max_seq_length)
@@ -4353,16 +3440,10 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             batch_ids = []
             batch_labels = []
             batch_lengths = []
-            for item in batch_items:
-                if item is None:
-                    batch_ids.append([pad_id] * padded_len)
-                    batch_labels.append([-100] * padded_len)
-                    batch_lengths.append([0, 0])
-                    continue
-                ids, lbls = item
+            for ids, lbls in batch_items:
                 L = min(len(ids), padded_len)
                 pad_len = padded_len - L
-                batch_ids.append(ids[:L] + [pad_id] * pad_len)
+                batch_ids.append(ids[:L] + [0] * pad_len)
                 batch_labels.append(lbls[:L] + [-100] * pad_len)
                 # [start, end) matches loss masks in utils.py:360/:393/:429/:439.
                 batch_lengths.append([1, L])
@@ -4406,14 +3487,9 @@ def _create_response_masked_dataset(items):
     return Dataset.from_list(rows)
 
 
-def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
+def _check_all_masked(batches, max_check=100):
     """Raise if all labels in the first N batches are -100 (mirrors
-    fix_zero_training_loss from the HF path).
-
-    In DDP ``batches`` is only this rank's shard, so the per-rank bad/good
-    counts are all-summed before the decision. Otherwise a rank whose shard
-    happens to be entirely masked would raise ZeroDivisionError alone while
-    peers with trainable labels advance to the first collective and hang."""
+    fix_zero_training_loss from the HF path)."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -4430,16 +3506,6 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
                 break
         if checked >= max_check:
             break
-
-    # Reduce across ranks before deciding so every rank raises/warns together
-    # (all ranks reach this collective; the early return below is post-reduce).
-    if comm_group is not None and world_size > 1:
-        counts = mx.distributed.all_sum(
-            mx.array([seen_bad, seen_good], dtype=mx.int32),
-            group=comm_group, stream=mx.cpu,
-        )
-        mx.eval(counts)
-        seen_bad, seen_good = int(counts[0].item()), int(counts[1].item())
 
     if seen_bad == 0 and seen_good == 0:
         return
@@ -4462,13 +3528,8 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
         )
 
 
-def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1):
-    """_check_all_masked for VLM batch dicts (a "labels" key, not a 3-tuple).
-
-    As in the text path, in DDP ``batches`` is only this rank's shard, so the
-    per-rank bad/good counts are all-summed before deciding. Otherwise a rank
-    whose shard is entirely masked would raise ZeroDivisionError alone while
-    peers advance to the first collective and hang."""
+def _check_vlm_all_masked(batches, max_check=100):
+    """_check_all_masked for VLM batch dicts (a "labels" key, not a 3-tuple)."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -4488,16 +3549,6 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
                 break
         if checked >= max_check:
             break
-
-    # Reduce across ranks before deciding so every rank raises/warns together
-    # (all ranks reach this collective; the early return below is post-reduce).
-    if comm_group is not None and world_size > 1:
-        counts = mx.distributed.all_sum(
-            mx.array([seen_bad, seen_good], dtype=mx.int32),
-            group=comm_group, stream=mx.cpu,
-        )
-        mx.eval(counts)
-        seen_bad, seen_good = int(counts[0].item()), int(counts[1].item())
 
     if seen_bad == 0 and seen_good == 0:
         return
@@ -4616,7 +3667,6 @@ def train_on_responses_only(
             else None
         )
         train_dataset = trainer._train_dataset_for_batches()
-        comm_group = getattr(trainer, "distributed_world", None)
         batches, response_masked_dataset = _create_labeled_batches(
             dataset=train_dataset,
             tokenizer=_tokenizer,
@@ -4639,18 +3689,12 @@ def train_on_responses_only(
             preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
             num_epochs=labeled_num_epochs,
             return_dataset=True,
-            comm_group=comm_group,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
 
-        # Safety check: detect all-masked labels early. In DDP batches is this
-        # rank's shard, so pass the group to reduce counts before deciding.
-        _check_all_masked(
-            batches,
-            comm_group=comm_group,
-            world_size=getattr(trainer, "distributed_world_size", 1),
-        )
+        # Safety check: detect all-masked labels early
+        _check_all_masked(batches)
         trainer._prepared_batches_include_epochs = (
             labeled_num_epochs is not None
         )
@@ -4683,12 +3727,8 @@ def train_on_responses_only(
                     ),
                     append_eos=bool(getattr(args, "append_eos", True)),
                     dataset_order=getattr(args, "dataset_order", "default"),
-                    preserve_dataset_order=bool(
-                        getattr(args, "preserve_dataset_order", False)
-                    ),
+                    preserve_dataset_order=bool(getattr(args, "preserve_dataset_order", False)),
                     return_dataset=True,
-                    comm_group=comm_group,
-                    distributed_pad_mode="empty",
                 )
                 return batches, response_masked_dataset
 

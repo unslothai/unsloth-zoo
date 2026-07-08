@@ -1276,6 +1276,33 @@ def test_distributed_diagnostics_per_rank_tokens_use_local_history():
     assert "_local_token_count_history" in src
 
 
+def test_callback_state_num_input_tokens_seen_uses_reduced_global_count():
+    # Complement of the per-rank diagnostics rule: HF's
+    # TrainerState.num_input_tokens_seen is a GLOBAL (all-rank gathered) count
+    # that callbacks read directly to report progress or stop on a token budget.
+    # The training loop must increment it from the all-reduced global_toks (which
+    # is already computed and eval'd just above for the zero-token guard), not the
+    # rank-local toks, which would undercount by ~world_size under DDP.
+    import inspect
+    import re
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    m = re.search(
+        r"self\.state\.num_input_tokens_seen\s*\+=\s*int\(\s*([A-Za-z_]+)\.item\(\)\s*\)",
+        src,
+    )
+    assert m is not None, "num_input_tokens_seen increment not found"
+    assert m.group(1) == "global_toks", (
+        "callback-visible num_input_tokens_seen must use the all-reduced "
+        f"global_toks, not the rank-local {m.group(1)}"
+    )
+    # global_toks must be reduced before it is consumed for the callback state.
+    reduce_at = src.index("global_toks = self._distributed_all_sum(")
+    assert reduce_at < m.start()
+
+
 def test_train_entry_clears_stale_stop_before_setup():
     # Regression for "Keep callback stops from poisoning trainer reuse" +
     # "Preserve external stop requests during setup".

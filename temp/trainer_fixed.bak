@@ -859,12 +859,8 @@ class MLXTrainer:
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
         # each train() so a reused trainer starts clean); callbacks and
         # pre-created batches persist across runs and stay here.
-        # stop_requested is cleared once at train() entry (before setup) rather
-        # than in _reset_run_state, so an external cancel raised during THIS
-        # run's data prep / optimizer build survives; initialize it here so a
-        # trainer inspected before train() still has the attribute.
-        self.stop_requested = False
         self._reset_run_state()
+        self.stop_requested = False  # Set True to stop training early
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
@@ -888,15 +884,14 @@ class MLXTrainer:
         )
 
     def _reset_run_state(self):
-        """Per-run training/metric state. Reset from __init__ and inside
-        _train_inner (after setup) so reusing a trainer for a second run starts
-        clean; _early_stopped cleared so a run-1 early stop doesn't block run 2.
-        stop_requested is deliberately NOT reset here: train() clears it once at
-        entry (before any data prep / optimizer build), so an external cancel
-        raised DURING this run's setup survives to the loop's top-of-loop
-        _distributed_should_stop() check instead of being clobbered by this
-        post-setup reset. Callbacks and pre-created batches persist across runs
-        and aren't reset."""
+        """Per-run training/metric state. Reset from __init__ and at the start
+        of each train() so reusing a trainer for a second run starts clean;
+        _early_stopped cleared so a run-1 early stop doesn't block run 2.
+        stop_requested is deliberately not reset: it is externally owned (a
+        controller thread may set it at any moment, including during train()
+        setup and batch prep), so clearing it here would silently drop an
+        in-flight cancel. Callbacks and pre-created batches persist across
+        runs and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
@@ -2138,14 +2133,6 @@ class MLXTrainer:
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
-        # Clear a stale stop from a PRIOR run at the EARLIEST point, before any
-        # data prep / optimizer build / _train_inner, so a reused trainer starts
-        # un-stopped. _reset_run_state (post-setup) no longer touches this, so an
-        # external cancel raised DURING this run's setup (e.g. a Studio cancel on
-        # a large dataset materializing in _prepare_data) survives to the loop's
-        # top-of-loop _distributed_should_stop() check. Local assignment only, no
-        # DDP collective.
-        self.stop_requested = False
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
@@ -3257,19 +3244,14 @@ class MLXTrainer:
             # at world size 1.
             self._distributed_sync_control_actions()
             self._update_callback_best_metric(metrics)
-            # An external cancel arriving before/during eval is OR-reduced here so
-            # every rank agrees on stop_requested before the divergent best-model /
-            # early-stopping branch in _run_best_tracking (its rank-0-guarded best
-            # save would otherwise hang peers). A callback stop requested during
-            # on_step_end / on_evaluate is deliberately NOT copied into
-            # stop_requested yet: HF (_maybe_log_save_evaluate) runs
-            # _determine_best_metric and writes the checkpoint for this step BEFORE
-            # the loop honors should_training_stop, so latching the callback stop
-            # here would make _run_best_tracking (gated on not stop_requested) skip
-            # a valid, improving eval, leaving load_best_model_at_end to restore a
-            # stale model. The callback stop is applied by the caller's tail
-            # _sync_stop(), after best tracking and the same-step save. No-op at
-            # world size 1.
+            # Eval + on_evaluate callbacks fire on rank 0 only, so a callback (or
+            # an external cancel arriving mid-eval) that sets stop_requested is
+            # visible on rank 0 alone. Copy control.should_training_stop into
+            # stop_requested, then all-reduce it across ranks before the divergent
+            # best-model / early-stopping branch below: otherwise _track diverges
+            # (rank 0 skips, peers enter) and the rank-0-guarded best-model save
+            # collective in _run_best_tracking hangs the peer ranks.
+            self._sync_callback_stop()
             self._distributed_should_stop()
             return True
 
@@ -3334,7 +3316,6 @@ class MLXTrainer:
         def _run_checkpoint(current_step):
             """Save a step checkpoint (rank 0) and dispatch HF on_save."""
             checkpoint_error = None
-            checkpoint_written = False
             if is_main_process:
                 ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
                 try:
@@ -3343,7 +3324,6 @@ class MLXTrainer:
                     except ValueError as e:
                         _main_print(f"  Unsloth: skipped checkpoint ({e})")
                     else:
-                        checkpoint_written = True
                         # Also write optimizer + trainer state so
                         # resume_from_checkpoint restores Adam moments, step
                         # counter, loss history, and best-model / early-stopping
@@ -3384,20 +3364,7 @@ class MLXTrainer:
                 checkpoint_error,
             )
             self.control.should_save = False
-            # HF fires callback_handler.on_save only after _save_checkpoint writes
-            # to disk. save_trainable_adapters raises ValueError for a fully frozen
-            # / no-adapter model, skipping the write; firing on_save anyway would
-            # make integrations that react to it (hub uploaders, checkpoint
-            # trackers) record a checkpoint-N directory that was never created.
-            # The write happens on rank 0 only, so broadcast the outcome (all-sum
-            # of a rank-0 flag; peers contribute 0) and fire on_save on every rank
-            # together, or the rank that skips it strands its peers at the _fire
-            # consensus collective. No-op at world size 1.
-            checkpoint_written_any = self._distributed_status_mask(
-                1 if (is_main_process and checkpoint_written) else 0
-            ) > 0
-            if checkpoint_written_any:
-                _fire("on_save")
+            _fire("on_save")
 
         def _run_callback_control_actions(current_step, grad_norm):
             """Run log/eval/save actions requested by callback control flags.
@@ -3638,26 +3605,8 @@ class MLXTrainer:
                 )
             if do_update:
                 _fire("on_optimizer_step")
-                # Do NOT latch a callback should_training_stop into stop_requested
-                # here. HF fires on_optimizer_step, then on_step_end, then
-                # _maybe_log_save_evaluate (log+eval+save) for this step, and only
-                # breaks on should_training_stop AFTER that block (transformers
-                # trainer.py _inner_training_loop: on_optimizer_step -> on_step_end
-                # -> _maybe_log_save_evaluate -> the should_epoch_stop/
-                # should_training_stop break). Latching the stop now would make
-                # this step's _evaluate_batch_totals skip every eval batch (it is
-                # gated on not stop_requested), reporting 0.0 loss and corrupting
-                # best-model / early-stopping state. OR-reduce only an external
-                # cancel here; the callback stop is applied by the tail
-                # _sync_stop() after the same-step log/eval/save, mirroring the
-                # on_step_end deferral below.
-                self._distributed_should_stop()
-            # HF's TrainerState.num_input_tokens_seen is a global (all-rank
-            # gathered) count; callbacks that report or stop on a token budget
-            # read it directly. global_toks was already all-reduced and eval'd
-            # above for the zero-token guard, so reuse it here instead of the
-            # rank-local toks, which would undercount by ~world_size under DDP.
-            self.state.num_input_tokens_seen += int(global_toks.item())
+                _sync_stop()
+            self.state.num_input_tokens_seen += int(toks.item())
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
             train_time += time.perf_counter() - tic
@@ -3666,33 +3615,6 @@ class MLXTrainer:
             if not do_update:
                 accum_progress += 1
                 _fire("on_substep_end")
-                # Do NOT latch a callback should_training_stop into stop_requested
-                # yet. When this non-update microstep is also an epoch boundary,
-                # _maybe_callback_epoch_end below fires on_epoch_end and may run a
-                # same-epoch eval; latching the stop now would make that eval's
-                # _evaluate_batch_totals skip every batch (it is gated on not
-                # stop_requested), reporting 0.0 loss and corrupting best-model /
-                # early-stopping state. OR-reduce only an external cancel here; the
-                # callback stop is applied by the tail _sync_stop() below after the
-                # epoch-end log/eval/save, mirroring the on_step_end / on_optimizer_
-                # step deferrals in the update branch.
-                self._distributed_should_stop()
-                # An epoch boundary can fall on a non-update microstep when
-                # batches-per-epoch is not a multiple of grad_accum (for example
-                # 3 micro-batches with grad_accum=2). HF always fires on_epoch_end
-                # once per epoch (its final batch forces an optimizer step), so
-                # fire it here too; otherwise on_epoch_end and any log/eval/save/
-                # stop it requests are dropped for that epoch. _maybe_callback_
-                # epoch_end is a no-op away from a boundary and runs the same
-                # collectives on every rank (it/batches_per_epoch are rank-
-                # consistent), so DDP stays in lockstep.
-                _maybe_callback_epoch_end(it, self._global_step, grad_norm)
-                # Apply any deferred callback stop (from on_substep_end or the
-                # epoch-end callbacks) now that the epoch-end eval has run. This
-                # tail _sync_stop() runs on every rank in the same order as the
-                # update branch's tail, so DDP stays in lockstep; the continue then
-                # routes to the top-of-loop _distributed_should_stop(), which drains
-                # the stop on every rank before the next collective.
                 _sync_stop()
                 microstep = it
                 continue

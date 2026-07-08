@@ -36,10 +36,9 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 import concurrent.futures
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -78,106 +77,6 @@ class MLXTrainOutput(dict):
     @property
     def training_loss(self):
         return self.get("train_loss", 0.0)
-
-
-@dataclass
-class _MLXTrainerControl:
-    """Torch-free subset of Hugging Face TrainerControl used by callbacks."""
-
-    should_training_stop: bool = False
-    should_save: bool = False
-    should_evaluate: bool = False
-    should_log: bool = False
-
-
-@dataclass
-class _MLXTrainerState:
-    """Torch-free subset of Hugging Face TrainerState used by callbacks."""
-
-    epoch: float | None = None
-    global_step: int = 0
-    max_steps: int = 0
-    logging_steps: int = 500
-    eval_steps: int = 500
-    save_steps: int = 500
-    train_batch_size: int | None = None
-    num_train_epochs: int = 0
-    num_input_tokens_seen: int = 0
-    total_flos: float = 0
-    log_history: list = field(default_factory=list)
-    best_metric: float | None = None
-    best_global_step: int | None = None
-    best_model_checkpoint: str | None = None
-    is_local_process_zero: bool = True
-    is_world_process_zero: bool = True
-    is_hyper_param_search: bool = False
-    trial_name: str | None = None
-    trial_params: dict | None = None
-    stateful_callbacks: dict = field(default_factory=dict)
-
-
-class _MLXCallbackHandler:
-    """Small HF-compatible callback dispatcher that keeps MLX imports Torch-free."""
-
-    def __init__(self, callbacks, model, processing_class, optimizer, lr_scheduler):
-        self.callbacks = []
-        for callback in callbacks:
-            self.add_callback(callback)
-        self.model = model
-        self.processing_class = processing_class
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.train_dataloader = None
-        self.eval_dataloader = None
-
-    @property
-    def callback_list(self):
-        """Return callback class names for diagnostics."""
-        return "\n".join(cb.__class__.__name__ for cb in self.callbacks)
-
-    def add_callback(self, callback):
-        """Add a callback class or instance."""
-        self.callbacks.append(callback() if isinstance(callback, type) else callback)
-
-    def pop_callback(self, callback):
-        """Remove and return a callback class or instance."""
-        if isinstance(callback, type):
-            for cb in self.callbacks:
-                if isinstance(cb, callback):
-                    self.callbacks.remove(cb)
-                    return cb
-        else:
-            for cb in self.callbacks:
-                if cb == callback:
-                    self.callbacks.remove(cb)
-                    return cb
-        return None
-
-    def remove_callback(self, callback):
-        """Remove a callback class or instance."""
-        self.pop_callback(callback)
-
-    def call_event(self, event, args, state, control, **kwargs):
-        """Dispatch one callback event and return the latest control object."""
-        for callback in self.callbacks:
-            method = getattr(callback, event, None)
-            if method is None:
-                continue
-            result = method(
-                args,
-                state,
-                control,
-                model=self.model,
-                processing_class=self.processing_class,
-                optimizer=self.optimizer,
-                lr_scheduler=self.lr_scheduler,
-                train_dataloader=self.train_dataloader,
-                eval_dataloader=self.eval_dataloader,
-                **kwargs,
-            )
-            if result is not None:
-                control = result
-        return control
 
 
 class _MLXTokenizedDatasetView:
@@ -672,8 +571,6 @@ class MLXTrainingConfig:
     # Logging & output
     logging_steps: int = 1
     output_dir: str = "./outputs"
-    logging_dir: str | None = None
-    run_name: str | None = None
     report_to: str = "none"
     save_steps: int = 0  # 0 = only save at end
     save_total_limit: int = -1  # -1 = no limit
@@ -768,21 +665,6 @@ class MLXTrainingConfig:
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
 
-    def to_dict(self):
-        """Return a TrainingArguments-style dict for integration callbacks."""
-        output = {}
-        for key, value in vars(self).items():
-            if is_dataclass(value):
-                value = asdict(value)
-            elif hasattr(value, "to_dict"):
-                value = value.to_dict()
-            output[key] = value
-        return output
-
-    def to_json_string(self):
-        """Serialize this config like TrainingArguments.to_json_string()."""
-        return json.dumps(self.to_dict(), indent=2, default=str)
-
 
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
@@ -800,7 +682,6 @@ class MLXTrainer:
         args=None,
         formatting_func=None,
         processor=None,
-        callbacks=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -859,44 +740,21 @@ class MLXTrainer:
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
         # each train() so a reused trainer starts clean); callbacks and
         # pre-created batches persist across runs and stay here.
-        # stop_requested is cleared once at train() entry (before setup) rather
-        # than in _reset_run_state, so an external cancel raised during THIS
-        # run's data prep / optimizer build survives; initialize it here so a
-        # trainer inspected before train() still has the attribute.
-        self.stop_requested = False
         self._reset_run_state()
+        self.stop_requested = False  # Set True to stop training early
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
 
-        # Hugging Face TrainerCallback support. The handler and TrainerState/
-        # TrainerControl persist across train() runs (callbacks are not reset
-        # in _reset_run_state); _init_callback_state re-seeds state at each run.
-        self._ensure_callback_args_compat()
-        self.callback_handler = _MLXCallbackHandler(
-            callbacks or [],
-            model=self.model,
-            processing_class=self.processor or self.tokenizer,
-            optimizer=None,
-            lr_scheduler=None,
-        )
-        self.state = _MLXTrainerState()
-        self.control = _MLXTrainerControl()
-        self.control = self.callback_handler.call_event(
-            "on_init_end",
-            self.args, self.state, self.control,
-        )
-
     def _reset_run_state(self):
-        """Per-run training/metric state. Reset from __init__ and inside
-        _train_inner (after setup) so reusing a trainer for a second run starts
-        clean; _early_stopped cleared so a run-1 early stop doesn't block run 2.
-        stop_requested is deliberately NOT reset here: train() clears it once at
-        entry (before any data prep / optimizer build), so an external cancel
-        raised DURING this run's setup survives to the loop's top-of-loop
-        _distributed_should_stop() check instead of being clobbered by this
-        post-setup reset. Callbacks and pre-created batches persist across runs
-        and aren't reset."""
+        """Per-run training/metric state. Reset from __init__ and at the start
+        of each train() so reusing a trainer for a second run starts clean;
+        _early_stopped cleared so a run-1 early stop doesn't block run 2.
+        stop_requested is deliberately not reset: it is externally owned (a
+        controller thread may set it at any moment, including during train()
+        setup and batch prep), so clearing it here would silently drop an
+        in-flight cancel. Callbacks and pre-created batches persist across
+        runs and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
@@ -1203,30 +1061,6 @@ class MLXTrainer:
             self.stop_requested = True
         return should_stop
 
-    def _distributed_sync_control_actions(self):
-        """OR the callback log/eval/save requests across ranks.
-
-        HF callbacks are dispatched on rank 0 only, so a callback that flips
-        control.should_log / should_evaluate / should_save sets it on rank 0
-        alone. Those actions run collective code (metric all-reduce, eval, and
-        rank-0-guarded saves), so every rank must agree before entering them or
-        the peers deadlock at the collective. One packed all-sum keeps the flags
-        in lockstep; a no-op at world size 1.
-        """
-        world = self._ensure_distributed()
-        if world is None or self._distributed_world_size <= 1:
-            return
-        base = self._distributed_world_size + 1
-        code = (
-            int(bool(self.control.should_log))
-            + base * int(bool(self.control.should_evaluate))
-            + base * base * int(bool(self.control.should_save))
-        )
-        total = self._distributed_status_mask(code)
-        self.control.should_log = (total % base) > 0
-        self.control.should_evaluate = ((total // base) % base) > 0
-        self.control.should_save = ((total // (base * base)) % base) > 0
-
     def _distributed_eval_status(self, failed=False):
         """Synchronize eval stop/failure state with one rank-wide collective."""
         status_base = self.distributed_world_size + 1
@@ -1302,160 +1136,6 @@ class MLXTrainer:
         fn(step, eval_loss, perplexity)
         """
         self._eval_callbacks.append(fn)
-
-    def add_callback(self, callback):
-        """Add a Hugging Face TrainerCallback class or instance."""
-        self.callback_handler.add_callback(callback)
-        self._ensure_callback_args_compat()
-
-    def remove_callback(self, callback):
-        """Remove a Hugging Face TrainerCallback class or instance."""
-        self.callback_handler.remove_callback(callback)
-
-    def pop_callback(self, callback):
-        """Remove and return a Hugging Face TrainerCallback class or instance."""
-        return self.callback_handler.pop_callback(callback)
-
-    def _ensure_callback_args_compat(self):
-        """Populate TrainingArguments-style fields read by common callbacks."""
-        args = self.args
-        if not hasattr(args, "logging_strategy"):
-            args.logging_strategy = "steps" if getattr(args, "logging_steps", 0) else "no"
-        if not hasattr(args, "eval_strategy") or getattr(args, "eval_strategy", None) is None:
-            args.eval_strategy = self._default_callback_eval_strategy()
-        if not hasattr(args, "save_strategy"):
-            args.save_strategy = "steps" if getattr(args, "save_steps", 0) else "no"
-        if not hasattr(args, "logging_first_step"):
-            args.logging_first_step = False
-        if not hasattr(args, "eval_delay"):
-            args.eval_delay = 0
-        if not hasattr(args, "include_num_input_tokens_seen"):
-            args.include_num_input_tokens_seen = False
-        if getattr(args, "logging_dir", None) is None:
-            args.logging_dir = os.path.join(args.output_dir, "runs")
-        if getattr(args, "run_name", None) is None:
-            args.run_name = args.output_dir
-
-    def _default_callback_eval_strategy(self):
-        """Return the MLX-derived eval strategy for callback compatibility."""
-        return (
-            "steps"
-            if self.eval_dataset is not None and getattr(self.args, "eval_steps", 0)
-            else "no"
-        )
-
-    def _init_callback_state(self, total_steps, resume_step):
-        """Initialize TrainerState for HF callback lifecycle events."""
-        args = self.args
-        eval_steps = int(getattr(args, "eval_steps", 0) or 0)
-        # Reflect the real MLX rank so HF callbacks (loggers, savers) gate their
-        # own I/O correctly. MLX distributed is single-node, so local and world
-        # process-zero both track rank 0.
-        is_main_process = self.is_main_process
-        self.state = _MLXTrainerState(
-            global_step=int(resume_step),
-            max_steps=int(total_steps),
-            logging_steps=int(getattr(args, "logging_steps", 0) or 0),
-            eval_steps=eval_steps,
-            save_steps=int(getattr(args, "save_steps", 0) or 0),
-            train_batch_size=int(getattr(args, "per_device_train_batch_size", 0) or 0),
-            num_train_epochs=max(0, int(getattr(args, "num_train_epochs", 0) or 0)),
-            log_history=[],
-            is_local_process_zero=is_main_process,
-            is_world_process_zero=is_main_process,
-        )
-        # Seed the callback-visible best-model fields from the restored native
-        # best state (set by the resume block before this call; None on a fresh
-        # run). Otherwise a resumed run starts with state.best_metric=None, so
-        # _update_callback_best_metric and HF callbacks like EarlyStoppingCallback
-        # treat the first post-resume eval as the new best and can overwrite the
-        # real best with a worse metric, diverging from the native best-model
-        # tracking in _run_best_tracking (which uses the restored self._best_metric).
-        self.state.best_metric = self._best_metric
-        self.state.best_global_step = self._best_step
-        if self._best_step is not None:
-            self.state.best_model_checkpoint = f"{args.output_dir}/best"
-        self.control = _MLXTrainerControl()
-
-    def _sync_callback_stop(self):
-        """Mirror TrainerControl stop requests into MLXTrainer's loop flag."""
-        if getattr(self.control, "should_training_stop", False):
-            self.stop_requested = True
-
-    def _call_callback_log(self, logs):
-        """Record and dispatch a Hugging Face on_log callback event."""
-        output = dict(logs)
-        output["step"] = self.state.global_step
-        self.state.log_history.append(output)
-        self.control.should_log = False
-        self.control = self.callback_handler.call_event(
-            "on_log",
-            self.args, self.state, self.control, logs=logs,
-        )
-
-    def _call_callback_evaluate(self, metrics):
-        """Dispatch a Hugging Face on_evaluate callback event."""
-        self._call_callback_log(dict(metrics))
-        self.control.should_evaluate = False
-        self.control = self.callback_handler.call_event(
-            "on_evaluate",
-            self.args, self.state, self.control, metrics=metrics,
-        )
-
-    def _call_callback_save(self):
-        """Dispatch a Hugging Face on_save callback event."""
-        self.control.should_save = False
-        self.control = self.callback_handler.call_event(
-            "on_save",
-            self.args, self.state, self.control,
-        )
-
-    def _callback_batches_per_epoch(self, batches):
-        """Return the finite micro-batch count for one callback epoch."""
-        if batches is None:
-            return None
-        total = len(batches)
-        if total <= 0:
-            return None
-        if getattr(self, "_prepared_batches_include_epochs", False):
-            epochs = int(getattr(self.args, "num_train_epochs", 0) or 0)
-            if epochs > 0 and total % epochs == 0:
-                return max(1, total // epochs)
-        return total
-
-    def _metric_for_best_model_name(self, metrics=None, require=False):
-        """Return the HF-normalized metric_for_best_model key."""
-        metric_name = getattr(self.args, "metric_for_best_model", None)
-        if not metric_name:
-            return None
-        metric_name = str(metric_name)
-        if not metric_name.startswith("eval_"):
-            metric_name = f"eval_{metric_name}"
-        if metrics is not None and metric_name not in metrics:
-            if require:
-                raise ValueError(
-                    f"metric_for_best_model={metric_name!r} not in eval "
-                    f"metrics; available: {sorted(metrics)}"
-                )
-            return None
-        return metric_name
-
-    def _update_callback_best_metric(self, metrics):
-        """Update TrainerState.best_metric after eval callbacks inspect prior state."""
-        metric_name = self._metric_for_best_model_name(metrics, require=False)
-        if metric_name is None:
-            return
-        value = metrics[metric_name]
-        if value != value:
-            return
-        greater = bool(getattr(self.args, "greater_is_better", False))
-        improved = (
-            self.state.best_metric is None
-            or (value > self.state.best_metric if greater else value < self.state.best_metric)
-        )
-        if improved:
-            self.state.best_metric = value
-            self.state.best_global_step = self.state.global_step
 
     @staticmethod
     def _apply_compile_recommendations(args, decision):
@@ -2138,14 +1818,6 @@ class MLXTrainer:
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
-        # Clear a stale stop from a PRIOR run at the EARLIEST point, before any
-        # data prep / optimizer build / _train_inner, so a reused trainer starts
-        # un-stopped. _reset_run_state (post-setup) no longer touches this, so an
-        # external cancel raised DURING this run's setup (e.g. a Studio cancel on
-        # a large dataset materializing in _prepare_data) survives to the loop's
-        # top-of-loop _distributed_should_stop() check. Local assignment only, no
-        # DDP collective.
-        self.stop_requested = False
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
@@ -2457,12 +2129,6 @@ class MLXTrainer:
                     f"resume state files are missing ({e}). Refusing to "
                     f"silently restart from step 0."
                 ) from e
-
-        self.callback_handler.optimizer = optimizer
-        self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
-        self.callback_handler.processing_class = self.processor or self.tokenizer
-        self._ensure_callback_args_compat()
-        self._init_callback_state(total_steps, _resume_step)
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -2918,18 +2584,7 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
-
-        def _prepare_eval_batches():
-            """Materialize eval batches the first time evaluation is requested.
-
-            Deferred so a callback can request evaluation even when the static
-            eval cadence is off. Every rank enters this together (the eval
-            control flag is rank-synced), so the collective create_batches call
-            stays in lockstep.
-            """
-            nonlocal eval_batches
-            if eval_batches is not None or self.eval_dataset is None:
-                return eval_batches
+        if args.eval_steps > 0 and self.eval_dataset is not None:
             eval_batch_size = (
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
@@ -2988,8 +2643,7 @@ class MLXTrainer:
                     }
                 else:
                     eval_batches = _create_eval_batches(self.eval_dataset)
-            self.callback_handler.eval_dataloader = eval_batches
-            if eval_batches and args.eval_steps > 0:
+            if eval_batches:
                 eval_batch_count = (
                     sum(len(value) for value in eval_batches.values())
                     if isinstance(eval_batches, dict) else len(eval_batches)
@@ -2998,55 +2652,6 @@ class MLXTrainer:
                     f"Unsloth: Eval enabled every {args.eval_steps} steps "
                     f"({eval_batch_count} eval batches)."
                 )
-            return eval_batches
-
-        def _fire(event, **kwargs):
-            """Dispatch an HF callback event on rank 0 only.
-
-            Callbacks perform host I/O (logging, saving, printing) and must not
-            run on every rank. Any resulting control-flag change is propagated
-            to the peer ranks by the caller (_sync_stop for the stop flag, or
-            _distributed_sync_control_actions for log/eval/save).
-
-            A callback that raises on rank 0 (an integration/logging error) must
-            not unwind rank 0 alone: the peers, which never enter this branch,
-            would return here and hang at the next collective while rank 0
-            aborts. Route the rank-0 failure through the distributed consensus
-            path (all ranks call _fire in lockstep) so every rank aborts with
-            the original error surfaced. Single-process keeps re-raising the
-            original exception unchanged.
-            """
-            call_error = None
-            if is_main_process:
-                try:
-                    self.control = self.callback_handler.call_event(
-                        event, args, self.state, self.control, **kwargs,
-                    )
-                except Exception as e:
-                    call_error = e
-            if distributed_world_size > 1:
-                self._raise_distributed_failure(
-                    call_error is not None,
-                    f"{event} callback",
-                    call_error,
-                )
-            elif call_error is not None:
-                raise call_error
-
-        def _sync_stop():
-            """Propagate a callback stop request to every rank in lockstep.
-
-            _sync_callback_stop copies control.should_training_stop into
-            stop_requested on rank 0; _distributed_should_stop all-reduces the
-            OR of stop_requested so no rank is left spinning while rank 0 exits.
-            """
-            self._sync_callback_stop()
-            return self._distributed_should_stop()
-
-        self.callback_handler.train_dataloader = batches if batches is not None else batch_iter
-        self.control.should_training_stop = False
-        _fire("on_train_begin")
-        _sync_stop()
 
         features = []
         if is_vlm:
@@ -3095,324 +2700,6 @@ class MLXTrainer:
         trained_tokens = 0
         train_time = 0
         grad_accum_state = None
-        accum_progress = 0
-        batches_per_epoch = self._callback_batches_per_epoch(batches)
-
-        def _run_callback_epoch_begin(epoch_value):
-            """Dispatch one epoch-begin event at a dataset boundary (rank 0)."""
-            self.state.epoch = epoch_value
-            _fire("on_epoch_begin")
-            _sync_stop()
-
-        def _maybe_callback_epoch_begin(microstep):
-            """Dispatch epoch-begin at finite dataset boundaries."""
-            if not batches_per_epoch or (microstep - 1) % batches_per_epoch != 0:
-                return False
-            _run_callback_epoch_begin((microstep - 1) / batches_per_epoch)
-            return True
-
-        def _maybe_callback_epoch_end(microstep, current_step, grad_norm):
-            """Dispatch epoch-end after an optimizer step at a dataset boundary."""
-            if not batches_per_epoch or microstep % batches_per_epoch != 0:
-                return
-            self.state.epoch = microstep / batches_per_epoch
-            _fire("on_epoch_end")
-            # on_epoch_end fires on rank 0 only; sync the log/eval/save requests
-            # before the collective control actions so peers stay in lockstep.
-            self._distributed_sync_control_actions()
-            if self.control.should_log or self.control.should_evaluate or self.control.should_save:
-                _run_callback_control_actions(current_step, grad_norm)
-            _sync_stop()
-
-        def _run_training_log(current_step, grad_norm):
-            """Emit one MLX/HF training log from accumulated loss counters.
-
-            The loss/token totals are all-reduced so every rank logs the same
-            global figures; host I/O (printing, step callbacks, on_log) runs on
-            rank 0 only.
-            """
-            nonlocal losses, n_tokens, steps, train_time, trained_tokens
-            metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
-            metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
-            mx.eval(metric_losses, metric_tokens)
-            train_loss = (
-                (metric_losses / metric_tokens).item()
-                if metric_tokens.item() > 0 else 0.0
-            )
-            local_tok_count = int(n_tokens.item())
-            tok_count = int(metric_tokens.item())
-            trained_tokens += tok_count
-            lr_val = optimizer.learning_rate.item()
-            tokens_sec = tok_count / train_time if train_time > 0 else 0
-            peak_mem = mx.get_peak_memory() / 1e9
-
-            self._train_loss_history.append(train_loss)
-            grad_norm_val = (
-                float(grad_norm.item())
-                if grad_norm is not None else None
-            )
-            if grad_norm_val is not None:
-                self._grad_norm_history.append(grad_norm_val)
-            self._tokens_per_second_history.append(tokens_sec)
-            self._peak_memory_history.append(peak_mem)
-            self._step_times.append(train_time / steps if steps > 0 else 0)
-            self._local_token_count_history.append(local_tok_count)
-            self._global_token_count_history.append(tok_count)
-
-            reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
-            if reset_after > 0 and current_step == reset_after:
-                mx.synchronize()
-                mx.reset_peak_memory()
-
-            elapsed_total = time.perf_counter() - start_time
-            grad_text = (
-                f"Grad: {grad_norm_val:.4f} | "
-                if grad_norm_val is not None else ""
-            )
-            _main_print(
-                f"  Step {current_step}/{total_steps} | "
-                f"Loss: {train_loss:.4f} | "
-                f"{grad_text}"
-                f"LR: {lr_val:.2e} | "
-                f"Tok/s: {tokens_sec:.0f} | "
-                f"Peak: {peak_mem:.2f} GB"
-            )
-
-            if is_main_process:
-                for cb in self._step_callbacks:
-                    try:
-                        cb(
-                            current_step, total_steps, train_loss, lr_val,
-                            tokens_sec, peak_mem, elapsed_total, trained_tokens,
-                            grad_norm_val,
-                        )
-                    except Exception as e:
-                        _main_print(f"Unsloth: step callback error: {e}")
-
-            logs = {
-                "loss": train_loss,
-                "learning_rate": lr_val,
-                "tokens_per_second": tokens_sec,
-                "peak_memory_gb": peak_mem,
-                "trained_tokens": trained_tokens,
-            }
-            if grad_norm_val is not None:
-                logs["grad_norm"] = grad_norm_val
-            self.control.should_log = False
-            if is_main_process:
-                record = dict(logs)
-                record["step"] = self.state.global_step
-                self.state.log_history.append(record)
-            _fire("on_log", logs=logs)
-            # on_log fires on rank 0 only and may itself request an eval or save
-            # (HF checks should_evaluate/should_save after logging in the same
-            # step). Sync those flags now: the caller's should_eval / should_save
-            # branches run collective eval + rank-0-guarded saves, so a request
-            # set on rank 0 alone would make rank 0 enter _run_eval/_run_checkpoint
-            # while peers skip them and hang at the collective. No-op at world 1.
-            self._distributed_sync_control_actions()
-
-            losses = 0
-            n_tokens = 0
-            steps = 0
-            train_time = 0
-
-        def _run_eval(current_step):
-            """Run eval and dispatch MLX/HF eval callbacks in DDP lockstep."""
-            current_eval_batches = _prepare_eval_batches()
-            if not current_eval_batches:
-                self.control.should_evaluate = False
-                return False
-            val_loss, ppl = self._evaluate(
-                current_eval_batches, loss_fn, is_vlm=is_vlm)
-            model.train()
-            _main_print(
-                f"  Eval  {current_step}/{total_steps} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Perplexity: {ppl:.2f}"
-            )
-            if is_main_process:
-                for cb in self._eval_callbacks:
-                    try:
-                        cb(current_step, val_loss, ppl)
-                    except Exception as e:
-                        _main_print(f"Unsloth: eval callback error: {e}")
-
-            metrics = self._last_eval_metrics or {}
-            self.control.should_evaluate = False
-            if is_main_process:
-                record = dict(metrics)
-                record["step"] = self.state.global_step
-                self.state.log_history.append(record)
-            _fire("on_log", logs=dict(metrics))
-            _fire("on_evaluate", metrics=metrics)
-            # on_log/on_evaluate fire on rank 0 only, and either may itself
-            # request a log/eval/save (HF checks should_save after on_evaluate in
-            # the same step). Sync those flags now, before the caller reads
-            # should_log / should_save: those branches run collective code
-            # (metric all-reduce, rank-0-guarded checkpoint save + on_save), so a
-            # request set on rank 0 alone would make rank 0 enter
-            # _run_training_log/_run_checkpoint while peers skip them and hang at
-            # the collective. Mirrors the on_log sync in _run_training_log; no-op
-            # at world size 1.
-            self._distributed_sync_control_actions()
-            self._update_callback_best_metric(metrics)
-            # An external cancel arriving before/during eval is OR-reduced here so
-            # every rank agrees on stop_requested before the divergent best-model /
-            # early-stopping branch in _run_best_tracking (its rank-0-guarded best
-            # save would otherwise hang peers). A callback stop requested during
-            # on_step_end / on_evaluate is deliberately NOT copied into
-            # stop_requested yet: HF (_maybe_log_save_evaluate) runs
-            # _determine_best_metric and writes the checkpoint for this step BEFORE
-            # the loop honors should_training_stop, so latching the callback stop
-            # here would make _run_best_tracking (gated on not stop_requested) skip
-            # a valid, improving eval, leaving load_best_model_at_end to restore a
-            # stale model. The callback stop is applied by the caller's tail
-            # _sync_stop(), after best tracking and the same-step save. No-op at
-            # world size 1.
-            self._distributed_should_stop()
-            return True
-
-        def _run_best_tracking(current_step):
-            """Update native best-model + early-stopping state in DDP lockstep."""
-            _track = not self.stop_requested and (
-                getattr(args, "load_best_model_at_end", False)
-                or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
-            )
-            if not _track:
-                return
-            _metric_name = self._resolved_best_metric_name()
-            _em = self._last_eval_metrics or {}
-            if _metric_name not in _em:
-                raise ValueError(
-                    f"metric_for_best_model={_metric_name!r} not in eval "
-                    f"metrics; available: {sorted(_em)}"
-                )
-            _cur = _em[_metric_name]
-            _greater = bool(getattr(args, "greater_is_better", False))
-            _improved = (
-                _cur == _cur  # reject NaN: a diverged eval must never be "best"
-                and (
-                    self._best_metric is None
-                    or (_cur > self._best_metric if _greater else _cur < self._best_metric)
-                )
-            )
-            if _improved:
-                self._best_metric = _cur
-                self._best_step = current_step
-                self.state.best_metric = _cur
-                self.state.best_global_step = current_step
-                self.state.best_model_checkpoint = f"{args.output_dir}/best"
-                self._es_patience_counter = 0
-                # Bookkeeping runs on every rank to keep early-stopping in
-                # lockstep; only rank 0 writes output_dir/best. Sync save
-                # failures so a rank-0 error does not hang peers at the next
-                # collective.
-                best_save_error = None
-                if is_main_process:
-                    try:
-                        save_trainable_adapters(model, f"{args.output_dir}/best")
-                    except ValueError as e:
-                        _main_print(f"  Unsloth: skipped best-model save ({e})")
-                    except Exception as e:
-                        best_save_error = e
-                self._raise_distributed_failure(
-                    best_save_error is not None,
-                    "best-model save",
-                    best_save_error,
-                )
-            else:
-                self._es_patience_counter += 1
-                _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
-                if _pat > 0 and self._es_patience_counter >= _pat:
-                    _main_print(
-                        f"Unsloth: early stopping at step {current_step} "
-                        f"(no {_metric_name} improvement in {_pat} evals)."
-                    )
-                    self._early_stopped = True
-
-        def _run_checkpoint(current_step):
-            """Save a step checkpoint (rank 0) and dispatch HF on_save."""
-            checkpoint_error = None
-            checkpoint_written = False
-            if is_main_process:
-                ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                try:
-                    try:
-                        save_trainable_adapters(model, ckpt_dir)
-                    except ValueError as e:
-                        _main_print(f"  Unsloth: skipped checkpoint ({e})")
-                    else:
-                        checkpoint_written = True
-                        # Also write optimizer + trainer state so
-                        # resume_from_checkpoint restores Adam moments, step
-                        # counter, loss history, and best-model / early-stopping
-                        # tracking. Best-effort: the adapter save already
-                        # succeeded, so log failures but keep it.
-                        checkpoint_complete = False
-                        try:
-                            save_optimizer_state(optimizer, ckpt_dir)
-                            save_trainer_state(
-                                {
-                                    "global_step": current_step,
-                                    "train_loss_history": list(
-                                        self._train_loss_history
-                                    ),
-                                    "best_metric": self._best_metric,
-                                    "best_step": self._best_step,
-                                    "es_patience_counter": self._es_patience_counter,
-                                },
-                                ckpt_dir,
-                            )
-                            checkpoint_complete = True
-                        except Exception as e:
-                            _main_print(
-                                "  Unsloth: checkpoint saved without "
-                                f"resume state ({e})"
-                            )
-                        _main_print(f"  Saved checkpoint to {ckpt_dir}")
-                        if checkpoint_complete:
-                            _prune_stale_checkpoints(
-                                args.output_dir,
-                                args.save_total_limit,
-                            )
-                except Exception as e:
-                    checkpoint_error = e
-            self._raise_distributed_failure(
-                checkpoint_error is not None,
-                "checkpoint save",
-                checkpoint_error,
-            )
-            self.control.should_save = False
-            # HF fires callback_handler.on_save only after _save_checkpoint writes
-            # to disk. save_trainable_adapters raises ValueError for a fully frozen
-            # / no-adapter model, skipping the write; firing on_save anyway would
-            # make integrations that react to it (hub uploaders, checkpoint
-            # trackers) record a checkpoint-N directory that was never created.
-            # The write happens on rank 0 only, so broadcast the outcome (all-sum
-            # of a rank-0 flag; peers contribute 0) and fire on_save on every rank
-            # together, or the rank that skips it strands its peers at the _fire
-            # consensus collective. No-op at world size 1.
-            checkpoint_written_any = self._distributed_status_mask(
-                1 if (is_main_process and checkpoint_written) else 0
-            ) > 0
-            if checkpoint_written_any:
-                _fire("on_save")
-
-        def _run_callback_control_actions(current_step, grad_norm):
-            """Run log/eval/save actions requested by callback control flags.
-
-            Callers sync the control action flags across ranks before invoking
-            this so the collective log/eval/save paths run in lockstep.
-            """
-            if self.control.should_log:
-                _run_training_log(current_step, grad_norm)
-            if self.control.should_evaluate:
-                if _run_eval(current_step):
-                    _run_best_tracking(current_step)
-            if self.control.should_save:
-                _run_checkpoint(current_step)
-
         # When resuming, start batch_idx at the resume position so
         # batches[batch_idx % len(batches)] lands on the same batch the
         # original run would have seen next.
@@ -3508,32 +2795,11 @@ class MLXTrainer:
 
             return result
 
-        # DDP-lockstep microstep loop. global_step advances only on optimizer
-        # updates; _distributed_should_stop() OR-reduces stop_requested at the
-        # top so an early stop (external cancel or an HF stop callback that ran
-        # on rank 0 only) drains every rank together before the next collective.
-        microstep = _resume_step * grad_accum
-        self._global_step = _resume_step
-        while self._global_step < total_steps:
-            it = microstep + 1
+        for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
             if self._distributed_should_stop() or self._early_stopped:
                 if self.stop_requested:
                     _main_print("Unsloth: Stop requested - ending training early.")
                 break
-
-            if _maybe_callback_epoch_begin(it):
-                if self.stop_requested:
-                    _main_print("Unsloth: Stop requested - ending training early.")
-                    break
-
-            if accum_progress == 0:
-                self.control.should_log = False
-                self.control.should_evaluate = False
-                self.control.should_save = False
-                _fire("on_step_begin")
-                if _sync_stop():
-                    _main_print("Unsloth: Stop requested - ending training early.")
-                    break
 
             tic = time.perf_counter()
 
@@ -3557,11 +2823,11 @@ class MLXTrainer:
             elif batch_error is not None:
                 raise batch_error
 
-            do_update = (accum_progress + 1 >= grad_accum)
+            do_update = (it % grad_accum == 0)
             if do_update:
                 # Keep callable scheduler evaluation outside mx.compile. The
                 # compiled step reads the scalar LR already in optimizer state.
-                self._set_optimizer_lr_for_step(optimizer, self._global_step)
+                self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
 
             if _ddp_update_outside_step:
                 lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
@@ -3636,136 +2902,223 @@ class MLXTrainer:
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
-            if do_update:
-                _fire("on_optimizer_step")
-                # Do NOT latch a callback should_training_stop into stop_requested
-                # here. HF fires on_optimizer_step, then on_step_end, then
-                # _maybe_log_save_evaluate (log+eval+save) for this step, and only
-                # breaks on should_training_stop AFTER that block (transformers
-                # trainer.py _inner_training_loop: on_optimizer_step -> on_step_end
-                # -> _maybe_log_save_evaluate -> the should_epoch_stop/
-                # should_training_stop break). Latching the stop now would make
-                # this step's _evaluate_batch_totals skip every eval batch (it is
-                # gated on not stop_requested), reporting 0.0 loss and corrupting
-                # best-model / early-stopping state. OR-reduce only an external
-                # cancel here; the callback stop is applied by the tail
-                # _sync_stop() after the same-step log/eval/save, mirroring the
-                # on_step_end deferral below.
-                self._distributed_should_stop()
-            # HF's TrainerState.num_input_tokens_seen is a global (all-rank
-            # gathered) count; callbacks that report or stop on a token budget
-            # read it directly. global_toks was already all-reduced and eval'd
-            # above for the zero-token guard, so reuse it here instead of the
-            # rank-local toks, which would undercount by ~world_size under DDP.
-            self.state.num_input_tokens_seen += int(global_toks.item())
-            if batches_per_epoch:
-                self.state.epoch = it / batches_per_epoch
             train_time += time.perf_counter() - tic
 
             # Only log/eval on actual optimizer steps
             if not do_update:
-                accum_progress += 1
-                _fire("on_substep_end")
-                # Do NOT latch a callback should_training_stop into stop_requested
-                # yet. When this non-update microstep is also an epoch boundary,
-                # _maybe_callback_epoch_end below fires on_epoch_end and may run a
-                # same-epoch eval; latching the stop now would make that eval's
-                # _evaluate_batch_totals skip every batch (it is gated on not
-                # stop_requested), reporting 0.0 loss and corrupting best-model /
-                # early-stopping state. OR-reduce only an external cancel here; the
-                # callback stop is applied by the tail _sync_stop() below after the
-                # epoch-end log/eval/save, mirroring the on_step_end / on_optimizer_
-                # step deferrals in the update branch.
-                self._distributed_should_stop()
-                # An epoch boundary can fall on a non-update microstep when
-                # batches-per-epoch is not a multiple of grad_accum (for example
-                # 3 micro-batches with grad_accum=2). HF always fires on_epoch_end
-                # once per epoch (its final batch forces an optimizer step), so
-                # fire it here too; otherwise on_epoch_end and any log/eval/save/
-                # stop it requests are dropped for that epoch. _maybe_callback_
-                # epoch_end is a no-op away from a boundary and runs the same
-                # collectives on every rank (it/batches_per_epoch are rank-
-                # consistent), so DDP stays in lockstep.
-                _maybe_callback_epoch_end(it, self._global_step, grad_norm)
-                # Apply any deferred callback stop (from on_substep_end or the
-                # epoch-end callbacks) now that the epoch-end eval has run. This
-                # tail _sync_stop() runs on every rank in the same order as the
-                # update branch's tail, so DDP stays in lockstep; the continue then
-                # routes to the top-of-loop _distributed_should_stop(), which drains
-                # the stop on every rank before the next collective.
-                _sync_stop()
-                microstep = it
                 continue
 
-            current_step = self._global_step + 1
-            self._global_step = current_step
-            self.state.global_step = current_step
-            accum_progress = 0
-            _fire("on_step_end")
-            # on_step_end runs on rank 0 only and may request log/eval/save or a
-            # stop. Sync those decisions across ranks before the collective
-            # log/eval/save paths so every rank makes the same choice.
-            self._distributed_sync_control_actions()
-            # Do NOT copy a callback should_training_stop into stop_requested yet.
-            # HF runs this step's log/evaluate/save before the loop breaks, so a
-            # stop requested on on_step_end must not pre-empt a same-step eval:
-            # _evaluate_batch_totals skips every eval batch while stop_requested
-            # is set, which would report 0.0 loss and corrupt best-model /
-            # early-stopping state. Only OR-reduce any external cancel here (a
-            # rank-consistent hard stop); the callback stop is applied after the
-            # same-step actions by the tail _sync_stop() below.
-            self._distributed_should_stop()
+            self._global_step = it // grad_accum
+            current_step = self._global_step
 
-            # Logging. logging_steps is guarded against 0 to avoid a modulo-by-zero;
-            # the callback control flag (synced across ranks above) can also force
-            # a log. _run_training_log all-reduces the loss/token totals so every
-            # rank stays in lockstep.
-            logging_steps = int(getattr(args, "logging_steps", 0) or 0)
-            should_log = (
-                (logging_steps > 0 and current_step % logging_steps == 0)
-                or current_step == total_steps
-                or self.control.should_log
-            )
-            if should_log:
-                _run_training_log(current_step, grad_norm)
-
-            # Eval (cadence or a synced callback request). _run_eval builds eval
-            # batches lazily on every rank, runs the collective eval, then fires
-            # on_evaluate on rank 0 and syncs any stop before best tracking.
-            should_eval = (
-                self.eval_dataset is not None
-                and (
-                    (args.eval_steps > 0 and current_step % args.eval_steps == 0)
-                    or self.control.should_evaluate
+            # Logging
+            if current_step % args.logging_steps == 0 or current_step == total_steps:
+                metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
+                metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
+                mx.eval(metric_losses, metric_tokens)
+                train_loss = (
+                    (metric_losses / metric_tokens).item()
+                    if metric_tokens.item() > 0 else 0.0
                 )
-            )
-            if should_eval:
-                if _run_eval(current_step):
-                    _run_best_tracking(current_step)
+                local_tok_count = int(n_tokens.item())
+                tok_count = int(metric_tokens.item())
+                trained_tokens += tok_count
+                lr_val = optimizer.learning_rate.item()
+                tokens_sec = tok_count / train_time if train_time > 0 else 0
+                peak_mem = mx.get_peak_memory() / 1e9
 
-            # Checkpointing (cadence or a synced callback request). _run_checkpoint
-            # writes on rank 0 and syncs save failures across ranks.
-            should_save = (
-                (args.save_steps > 0 and current_step % args.save_steps == 0)
-                or self.control.should_save
-            )
-            if should_save:
-                _run_checkpoint(current_step)
+                self._train_loss_history.append(train_loss)
+                grad_norm_val = (
+                    float(grad_norm.item())
+                    if grad_norm is not None else None
+                )
+                if grad_norm_val is not None:
+                    self._grad_norm_history.append(grad_norm_val)
+                self._tokens_per_second_history.append(tokens_sec)
+                self._peak_memory_history.append(peak_mem)
+                self._step_times.append(train_time / steps if steps > 0 else 0)
+                self._local_token_count_history.append(local_tok_count)
+                self._global_token_count_history.append(tok_count)
 
-            _maybe_callback_epoch_end(it, current_step, grad_norm)
-            # Propagate any stop set by the tail callbacks (on_step_end / on_log /
-            # on_evaluate / on_save / on_epoch_end) to every rank before breaking,
-            # so no rank is left waiting at the next collective.
-            if _sync_stop():
-                break
-            microstep = it
+                # Benchmark hook: reset peak memory after warmup
+                reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
+                if reset_after > 0 and current_step == reset_after:
+                    mx.synchronize()
+                    mx.reset_peak_memory()
+
+                elapsed_total = time.perf_counter() - start_time
+
+                grad_text = (
+                    f"Grad: {grad_norm_val:.4f} | "
+                    if grad_norm_val is not None else ""
+                )
+                _main_print(
+                    f"  Step {current_step}/{total_steps} | "
+                    f"Loss: {train_loss:.4f} | "
+                    f"{grad_text}"
+                    f"LR: {lr_val:.2e} | "
+                    f"Tok/s: {tokens_sec:.0f} | "
+                    f"Peak: {peak_mem:.2f} GB"
+                )
+
+                if is_main_process:
+                    for cb in self._step_callbacks:
+                        try:
+                            cb(
+                                current_step, total_steps, train_loss, lr_val,
+                                tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                                grad_norm_val,
+                            )
+                        except Exception as e:
+                            _main_print(f"Unsloth: step callback error: {e}")
+
+                losses = 0
+                n_tokens = 0
+                steps = 0
+                train_time = 0
+
+            # Eval
+            if (eval_batches and args.eval_steps > 0
+                    and current_step % args.eval_steps == 0):
+                val_loss, ppl = self._evaluate(
+                    eval_batches, loss_fn, is_vlm=is_vlm)
+                model.train()
+                _main_print(
+                    f"  Eval  {current_step}/{total_steps} | "
+                    f"Val Loss: {val_loss:.4f} | "
+                    f"Perplexity: {ppl:.2f}"
+                )
+                if is_main_process:
+                    for cb in self._eval_callbacks:
+                        try:
+                            cb(current_step, val_loss, ppl)
+                        except Exception as e:
+                            _main_print(f"Unsloth: eval callback error: {e}")
+
+                # Eval callbacks fire on rank 0 only, so a callback (or an
+                # external cancel arriving mid-eval) that sets stop_requested is
+                # initially visible on rank 0 alone. Sync it across ranks before
+                # the best-model / early-stopping branch below: otherwise _track
+                # diverges (rank 0 skips, peers enter) and the rank-0-guarded
+                # best-model save collective in _track hangs the peer ranks.
+                self._distributed_should_stop()
+
+                # Best-model tracking + early stopping (Item-5). Skipped after
+                # a stop request: an aborted eval leaves partial metrics (a
+                # truncated eval_loss can beat any real best) and may lack the
+                # tracked key entirely.
+                _track = not self.stop_requested and (
+                    getattr(args, "load_best_model_at_end", False)
+                    or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                )
+                if _track:
+                    _metric_name = self._resolved_best_metric_name()
+                    _em = self._last_eval_metrics or {}
+                    if _metric_name not in _em:
+                        raise ValueError(
+                            f"metric_for_best_model={_metric_name!r} not in eval "
+                            f"metrics; available: {sorted(_em)}"
+                        )
+                    _cur = _em[_metric_name]
+                    _greater = bool(getattr(args, "greater_is_better", False))
+                    _improved = (
+                        _cur == _cur  # reject NaN: a diverged eval must never become "best"
+                        and (
+                            self._best_metric is None
+                            or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                        )
+                    )
+                    if _improved:
+                        self._best_metric = _cur
+                        self._best_step = current_step
+                        self._es_patience_counter = 0
+                        # Bookkeeping runs on every rank to keep early-stopping
+                        # in lockstep; only rank 0 writes output_dir/best. Sync
+                        # save failures across ranks so a rank-0 error does not
+                        # hang peers at the next collective.
+                        best_save_error = None
+                        if is_main_process:
+                            try:
+                                save_trainable_adapters(model, f"{args.output_dir}/best")
+                            except ValueError as e:
+                                print(f"  Unsloth: skipped best-model save ({e})")
+                            except Exception as e:
+                                best_save_error = e
+                        self._raise_distributed_failure(
+                            best_save_error is not None,
+                            "best-model save",
+                            best_save_error,
+                        )
+                    else:
+                        self._es_patience_counter += 1
+                        _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
+                        if _pat > 0 and self._es_patience_counter >= _pat:
+                            _main_print(
+                                f"Unsloth: early stopping at step {current_step} "
+                                f"(no {_metric_name} improvement in {_pat} evals)."
+                            )
+                            self._early_stopped = True
+
+            # Checkpointing
+            checkpoint_due = (
+                args.save_steps > 0
+                and current_step % args.save_steps == 0
+            )
+            if checkpoint_due:
+                checkpoint_error = None
+                if is_main_process:
+                    ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
+                    try:
+                        try:
+                            save_trainable_adapters(model, ckpt_dir)
+                        except ValueError as e:
+                            _main_print(f"  Unsloth: skipped checkpoint ({e})")
+                        else:
+                            # Also write optimizer + trainer state so
+                            # resume_from_checkpoint restores Adam moments, step
+                            # counter, loss history, and best-model / early-stopping
+                            # tracking. Best-effort: the adapter save already
+                            # succeeded, so log failures but keep it.
+                            checkpoint_complete = False
+                            try:
+                                save_optimizer_state(optimizer, ckpt_dir)
+                                save_trainer_state(
+                                    {
+                                        "global_step": current_step,
+                                        "train_loss_history": list(
+                                            self._train_loss_history
+                                        ),
+                                        "best_metric": self._best_metric,
+                                        "best_step": self._best_step,
+                                        "es_patience_counter": self._es_patience_counter,
+                                    },
+                                    ckpt_dir,
+                                )
+                                checkpoint_complete = True
+                            except Exception as e:
+                                _main_print(
+                                    "  Unsloth: checkpoint saved without "
+                                    f"resume state ({e})"
+                                )
+                            _main_print(f"  Saved checkpoint to {ckpt_dir}")
+                            if checkpoint_complete:
+                                _prune_stale_checkpoints(
+                                    args.output_dir,
+                                    args.save_total_limit,
+                                )
+                    except Exception as e:
+                        checkpoint_error = e
+                self._raise_distributed_failure(
+                    checkpoint_error is not None,
+                    "checkpoint save",
+                    checkpoint_error,
+                )
+
+        total_time = time.perf_counter() - start_time
         avg_loss = (
             sum(self._train_loss_history) / len(self._train_loss_history)
             if self._train_loss_history else 0.0
         )
-        # Total wall-clock training time, consumed by the summary line and the
-        # distributed diagnostics / train_runtime metrics below.
-        total_time = time.perf_counter() - start_time
 
         # Report the step actually reached, which is < total_steps after an
         # early stop (self._global_step == total_steps on a full run).
@@ -3814,9 +3167,6 @@ class MLXTrainer:
             "final save",
             final_save_error,
         )
-
-        _fire("on_train_end")
-        _sync_stop()
 
         return MLXTrainOutput({
             "train_loss": avg_loss,
