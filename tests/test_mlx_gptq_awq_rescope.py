@@ -379,3 +379,104 @@ def test_adapter_dir_with_gptq_base_config_not_dequantized(monkeypatch, tmp_path
     # Only the recursively-loaded base was dequantized; the adapter dir itself
     # was routed to the adapter branch (never materialized).
     assert seen == [str(base_dir)]
+
+
+# ---------------------------------------------------------------------------
+# AutoAWQ GEMM 4-bit packing helper ([in, out//8], interleave 0,4,1,5,2,6,3,7).
+# ---------------------------------------------------------------------------
+
+# Natural output column k is stored at packed nibble slot _AWQ_ORDER[k]; this is
+# the inverse of loader._AWQ_REVERSE_ORDER used on unpack.
+_AWQ_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+
+
+def _pack_awq(intmat):
+    rows, cols = intmat.shape
+    q = np.zeros((rows, cols // 8), dtype=np.uint32)
+    for b in range(cols // 8):
+        for k in range(8):
+            q[:, b] |= (intmat[:, 8 * b + k].astype(np.uint32) & 0xF) << (4 * _AWQ_ORDER[k])
+    return q.astype(np.int32)
+
+
+def _make_awq_tensors(inn=8, out=16, gs=4, seed=3):
+    rng = np.random.default_rng(seed)
+    groups = 1 if gs <= 0 else inn // gs
+    w_int = rng.integers(0, 16, size=(inn, out)).astype(np.int64)   # [in, out]
+    z_int = rng.integers(0, 16, size=(groups, out)).astype(np.int64)
+    scales = rng.random((groups, out)).astype(np.float32) + 0.1
+    eff_gs = inn if gs <= 0 else gs
+    ref = np.zeros((out, inn), dtype=np.float32)                    # [out, in]
+    for i in range(inn):
+        g = i // eff_gs
+        ref[:, i] = (w_int[i] - z_int[g]) * scales[g]
+    return _pack_awq(w_int), _pack_awq(z_int), scales, ref
+
+
+# ---------------------------------------------------------------------------
+# AWQ layout guards: full-group (group_size <= 0) dequant math, and rejection of
+# non-GEMM AWQ variants that neither mlx-lm nor the local dequant can decode.
+# ---------------------------------------------------------------------------
+
+def test_awq_dequantize_weight_grouped_roundtrip():
+    # Standard grouped AWQ (group_size > 0) still round-trips; this also pins the
+    # test packer against the loader's unpack.
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    qw, qz, scales, ref = _make_awq_tensors(inn=8, out=16, gs=4, seed=5)
+    dense = ml._awq_dequantize_weight(mx.array(qw), mx.array(qz), mx.array(scales), 4, bits=4)
+    got = np.asarray(dense).astype(np.float32)
+    assert np.allclose(got, ref, atol=1e-2), np.abs(got - ref).max()
+
+
+@pytest.mark.parametrize("group_size", [-1, 0])
+def test_awq_dequantize_weight_full_group(group_size):
+    # AutoAWQ full-group / per-column (q_group_size <= 0): a single group spans
+    # the whole input dim. Without the guard, arange//-1 mis-gathers the single
+    # row of scales/zeros and reconstructs wrong weights (or indexes negatively).
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    qw, qz, scales, ref = _make_awq_tensors(inn=8, out=16, gs=-1, seed=6)
+    dense = ml._awq_dequantize_weight(
+        mx.array(qw), mx.array(qz), mx.array(scales), group_size, bits=4,
+    )
+    got = np.asarray(dense).astype(np.float32)
+    assert np.allclose(got, ref, atol=1e-2), np.abs(got - ref).max()
+
+
+def test_awq_quant_config_is_gemm_predicate():
+    import unsloth_zoo.mlx.loader as ml
+    # GEMM (default) and a blank/missing version are the native layout.
+    assert ml._awq_quant_config_is_gemm({"version": "GEMM"}) is True
+    assert ml._awq_quant_config_is_gemm({"version": "gemm"}) is True
+    assert ml._awq_quant_config_is_gemm({}) is True
+    assert ml._awq_quant_config_is_gemm({"version": ""}) is True
+    # Non-GEMM variants pack differently and must be rejected upstream.
+    for bad in ("GEMV", "gemv", "gemv_fast", "marlin", "exllama", "ipex"):
+        assert ml._awq_quant_config_is_gemm({"version": bad}) is False, bad
+
+
+def test_non_gemm_awq_rejected_before_native_load(monkeypatch, tmp_path):
+    # A GEMV-packed AWQ checkpoint must fail loud instead of silently deferring
+    # to mlx-lm (whose loader assumes GEMM) or being locally mis-dequantized.
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    repo = str(tmp_path / "awq_gemv")
+    os.makedirs(repo, exist_ok=True)
+    with open(os.path.join(repo, "config.json"), "w") as f:
+        json.dump({
+            "model_type": "llama",
+            "quantization_config": {
+                "quant_method": "awq", "bits": 4, "group_size": 128,
+                "version": "GEMV",
+            },
+        }, f)
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: repo)
+    monkeypatch.setattr(
+        loader, "_materialize_dequantized_hf_checkpoint",
+        lambda *a, **k: pytest.fail("non-GEMM AWQ must not be locally dequantized"),
+    )
+    with pytest.raises(NotImplementedError, match=r"'GEMV' layout"):
+        FastMLXModel.from_pretrained(repo, text_only=True)

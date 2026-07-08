@@ -3435,7 +3435,14 @@ def _awq_dequantize_weight(qweight, qzeros, scales, group_size, bits=4):
 
     w = _unpack(qw).astype(mx.float32)                  # [in, out]
     z = _unpack(qz).astype(mx.float32)                  # [groups, out]
-    g = (mx.arange(w.shape[0]) // group_size).astype(mx.int32)   # [in]
+    if group_size and group_size > 0:
+        g = (mx.arange(w.shape[0]) // group_size).astype(mx.int32)   # [in]
+    else:
+        # AutoAWQ full-group / per-column (q_group_size <= 0): a single group
+        # spans the whole input dim, so every row maps to group 0. Mirrors the
+        # GPTQ g_idx synthesis; without this arange//-1 yields negative indices
+        # that mis-gather the single-row scales/zeros.
+        g = mx.zeros((w.shape[0],), dtype=mx.int32)     # [in]
     eff = (w - z[g]) * scales[g]                        # [in, out]
     return mx.transpose(eff)                            # [out, in]
 
@@ -3451,6 +3458,28 @@ def _detect_hf_prequant_method(config_data):
     if method in _HF_RUNTIME_DEQUANT_METHODS:
         return method, quant_config
     return None, None
+
+
+# AutoAWQ packs INT4 several ways selected by quant_config["version"]: "gemm"
+# (the default), "gemv"/"gemv_fast", "marlin", "exllama", "ipex". Only the GEMM
+# layout matches the [in, out//pack] packing + (0,4,1,5,2,6,3,7) interleave that
+# both mlx-lm's native _transform_awq_weights and our local _awq_dequantize_weight
+# assume. A blank/missing version is the AutoAWQ + HF AwqConfig default (GEMM).
+_AWQ_NATIVE_GEMM_VERSIONS = frozenset({"", "gemm"})
+
+
+def _awq_quant_config_is_gemm(quant_config):
+    """True when an AWQ quant_config uses the AutoAWQ GEMM packing layout.
+
+    Non-GEMM AWQ variants (GEMV / gemv_fast / Marlin / ExLlama / IPEX) pack the
+    packed weights and zero-points differently, so decoding them with the GEMM
+    assumption -- whether deferred to mlx-lm or dequantized locally -- silently
+    reconstructs wrong dense weights. Callers reject those to a clear error.
+    """
+    if not isinstance(quant_config, dict):
+        return True
+    version = str(quant_config.get("version", "") or "").strip().lower()
+    return version in _AWQ_NATIVE_GEMM_VERSIONS
 
 
 # mlx-lm gained native GPTQ/AWQ dequant-on-load in mlx-lm PR #730 (0.30.4).
@@ -5518,6 +5547,24 @@ class FastMLXModel:
                     f"Unsloth: {hf_prequant_method.upper()} runtime dequant is not "
                     "yet supported for vision models on MLX. Load an unquantized "
                     "VLM base for LoRA instead."
+                )
+            # Only the AutoAWQ GEMM layout matches the packing that mlx-lm's
+            # native loader and our local dequant both assume. A non-GEMM AWQ
+            # (GEMV / gemv_fast / Marlin / ExLlama / IPEX) would silently decode
+            # to wrong dense weights on either path, so reject it loudly.
+            if hf_prequant_method == "awq" and not _awq_quant_config_is_gemm(
+                hf_prequant_config
+            ):
+                _awq_version = str(
+                    (hf_prequant_config or {}).get("version", "")
+                ).strip()
+                raise NotImplementedError(
+                    f"Unsloth: '{model_name}' is an AWQ checkpoint packed with the "
+                    f"'{_awq_version or 'unknown'}' layout, which is not supported "
+                    "on the MLX path. Only the standard AutoAWQ GEMM layout can be "
+                    "loaded (mlx-lm's native loader and the local dequant both "
+                    "assume the GEMM packing). Re-quantize with version=\"GEMM\" or "
+                    "load an unquantized base for LoRA."
                 )
             # Deferring to mlx-lm returns a quantized base; a dense/16-bit/
             # full-finetuning request needs trainable fp16 weights, so force the
