@@ -1392,6 +1392,30 @@ def get_backend_compile_qualifications(model_or_arch) -> tuple[MLXVLMCompileQual
     return tuple(qualifications)
 
 
+def _module_is_gated_delta(module) -> bool:
+    """Match gated-delta (GDN linear attention) layers structurally.
+
+    Class-name + parameter check: GatedDeltaNet / Qwen3NextGatedDeltaNet /
+    Qwen3_5GatedDeltaNet / KimiDeltaAttention all contain "delta" and carry
+    the A_log + dt_bias pair. Mamba/SSM mixers carry the same parameters but
+    never the name, so they are deliberately not matched here.
+    """
+    return (
+        "delta" in type(module).__name__.lower()
+        and hasattr(module, "A_log")
+        and hasattr(module, "dt_bias")
+    )
+
+
+def model_has_gated_delta_layers(model) -> bool:
+    """Whether any module in the model is a gated-delta recurrence layer."""
+    try:
+        modules = model.named_modules()
+    except Exception:
+        return False
+    return any(_module_is_gated_delta(module) for _, module in modules)
+
+
 def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:
     """Return a repo-specific compile block reason when policy should stay eager.
 

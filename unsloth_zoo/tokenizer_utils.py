@@ -14,7 +14,14 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import torch
+try:
+    import torch
+except ImportError:
+    # MLX (Apple Silicon) is torch-free. Only the embedding-fix helpers below use
+    # torch and they are never called on MLX, so keep the module importable so the
+    # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
+    torch = None
+import functools
 import gc
 import numpy as np
 import itertools
@@ -30,7 +37,19 @@ __all__ = [
 ]
 
 
-@torch.inference_mode
+def _maybe_inference_mode(func):
+    """torch.inference_mode when torch is present; a plain passthrough on torch-free
+    installs (MLX), where these torch-only helpers are never invoked."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch is None:
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+    return wrapper
+
+
+@_maybe_inference_mode
 def mean_of_trained_tokens(model, eps = 1e-16):
     """
     Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
@@ -199,7 +218,7 @@ def add_new_tokens(
 pass
 
 
-@torch.inference_mode
+@_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
     Llama-3 etc have untrained vectors (<|eot_id|>, <|start_header_id|>, ...)
@@ -465,7 +484,7 @@ from .pad_token import (
     VISION_RESERVED_TOKENS,
 )
 
-@torch.inference_mode
+@_maybe_inference_mode
 def patch_tokenizer(model, tokenizer):
     """
         Set a sensible pad_token when missing (Phi3 -> <|placeholder...,
