@@ -601,3 +601,42 @@ def test_full_group_gemm_awq_routes_to_local_dequant(monkeypatch, tmp_path):
     # full-group routing, not the dense-load fallback.
     with pytest.raises(_ReachedLocalDequant):
         FastMLXModel.from_pretrained(repo, text_only=True)
+
+
+def test_copy_source_sidecars_skips_packed_quant_descriptors(tmp_path):
+    # A merged/exported model always writes MLX-format weights (dense fp16 or
+    # MLX affine), never AutoGPTQ/AutoAWQ packing. When the load was locally
+    # dequantized, model._src_path points back at the original packed GPTQ/AWQ
+    # repo, so save_merged_model() -> _copy_source_sidecars() must NOT reintroduce
+    # quantize_config.json / quant_config.json: a stale packed-quant descriptor
+    # next to unpacked weights lets a downstream loader mis-detect the export as
+    # still packed and look for .qweight tensors that no longer exist.
+    import unsloth_zoo.mlx.utils as mu
+
+    src = tmp_path / "packed_src"
+    dst = tmp_path / "merged_out"
+    src.mkdir()
+    dst.mkdir()
+    (src / "quantize_config.json").write_text(
+        json.dumps({"bits": 4, "group_size": 128, "quant_method": "gptq"})
+    )
+    (src / "quant_config.json").write_text(
+        json.dumps({"bits": 4, "q_group_size": 128, "version": "GEMM"})
+    )
+    # Ordinary metadata the dense export still needs is copied through.
+    (src / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 2048}))
+    (src / "chat_template.jinja").write_text("{{ messages }}")
+    # Core / weight files are handled by the existing filters, not copied here.
+    (src / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (src / "model-00001-of-00001.safetensors").write_text("weights")
+
+    copied = mu._copy_source_sidecars(str(src), str(dst))
+
+    present = set(os.listdir(dst))
+    assert "quantize_config.json" not in present
+    assert "quant_config.json" not in present
+    assert "tokenizer_config.json" in present
+    assert "chat_template.jinja" in present
+    assert "config.json" not in present
+    assert "model-00001-of-00001.safetensors" not in present
+    assert copied == 2
