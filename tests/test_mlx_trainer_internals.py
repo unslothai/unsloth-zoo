@@ -1949,3 +1949,113 @@ def test_quantized_linear_forward():
     # x @ W.T  with W = [[0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7]] = [28, 28]
     out = layer(x)
     torch.testing.assert_close(out, torch.tensor([[28.0, 28.0]]))
+
+
+def test_on_step_end_defers_callback_stop_until_after_same_step_eval():
+    # Regression for the "defer stop-control until after same-step eval" bug.
+    # HF runs this step's log/evaluate/save before the loop breaks, so a stop
+    # requested by a callback on on_step_end must NOT be copied into
+    # stop_requested before the same-step eval: _evaluate_batch_totals skips
+    # every eval batch while stop_requested is set, which reports 0.0 loss and
+    # corrupts best-model / early-stopping state. Only an external cancel may be
+    # OR-reduced here; the callback stop is applied by the tail _sync_stop().
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    step_end = src.index('_fire("on_step_end")')
+    eval_block = src.index("should_eval = (", step_end)
+    tail_stop = src.index("if _sync_stop():", eval_block)
+    # Strip comment lines so the prose describing the deferral is not mistaken
+    # for the code that performs it.
+    between = "\n".join(
+        line for line in src[step_end:eval_block].splitlines()
+        if not line.strip().startswith("#")
+    )
+
+    # The callback stop must not be latched into stop_requested before the eval.
+    assert "_sync_stop()" not in between
+    assert "_sync_callback_stop()" not in between
+    # Only the external-cancel OR-reduce is allowed ahead of the same-step eval.
+    assert "self._distributed_should_stop()" in between
+    # The deferred callback stop is applied after log/eval/save (loop tail).
+    assert tail_stop > eval_block
+
+
+def test_same_step_eval_not_preempted_by_callback_stop_ddp(monkeypatch):
+    # world_size == 2 regression proving DDP lockstep is preserved: a callback
+    # stop deferred past the same-step eval still stops every rank, the same-step
+    # eval reports the real loss (not 0.0), and a stop on rank 0 stops the peer.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
+
+    # all_sum == identity plus a configurable peer contribution, so rank 0 (which
+    # owns the callback stop) and its peer can be modelled independently here.
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    class Model:
+        def __init__(self): self.modes = []
+        def eval(self): self.modes.append("eval")
+        def train(self): self.modes.append("train")
+
+    def make_trainer(rank, local_stop):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t.model = Model()
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        t.stop_requested = local_stop
+        t.control = _MLXTrainerControl()
+        t._last_eval_metrics = {}
+        return t
+
+    def loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(2.0), mx.array(4)
+
+    eval_batches = [("a", None, None), ("b", None, None)]
+
+    # Rank 0: a callback sets should_training_stop during on_step_end.
+    rank0 = make_trainer(rank=0, local_stop=False)
+    rank0.control.should_training_stop = True
+    peer["value"] = 0  # the peer requested nothing this step
+    # Re-implanted on_step_end sync: log/eval/save flags then only an external
+    # OR-reduce. The callback stop must stay deferred.
+    rank0._distributed_sync_control_actions()
+    rank0._distributed_should_stop()
+    assert rank0.stop_requested is False
+
+    # The same-step eval therefore consumes every batch and reports real loss.
+    loss, _ = rank0._evaluate(eval_batches, loss_fn, is_vlm=False)
+    assert loss == pytest.approx(2.0)
+    assert loss != 0.0
+
+    # The deferred callback stop, applied by the tail _sync_stop(), stops rank 0.
+    rank0._sync_callback_stop()
+    assert rank0._distributed_should_stop() is True
+    assert rank0.stop_requested is True
+
+    # Lockstep: the stop on rank 0 must OR-reduce onto the peer (rank 1), which
+    # requested nothing locally, so no rank is left spinning at the next
+    # collective.
+    rank1 = make_trainer(rank=1, local_stop=False)
+    rank1.control.should_training_stop = False
+    peer["value"] = 1  # rank 0 contributes its stop into the reduction
+    rank1._sync_callback_stop()
+    assert rank1.stop_requested is False
+    assert rank1._distributed_should_stop() is True
+    assert rank1.stop_requested is True
+
+    # Contrast: the pre-fix ordering (stop latched before eval) skips every eval
+    # batch and reports 0.0, corrupting best-model tracking.
+    buggy = make_trainer(rank=0, local_stop=True)
+    peer["value"] = 0
+    buggy_loss, _ = buggy._evaluate(eval_batches, loss_fn, is_vlm=False)
+    assert buggy_loss == 0.0

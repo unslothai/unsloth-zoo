@@ -3580,7 +3580,15 @@ class MLXTrainer:
             # stop. Sync those decisions across ranks before the collective
             # log/eval/save paths so every rank makes the same choice.
             self._distributed_sync_control_actions()
-            _sync_stop()
+            # Do NOT copy a callback should_training_stop into stop_requested yet.
+            # HF runs this step's log/evaluate/save before the loop breaks, so a
+            # stop requested on on_step_end must not pre-empt a same-step eval:
+            # _evaluate_batch_totals skips every eval batch while stop_requested
+            # is set, which would report 0.0 loss and corrupt best-model /
+            # early-stopping state. Only OR-reduce any external cancel here (a
+            # rank-consistent hard stop); the callback stop is applied after the
+            # same-step actions by the tail _sync_stop() below.
+            self._distributed_should_stop()
 
             # Logging. logging_steps is guarded against 0 to avoid a modulo-by-zero;
             # the callback control flag (synced across ranks above) can also force
