@@ -1,8 +1,11 @@
 """The torch._grouped_mm support probe must use bfloat16, not float16.
 
-The non-scaled torch._grouped_mm is bf16-only, so a float16 probe always raises
-and caches the backend as unsupported even on hardware that supports it. Probe
-with bfloat16 so supported hardware is detected.
+The non-scaled torch._grouped_mm grouped kernel is bf16-only. On torch 2.8 a
+float16 probe raises outright (hard TORCH_CHECK, no fallback) and caches the
+backend as unsupported even on hardware that supports it; on torch >= 2.9 a
+float16 probe only "passes" through the slow per-group fallback loop, not the
+grouped kernel the backend actually targets. Probe with bfloat16, the dtype
+the backend runs with.
 """
 
 import torch
