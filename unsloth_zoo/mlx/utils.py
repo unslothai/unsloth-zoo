@@ -835,6 +835,30 @@ def make_cce_loss_fn(model):
 # own length-mask convention (see make_baseline_loss_fn), not ported from TRL
 # (no TRL on MLX) or copied from third-party MLX projects.
 # ============================================================================
+def _orpo_odds_ratio_loss(logp_c, logp_r):
+    """ORPO odds-ratio term L_OR, computed in float32 for numerical stability.
+
+    Returns -mean(log_sigmoid(log_odds_chosen - log_odds_rejected)) where the
+    per-side odds are p/(1-p), i.e. log(1-p) = log(-expm1(logp)). The inputs are
+    upcast to float32 before the log(1-p) step, mirroring TRL's
+    ORPOTrainer.odds_ratio_loss (policy_chosen_logps.float() /
+    policy_rejected_logps.float()). This is required, not merely defensive: in
+    float16 the 1e-12 floor underflows to 0.0 (float16's smallest positive
+    subnormal is ~5.96e-8), so on any perfectly-predicted response row
+    (logp -> 0, e.g. an empty response span where response_start == seq_end)
+    -expm1(logp) is 0.0, mx.maximum(0.0, 0.0) stays 0.0, and mx.log(0.0) = -inf,
+    producing NaN gradients. In float32 the floor is representable and the term
+    stays finite. See ORPO (arXiv:2403.07691) and TRL issue #1473 (ORPO NaN).
+    """
+    logp_c = logp_c.astype(mx.float32)
+    logp_r = logp_r.astype(mx.float32)
+    floor = mx.array(1e-12, mx.float32)
+    val_c = mx.maximum(-mx.expm1(logp_c), floor)
+    val_r = mx.maximum(-mx.expm1(logp_r), floor)
+    log_odds = (logp_c - mx.log(val_c)) - (logp_r - mx.log(val_r))
+    return -mx.mean(nn.log_sigmoid(log_odds))
+
+
 def make_orpo_loss_fn(beta=0.1):
     """Create an ORPO loss function over a concatenated [chosen; rejected] batch.
 
@@ -867,12 +891,12 @@ def make_orpo_loss_fn(beta=0.1):
         # length-normalized logp used for the odds-ratio term below.
         nll_mask = (steps < lengths[:, 1:]).astype(mx.float32)[:B]
         sft = (ce_tok[:B] * nll_mask).sum() / mx.maximum(nll_mask.sum(), mx.array(1.0))
-        # Odds-ratio term. log(p/(1-p)) per side; 1-exp(logp) stabilized.
-        val_c = mx.maximum(-mx.expm1(logp_c), mx.array(1e-12, logp_c.dtype))
-        val_r = mx.maximum(-mx.expm1(logp_r), mx.array(1e-12, logp_r.dtype))
-        log_odds = (logp_c - mx.log(val_c)) - (logp_r - mx.log(val_r))
-        or_loss = -mx.mean(nn.log_sigmoid(log_odds))
-        loss = sft + beta * or_loss
+        # Odds-ratio term. log(p/(1-p)) per side; computed in float32 (see
+        # _orpo_odds_ratio_loss) so the 1-exp(logp) floor does not underflow in
+        # float16 and drive log(0) = -inf / NaN gradients. Cast back to the SFT
+        # (model) dtype so the combined loss dtype is unchanged.
+        or_loss = _orpo_odds_ratio_loss(logp_c, logp_r)
+        loss = sft + beta * or_loss.astype(sft.dtype)
         return loss, mask.sum()
     return loss_fn
 

@@ -408,6 +408,14 @@ init_module.uniform = _init_uniform
 
 
 # ---------------------------------------------------------------------------
+# Activations
+# ---------------------------------------------------------------------------
+def log_sigmoid(a, **kw):
+    """mlx.nn.log_sigmoid(x) = log(sigmoid(x)); route to torch's stable impl."""
+    return F.logsigmoid(a)
+
+
+# ---------------------------------------------------------------------------
 # Module-level __getattr__: any unknown nn.X returns _Noop.
 # ---------------------------------------------------------------------------
 from . import mlx_stub  # for _Noop
