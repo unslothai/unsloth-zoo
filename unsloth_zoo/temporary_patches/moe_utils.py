@@ -1733,7 +1733,7 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm
         )
 
-        second_gemm_output = second_gemm_output.index_add(0, gather_indices, lora_delta)
+        second_gemm_output.index_add_(0, gather_indices, lora_delta)
 
     # Apply routing weights and sum across top_k: (num_tokens, top_k, hidden) -> (num_tokens, hidden).
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
