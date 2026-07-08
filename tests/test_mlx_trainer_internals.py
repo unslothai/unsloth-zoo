@@ -1328,6 +1328,29 @@ def test_accuracy_all_reduce_is_unconditional_across_ranks():
     assert len(calls) == 4
 
 
+def test_greater_is_better_inferred_from_metric_name():
+    # Exposing eval_mean_token_accuracy for metric_for_best_model must not
+    # silently minimize accuracy: greater_is_better defaults to None and is
+    # inferred from the metric name (HF parity), while an explicit value wins.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    def gib(metric, explicit=None):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t.args = MLXTrainingConfig(
+            metric_for_best_model=metric,
+            greater_is_better=explicit,
+            output_dir="/tmp/o",
+        )
+        return t._resolved_greater_is_better()
+
+    assert gib("eval_mean_token_accuracy") is True
+    assert gib("mean_token_accuracy") is True  # eval_ prefix added; still accuracy
+    assert gib("eval_loss") is False
+    assert gib("eval_perplexity") is False
+    assert gib("eval_mean_token_accuracy", explicit=False) is False
+    assert gib("eval_loss", explicit=True) is True
+
+
 def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):
     # In DDP each rank only sees its own shard. A rank whose shard happens to be
     # entirely masked must not raise alone (that would hang peers at the next

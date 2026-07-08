@@ -580,7 +580,7 @@ class MLXTrainingConfig:
     eval_steps: int = 0  # 0 = disabled
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
-    greater_is_better: bool = False
+    greater_is_better: bool | None = None  # None: infer direction from the metric name (HF parity)
     early_stopping_patience: int = 0  # 0 = disabled
     neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
 
@@ -784,6 +784,18 @@ class MLXTrainer:
         bare name ("loss") gets the eval_ prefix eval metric keys carry."""
         name = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
         return name if name.startswith("eval_") else f"eval_{name}"
+
+    def _resolved_greater_is_better(self):
+        """greater_is_better with HF-style inference when left unset (None):
+        metrics ending in loss/perplexity are lower-is-better, everything else
+        (e.g. mean_token_accuracy) is higher-is-better. An explicit True/False
+        always wins. Mirrors transformers TrainingArguments, so exposing an
+        accuracy metric for metric_for_best_model does not silently minimize it."""
+        explicit = getattr(self.args, "greater_is_better", None)
+        if explicit is not None:
+            return bool(explicit)
+        name = self._resolved_best_metric_name().lower()
+        return not (name.endswith("loss") or name.endswith("perplexity"))
 
     def _train_dataset_for_batches(self):
         """Return the internal dataset used for MLX batch construction."""
@@ -3085,7 +3097,7 @@ class MLXTrainer:
                             f"metrics; available: {sorted(_em)}"
                         )
                     _cur = _em[_metric_name]
-                    _greater = bool(getattr(args, "greater_is_better", False))
+                    _greater = self._resolved_greater_is_better()
                     _improved = (
                         _cur == _cur  # reject NaN: a diverged eval must never become "best"
                         and (
