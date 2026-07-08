@@ -50,7 +50,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
-from mlx_lm.tuner.lora import LoRALinear
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
@@ -171,6 +170,7 @@ from .utils import (
     make_vlm_baseline_loss_fn,
     create_batches,
     create_preference_batches,
+    _hf_encoding_tokenizer,
     make_orpo_loss_fn,
     make_dpo_loss_fn,
     make_grpo_loss_fn,
@@ -2058,9 +2058,7 @@ class MLXTrainer:
             elif getattr(args, "loss_type", "sft") == "dpo":
                 _db = getattr(args, "dpo_beta", 0.1)
                 _rf = bool(getattr(args, "reference_free", False))
-                _lora_mods = [mod for _, mod in tree_flatten(
-                    model, is_leaf=lambda x: isinstance(x, LoRALinear))
-                    if isinstance(mod, LoRALinear)]
+                _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
@@ -2068,9 +2066,7 @@ class MLXTrainer:
                 _gb = getattr(args, "grpo_beta", 0.04)
                 _ge = getattr(args, "grpo_epsilon", 0.2)
                 _grf = bool(getattr(args, "reference_free", False))
-                _lora_mods = [mod for _, mod in tree_flatten(
-                    model, is_leaf=lambda x: isinstance(x, LoRALinear))
-                    if isinstance(mod, LoRALinear)]
+                _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
                 loss_fn = make_grpo_loss_fn(beta=_gb, lora_mods=_lora_mods,
                     reference_free=_grf, epsilon_low=_ge, epsilon_high=_ge)
                 print("Unsloth: Using GRPO loss (beta=" + str(_gb) + ").")
@@ -2644,7 +2640,7 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
-        if (getattr(args, "loss_type", "sft") in ("orpo", "dpo")
+        if (getattr(args, "loss_type", "sft") in ("orpo", "dpo", "grpo")
                 and args.eval_steps > 0 and self.eval_dataset is not None):
             _main_print(f"Unsloth: eval is not yet supported for {args.loss_type}; skipping eval.")
         elif args.eval_steps > 0 and self.eval_dataset is not None:
@@ -3331,6 +3327,17 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        # GRPO needs the rollout data path (and reward_funcs), which only
+        # MLXGRPOTrainer supplies via its own _prepare_data override. Reaching
+        # here with loss_type='grpo' means the base MLXTrainer was used with a
+        # GRPO config, which would feed SFT batches into the GRPO loss and
+        # crash on advantages.reshape. Fail fast with a clear message instead.
+        if getattr(args, "loss_type", "sft") == "grpo":
+            raise ValueError(
+                "Unsloth: GRPO training requires MLXGRPOTrainer (which supplies "
+                "reward_funcs and generates rollouts). Use MLXGRPOTrainer instead "
+                "of the base MLXTrainer for loss_type='grpo'."
+            )
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3689,6 +3696,14 @@ class MLXGRPOTrainer(MLXTrainer):
             args = MLXGRPOConfig()
         elif getattr(args, "loss_type", "sft") != "grpo":
             args.loss_type = "grpo"
+        # A base MLXTrainingConfig (or any non-GRPO config) coerced to
+        # loss_type='grpo' lacks the GRPO-only fields (num_generations,
+        # max_completion_length, ...). Fill them with the documented
+        # MLXGRPOConfig defaults so rollout setup does not AttributeError.
+        _grpo_defaults = MLXGRPOConfig()
+        for _field in fields(MLXGRPOConfig):
+            if not hasattr(args, _field.name):
+                setattr(args, _field.name, getattr(_grpo_defaults, _field.name))
         if not isinstance(reward_funcs, (list, tuple)):
             reward_funcs = [reward_funcs]
         self.reward_funcs = list(reward_funcs)
@@ -3747,15 +3762,11 @@ class MLXGRPOTrainer(MLXTrainer):
         """
         import mlx.core as mx
         import mlx.nn as nn
-        from mlx.utils import tree_flatten
-        from mlx_lm.tuner.lora import LoRALinear
         args = self.args
         if (getattr(args, "grpo_beta", 0.04) == 0.0
                 or bool(getattr(args, "reference_free", False))):
             return None
-        mods = [mod for _, mod in tree_flatten(
-            self.model, is_leaf=lambda x: isinstance(x, LoRALinear))
-            if isinstance(mod, LoRALinear)]
+        mods = [mod for _, mod in iter_mlx_lora_modules(self.model)]
         if not mods:
             return None
 
@@ -3796,7 +3807,7 @@ class MLXGRPOTrainer(MLXTrainer):
         from mlx_lm import batch_generate
         from mlx_lm.sample_utils import make_sampler
         args = self.args
-        hf = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
+        hf = _hf_encoding_tokenizer(self.tokenizer)
         pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
         N = args.num_generations
         sampler = make_sampler(temp=getattr(args, "temperature", 1.0))

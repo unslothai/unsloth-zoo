@@ -1013,6 +1013,25 @@ def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
     return loss_fn
 
 
+def _hf_encoding_tokenizer(tokenizer):
+    """Return the Hugging Face tokenizer used for text encoding.
+
+    mlx-lm's ``TokenizerWrapper`` stores the HF tokenizer under ``_tokenizer``,
+    so unwrapping it exposes ``eos_token_id`` and a list-returning ``encode``.
+    HF fast tokenizers ALSO expose ``_tokenizer``, but there it is the
+    low-level Rust ``tokenizers.Tokenizer`` (no ``eos_token_id``; ``encode``
+    returns ``Encoding`` objects). Only unwrap when the object is not already
+    an HF tokenizer, mirroring ``_resolve_response_mask_tokenizer``.
+    """
+    try:
+        from transformers import PreTrainedTokenizerBase
+        if isinstance(tokenizer, PreTrainedTokenizerBase):
+            return tokenizer
+    except Exception:
+        pass
+    return getattr(tokenizer, "_tokenizer", tokenizer)
+
+
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
@@ -1028,7 +1047,7 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
       lengths: (2B, 2) — per row [response_start, seq_end)
     """
-    hf = getattr(tokenizer, "_tokenizer", tokenizer)
+    hf = _hf_encoding_tokenizer(tokenizer)
     pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
 
     rows = []

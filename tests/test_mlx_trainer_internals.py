@@ -1109,6 +1109,125 @@ def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
         _resolve_response_mask_tokenizer(EncodeOnlyTokenizer())
 
 
+# ---------------------------------------------------------------------------
+# GRPO / DPO preference correctness (PR #832 review fixes).
+# ---------------------------------------------------------------------------
+
+def test_hf_encoding_tokenizer_keeps_plain_hf_and_unwraps_mlx_wrapper():
+    from unsloth_zoo.mlx.utils import _hf_encoding_tokenizer
+    from transformers import PreTrainedTokenizerBase
+
+    class PlainHF(PreTrainedTokenizerBase):
+        pass
+
+    class RustLike:
+        # The low-level Rust tokenizer: encode returns Encoding, no eos_token_id.
+        def encode(self, text):
+            return object()
+
+    class Wrapper:
+        # mlx-lm TokenizerWrapper: real HF tokenizer stored under _tokenizer.
+        def __init__(self, inner):
+            self._tokenizer = inner
+
+    hf = PlainHF()
+    assert _hf_encoding_tokenizer(Wrapper(hf)) is hf
+
+    # A plain HF fast tokenizer ALSO exposes _tokenizer (its Rust backend); it
+    # must be returned as-is rather than unwrapped to the Rust object.
+    plain = PlainHF()
+    plain._tokenizer = RustLike()
+    assert _hf_encoding_tokenizer(plain) is plain
+
+
+def test_grpo_and_preference_use_hf_aware_tokenizer_unwrap():
+    import inspect
+    from unsloth_zoo.mlx import trainer as trainer_mod
+    from unsloth_zoo.mlx import utils as utils_mod
+
+    grpo_src = inspect.getsource(trainer_mod.MLXGRPOTrainer._grpo_rollout_generator)
+    assert "_hf_encoding_tokenizer(self.tokenizer)" in grpo_src
+    assert 'getattr(self.tokenizer, "_tokenizer"' not in grpo_src
+
+    pref_src = inspect.getsource(utils_mod.create_preference_batches)
+    assert "_hf_encoding_tokenizer(tokenizer)" in pref_src
+
+
+def test_grpo_trainer_fills_defaults_from_base_config(monkeypatch):
+    from unsloth_zoo.mlx.trainer import (
+        MLXGRPOTrainer,
+        MLXGRPOConfig,
+        MLXTrainer,
+        MLXTrainingConfig,
+    )
+
+    # Exercise only the config coercion; skip the heavy base __init__.
+    monkeypatch.setattr(MLXTrainer, "__init__", lambda self, *a, **k: None)
+
+    base = MLXTrainingConfig(max_steps=3)
+    assert not hasattr(base, "num_generations")
+    assert not hasattr(base, "max_completion_length")
+
+    reward = lambda completions, **kw: [0.0] * len(completions)
+    MLXGRPOTrainer(object(), object(), [], reward, args=base)
+
+    defaults = MLXGRPOConfig()
+    assert base.loss_type == "grpo"
+    assert base.num_generations == defaults.num_generations
+    assert base.max_completion_length == defaults.max_completion_length
+    assert base.grpo_beta == defaults.grpo_beta
+
+
+def test_base_trainer_rejects_grpo_loss_type():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXGRPOConfig
+
+    inst = MLXTrainer.__new__(MLXTrainer)
+    inst.args = MLXGRPOConfig()
+    with pytest.raises(ValueError, match="MLXGRPOTrainer"):
+        MLXTrainer._prepare_data(inst, is_vlm=False)
+
+
+def test_grpo_eval_is_skipped_like_dpo():
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    # GRPO must be inside the unsupported-eval skip guard; otherwise SFT eval
+    # batches feed labels as advantages into make_grpo_loss_fn and crash on
+    # advantages.reshape.
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert 'in ("orpo", "dpo", "grpo")' in src
+
+
+def test_lora_reference_discovery_covers_non_loralinear_adapters():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    # A LoRA adapter that is NOT an mlx-lm LoRALinear (e.g. LoRAEmbedding /
+    # LoRASwitchLinear) still exposes lora_a/lora_b and must be discovered so
+    # the DPO/GRPO reference forward disables every adapter, not just linears.
+    class FakeEmbedAdapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = mx.zeros((4, 2))
+            self.lora_b = mx.zeros((2, 4))
+            self.scale = 1.0
+
+    class Root(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = FakeEmbedAdapter()
+
+    found = [m for _, m in iter_mlx_lora_modules(Root())]
+    assert any(isinstance(m, FakeEmbedAdapter) for m in found)
+
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert src.count("iter_mlx_lora_modules(model)") >= 2
+    assert "is_leaf=lambda x: isinstance(x, LoRALinear)" not in src
+
+
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
     import inspect
 
