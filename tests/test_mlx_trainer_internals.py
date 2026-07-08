@@ -1354,6 +1354,23 @@ def test_on_init_end_receives_seeded_process_zero_flags():
     assert seen["lpz"] == trainer.is_main_process
 
 
+def test_on_init_end_dispatch_uses_distributed_failure_consensus():
+    # Because on_init_end now runs with rank-specific process-zero flags, a
+    # rank-0-only callback failure there must abort every rank via the same DDP
+    # failure consensus as _fire; otherwise rank 0 unwinds __init__ while peers
+    # proceed into train() and hang at the next collective.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer.__init__)
+    assert '"on_init_end"' in src
+    oi = src.index('"on_init_end"')
+    tail = src[oi:]
+    # The dispatch is caught and OR-reduced across ranks before continuing.
+    assert "_init_error" in tail
+    assert "_raise_distributed_failure(" in tail
+
+
 def test_num_input_tokens_seen_persisted_and_restored_across_resume():
     # HF saves num_input_tokens_seen in trainer_state.json and restores it on
     # resume; the MLX loop increments it every step, so it must be checkpointed
@@ -1420,8 +1437,13 @@ def test_should_epoch_stop_field_reset_and_honored():
     assert "_sync_epoch_stop()" in src
     # The honor fast-forwards the batch cursor to the next epoch boundary, and
     # only for materialized batches (a streaming iterator can't be index-skipped).
-    assert "batch_idx += next_boundary - it" in src
+    assert "batch_idx += _skipped" in src
     assert "batch_iter is None" in src
+    # On the epoch-count-driven path the skipped batches also shrink the
+    # optimizer-step budget so the run does not overtrain past num_train_epochs;
+    # max_steps runs keep their fixed budget.
+    assert "total_steps - _skipped // grad_accum" in src
+    assert '_prepared_batches_include_epochs' in src
 
 
 def test_train_entry_clears_stale_stop_before_setup():

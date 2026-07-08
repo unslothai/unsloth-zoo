@@ -923,10 +923,28 @@ class MLXTrainer:
             is_world_process_zero=_is_main,
         )
         self.control = _MLXTrainerControl()
-        self.control = self.callback_handler.call_event(
-            "on_init_end",
-            self.args, self.state, self.control,
-        )
+        # Dispatch on_init_end under the same DDP failure consensus as _fire: now
+        # that the process-zero flags are rank-specific, a callback that raises on
+        # rank 0 only (e.g. after gating an integration on is_world_process_zero)
+        # would otherwise unwind rank 0's __init__ while the peers proceed into
+        # train() and hang at the next collective. Catch the error and OR-reduce
+        # it so every rank aborts with the original exception surfaced. on_init_end
+        # runs on all ranks (HF fires it on every process; callbacks self-gate on
+        # the state flags); single-process re-raises unchanged.
+        _init_error = None
+        try:
+            self.control = self.callback_handler.call_event(
+                "on_init_end",
+                self.args, self.state, self.control,
+            )
+        except Exception as e:
+            _init_error = e
+        if self.distributed_world_size > 1:
+            self._raise_distributed_failure(
+                _init_error is not None, "on_init_end callback", _init_error,
+            )
+        elif _init_error is not None:
+            raise _init_error
 
     def _reset_run_state(self):
         """Per-run training/metric state. Reset from __init__ and inside
@@ -3887,8 +3905,23 @@ class MLXTrainer:
                     next_boundary = (
                         (it // batches_per_epoch) + 1
                     ) * batches_per_epoch
-                    batch_idx += next_boundary - it
+                    _skipped = next_boundary - it
+                    batch_idx += _skipped
                     it = next_boundary
+                    # For an epoch-count-driven run (num_train_epochs, not
+                    # max_steps) a shortened epoch must also shrink the
+                    # optimizer-step budget, otherwise the loop keeps cycling into
+                    # extra data passes to reach the original step count -- i.e. it
+                    # overtrains past num_train_epochs instead of ending the epoch
+                    # early like HF. max_steps runs keep their fixed budget (HF runs
+                    # max_steps regardless of epoch stops). _skipped and the flag
+                    # are rank-consistent, so total_steps stays identical on every
+                    # rank and the loop bound remains in lockstep.
+                    if getattr(self, "_prepared_batches_include_epochs", False):
+                        total_steps = max(
+                            self._global_step,
+                            total_steps - _skipped // grad_accum,
+                        )
                 self.control.should_epoch_stop = False
             # Propagate any stop set by the tail callbacks (on_step_end / on_log /
             # on_evaluate / on_save / on_epoch_end) to every rank before breaking,
