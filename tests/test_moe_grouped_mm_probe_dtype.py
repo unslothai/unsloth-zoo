@@ -32,3 +32,38 @@ def test_probe_uses_bf16_and_detects_support(monkeypatch):
 
     assert moe_utils._check_torch_grouped_mm_supported() is True
     assert recorded_dtypes == [torch.bfloat16]
+
+
+def test_backend_selection_is_dtype_aware(monkeypatch):
+    """A passing bf16 probe must not route non-bf16 forwards to grouped_mm.
+
+    torch._grouped_mm's grouped kernel is bf16-only (raises on torch 2.8 eager
+    and under compile's meta checks; slow per-group fallback on >= 2.9), so with
+    the probe fixed to bf16 the backend selection has to stay dtype-aware:
+    non-bf16 activations go to the Triton path (or the native loop), and only
+    dtype=None keeps the permissive legacy behavior.
+    """
+    monkeypatch.delenv("UNSLOTH_MOE_BACKEND", raising=False)
+    monkeypatch.setattr(
+        moe_utils, "_check_torch_grouped_mm_supported", lambda: True
+    )
+    monkeypatch.setattr(moe_utils, "_check_grouped_gemm_available", lambda: True)
+
+    moe_utils.select_moe_backend.cache_clear()
+    try:
+        assert moe_utils.select_moe_backend(torch.bfloat16) == "grouped_mm"
+        assert moe_utils.select_moe_backend(torch.float16) == "unsloth_triton"
+        assert moe_utils.select_moe_backend(torch.float32) == "unsloth_triton"
+        # Callers that don't know the activation dtype keep the old behavior.
+        assert moe_utils.select_moe_backend() == "grouped_mm"
+
+        # Without Triton, non-bf16 falls through to the native loop.
+        monkeypatch.setattr(
+            moe_utils, "_check_grouped_gemm_available", lambda: False
+        )
+        moe_utils.select_moe_backend.cache_clear()
+        assert moe_utils.select_moe_backend(torch.float16) == "native_torch"
+        assert moe_utils.select_moe_backend(torch.bfloat16) == "grouped_mm"
+    finally:
+        # Drop entries computed against the patched availability checks.
+        moe_utils.select_moe_backend.cache_clear()

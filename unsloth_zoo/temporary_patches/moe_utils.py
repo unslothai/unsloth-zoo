@@ -425,11 +425,20 @@ def _check_grouped_gemm_available():
 from functools import lru_cache, wraps
 
 
-@lru_cache(maxsize=1)
-def select_moe_backend():
+# maxsize covers the distinct dtype keys (None, bf16, fp16, fp32) so mixed
+# dtype-aware and legacy zero-arg callers don't evict each other every call.
+@lru_cache(maxsize=4)
+def select_moe_backend(dtype: Optional[torch.dtype] = None):
     """Select MoE backend from UNSLOTH_MOE_BACKEND + availability.
 
     Choices: "grouped_mm", "unsloth_triton", "native_torch" (default "grouped_mm").
+
+    dtype is the forward activation dtype. torch._grouped_mm's grouped kernel is
+    bf16-only: a non-bf16 call raises on torch 2.8 eager and under torch.compile's
+    meta checks, and silently hits a slow per-group fallback loop on torch >= 2.9,
+    so "grouped_mm" is only auto-selected for bf16 activations. dtype=None (callers
+    that don't know the activation dtype) keeps the previous permissive behavior,
+    and an explicit UNSLOTH_MOE_BACKEND="grouped_mm" request bypasses the gate.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
@@ -443,7 +452,7 @@ def select_moe_backend():
             return "native_torch"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
-    if _check_torch_grouped_mm_supported():
+    if (dtype is None or dtype == torch.bfloat16) and _check_torch_grouped_mm_supported():
         _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
     if _check_grouped_gemm_available():
@@ -508,7 +517,7 @@ def forward_moe_backend(
     if _moe_uses_fp8_expert_weights is not None and _moe_uses_fp8_expert_weights(self):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
-    backend = select_moe_backend()
+    backend = select_moe_backend(hidden_states.dtype)
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
     if backend == "unsloth_triton":
