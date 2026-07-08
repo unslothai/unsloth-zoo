@@ -21,6 +21,7 @@ from contextlib import contextmanager, nullcontext
 import os
 import warnings
 import gc
+import threading
 from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
@@ -162,6 +163,34 @@ def prepare_n_gradient_checkpoints(
 pass
 
 
+# ---------------------------------------------------------------------------
+# Gradient-checkpoint recompute marker
+# ---------------------------------------------------------------------------
+# Thread-local flag, True only while a gradient-checkpoint backward is re-running
+# its wrapped forward to rebuild activations. Consumers (e.g. the MoE grouped-mm
+# recompute policy) read it via in_gradient_checkpoint_recompute() to decide whether
+# to pin a freshly dequantized tensor for the immediate backward (cheap under
+# checkpointing) or recompute it later. The context manager always restores the
+# previous value, so it is idempotent and safe under nesting and exceptions, and it
+# never alters checkpointing behaviour itself.
+_GC_RECOMPUTE_TLS = threading.local()
+
+
+def in_gradient_checkpoint_recompute() -> bool:
+    """True while a gradient-checkpoint backward is recomputing its forward."""
+    return getattr(_GC_RECOMPUTE_TLS, "active", False)
+
+
+@contextmanager
+def _gradient_checkpoint_recompute_marker():
+    previous = getattr(_GC_RECOMPUTE_TLS, "active", False)
+    _GC_RECOMPUTE_TLS.active = True
+    try:
+        yield
+    finally:
+        _GC_RECOMPUTE_TLS.active = previous
+
+
 class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     """
     All Unsloth Zoo code licensed under LGPLv3
@@ -187,7 +216,7 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
-        with torch.enable_grad():
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
             (output,) = ctx.forward_function(hidden_states, *ctx.args)
         torch.autograd.backward(output, dY)
         return (None, hidden_states.grad,) + (None,)*len(ctx.args)
@@ -217,7 +246,7 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
-        with torch.enable_grad():
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
             (output,) = ctx.forward_function(hidden_states, *ctx.args)
         torch.autograd.backward(output, dY)
         return (None, hidden_states.grad,) + (None,)*len(ctx.args)
@@ -724,7 +753,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker():  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
