@@ -3634,7 +3634,17 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
     import mlx.core as mx
 
     bits = int(quant_config.get("bits", 4) or 4)
-    group_size = int(quant_config.get("group_size", 128) or 128)
+    # AutoAWQ stores the group size under ``q_group_size``; GPTQ under
+    # ``group_size``. A non-positive value (0 / -1) means full-group /
+    # per-column and must be preserved -- the dequantizers treat group_size <= 0
+    # as a single group -- rather than coerced to the 128 default (which would
+    # gather the wrong scale rows for a non-128 checkpoint and silently break
+    # full-group AWQ that routing already sent to the local path).
+    if method == "awq":
+        raw_group_size = quant_config.get("q_group_size", quant_config.get("group_size"))
+    else:
+        raw_group_size = quant_config.get("group_size")
+    group_size = int(raw_group_size) if raw_group_size is not None else 128
     if bits != 4:
         raise NotImplementedError(
             f"Unsloth: {method.upper()} runtime dequant on MLX currently supports "

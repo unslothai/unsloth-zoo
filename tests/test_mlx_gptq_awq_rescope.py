@@ -476,6 +476,57 @@ def test_awq_dequantize_weight_full_group(group_size):
     assert np.allclose(got, ref, atol=1e-2), np.abs(got - ref).max()
 
 
+@pytest.mark.parametrize("cfg_key", ["q_group_size", "group_size"])
+def test_materialize_awq_honors_non_default_group_size(cfg_key):
+    # AutoAWQ stores the group size under q_group_size. The materializer must
+    # read the AWQ key (not fall back to the GPTQ 'group_size' default of 128),
+    # so a non-128 AWQ checkpoint reconstructs correct dense weights instead of
+    # gathering the wrong scale rows.
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    gs = 4
+    qw, qz, scales, ref = _make_awq_tensors(inn=8, out=16, gs=gs, seed=7)
+    tmp = tempfile.mkdtemp(prefix="rescope_awq_qgs_")
+    name = "model.layers.0.self_attn.q_proj"
+    mx.save_safetensors(os.path.join(tmp, "model.safetensors"), {
+        name + ".qweight": mx.array(qw),
+        name + ".qzeros": mx.array(qz),
+        name + ".scales": mx.array(scales),
+    })
+    with open(os.path.join(tmp, "config.json"), "w") as f:
+        json.dump({"model_type": "llama"}, f)
+    quant_config = {"quant_method": "awq", "bits": 4, cfg_key: gs}
+    cfg = {"model_type": "llama", "quantization_config": quant_config}
+    out_dir, _ = ml._materialize_dequantized_hf_checkpoint(tmp, cfg, "awq", quant_config)
+    weights = mx.load(glob.glob(os.path.join(out_dir, "*.safetensors"))[0])
+    got = np.asarray(weights[name + ".weight"]).astype(np.float32)
+    assert np.allclose(got, ref, atol=1e-2), np.abs(got - ref).max()
+
+
+@pytest.mark.parametrize("gs_value", [-1, 0])
+def test_materialize_full_group_awq_preserves_non_positive_group_size(gs_value):
+    # A full-group AWQ config (q_group_size <= 0) must reach _awq_dequantize_weight
+    # as-is (single group), not be coerced to 128 by the read.
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    qw, qz, scales, ref = _make_awq_tensors(inn=8, out=16, gs=-1, seed=8)
+    tmp = tempfile.mkdtemp(prefix="rescope_awq_full_")
+    name = "model.layers.0.mlp.down_proj"
+    mx.save_safetensors(os.path.join(tmp, "model.safetensors"), {
+        name + ".qweight": mx.array(qw),
+        name + ".qzeros": mx.array(qz),
+        name + ".scales": mx.array(scales),
+    })
+    with open(os.path.join(tmp, "config.json"), "w") as f:
+        json.dump({"model_type": "llama"}, f)
+    quant_config = {"quant_method": "awq", "bits": 4, "q_group_size": gs_value}
+    cfg = {"model_type": "llama", "quantization_config": quant_config}
+    out_dir, _ = ml._materialize_dequantized_hf_checkpoint(tmp, cfg, "awq", quant_config)
+    weights = mx.load(glob.glob(os.path.join(out_dir, "*.safetensors"))[0])
+    got = np.asarray(weights[name + ".weight"]).astype(np.float32)
+    assert np.allclose(got, ref, atol=1e-2), np.abs(got - ref).max()
+
+
 def test_awq_quant_config_is_gemm_predicate():
     import unsloth_zoo.mlx.loader as ml
     # GEMM (default) and a blank/missing version are the native layout.
