@@ -3637,6 +3637,9 @@ class MLXTrainer:
             sum(self._train_loss_history) / len(self._train_loss_history)
             if self._train_loss_history else 0.0
         )
+        # Total wall-clock training time, consumed by the summary line and the
+        # distributed diagnostics / train_runtime metrics below.
+        total_time = time.perf_counter() - start_time
 
         # Report the step actually reached, which is < total_steps after an
         # early stop (self._global_step == total_steps on a full run).
