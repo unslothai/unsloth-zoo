@@ -1277,12 +1277,12 @@ def test_distributed_diagnostics_per_rank_tokens_use_local_history():
 
 
 def test_callback_state_num_input_tokens_seen_uses_reduced_global_count():
-    # Complement of the per-rank diagnostics rule: HF's
-    # TrainerState.num_input_tokens_seen is a GLOBAL (all-rank gathered) count
-    # that callbacks read directly to report progress or stop on a token budget.
-    # The training loop must increment it from the all-reduced global_toks (which
-    # is already computed and eval'd just above for the zero-token guard), not the
-    # rank-local toks, which would undercount by ~world_size under DDP.
+    # HF's TrainerState.num_input_tokens_seen is a GLOBAL (all-rank gathered)
+    # count of INPUT tokens that callbacks read directly to report progress or
+    # stop on a token budget. The training loop must increment it from the
+    # all-reduced global_input_toks (the batch input numel summed across ranks),
+    # NOT global_toks (the supervised/label-token count from the loss mask) and
+    # NOT the rank-local value (which would undercount by ~world_size under DDP).
     import inspect
     import re
 
@@ -1294,13 +1294,33 @@ def test_callback_state_num_input_tokens_seen_uses_reduced_global_count():
         src,
     )
     assert m is not None, "num_input_tokens_seen increment not found"
-    assert m.group(1) == "global_toks", (
+    assert m.group(1) == "global_input_toks", (
         "callback-visible num_input_tokens_seen must use the all-reduced "
-        f"global_toks, not the rank-local {m.group(1)}"
+        f"INPUT-token count global_input_toks, not {m.group(1)}"
     )
-    # global_toks must be reduced before it is consumed for the callback state.
-    reduce_at = src.index("global_toks = self._distributed_all_sum(")
+    # global_input_toks must be the all-reduced batch input-token count, reduced
+    # before it is consumed for the callback state.
+    reduce_at = src.index("global_input_toks = self._distributed_all_sum(")
     assert reduce_at < m.start()
+    assert "_mlx_batch_input_token_count(batch_data)" in src
+
+
+def test_mlx_batch_input_token_count_counts_all_positions():
+    # The helper feeding num_input_tokens_seen must count every input position
+    # (prompt + response + padding), matching HF's input_ids.numel(), for both
+    # the text/preference/GRPO tuple batch and the VLM dict batch, and degrade to
+    # 0 (rather than raise) when no input-id tensor is present.
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _mlx_batch_input_token_count
+
+    # tuple batch: (input_ids[B, L], lengths/aux, labels) -> B*L
+    tup = (mx.zeros((3, 5), dtype=mx.int32), mx.zeros((3, 2)), mx.zeros((3, 5)))
+    assert _mlx_batch_input_token_count(tup) == 15
+    # dict (VLM) batch keyed by input_ids -> numel
+    assert _mlx_batch_input_token_count({"input_ids": mx.zeros((2, 7))}) == 14
+    # no input ids present -> 0, never raises
+    assert _mlx_batch_input_token_count({"pixel_values": mx.zeros((2, 3))}) == 0
+    assert _mlx_batch_input_token_count(None) == 0
 
 
 def test_train_entry_clears_stale_stop_before_setup():

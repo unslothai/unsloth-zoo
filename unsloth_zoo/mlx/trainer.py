@@ -630,6 +630,34 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
               f"(save_total_limit={save_total_limit})")
 
 
+def _mlx_batch_input_token_count(batch_data):
+    """Input-token positions in a training microbatch (HF num_input_tokens_seen).
+
+    HF's TrainerState.num_input_tokens_seen counts the main input tensor's numel
+    (every forwarded position: prompt + response + padding), NOT just the
+    supervised/label tokens the loss mask counts. Mirror that here so a callback
+    reading state.num_input_tokens_seen for token-budget stopping or throughput
+    reporting is not undercounted by the masked/prompt fraction (which for
+    completion-only / assistant-only loss is most of the sequence).
+
+    Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
+    than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
+    GRPO tuple batch (input ids first) and the VLM dict batch (``input_ids`` key);
+    returns 0 when no input-id tensor is present so the counter simply does not
+    advance rather than raising.
+    """
+    import math
+    if isinstance(batch_data, dict):
+        arr = batch_data.get("input_ids")
+    elif isinstance(batch_data, (tuple, list)) and batch_data:
+        arr = batch_data[0]
+    else:
+        arr = None
+    if arr is None or not hasattr(arr, "shape"):
+        return 0
+    return int(math.prod(arr.shape))
+
+
 @dataclass
 class MLXTrainingConfig:
     """Training configuration mirroring SFTConfig / TrainingArguments field names."""
@@ -3636,6 +3664,17 @@ class MLXTrainer:
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
+            # Global INPUT-token count for HF's num_input_tokens_seen. global_toks
+            # above is the loss mask's supervised-token count (used for the
+            # zero-token guard), not the input-token count HF's field reports, so
+            # counting it would undercount prompts and masked tokens. Sum the batch
+            # input numel and all-reduce it (same global gather semantics as HF and
+            # as global_toks). Unconditional on every rank, so DDP lockstep holds.
+            global_input_toks = self._distributed_all_sum(
+                mx.array(_mlx_batch_input_token_count(batch_data), dtype=mx.int32),
+                stream=mx.cpu,
+            )
+            mx.eval(global_input_toks)
             if do_update:
                 _fire("on_optimizer_step")
                 # Do NOT latch a callback should_training_stop into stop_requested
@@ -3653,11 +3692,11 @@ class MLXTrainer:
                 # on_step_end deferral below.
                 self._distributed_should_stop()
             # HF's TrainerState.num_input_tokens_seen is a global (all-rank
-            # gathered) count; callbacks that report or stop on a token budget
-            # read it directly. global_toks was already all-reduced and eval'd
-            # above for the zero-token guard, so reuse it here instead of the
-            # rank-local toks, which would undercount by ~world_size under DDP.
-            self.state.num_input_tokens_seen += int(global_toks.item())
+            # gathered) count of INPUT tokens; callbacks that report or stop on a
+            # token budget read it directly. Use the all-reduced input-token count
+            # (not global_toks, which is the supervised/label-token count, nor the
+            # rank-local value which would undercount by ~world_size under DDP).
+            self.state.num_input_tokens_seen += int(global_input_toks.item())
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
             train_time += time.perf_counter() - tic
