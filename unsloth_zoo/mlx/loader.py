@@ -49,6 +49,7 @@ from .compile import (
 
 _vlm_model_types_cache = None
 _SAFE_TEXT_SANITIZE_PATCHED: set[str] = set()
+_AUDIO_CONV_SANITIZE_PATCHED: set[str] = set()
 _MULTIMODAL_STRIP_KEYS = (
     "vision_tower",
     "audio_tower",
@@ -1334,6 +1335,118 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
 
     cls.sanitize = patched_sanitize
     _SAFE_TEXT_SANITIZE_PATCHED.add(model_type)
+
+
+def _resolve_mlx_vlm_model_class(model_type):
+    """Resolve the mlx_vlm ``Model`` class for a model_type (honoring remaps)."""
+    if not model_type:
+        return None
+    module_type = str(model_type).replace("-", "_")
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        remapped = MODEL_REMAPPING.get(model_type, MODEL_REMAPPING.get(module_type))
+        if remapped:
+            module_type = str(remapped).replace("-", "_")
+    except Exception:
+        pass
+    for candidate in (
+        f"mlx_vlm.models.{module_type}.{module_type}",
+        f"mlx_vlm.models.{module_type}",
+    ):
+        try:
+            module = importlib.import_module(candidate)
+        except Exception:
+            continue
+        cls = getattr(module, "Model", None)
+        if cls is not None:
+            return cls
+    return None
+
+
+def _lookup_module_array(root, dotted_key):
+    """Resolve a parameter (mx.array) by its checkpoint dotted key, else None."""
+    obj = root
+    for part in dotted_key.split("."):
+        if isinstance(obj, Mapping):
+            if part not in obj:
+                return None
+            obj = obj[part]
+        elif isinstance(obj, (list, tuple)):
+            if not part.isdigit() or int(part) >= len(obj):
+                return None
+            obj = obj[int(part)]
+        else:
+            obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+# Inverse of the unconditional PyTorch->MLX conv transpose mlx-vlm applies in
+# sanitize(): Conv1d transpose(0, 2, 1) is self-inverse, Conv2d transpose(
+# 0, 2, 3, 1) inverts to (0, 3, 1, 2).
+_MLX_CONV_TRANSPOSE_INVERSE = {3: (0, 2, 1), 4: (0, 3, 1, 2)}
+
+
+def _ensure_audio_conv_sanitize(model_type: str) -> None:
+    """Guard mlx-vlm audio-tower conv sanitize against a double transpose.
+
+    Pre-converted MLX checkpoints (e.g. mlx-community/gemma-4-e2b-it-4bit) store
+    the audio SubSampleConvProjection Conv2d weights and Conformer depthwise
+    Conv1d weights already in MLX channel-last layout. mlx-vlm's ``sanitize``
+    unconditionally re-applies the PyTorch->MLX transpose, corrupting the shape
+    and failing the load with an HTTP 500 shape mismatch (e.g. "Expected shape
+    (128, 3, 3, 1) but received shape (128, 3, 1, 3)").
+
+    When a checkpoint weight already matches the instantiated module's
+    channel-last target shape, pre-apply the inverse permutation so the upstream
+    transpose round-trips to the correct layout instead of double transposing.
+    We only intervene on an exact target-shape match, so raw PyTorch checkpoints
+    (which genuinely need the transpose) are untouched. Patched by behavior
+    (sanitize source signature), not by hardcoding a single family.
+    """
+    if not model_type or model_type in _AUDIO_CONV_SANITIZE_PATCHED:
+        return
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if cls is None:
+        return
+    sanitize = getattr(cls, "sanitize", None)
+    if sanitize is None:
+        return
+    source = _safe_getsource(sanitize)
+    if not source:
+        return
+    compact = re.sub(r"\s+", "", source)
+    conv2d_transpose = "subsample_conv_projection" in source and "transpose(0,2,3,1)" in compact
+    conv1d_transpose = "depthwise_conv1d.weight" in source and "transpose(0,2,1)" in compact
+    if not (conv2d_transpose or conv1d_transpose):
+        return
+
+    original_sanitize = sanitize
+
+    def _is_audio_conv_key(key, ndim):
+        if ndim == 4 and "subsample_conv_projection" in key and "conv.weight" in key:
+            return conv2d_transpose
+        if ndim == 3 and "depthwise_conv1d.weight" in key:
+            return conv1d_transpose
+        return False
+
+    def patched_sanitize(self, weights):
+        prepared = {}
+        for key, value in weights.items():
+            ndim = getattr(value, "ndim", 0)
+            inverse = _MLX_CONV_TRANSPOSE_INVERSE.get(ndim)
+            if inverse is not None and _is_audio_conv_key(key, ndim):
+                target = _lookup_module_array(self, key)
+                target_shape = tuple(getattr(target, "shape", ()) or ())
+                if target_shape and target_shape == tuple(value.shape):
+                    # Already channel-last: undo the upcoming upstream transpose.
+                    value = value.transpose(*inverse)
+            prepared[key] = value
+        return original_sanitize(self, prepared)
+
+    cls.sanitize = patched_sanitize
+    _AUDIO_CONV_SANITIZE_PATCHED.add(model_type)
 
 
 def _fp16_needs_bf16_modules(model):
@@ -4863,6 +4976,7 @@ class FastMLXModel:
             if patch_mode == "patched":
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
                 config_data, quantization_spec, model_name,
