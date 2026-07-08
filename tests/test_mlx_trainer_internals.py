@@ -1949,3 +1949,172 @@ def test_quantized_linear_forward():
     # x @ W.T  with W = [[0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7]] = [28, 28]
     out = layer(x)
     torch.testing.assert_close(out, torch.tensor([[28.0, 28.0]]))
+
+
+# --- Preference (ORPO / DPO) review-round-3 regressions ----------------
+
+def _build_fast_tokenizer(eos="<eos>"):
+    """A plain HF PreTrainedTokenizerFast (its ``_tokenizer`` is the Rust
+    backend, which exposes neither ``eos_token_id`` nor a list-returning
+    ``encode``)."""
+    from transformers import PreTrainedTokenizerFast
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    vocab = {eos: 0, "a": 1, "b": 2, "c": 3, "prompt": 4, "good": 5, "bad": 6}
+    inner = Tokenizer(models.WordLevel(vocab=vocab, unk_token=eos))
+    inner.pre_tokenizer = pre_tokenizers.Whitespace()
+    return PreTrainedTokenizerFast(tokenizer_object=inner, eos_token=eos)
+
+
+def test_preference_tokenizer_keeps_public_hf_fast_tokenizer_api():
+    # Regression: create_preference_batches used getattr(tok, "_tokenizer", tok),
+    # which unwraps a plain PreTrainedTokenizerFast to its low-level Rust
+    # tokenizers.Tokenizer (no eos_token_id; encode returns an Encoding), so
+    # ORPO/DPO batching crashed before training. _hf_encoding_tokenizer must
+    # only unwrap non-HF wrappers (mlx-lm's TokenizerWrapper).
+    from unsloth_zoo.mlx.utils import _hf_encoding_tokenizer
+
+    ptf = _build_fast_tokenizer()
+    assert ptf._tokenizer is not ptf  # the Rust backend is present...
+    resolved = _hf_encoding_tokenizer(ptf)
+    assert resolved is ptf  # ...but we must NOT unwrap to it
+    assert resolved.eos_token_id == 0
+    assert isinstance(resolved.encode("prompt good"), list)
+
+    # A TokenizerWrapper-style object (not a PreTrainedTokenizerBase) that
+    # proxies the HF tokenizer under _tokenizer IS unwrapped.
+    class _Wrapper:
+        def __init__(self, inner):
+            self._tokenizer = inner
+    inner = object()
+    assert _hf_encoding_tokenizer(_Wrapper(inner)) is inner
+
+
+def test_create_preference_batches_runs_with_plain_fast_tokenizer():
+    # End-to-end: batching a plain PreTrainedTokenizerFast must not raise.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    ptf = _build_fast_tokenizer()
+    dataset = [
+        {"prompt": "prompt", "chosen": "good", "rejected": "bad"},
+        {"prompt": "prompt a", "chosen": "good b", "rejected": "bad c"},
+    ]
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=ptf,
+        batch_size=2,
+        max_seq_length=16,
+        pad_to_multiple=8,
+    )
+    assert len(batches) == 1
+    batch, lengths, extra = batches[0]
+    assert extra is None
+    # 2 pairs -> 4 rows (chosen block then rejected block).
+    assert batch.shape[0] == 4
+    assert lengths.shape[0] == 4
+
+
+def test_dpo_reference_collects_nested_lora_modules():
+    # Regression: the DPO reference collected adapters with
+    #   tree_flatten(model, is_leaf=lambda x: isinstance(x, LoRALinear)),
+    # but tree_flatten only recurses dict/list/tuple, so a bare nn.Module is a
+    # single leaf and nested adapters are never reached -> _lora_mods empty ->
+    # make_dpo_loss_fn raises "model has none". iter_mlx_lora_modules walks the
+    # module tree instead.
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    class Adapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = torch.zeros(2, 4)
+            self.lora_b = torch.zeros(4, 2)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = Adapter()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Block(), Block()]
+
+    model = Model()
+    # The old leaf-scan treats the whole module as one leaf: no adapter found.
+    flat = tree_flatten(model, is_leaf=lambda x: isinstance(x, Adapter))
+    assert all(not isinstance(m, Adapter) for _, m in flat)
+    # The fix traverses modules and finds every adapter that owns lora_a/lora_b.
+    mods = [m for _, m in iter_mlx_lora_modules(model)]
+    assert len(mods) == 2
+    assert all(hasattr(m, "lora_a") and hasattr(m, "lora_b") for m in mods)
+
+
+class _StubLM:
+    def __init__(self, vocab):
+        self.vocab = vocab
+
+    def __call__(self, x):
+        import mlx.core as mx
+        return mx.zeros((x.shape[0], x.shape[1], self.vocab))
+
+
+def _preference_batch(vocab=8):
+    # 2 pairs (B=2) -> 4 rows; chosen rows have long responses, rejected short,
+    # so the response-token count differs from the pair count.
+    import mlx.core as mx
+    batch = mx.array(
+        [
+            [4, 1, 1, 1, 1],  # chosen pair 0
+            [4, 2, 2, 2, 2],  # chosen pair 1
+            [4, 3, 0, 0, 0],  # rejected pair 0
+            [4, 3, 0, 0, 0],  # rejected pair 1
+        ],
+        dtype=mx.int32,
+    )
+    # [response_start, seq_end): chosen span 4 tokens each, rejected 1 each.
+    lengths = mx.array(
+        [
+            [1, 5],
+            [1, 5],
+            [1, 2],
+            [1, 2],
+        ]
+    )
+    return batch, lengths
+
+
+def _patch_per_token_ce(monkeypatch):
+    # The shim's nn.losses.cross_entropy defaults to reduction="mean" and is
+    # not shape-faithful; real mlx returns a per-token tensor. Patch it so the
+    # loss fns run end-to-end (the pair-count return is what is under test).
+    import mlx.nn as nn
+    monkeypatch.setattr(
+        nn.losses,
+        "cross_entropy",
+        lambda logits, targets, **kw: torch.zeros(tuple(targets.shape)),
+    )
+
+
+def test_dpo_loss_returns_pair_count_not_token_count(monkeypatch):
+    # Regression: DPO is a mean over PAIRS, so the accumulate-then-normalize
+    # trainer must weight each microbatch by its pair count. Returning the
+    # response-token count made long-completion microbatches dominate and broke
+    # equivalence with a single batch under gradient_accumulation_steps > 1.
+    from unsloth_zoo.mlx.utils import make_dpo_loss_fn
+
+    _patch_per_token_ce(monkeypatch)
+    batch, lengths = _preference_batch()
+    loss_fn = make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=True)
+    _loss, count = loss_fn(_StubLM(8), batch, lengths)
+    assert int(count) == 2  # pair count (B), not the 10 response tokens
+
+
+def test_orpo_loss_returns_pair_count_not_token_count(monkeypatch):
+    from unsloth_zoo.mlx.utils import make_orpo_loss_fn
+
+    _patch_per_token_ce(monkeypatch)
+    batch, lengths = _preference_batch()
+    loss_fn = make_orpo_loss_fn(beta=0.1)
+    _loss, count = loss_fn(_StubLM(8), batch, lengths)
+    assert int(count) == 2  # pair count (B), not the response-token count

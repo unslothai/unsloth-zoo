@@ -50,7 +50,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
-from mlx_lm.tuner.lora import LoRALinear
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
@@ -2043,9 +2042,12 @@ class MLXTrainer:
             elif getattr(args, "loss_type", "sft") == "dpo":
                 _db = getattr(args, "dpo_beta", 0.1)
                 _rf = bool(getattr(args, "reference_free", False))
-                _lora_mods = [mod for _, mod in tree_flatten(
-                    model, is_leaf=lambda x: isinstance(x, LoRALinear))
-                    if isinstance(mod, LoRALinear)]
+                # tree_flatten only recurses dict/list/tuple, so a bare
+                # nn.Module is a single leaf and never reaches nested LoRA
+                # layers. Walk the module tree instead so LoRALinear,
+                # LoRAEmbedding, LoRASwitchLinear and DoRA adapters are all
+                # collected for the reference (adapters-off) pass.
+                _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")

@@ -897,7 +897,13 @@ def make_orpo_loss_fn(beta=0.1):
         # (model) dtype so the combined loss dtype is unchanged.
         or_loss = _orpo_odds_ratio_loss(logp_c, logp_r)
         loss = sft + beta * or_loss.astype(sft.dtype)
-        return loss, mask.sum()
+        # Return the PAIR count, not the response-token count. This is a
+        # preference loss reduced as a mean over pairs (the odds-ratio term),
+        # so the trainer's accumulate-then-normalize machinery must weight each
+        # microbatch by its pair count. Weighting by tokens would make
+        # long-completion microbatches dominate and break equivalence with a
+        # single batch of the same pairs under gradient_accumulation_steps > 1.
+        return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
 
 
@@ -942,7 +948,7 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
 
     def loss_fn(model, batch, lengths, labels=None):
         B = batch.shape[0] // 2
-        pol, ntoks = _row_logp_and_mask(model, batch, lengths)
+        pol, _ = _row_logp_and_mask(model, batch, lengths)
         pol_c, pol_r = pol[:B], pol[B:]
 
         if reference_free or not _mods:
@@ -962,8 +968,34 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
 
         logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
         loss = -mx.mean(nn.log_sigmoid(logits))
-        return loss, ntoks
+        # Return the PAIR count, not the response-token count. DPO is a mean
+        # over preference pairs, so the trainer must weight each microbatch by
+        # its pair count when accumulating; token weighting would let
+        # long-completion microbatches dominate and break equivalence with a
+        # single batch of the same pairs under gradient_accumulation_steps > 1.
+        return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
+
+
+def _hf_encoding_tokenizer(tokenizer):
+    """Return the Hugging Face tokenizer used for text encoding.
+
+    mlx-lm's ``TokenizerWrapper`` stores the HF tokenizer under ``_tokenizer``,
+    so unwrapping it exposes ``eos_token_id`` and a list-returning ``encode``.
+    HF fast tokenizers ALSO expose ``_tokenizer``, but there it is the
+    low-level Rust ``tokenizers.Tokenizer`` (no ``eos_token_id``; ``encode``
+    returns ``Encoding`` objects). Only unwrap when the object is not already
+    an HF tokenizer, mirroring ``_get_processor_tokenizer`` /
+    ``_resolve_response_mask_tokenizer``.
+    """
+    try:
+        from transformers import PreTrainedTokenizerBase
+        if isinstance(tokenizer, PreTrainedTokenizerBase):
+            return tokenizer
+    except Exception:
+        pass
+    return getattr(tokenizer, "_tokenizer", tokenizer)
+
 
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
@@ -1004,7 +1036,7 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
             f"Unsloth MLX: unsupported preference dataset_order={order_mode!r}. "
             "Expected 'default', 'sequential', or 'torch_randperm'."
         )
-    hf = getattr(tokenizer, "_tokenizer", tokenizer)
+    hf = _hf_encoding_tokenizer(tokenizer)
     eos_id = hf.eos_token_id
     pad_id = eos_id if eos_id is not None else 0
 
