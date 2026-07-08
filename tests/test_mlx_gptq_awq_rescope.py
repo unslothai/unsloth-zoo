@@ -213,6 +213,53 @@ def test_materialize_gptq_with_and_without_g_idx(with_g_idx):
     assert np.allclose(got, ref, atol=1e-2), np.abs(got - ref).max()
 
 
+def test_is_dropped_dequant_sidecar_predicate():
+    import unsloth_zoo.mlx.loader as ml
+    # Packed weights, their shard index, and the quant sidecars are dropped.
+    for dropped in (
+        "model.safetensors", "model-00001-of-00002.safetensors",
+        "model.safetensors.index.json",
+        "quantize_config.json", "quant_config.json",
+    ):
+        assert ml._is_dropped_dequant_sidecar(dropped) is True, dropped
+    # Ordinary metadata the dense checkpoint still needs is kept.
+    for kept in (
+        "config.json", "tokenizer_config.json", "tokenizer.json",
+        "tokenizer.model", "special_tokens_map.json", "generation_config.json",
+    ):
+        assert ml._is_dropped_dequant_sidecar(kept) is False, kept
+
+
+def test_materialize_gptq_drops_quant_sidecars():
+    import unsloth_zoo.mlx.loader as ml
+    gs = 8
+    tmp = tempfile.mkdtemp(prefix="rescope_gptq_sidecar_")
+    name, ref = _write_gptq_repo(tmp, with_g_idx=True, gs=gs)
+    # A real GPTQ repo ships quantize_config.json (AWQ ships quant_config.json)
+    # describing the packed tensors, plus ordinary tokenizer metadata.
+    with open(os.path.join(tmp, "quantize_config.json"), "w") as f:
+        json.dump({"bits": 4, "group_size": gs, "quant_method": "gptq"}, f)
+    with open(os.path.join(tmp, "quant_config.json"), "w") as f:
+        json.dump({"bits": 4, "q_group_size": gs, "version": "GEMM"}, f)
+    with open(os.path.join(tmp, "tokenizer_config.json"), "w") as f:
+        json.dump({"model_max_length": 2048}, f)
+    quant_config = {"quant_method": "gptq", "bits": 4, "group_size": gs}
+    cfg = {"model_type": "llama", "quantization_config": quant_config}
+    out_dir, _ = ml._materialize_dequantized_hf_checkpoint(
+        tmp, cfg, "gptq", quant_config,
+    )
+    present = set(os.listdir(out_dir))
+    # The now-invalid quantization sidecars must not survive into the dense
+    # checkpoint (they would let a loader mis-detect it as still packed).
+    assert "quantize_config.json" not in present
+    assert "quant_config.json" not in present
+    # Ordinary metadata is preserved, and config.json is the stripped dense one.
+    assert "tokenizer_config.json" in present
+    assert "config.json" in present
+    with open(os.path.join(out_dir, "config.json")) as f:
+        assert "quantization_config" not in json.load(f)
+
+
 # ---------------------------------------------------------------------------
 # FIX 3: dense / 16-bit / full-finetuning requests resolve to a disabled spec,
 # which the loader uses to force the fp16 dequant path (never a quantized base).

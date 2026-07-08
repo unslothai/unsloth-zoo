@@ -3545,6 +3545,25 @@ def _adapter_base_prefers_native_prequant(
     return _mlx_lm_supports_native_prequant()
 
 
+# AutoGPTQ ships quantize_config.json; AWQ ships quant_config.json. Both
+# describe the packed .qweight/.qzeros tensors, so they must not travel into a
+# dequantized dense checkpoint (mirrors stripping quantization_config from
+# config.json).
+_DEQUANT_DROP_SIDECARS = ("quantize_config.json", "quant_config.json")
+
+
+def _is_dropped_dequant_sidecar(filename):
+    """Files excluded when materializing a dense checkpoint from a packed
+    GPTQ/AWQ repo: the packed weights, their shard index, and the quantization
+    sidecars that describe the now-removed .qweight/.qzeros tensors. Leaving a
+    sidecar behind lets a downstream loader mis-detect the dense checkpoint as
+    still packed and look for tensors that no longer exist.
+    """
+    if filename.endswith(".safetensors") or filename.endswith(".safetensors.index.json"):
+        return True
+    return filename in _DEQUANT_DROP_SIDECARS
+
+
 def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quant_config):
     """Dequantize a GPTQ/AWQ checkpoint to a temporary dense fp16 checkpoint.
 
@@ -3631,7 +3650,7 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
         src = os.path.join(local_path, filename)
         if not os.path.isfile(src):
             continue
-        if filename.endswith(".safetensors") or filename.endswith(".safetensors.index.json"):
+        if _is_dropped_dequant_sidecar(filename):
             continue
         shutil.copy(src, os.path.join(temp_dir, filename))
 
