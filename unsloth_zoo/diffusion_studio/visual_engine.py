@@ -194,7 +194,7 @@ class VisualServer:
         """Launch the subprocess and finish the READY handshake. Used at startup and by restart()
         after a crash (re-loads the model, so it costs tens of seconds)."""
         self.p = subprocess.Popen([self.server_bin, self.gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  env=self.env, bufsize=1, text=True,
+                                  env=self.env, bufsize=1, text=True, encoding="utf-8",
                                   preexec_fn=_set_pdeathsig if os.name == "posix" else None)
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
@@ -221,7 +221,7 @@ class VisualServer:
         # strand this and every later turn with a broken pipe.
         if self.p is None or self.p.poll() is not None:
             self.restart()
-        with open(self.req, "w") as f:
+        with open(self.req, "w", encoding="utf-8") as f:
             json.dump({"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}, f,
                       ensure_ascii=False)
         try:
