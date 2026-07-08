@@ -427,6 +427,30 @@ def _normalize_mlx_scheduler_type(name):
     return sched_type
 
 
+def _mlx_identity(x):
+    return x
+
+
+def _mlx_disable_lora_dropout(model):
+    """Disable adapter dropout for TRL DPO/ORPO parity.
+
+    TRL's DPOConfig and ORPOConfig default disable_dropout=True and call
+    disable_dropout_in_model, so the preference log-prob forwards are
+    deterministic. The MLX preference loss runs inside the train()-mode compiled
+    step, where a per-step model.eval() is unreliable, so neutralize the LoRA/DoRA
+    dropout once at setup instead: mlx-lm's LoRALinear/DoRALinear call
+    self.dropout(x), so replacing it with identity makes the forward
+    deterministic. lora_dropout=0 is already a no-op, so default configs are
+    unaffected. NOT applied to GRPO, whose TRL default disable_dropout is False.
+    """
+    count = 0
+    for _, mod in iter_mlx_lora_modules(model):
+        if getattr(mod, "dropout", None) is not None:
+            mod.dropout = _mlx_identity
+            count += 1
+    return count
+
+
 def _resolve_mlx_grad_clipping(args):
     """Resolve mutually exclusive MLX clipping knobs.
 
@@ -2061,6 +2085,10 @@ class MLXTrainer:
         else:
             if getattr(args, "loss_type", "sft") == "orpo":
                 _ob = getattr(args, "orpo_beta", 0.1)
+                # TRL's ORPOConfig defaults disable_dropout=True; the single ORPO
+                # forward (SFT + odds-ratio) runs under train() mode, so nonzero
+                # LoRA dropout would perturb the log-probs vs TRL. Disable it.
+                _mlx_disable_lora_dropout(model)
                 loss_fn = make_orpo_loss_fn(beta=_ob)
                 print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
             elif getattr(args, "loss_type", "sft") == "dpo":
@@ -2092,6 +2120,13 @@ class MLXTrainer:
                         "plain LoRA adapter, or pass reference_free=True to train "
                         "without a reference."
                     )
+                # TRL's DPOConfig defaults disable_dropout=True. The DPO policy
+                # forward runs under train() mode, so nonzero LoRA dropout would
+                # perturb the policy log-probs (the reference forward is already
+                # clean via scale=0) and bias the preference margin vs TRL. Disable
+                # it. (reference_free runs still benefit: the policy is perturbed
+                # the same way.)
+                _mlx_disable_lora_dropout(model)
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")

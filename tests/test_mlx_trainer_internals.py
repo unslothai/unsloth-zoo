@@ -1268,6 +1268,60 @@ def test_lora_reference_discovery_covers_non_loralinear_adapters():
     assert "is_leaf=lambda x: isinstance(x, LoRALinear)" not in src
 
 
+def test_disable_lora_dropout_neutralizes_every_adapter_dropout():
+    # TRL DPO/ORPO default disable_dropout=True; the MLX preference loss runs in
+    # train() mode inside the compiled step (per-step eval() unreliable), so the
+    # setup must neutralize each LoRA/DoRA module's dropout by replacing it with
+    # identity, covering every adapter iter_mlx_lora_modules finds.
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout, _mlx_identity
+
+    class FakeLoRA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = mx.zeros((4, 2))
+            self.lora_b = mx.zeros((2, 4))
+            self.scale = 1.0
+            # A stand-in "dropout" that is NOT identity (zeros its input).
+            self.dropout = lambda x: x * 0.0
+
+    class Root(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q = FakeLoRA()
+            self.k = FakeLoRA()
+
+    root = Root()
+    n = _mlx_disable_lora_dropout(root)
+    assert n == 2
+    assert root.q.dropout is _mlx_identity
+    assert root.k.dropout is _mlx_identity
+    x = mx.ones((2, 4))
+    assert _mlx_identity(x).tolist() == x.tolist()
+
+
+def test_dpo_orpo_setup_disables_lora_dropout_but_grpo_does_not():
+    # DPO and ORPO must disable adapter dropout before building their loss (TRL
+    # default disable_dropout=True); GRPO must NOT (TRL default False), so keeping
+    # the prior-round GRPO-dropout rejection consistent.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    call = "_mlx_disable_lora_dropout(model)"
+    assert src.count(call) == 2
+    orpo_b = src.index("make_orpo_loss_fn")
+    dpo_b = src.index("make_dpo_loss_fn")
+    grpo_b = src.index("make_grpo_loss_fn")
+    # ORPO disables before its loss builder ...
+    assert src.index(call) < orpo_b
+    # ... DPO disables before its loss builder (after the ORPO builder) ...
+    assert orpo_b < src.index(call, orpo_b) < dpo_b
+    # ... and the GRPO branch has no disable call before its builder.
+    assert call not in src[dpo_b:grpo_b]
+
+
 def test_grpo_reward_aggregation_skips_none_values():
     import inspect
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
