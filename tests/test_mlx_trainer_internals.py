@@ -2126,6 +2126,76 @@ def test_on_log_eval_request_or_syncs_onto_peer_ddp(monkeypatch):
     assert rank1.control.should_evaluate is True
 
 
+def test_run_eval_syncs_control_actions_after_on_evaluate():
+    # Regression for "Synchronize save requests raised by eval callbacks". Inside
+    # _run_eval, on_log and on_evaluate fire on rank 0 only and HF checks
+    # should_save after on_evaluate in the same step, so a callback that requests
+    # a save inside either event sets the flag on rank 0 alone. _run_eval must
+    # OR-sync the control action flags (_distributed_sync_control_actions) after
+    # the on_evaluate dispatch, before returning to the caller's should_save
+    # branch, or rank 0 enters the collective _run_checkpoint while peers skip it
+    # and hang at the next collective.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    eval_def = src.index("def _run_eval(current_step):")
+    eval_body = src[eval_def:src.index("def _run_best_tracking(", eval_def)]
+    evaluate_fire = eval_body.index('_fire("on_evaluate"')
+    sync_after = eval_body.find(
+        "self._distributed_sync_control_actions()", evaluate_fire
+    )
+    # The sync must follow the on_evaluate dispatch...
+    assert sync_after != -1
+    # ...and land before _run_eval returns, so the synced flags are the ones the
+    # caller's should_log / should_save branches read.
+    assert sync_after < eval_body.index("return True", evaluate_fire)
+
+
+def test_on_evaluate_save_request_or_syncs_onto_peer_ddp(monkeypatch):
+    # world_size == 2: a callback sets should_save during on_evaluate on rank 0
+    # only; _distributed_sync_control_actions must OR it onto the peer (rank 1)
+    # so both ranks agree to enter the collective checkpoint save, none left
+    # spinning at the on_save / _raise_distributed_failure collective.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
+
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    def make_trainer(rank):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        t.control = _MLXTrainerControl()
+        return t
+
+    base = 2 + 1  # flags pack base-(world+1); should_save is the base*base digit
+
+    # Rank 0's on_evaluate requested a save; the peer requested nothing.
+    rank0 = make_trainer(rank=0)
+    rank0.control.should_save = True
+    peer["value"] = 0  # rank 1's code contributes 0 to the should_save digit
+    rank0._distributed_sync_control_actions()
+    assert rank0.control.should_save is True
+
+    # Rank 1 saw no local request but must adopt rank 0's save after the sync,
+    # so it enters the same collective checkpoint instead of hanging.
+    rank1 = make_trainer(rank=1)
+    rank1.control.should_save = False
+    peer["value"] = base * base  # rank 0 contributes its should_save into the OR
+    rank1._distributed_sync_control_actions()
+    assert rank1.control.should_save is True
+
+
 def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
     # Regression for "Synchronize rank-zero callback failures". A callback that
     # raises on rank 0 must not unwind rank 0 alone: the peers never enter the

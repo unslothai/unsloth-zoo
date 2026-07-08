@@ -3233,6 +3233,16 @@ class MLXTrainer:
                 self.state.log_history.append(record)
             _fire("on_log", logs=dict(metrics))
             _fire("on_evaluate", metrics=metrics)
+            # on_log/on_evaluate fire on rank 0 only, and either may itself
+            # request a log/eval/save (HF checks should_save after on_evaluate in
+            # the same step). Sync those flags now, before the caller reads
+            # should_log / should_save: those branches run collective code
+            # (metric all-reduce, rank-0-guarded checkpoint save + on_save), so a
+            # request set on rank 0 alone would make rank 0 enter
+            # _run_training_log/_run_checkpoint while peers skip them and hang at
+            # the collective. Mirrors the on_log sync in _run_training_log; no-op
+            # at world size 1.
+            self._distributed_sync_control_actions()
             self._update_callback_best_metric(metrics)
             # Eval + on_evaluate callbacks fire on rank 0 only, so a callback (or
             # an external cancel arriving mid-eval) that sets stop_requested is
