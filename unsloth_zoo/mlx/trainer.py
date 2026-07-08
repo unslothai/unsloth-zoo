@@ -189,6 +189,11 @@ from .utils import (
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
+    _mlx_norm_path_part_is_norm,
+    iter_mlx_norm_output_cast_classes,
+    restore_mlx_norm_output_cast_state,
+    set_mlx_norm_output_cast_to_input_dtype,
+    snapshot_mlx_norm_output_cast_state,
     _get_text_model,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
@@ -391,184 +396,9 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
-_NORM_OUTPUT_CAST_BASE_CLASSES = (nn.RMSNorm, nn.LayerNorm)
-_NORM_OUTPUT_CAST_PATCHED_CLASSES = set()
-
-
-def _part_is_norm(part: str) -> bool:
-    # "norm" matches RMSNorm/LayerNorm/input_layernorm; ln_* covers GPT-2/GPT-OSS.
-    return "norm" in part or part.startswith("ln_") or part == "ln_f"
-
-
-def _is_norm_parameter_path(path) -> bool:
-    parts = str(path).lower().split(".")
-    return any(_part_is_norm(part) for part in parts[:-1])
-
-
-def _is_norm_module_path(path) -> bool:
-    return any(_part_is_norm(part) for part in str(path).lower().split("."))
-
-
-def _has_norm_selected_floating_parameter(module_path, module) -> bool:
-    try:
-        parameters = module.parameters()
-    except Exception:
-        return False
-
-    module_path_selected = _is_norm_module_path(module_path)
-    try:
-        for parameter_path, value in tree_flatten(parameters):
-            if (
-                hasattr(value, "dtype")
-                and mx.issubdtype(value.dtype, mx.floating)
-                and (
-                    module_path_selected
-                    or _is_norm_parameter_path(parameter_path)
-                )
-            ):
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _has_floating_parameter(module) -> bool:
-    try:
-        parameters = module.parameters()
-    except Exception:
-        return False
-
-    try:
-        for _, value in tree_flatten(parameters):
-            if hasattr(value, "dtype") and mx.issubdtype(value.dtype, mx.floating):
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _has_parameterized_non_norm_children(module) -> bool:
-    try:
-        children = module.children()
-    except Exception:
-        return False
-
-    try:
-        for _, child in tree_flatten(children, is_leaf=nn.Module.is_module):
-            if (
-                isinstance(child, nn.Module)
-                and "norm" not in type(child).__name__.lower()
-                and _has_floating_parameter(child)
-            ):
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _norm_output_cast_input_dtype(args, kwargs):
-    for value in args:
-        if hasattr(value, "dtype"):
-            return value.dtype
-    for value in kwargs.values():
-        if hasattr(value, "dtype"):
-            return value.dtype
-    return None
-
-
-def _is_norm_output_cast_candidate(module_path, module) -> bool:
-    """Return whether a custom module itself produces norm-like output."""
-    norm_cls = type(module)
-    if norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
-        return True
-    if "norm" not in norm_cls.__name__.lower():
-        return False
-    if _has_parameterized_non_norm_children(module):
-        return False
-    if not _has_norm_selected_floating_parameter(module_path, module):
-        return False
-    return True
-
-
-def _iter_norm_output_cast_classes(model=None):
-    norm_classes = []
-    seen = set()
-
-    for norm_cls in _NORM_OUTPUT_CAST_BASE_CLASSES:
-        norm_classes.append(norm_cls)
-        seen.add(norm_cls)
-
-    if model is not None:
-        try:
-            named_modules = model.named_modules()
-        except Exception:
-            named_modules = ()
-        for module_path, module in named_modules:
-            if _is_norm_output_cast_candidate(module_path, module):
-                norm_cls = type(module)
-                if norm_cls not in seen:
-                    norm_classes.append(norm_cls)
-                    seen.add(norm_cls)
-
-    return tuple(norm_classes)
-
-
-def _set_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
-    """Control whether norm outputs are cast back to activation dtype.
-
-    Norm parameters can stay in fp32 for stability, but letting fp32 norm
-    outputs flow through the rest of the graph promotes downstream
-    intermediates and materially increases LoRA/QLoRA memory. Casting the
-    result back matches PyTorch autocast behavior more closely: fp32 norm math,
-    bf16/fp16 downstream activations.
-    """
-    # Sync Qwen3-VL vision-block patch with generic patcher (lazy import: cycle).
-    try:
-        from . import compile as _mlx_compile
-        _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
-    except Exception:
-        pass
-
-    norm_classes = list(_iter_norm_output_cast_classes(model))
-    if not enabled:
-        norm_classes.extend(
-            norm_cls for norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
-            if norm_cls not in norm_classes
-        )
-
-    for norm_cls in norm_classes:
-        patched = norm_cls in _NORM_OUTPUT_CAST_PATCHED_CLASSES
-        if enabled:
-            original_call = norm_cls.__call__
-            if (
-                patched
-                or getattr(original_call, "_unsloth_norm_output_cast_wrapper", False)
-            ):
-                continue
-
-            def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):
-                input_dtype = _norm_output_cast_input_dtype(args, kwargs)
-                out = _original_call(self, *args, **kwargs)
-                if (
-                    input_dtype is not None
-                    and hasattr(out, "dtype")
-                    and out.dtype != input_dtype
-                ):
-                    return out.astype(input_dtype)
-                return out
-
-            norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
-            norm_cls._unsloth_original_call = original_call
-            norm_cls.__call__ = norm_call_cast_output
-            norm_cls._unsloth_cast_output_to_input_dtype = True
-            _NORM_OUTPUT_CAST_PATCHED_CLASSES.add(norm_cls)
-        elif patched:
-            original_call = getattr(norm_cls, "_unsloth_original_call", None)
-            if original_call is not None:
-                norm_cls.__call__ = original_call
-            norm_cls._unsloth_original_call = None
-            norm_cls._unsloth_cast_output_to_input_dtype = False
-            _NORM_OUTPUT_CAST_PATCHED_CLASSES.discard(norm_cls)
+_part_is_norm = _mlx_norm_path_part_is_norm
+_iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
+_set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
 
 
 def _normalize_mlx_scheduler_type(name):
@@ -1994,6 +1824,9 @@ class MLXTrainer:
         args = self.args
         model = self.model
         cast_norm_output = bool(getattr(args, "cast_norm_output_to_input_dtype", True))
+        _prev_norm_output_cast_state = snapshot_mlx_norm_output_cast_state(
+            iter_mlx_norm_output_cast_classes(model)
+        )
         # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
@@ -2004,10 +1837,10 @@ class MLXTrainer:
         except Exception:
             pass
         # Patch INSIDE try/finally so any raise during setup still restores globals.
-        _norm_cast_applied = False
         try:
+            from .loader import _keep_norm_parameters_float32
+            _keep_norm_parameters_float32(model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
-            _norm_cast_applied = True
             if cast_norm_output:
                 _main_print("Unsloth: Casting MLX norm outputs back to activation dtype.")
             args.patch_mode = normalize_mlx_patch_mode(getattr(args, "patch_mode", "patched"))
@@ -2111,12 +1944,11 @@ class MLXTrainer:
                 self._restore_memory_limits()
             except Exception:
                 pass
-            if _norm_cast_applied and cast_norm_output:
-                # Undo the global norm-class patch; tolerate partial state.
-                try:
-                    _set_norm_output_cast_to_input_dtype(False, model)
-                except Exception:
-                    pass
+            # Restore the pre-run process-global norm patch state, even if setup failed mid-patch.
+            try:
+                restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
+            except Exception:
+                pass
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile

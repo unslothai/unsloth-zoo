@@ -52,6 +52,327 @@ def _normalize_seed(seed, default=3407):
     return default if seed is None else int(seed)
 
 
+class _MLXNormOutputCastState:
+    __slots__ = ("patched_classes", "missing", "lock")
+
+    def __init__(self):
+        self.patched_classes = set()
+        self.missing = object()
+        self.lock = threading.RLock()
+
+
+_MLX_NORM_OUTPUT_CAST_STATE = _MLXNormOutputCastState()
+
+
+def _mlx_norm_path_part_is_norm(part: str) -> bool:
+    # "norm" matches RMSNorm/LayerNorm/input_layernorm; ln_* covers GPT-2/GPT-OSS.
+    return "norm" in part or part.startswith("ln_") or part == "ln_f"
+
+
+def is_mlx_norm_parameter_path(path) -> bool:
+    parts = str(path).lower().split(".")
+    return any(_mlx_norm_path_part_is_norm(part) for part in parts[:-1])
+
+
+def is_mlx_norm_module_path(path) -> bool:
+    return any(
+        _mlx_norm_path_part_is_norm(part)
+        for part in str(path).lower().split(".")
+    )
+
+
+def _join_mlx_parameter_path(module_path, parameter_path):
+    if module_path and parameter_path:
+        return f"{module_path}.{parameter_path}"
+    return module_path or parameter_path
+
+
+def _mlx_norm_runtime():
+    import mlx.core as _mx
+    import mlx.nn as _nn
+    from mlx.utils import tree_flatten as _tree_flatten
+
+    return _mx, _nn, _tree_flatten
+
+
+def _has_mlx_norm_selected_floating_parameter(module_path, module) -> bool:
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    module_path_selected = is_mlx_norm_module_path(module_path)
+    try:
+        for parameter_path, value in tree_flatten(parameters):
+            if (
+                hasattr(value, "dtype")
+                and _mx.issubdtype(value.dtype, _mx.floating)
+                and (
+                    module_path_selected
+                    or is_mlx_norm_parameter_path(parameter_path)
+                    or is_mlx_norm_parameter_path(
+                        _join_mlx_parameter_path(module_path, parameter_path)
+                    )
+                )
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_mlx_floating_parameter(module) -> bool:
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    try:
+        parameters = module.parameters()
+    except Exception:
+        return False
+
+    try:
+        for _, value in tree_flatten(parameters):
+            if hasattr(value, "dtype") and _mx.issubdtype(value.dtype, _mx.floating):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_mlx_parameterized_non_norm_children(module) -> bool:
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    try:
+        children = module.children()
+    except Exception:
+        return False
+
+    try:
+        is_module = getattr(_nn.Module, "is_module", None)
+        child_items = (
+            tree_flatten(children, is_leaf=is_module)
+            if is_module is not None else tree_flatten(children)
+        )
+        for _, child in child_items:
+            if (
+                isinstance(child, _nn.Module)
+                and "norm" not in type(child).__name__.lower()
+                and _has_mlx_floating_parameter(child)
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def is_mlx_norm_output_cast_candidate(module_path, module) -> bool:
+    """Return whether a custom module itself produces norm-like output."""
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    base_norm_classes = tuple(
+        cls for cls in (getattr(_nn, "RMSNorm", None), getattr(_nn, "LayerNorm", None))
+        if isinstance(cls, type)
+    )
+    norm_cls = type(module)
+    if base_norm_classes and issubclass(norm_cls, base_norm_classes):
+        return True
+    if "norm" not in norm_cls.__name__.lower():
+        return False
+    if _has_mlx_parameterized_non_norm_children(module):
+        return False
+    if not _has_mlx_norm_selected_floating_parameter(module_path, module):
+        return False
+    return True
+
+
+def mlx_norm_input_dtype(args, kwargs):
+    for value in args:
+        if hasattr(value, "dtype"):
+            return value.dtype
+    for value in kwargs.values():
+        if hasattr(value, "dtype"):
+            return value.dtype
+    return None
+
+
+def iter_mlx_norm_output_cast_classes(model=None):
+    _mx, _nn, tree_flatten = _mlx_norm_runtime()
+    norm_classes = []
+    seen = set()
+
+    for norm_cls in (getattr(_nn, "RMSNorm", None), getattr(_nn, "LayerNorm", None)):
+        if isinstance(norm_cls, type):
+            norm_classes.append(norm_cls)
+            seen.add(norm_cls)
+
+    if model is not None:
+        try:
+            named_modules = model.named_modules()
+        except Exception:
+            named_modules = ()
+        for module_path, module in named_modules:
+            if is_mlx_norm_output_cast_candidate(module_path, module):
+                norm_cls = type(module)
+                if norm_cls not in seen:
+                    norm_classes.append(norm_cls)
+                    seen.add(norm_cls)
+
+    return tuple(norm_classes)
+
+
+def _set_mlx_norm_output_cast_classes(enabled: bool, norm_classes) -> None:
+    patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+    for norm_cls in norm_classes:
+        patched = norm_cls in patched_classes
+        if enabled:
+            original_call = norm_cls.__call__
+            current_is_wrapper = getattr(
+                original_call, "_unsloth_norm_output_cast_wrapper", False
+            )
+            if patched and not current_is_wrapper:
+                patched_classes.discard(norm_cls)
+                patched = False
+            if (
+                patched
+                or current_is_wrapper
+            ):
+                continue
+
+            def norm_call_cast_output(self, *args, _original_call=original_call, **kwargs):
+                input_dtype = mlx_norm_input_dtype(args, kwargs)
+                out = _original_call(self, *args, **kwargs)
+                if (
+                    input_dtype is not None
+                    and hasattr(out, "dtype")
+                    and out.dtype != input_dtype
+                ):
+                    return out.astype(input_dtype)
+                return out
+
+            norm_call_cast_output._unsloth_norm_output_cast_wrapper = True
+            norm_call_cast_output._unsloth_original_call = original_call
+            norm_cls._unsloth_original_call = original_call
+            norm_cls.__call__ = norm_call_cast_output
+            norm_cls._unsloth_cast_output_to_input_dtype = True
+            patched_classes.add(norm_cls)
+        elif patched:
+            if not getattr(norm_cls.__call__, "_unsloth_norm_output_cast_wrapper", False):
+                patched_classes.discard(norm_cls)
+                continue
+            original_call = getattr(norm_cls, "_unsloth_original_call", None)
+            if original_call is not None:
+                norm_cls.__call__ = original_call
+            norm_cls._unsloth_original_call = None
+            norm_cls._unsloth_cast_output_to_input_dtype = False
+            patched_classes.discard(norm_cls)
+
+
+def mlx_norm_output_cast_patched_classes():
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        return tuple(_MLX_NORM_OUTPUT_CAST_STATE.patched_classes)
+
+
+def snapshot_mlx_norm_output_cast_state(norm_classes=None):
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+        missing = _MLX_NORM_OUTPUT_CAST_STATE.missing
+        snapshot_classes = []
+        seen = set()
+        for norm_cls in patched_classes:
+            snapshot_classes.append(norm_cls)
+            seen.add(norm_cls)
+        for norm_cls in norm_classes or ():
+            if isinstance(norm_cls, type) and norm_cls not in seen:
+                snapshot_classes.append(norm_cls)
+                seen.add(norm_cls)
+
+        return tuple(
+            (
+                norm_cls,
+                norm_cls in patched_classes,
+                norm_cls.__dict__.get("__call__", missing),
+                norm_cls.__dict__.get(
+                    "_unsloth_original_call",
+                    missing,
+                ),
+                norm_cls.__dict__.get(
+                    "_unsloth_cast_output_to_input_dtype",
+                    missing,
+                ),
+            )
+            for norm_cls in snapshot_classes
+        )
+
+
+def _restore_mlx_norm_output_cast_attr(norm_cls, attr_name, value) -> None:
+    if value is _MLX_NORM_OUTPUT_CAST_STATE.missing:
+        try:
+            delattr(norm_cls, attr_name)
+        except AttributeError:
+            pass
+    else:
+        setattr(norm_cls, attr_name, value)
+
+
+def restore_mlx_norm_output_cast_state(snapshot) -> None:
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        patched_classes = _MLX_NORM_OUTPUT_CAST_STATE.patched_classes
+        desired = {}
+        for entry in snapshot:
+            try:
+                norm_cls, was_patched, call, original_call, cast_output = entry
+            except (TypeError, ValueError):
+                continue
+            if isinstance(norm_cls, type):
+                desired[norm_cls] = (was_patched, call, original_call, cast_output)
+
+        for norm_cls, (was_patched, call, original_call, cast_output) in desired.items():
+            current_call = getattr(norm_cls, "__call__", None)
+            current_is_wrapper = getattr(
+                current_call, "_unsloth_norm_output_cast_wrapper", False
+            )
+            if not was_patched and not current_is_wrapper:
+                patched_classes.discard(norm_cls)
+                continue
+            _restore_mlx_norm_output_cast_attr(norm_cls, "__call__", call)
+            _restore_mlx_norm_output_cast_attr(
+                norm_cls, "_unsloth_original_call", original_call
+            )
+            _restore_mlx_norm_output_cast_attr(
+                norm_cls, "_unsloth_cast_output_to_input_dtype", cast_output
+            )
+            if was_patched:
+                patched_classes.add(norm_cls)
+            else:
+                patched_classes.discard(norm_cls)
+
+
+def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
+    """Control whether MLX norm outputs are cast back to activation dtype.
+
+    MLX training can keep norm parameters in fp32 for stability, but letting
+    fp32 norm outputs flow through the rest of the graph promotes downstream
+    intermediates and materially increases LoRA/QLoRA memory. Casting the
+    result back keeps bf16/fp16 downstream activations.
+
+    This patches norm classes process-wide, not per model. Use
+    snapshot_mlx_norm_output_cast_state() and restore_mlx_norm_output_cast_state()
+    to bracket temporary changes; overlapping trainer/inference runs in the
+    same process are still not safe because the patched classes are shared.
+    """
+    with _MLX_NORM_OUTPUT_CAST_STATE.lock:
+        try:
+            from . import compile as _mlx_compile
+            _mlx_compile.set_qwen3_vision_norm_cast_output(enabled)
+        except Exception:
+            pass
+
+        norm_classes = list(iter_mlx_norm_output_cast_classes(model))
+        if not enabled:
+            norm_classes.extend(
+                norm_cls for norm_cls in mlx_norm_output_cast_patched_classes()
+                if norm_cls not in norm_classes
+            )
+        _set_mlx_norm_output_cast_classes(enabled, norm_classes)
+
+
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 

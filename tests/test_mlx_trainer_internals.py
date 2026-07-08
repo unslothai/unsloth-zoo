@@ -985,6 +985,116 @@ def test_mlx_loader_keeps_norm_parameters_float32():
     )
 
 
+def test_mlx_trainer_upcasts_norms_and_restores_prior_norm_output_cast_state(monkeypatch):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import set_mlx_norm_output_cast_to_input_dtype
+
+    class LoaderOnlyNorm(nn.Module):
+        def __init__(self, dtype=mx.float32):
+            super().__init__()
+            self.weight = mx.ones((4,), dtype=dtype)
+
+        def __call__(self, x):
+            return x.astype(mx.float32) * self.weight
+
+        def parameters(self):
+            return {"weight": self.weight}
+
+    class LoadedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = LoaderOnlyNorm()
+
+    class TrainerModel(nn.Module):
+        _config = {}
+
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = LoaderOnlyNorm(mx.bfloat16)
+
+    set_mlx_norm_output_cast_to_input_dtype(False)
+    loaded_model = LoadedModel()
+    x = mx.ones((2, 4), dtype=mx.bfloat16)
+    try:
+        set_mlx_norm_output_cast_to_input_dtype(True, loaded_model)
+        assert loaded_model.input_layernorm(x).dtype == x.dtype
+        patched_state = (
+            LoaderOnlyNorm.__call__,
+            getattr(LoaderOnlyNorm, "_unsloth_original_call"),
+            getattr(LoaderOnlyNorm, "_unsloth_cast_output_to_input_dtype"),
+        )
+
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.model = TrainerModel()
+        assert trainer.model.parameters()["input_layernorm.weight"].dtype == mx.bfloat16
+        trainer.args = MLXTrainingConfig(
+            cast_norm_output_to_input_dtype=False,
+            gradient_checkpointing=False,
+            compile=False,
+            compile_auto_tune=False,
+            compile_trace=False,
+            disable_memory_limits=True,
+        )
+        trainer._is_vlm = False
+        monkeypatch.setattr(MLXTrainer, "_configure_memory_limits", lambda self: {})
+        monkeypatch.setattr(MLXTrainer, "_restore_memory_limits", lambda self: None)
+
+        def train_inner(self):
+            assert self.model.parameters()["input_layernorm.weight"].dtype == mx.float32
+            assert loaded_model.input_layernorm(x).dtype == mx.float32
+            return {"ok": True}
+
+        monkeypatch.setattr(MLXTrainer, "_train_inner", train_inner)
+
+        assert trainer.train() == {"ok": True}
+        assert loaded_model.input_layernorm(x).dtype == x.dtype
+        assert (
+            LoaderOnlyNorm.__call__,
+            getattr(LoaderOnlyNorm, "_unsloth_original_call"),
+            getattr(LoaderOnlyNorm, "_unsloth_cast_output_to_input_dtype"),
+        ) == patched_state
+
+        class FailingNorm:
+            weight = mx.ones((4,), dtype=mx.float32)
+
+            def __call__(self, x):
+                return x.astype(mx.float32)
+
+            def parameters(self):
+                return {"weight": self.weight}
+
+        failing_norm = FailingNorm()
+
+        class FailingModel:
+            _config = {}
+
+            def parameters(self):
+                return {}
+
+            def named_modules(self):
+                return [("input_layernorm", failing_norm)]
+
+        def raising_set_norm_output_cast(enabled, model=None):
+            set_mlx_norm_output_cast_to_input_dtype(enabled, model)
+            raise RuntimeError("setup failed")
+
+        monkeypatch.setattr(
+            "unsloth_zoo.mlx.trainer._set_norm_output_cast_to_input_dtype",
+            raising_set_norm_output_cast,
+        )
+
+        failing_trainer = MLXTrainer.__new__(MLXTrainer)
+        failing_trainer.model = FailingModel()
+        failing_trainer.args = MLXTrainingConfig(cast_norm_output_to_input_dtype=True)
+        with pytest.raises(RuntimeError, match="setup failed"):
+            failing_trainer.train()
+        assert not getattr(FailingNorm.__call__, "_unsloth_norm_output_cast_wrapper", False)
+    finally:
+        set_mlx_norm_output_cast_to_input_dtype(False)
+
+
 def test_mlx_loader_fixes_gemma3_vision_post_layernorm_eps():
     from types import SimpleNamespace
 
@@ -1020,11 +1130,14 @@ def test_mlx_loader_patches_gemma3_vision_attention_fp32_sdpa():
     assert "output.astype(orig_dtype)" in source
 
 
-def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32():
+def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32(monkeypatch):
     import inspect
+    from types import SimpleNamespace
 
+    import mlx.core as mx
     import unsloth_zoo.mlx.loader as loader
     from unsloth_zoo.mlx.loader import _fix_gemma3_text_rmsnorm_fp32
+    from unsloth_zoo.mlx.utils import set_mlx_norm_output_cast_to_input_dtype
 
     patched = _fix_gemma3_text_rmsnorm_fp32()
     assert patched in {True, False}
@@ -1034,6 +1147,49 @@ def test_mlx_loader_patches_gemma3_text_rmsnorm_fp32():
     assert "mx.rsqrt(mx.mean(x_f * x_f" in source
     assert "return y.astype(orig_dtype)" in source
     assert "_unsloth_fp32_rmsnorm_patched" in source
+
+    class FakeRMSNorm:
+        def __init__(self):
+            self.weight = mx.ones((4,), dtype=mx.float32)
+
+        def __call__(self, x):
+            return x.astype(mx.float32)
+
+        def parameters(self):
+            return {"weight": self.weight}
+
+    class TinyModel:
+        def __init__(self):
+            self.norm = FakeRMSNorm()
+
+        def named_modules(self):
+            return [("language_model.input_layernorm", self.norm)]
+
+    real_import_module = loader.importlib.import_module
+
+    def fake_import_module(name, *args, **kwargs):
+        if name == "mlx_vlm.models.gemma3.language":
+            return SimpleNamespace(RMSNorm=FakeRMSNorm)
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(loader.importlib, "import_module", fake_import_module)
+    model = TinyModel()
+    set_mlx_norm_output_cast_to_input_dtype(False)
+    try:
+        set_mlx_norm_output_cast_to_input_dtype(True, model)
+        assert _fix_gemma3_text_rmsnorm_fp32(model) is True
+        gemma_call = FakeRMSNorm.__call__
+
+        set_mlx_norm_output_cast_to_input_dtype(False, model)
+        assert FakeRMSNorm.__call__ is gemma_call
+
+        set_mlx_norm_output_cast_to_input_dtype(True, model)
+        assert getattr(FakeRMSNorm, "_unsloth_original_call") is gemma_call
+
+        set_mlx_norm_output_cast_to_input_dtype(False, model)
+        assert FakeRMSNorm.__call__ is gemma_call
+    finally:
+        set_mlx_norm_output_cast_to_input_dtype(False)
 
 
 def test_vlm_hidden_stack_preserves_inputs_embed_dtype():
