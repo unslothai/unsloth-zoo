@@ -1359,6 +1359,17 @@ class MLXTrainer:
             is_local_process_zero=is_main_process,
             is_world_process_zero=is_main_process,
         )
+        # Seed the callback-visible best-model fields from the restored native
+        # best state (set by the resume block before this call; None on a fresh
+        # run). Otherwise a resumed run starts with state.best_metric=None, so
+        # _update_callback_best_metric and HF callbacks like EarlyStoppingCallback
+        # treat the first post-resume eval as the new best and can overwrite the
+        # real best with a worse metric, diverging from the native best-model
+        # tracking in _run_best_tracking (which uses the restored self._best_metric).
+        self.state.best_metric = self._best_metric
+        self.state.best_global_step = self._best_step
+        if self._best_step is not None:
+            self.state.best_model_checkpoint = f"{args.output_dir}/best"
         self.control = _MLXTrainerControl()
 
     def _sync_callback_stop(self):
@@ -2983,11 +2994,31 @@ class MLXTrainer:
             run on every rank. Any resulting control-flag change is propagated
             to the peer ranks by the caller (_sync_stop for the stop flag, or
             _distributed_sync_control_actions for log/eval/save).
+
+            A callback that raises on rank 0 (an integration/logging error) must
+            not unwind rank 0 alone: the peers, which never enter this branch,
+            would return here and hang at the next collective while rank 0
+            aborts. Route the rank-0 failure through the distributed consensus
+            path (all ranks call _fire in lockstep) so every rank aborts with
+            the original error surfaced. Single-process keeps re-raising the
+            original exception unchanged.
             """
+            call_error = None
             if is_main_process:
-                self.control = self.callback_handler.call_event(
-                    event, args, self.state, self.control, **kwargs,
+                try:
+                    self.control = self.callback_handler.call_event(
+                        event, args, self.state, self.control, **kwargs,
+                    )
+                except Exception as e:
+                    call_error = e
+            if distributed_world_size > 1:
+                self._raise_distributed_failure(
+                    call_error is not None,
+                    f"{event} callback",
+                    call_error,
                 )
+            elif call_error is not None:
+                raise call_error
 
         def _sync_stop():
             """Propagate a callback stop request to every rank in lockstep.
@@ -3160,6 +3191,13 @@ class MLXTrainer:
                 record["step"] = self.state.global_step
                 self.state.log_history.append(record)
             _fire("on_log", logs=logs)
+            # on_log fires on rank 0 only and may itself request an eval or save
+            # (HF checks should_evaluate/should_save after logging in the same
+            # step). Sync those flags now: the caller's should_eval / should_save
+            # branches run collective eval + rank-0-guarded saves, so a request
+            # set on rank 0 alone would make rank 0 enter _run_eval/_run_checkpoint
+            # while peers skip them and hang at the collective. No-op at world 1.
+            self._distributed_sync_control_actions()
 
             losses = 0
             n_tokens = 0

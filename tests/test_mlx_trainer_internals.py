@@ -2059,3 +2059,171 @@ def test_same_step_eval_not_preempted_by_callback_stop_ddp(monkeypatch):
     peer["value"] = 0
     buggy_loss, _ = buggy._evaluate(eval_batches, loss_fn, is_vlm=False)
     assert buggy_loss == 0.0
+
+
+def test_on_log_control_actions_synced_before_eval_save():
+    # Regression for "Sync callback actions raised from on_log in DDP". on_log
+    # fires on rank 0 only and HF checks should_evaluate/should_save after the
+    # log in the same step, so a callback that requests an eval/save inside
+    # on_log sets the flag on rank 0 alone. _run_training_log must OR-sync those
+    # flags across ranks (_distributed_sync_control_actions) right after the
+    # on_log dispatch, before the caller's collective eval/save branches, or
+    # rank 0 enters _run_eval/_run_checkpoint while peers skip them and hang.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    log_fire = src.index('_fire("on_log", logs=logs)')
+    # The sync must follow the on_log dispatch inside _run_training_log.
+    sync_after = src.find("self._distributed_sync_control_actions()", log_fire)
+    assert sync_after != -1
+    # ...and land before the loss counter reset that ends _run_training_log, so
+    # the synced flags are the ones the caller's should_eval/should_save read.
+    reset_after = src.index("losses = 0", log_fire)
+    assert sync_after < reset_after
+
+
+def test_on_log_eval_request_or_syncs_onto_peer_ddp(monkeypatch):
+    # world_size == 2: a callback sets should_evaluate during on_log on rank 0
+    # only; _distributed_sync_control_actions must OR it onto the peer (rank 1)
+    # so both ranks agree to enter the collective eval, none left spinning.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
+
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    def make_trainer(rank):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        t.control = _MLXTrainerControl()
+        return t
+
+    base = 2 + 1  # _distributed_sync_control_actions packs flags base-(world+1)
+
+    # Rank 0's on_log requested an eval; the peer requested nothing this step.
+    rank0 = make_trainer(rank=0)
+    rank0.control.should_evaluate = True
+    peer["value"] = base  # rank 1 contributes 0 to the should_evaluate digit
+    rank0._distributed_sync_control_actions()
+    assert rank0.control.should_evaluate is True
+
+    # Rank 1 saw no local request but must adopt rank 0's eval after the sync,
+    # so it enters the same collective eval instead of hanging.
+    rank1 = make_trainer(rank=1)
+    rank1.control.should_evaluate = False
+    peer["value"] = base  # rank 0 contributes its should_evaluate into the OR
+    rank1._distributed_sync_control_actions()
+    assert rank1.control.should_evaluate is True
+
+
+def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
+    # Regression for "Synchronize rank-zero callback failures". A callback that
+    # raises on rank 0 must not unwind rank 0 alone: the peers never enter the
+    # rank-0-only dispatch, so they would return and hang at the next collective
+    # while rank 0 aborts. _fire routes the rank-0 failure through the
+    # distributed consensus (_raise_distributed_failure), which every rank calls
+    # in lockstep, so all ranks raise together and the original error surfaces.
+    import inspect
+
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    # Source-level: _fire wraps the rank-0 call_event and routes failures through
+    # the distributed consensus path rather than propagating on rank 0 alone.
+    src = inspect.getsource(MLXTrainer._train_inner)
+    fire_def = src.index("def _fire(event, **kwargs):")
+    fire_body = src[fire_def:src.index("def _sync_stop():", fire_def)]
+    assert "call_event" in fire_body
+    assert "except Exception" in fire_body
+    assert "self._raise_distributed_failure(" in fire_body
+
+    # Behavioral world_size == 2 consensus: rank 0 failed, peer succeeded, both
+    # must raise (no peer left waiting at the collective).
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    def make_trainer(rank):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        t.stop_requested = False
+        return t
+
+    # Rank 0's callback raised; its failure flag is 1, the peer contributes 0.
+    rank0 = make_trainer(rank=0)
+    peer["value"] = 0
+    with pytest.raises(RuntimeError, match="callback"):
+        rank0._raise_distributed_failure(True, "on_log callback", ValueError("boom"))
+
+    # Rank 1 saw no local failure but the reduced consensus is non-zero, so it
+    # aborts too instead of hanging at the next all-reduce.
+    rank1 = make_trainer(rank=1)
+    peer["value"] = 1  # rank 0 contributes its failure into the reduction
+    with pytest.raises(RuntimeError, match="peer rank failed"):
+        rank1._raise_distributed_failure(False, "on_log callback")
+
+
+def test_init_callback_state_seeds_best_from_restored_resume_state():
+    # Regression for "Seed callback best state when resuming". On resume the
+    # native best fields (self._best_metric/_best_step) are restored before
+    # _init_callback_state, but the fresh TrainerState leaves best_metric=None.
+    # HF callbacks (EarlyStoppingCallback) and _update_callback_best_metric would
+    # then treat the first post-resume eval as the new best and overwrite the
+    # real best with a worse metric. _init_callback_state must seed the visible
+    # best fields from the restored native best state.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    def make_shell(best_metric, best_step):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t.args = MLXTrainingConfig(output_dir="out_dir")
+        t._distributed_initialized = True
+        t._distributed_is_main_process = True
+        t._distributed_world_size = 1
+        t._distributed_rank = 0
+        t.callback_handler = types.SimpleNamespace(
+            call_event=lambda *a, **k: k.get("control", a[3] if len(a) > 3 else None)
+        )
+        t._best_metric = best_metric
+        t._best_step = best_step
+        return t
+
+    # Resume: restored best is seeded into the callback-visible state.
+    resumed = make_shell(best_metric=0.5, best_step=7)
+    resumed._init_callback_state(total_steps=100, resume_step=7)
+    assert resumed.state.best_metric == 0.5
+    assert resumed.state.best_global_step == 7
+    assert resumed.state.best_model_checkpoint == "out_dir/best"
+
+    # A fresh run has no prior best; the fields stay None (no phantom best).
+    fresh = make_shell(best_metric=None, best_step=None)
+    fresh._init_callback_state(total_steps=100, resume_step=0)
+    assert fresh.state.best_metric is None
+    assert fresh.state.best_global_step is None
+    assert fresh.state.best_model_checkpoint is None
+
+    # With the seed in place, a worse post-resume eval must NOT overwrite the
+    # restored best (greater_is_better=False: lower eval_loss is better).
+    resumed.args.metric_for_best_model = "eval_loss"
+    resumed.args.greater_is_better = False
+    resumed._update_callback_best_metric({"eval_loss": 0.9})
+    assert resumed.state.best_metric == 0.5  # unchanged: 0.9 is worse than 0.5
+    # A genuine improvement still updates it.
+    resumed._update_callback_best_metric({"eval_loss": 0.3})
+    assert resumed.state.best_metric == 0.3
