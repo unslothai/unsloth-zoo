@@ -1276,20 +1276,27 @@ def test_distributed_diagnostics_per_rank_tokens_use_local_history():
     assert "_local_token_count_history" in src
 
 
-def test_reset_run_state_preserves_external_stop_request():
+def test_reset_run_state_clears_stop_request_for_reuse():
+    # Regression for "Keep callback stops from poisoning trainer reuse".
+    # stop_requested is a persistent instance flag; a run whose callback latched
+    # should_training_stop leaves it True. _reset_run_state runs at the start of
+    # each train(), so it must clear stop_requested (and _early_stopped) or the
+    # next trainer.train() on the same instance exits at the top of the loop with
+    # 0 steps. A new train() call is a fresh run: an in-flight cancel targets the
+    # run active when it is set (that run's loop), not a not-yet-started one.
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     trainer = MLXTrainer.__new__(MLXTrainer)
 
-    # An externally-set cancel (e.g. a controller thread firing during train()
-    # setup or batch prep) must survive the per-run reset.
+    # A callback-latched stop from a prior run must not survive into the reset
+    # that a reused train() performs, else run 2 exits at step 0.
     trainer.stop_requested = True
     trainer._reset_run_state()
-    assert trainer.stop_requested is True
+    assert trainer.stop_requested is False
     assert trainer._early_stopped is False
 
-    # A run-1 early stop must not block run 2 on a reused trainer.
-    trainer.stop_requested = False
+    # A run-1 early stop must not block run 2 on a reused trainer either.
+    trainer.stop_requested = True
     trainer._early_stopped = True
     trainer._reset_run_state()
     assert trainer._early_stopped is False
@@ -2595,3 +2602,120 @@ def test_epoch_boundary_can_land_on_substep():
             boundary_is_update = do_update
         accum_progress = 0 if do_update else accum_progress + 1
     assert boundary_is_update is False
+
+
+def test_substep_defers_callback_stop_until_after_epoch_end_eval():
+    # Regression for the epoch-end twin of the on_step_end / on_optimizer_step
+    # deferral bug. When batches-per-epoch is not a multiple of grad_accum, the
+    # epoch-boundary microstep is a non-update (substep); on_substep_end can set
+    # should_training_stop while _maybe_callback_epoch_end then fires on_epoch_end
+    # and may run a same-epoch eval. Latching the stop before that eval makes
+    # _evaluate_batch_totals skip every batch (it is gated on not stop_requested),
+    # reporting 0.0 loss and corrupting best-model / early-stopping state. Only an
+    # external cancel may be OR-reduced ahead of the epoch-end eval; the callback
+    # stop is applied by the tail _sync_stop() after it.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    substep = src.index("if not do_update:")
+    # Work on a comment-stripped slice of the substep branch (up to its continue)
+    # so prose mentioning continue / _sync_stop / _maybe_callback_epoch_end is not
+    # mistaken for the code that performs it.
+    branch_lines = []
+    for line in src[substep:].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        branch_lines.append(line)
+        if stripped == "continue":
+            break
+    branch = "\n".join(branch_lines)
+
+    substep_end = branch.index('_fire("on_substep_end")')
+    epoch_end_call = branch.index("_maybe_callback_epoch_end(")
+    continue_idx = branch.index("continue", epoch_end_call)
+
+    between = branch[substep_end:epoch_end_call]
+    # The callback stop must not be latched into stop_requested before the
+    # epoch-end eval.
+    assert "_sync_stop()" not in between
+    assert "_sync_callback_stop()" not in between
+    # Only the external-cancel OR-reduce is allowed ahead of the epoch-end eval.
+    assert "self._distributed_should_stop()" in between
+
+    # The deferred callback stop is applied by a tail _sync_stop() after the
+    # epoch-end log/eval/save and before the substep continue.
+    after_epoch = branch[epoch_end_call:continue_idx]
+    assert "_sync_stop()" in after_epoch
+
+
+def test_substep_stop_not_preempted_by_epoch_end_eval_ddp(monkeypatch):
+    # world_size == 2 regression proving DDP lockstep is preserved for the
+    # substep epoch-end deferral: a callback stop set on on_substep_end at an
+    # epoch-boundary microstep is deferred past the epoch-end eval (which reports
+    # the real loss, not 0.0), the tail _sync_stop() then applies it, and a stop
+    # on rank 0 OR-reduces onto the peer so no rank is left spinning.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
+
+    peer = {"value": 0}
+    def fake_all_sum(value, group=None, stream=None):
+        return value + mx.array(peer["value"], dtype=value.dtype)
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    class Model:
+        def __init__(self): self.modes = []
+        def eval(self): self.modes.append("eval")
+        def train(self): self.modes.append("train")
+
+    def make_trainer(rank, local_stop):
+        t = MLXTrainer.__new__(MLXTrainer)
+        t.model = Model()
+        t._distributed_initialized = True
+        t._distributed_world = object()
+        t._distributed_world_size = 2
+        t._distributed_rank = rank
+        t._distributed_is_main_process = (rank == 0)
+        t.stop_requested = local_stop
+        t.control = _MLXTrainerControl()
+        t._last_eval_metrics = {}
+        return t
+
+    def loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(2.0), mx.array(4)
+
+    eval_batches = [("a", None, None), ("b", None, None)]
+
+    # Rank 0: an on_substep_end callback sets should_training_stop at an epoch
+    # boundary. The substep branch runs only the external-cancel OR-reduce there
+    # (no latch), so the callback stop stays deferred and stop_requested is False.
+    rank0 = make_trainer(rank=0, local_stop=False)
+    rank0.control.should_training_stop = True
+    peer["value"] = 0  # the peer requested nothing this step
+    rank0._distributed_should_stop()
+    assert rank0.stop_requested is False
+
+    # The epoch-end eval therefore consumes every batch and reports the real loss.
+    loss, _ = rank0._evaluate(eval_batches, loss_fn, is_vlm=False)
+    assert loss == pytest.approx(2.0)
+    assert loss != 0.0
+
+    # The deferred callback stop, applied by the tail _sync_stop(), stops rank 0.
+    rank0._sync_callback_stop()
+    assert rank0._distributed_should_stop() is True
+    assert rank0.stop_requested is True
+
+    # Lockstep: the stop on rank 0 OR-reduces onto the peer (rank 1), which
+    # requested nothing locally, so no rank is left spinning at the next
+    # collective.
+    rank1 = make_trainer(rank=1, local_stop=False)
+    rank1.control.should_training_stop = False
+    peer["value"] = 1  # rank 0 contributes its stop into the reduction
+    rank1._sync_callback_stop()
+    assert rank1.stop_requested is False
+    assert rank1._distributed_should_stop() is True
+    assert rank1.stop_requested is True

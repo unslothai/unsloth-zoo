@@ -857,10 +857,9 @@ class MLXTrainer:
         self._ensure_lora_frozen(model)
 
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
-        # each train() so a reused trainer starts clean); callbacks and
-        # pre-created batches persist across runs and stay here.
+        # each train() so a reused trainer starts clean, including stop_requested);
+        # callbacks and pre-created batches persist across runs and stay here.
         self._reset_run_state()
-        self.stop_requested = False  # Set True to stop training early
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
@@ -886,12 +885,14 @@ class MLXTrainer:
     def _reset_run_state(self):
         """Per-run training/metric state. Reset from __init__ and at the start
         of each train() so reusing a trainer for a second run starts clean;
-        _early_stopped cleared so a run-1 early stop doesn't block run 2.
-        stop_requested is deliberately not reset: it is externally owned (a
-        controller thread may set it at any moment, including during train()
-        setup and batch prep), so clearing it here would silently drop an
-        in-flight cancel. Callbacks and pre-created batches persist across
-        runs and aren't reset."""
+        _early_stopped cleared so a run-1 early stop doesn't block run 2, and
+        stop_requested cleared so a run-1 stop (a callback that latched
+        should_training_stop, or a prior external cancel) does not make a reused
+        trainer.train() exit at step 0. A new train() call is a fresh run: an
+        in-flight cancel targets whichever run is active when it is set (during
+        that run's loop), not a not-yet-started one, so clearing it at run start
+        is correct. Callbacks and pre-created batches persist across runs and
+        aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
@@ -905,6 +906,10 @@ class MLXTrainer:
         # eval_loss/perplexity in its result. Repopulated by _evaluate.
         self._last_eval_metrics = {}
         self._early_stopped = False
+        # Cleared each run so a run-1 stop (callback-latched or a prior external
+        # cancel) does not exit a reused trainer.train() at step 0; set True to
+        # stop training early.
+        self.stop_requested = False
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
@@ -3648,7 +3653,17 @@ class MLXTrainer:
             if not do_update:
                 accum_progress += 1
                 _fire("on_substep_end")
-                _sync_stop()
+                # Do NOT latch a callback should_training_stop into stop_requested
+                # yet. When this non-update microstep is also an epoch boundary,
+                # _maybe_callback_epoch_end below fires on_epoch_end and may run a
+                # same-epoch eval; latching the stop now would make that eval's
+                # _evaluate_batch_totals skip every batch (it is gated on not
+                # stop_requested), reporting 0.0 loss and corrupting best-model /
+                # early-stopping state. OR-reduce only an external cancel here; the
+                # callback stop is applied by the tail _sync_stop() below after the
+                # epoch-end log/eval/save, mirroring the on_step_end / on_optimizer_
+                # step deferrals in the update branch.
+                self._distributed_should_stop()
                 # An epoch boundary can fall on a non-update microstep when
                 # batches-per-epoch is not a multiple of grad_accum (for example
                 # 3 micro-batches with grad_accum=2). HF always fires on_epoch_end
@@ -3657,9 +3672,15 @@ class MLXTrainer:
                 # stop it requests are dropped for that epoch. _maybe_callback_
                 # epoch_end is a no-op away from a boundary and runs the same
                 # collectives on every rank (it/batches_per_epoch are rank-
-                # consistent), so DDP stays in lockstep; a stop it sets is drained
-                # by the top-of-loop stop check on the next iteration.
+                # consistent), so DDP stays in lockstep.
                 _maybe_callback_epoch_end(it, self._global_step, grad_norm)
+                # Apply any deferred callback stop (from on_substep_end or the
+                # epoch-end callbacks) now that the epoch-end eval has run. This
+                # tail _sync_stop() runs on every rank in the same order as the
+                # update branch's tail, so DDP stays in lockstep; the continue then
+                # routes to the top-of-loop _distributed_should_stop(), which drains
+                # the stop on every rank before the next collective.
+                _sync_stop()
                 microstep = it
                 continue
 
