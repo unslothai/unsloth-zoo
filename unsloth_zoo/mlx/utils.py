@@ -1088,9 +1088,19 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                 f"columns; got {sorted(ex.keys())}."
             )
         prompt = ex[prompt_key]
-        p_ids = hf.encode(prompt)
-        c_ids = hf.encode(prompt + ex[chosen_key])[:max_seq_length]
-        r_ids = hf.encode(prompt + ex[rejected_key])[:max_seq_length]
+        # Route through encode_mlx_text (the shared double-BOS guard), like the
+        # SFT and GRPO paths. Raw hf.encode uses add_special_tokens=True and
+        # prepends a BOS unconditionally, so a preference row whose prompt was
+        # already rendered with the chat template's leading BOS
+        # (apply_chat_template(..., tokenize=False)) would get a SECOND BOS. DPO/
+        # ORPO would then optimize duplicate-BOS sequences (policy + reference,
+        # chosen + rejected) on every row and diverge from the rest of the MLX
+        # trainer for identical rendered text. encode_mlx_text drops
+        # add_special_tokens only when the text already starts with the BOS, so
+        # plain non-BOS strings and tokenizers without a bos_token are unchanged.
+        p_ids = encode_mlx_text(hf, prompt)
+        c_ids = encode_mlx_text(hf, prompt + ex[chosen_key])[:max_seq_length]
+        r_ids = encode_mlx_text(hf, prompt + ex[rejected_key])[:max_seq_length]
         pe = min(len(p_ids), len(c_ids), len(r_ids))
         rows.append((pe, c_ids, r_ids))
 

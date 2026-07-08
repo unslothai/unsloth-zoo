@@ -3885,8 +3885,29 @@ class MLXGRPOTrainer(MLXTrainer):
             was_training = self.model.training
             self.model.eval()
             try:
+                # Bound generation so prompt + completion fits max_seq_length. The
+                # reward funcs score the FULL generated text (comps below), so if
+                # (pids + comp) were post-hoc truncated to max_seq_length the loss/
+                # KL would score only the surviving prefix while the reward (and
+                # thus the group-relative advantage) already reflects the dropped
+                # suffix: a silent reward/score misattribution that also corrupts
+                # the other rows' advantages via the group mean/std. TRL avoids
+                # this by bounding the prompt (max_prompt_length) and completion
+                # (max_completion_length) so their sum fits; cap generation to the
+                # trainable remainder here for the same effect. A single prompt
+                # that already fills max_seq_length leaves no trainable completion,
+                # so fail fast rather than emit an empty/degenerate loss span.
+                _avail = args.max_seq_length - len(pids)
+                if _avail <= 0:
+                    raise ValueError(
+                        f"Unsloth MLX GRPO: the rendered prompt uses {len(pids)} "
+                        f"tokens, leaving no room for a completion within "
+                        f"max_seq_length={args.max_seq_length}. Increase "
+                        f"max_seq_length or shorten the prompt."
+                    )
+                _gen_max = min(args.max_completion_length, _avail)
                 _gen_kwargs = dict(
-                    max_tokens=args.max_completion_length,
+                    max_tokens=_gen_max,
                     sampler=sampler, verbose=False,
                 )
                 if _supports_token_ids:
@@ -3966,17 +3987,19 @@ class MLXGRPOTrainer(MLXTrainer):
                     comp = [int(t) for t in comp_ids[i]]
                     # mlx-lm's batch_generate strips the terminal EOS from the
                     # returned ids for a normally-terminating row (finish_reason
-                    # == "stop"), keeping all max_completion_length tokens only
-                    # when it truncated on length. TRL's GRPO completion mask is
-                    # inclusive of that EOS (sequence_indices <= eos_idx), so the
-                    # stop action gets advantage-weighted gradient/KL. Re-add the
-                    # EOS when the row stopped normally (shorter than the cap) so
+                    # == "stop"), keeping all _gen_max tokens only when it truncated
+                    # on length. TRL's GRPO completion mask is inclusive of that EOS
+                    # (sequence_indices <= eos_idx), so the stop action gets
+                    # advantage-weighted gradient/KL. Re-add the EOS when the row
+                    # stopped normally (shorter than the generation cap _gen_max) so
                     # the loss scores the model's probability of stopping and does
                     # not bias completion-length/EOS behavior. A row at the cap was
                     # truncated (no EOS emitted) and is left as-is, mirroring TRL's
-                    # default mask_truncated_completions=False.
+                    # default mask_truncated_completions=False. _gen_max already
+                    # bounds pids + comp (+ this EOS) to max_seq_length, so the cut
+                    # below never drops a reward-scored token.
                     _eos_id = getattr(hf, "eos_token_id", None)
-                    if _eos_id is not None and len(comp) < args.max_completion_length:
+                    if _eos_id is not None and len(comp) < _gen_max:
                         comp = comp + [int(_eos_id)]
                     full = (pids + comp)[: args.max_seq_length]
                 else:

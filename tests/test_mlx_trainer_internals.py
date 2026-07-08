@@ -1684,6 +1684,68 @@ def test_grpo_rollout_appends_no_eos_when_tokenizer_lacks_eos_id(monkeypatch):
     assert rows[1][pe:lens[1][1]] == [7, 8]
 
 
+def test_grpo_rollout_caps_generation_to_trainable_remainder(monkeypatch):
+    # The reward funcs score the FULL generated text, so generation must be
+    # bounded so prompt + completion fits max_seq_length; otherwise a post-hoc
+    # (pids+comp)[:max_seq_length] cut would drop reward-scored completion tokens
+    # from the loss/KL span (silent reward/score misattribution). When the prompt
+    # is long relative to max_seq_length, max_tokens must be capped to
+    # max_seq_length - len(pids), below max_completion_length.
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    # Prompt encodes to 6 ids; tiny max_seq_length leaves only 2 for completion.
+    trainer.tokenizer.encode = lambda s: [1, 2, 3, 4, 5, 6]
+    trainer.args.max_completion_length = 20
+    trainer.args.max_seq_length = 8
+
+    seen = {}
+    def _gen(model, tokenizer, prompts=None, max_tokens=None,
+             sampler=None, verbose=False, return_token_ids=False):
+        seen["max_tokens"] = max_tokens
+        return types.SimpleNamespace(texts=["a", "b"], token_ids=[[7, 8], [7, 8]])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _adv = next(gen)
+    # max_seq_length(8) - len(pids)(6) = 2, below max_completion_length(20).
+    assert seen["max_tokens"] == 2
+    # Every built row fits within max_seq_length (no reward-scored token dropped).
+    for row_len in [l[1] for l in lengths.tolist()]:
+        assert row_len <= 8
+
+
+def test_grpo_rollout_rejects_prompt_that_fills_max_seq_length(monkeypatch):
+    # A single prompt that already consumes max_seq_length leaves no trainable
+    # completion; the rollout must fail fast rather than emit an empty/degenerate
+    # loss span whose reward still folds into the group advantages.
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    trainer.tokenizer.encode = lambda s: list(range(40))  # len 40
+    trainer.args.max_seq_length = 32
+
+    monkeypatch.setattr(
+        mlx_lm, "batch_generate",
+        lambda *a, **k: types.SimpleNamespace(texts=["a", "b"], token_ids=[[7], [7]]),
+        raising=False,
+    )
+    gen = trainer._grpo_rollout_generator()
+    with pytest.raises(ValueError, match="no room for a completion"):
+        next(gen)
+
+
 def test_grpo_advantages_use_unbiased_group_std(monkeypatch):
     # TRL standardizes grouped rewards with the sample (Bessel-corrected) std
     # (torch.std default unbiased=True); the population std (mx.std default) is
@@ -1764,6 +1826,39 @@ def test_create_preference_batches_samples_across_lengths_when_truncating():
     assert kept == expected
     # The length-sort-then-truncate bug would keep only the two shortest pairs.
     assert kept != [0, 1]
+
+
+def test_create_preference_batches_guards_double_bos_on_chat_prompts():
+    # A preference row whose prompt was already rendered with the chat template's
+    # leading BOS (apply_chat_template(tokenize=False)) must be tokenized with
+    # add_special_tokens=False, matching the SFT/GRPO encode_mlx_text guard. Raw
+    # hf.encode would prepend a SECOND BOS, so DPO/ORPO would optimize
+    # duplicate-BOS sequences (policy + reference, chosen + rejected) on every row.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class Tok:
+        eos_token_id = 0
+        bos_token = "<s>"
+
+        def __init__(self):
+            self.add_special_tokens_seen = []
+
+        def encode(self, text, add_special_tokens=True):
+            self.add_special_tokens_seen.append(add_special_tokens)
+            ids = [5] if add_special_tokens else []  # 5 stands in for BOS
+            return ids + [ord(ch) for ch in text]
+
+    tok = Tok()
+    # Prompt already carries the rendered BOS; chosen/rejected are appended text.
+    dataset = [{"prompt": "<s>hi", "chosen": "ok", "rejected": "no"}]
+    create_preference_batches(
+        dataset, tok, batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )
+    # All three encodes (prompt, prompt+chosen, prompt+rejected) run on
+    # BOS-prefixed text, so none may re-add a second BOS.
+    assert tok.add_special_tokens_seen  # encode actually ran
+    assert all(flag is False for flag in tok.add_special_tokens_seen)
 
 
 def test_grpo_rollout_guards_double_bos_on_chat_prompts(monkeypatch):
