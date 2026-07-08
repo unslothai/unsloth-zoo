@@ -3847,7 +3847,12 @@ class MLXGRPOTrainer(MLXTrainer):
             for rf in self.reward_funcs:
                 vals = rf(completions=comps, prompts=[prompt] * N, **reward_kwargs)
                 for i, v in enumerate(vals):
-                    total[i] += float(v)
+                    # TRL-style reward funcs may return None to skip a sample
+                    # (multi-task rewards); TRL maps None to NaN and drops it
+                    # from the sum. Skip None here instead of crashing on
+                    # float(None).
+                    if v is not None:
+                        total[i] += float(v)
             rewards = mx.array(total)
             advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
             # build the concatenated group batch

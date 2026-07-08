@@ -1228,6 +1228,30 @@ def test_lora_reference_discovery_covers_non_loralinear_adapters():
     assert "is_leaf=lambda x: isinstance(x, LoRALinear)" not in src
 
 
+def test_grpo_reward_aggregation_skips_none_values():
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    # The rollout reward loop must skip None (TRL multi-task reward pattern)
+    # rather than crash on float(None).
+    src = inspect.getsource(MLXGRPOTrainer._grpo_rollout_generator)
+    assert "if v is not None" in src
+
+    # Behavioral check on the aggregation logic the generator runs: None from
+    # one reward func is ignored, the applicable func still contributes.
+    N = 3
+    reward_funcs = [
+        lambda **kw: [1.0, None, 2.0],
+        lambda **kw: [None, 0.5, None],
+    ]
+    total = [0.0] * N
+    for rf in reward_funcs:
+        for i, v in enumerate(rf()):
+            if v is not None:
+                total[i] += float(v)
+    assert total == [1.0, 0.5, 2.0]
+
+
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
     import inspect
 
