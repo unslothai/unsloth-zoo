@@ -226,7 +226,7 @@ class VisualServer:
         # for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        with open(self.req, "w") as f:
+        with open(self.req, "w", encoding="utf-8") as f:
             json.dump(req, f, ensure_ascii=False)
         try:
             self.p.stdin.write(self.req + "\n")
