@@ -3625,7 +3625,20 @@ class MLXTrainer:
                 )
             if do_update:
                 _fire("on_optimizer_step")
-                _sync_stop()
+                # Do NOT latch a callback should_training_stop into stop_requested
+                # here. HF fires on_optimizer_step, then on_step_end, then
+                # _maybe_log_save_evaluate (log+eval+save) for this step, and only
+                # breaks on should_training_stop AFTER that block (transformers
+                # trainer.py _inner_training_loop: on_optimizer_step -> on_step_end
+                # -> _maybe_log_save_evaluate -> the should_epoch_stop/
+                # should_training_stop break). Latching the stop now would make
+                # this step's _evaluate_batch_totals skip every eval batch (it is
+                # gated on not stop_requested), reporting 0.0 loss and corrupting
+                # best-model / early-stopping state. OR-reduce only an external
+                # cancel here; the callback stop is applied by the tail
+                # _sync_stop() after the same-step log/eval/save, mirroring the
+                # on_step_end deferral below.
+                self._distributed_should_stop()
             self.state.num_input_tokens_seen += int(toks.item())
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
