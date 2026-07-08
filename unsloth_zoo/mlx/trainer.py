@@ -3450,6 +3450,19 @@ class MLXTrainer:
             )
 
         if self._batches is not None:
+            # Defense in depth: prebuilt batches are SFT-shaped (from
+            # train_on_responses_only). They must never reach the DPO/ORPO
+            # preference losses, which would mis-split them into [chosen; rejected]
+            # pairs. train_on_responses_only already fails fast for these
+            # loss_types; guard here too so no future caller can slip SFT batches
+            # through.
+            if getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
+                raise ValueError(
+                    "Unsloth: prebuilt response-only SFT batches are not valid for "
+                    "DPO/ORPO preference losses (they would be mis-paired as "
+                    "[chosen; rejected]). Do not use train_on_responses_only() with "
+                    "a preference loss_type."
+                )
             return self._batches, None
 
         total_batches_needed = (
@@ -4463,6 +4476,28 @@ def train_on_responses_only(
     from ..dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
+
+    # Fail fast before any tokenization work: train_on_responses_only builds
+    # SFT-shaped (batch, lengths, labels) batches and stores them on
+    # trainer._batches, which _prepare_data returns before the DPO/ORPO preference
+    # branch. The preference losses split each batch into row halves as
+    # [chosen; rejected] (batch.shape[0]//2), so SFT rows get paired as unrelated
+    # chosen/rejected examples (garbage gradient), and at
+    # per_device_train_batch_size=1 the chosen half is empty -> NaN. Mirror the
+    # DPO+VLM / DPO+non-LoRA fail-fast guards rather than train silently on
+    # corrupted pairs. (return_function=True has no trainer/_batches to corrupt.)
+    if trainer is not None and getattr(trainer.args, "loss_type", "sft") in (
+        "dpo", "orpo",
+    ):
+        raise ValueError(
+            "Unsloth: train_on_responses_only() masks SFT completion tokens and is "
+            "incompatible with preference losses. DPO/ORPO build their own "
+            "[chosen; rejected] batches via create_preference_batches (prompt "
+            "masking is handled there); feeding response-only SFT batches to the "
+            "preference loss pairs unrelated rows as chosen/rejected and yields NaN "
+            "at per_device_train_batch_size=1. Remove the train_on_responses_only() "
+            "call for loss_type in {'dpo','orpo'}."
+        )
 
     # Resolve tokenizer: kwarg > trainer.tokenizer
     _source = tokenizer

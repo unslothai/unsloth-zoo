@@ -1915,6 +1915,43 @@ def test_create_preference_batches_guards_double_bos_on_chat_prompts():
     assert all(flag is False for flag in tok.add_special_tokens_seen)
 
 
+def test_train_on_responses_only_rejects_preference_loss_types():
+    # train_on_responses_only builds SFT-shaped batches on trainer._batches, which
+    # _prepare_data returns before the DPO/ORPO branch; the preference loss would
+    # then mis-split unrelated SFT rows into [chosen; rejected] pairs (NaN at
+    # batch size 1). It must fail fast for a preference loss_type.
+    import types
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    for lt in ("dpo", "orpo"):
+        trainer = types.SimpleNamespace(args=types.SimpleNamespace(loss_type=lt))
+        with pytest.raises(ValueError, match="incompatible with preference losses"):
+            train_on_responses_only(trainer)
+
+    # SFT is unaffected: the guard does not fire, so execution proceeds past it
+    # (failing later on the missing tokenizer, a different error).
+    sft = types.SimpleNamespace(
+        args=types.SimpleNamespace(loss_type="sft"), tokenizer=None,
+    )
+    with pytest.raises(ValueError, match="tokenizer must be provided"):
+        train_on_responses_only(sft)
+
+
+def test_prepare_data_short_circuit_guards_preference_prebuilt_batches():
+    # Defense in depth: prebuilt SFT batches (_batches) must never be handed to
+    # the DPO/ORPO preference losses; the short-circuit must raise for those
+    # loss_types before returning them.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._prepare_data)
+    sc = src.index("if self._batches is not None:")
+    ret = src.index("return self._batches, None", sc)
+    guard = src[sc:ret]
+    assert 'loss_type", "sft") in ("orpo", "dpo")' in guard
+    assert "raise ValueError" in guard
+
+
 def test_grpo_rollout_guards_double_bos_on_chat_prompts(monkeypatch):
     # A chat template that already renders a leading BOS must be tokenized with
     # add_special_tokens=False on the GRPO rollout path (matching the SFT
