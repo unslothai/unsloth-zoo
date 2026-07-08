@@ -51,6 +51,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.lfm2_moe",
     "unsloth_zoo.temporary_patches.ministral",
     "unsloth_zoo.temporary_patches.misc",
+    "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_bnb",
     "unsloth_zoo.temporary_patches.moe_grouped_modulelist",
     "unsloth_zoo.temporary_patches.moe_utils",
