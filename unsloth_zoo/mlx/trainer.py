@@ -1503,9 +1503,7 @@ class MLXTrainer:
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
                     # distributed all-sum. mx.where never selects the NaN branch.
-                    all_losses += mx.where(
-                        ntoks > 0, loss * ntoks, mx.zeros_like(all_losses)
-                    )
+                    all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
                     mx.eval(all_losses, ntokens)
                 except Exception as exc:
