@@ -1500,7 +1500,10 @@ class MLXTrainer:
                     else:
                         batch, lengths, labels = batch_data
                         loss, ntoks = loss_fn(self.model, batch, lengths, labels)
-                    all_losses += loss * ntoks
+                    # Zero-token eval batches (distributed_pad_mode="empty" padding
+                    # rows) make loss NaN; mask them so NaN * 0 does not poison the
+                    # distributed all-sum. mx.where never selects the NaN branch.
+                    all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
                     mx.eval(all_losses, ntokens)
                 except Exception as exc:
