@@ -1361,6 +1361,90 @@ def test_mlx_train_result_reports_base_quantization():
     assert '"base_quantized_source"' in source
 
 
+def test_native_awq_adapter_base_reloads_as_native_prequant(monkeypatch):
+    # Reloading a LoRA adapter whose base is a natively-loaded (mlx-lm) AWQ
+    # checkpoint must preserve the packed AWQ base: reloading it dense
+    # (load_in_4bit=False) trips the prequant dense-dequant path and
+    # materializes it to fp16, so _validate_mlx_adapter_base rejects the reload.
+    from unsloth_zoo.mlx import loader as _loader
+
+    # macOS-only mlx-lm dist is absent under the torch shim; force the native
+    # prequant capability that gated the AWQ defer at train time.
+    monkeypatch.setattr(_loader, "_mlx_lm_supports_native_prequant", lambda: True)
+
+    native_awq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "awq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "mlx_config",
+    }
+    # requires_runtime False and no replayed MLX quant config -> the base would
+    # otherwise be reloaded dense; the fix re-requests the native 4-bit load.
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+
+    # GPTQ / runtime-quantized / bnb / dense bases must keep load_in_4bit=False
+    # (they replay a runtime MLX quant config or are genuinely dense).
+    gptq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "gptq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "runtime",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        gptq_cfg,
+        adapter_requires_runtime_quant=True,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    # A replayed runtime MLX quant config always takes the load_in_4bit=False path.
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    # bnb-4bit base (remapped to a non-bnb base + forced MLX 4-bit) is not AWQ-native.
+    assert _loader._adapter_base_prefers_native_prequant(
+        {"base_quantization_config": {"load_in_4bit": True}},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 64, "mode": "affine"},
+        adapter_base_is_bnb=True,
+    ) is False
+    # No base quantization metadata -> genuinely dense reload.
+    assert _loader._adapter_base_prefers_native_prequant(
+        {},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is False
+
+    # On an mlx-lm too old to load AWQ natively, a native-AWQ base cannot be
+    # reproduced, so do not force the native 4-bit reload.
+    monkeypatch.setattr(_loader, "_mlx_lm_supports_native_prequant", lambda: False)
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is False
+
+
+def test_native_awq_adapter_reload_wires_preserve_flag_into_base_load():
+    # The reload block must feed the preserve decision into the base reload's
+    # load_in_4bit rather than the old hardcoded False.
+    import inspect
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    source = inspect.getsource(FastMLXModel.from_pretrained)
+    assert "_adapter_base_prefers_native_prequant(" in source
+    assert "load_in_4bit=_reload_base_load_in_4bit," in source
+
+
 def test_mlx_loader_exposes_dense_nf4_diagnostic_mode():
     import mlx.core as mx
     from unsloth_zoo.mlx.loader import (

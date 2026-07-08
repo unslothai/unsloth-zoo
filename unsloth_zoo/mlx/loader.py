@@ -3507,6 +3507,44 @@ def _mlx_lm_would_reject_prequant(local_path, method, quant_config):
     return False
 
 
+def _adapter_base_prefers_native_prequant(
+    adapter_cfg,
+    *,
+    adapter_requires_runtime_quant,
+    adapter_mlx_quant_config,
+    adapter_base_is_bnb,
+):
+    """Should this adapter's base be reloaded as a native (mlx-lm) AWQ checkpoint?
+
+    A standard AWQ base is deferred to mlx-lm at train time (packed AWQ kept on
+    disk, quantized source "mlx_config", no runtime requantization), so the
+    adapter records it as an existing quantized base rather than a runtime one.
+    On reload the recursive base load is issued with ``load_in_4bit=False`` and
+    no replayed MLX quant config; for such an AWQ base that flips the prequant
+    guard into the dense-dequant path and materializes it to fp16, so the
+    reloaded base no longer matches the adapter's quantized modules and
+    ``_validate_mlx_adapter_base`` rejects the reload. Re-request the native
+    4-bit load instead so mlx-lm reloads the packed AWQ base unchanged.
+
+    Only AWQ qualifies: GPTQ (and any base an older mlx-lm could not load
+    natively) is dequantized then runtime-requantized at train time
+    (source "runtime"), so it is replayed through ``adapter_mlx_quant_config``
+    and must keep ``load_in_4bit=False``.
+    """
+    if adapter_requires_runtime_quant:
+        return False
+    if adapter_mlx_quant_config is not None:
+        return False
+    if adapter_base_is_bnb:
+        return False
+    base_quant_cfg = adapter_cfg.get("base_quantization_config")
+    if not isinstance(base_quant_cfg, dict):
+        return False
+    if str(base_quant_cfg.get("quant_method", "")).lower() != "awq":
+        return False
+    return _mlx_lm_supports_native_prequant()
+
+
 def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quant_config):
     """Dequantize a GPTQ/AWQ checkpoint to a temporary dense fp16 checkpoint.
 
@@ -5679,6 +5717,18 @@ class FastMLXModel:
                             "group_size": _MLX_QUANT_MODE_DEFAULTS["affine"][0],
                             "mode": "affine",
                         }
+                    # A native (mlx-lm) AWQ base is stored on disk as packed AWQ
+                    # with no runtime quant config to replay; reloading it with
+                    # load_in_4bit=False would trip the prequant dense-dequant
+                    # path and materialize it to fp16, so the adapter's quantized
+                    # base would no longer match. Re-request the native 4-bit load
+                    # so mlx-lm reloads the packed AWQ base unchanged.
+                    _reload_base_load_in_4bit = _adapter_base_prefers_native_prequant(
+                        adapter_cfg,
+                        adapter_requires_runtime_quant=adapter_requires_runtime_quant,
+                        adapter_mlx_quant_config=adapter_mlx_quant_config,
+                        adapter_base_is_bnb=_adapter_base_bnb is not None,
+                    )
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).
@@ -5686,7 +5736,7 @@ class FastMLXModel:
                         base_model_id,
                         max_seq_length=max_seq_length,
                         dtype=dtype,
-                        load_in_4bit=False,
+                        load_in_4bit=_reload_base_load_in_4bit,
                         load_in_8bit=False,
                         load_in_16bit=False,
                         load_in_fp8=False,
