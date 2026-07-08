@@ -32,6 +32,7 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_torch_shim():
+    pytest.importorskip("torch")
     from mlx_simulation import simulate_mlx_on_torch
 
     simulate_mlx_on_torch()
@@ -217,6 +218,272 @@ def test_bound_gguf_push_filters_kwargs(monkeypatch):
             "token": "hf_token",
             "private": True,
         },
+    }
+
+
+def test_text_generate_honors_do_sample_false(monkeypatch):
+    import mlx_lm
+    import mlx_lm.sample_utils as sample_utils
+    import torch
+    from transformers.tokenization_utils_base import to_py_obj
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = {}
+
+    class Tokenizer:
+        bos_token = None
+        eos_token_ids = {2}
+
+        def encode(self, prompt, add_special_tokens=True):
+            return [1, 2, 3]
+
+    def fake_make_sampler(**kwargs):
+        calls["sampler"] = kwargs
+        return "sampler"
+
+    def fake_stream_generate(_model, tokenizer, prompt, max_tokens=None, **kwargs):
+        calls["prompt"] = prompt
+        calls["max_tokens"] = max_tokens
+        calls["stream_sampler"] = kwargs["sampler"]
+        calls["eos_during_stream"] = set(tokenizer.eos_token_ids)
+        yield types.SimpleNamespace(token=9, finish_reason=None)
+        yield types.SimpleNamespace(token=5, finish_reason="stop")
+
+    monkeypatch.setattr(sample_utils, "make_sampler", fake_make_sampler)
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+
+    tokenizer = Tokenizer()
+    model = types.SimpleNamespace(_tokenizer=tokenizer, _is_vlm_model=False)
+    out = loader._mlx_generate(
+        model,
+        input_ids=[[0, 1, 2, 0]],
+        attention_mask=[[0, 1, 1, 0]],
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=32,
+        eos_token_id=5,
+        max_length=4,
+    )
+
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
+    assert out.tolist() == [[1, 2, 9, 5]]
+    assert out.shape == (1, 4)
+    assert out[:, 2:].tolist() == [[9, 5]]
+    assert to_py_obj(out) == [[1, 2, 9, 5]]
+    assert calls["sampler"] == {
+        "temp": 0.0,
+        "top_p": 0.0,
+        "min_p": 0.0,
+        "top_k": 0,
+    }
+    assert calls["prompt"] == [1, 2]
+    assert calls["max_tokens"] == 2
+    assert calls["stream_sampler"] == "sampler"
+    assert calls["eos_during_stream"] == {5}
+    assert tokenizer.eos_token_ids == {2}
+
+
+def test_mlx_generate_output_numpy_fallback_without_torch(monkeypatch):
+    import builtins
+    import numpy as np
+    import unsloth_zoo.mlx.loader as loader
+
+    # torch is installed here (the sim needs it), so force `import torch` to fail
+    # inside _mlx_generate_output to cover the numpy int64 fallback branch. Test
+    # both a missing torch (ImportError) and an installed-but-broken torch
+    # (OSError) -- the broadened except must degrade to numpy in both cases.
+    real_import = builtins.__import__
+
+    def failing_import(exc):
+        def _fake_import(name, *args, **kwargs):
+            if name == "torch":
+                raise exc
+            return real_import(name, *args, **kwargs)
+        return _fake_import
+
+    for exc in (ImportError("no torch"), OSError("broken torch native lib")):
+        monkeypatch.setattr(builtins, "__import__", failing_import(exc))
+        out = loader._mlx_generate_output([1, 2], [9, 5])
+        monkeypatch.undo()
+        assert isinstance(out, np.ndarray)
+        assert out.dtype == np.int64
+        assert out.shape == (1, 4)
+        assert out.tolist() == [[1, 2, 9, 5]]
+        assert out[:, 2:].tolist() == [[9, 5]]
+
+
+def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
+    import unsloth_zoo.mlx.loader as loader
+
+    class InnerTokenizer:
+        def __call__(self, *args, **kwargs):
+            return {"called": True}
+
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            if tokenize and kwargs.get("return_dict", False):
+                return {
+                    "input_ids": [1, 2, 3],
+                    "attention_mask": [1, 1, 1],
+                }
+            return [1, 2, 3] if tokenize else "rendered"
+
+    class TokenizerWrapper:
+        def __init__(self):
+            self._tokenizer = InnerTokenizer()
+
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            return [1, 2, 3] if tokenize else "rendered"
+
+    tokenizer = TokenizerWrapper()
+    loader._patch_mlx_tokenizer_call(tokenizer)
+
+    encoded = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "hi"}],
+        tokenize=True,
+        return_dict=True,
+    )
+
+    def expand_generate_inputs(**kwargs):
+        return kwargs
+
+    assert expand_generate_inputs(**encoded) == {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 1],
+    }
+    assert encoded.to("cpu")["input_ids"] == [1, 2, 3]
+    assert tokenizer.apply_chat_template([], tokenize=False, return_dict=True) == "rendered"
+    assert tokenizer("hi") == {"called": True}
+
+
+def test_vlm_generate_hf_kwargs(monkeypatch):
+    import torch
+    from transformers.tokenization_utils_base import to_py_obj
+    import unsloth_zoo.mlx.loader as loader
+
+    fake_mlx_vlm = types.ModuleType("mlx_vlm")
+    calls = []
+
+    def fake_stream_generate(_model, _processor, _prompt, max_tokens=None, **batch):
+        calls.append((max_tokens, batch))
+        return iter(())
+
+    fake_mlx_vlm.stream_generate = fake_stream_generate
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+
+    model = types.SimpleNamespace(
+        _tokenizer=types.SimpleNamespace(tokenizer=object()),
+        _is_vlm_model=True,
+        config=types.SimpleNamespace(eos_token_id=None),
+    )
+    out = loader._mlx_generate(
+        model,
+        input_ids=[1, 2],
+        attention_mask=[1, 1],
+        do_sample=False,
+        temperature=0.7,
+        top_p=0.9,
+        max_new_tokens=1,
+    )
+
+    assert isinstance(out, torch.Tensor)
+    assert out.dtype == torch.long
+    assert out.tolist() == [[1, 2]]
+    assert out.shape == (1, 2)
+    assert to_py_obj(out) == [[1, 2]]
+    assert calls[0][0] == 1
+    assert tuple(calls[0][1]["input_ids"].shape) == (1, 2)
+    assert tuple(calls[0][1]["mask"].shape) == (1, 2)
+    assert calls[0][1]["temperature"] == 0.0
+    assert "top_p" not in calls[0][1]
+
+
+def test_bound_save_pretrained_defaults_to_full_save_without_lora(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+
+    def fake_save_pretrained_merged(model, tokenizer, save_directory, **kwargs):
+        calls["tokenizer"] = tokenizer
+        calls["save_directory"] = Path(save_directory)
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(mutils, "collect_mlx_lora_adapter_tensors", lambda model: {})
+    monkeypatch.setattr(mutils, "save_pretrained_merged", fake_save_pretrained_merged)
+
+    tokenizer = object()
+    model = types.SimpleNamespace(_tokenizer=tokenizer)
+    loader._mlx_save_pretrained_merged(
+        model,
+        tmp_path,
+        safe_serialization=True,
+        save_peft_format=True,
+        save_embedding_layers="auto",
+        path_initial_model_for_weight_conversion="/tmp/base",
+        token="hf_token",
+    )
+
+    assert calls == {
+        "tokenizer": tokenizer,
+        "save_directory": tmp_path,
+        "kwargs": {"save_method": "merged_16bit", "token": "hf_token"},
+    }
+
+
+def test_adapter_bnb_base_remap_defaults_to_mlx_4bit_quantization(
+    monkeypatch,
+    tmp_path,
+):
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": "unsloth/tinyllama-bnb-4bit",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {}
+    original_from_pretrained = loader.FastMLXModel.from_pretrained
+
+    class StopAdapterLoad(RuntimeError):
+        pass
+
+    def fake_download(model_name, revision=None):
+        assert model_name == str(adapter_dir)
+        return adapter_dir
+
+    def fake_recursive_from_pretrained(model_name, **kwargs):
+        calls["model_name"] = model_name
+        calls["kwargs"] = kwargs
+        raise StopAdapterLoad("Unsloth: stop after recursive adapter base load")
+
+    monkeypatch.setattr(mlx_lm_utils, "_download", fake_download)
+    monkeypatch.setattr(
+        loader.FastMLXModel,
+        "from_pretrained",
+        staticmethod(fake_recursive_from_pretrained),
+    )
+
+    with pytest.raises(StopAdapterLoad):
+        original_from_pretrained(str(adapter_dir))
+
+    assert calls["model_name"] == "unsloth/tinyllama"
+    assert calls["kwargs"]["load_in_4bit"] is False
+    assert calls["kwargs"]["mlx_quantization_config"] == {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
     }
 
 

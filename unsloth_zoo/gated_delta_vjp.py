@@ -252,86 +252,139 @@ def gated_delta_ops_efficient(
     return y, s
 
 
+_WARNED_FOREIGN_GATED_DELTA: set[str] = set()
+
+
 def patch_gated_delta():
-    """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP."""
+    """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP.
+
+    Consumers (mlx_lm qwen3_5 / qwen3_next / kimi_linear, mlx_vlm qwen3_5)
+    bind ``gated_delta_update`` via ``from .gated_delta import ...`` at import
+    time, so rebinding the source module alone never reaches their call sites.
+    After patching the source, sweep already-imported consumer modules and
+    rebind any stale reference to the original function.
+    """
+    import sys
     from mlx_lm.models import gated_delta
 
-    if getattr(gated_delta, "_unsloth_gated_delta_patched", False):
+    if not getattr(gated_delta, "_unsloth_gated_delta_patched", False):
+        original_gated_delta_update = gated_delta.gated_delta_update
+
+        def patched_gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias,
+            state=None, mask=None, use_kernel=True,
+        ):
+            # state=None marks a training call (no cache); route it through
+            # the custom VJP, since gated_delta_kernel has none.
+            is_training_call = state is None
+            beta = mx.sigmoid(b)
+            g = gated_delta.compute_g(A_log, a, dt_bias)
+            if state is None:
+                B, _, Hk, Dk = q.shape
+                Hv, Dv = v.shape[-2:]
+                state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+            # Training: prefer the fused-kernel VJP, ops VJP otherwise.
+            if is_training_call:
+                if gated_delta_kernel_supported(q, g, mask, v):
+                    return gated_delta_kernel_efficient(
+                        q, k, v, g, beta, state, mask,
+                    )
+                return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+            # Cached state: prefer the kernel for speed, else efficient ops.
+            if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+                return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+            return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
+
+        gated_delta._unsloth_gated_delta_original = original_gated_delta_update
+        gated_delta.gated_delta_update = patched_gated_delta_update
+        gated_delta._unsloth_gated_delta_patched = True
+        print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+
+    # Sweep every call: a consumer imported after a prior patch is still stale.
+    original = getattr(gated_delta, "_unsloth_gated_delta_original", None)
+    if original is None:
+        # Older patch set the flag without recording the original; nothing to match.
         return
-
-    def patched_gated_delta_update(
-        q, k, v, a, b, A_log, dt_bias,
-        state=None, mask=None, use_kernel=True,
-    ):
-        # Heuristic: training calls enter with state=None (no cache); inference
-        # passes the cached state in. Route training through the efficient ops
-        # so the custom VJP runs — gated_delta_kernel has none, so it would keep
-        # all T intermediate states alive and defeat this module.
-        is_training_call = state is None
-        beta = mx.sigmoid(b)
-        g = gated_delta.compute_g(A_log, a, dt_bias)
-        if state is None:
-            B, _, Hk, Dk = q.shape
-            Hv, Dv = v.shape[-2:]
-            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-
-        # No incoming state cache: use the memory-efficient ops path.
-        if is_training_call:
-            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
-
-        # Cached state: prefer the kernel for speed, else efficient ops.
-        if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-            return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
-        return gated_delta.gated_delta_kernel(q, k, v, g, beta, state, mask)
-
-    gated_delta.gated_delta_update = patched_gated_delta_update
-    gated_delta._unsloth_gated_delta_patched = True
-    print("Unsloth: Patched GatedDeltaNet with memory-efficient custom VJP.")
+    patched = gated_delta.gated_delta_update
+    rebound = []
+    foreign = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith(("mlx_lm.models", "mlx_vlm.models")):
+            continue
+        binding = getattr(module, "gated_delta_update", None)
+        if binding is None or binding is patched:
+            continue
+        if "patch_gated_delta" in getattr(binding, "__qualname__", ""):
+            # Owned by a sibling unsloth patch (patch_gated_delta_vlm); not foreign.
+            continue
+        if binding is original:
+            # Stale from-import of the function we replaced; rebind it. Anything
+            # else is a foreign implementation (e.g. mlx-vlm >= 0.6's own module).
+            module.gated_delta_update = patched
+            rebound.append(name)
+        else:
+            foreign.append(name)
+    if rebound:
+        print(f"Unsloth: Rebound gated_delta_update in {', '.join(sorted(rebound))}.")
+    new_foreign = [name for name in foreign if name not in _WARNED_FOREIGN_GATED_DELTA]
+    if new_foreign:
+        _WARNED_FOREIGN_GATED_DELTA.update(new_foreign)
+        print(
+            "Unsloth: WARNING — unrecognized gated_delta_update in "
+            f"{', '.join(sorted(new_foreign))}; those modules will train without "
+            "the memory-efficient VJP (slow, and long sequences may exhaust "
+            "Metal resources)."
+        )
 
 
 def patch_gated_delta_vlm():
-    """Patch mlx_vlm's qwen3_5 gated_delta_update the same way.
+    """Patch mlx_vlm >= 0.6's own qwen3_5 gated_delta_update.
 
-    mlx_vlm >= 0.6 ships its own copy that calls the non-differentiable
-    gated_delta_kernel directly, so patch_gated_delta() never intercepts
-    it; language.py also from-imports it, so patch both namespaces.
-    Older mlx_vlm (0.4.4 - 0.5.x) has no qwen3_5/gated_delta.py and
-    instead from-imports mlx_lm's gated_delta_update into language.py,
-    a by-value copy that patch_gated_delta() cannot rebind either.
+    That module ships its own copy of the function (calling the
+    non-differentiable gated_delta_kernel directly), so it is a distinct
+    object that patch_gated_delta()'s identity sweep deliberately leaves
+    alone. Patch it with the same training dispatch (fused-kernel VJP,
+    ops fallback) in both namespaces that hold a reference. Older
+    mlx_vlm (0.4.x - 0.5.x) from-imports mlx_lm's function instead;
+    the sweep in patch_gated_delta() already rebinds those.
     """
-    try:
-        from mlx_lm.models import gated_delta
-        from mlx_vlm.models.qwen3_5 import language as vlm_language
-    except ImportError:
-        return
-
     try:
         from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
     except ImportError:
-        # Old layout: re-route language.py's stale by-value copy through the
-        # mlx_lm module attribute, which patch_gated_delta() keeps patched.
-        if getattr(vlm_language, "_unsloth_gated_delta_patched", False):
+        try:
+            from mlx_vlm.models.qwen3_5 import language as vlm_language
+        except ImportError:
             return
-
-        def forwarded_gated_delta_update(*args, **kwargs):
-            return gated_delta.gated_delta_update(*args, **kwargs)
-
-        vlm_language.gated_delta_update = forwarded_gated_delta_update
-        vlm_language._unsloth_gated_delta_patched = True
-        print("Unsloth: Patched mlx-vlm GatedDeltaNet (legacy mlx_lm import) with memory-efficient custom VJP.")
+        patch_gated_delta()
+        from mlx_lm.models import gated_delta
+        if (
+            getattr(vlm_language, "gated_delta_update", None)
+            is not gated_delta.gated_delta_update
+        ):
+            vlm_language.gated_delta_update = gated_delta.gated_delta_update
+            print(
+                "Unsloth: Rebound legacy mlx-vlm GatedDeltaNet to mlx-lm "
+                "patched VJP."
+            )
         return
+    try:
+        from mlx_vlm.models.qwen3_5 import language as vlm_language
+    except ImportError:
+        vlm_language = None
+    from mlx_lm.models import gated_delta
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
         return
 
     original_update = vlm_gated_delta.gated_delta_update
 
-    def patched_gated_delta_update(
+    def patched_vlm_gated_delta_update(
         q, k, v, a, b, A_log, dt_bias,
         state=None, mask=None, use_kernel=True,
     ):
-        # state=None means a training call; route it through the
-        # differentiable VJP. Inference (state provided) keeps the kernel.
+        # state=None is training (use the VJP); inference keeps the kernel.
         if state is not None:
             return original_update(
                 q, k, v, a, b, A_log, dt_bias,
@@ -342,9 +395,446 @@ def patch_gated_delta_vlm():
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        if gated_delta_kernel_supported(q, g, mask, v):
+            return gated_delta_kernel_efficient(q, k, v, g, beta, state, mask)
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
-    vlm_gated_delta.gated_delta_update = patched_gated_delta_update
-    vlm_language.gated_delta_update = patched_gated_delta_update
+    vlm_gated_delta.gated_delta_update = patched_vlm_gated_delta_update
+    if vlm_language is not None:
+        vlm_language.gated_delta_update = patched_vlm_gated_delta_update
     vlm_gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
+
+
+# --------------------------------------------------------------------------
+# Fused Metal kernels for the training backward pass.
+#
+# The ops VJP above is memory-correct but dispatch-bound (~T*12 lazy
+# primitives per layer per step, unfusable by mx.compile). These kernels work
+# at chunk granularity: forward reuses mlx-lm's gated_delta_kernel per chunk;
+# backward replays chunk states (K1) and reverse-scans with atomic grad
+# accumulation (K2). Eligible on Metal GPU, mask=None, Dk % 32 == 0, for both
+# scalar (qwen3_5/qwen3_next) and vectorized (kimi_linear) gating; else falls
+# back to the ops VJP. Atomic accumulation leaves low-order gradient bits
+# nondeterministic, as elsewhere on Metal.
+#
+# Must stay BELOW patch_gated_delta: the pinned-symbol suite (commit 46866ce)
+# asserts the patched training branch precedes the first `gated_delta_kernel(`
+# here. patch_gated_delta resolves these names at call time, so definition
+# order is semantically irrelevant.
+# --------------------------------------------------------------------------
+
+_KERNEL_CHUNK_SIZE = 64
+_KERNEL_THREADGROUP_X = 32
+_KERNEL_THREADGROUP_Y = 4
+
+
+def _make_gd_chunk_states_kernel(vectorized=False):
+    """K1: replay the chunk forward, storing every post-step state.
+
+    Thread layout mirrors mlx-lm's gated_delta_step kernel: grid z = B*Hv,
+    grid y = Dv (one state row per simdgroup), 32 lanes each owning
+    Dk/32 contiguous state columns held in registers. `vectorized` selects
+    per-column gating (g: [B, T, Hv, Dk], kimi_linear) over per-head
+    scalar gating (g: [B, T, Hv]).
+    """
+    if not mx.metal.is_available():
+        return None
+    if vectorized:
+        g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
+        g_decay = "g_[s_idx]"
+        g_advance = "g_ += Hv * Dk;"
+    else:
+        g_setup = "auto g_ = g + b_idx * T * Hv;"
+        g_decay = "g_[hv_idx]"
+        g_advance = "g_ += Hv;"
+    source = f"""
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        constexpr int n_per_t = Dk / 32;
+
+        // q unused in the state replay; k: [B, T, Hv, Dk] (post GQA-repeat)
+        auto k_ = k + b_idx * T * Hv * Dk + hv_idx * Dk;
+        // v: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        // states: [B, Hv, T, Dv, Dk] -- post-update state for each step
+        auto states_ = states + ((n * T) * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }}
+
+        {g_setup}
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {{
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {{
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * {g_decay};
+            kv_mem += state[i] * k_[s_idx];
+          }}
+          kv_mem = simd_sum(kv_mem);
+
+          auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
+              * static_cast<float>(beta_[hv_idx]);
+
+          for (int i = 0; i < n_per_t; ++i) {{
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+            states_[s_idx] = state[i];
+          }}
+
+          k_ += Hv * Dk;
+          v_ += Hv * Dv;
+          {g_advance}
+          beta_ += Hv;
+          states_ += Dv * Dk;
+        }}
+    """
+    suffix = "_vec" if vectorized else ""
+    return mx.fast.metal_kernel(
+        name=f"unsloth_gd_chunk_states{suffix}",
+        input_names=["k", "v", "g", "beta", "state_in", "T"],
+        output_names=["states"],
+        source=source,
+    )
+
+
+def _make_gd_chunk_backward_kernel(vectorized=False):
+    """K2: reverse-time scan over one chunk, accumulating input gradients.
+
+    Same thread layout as K1. The per-row d_state slice lives in registers;
+    cross-row reductions (d_q, d_k, d_g, d_beta) go through atomic float
+    adds into zero-initialized outputs. With vectorized gating d_g is
+    per-column ([B, T, Hv, Dk]) and needs no simdgroup reduction.
+    """
+    if not mx.metal.is_available():
+        return None
+    if vectorized:
+        g_setup = "auto g_ = g + ((b_idx * T + (T - 1)) * Hv + hv_idx) * Dk;"
+        d_g_setup = "auto d_g_ = d_g + ((b_idx * T + (T - 1)) * Hv + hv_idx) * Dk;"
+        g_step_decl = "float gcol[n_per_t];"
+        g_load = "gcol[i] = static_cast<float>(g_[s_idx]);"
+        g_col = "gcol[i]"
+        d_g_accum = """atomic_fetch_add_explicit(&d_g_[s_idx], d_sd * s_prev[i],
+                                      memory_order_relaxed);"""
+        d_g_finalize = ""
+        g_retreat = "g_ -= Hv * Dk;"
+        d_g_retreat = "d_g_ -= Hv * Dk;"
+    else:
+        g_setup = "auto g_ = g + (b_idx * T + (T - 1)) * Hv;"
+        d_g_setup = "auto d_g_ = d_g + (b_idx * T + (T - 1)) * Hv;"
+        g_step_decl = "float g_t = 0.0f;"
+        g_load = "g_t = static_cast<float>(g_[hv_idx]);"
+        g_col = "g_t"
+        d_g_accum = "d_g_partial += d_sd * s_prev[i];"
+        d_g_finalize = """d_g_partial = simd_sum(d_g_partial);
+          if (thread_index_in_simdgroup == 0) {
+            atomic_fetch_add_explicit(&d_g_[hv_idx], d_g_partial,
+                                      memory_order_relaxed);
+          }"""
+        g_retreat = "g_ -= Hv;"
+        d_g_retreat = "d_g_ -= Hv;"
+    source = f"""
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        constexpr int n_per_t = Dk / 32;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // Start every per-timestep pointer at t = T-1.
+        auto q_ = q + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto k_ = k + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto v_ = v + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+        {g_setup}
+        auto beta_ = beta + (b_idx * T + (T - 1)) * Hv;
+        auto dy_ = dy + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+
+        auto d_q_ = d_q + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto d_k_ = d_k + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+        auto d_v_ = d_v + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+        {d_g_setup}
+        auto d_beta_ = d_beta + (b_idx * T + (T - 1)) * Hv;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto states_ = states + ((n * T) * Dv + dv_idx) * Dk;
+        auto d_state_out_ = d_state_out + (n * Dv + dv_idx) * Dk;
+        auto d_state_in_ = d_state_in + (n * Dv + dv_idx) * Dk;
+
+        // d_state: cotangent w.r.t. the state RETURNED by step t.
+        float d_state[n_per_t];
+        float s_prev[n_per_t];
+        float s_cur[n_per_t];
+        // Reduce threadgroup-local Dv rows before the global d_q/d_k atomics.
+        threadgroup float tg_dq[TG_ROWS * 32];
+        threadgroup float tg_dk[TG_ROWS * 32];
+        {g_step_decl}
+        auto tg_y = thread_position_in_threadgroup.y;
+        auto tg_lane = thread_index_in_simdgroup;
+        auto tg_idx = tg_y * 32 + tg_lane;
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          d_state[i] = static_cast<float>(d_state_out_[s_idx]);
+        }}
+
+        for (int t = T - 1; t >= 0; --t) {{
+          auto cur_row = states_ + t * Dv * Dk;
+          float beta_t = static_cast<float>(beta_[hv_idx]);
+          float v_t = static_cast<float>(v_[dv_idx]);
+          float dy_t = static_cast<float>(dy_[dv_idx]);
+
+          // Recompute Sd = S_prev * g, kv, delta from the stored states.
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {{
+            auto s_idx = n_per_t * dk_idx + i;
+            {g_load}
+            if (t > 0) {{
+              auto prev_row = states_ + (t - 1) * Dv * Dk;
+              s_prev[i] = static_cast<float>(prev_row[s_idx]);
+            }} else {{
+              s_prev[i] = static_cast<float>(i_state[s_idx]);
+            }}
+            s_cur[i] = cur_row[s_idx];
+            kv_mem += s_prev[i] * {g_col} * static_cast<float>(k_[s_idx]);
+          }}
+          kv_mem = simd_sum(kv_mem);
+          float delta = (v_t - kv_mem) * beta_t;
+
+          // y = (S_t * q).sum(-1): dy contributes to d_state and d_q.
+          float d_delta_partial = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {{
+            auto s_idx = n_per_t * dk_idx + i;
+            float k_c = static_cast<float>(k_[s_idx]);
+            float q_c = static_cast<float>(q_[s_idx]);
+            float dS_tot = d_state[i] + dy_t * q_c;
+
+            tg_dq[tg_idx] = dy_t * s_cur[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tg_y == 0) {{
+              float d_q_group = 0.0f;
+              for (int yy = 0; yy < TG_ROWS; ++yy) {{
+                d_q_group += tg_dq[yy * 32 + tg_lane];
+              }}
+              atomic_fetch_add_explicit(&d_q_[s_idx], d_q_group,
+                                        memory_order_relaxed);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            d_delta_partial += dS_tot * k_c;
+            // Stash dS_tot for the second pass below.
+            s_cur[i] = dS_tot;
+          }}
+          float d_delta = simd_sum(d_delta_partial);
+
+          float d_kv = -d_delta * beta_t;
+          float d_g_partial = 0.0f;
+          (void)d_g_partial;
+          for (int i = 0; i < n_per_t; ++i) {{
+            auto s_idx = n_per_t * dk_idx + i;
+            float k_c = static_cast<float>(k_[s_idx]);
+            float dS_tot = s_cur[i];
+            float sd = s_prev[i] * {g_col};
+            float d_sd = dS_tot + d_kv * k_c;
+
+            tg_dk[tg_idx] = dS_tot * delta + d_kv * sd;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tg_y == 0) {{
+              float d_k_group = 0.0f;
+              for (int yy = 0; yy < TG_ROWS; ++yy) {{
+                d_k_group += tg_dk[yy * 32 + tg_lane];
+              }}
+              atomic_fetch_add_explicit(&d_k_[s_idx], d_k_group,
+                                        memory_order_relaxed);
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            {d_g_accum}
+            d_state[i] = d_sd * {g_col};
+          }}
+          {d_g_finalize}
+
+          if (thread_index_in_simdgroup == 0) {{
+            atomic_fetch_add_explicit(&d_v_[dv_idx], d_delta * beta_t,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&d_beta_[hv_idx],
+                                      d_delta * (v_t - kv_mem),
+                                      memory_order_relaxed);
+          }}
+
+          if (t > 0) {{
+            q_ -= Hv * Dk;
+            k_ -= Hv * Dk;
+            v_ -= Hv * Dv;
+            {g_retreat}
+            beta_ -= Hv;
+            dy_ -= Hv * Dv;
+            d_q_ -= Hv * Dk;
+            d_k_ -= Hv * Dk;
+            d_v_ -= Hv * Dv;
+            {d_g_retreat}
+            d_beta_ -= Hv;
+          }}
+        }}
+
+        for (int i = 0; i < n_per_t; ++i) {{
+          auto s_idx = n_per_t * dk_idx + i;
+          atomic_fetch_add_explicit(&d_state_in_[s_idx], d_state[i],
+                                    memory_order_relaxed);
+        }}
+    """
+    suffix = "_vec" if vectorized else ""
+    return mx.fast.metal_kernel(
+        name=f"unsloth_gd_chunk_backward{suffix}",
+        input_names=[
+            "q", "k", "v", "g", "beta", "state_in", "states",
+            "dy", "d_state_out", "T",
+        ],
+        output_names=["d_q", "d_k", "d_v", "d_g", "d_beta", "d_state_in"],
+        source=source,
+        atomic_outputs=True,
+    )
+
+
+_GD_KERNELS: dict = {}
+
+
+def _get_kernels(vectorized=False):
+    if vectorized not in _GD_KERNELS:
+        _GD_KERNELS[vectorized] = (
+            _make_gd_chunk_states_kernel(vectorized=vectorized),
+            _make_gd_chunk_backward_kernel(vectorized=vectorized),
+        )
+    return _GD_KERNELS[vectorized]
+
+
+def gated_delta_kernel_supported(q, g, mask, v=None) -> bool:
+    """Whether the fused-kernel VJP path can handle this call.
+
+    Dv must divide evenly into threadgroup rows: the backward kernel's
+    shared-memory pre-reduction reads every row slot in a threadgroup, and
+    a partial trailing group would read uninitialized slots.
+    """
+    return (
+        mask is None
+        and g.ndim in (3, 4)
+        and q.shape[-1] % 32 == 0
+        and (v is None or v.shape[-1] % _KERNEL_THREADGROUP_Y == 0)
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    )
+
+
+def gated_delta_kernel_efficient(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    """Chunked GDN forward+backward with fused Metal kernels.
+
+    Same contract as gated_delta_ops_efficient, restricted to the
+    kernel-eligible case (see gated_delta_kernel_supported).
+    """
+    if not gated_delta_kernel_supported(q, g, mask, v):
+        raise ValueError(
+            "gated_delta_kernel_efficient called outside kernel support "
+            "(requires a Metal GPU, mask=None, Dk % 32 == 0, and Dv divisible "
+            "by the threadgroup rows); use gated_delta_ops_efficient instead."
+        )
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[-2:]
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    if (repeat_factor := Hv // Hk) > 1:
+        # Repeat outside custom_function so autodiff folds the per-group
+        # gradient sum back to [B, T, Hk, Dk].
+        q = mx.repeat(q, repeat_factor, -2)
+        k = mx.repeat(k, repeat_factor, -2)
+
+    vectorized = g.ndim == 4
+    states_kernel, backward_kernel = _get_kernels(vectorized=vectorized)
+    d_g_shape = (lambda b, t: (b, t, Hv, Dk)) if vectorized else (lambda b, t: (b, t, Hv))
+
+    @mx.custom_function
+    def _chunk(q_c, k_c, v_c, g_c, beta_c, state_in):
+        return gated_delta_kernel(q_c, k_c, v_c, g_c, beta_c, state_in)
+
+    @_chunk.vjp
+    def _chunk_vjp(primals, cotangents, outputs):
+        q_c, k_c, v_c, g_c, beta_c, state_in = primals
+        dy, d_state_out = cotangents
+        Bc, Tc = q_c.shape[:2]
+
+        (states,) = states_kernel(
+            inputs=[k_c, v_c, g_c, beta_c, state_in, Tc],
+            template=[("Dk", Dk), ("Dv", Dv), ("Hv", Hv)],
+            grid=(32, Dv, Bc * Hv),
+            threadgroup=(_KERNEL_THREADGROUP_X, _KERNEL_THREADGROUP_Y, 1),
+            output_shapes=[(Bc, Hv, Tc, Dv, Dk)],
+            output_dtypes=[mx.float32],
+        )
+        d_q, d_k, d_v, d_g, d_beta, d_state_in = backward_kernel(
+            inputs=[
+                q_c, k_c, v_c, g_c, beta_c, state_in, states,
+                dy, d_state_out, Tc,
+            ],
+            template=[
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hv", Hv),
+                ("TG_ROWS", _KERNEL_THREADGROUP_Y),
+            ],
+            grid=(32, Dv, Bc * Hv),
+            threadgroup=(_KERNEL_THREADGROUP_X, _KERNEL_THREADGROUP_Y, 1),
+            output_shapes=[
+                (Bc, Tc, Hv, Dk),
+                (Bc, Tc, Hv, Dk),
+                (Bc, Tc, Hv, Dv),
+                d_g_shape(Bc, Tc),
+                (Bc, Tc, Hv),
+                (Bc, Hv, Dv, Dk),
+            ],
+            output_dtypes=[mx.float32] * 6,
+            init_value=0,
+        )
+        return (
+            d_q.astype(q_c.dtype),
+            d_k.astype(k_c.dtype),
+            d_v.astype(v_c.dtype),
+            d_g.astype(g_c.dtype),
+            d_beta.astype(beta_c.dtype),
+            d_state_in.astype(state_in.dtype),
+        )
+
+    all_ys = []
+    s = state
+    for t_start in range(0, T, _KERNEL_CHUNK_SIZE):
+        t_end = min(t_start + _KERNEL_CHUNK_SIZE, T)
+        chunk_y, s = _chunk(
+            q[:, t_start:t_end],
+            k[:, t_start:t_end],
+            v[:, t_start:t_end],
+            g[:, t_start:t_end],
+            beta[:, t_start:t_end],
+            s,
+        )
+        all_ys.append(chunk_y)
+
+    y = mx.concatenate(all_ys, axis=1) if len(all_ys) > 1 else all_ys[0]
+    return y, s
