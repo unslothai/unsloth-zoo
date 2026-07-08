@@ -3410,6 +3410,7 @@ class MLXTrainer:
                 batch_size=args.per_device_train_batch_size,
                 max_seq_length=args.max_seq_length,
                 num_batches=total_batches_needed,
+                seed=getattr(args, "seed", 42),
             )
             return batches, None
 
@@ -3820,8 +3821,19 @@ class MLXGRPOTrainer(MLXTrainer):
     def _grpo_rollout_generator(self):
         """Infinite generator: each next() does generate->reward->advantage
         and yields (batch, lengths, advantages). Runs uncompiled."""
+        import inspect as _inspect
         from mlx_lm import batch_generate
         from mlx_lm.sample_utils import make_sampler
+        # Newer mlx-lm (>= the return_token_ids addition) surfaces the exact
+        # generated token IDs from batch_generate. Prefer them for scoring so the
+        # GRPO loss/KL run on the sequence the policy actually sampled, rather
+        # than on a decode->re-encode roundtrip of the completion text (which is
+        # not identity: byte-fallback/cleanup tokens and prompt/completion
+        # boundary merges can yield different IDs). Fall back to re-encoding on
+        # older mlx-lm that lacks the flag.
+        _supports_token_ids = (
+            "return_token_ids" in _inspect.signature(batch_generate).parameters
+        )
         args = self.args
         hf = _hf_encoding_tokenizer(self.tokenizer)
         pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
@@ -3873,23 +3885,33 @@ class MLXGRPOTrainer(MLXTrainer):
             was_training = self.model.training
             self.model.eval()
             try:
+                _gen_kwargs = dict(
+                    max_tokens=args.max_completion_length,
+                    sampler=sampler, verbose=False,
+                )
+                if _supports_token_ids:
+                    _gen_kwargs["return_token_ids"] = True
                 resp = batch_generate(
                     self.model, self.tokenizer, prompts=[pids] * N,
-                    max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
+                    **_gen_kwargs,
                 )
             finally:
                 if was_training:
                     self.model.train()
             comps = resp.texts
+            # Exact generated IDs per completion (see _supports_token_ids note);
+            # None when unavailable, in which case rows fall back to re-encoding.
+            comp_ids = getattr(resp, "token_ids", None) if _supports_token_ids else None
             # rewards: sum across reward functions (TRL-style). Pass through the
             # dataset row's other columns as kwargs (repeated per generation to
             # align row-for-row with completions), mirroring
             # GRPOTrainer._calculate_rewards. 'prompt'/'completion'/
             # 'completion_ids' are excluded exactly as TRL does. completion_ids
-            # and trainer_state are not yet available on the MLX path (mlx_lm
-            # batch_generate does not surface generated token IDs, and there is
-            # no transformers TrainerState here) and are left as follow-up
-            # rather than faked.
+            # are not passed to reward functions (and trainer_state is not
+            # available: there is no transformers TrainerState here), so they are
+            # left as follow-up rather than faked. Note the scoring path above
+            # does consume the generated ids (comp_ids) when mlx-lm surfaces
+            # them, so the loss runs on the sampled tokens.
             reward_kwargs = {
                 k: [example[k]] * N
                 for k in example
@@ -3923,12 +3945,20 @@ class MLXGRPOTrainer(MLXTrainer):
             # build the concatenated group batch
             pe = len(pids)
             rows, lengths = [], []
-            for c in comps:
-                # Guard the prompt+completion tokenization against the same
-                # double BOS as the prompt above, and with the SAME guard so
-                # the response boundary pe (from the guarded prompt encode)
-                # stays a true prefix length of this full sequence.
-                full = encode_mlx_text(hf, rendered + c)[: args.max_seq_length]
+            for i, c in enumerate(comps):
+                if comp_ids is not None and comp_ids[i] is not None:
+                    # Score the EXACT generated continuation: prompt ids followed
+                    # by the sampled completion ids. This makes pe a true prefix
+                    # length by construction and avoids the decode->re-encode
+                    # roundtrip corrupting the tokens the policy generated.
+                    full = (pids + [int(t) for t in comp_ids[i]])[: args.max_seq_length]
+                else:
+                    # Fallback (older mlx-lm without generated-id surfacing):
+                    # guard the prompt+completion tokenization against the same
+                    # double BOS as the prompt above, and with the SAME guard so
+                    # the response boundary pe (from the guarded prompt encode)
+                    # stays a true prefix length of this full sequence.
+                    full = encode_mlx_text(hf, rendered + c)[: args.max_seq_length]
                 rows.append(full)
                 lengths.append([pe, len(full)])
             L = max(len(r) for r in rows)

@@ -1481,6 +1481,198 @@ def test_grpo_loss_returns_rollout_row_count_not_token_count(monkeypatch):
     assert int(weight) == batch.shape[0] == 2
 
 
+# ---------------------------------------------------------------------------
+# PR #832 round-7 review fixes: ORPO/DPO gradient-accumulation weight must be
+# the PAIR count (not the response-token count), the GRPO rollout must score the
+# generated token IDs (not a decode->re-encode roundtrip), and preference
+# truncation under max_steps must not keep only the shortest pairs.
+# ---------------------------------------------------------------------------
+
+def _ce_none_monkeypatch(monkeypatch):
+    """Force MLX's per-token cross_entropy reduction under the torch shim."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    _orig_ce = nn.losses.cross_entropy
+
+    def _ce_none(logits, targets, **kw):
+        out = _orig_ce(logits, targets, **{**kw, "reduction": "none"})
+        return out.reshape(*targets.shape)
+
+    monkeypatch.setattr(nn.losses, "cross_entropy", _ce_none)
+    _orig_max = mx.maximum
+    monkeypatch.setattr(
+        mx, "maximum",
+        lambda a, b, **kw: _orig_max(
+            a, mx.array(b) if isinstance(b, (int, float)) else b, **kw
+        ),
+    )
+    # The torch shim does not implement nn.log_sigmoid (no existing MLX test
+    # exercises it); route it to torch for the preference losses under test.
+    monkeypatch.setattr(
+        nn, "log_sigmoid",
+        lambda x: torch.nn.functional.logsigmoid(x),
+        raising=False,
+    )
+
+
+def test_orpo_loss_returns_pair_count_not_token_count(monkeypatch):
+    # The ORPO loss reduces as a token-mean SFT term plus a pair-mean odds-ratio
+    # term. The trainer weights each accumulated micro-batch gradient by this
+    # returned count, so it must be the number of preference PAIRS; returning the
+    # response-token total would let micro-batches with longer chosen/rejected
+    # responses dominate under gradient_accumulation_steps > 1.
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import make_orpo_loss_fn
+
+    _ce_none_monkeypatch(monkeypatch)
+    V = 5
+    # 2 pairs -> 4 rows [chosen0, chosen1, rejected0, rejected1] with DIFFERENT
+    # response lengths so the pair count (2) and the token total are distinct.
+    batch = mx.array(
+        [
+            [1, 2, 3, 4, 0, 0],
+            [1, 2, 3, 4, 4, 4],
+            [1, 2, 3, 0, 0, 0],
+            [1, 2, 3, 4, 4, 0],
+        ],
+        dtype=mx.int32,
+    )
+    lengths = mx.array([[1, 4], [1, 6], [1, 3], [1, 5]], dtype=mx.int32)
+
+    def model(inp):
+        return mx.zeros((inp.shape[0], inp.shape[1], V))
+
+    loss_fn = make_orpo_loss_fn(beta=0.1)
+    _loss, weight = loss_fn(model, batch, lengths, None)
+    assert int(weight) == batch.shape[0] // 2 == 2
+
+
+def test_dpo_loss_returns_pair_count_not_token_count(monkeypatch):
+    # DPO loss is a mean over preference pairs, so the accumulate-then-normalize
+    # weight must be the pair count, not the response-token total.
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import make_dpo_loss_fn
+
+    _ce_none_monkeypatch(monkeypatch)
+    V = 5
+    batch = mx.array(
+        [
+            [1, 2, 3, 4, 0, 0],
+            [1, 2, 3, 4, 4, 4],
+            [1, 2, 3, 0, 0, 0],
+            [1, 2, 3, 4, 4, 0],
+        ],
+        dtype=mx.int32,
+    )
+    lengths = mx.array([[1, 4], [1, 6], [1, 3], [1, 5]], dtype=mx.int32)
+
+    def model(inp):
+        return mx.zeros((inp.shape[0], inp.shape[1], V))
+
+    loss_fn = make_dpo_loss_fn(beta=0.1, reference_free=True)
+    _loss, weight = loss_fn(model, batch, lengths, None)
+    assert int(weight) == batch.shape[0] // 2 == 2
+
+
+def test_grpo_rollout_scores_generated_token_ids_not_reencoded_text(monkeypatch):
+    # When mlx-lm surfaces the generated token IDs, the rollout must score those
+    # exact ids (prompt ids + sampled completion ids), not a decode->re-encode
+    # roundtrip of the completion text. Here the decoded text 'gen' re-encodes to
+    # [1, 2, 3], distinct from the sampled ids, so building rows from the ids
+    # proves the roundtrip is bypassed and the loss runs on the sampled tokens.
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["gen", "gen"],
+    )
+
+    def _fake_generate(model, tokenizer, prompts=None, max_tokens=None,
+                       sampler=None, verbose=False, return_token_ids=False):
+        # The trainer detects support via this explicit parameter and must
+        # request the ids.
+        assert return_token_ids is True
+        return types.SimpleNamespace(
+            texts=["gen", "gen"], token_ids=[[7, 8, 9, 9], [7, 8]]
+        )
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _fake_generate, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _advantages = next(gen)
+    rows = batch.tolist()
+    lens = lengths.tolist()
+    # pids = encode('hello') = [1, 2, 3]; response boundary pe = 3.
+    pe = lens[0][0]
+    assert pe == 3
+    assert rows[0][:pe] == [1, 2, 3]
+    assert rows[0][pe:lens[0][1]] == [7, 8, 9, 9]
+    assert rows[1][pe:lens[1][1]] == [7, 8]
+
+
+def test_grpo_rollout_falls_back_to_reencode_without_token_ids(monkeypatch):
+    # On older mlx-lm whose batch_generate lacks return_token_ids, the rollout
+    # must still build rows by re-encoding the completion text (no crash).
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["gen", "gen"],
+    )
+
+    def _old_generate(model, tokenizer, prompts=None, max_tokens=None,
+                      sampler=None, verbose=False):
+        return types.SimpleNamespace(texts=["gen", "gen"])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _old_generate, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _advantages = next(gen)
+    # Fallback re-encodes rendered + c; encode() returns [1, 2, 3] here.
+    assert batch.shape[0] == 2
+    assert lengths.tolist()[0][0] == 3
+
+
+def test_create_preference_batches_samples_across_lengths_when_truncating():
+    # With max_steps (num_batches) capping the run below the dataset size,
+    # length-sorting then keeping the first chunks would train only on the
+    # shortest pairs. A random subset must be taken before the sort instead.
+    import numpy as np
+    from unsloth_zoo.mlx.utils import (
+        create_preference_batches,
+        _normalize_seed,
+    )
+
+    class Tok:
+        eos_token_id = 0
+
+        def encode(self, s, add_special_tokens=True):
+            return [1] * len(s)
+
+    # 10 pairs; pair i has i+1 response tokens. Keep 2 of 10.
+    N = 10
+    dataset = [
+        {"prompt": "", "chosen": "a" * (i + 1), "rejected": "a" * (i + 1)}
+        for i in range(N)
+    ]
+    batches = create_preference_batches(
+        dataset, Tok(), batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=2, seed=42,
+    )
+    assert len(batches) == 2
+    # Recover kept pair indices from the unpadded chosen length (== i+1).
+    kept = sorted(int(l.tolist()[0][1]) - 1 for _, l, _ in batches)
+    order = np.random.RandomState(_normalize_seed(42)).permutation(N)
+    expected = sorted(int(i) for i in order[:2])
+    assert kept == expected
+    # The length-sort-then-truncate bug would keep only the two shortest pairs.
+    assert kept != [0, 1]
+
+
 def test_grpo_rollout_guards_double_bos_on_chat_prompts(monkeypatch):
     # A chat template that already renders a leading BOS must be tokenized with
     # add_special_tokens=False on the GRPO rollout path (matching the SFT

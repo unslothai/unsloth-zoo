@@ -873,7 +873,16 @@ def make_orpo_loss_fn(beta=0.1):
         log_odds = (logp_c - mx.log(val_c)) - (logp_r - mx.log(val_r))
         or_loss = -mx.mean(nn.log_sigmoid(log_odds))
         loss = sft + beta * or_loss
-        return loss, mask.sum()
+        # Return the PAIR count, not the response-token count. Under
+        # gradient_accumulation_steps > 1 the trainer weights each microbatch's
+        # gradient by this value before accumulate-then-normalize. This ORPO
+        # loss reduces as a token-mean SFT term PLUS a pair-mean odds-ratio term,
+        # so the correct single-scalar microbatch weight is the number of
+        # preference pairs (the odds-ratio term is the characteristic per-pair
+        # signal). Weighting by response tokens would let microbatches with
+        # longer chosen/rejected responses dominate the optimizer step and break
+        # equivalence with a single combined batch of the same pairs.
+        return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
 
 
@@ -918,7 +927,7 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
 
     def loss_fn(model, batch, lengths, labels=None):
         B = batch.shape[0] // 2
-        pol, ntoks = _row_logp_and_mask(model, batch, lengths)
+        pol, _ = _row_logp_and_mask(model, batch, lengths)
         pol_c, pol_r = pol[:B], pol[B:]
 
         if reference_free or not _mods:
@@ -938,7 +947,14 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
 
         logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
         loss = -mx.mean(nn.log_sigmoid(logits))
-        return loss, ntoks
+        # Return the PAIR count, not the response-token count (ntoks). The DPO
+        # loss above is a mean over preference pairs, so under
+        # gradient_accumulation_steps > 1 the trainer's accumulate-then-normalize
+        # machinery must weight each microbatch by its pair count. Weighting by
+        # response tokens would over-weight microbatches whose chosen/rejected
+        # responses are longer and break equivalence with a single combined DPO
+        # batch of the same pairs.
+        return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
 
 def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
@@ -1044,13 +1060,18 @@ def _hf_encoding_tokenizer(tokenizer):
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
-                        num_batches=None):
+                        num_batches=None, seed=42):
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
     Pairs are length-sorted (by max of the two), grouped into batches of
     ``batch_size`` PAIRS, and every row in a batch is padded to that batch's
     max length, rounded up to ``pad_to_multiple`` (Apple-Silicon padding).
+
+    When ``num_batches`` caps the run below the dataset size (e.g. ``max_steps``
+    on a large preference dataset), a RANDOM subset of pairs (seeded by ``seed``)
+    is selected before the length sort, so training samples the full length
+    distribution instead of only the shortest pairs.
 
     Returns a list of ``(batch, lengths, None)`` tuples:
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
@@ -1072,6 +1093,19 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         r_ids = hf.encode(prompt + ex[rejected_key])[:max_seq_length]
         pe = min(len(p_ids), len(c_ids), len(r_ids))
         rows.append((pe, c_ids, r_ids))
+
+    # If num_batches would truncate the run, pick a random subset of pairs
+    # BEFORE the length sort. Sorting all pairs by length and then keeping only
+    # the first num_batches chunks would train exclusively on the shortest pairs
+    # and never sample the longer ones (a silent, systematic drop of legitimate
+    # rows). The SFT path avoids this by shuffling batches before truncating
+    # (_create_labeled_batches); mirror that here. Sorting the reduced subset
+    # afterwards still yields efficient per-batch padding.
+    if num_batches is not None:
+        needed = num_batches * batch_size
+        if len(rows) > needed:
+            order = np.random.RandomState(_normalize_seed(seed)).permutation(len(rows))
+            rows = [rows[int(i)] for i in order[:needed]]
 
     rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
 
