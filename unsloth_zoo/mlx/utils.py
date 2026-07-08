@@ -2904,6 +2904,25 @@ def _resolve_mlx_pretokenized_completion_only_loss(dataset, completion_only_loss
     return False
 
 
+def _prompt_completion_formatter_conflict(
+    dataset, formatting_func, completion_only_loss
+):
+    """Detect a formatter that erases a prompt/completion boundary under the default.
+
+    SFTTrainer resolves the completion_only_loss default to True for prompt/completion
+    datasets and then rejects a formatting_func as incompatible, because formatting
+    collapses the row into free text and drops the completion boundary. We only reach
+    this after formatting produced no labeled rows, so raising here mirrors that
+    guardrail instead of silently training on the full formatted sequence. A formatter
+    that keeps prompt/completion keys still yields labeled rows and never lands here.
+    """
+    if formatting_func is None or completion_only_loss is not None:
+        return False
+    for item in dataset:
+        return isinstance(item, Mapping) and "prompt" in item and "completion" in item
+    return False
+
+
 def _tokenize_mlx_pretokenized_row(
     item,
     *,
@@ -4280,6 +4299,15 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
                 "Unsloth MLX: text completion_only_loss=True requires "
                 "prompt/completion rows."
             )
+        if _prompt_completion_formatter_conflict(
+            dataset, formatting_func, completion_only_loss
+        ):
+            raise ValueError(
+                "Unsloth MLX: a formatting_func was provided for a prompt/completion "
+                "dataset, which drops the completion boundary needed for the default "
+                "completion-only loss. Apply your formatting before passing the "
+                "dataset, or set completion_only_loss=False."
+            )
 
     ds = _prepare_dataset(
         dataset, tokenizer, dataset_text_field, formatting_func,
@@ -4379,6 +4407,15 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             raise ValueError(
                 "Unsloth MLX: text completion_only_loss=True requires "
                 "prompt/completion rows."
+            )
+        if not labeled and _prompt_completion_formatter_conflict(
+            dataset, formatting_func, completion_only_loss
+        ):
+            raise ValueError(
+                "Unsloth MLX: a formatting_func was provided for a prompt/completion "
+                "dataset, which drops the completion boundary needed for the default "
+                "completion-only loss. Apply your formatting before passing the "
+                "dataset, or set completion_only_loss=False."
             )
 
     if not labeled:
@@ -4552,6 +4589,15 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             raise ValueError(
                 "Unsloth MLX: text completion_only_loss=True requires "
                 "prompt/completion rows for streaming text training."
+            )
+        if _prompt_completion_formatter_conflict(
+            dataset, formatting_func, completion_only_loss
+        ):
+            raise ValueError(
+                "Unsloth MLX: a formatting_func was provided for a prompt/completion "
+                "dataset, which drops the completion boundary needed for the default "
+                "completion-only loss. Apply your formatting before passing the "
+                "dataset, or set completion_only_loss=False."
             )
 
     ds = _prepare_dataset(

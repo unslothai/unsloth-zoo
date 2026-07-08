@@ -2059,6 +2059,12 @@ class MLXTrainer:
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
         if is_vlm:
+            if text_assistant_only_loss:
+                raise ValueError(
+                    "Unsloth MLX VLM: assistant_only_loss=True is not supported for "
+                    "vision-language models. Set assistant_only_loss=False, or use "
+                    "train_on_responses_only for response masking."
+                )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
             vlm_dataset_order = (
                 "sequential"
