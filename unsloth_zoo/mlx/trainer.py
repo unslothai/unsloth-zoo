@@ -900,7 +900,24 @@ class MLXTrainer:
         # 1D second-moment init is numerically unstable).
         self._ensure_lora_frozen(model)
 
-        # Training state
+        # Training state. Per-run tracking lives in _reset_run_state (re-run at
+        # each train() so a reused trainer starts clean); callbacks and
+        # pre-created batches persist across runs and stay here.
+        self._reset_run_state()
+        self.stop_requested = False  # Set True to stop training early
+        self._batches = None  # Pre-created batches (skips internal batch creation)
+        self._step_callbacks = []  # Callbacks called after each logged step
+        self._eval_callbacks = []  # Callbacks called after each eval
+
+    def _reset_run_state(self):
+        """Per-run training/metric state. Reset from __init__ and at the start
+        of each train() so reusing a trainer for a second run starts clean;
+        _early_stopped cleared so a run-1 early stop doesn't block run 2.
+        stop_requested is deliberately not reset: it is externally owned (a
+        controller thread may set it at any moment, including during train()
+        setup and batch prep), so clearing it here would silently drop an
+        in-flight cancel. Callbacks and pre-created batches persist across
+        runs and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
         self._grad_norm_history = []
@@ -912,7 +929,7 @@ class MLXTrainer:
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
-        self.stop_requested = False  # Set True to stop training early
+        self._early_stopped = False
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
@@ -921,6 +938,13 @@ class MLXTrainer:
         self._distributed_rank = 0
         self._distributed_world_size = 1
         self._distributed_is_main_process = True
+
+    def _resolved_best_metric_name(self):
+        """metric_for_best_model as it is looked up in eval metrics, mirroring
+        HF Trainer: a present-but-None value falls back to eval_loss, and a
+        bare name ("loss") gets the eval_ prefix eval metric keys carry."""
+        name = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
+        return name if name.startswith("eval_") else f"eval_{name}"
 
     def _train_dataset_for_batches(self):
         """Return the internal dataset used for MLX batch construction."""
@@ -1793,6 +1817,13 @@ class MLXTrainer:
             return
         targets = raw if isinstance(raw, (list, tuple)) else [raw]
         targets = {str(t).lower() for t in targets}
+        # "all" mirrors HF: enable every backend we support on MLX.
+        if "all" in targets:
+            targets |= {"wandb", "tensorboard"}
+        unsupported = targets - {"wandb", "tensorboard", "all", "none"}
+        if unsupported:
+            print(f"Unsloth: report_to target(s) {sorted(unsupported)} are not "
+                  f"supported on MLX; only 'wandb' and 'tensorboard' are logged.")
 
         wandb_run = None
         if "wandb" in targets:
@@ -1817,8 +1848,12 @@ class MLXTrainer:
                 except ImportError:
                     SummaryWriter = None
             if SummaryWriter is not None:
-                tb_writer = SummaryWriter(
-                    log_dir=os.path.join(self.args.output_dir, "runs"))
+                try:
+                    tb_writer = SummaryWriter(
+                        log_dir=os.path.join(self.args.output_dir, "runs"))
+                except Exception as e:
+                    print(f"Unsloth: tensorboard init failed: {e}")
+                    tb_writer = None
 
         if wandb_run is None and tb_writer is None:
             return
@@ -1874,7 +1909,9 @@ class MLXTrainer:
         unchanged -- .weight stays readable for tied LM-head models, and
         __call__ resolves on the subtype so interception actually fires."""
         alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
-        if alpha <= 0:
+        # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison
+        # every embedding with nan/inf noise from step 0.
+        if not math.isfinite(alpha) or alpha <= 0:
             return
         if self._is_vlm:
             print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
@@ -1905,6 +1942,16 @@ class MLXTrainer:
                     ).astype(out.dtype) * scale
                     return out + noise
                 return out
+
+        # Report the base class's name so the save-window DoRA detection
+        # (`type(module).__name__.startswith("DoRA")` in mlx/utils.py) sees
+        # through this transparent stand-in. An embedding-only DoRA adapter
+        # (use_dora=True targets embed_tokens) is what NEFTune subclasses here,
+        # so a bare "_NEFTuneEmbed" name would fail that check and silently
+        # demote the DoRA adapter to plain LoRA on save. The quantization-map
+        # scan is safe without this: it already keys on isinstance, not name.
+        _NEFTuneEmbed.__name__ = _Base.__name__
+        _NEFTuneEmbed.__qualname__ = getattr(_Base, "__qualname__", _Base.__name__)
 
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
@@ -2028,6 +2075,10 @@ class MLXTrainer:
                 from .loader import _disable_fused_mrope
                 _disable_fused_mrope(model)
 
+            # Register W&B/TensorBoard reporters after arg auto-tuning so the
+            # W&B config snapshot reflects the settings actually used (e.g. VLM
+            # compile auto-tune can flip gradient_checkpointing before training).
+            self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
             _handles = getattr(self, "_report_to_handles", (None, None))
@@ -2167,6 +2218,11 @@ class MLXTrainer:
         # was called, so we only handle optimizer and trainer state here.
         # The step offset is applied below at loop start so the LR scheduler
         # and dataloader fast-forward to the right position.
+        # Reset per-run state so reusing a trainer for a second train() without
+        # resume starts clean (else run-1's early-stop flag breaks the loop at
+        # step 0). The resume block below re-seeds the persisted fields.
+        self._reset_run_state()
+
         _resume_step = 0
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
@@ -2181,10 +2237,36 @@ class MLXTrainer:
                 )
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
-                # 3. Restore trainer scalars (step counter, loss history).
+                # 3. Restore trainer scalars (step counter, loss history, and
+                #    best-model / early-stopping tracking). .get defaults keep
+                #    pre-fix checkpoints (which lack these keys) resumable.
                 ts = load_trainer_state(_resume_from)
                 _resume_step = int(ts.get("global_step", 0))
+                # Seed the live step counter from the checkpoint so a no-op
+                # resume (checkpoint already at max_steps, loop body never runs)
+                # still reports the reached step instead of the initial 0. The
+                # loop overwrites this on every optimizer step of a real resume.
+                self._global_step = _resume_step
                 self._train_loss_history = list(ts.get("train_loss_history", []))
+                self._best_metric = ts.get("best_metric", None)
+                self._best_step = ts.get("best_step", None)
+                self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
+                # best/ lives in output_dir, not in the checkpoint dir, so a
+                # checkpoint resumed elsewhere (copied dir, new output_dir) can
+                # carry best-model state whose weights aren't present. Keep the
+                # state only when they are: an unloadable "best" would suppress
+                # best-saves and early-stop against a model that
+                # load_best_model_at_end can't restore.
+                _best_path = f"{args.output_dir}/best/adapters.safetensors"
+                if self._best_step is not None and not os.path.exists(_best_path):
+                    _main_print(
+                        f"Unsloth: checkpoint carries best-model state (step "
+                        f"{self._best_step}) but {args.output_dir}/best has no "
+                        f"saved weights; restarting best-model tracking."
+                    )
+                    self._best_metric = None
+                    self._best_step = None
+                    self._es_patience_counter = 0
                 _main_print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
@@ -2859,8 +2941,9 @@ class MLXTrainer:
             return result
 
         for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
-            if self._distributed_should_stop():
-                _main_print("Unsloth: Stop requested — ending training early.")
+            if self._distributed_should_stop() or self._early_stopped:
+                if self.stop_requested:
+                    _main_print("Unsloth: Stop requested - ending training early.")
                 break
 
             tic = time.perf_counter()
@@ -3057,11 +3140,16 @@ class MLXTrainer:
                         except Exception as e:
                             _main_print(f"Unsloth: eval callback error: {e}")
 
-                # Best-model tracking + early stopping (Item-5).
-                _track = getattr(args, "load_best_model_at_end", False) or \
-                    int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                # Best-model tracking + early stopping (Item-5). Skipped after
+                # a stop request: an aborted eval leaves partial metrics (a
+                # truncated eval_loss can beat any real best) and may lack the
+                # tracked key entirely.
+                _track = not self.stop_requested and (
+                    getattr(args, "load_best_model_at_end", False)
+                    or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+                )
                 if _track:
-                    _metric_name = getattr(args, "metric_for_best_model", "eval_loss")
+                    _metric_name = self._resolved_best_metric_name()
                     _em = self._last_eval_metrics or {}
                     if _metric_name not in _em:
                         raise ValueError(
@@ -3102,11 +3190,11 @@ class MLXTrainer:
                         self._es_patience_counter += 1
                         _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
                         if _pat > 0 and self._es_patience_counter >= _pat:
-                            print(
+                            _main_print(
                                 f"Unsloth: early stopping at step {current_step} "
                                 f"(no {_metric_name} improvement in {_pat} evals)."
                             )
-                            self.stop_requested = True
+                            self._early_stopped = True
 
             # Checkpointing
             checkpoint_due = (
@@ -3125,8 +3213,9 @@ class MLXTrainer:
                         else:
                             # Also write optimizer + trainer state so
                             # resume_from_checkpoint restores Adam moments, step
-                            # counter, and loss history. Best-effort: the adapter
-                            # save already succeeded, so log failures but keep it.
+                            # counter, loss history, and best-model / early-stopping
+                            # tracking. Best-effort: the adapter save already
+                            # succeeded, so log failures but keep it.
                             checkpoint_complete = False
                             try:
                                 save_optimizer_state(optimizer, ckpt_dir)
@@ -3136,6 +3225,9 @@ class MLXTrainer:
                                         "train_loss_history": list(
                                             self._train_loss_history
                                         ),
+                                        "best_metric": self._best_metric,
+                                        "best_step": self._best_step,
+                                        "es_patience_counter": self._es_patience_counter,
                                     },
                                     ckpt_dir,
                                 )
@@ -3165,11 +3257,14 @@ class MLXTrainer:
             if self._train_loss_history else 0.0
         )
 
+        # Report the step actually reached, which is < total_steps after an
+        # early stop (self._global_step == total_steps on a full run).
+        completed_steps = self._global_step
         _main_print(
             f"\nUnsloth: Training complete! "
             f"Avg loss: {avg_loss:.4f} | "
             f"Total time: {total_time:.1f}s | "
-            f"Steps: {total_steps} | "
+            f"Steps: {completed_steps} | "
             f"Tokens: {trained_tokens}"
         )
 
@@ -3181,7 +3276,7 @@ class MLXTrainer:
                     model.load_weights(_best_path, strict=False)
                     _main_print(
                         f"Unsloth: Restored best model from step {self._best_step} "
-                        f"({args.metric_for_best_model}={self._best_metric:.4f})."
+                        f"({self._resolved_best_metric_name()}={self._best_metric:.4f})."
                     )
                 except Exception as e:
                     _main_print(f"Unsloth: failed to restore best model ({e}).")
@@ -3213,7 +3308,7 @@ class MLXTrainer:
         return MLXTrainOutput({
             "train_loss": avg_loss,
             "train_runtime": total_time,
-            "train_steps": self._global_step,
+            "train_steps": completed_steps,
             "total_train_steps": total_steps,
             "trained_tokens": trained_tokens,
             "train_samples_per_second": (

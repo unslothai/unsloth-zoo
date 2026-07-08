@@ -662,6 +662,46 @@ def test_evaluate_batch_totals_uses_single_eval_status_collective():
     assert "_raise_distributed_failure(" not in source
 
 
+def test_reset_run_state_preserves_external_stop_request():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    # An externally-set cancel (e.g. a controller thread firing during train()
+    # setup or batch prep) must survive the per-run reset.
+    trainer.stop_requested = True
+    trainer._reset_run_state()
+    assert trainer.stop_requested is True
+    assert trainer._early_stopped is False
+
+    # A run-1 early stop must not block run 2 on a reused trainer.
+    trainer.stop_requested = False
+    trainer._early_stopped = True
+    trainer._reset_run_state()
+    assert trainer._early_stopped is False
+    assert trainer.stop_requested is False
+
+
+def test_resolved_best_metric_name_mirrors_hf_lookup():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+
+    class Args:
+        pass
+
+    trainer.args = Args()
+    for value, expected in [
+        (None, "eval_loss"),
+        ("loss", "eval_loss"),
+        ("eval_loss", "eval_loss"),
+        ("perplexity", "eval_perplexity"),
+        ("eval_val_loss", "eval_val_loss"),
+    ]:
+        trainer.args.metric_for_best_model = value
+        assert trainer._resolved_best_metric_name() == expected
+
+
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
