@@ -1371,6 +1371,117 @@ def test_grpo_rollout_accepts_matching_length_reward_vector(monkeypatch):
     assert advantages.shape[0] == 3
 
 
+# ---------------------------------------------------------------------------
+# PR #832 round-4 review fixes: GRPO gradient-accumulation weight (rollout rows,
+# not tokens) and the GRPO rollout double-BOS guard.
+# ---------------------------------------------------------------------------
+
+def test_grpo_loss_returns_rollout_row_count_not_token_count(monkeypatch):
+    # The GRPO loss is a masked per-row mean over completion tokens, then a mean
+    # over the rollout group (TRL loss_type="grpo"). The trainer accumulates
+    # micro-batch grads weighted by this returned count, so it must be the
+    # number of rollout ROWS; returning the completion-token total would let
+    # micro-batches with longer completions dominate under
+    # gradient_accumulation_steps > 1.
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.utils import make_grpo_loss_fn
+
+    # Real MLX cross_entropy defaults to reduction="none" (per token), which the
+    # loss relies on; the torch shim defaults to "mean". Force the faithful
+    # per-token reduction so the code path runs exactly as on MLX.
+    _orig_ce = nn.losses.cross_entropy
+
+    def _ce_none(logits, targets, **kw):
+        # Real MLX returns a per-element tensor shaped like ``targets``; the
+        # shim flattens, so reshape back to keep the (rows, tokens) layout.
+        out = _orig_ce(logits, targets, **{**kw, "reduction": "none"})
+        return out.reshape(*targets.shape)
+
+    monkeypatch.setattr(nn.losses, "cross_entropy", _ce_none)
+    # Real MLX mx.maximum broadcasts a Python scalar; the torch shim requires a
+    # tensor. Coerce so the loss's tok_per_row = mx.maximum(mask.sum(-1), 1.0)
+    # runs as it does on MLX.
+    _orig_max = mx.maximum
+    monkeypatch.setattr(
+        mx, "maximum",
+        lambda a, b, **kw: _orig_max(
+            a, mx.array(b) if isinstance(b, (int, float)) else b, **kw
+        ),
+    )
+
+    V = 5
+    # Two rollout rows with DIFFERENT completion lengths so the row count (2)
+    # and the completion-token total (2 + 5 = 7) are distinct.
+    batch = mx.array(
+        [[1, 2, 3, 4, 0, 0], [1, 2, 3, 4, 4, 4]], dtype=mx.int32
+    )
+    lengths = mx.array([[1, 3], [1, 6]], dtype=mx.int32)
+    advantages = mx.array([0.5, -0.5])
+
+    def model(inp):
+        return mx.zeros((inp.shape[0], inp.shape[1], V))
+
+    loss_fn = make_grpo_loss_fn(beta=0.0, reference_free=True)
+    _loss, weight = loss_fn(model, batch, lengths, advantages)
+    assert int(weight) == batch.shape[0] == 2
+
+
+def test_grpo_rollout_guards_double_bos_on_chat_prompts(monkeypatch):
+    # A chat template that already renders a leading BOS must be tokenized with
+    # add_special_tokens=False on the GRPO rollout path (matching the SFT
+    # encode_mlx_text guard), otherwise the rollout prompt and the training rows
+    # begin with two BOS tokens and the prompt distribution is corrupted. Both
+    # the prompt encode and the prompt+completion encode must take the guard.
+    import types
+    import mlx_lm
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    class _Tok:
+        eos_token_id = 0
+        bos_token = "<s>"
+
+        def __init__(self):
+            self.add_special_tokens_seen = []
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False,
+                                continue_final_message=False):
+            # Llama/Qwen/Gemma-style: template emits a leading BOS.
+            return "<s>USER: " + messages[-1]["content"]
+
+        def encode(self, text, add_special_tokens=True):
+            self.add_special_tokens_seen.append(add_special_tokens)
+            return [1, 2, 3]
+
+    resp = types.SimpleNamespace(texts=["a", "b"])
+    monkeypatch.setattr(mlx_lm, "batch_generate",
+                        lambda *a, **k: resp, raising=False)
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = object()
+    tok = _Tok()
+    trainer.tokenizer = tok
+    trainer.train_dataset = [
+        {"prompt": [{"role": "user", "content": "hi"}], "answer": "x"}
+    ]
+    trainer.reward_funcs = [
+        lambda completions=None, prompts=None, **kw: [0.1, 0.2]
+    ]
+    trainer.args = types.SimpleNamespace(
+        num_generations=2, temperature=1.0,
+        max_completion_length=4, max_seq_length=32,
+    )
+
+    gen = trainer._grpo_rollout_generator()
+    next(gen)
+    # The rendered chat prompt already carries a BOS, so every encode on this
+    # rollout (1 prompt + 1 per completion) must suppress the extra special
+    # token; no call may re-add a second BOS.
+    assert tok.add_special_tokens_seen  # encode actually ran
+    assert all(flag is False for flag in tok.add_special_tokens_seen)
+
+
 def test_model_has_non_lora_trainable_params_detects_full_module():
     import mlx.core as mx
     from unsloth_zoo.mlx.utils import model_has_non_lora_trainable_params

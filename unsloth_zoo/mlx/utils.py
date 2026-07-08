@@ -1009,7 +1009,16 @@ def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
 
         tok_per_row = mx.maximum(mask.sum(-1), 1.0)
         loss = ((per_token_loss * mask).sum(-1) / tok_per_row).mean()
-        return loss, mask.sum()
+        # Return the ROLLOUT-ROW count, not the completion-token count. This
+        # GRPO loss is a masked mean over each row's completion tokens and then
+        # a mean over the rollout group (TRL loss_type="grpo":
+        # ((per_token_loss * mask).sum(-1) / mask.sum(-1)).mean()), so the
+        # trainer's accumulate-then-normalize machinery must weight each
+        # microbatch by its row count. Weighting by tokens would let
+        # microbatches with longer generated completions dominate the optimizer
+        # step and break equivalence with a single batch of the same rollout
+        # rows under gradient_accumulation_steps > 1.
+        return loss, mx.array(batch.shape[0], dtype=mx.int32)
     return loss_fn
 
 

@@ -3852,7 +3852,14 @@ class MLXGRPOTrainer(MLXTrainer):
             example = examples[j]
             idx += 1
             rendered = self._grpo_render_prompt(prompt, hf)
-            pids = hf.encode(rendered)
+            # Chat templates (Llama/Qwen/Gemma-style) already emit a leading BOS
+            # when rendering the prompt string, so tokenizing with the raw
+            # encode()'s default add_special_tokens=True would prepend a SECOND
+            # BOS and corrupt the rollout prompt distribution. Route through the
+            # same double-BOS guard the SFT path uses (encode_mlx_text drops
+            # add_special_tokens when the rendered text already starts with the
+            # BOS token); plain-string prompts still get their single BOS.
+            pids = encode_mlx_text(hf, rendered)
             resp = batch_generate(
                 self.model, self.tokenizer, prompts=[pids] * N,
                 max_tokens=args.max_completion_length, sampler=sampler, verbose=False,
@@ -3901,7 +3908,11 @@ class MLXGRPOTrainer(MLXTrainer):
             pe = len(pids)
             rows, lengths = [], []
             for c in comps:
-                full = hf.encode(rendered + c)[: args.max_seq_length]
+                # Guard the prompt+completion tokenization against the same
+                # double BOS as the prompt above, and with the SAME guard so
+                # the response boundary pe (from the guarded prompt encode)
+                # stays a true prefix length of this full sequence.
+                full = encode_mlx_text(hf, rendered + c)[: args.max_seq_length]
                 rows.append(full)
                 lengths.append([pe, len(full)])
             L = max(len(r) for r in rows)
