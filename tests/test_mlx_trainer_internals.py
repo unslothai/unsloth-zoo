@@ -201,7 +201,9 @@ def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
     class Tokenizer:
         pad_token_id = 99
 
-    dataset = [([5], 0), ([6, 7, 8], 0)]
+    # Shortest row has 2 tokens so it survives the sub-two-token filter while
+    # still being padded out to the block length, exercising the pad id path.
+    dataset = [([5, 6], 0), ([7, 8, 9], 0)]
     np.random.seed(123)
     expected = np.random.random(3)
     np.random.seed(123)
@@ -217,7 +219,38 @@ def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
 
     assert np.random.random(3) == pytest.approx(expected)
     rows = batches[0][0].tolist()
-    assert rows[0][1:] == [99] * (len(rows[0]) - 1)
+    assert rows[0][:2] == [5, 6]
+    assert rows[0][2:] == [99] * (len(rows[0]) - 2)
+
+
+def test_distributed_text_batches_filter_sub_two_token_rows():
+    from unsloth_zoo.mlx.utils import _create_distributed_text_batches
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+
+    class Tokenizer:
+        pad_token_id = 99
+
+    # The length-1 row (token 5) has no causal target and must be filtered, so
+    # every batch is drawn only from the length-2 row (tokens 6, 7).
+    dataset = [([5], 0), ([6, 7], 0)]
+    batches = _create_distributed_text_batches(
+        dataset,
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=3,
+        seed=7,
+        comm_group=FakeWorld(),
+        tokenizer=Tokenizer(),
+    )
+
+    assert len(batches) == 3
+    for batch in batches:
+        for row in batch[0].tolist():
+            content = [tok for tok in row if tok != 99]
+            assert content == [6, 7]
 
 
 @pytest.mark.parametrize("optim_name", ["adamw", "adam", "sgd", "adafactor"])

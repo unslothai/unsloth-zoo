@@ -3835,9 +3835,16 @@ def _create_distributed_text_batches(
         len_fn = lambda idx: dataset.itemlen(idx)
     else:
         len_fn = lambda idx: len(dataset[idx][0])
-    idx = sorted(range(len(dataset)), key=len_fn)
+    # Mirror _iter_tokenized_text_rows and drop rows with fewer than two tokens
+    # (no causal target). Length sorting places these shortest rows first, so
+    # without this filter an all-short first global microbatch would sum to zero
+    # supervised tokens and trip the zero-supervised-token abort in trainer.py.
+    idx = sorted((i for i in range(len(dataset)) if len_fn(i) >= 2), key=len_fn)
     if not idx:
-        raise ValueError("Dataset must have at least one example.")
+        raise ValueError(
+            "Unsloth MLX: distributed text dataset has no rows with at least 2 "
+            "tokens (need an input and a causal target)."
+        )
 
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     batch_idx = [
