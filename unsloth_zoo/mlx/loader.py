@@ -3482,6 +3482,26 @@ def _awq_quant_config_is_gemm(quant_config):
     return version in _AWQ_NATIVE_GEMM_VERSIONS
 
 
+def _awq_group_size_is_full(quant_config):
+    """True when an AWQ quant_config uses AutoAWQ's full-group / per-column form.
+
+    AutoAWQ encodes per-column quantization as ``q_group_size <= 0`` (the HF
+    ``AwqConfig`` serializes it under ``group_size``; ``-1`` is per-column). Such
+    a checkpoint carries a single scale/zero-point row per output channel, which
+    mlx-lm's native loader cannot handle (it hands the raw non-positive group
+    size to MLX's affine quantizer). Callers dequantize these locally instead.
+    """
+    if not isinstance(quant_config, dict):
+        return False
+    raw = quant_config.get("group_size", quant_config.get("q_group_size"))
+    if raw is None:
+        return False
+    try:
+        return int(raw) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 # mlx-lm gained native GPTQ/AWQ dequant-on-load in mlx-lm PR #730 (0.30.4).
 _MLX_LM_NATIVE_PREQUANT_MIN = (0, 30, 4)
 
@@ -3527,12 +3547,21 @@ def _mlx_lm_would_reject_prequant(local_path, method, quant_config):
     layout. No released mlx-lm can load an AutoGPTQ/GPTQModel checkpoint
     natively, so GPTQ is always dequantized to fp16 here. Standard AWQ (GEMM)
     matches that layout and is deferred to mlx-lm.
+
+    Full-group / per-column AWQ (AutoAWQ ``q_group_size <= 0``) is the one AWQ
+    case mlx-lm cannot load: its native ``_transform_awq_weights`` forwards the
+    raw group_size straight into ``nn.quantize(group_size=...)``, but MLX's
+    affine kernels require a positive group size (32/64/128) and reject a
+    non-positive one, so the deferred native load would crash / mis-load. Route
+    it to the local dequantizer instead, which maps every input row to group 0.
     """
     if not _mlx_lm_supports_native_prequant():
         return True
     if method == "gptq":
         return True
-    # Standard AWQ (GEMM) is loadable natively by mlx-lm >= 0.30.4.
+    if method == "awq" and _awq_group_size_is_full(quant_config):
+        return True
+    # Standard grouped AWQ (GEMM) is loadable natively by mlx-lm >= 0.30.4.
     return False
 
 

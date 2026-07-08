@@ -137,6 +137,38 @@ def test_reject_prequant_awq_defers_on_supported_mlx_lm(monkeypatch):
     ) is False
 
 
+@pytest.mark.parametrize("group_size", [-1, 0])
+def test_reject_prequant_full_group_awq_dequants_locally(monkeypatch, group_size):
+    # Full-group / per-column GEMM AWQ (q_group_size <= 0) cannot be deferred to
+    # mlx-lm: its native _transform_awq_weights forwards the raw non-positive
+    # group size into nn.quantize, which MLX's affine kernels reject. It must be
+    # routed to the local dequantizer instead (which the round-4 fix handles).
+    import unsloth_zoo.mlx.loader as ml
+    monkeypatch.setattr(ml, "_mlx_lm_supports_native_prequant", lambda: True)
+    assert ml._mlx_lm_would_reject_prequant(
+        "/nonexistent", "awq", {"bits": 4, "group_size": group_size}
+    ) is True
+    # The alternate AutoAWQ key spelling is honoured too.
+    assert ml._mlx_lm_would_reject_prequant(
+        "/nonexistent", "awq", {"bits": 4, "q_group_size": group_size}
+    ) is True
+
+
+def test_awq_group_size_is_full_predicate():
+    import unsloth_zoo.mlx.loader as ml
+    # Non-positive group sizes are full-group / per-column; positive ones grouped.
+    assert ml._awq_group_size_is_full({"group_size": -1}) is True
+    assert ml._awq_group_size_is_full({"group_size": 0}) is True
+    assert ml._awq_group_size_is_full({"q_group_size": -1}) is True
+    assert ml._awq_group_size_is_full({"group_size": 128}) is False
+    assert ml._awq_group_size_is_full({"group_size": 64}) is False
+    # A missing / unparseable group size defers to the grouped native path.
+    assert ml._awq_group_size_is_full({}) is False
+    assert ml._awq_group_size_is_full({"group_size": None}) is False
+    assert ml._awq_group_size_is_full({"group_size": "bad"}) is False
+    assert ml._awq_group_size_is_full(None) is False
+
+
 def test_reject_prequant_old_mlx_lm_dequants_everything(monkeypatch):
     import unsloth_zoo.mlx.loader as ml
     monkeypatch.setattr(ml, "_mlx_lm_supports_native_prequant", lambda: False)
@@ -479,4 +511,42 @@ def test_non_gemm_awq_rejected_before_native_load(monkeypatch, tmp_path):
         lambda *a, **k: pytest.fail("non-GEMM AWQ must not be locally dequantized"),
     )
     with pytest.raises(NotImplementedError, match=r"'GEMV' layout"):
+        FastMLXModel.from_pretrained(repo, text_only=True)
+
+
+def test_full_group_gemm_awq_routes_to_local_dequant(monkeypatch, tmp_path):
+    # A full-group / per-column GEMM AWQ base (q_group_size == -1) on a default
+    # 4-bit LoRA load must NOT be deferred to mlx-lm's native path (which cannot
+    # apply the group_size <= 0 normalization) but instead be dequantized
+    # locally. Prove the load reaches _materialize_dequantized_hf_checkpoint.
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    repo = str(tmp_path / "awq_full_group")
+    os.makedirs(repo, exist_ok=True)
+    with open(os.path.join(repo, "config.json"), "w") as f:
+        json.dump({
+            "model_type": "llama",
+            "quantization_config": {
+                "quant_method": "awq", "bits": 4, "group_size": -1,
+                "version": "GEMM",
+            },
+        }, f)
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: repo)
+    monkeypatch.setattr(loader, "_mlx_lm_supports_native_prequant", lambda: True)
+
+    class _ReachedLocalDequant(Exception):
+        pass
+
+    def _sentinel(*a, **k):
+        raise _ReachedLocalDequant
+
+    monkeypatch.setattr(
+        loader, "_materialize_dequantized_hf_checkpoint", _sentinel,
+    )
+    # Default (4-bit) load keeps quantization_spec.enabled True, so this is not
+    # the _force_dense_dequant path -- reaching local dequant proves the AWQ
+    # full-group routing, not the dense-load fallback.
+    with pytest.raises(_ReachedLocalDequant):
         FastMLXModel.from_pretrained(repo, text_only=True)
