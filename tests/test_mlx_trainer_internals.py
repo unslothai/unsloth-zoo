@@ -1143,10 +1143,13 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     trainer.model = Model()
     trainer.stop_requested = False
 
-    def loss_fn(_model, name, _lengths, _labels):
-        if name == "small":
-            return mx.array(1.0), mx.array(2)
-        return mx.array(3.0), mx.array(6)
+    def loss_fn(_model, name, _lengths, _labels, return_correct=False):
+        base = (mx.array(1.0), mx.array(2)) if name == "small" else (mx.array(3.0), mx.array(6))
+        if return_correct:
+            # Real eval loss_fns accept return_correct; this split-metrics test
+            # does not exercise accuracy, so report no numerator (c=None).
+            return base[0], base[1], None
+        return base
 
     loss, ppl = trainer._evaluate(
         {"small": [("small", None, None)], "large": [("large", None, None)]},
@@ -1207,8 +1210,11 @@ def test_evaluate_all_reduces_token_accuracy_across_ranks():
 
     # Simulate the peer rank (rank 1) contributing 4 correct over 15 tokens
     # (plus some loss mass). Each _distributed_all_sum call adds the matching
-    # peer contribution, in order: all_losses, ntokens, correct_total.
-    peer_deltas = iter([mx.array(10.0), mx.array(15), mx.array(4.0)])
+    # peer contribution, in order: all_losses, ntokens, the rank-wide
+    # "any rank has an accuracy numerator" consensus vote (int), correct_total.
+    peer_deltas = iter([
+        mx.array(10.0), mx.array(15), mx.array(1, dtype=mx.int32), mx.array(4.0),
+    ])
 
     def fake_all_sum(value, stream=None):
         return value + next(peer_deltas)
@@ -1226,6 +1232,100 @@ def test_evaluate_all_reduces_token_accuracy_across_ranks():
     assert metrics["eval_mean_token_accuracy"] == pytest.approx(7.0 / 20.0)
     # The un-reduced (buggy) numerator would give 3 / 20 = 0.15.
     assert metrics["eval_mean_token_accuracy"] != pytest.approx(3.0 / 20.0)
+
+
+def test_evaluate_reports_accuracy_for_dict_eval_datasets():
+    # A dict eval_dataset (multiple named splits) must still report
+    # eval_mean_token_accuracy, so metric_for_best_model="eval_mean_token_accuracy"
+    # works the same as on the single-stream path.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def eval(self):
+            pass
+
+        def train(self):
+            pass
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+    trainer._distributed_eval_status = lambda failed=False: (False, False)
+    trainer._distributed_should_stop = lambda: False
+    # Single-rank simulation: every all-reduce is the identity.
+    trainer._distributed_all_sum = lambda value, stream=None: value
+
+    def loss_fn(_model, _batch, _lengths, _labels, return_correct=False):
+        loss = mx.array(1.0)
+        ntoks = mx.array(5)
+        if return_correct:
+            return loss, ntoks, mx.array(3.0)
+        return loss, ntoks
+
+    one_batch = [(mx.array([[1, 2, 3]]), None, None)]
+    trainer._evaluate({"a": one_batch, "b": one_batch}, loss_fn, is_vlm=False)
+
+    metrics = trainer._last_eval_metrics
+    # Two splits, 3 correct / 5 tokens each -> 6 / 10 = 0.6.
+    assert metrics["eval_mean_token_accuracy"] == pytest.approx(6.0 / 10.0)
+    assert "eval_a_loss" in metrics and "eval_b_loss" in metrics
+
+
+def test_accuracy_all_reduce_is_unconditional_across_ranks():
+    # DDP lockstep: a rank that produced no accuracy numerator (correct_total is
+    # None, e.g. the loss backend returned no argmax, or it stopped before its
+    # first eval batch) must still enter the numerator all-reduce when a PEER
+    # produced one. A per-rank `if correct_total is not None` gate would let only
+    # the peers call the collective and deadlock; the reduce is gated on a
+    # rank-wide consensus vote instead, so every rank calls it in lockstep.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def eval(self):
+            pass
+
+        def train(self):
+            pass
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+    trainer._distributed_eval_status = lambda failed=False: (False, False)
+
+    # This rank's loss backend returns no accuracy numerator (c=None).
+    def loss_fn(_model, _batch, _lengths, _labels, return_correct=False):
+        loss = mx.array(1.0)
+        ntoks = mx.array(5)
+        if return_correct:
+            return loss, ntoks, None
+        return loss, ntoks
+
+    calls = []
+    # Peer contributions, in call order: all_losses, ntokens, the rank-wide "any
+    # rank has a numerator" consensus vote (a peer does, so 1), then the numerator.
+    peer_deltas = iter([
+        mx.array(10.0), mx.array(15), mx.array(1, dtype=mx.int32), mx.array(4.0),
+    ])
+
+    def fake_all_sum(value, stream=None):
+        calls.append(value)
+        return value + next(peer_deltas)
+
+    trainer._distributed_all_sum = fake_all_sum
+
+    trainer._evaluate([(mx.array([[1, 2, 3]]), None, None)], loss_fn, is_vlm=False)
+
+    metrics = trainer._last_eval_metrics
+    # This rank had no numerator (None -> 0); the peer had 4 correct over a global
+    # 5 + 15 = 20 tokens -> 0.2. The metric being present proves the numerator
+    # collective ran on the no-numerator rank (no deadlock).
+    assert metrics["eval_mean_token_accuracy"] == pytest.approx(4.0 / 20.0)
+    # Exactly four all-reduces: losses, tokens, consensus vote, numerator.
+    assert len(calls) == 4
 
 
 def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):

@@ -1521,7 +1521,15 @@ class MLXTrainer:
                         correct_total = (
                             c if correct_total is None else correct_total + c
                         )
-                    mx.eval(all_losses, ntokens)
+                    # Materialize the accuracy numerator with the loss and token
+                    # totals. Leaving correct_total lazy keeps every batch's
+                    # argmax(logits) graph alive until the final metric, so eval
+                    # memory would grow with the whole eval set (unlike the loss
+                    # and token totals, which are evaluated each batch).
+                    if correct_total is None:
+                        mx.eval(all_losses, ntokens)
+                    else:
+                        mx.eval(all_losses, ntokens, correct_total)
                 except Exception as exc:
                     failed = True
                     error = exc
@@ -1550,14 +1558,24 @@ class MLXTrainer:
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
             for split_name, split_batches in eval_batches.items():
-                split_losses, split_tokens, _ = self._evaluate_batch_totals(
-                    split_batches, loss_fn, is_vlm=is_vlm, want_accuracy=False,
+                split_losses, split_tokens, split_correct = self._evaluate_batch_totals(
+                    split_batches, loss_fn, is_vlm=is_vlm, want_accuracy=True,
                 )
                 split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
                 split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
                 all_losses += split_losses
                 ntokens += split_tokens
-                mx.eval(all_losses, ntokens)
+                # Accumulate the raw (pre-reduce) accuracy numerator across
+                # splits; it is rank-reduced once after the loop, so dict eval
+                # reports eval_mean_token_accuracy like the single-stream path.
+                if split_correct is not None:
+                    correct_total = (
+                        split_correct if correct_total is None
+                        else correct_total + split_correct
+                    )
+                    mx.eval(all_losses, ntokens, correct_total)
+                else:
+                    mx.eval(all_losses, ntokens)
                 split_loss = (
                     (split_losses / split_tokens).item()
                     if split_tokens.item() > 0 else 0.0
@@ -1574,13 +1592,27 @@ class MLXTrainer:
             )
             all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
             ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
-            # DDP: reduce the token-accuracy numerator across ranks before
-            # dividing. ntokens above is already the global token denominator,
-            # so both correct_total and its denominator are rank-summed here.
-            if correct_total is not None:
-                correct_total = self._distributed_all_sum(
-                    correct_total, stream=mx.cpu,
-                )
+        # DDP: reduce the token-accuracy numerator across ranks before dividing.
+        # ntokens above is already the global token denominator, so both
+        # correct_total and its denominator are rank-summed. The decision to run
+        # this collective must be identical on every rank: correct_total is None
+        # on a rank that produced no numerator (e.g. an external stop set
+        # stop_requested before its first eval batch, so it skipped every
+        # compute while peers accumulated a real numerator). Gating the all_sum
+        # on the per-rank `correct_total is not None` would let only the peers
+        # call it and deadlock DDP. Reduce a rank-wide "any rank has a numerator"
+        # flag first (an unconditional collective), then have every rank
+        # all-sum, so a None rank contributes zero and the collective stays in
+        # lockstep. Shared by both the dict and single-stream paths.
+        if self._distributed_any_flag(correct_total is not None):
+            numerator = (
+                mx.array(0.0, dtype=mx.float32)
+                if correct_total is None
+                else correct_total.astype(mx.float32)
+            )
+            correct_total = self._distributed_all_sum(numerator, stream=mx.cpu)
+        else:
+            correct_total = None
 
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
