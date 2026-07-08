@@ -1343,7 +1343,7 @@ class MLXTrainer:
                 decay = mx.array(1.0, dtype=mx.float32) / mx.sqrt(arg)
             elif sched_type == "warmup_stable_decay":
                 # HF parity: constant until decay_start = 1 - lr_scheduler_num_cycles
-                # of the decay window, then linear-decay through the remainder.
+                # of the decay window, then cosine-decay through the remainder.
                 # We reuse num_cycles as the "decay fraction" (HF
                 # get_wsd_schedule uses num_decay_steps; expressed here as a
                 # fraction of the post-warmup window).
@@ -1352,14 +1352,23 @@ class MLXTrainer:
                 )
                 stable_end = mx.array(1.0, dtype=mx.float32) - decay_frac
                 in_stable = progress < stable_end
-                # Linear decay across the final decay_frac of progress.
+                # Progress through the final decay_frac of the window, in [0, 1].
                 decay_progress_local = mx.maximum(
                     (progress - stable_end) / mx.maximum(
                         decay_frac, mx.array(1e-8, dtype=mx.float32),
                     ),
                     mx.array(0.0, dtype=mx.float32),
                 )
-                decay_phase = mx.array(1.0, dtype=mx.float32) - decay_progress_local
+                # HF get_wsd_schedule defaults decay_type="cosine", num_cycles=0.5,
+                # so the decay factor is 0.5 * (1 + cos(pi * num_cycles * 2 * p)),
+                # which for num_cycles=0.5 reduces to the half cosine
+                # 0.5 * (1 + cos(pi * p)) falling from 1 to 0 over the decay window.
+                # Match that shape (not a linear falloff) so ported WSD recipes
+                # follow HF's default LR trajectory.
+                decay_phase = mx.array(0.5, dtype=mx.float32) * (
+                    mx.array(1.0, dtype=mx.float32)
+                    + mx.cos(mx.array(math.pi) * decay_progress_local)
+                )
                 decay = mx.where(
                     in_stable,
                     mx.array(1.0, dtype=mx.float32),
