@@ -306,7 +306,7 @@ def _check_torch_grouped_mm_supported():
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         device = torch.cuda.current_device()
-        dtype = torch.float16
+        dtype = torch.bfloat16  # torch._grouped_mm is bf16-only; an fp16 probe always raises and disables the backend
 
         # 1 expert, 1 token, dim 8 (safe alignment).
         x = torch.ones((1, 8), device=device, dtype=dtype)
@@ -1716,6 +1716,8 @@ def forward_triton_grouped_gemm(
     )
 
     # Separated LoRA for down (intermediate already permuted from step 1, same offsets).
+    # The second GEMM ran permute_y=True, so second_gemm_output is already back in token
+    # order while lora_delta stays expert-sorted: scatter it through gather_indices to match.
     if down_lora is not None:
         first_weight, second_weight, scaling = down_lora
 
@@ -1731,7 +1733,7 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm
         )
 
-        second_gemm_output = second_gemm_output + lora_delta
+        second_gemm_output = second_gemm_output.index_add(0, gather_indices, lora_delta)
 
     # Apply routing weights and sum across top_k: (num_tokens, top_k, hidden) -> (num_tokens, hidden).
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
