@@ -662,6 +662,54 @@ def test_evaluate_batch_totals_uses_single_eval_status_collective():
     assert "_raise_distributed_failure(" not in source
 
 
+def test_check_all_masked_reduces_counts_across_ranks(monkeypatch):
+    # In DDP each rank only sees its own shard. A rank whose shard happens to be
+    # entirely masked must not raise alone (that would hang peers at the next
+    # collective); the bad/good counts are all-summed first so the raise/warn
+    # decision is global and identical on every rank.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import _check_all_masked
+
+    def fake_all_sum(value, group=None, stream=None):
+        # Simulate a peer rank that contributed trainable (good) rows.
+        return value + mx.array([0, 5], dtype=mx.int32)
+
+    monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
+
+    all_bad = [("ids", None, mx.array([[-100, -100]]))]
+    # Local shard is fully masked, but the global reduction sees good rows, so
+    # no rank raises. (Would raise ZeroDivisionError without the reduction.)
+    _check_all_masked(all_bad, comm_group=object(), world_size=2)
+
+
+def test_check_all_masked_single_process_still_raises_when_all_masked():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import _check_all_masked
+
+    all_bad = [("ids", None, mx.array([[-100, -100]]))]
+    with pytest.raises(ZeroDivisionError):
+        _check_all_masked(all_bad)
+
+
+def test_eval_callback_stop_request_synced_before_best_model_track():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    cb_idx = src.index("for cb in self._eval_callbacks")
+    track_idx = src.index("_track = not self.stop_requested")
+    assert cb_idx < track_idx
+    # A rank-wide stop sync must sit between the rank-0-only eval callbacks and
+    # the divergent best-model / early-stopping branch, else a callback that
+    # sets stop_requested on rank 0 alone makes _track diverge and hangs peers
+    # at the rank-0-guarded best-model save collective.
+    assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
+
+
 def test_reset_run_state_preserves_external_stop_request():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 

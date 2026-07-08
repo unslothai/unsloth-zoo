@@ -3136,6 +3136,14 @@ class MLXTrainer:
                         except Exception as e:
                             _main_print(f"Unsloth: eval callback error: {e}")
 
+                # Eval callbacks fire on rank 0 only, so a callback (or an
+                # external cancel arriving mid-eval) that sets stop_requested is
+                # initially visible on rank 0 alone. Sync it across ranks before
+                # the best-model / early-stopping branch below: otherwise _track
+                # diverges (rank 0 skips, peers enter) and the rank-0-guarded
+                # best-model save collective in _track hangs the peer ranks.
+                self._distributed_should_stop()
+
                 # Best-model tracking + early stopping (Item-5). Skipped after
                 # a stop request: an aborted eval leaves partial metrics (a
                 # truncated eval_loss can beat any real best) and may lack the
@@ -3867,9 +3875,14 @@ def _create_response_masked_dataset(items):
     return Dataset.from_list(rows)
 
 
-def _check_all_masked(batches, max_check=100):
+def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
     """Raise if all labels in the first N batches are -100 (mirrors
-    fix_zero_training_loss from the HF path)."""
+    fix_zero_training_loss from the HF path).
+
+    In DDP ``batches`` is only this rank's shard, so the per-rank bad/good
+    counts are all-summed before the decision. Otherwise a rank whose shard
+    happens to be entirely masked would raise ZeroDivisionError alone while
+    peers with trainable labels advance to the first collective and hang."""
     seen_bad = 0
     seen_good = 0
     checked = 0
@@ -3886,6 +3899,16 @@ def _check_all_masked(batches, max_check=100):
                 break
         if checked >= max_check:
             break
+
+    # Reduce across ranks before deciding so every rank raises/warns together
+    # (all ranks reach this collective; the early return below is post-reduce).
+    if comm_group is not None and world_size > 1:
+        counts = mx.distributed.all_sum(
+            mx.array([seen_bad, seen_good], dtype=mx.int32),
+            group=comm_group, stream=mx.cpu,
+        )
+        mx.eval(counts)
+        seen_bad, seen_good = int(counts[0].item()), int(counts[1].item())
 
     if seen_bad == 0 and seen_good == 0:
         return
@@ -4075,8 +4098,13 @@ def train_on_responses_only(
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
 
-        # Safety check: detect all-masked labels early
-        _check_all_masked(batches)
+        # Safety check: detect all-masked labels early. In DDP batches is this
+        # rank's shard, so pass the group to reduce counts before deciding.
+        _check_all_masked(
+            batches,
+            comm_group=comm_group,
+            world_size=getattr(trainer, "distributed_world_size", 1),
+        )
         trainer._prepared_batches_include_epochs = (
             labeled_num_epochs is not None
         )
