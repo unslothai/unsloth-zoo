@@ -2079,6 +2079,19 @@ class MLXTrainer:
                         "wrong. Train LoRA adapters only, or pass "
                         "reference_free=True to train without a reference."
                     )
+                if (_lora_mods and not _rf
+                        and any(type(m).__name__.startswith("DoRA")
+                                for m in _lora_mods)):
+                    raise ValueError(
+                        "Unsloth: DPO with a reference is not supported for DoRA "
+                        "adapters. The reference is obtained by zeroing the LoRA "
+                        "scale, but a DoRA layer still applies its trainable "
+                        "magnitude m/||W|| (initialized to ||W|| but drifting as m "
+                        "trains), so the reference would no longer be the frozen "
+                        "initial policy and the DPO gradient would be wrong. Use a "
+                        "plain LoRA adapter, or pass reference_free=True to train "
+                        "without a reference."
+                    )
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
@@ -2098,6 +2111,19 @@ class MLXTrainer:
                         "training, so the reference would no longer be the frozen "
                         "initial policy and the KL term would be wrong. Train LoRA "
                         "adapters only, or set grpo_beta=0 (equivalently "
+                        "reference_free=True) to train without the KL term."
+                    )
+                if (_lora_mods and _gb != 0.0 and not _grf
+                        and any(type(m).__name__.startswith("DoRA")
+                                for m in _lora_mods)):
+                    raise ValueError(
+                        "Unsloth: GRPO KL regularization with a reference is not "
+                        "supported for DoRA adapters. The KL reference is obtained "
+                        "by zeroing the LoRA scale, but a DoRA layer still applies "
+                        "its trainable magnitude m/||W|| (initialized to ||W|| but "
+                        "drifting as m trains), so the reference would no longer be "
+                        "the frozen initial policy and the KL term would be wrong. "
+                        "Use a plain LoRA adapter, or set grpo_beta=0 (equivalently "
                         "reference_free=True) to train without the KL term."
                     )
                 loss_fn = make_grpo_loss_fn(beta=_gb, lora_mods=_lora_mods,
@@ -3998,8 +4024,26 @@ class MLXGRPOTrainer(MLXTrainer):
                     # default mask_truncated_completions=False. _gen_max already
                     # bounds pids + comp (+ this EOS) to max_seq_length, so the cut
                     # below never drops a reward-scored token.
+                    # Only re-append when the stop token is unambiguous. mlx-lm
+                    # stops on ANY id in the tokenizer's eos set and strips
+                    # whichever one stopped the row without surfacing which, so for
+                    # a model with multiple eos ids (e.g. a chat end-of-turn token
+                    # distinct from eos_token_id) appending the singular
+                    # hf.eos_token_id could train the probability of the WRONG
+                    # terminal token. Re-append only when there is no multi-eos set
+                    # or it is a single id equal to hf.eos_token_id; otherwise skip
+                    # (leaving the stop action unscored is safer than scoring a
+                    # wrong token). Single-eos models keep the exact prior behavior.
                     _eos_id = getattr(hf, "eos_token_id", None)
-                    if _eos_id is not None and len(comp) < _gen_max:
+                    _mlx_eos = getattr(self.tokenizer, "eos_token_ids", None)
+                    if isinstance(_mlx_eos, int):
+                        _mlx_eos = [_mlx_eos]
+                    _eos_unambiguous = (
+                        _eos_id is not None
+                        and (not _mlx_eos
+                             or (len(_mlx_eos) == 1 and _eos_id in _mlx_eos))
+                    )
+                    if _eos_unambiguous and len(comp) < _gen_max:
                         comp = comp + [int(_eos_id)]
                     full = (pids + comp)[: args.max_seq_length]
                 else:

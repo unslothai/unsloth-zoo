@@ -1985,6 +1985,60 @@ def test_preference_reference_guards_reject_non_lora_trainables():
         < grpo_builder
 
 
+def test_preference_reference_guards_reject_dora_adapters():
+    # DPO/GRPO obtain the reference by zeroing the LoRA scale, but a DoRA layer
+    # still applies its trainable magnitude m/||W|| (which drifts as m trains),
+    # so the reference would no longer be the frozen base. The setup must reject
+    # DoRA for referenced runs (before building the DPO/GRPO loss), gated so that
+    # plain LoRA is untouched.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    guard = 'type(m).__name__.startswith("DoRA")'
+    assert src.count(guard) >= 2
+    dpo_builder = src.index("make_dpo_loss_fn")
+    grpo_builder = src.index("make_grpo_loss_fn")
+    # DoRA guard precedes the DPO loss builder ...
+    assert src.index(guard) < dpo_builder
+    # ... and a second DoRA guard sits before the GRPO loss builder.
+    assert src.index(guard, dpo_builder) < grpo_builder
+
+
+def test_grpo_rollout_skips_eos_reappend_for_multi_eos_tokenizer(monkeypatch):
+    # mlx-lm stops on ANY id in the tokenizer's eos set and strips whichever one
+    # stopped the row without surfacing which. For a multi-eos model, re-appending
+    # the singular hf.eos_token_id could train the WRONG terminal token, so the
+    # rollout must skip the re-append when the eos is ambiguous (a single-eos
+    # tokenizer keeps re-appending, as the other tests assert).
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    # eos_token_id is 0 (see _Tok), but the model can also stop on 99.
+    trainer.tokenizer.eos_token_ids = [0, 99]
+
+    def _gen(model, tokenizer, prompts=None, max_tokens=None,
+             sampler=None, verbose=False, return_token_ids=False):
+        # Both rows stopped early (len < max_completion_length 4).
+        return types.SimpleNamespace(texts=["a", "b"], token_ids=[[7], [7, 8]])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _adv = next(gen)
+    rows = batch.tolist()
+    lens = lengths.tolist()
+    pe = lens[0][0]
+    # No EOS re-appended for the ambiguous multi-eos tokenizer.
+    assert rows[0][pe:lens[0][1]] == [7]
+    assert rows[1][pe:lens[1][1]] == [7, 8]
+
+
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
     import inspect
 
