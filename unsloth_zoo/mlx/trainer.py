@@ -1361,16 +1361,22 @@ class MLXTrainer:
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "rmsprop":
-            self._manual_weight_decay = float(wd or 0.0)
+            # HF/PyTorch RMSprop, Adamax, Adagrad, and Adadelta fold weight
+            # decay into the gradient as coupled L2 (grad += wd * param),
+            # unlike AdamW's decoupled shrink. Use the same coupled path as
+            # SGD so the adaptive denominator and optimizer state see the
+            # decay term and the trained result matches the requested
+            # optimizer.
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.RMSprop(learning_rate=initial_lr)
         elif opt_name == "adamax":
-            self._manual_weight_decay = float(wd or 0.0)
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.Adamax(learning_rate=initial_lr, **adam_kwargs)
         elif opt_name == "adagrad":
-            self._manual_weight_decay = float(wd or 0.0)
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.Adagrad(learning_rate=initial_lr)
         elif opt_name == "adadelta":
-            self._manual_weight_decay = float(wd or 0.0)
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.AdaDelta(learning_rate=initial_lr)
         self._resolved_optimizer_name = opt_name
         return optimizer
