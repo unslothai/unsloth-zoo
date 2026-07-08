@@ -2470,7 +2470,7 @@ def patch_GptOssModel():
         # kwargs filter below drop every mask argument -> create_causal_mask()
         # called with no args -> "missing required positional arguments". Recover
         # the true parameter names from the pristine reference misc.py saves, then
-        # __wrapped__, then the object itself, then a static 4.x + 5.x fallback.
+        # __wrapped__, then the object itself, then a version-aware fallback.
         for cand in (
             getattr(transformers.masking_utils, "_unsloth_original_" + name, None),
             getattr(fn, "__wrapped__", None),
@@ -2483,7 +2483,17 @@ def patch_GptOssModel():
                 continue
             if not params <= {"args", "kwargs", "self"}:
                 return params
-        return {"config", "inputs_embeds", "input_embeds", "attention_mask",
+        # Introspection failed on every candidate (should not happen: misc.py saves
+        # the pristine factory and torch.compile exposes __wrapped__). Fall back to
+        # the parameter set for the running transformers, choosing the embeds arg
+        # name by major version (4.x uses input_embeds, 5.x uses inputs_embeds) so a
+        # reached fallback never passes an unexpected keyword to the real factory.
+        try:
+            _tf_major = int(str(transformers.__version__).split(".", 1)[0])
+        except (ValueError, AttributeError, IndexError):
+            _tf_major = 5
+        _embeds_name = "input_embeds" if _tf_major < 5 else "inputs_embeds"
+        return {"config", _embeds_name, "attention_mask",
                 "cache_position", "past_key_values", "position_ids"}
     _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
     _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
