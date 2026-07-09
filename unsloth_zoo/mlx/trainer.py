@@ -3811,7 +3811,7 @@ class MLXGRPOTrainer(MLXTrainer):
             prompts.append(ex["prompt"])
         return prompts
 
-    def _grpo_render_prompt(self, prompt, hf):
+    def _grpo_render_prompt(self, prompt, tokenizer):
         """Render a GRPO prompt to a string for rollout.
 
         Conversational prompts (a list of ``{"role","content"}`` message dicts,
@@ -3820,6 +3820,16 @@ class MLXGRPOTrainer(MLXTrainer):
         ``maybe_apply_chat_template`` (add_generation_prompt when the last role
         is 'user'; continue_final_message when it is 'assistant'). Plain-string
         prompts pass through unchanged (back-compat).
+
+        ``tokenizer`` must be the wrapper-level tokenizer (``self.tokenizer``),
+        NOT the unwrapped HF tokenizer. mlx-lm's TokenizerWrapper defines its own
+        ``apply_chat_template`` that honors a wrapper-level custom template
+        (``_chat_template`` / ``chat_template_type`` from the model's tokenizer
+        config) which the inner HF tokenizer (``_tokenizer``) does not carry, so
+        rendering through the wrapper matches the SFT/DPO render path and the
+        configured ``chat_template`` override normalized in ``_prepare_data``.
+        Rendering through the unwrapped HF tokenizer would use the wrong template
+        (or raise when the inner tokenizer has none).
         """
         if (isinstance(prompt, list) and prompt
                 and isinstance(prompt[0], dict)
@@ -3834,7 +3844,7 @@ class MLXGRPOTrainer(MLXTrainer):
                     f"GRPO chat prompt: invalid last-message role {last_role!r}; "
                     "expected 'user' or 'assistant'."
                 )
-            return hf.apply_chat_template(
+            return tokenizer.apply_chat_template(
                 prompt, tokenize=False,
                 add_generation_prompt=add_gen,
                 continue_final_message=cont,
@@ -3937,14 +3947,29 @@ class MLXGRPOTrainer(MLXTrainer):
         # Full dataset rows, in the same order as prompts, so reward_kwargs can
         # pass through each row's other columns (e.g. 'answer'). prompt and
         # example are indexed by the SAME cycled index below to stay aligned.
-        examples = list(self.train_dataset)
+        # Use the ORIGINAL (pre-view) dataset rows, not self.train_dataset: the
+        # latter is the _MLXTokenizedDatasetView, which injects synthetic
+        # input_ids/attention_mask columns onto any row it can render (e.g. a
+        # prompt+completion dataset) for SFT parity. Those tokenized columns must
+        # NOT leak into reward_kwargs below -- TRL builds reward kwargs from the
+        # raw dataset columns only (excluding prompt/completion/completion_ids)
+        # and never forwards input_ids/attention_mask, so an otherwise valid
+        # reward callback that accepts only its real columns (def r(completions,
+        # prompts, answer)) would crash on the unexpected token kwargs. The
+        # original rows carry exactly the user's columns.
+        examples = list(self._train_dataset_for_batches())
         idx = 0
         while True:
             j = idx % len(prompts)
             prompt = prompts[j]
             example = examples[j]
             idx += 1
-            rendered = self._grpo_render_prompt(prompt, hf)
+            # Render through the wrapper-level tokenizer (self.tokenizer) so a
+            # wrapper-level custom chat template (mlx-lm TokenizerWrapper) or the
+            # chat_template override normalized in _prepare_data is honored,
+            # matching the SFT/DPO render path. hf (the unwrapped HF tokenizer) is
+            # reserved for raw token encoding only, below.
+            rendered = self._grpo_render_prompt(prompt, self.tokenizer)
             # Chat templates (Llama/Qwen/Gemma-style) already emit a leading BOS
             # when rendering the prompt string, so tokenizing with the raw
             # encode()'s default add_special_tokens=True would prepend a SECOND
@@ -4058,46 +4083,48 @@ class MLXGRPOTrainer(MLXTrainer):
             advantages = (rewards - _mean) / (_std + 1e-4)
             # build the concatenated group batch
             pe = len(pids)
+            # EOS re-append policy, shared by BOTH scoring paths (the comp_ids
+            # branch and the re-encode fallback). mlx-lm's batch_generate strips
+            # the terminal EOS from a normally-terminating row (finish_reason ==
+            # "stop") -- from the returned ids AND from resp.texts -- keeping all
+            # _gen_max tokens only when it truncated on length. TRL's GRPO
+            # completion mask is inclusive of that EOS (sequence_indices <=
+            # eos_idx), so the stop action gets advantage-weighted gradient/KL.
+            # Re-add the EOS when a row stopped normally (its completion is shorter
+            # than the generation cap _gen_max) so the loss scores the model's
+            # probability of stopping and does not bias completion-length/EOS
+            # behavior; a row at the cap was length-truncated (no EOS emitted) and
+            # is left as-is, mirroring TRL's default mask_truncated_completions=
+            # False. _gen_max already bounds the prompt + completion (+ this EOS)
+            # to max_seq_length, so the cut below never drops a reward-scored token.
+            # Only re-append when the stop token is unambiguous. mlx-lm stops on ANY
+            # id in the tokenizer's eos set and strips whichever one stopped the row
+            # without surfacing which, so for a model with multiple eos ids (e.g. a
+            # chat end-of-turn token distinct from eos_token_id) appending the
+            # singular hf.eos_token_id could train the probability of the WRONG
+            # terminal token. Re-append only when there is no multi-eos set or it is
+            # a single id equal to hf.eos_token_id; otherwise skip (leaving the stop
+            # action unscored is safer than scoring a wrong token). Single-eos
+            # models keep the exact prior behavior.
+            _eos_id = getattr(hf, "eos_token_id", None)
+            _mlx_eos = getattr(self.tokenizer, "eos_token_ids", None)
+            if isinstance(_mlx_eos, int):
+                _mlx_eos = [_mlx_eos]
+            _eos_unambiguous = (
+                _eos_id is not None
+                and (not _mlx_eos
+                     or (len(_mlx_eos) == 1 and _eos_id in _mlx_eos))
+            )
             rows, lengths = [], []
             for i, c in enumerate(comps):
                 if comp_ids is not None and comp_ids[i] is not None:
                     # Score the EXACT generated continuation: prompt ids followed
                     # by the sampled completion ids. This makes pe a true prefix
                     # length by construction and avoids the decode->re-encode
-                    # roundtrip corrupting the tokens the policy generated.
+                    # roundtrip corrupting the tokens the policy generated. len(comp)
+                    # is the surfaced token count, so len(comp) < _gen_max marks a
+                    # normal stop (see the EOS policy above).
                     comp = [int(t) for t in comp_ids[i]]
-                    # mlx-lm's batch_generate strips the terminal EOS from the
-                    # returned ids for a normally-terminating row (finish_reason
-                    # == "stop"), keeping all _gen_max tokens only when it truncated
-                    # on length. TRL's GRPO completion mask is inclusive of that EOS
-                    # (sequence_indices <= eos_idx), so the stop action gets
-                    # advantage-weighted gradient/KL. Re-add the EOS when the row
-                    # stopped normally (shorter than the generation cap _gen_max) so
-                    # the loss scores the model's probability of stopping and does
-                    # not bias completion-length/EOS behavior. A row at the cap was
-                    # truncated (no EOS emitted) and is left as-is, mirroring TRL's
-                    # default mask_truncated_completions=False. _gen_max already
-                    # bounds pids + comp (+ this EOS) to max_seq_length, so the cut
-                    # below never drops a reward-scored token.
-                    # Only re-append when the stop token is unambiguous. mlx-lm
-                    # stops on ANY id in the tokenizer's eos set and strips
-                    # whichever one stopped the row without surfacing which, so for
-                    # a model with multiple eos ids (e.g. a chat end-of-turn token
-                    # distinct from eos_token_id) appending the singular
-                    # hf.eos_token_id could train the probability of the WRONG
-                    # terminal token. Re-append only when there is no multi-eos set
-                    # or it is a single id equal to hf.eos_token_id; otherwise skip
-                    # (leaving the stop action unscored is safer than scoring a
-                    # wrong token). Single-eos models keep the exact prior behavior.
-                    _eos_id = getattr(hf, "eos_token_id", None)
-                    _mlx_eos = getattr(self.tokenizer, "eos_token_ids", None)
-                    if isinstance(_mlx_eos, int):
-                        _mlx_eos = [_mlx_eos]
-                    _eos_unambiguous = (
-                        _eos_id is not None
-                        and (not _mlx_eos
-                             or (len(_mlx_eos) == 1 and _eos_id in _mlx_eos))
-                    )
                     if _eos_unambiguous and len(comp) < _gen_max:
                         comp = comp + [int(_eos_id)]
                     full = (pids + comp)[: args.max_seq_length]
@@ -4107,7 +4134,20 @@ class MLXGRPOTrainer(MLXTrainer):
                     # double BOS as the prompt above, and with the SAME guard so
                     # the response boundary pe (from the guarded prompt encode)
                     # stays a true prefix length of this full sequence.
-                    full = encode_mlx_text(hf, rendered + c)[: args.max_seq_length]
+                    full = encode_mlx_text(hf, rendered + c)
+                    # Mirror the comp_ids branch's EOS re-append here too: on a
+                    # normal stop batch_generate already stripped the terminal EOS
+                    # from resp.texts, so the re-encoded row has none to score and
+                    # the loss/KL would silently stop training EOS/length behavior on
+                    # this compatibility path. The completion's re-encoded span is
+                    # len(full) - pe; when it is below the generation cap _gen_max the
+                    # row stopped normally, so append the EOS (a span at _gen_max was
+                    # length-truncated and is left as-is). _gen_max bounds pe + span
+                    # (+ EOS) to max_seq_length, so the cut below keeps the EOS.
+                    _comp_len = len(full) - pe
+                    if _eos_unambiguous and 0 <= _comp_len < _gen_max:
+                        full = full + [int(_eos_id)]
+                    full = full[: args.max_seq_length]
                 rows.append(full)
                 lengths.append([pe, len(full)])
             L = max(len(r) for r in rows)

@@ -2242,6 +2242,212 @@ def test_grpo_rollout_skips_eos_reappend_for_multi_eos_tokenizer(monkeypatch):
     assert rows[1][pe:lens[1][1]] == [7, 8]
 
 
+def test_grpo_rollout_renders_chat_prompt_through_wrapper_not_inner(monkeypatch):
+    # mlx-lm's TokenizerWrapper.apply_chat_template can honor a wrapper-level
+    # custom template (chat_template_type / _chat_template from the model's
+    # tokenizer config) that the inner HF tokenizer (_tokenizer) does not carry.
+    # The GRPO rollout must render conversational prompts through the wrapper
+    # (self.tokenizer) -- matching the SFT/DPO render path and the chat_template
+    # override normalized in _prepare_data -- not through the unwrapped inner HF
+    # tokenizer, which would render with the wrong template or raise. hf (the
+    # inner tokenizer) is reserved for raw encoding only.
+    import types
+    import mlx_lm
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    encoded_texts = []
+
+    class _InnerHF:
+        # The unwrapped HF tokenizer: lacks the wrapper-level chat template.
+        eos_token_id = 0
+        bos_token = None
+
+        def apply_chat_template(self, *args, **kwargs):
+            raise AssertionError(
+                "GRPO rendered through the inner HF tokenizer, which lacks the "
+                "wrapper-level chat template"
+            )
+
+        def encode(self, text, add_special_tokens=True):
+            encoded_texts.append(text)
+            return [1, 2, 3]
+
+    class _Wrapper:
+        # mlx-lm TokenizerWrapper stand-in: a wrapper-level apply_chat_template
+        # plus a distinct inner _tokenizer used only for raw encoding.
+        eos_token_id = 0
+
+        def __init__(self, inner):
+            self._tokenizer = inner
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False,
+                                continue_final_message=False):
+            return "WRAP:" + messages[-1]["content"]
+
+    resp = types.SimpleNamespace(texts=["a", "b"])
+    monkeypatch.setattr(mlx_lm, "batch_generate",
+                        lambda *a, **k: resp, raising=False)
+
+    class _Model:
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
+    inner = _InnerHF()
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = _Model()
+    trainer.tokenizer = _Wrapper(inner)
+    trainer.train_dataset = [
+        {"prompt": [{"role": "user", "content": "hi"}], "answer": "x"}
+    ]
+    trainer.reward_funcs = [
+        lambda completions=None, prompts=None, **kw: [0.1, 0.2]
+    ]
+    trainer.args = types.SimpleNamespace(
+        num_generations=2, temperature=1.0,
+        max_completion_length=4, max_seq_length=32,
+    )
+
+    gen = trainer._grpo_rollout_generator()
+    next(gen)  # must NOT raise: rendering goes through the wrapper
+    # The wrapper's rendered output ("WRAP:...") is what gets encoded, proving the
+    # render used the wrapper template rather than the inner HF tokenizer.
+    assert encoded_texts and encoded_texts[0].startswith("WRAP:")
+
+
+def test_grpo_rollout_excludes_view_added_token_columns_from_reward_kwargs(monkeypatch):
+    # When a GRPO dataset carries a completion column, the base tokenized dataset
+    # view (_MLXTokenizedDatasetView) injects synthetic input_ids/attention_mask
+    # onto every row for SFT parity. TRL builds reward kwargs from the original
+    # dataset columns only (excluding prompt/completion/completion_ids) and never
+    # forwards tokenized input_ids/attention_mask, so a valid reward callback with
+    # a strict signature (accepts its real columns but no token kwargs) must not
+    # crash. The rollout must therefore source reward kwargs from the original
+    # rows, not the view.
+    import types
+    import mlx_lm
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer, _MLXTokenizedDatasetView
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    resp = types.SimpleNamespace(texts=["a", "b"])
+    monkeypatch.setattr(mlx_lm, "batch_generate",
+                        lambda *a, **k: resp, raising=False)
+
+    class _Model:
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
+    tok = _Tok()
+    # A prompt+completion GRPO dataset (plain strings need no chat template): the
+    # view renders "p"+"c" and so injects input_ids/attention_mask onto the row.
+    original = [{"prompt": "p", "completion": "c", "answer": "a"}]
+    view = _MLXTokenizedDatasetView(original, tok, 32)
+    # Sanity: the view really does inject the synthetic token columns.
+    assert "input_ids" in list(view)[0]
+    assert "attention_mask" in list(view)[0]
+
+    # Strict-signature reward: accepts the real 'answer' column but NOT the
+    # synthetic token columns; it raises TypeError if input_ids/attention_mask leak
+    # in (as they did before the fix). No **kwargs on purpose.
+    def _reward(completions=None, prompts=None, answer=None):
+        return [0.1, 0.2]
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = _Model()
+    trainer.tokenizer = tok
+    trainer.train_dataset = view
+    trainer._mlx_train_dataset_for_batches = original
+    trainer.reward_funcs = [_reward]
+    trainer.args = types.SimpleNamespace(
+        num_generations=2, temperature=1.0,
+        max_completion_length=4, max_seq_length=32,
+    )
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, advantages = next(gen)  # must not raise on leaked token kwargs
+    assert batch.shape[0] == 2
+    assert advantages.shape[0] == 2
+
+
+def test_grpo_rollout_reencode_fallback_appends_eos_on_normal_stop(monkeypatch):
+    # On older mlx-lm without return_token_ids, the rollout falls back to
+    # re-encoding the decoded completion text. batch_generate strips the terminal
+    # EOS from resp.texts on a normal stop, so a completion that stopped before the
+    # generation cap has no EOS to score. Mirroring the comp_ids branch (and TRL,
+    # whose completion mask is inclusive of the EOS), the fallback must re-append
+    # the EOS for a normally-stopped row and leave a length-truncated row (its span
+    # == the cap) untouched.
+    import types
+    import mlx_lm
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    class _Tok:
+        eos_token_id = 7
+        bos_token = None
+
+        def encode(self, text, add_special_tokens=True):
+            # Deterministic map so the re-encoded completion span is controllable:
+            # prompt "P" -> 3 tokens (pe = 3); "Pshort" adds 1 completion token
+            # (stopped early, < cap 4); "Plong" adds 4 (filled the cap == 4).
+            table = {
+                "P": [1, 2, 3],
+                "Pshort": [1, 2, 3, 4],
+                "Plong": [1, 2, 3, 4, 5, 6, 7],
+            }
+            return list(table[text])
+
+    # Older batch_generate: no return_token_ids parameter -> fallback re-encode.
+    def _old_generate(model, tokenizer, prompts=None, max_tokens=None,
+                      sampler=None, verbose=False):
+        return types.SimpleNamespace(texts=["short", "long"])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _old_generate, raising=False)
+
+    class _Model:
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = _Model()
+    trainer.tokenizer = _Tok()
+    trainer.train_dataset = [{"prompt": "P", "answer": "x"}]
+    trainer.reward_funcs = [
+        lambda completions=None, prompts=None, **kw: [0.1, 0.2]
+    ]
+    trainer.args = types.SimpleNamespace(
+        num_generations=2, temperature=1.0,
+        max_completion_length=4, max_seq_length=32,
+    )
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _adv = next(gen)
+    rows = batch.tolist()
+    lens = lengths.tolist()
+    pe = lens[0][0]
+    assert pe == 3
+    # Row 0 stopped early (1 completion token < cap 4): EOS (7) re-appended.
+    assert rows[0][pe:lens[0][1]] == [4, 7]
+    # Row 1 filled the cap (4 completion tokens == 4): length-truncated, no EOS.
+    assert rows[1][pe:lens[1][1]] == [4, 5, 6, 7]
+
+
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
     import inspect
 
