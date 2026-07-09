@@ -2320,6 +2320,132 @@ def test_preference_boundary_common_prefix_is_noop_without_prompt_eos():
     assert int(lengths[1][0]) == 3
 
 
+def test_preference_torch_randperm_reshuffles_batches_each_epoch():
+    # Regression (EPOCH-PERMUTATIONS): epoch-based preference runs (max_steps<=0,
+    # num_train_epochs>1) call create_preference_batches with num_batches=None, so
+    # without num_epochs it materialized ONE torch_randperm pass and the training
+    # loop (batches[i % len]) replayed that identical order every epoch -- the same
+    # bias the step-based per-pass reshuffle addressed, and divergent from the SFT
+    # create_ordered_batches path that reseeds torch_randperm per epoch. Threading
+    # num_epochs must materialize a freshly reseeded (base_seed + epoch)
+    # permutation per epoch while keeping epoch 0 byte-identical to the single pass.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _RowTokenizer:
+        # Not a PreTrainedTokenizerBase / no _tokenizer attr -> used directly.
+        bos_token = None
+        eos_token_id = None  # no EOS append; keep ids identity-simple
+
+        def encode(self, text, add_special_tokens=True):
+            # One id per whitespace word = ord(first char). Each row's leading
+            # prompt word is unique, so a batch's first token identifies its row.
+            return [ord(tok[0]) for tok in text.split()]
+
+    # 6 rows with distinct leading prompt words -> distinct per-row signatures
+    # (6! permutations make an accidental reseed collision negligible).
+    letters = ["a", "b", "c", "d", "e", "f"]
+    dataset = [
+        {"prompt": f"{c} p ", "chosen": "y", "rejected": "n"} for c in letters
+    ]
+    n = len(letters)
+    epochs = 3
+
+    def _signatures(batches):
+        # batch_size=1 -> one row per batch; batch[0] is the chosen row and its
+        # first token == ord(prompt leading char) == the row's signature.
+        return [int(b[0].tolist()[0]) for b, _l, _e in batches]
+
+    multi = create_preference_batches(
+        dataset=dataset, tokenizer=_RowTokenizer(),
+        batch_size=1, max_seq_length=32, pad_to_multiple=1,
+        dataset_order="torch_randperm", seed=123, num_epochs=epochs,
+    )
+    # num_epochs full passes over the 6 rows are materialized (not truncated).
+    assert len(multi) == epochs * n
+    sigs = _signatures(multi)
+    per_epoch = [sigs[i:i + n] for i in range(0, len(sigs), n)]
+    expected_set = sorted(ord(c) for c in letters)
+    # Every epoch is a full permutation of the rows...
+    for block in per_epoch:
+        assert sorted(block) == expected_set
+    # ...the epochs are reshuffled (reseeded), not one order replayed 3x...
+    assert per_epoch != [per_epoch[0], per_epoch[0], per_epoch[0]]
+    assert per_epoch[0] != per_epoch[1]
+    assert per_epoch[1] != per_epoch[2]
+
+    # ...and epoch 0 is byte-identical to the single-pass (num_epochs=None) order,
+    # so only later epochs gain reshuffling and existing behavior is preserved.
+    single = create_preference_batches(
+        dataset=dataset, tokenizer=_RowTokenizer(),
+        batch_size=1, max_seq_length=32, pad_to_multiple=1,
+        dataset_order="torch_randperm", seed=123,
+    )
+    assert per_epoch[0] == _signatures(single)
+
+
+def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypatch):
+    # Regression (EPOCH-PERMUTATIONS wiring): _prepare_data must thread
+    # num_epochs into create_preference_batches for epoch-based torch_randperm
+    # preference runs (max_steps<=0, num_train_epochs>0), and flag
+    # _prepared_batches_include_epochs so total_steps uses n_batches // grad_accum
+    # over the already-epoch-expanded list. Step-based and non-random orders stay
+    # single-pass (num_epochs=None).
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+
+    captured = {}
+
+    def fake_create_preference_batches(**kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return [("batch", "lengths", None)]
+
+    monkeypatch.setattr(
+        mlx_trainer, "create_preference_batches", fake_create_preference_batches
+    )
+
+    for loss_type in ("orpo", "dpo"):
+        # Epoch-based torch_randperm -> num_epochs threaded, num_batches None.
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(
+            loss_type=loss_type, max_steps=0, num_train_epochs=3,
+            dataset_order="torch_randperm",
+        )
+        _pin_distributed(trainer, world_size=1)
+        trainer._prepared_batches_include_epochs = False
+        batches, batch_iter = MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+        assert batches == [("batch", "lengths", None)]
+        assert batch_iter is None
+        assert captured["dataset_order"] == "torch_randperm"
+        assert captured["num_batches"] is None
+        assert captured["num_epochs"] == 3
+        assert trainer._prepared_batches_include_epochs is True
+
+        # Step-based (max_steps>0) stays single-pass: num_epochs None even for
+        # torch_randperm (the step-based per-pass reshuffle already handles it).
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(
+            loss_type=loss_type, max_steps=4, num_train_epochs=3,
+            dataset_order="torch_randperm",
+        )
+        _pin_distributed(trainer, world_size=1)
+        trainer._prepared_batches_include_epochs = False
+        MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+        assert captured["num_epochs"] is None
+        assert captured["num_batches"] is not None
+        assert trainer._prepared_batches_include_epochs is False
+
+        # Epoch-based DEFAULT order stays single-pass (matches SFT create_batches
+        # which also modulo-cycles one pass); num_epochs must NOT be threaded.
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(
+            loss_type=loss_type, max_steps=0, num_train_epochs=3,
+            dataset_order="default",
+        )
+        _pin_distributed(trainer, world_size=1)
+        trainer._prepared_batches_include_epochs = False
+        MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+        assert captured["dataset_order"] == "default"
+        assert captured["num_epochs"] is None
+        assert trainer._prepared_batches_include_epochs is False
+
+
 def test_dpo_reference_collects_nested_lora_modules():
     # Regression: the DPO reference collected adapters with
     #   tree_flatten(model, is_leaf=lambda x: isinstance(x, LoRALinear)),
@@ -2477,6 +2603,75 @@ def test_preference_disable_dropout_neutralizes_base_model_dropout():
     for l in model.layers:
         assert l.resid_dropout._p_1 == 1.0
         assert _get_mlx_dropout_probability(l.resid_dropout) == 0.0
+
+
+def test_preference_disable_dropout_preserves_saved_lora_dropout_metadata():
+    # Regression (DROPOUT-METADATA): _mlx_disable_lora_dropout replaces each
+    # adapter's dropout with _mlx_identity to make the ORPO/DPO forward
+    # deterministic. That runs at setup, BEFORE save_model, and permanently
+    # mutates the live module -- so the save path (_extract_mlx_lora_parameters /
+    # save_model / _enrich_mlx_adapter_config), which reads lora_dropout back off
+    # the live module, would record dropout=0.0 in adapter_config.json for a run
+    # trained with nonzero lora_dropout, and the reloaded adapter would no longer
+    # match the original LoRA config. The disable must stash the configured
+    # probability first so the forward stays deterministic AND the saved metadata
+    # stays correct.
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout, _mlx_identity
+    from unsloth_zoo.mlx.utils import (
+        _extract_mlx_lora_parameters,
+        _read_mlx_lora_dropout,
+        _get_mlx_dropout_probability,
+    )
+
+    class _Dropout(nn.Module):
+        # Stand-in for mlx.nn.Dropout: keep-prob in _p_1, identity when _p_1 == 1.
+        def __init__(self, p):
+            super().__init__()
+            self._p_1 = 1.0 - p
+
+        def __call__(self, x):
+            return x
+
+    class Adapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = torch.zeros(4, 8)
+            self.lora_b = torch.zeros(8, 4)
+            self.dropout = _Dropout(0.25)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = Adapter()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Block(), Block()]
+
+    model = Model()
+    # Baseline: the save path reads the configured lora_dropout off the live
+    # module (rank comes from lora_a's trailing axis: shape (4, 8) -> 8).
+    rank_before, _scale_before, dropout_before = _extract_mlx_lora_parameters(model)
+    assert rank_before == 8
+    assert dropout_before == pytest.approx(0.25)
+
+    _mlx_disable_lora_dropout(model)
+
+    # The forward is now a deterministic identity (dropout genuinely disabled)...
+    for blk in model.layers:
+        assert blk.q_proj.dropout is _mlx_identity
+        assert _get_mlx_dropout_probability(blk.q_proj.dropout) == 0.0
+        # ...but the stash preserves the configured probability for the save path.
+        assert blk.q_proj._unsloth_orig_lora_dropout == pytest.approx(0.25)
+        assert _read_mlx_lora_dropout(blk.q_proj) == pytest.approx(0.25)
+
+    # So the adapter_config still reports the ORIGINAL dropout after ORPO/DPO,
+    # not 0.0 -- reload parity with the trained LoRA config is preserved.
+    rank_after, _scale_after, dropout_after = _extract_mlx_lora_parameters(model)
+    assert rank_after == 8
+    assert dropout_after == pytest.approx(0.25)
 
 
 class _StubLM:

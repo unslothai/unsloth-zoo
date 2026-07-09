@@ -190,6 +190,8 @@ from .utils import (
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
     _disable_mlx_base_dropout,
+    _get_mlx_dropout_probability,
+    _read_mlx_lora_dropout,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -528,6 +530,20 @@ def _mlx_disable_lora_dropout(model):
     count = 0
     for _, mod in iter_mlx_lora_modules(model):
         if getattr(mod, "dropout", None) is not None:
+            # Stash the configured dropout probability BEFORE swapping in the
+            # identity. Replacing mod.dropout with _mlx_identity makes the
+            # forward deterministic but ERASES the probability the save path
+            # (_extract_mlx_lora_parameters / save_model / _enrich_mlx_adapter_
+            # config) reads back off the live module -- so a checkpoint saved
+            # after ORPO/DPO would record dropout=0.0 in adapter_config.json and
+            # no longer match the trained LoRA config on reload. _read_mlx_lora_
+            # dropout prefers this stash. Guard with hasattr so a repeated
+            # disable (reused trainer) keeps the ORIGINAL value instead of
+            # re-reading 0.0 off the already-neutralized module.
+            if not hasattr(mod, "_unsloth_orig_lora_dropout"):
+                mod._unsloth_orig_lora_dropout = _get_mlx_dropout_probability(
+                    mod.dropout
+                )
             mod.dropout = _mlx_identity
             count += 1
     count += _disable_mlx_base_dropout(model)
@@ -3480,20 +3496,47 @@ class MLXTrainer:
                     "at max_steps. Disable streaming (streaming=False) for "
                     "DPO/ORPO, or use a finite (map-style) dataset."
                 )
+            pref_dataset_order = (
+                "sequential"
+                if getattr(args, "preserve_dataset_order", False)
+                else getattr(args, "dataset_order", "default")
+            )
+            # Epoch-based preference runs (max_steps<=0, num_train_epochs>1) get
+            # num_batches=None, so without num_epochs create_preference_batches
+            # would materialize ONE torch_randperm pass and the modulo-cycled
+            # training loop (batches[i % len]) would replay that identical
+            # "random" order every epoch -- the same bias the step-based per-pass
+            # reshuffle fixed, and divergent from the SFT create_ordered_batches
+            # path that reseeds torch_randperm per epoch. Thread num_epochs so
+            # the reshuffle spans every epoch. Only torch_randperm needs it:
+            # "default" (length-sort) and "sequential" modulo-cycle one pass
+            # exactly like their SFT counterparts (create_batches /
+            # SequentialSampler), so their per-epoch order already matches SFT.
+            # Step-based runs (num_batches set) are unchanged.
+            pref_num_epochs = (
+                int(args.num_train_epochs)
+                if (
+                    args.max_steps <= 0
+                    and getattr(args, "num_train_epochs", -1) > 0
+                    and pref_dataset_order == "torch_randperm"
+                )
+                else None
+            )
             batches = create_preference_batches(
                 dataset=self.train_dataset,
                 tokenizer=self.tokenizer,
                 batch_size=args.per_device_train_batch_size,
                 max_seq_length=args.max_seq_length,
                 num_batches=total_batches_needed,
-                dataset_order=(
-                    "sequential"
-                    if getattr(args, "preserve_dataset_order", False)
-                    else getattr(args, "dataset_order", "default")
-                ),
+                dataset_order=pref_dataset_order,
                 seed=getattr(args, "seed", None),
                 append_eos=bool(getattr(args, "append_eos", True)),
+                num_epochs=pref_num_epochs,
             )
+            # When num_epochs was materialized the returned list already spans
+            # every epoch, so total_steps must use n_batches // grad_accum (not
+            # n_batches * num_train_epochs); mirror the SFT/VLM ordered paths.
+            self._prepared_batches_include_epochs = pref_num_epochs is not None
             return batches, None
 
         if is_vlm:
@@ -3628,7 +3671,7 @@ class MLXTrainer:
         """Save LoRA adapters or full merged model (if no LoRA)."""
         from .utils import (
             _coerce_mlx_lora_scale,
-            _get_mlx_dropout_probability,
+            _read_mlx_lora_dropout,
             _infer_mlx_lora_rank,
             save_merged_model,
         )
@@ -3655,9 +3698,10 @@ class MLXTrainer:
                 # _coerce handles LoRASwitchLinear's per-expert mx.array where
                 # raw float()/.item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
-                _lora_dropout = _get_mlx_dropout_probability(
-                    getattr(m, "dropout", None)
-                )
+                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
+                # (which swapped the live dropout for an identity) still records
+                # the configured lora_dropout, not 0.0.
+                _lora_dropout = _read_mlx_lora_dropout(m)
                 break
 
             from .utils import _get_transformer_layers
