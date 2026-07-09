@@ -1108,9 +1108,31 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         # add_special_tokens only when the text already starts with the BOS, so
         # plain non-BOS strings and tokenizers without a bos_token are unchanged.
         p_ids = encode_mlx_text(hf, prompt)
-        c_ids = encode_mlx_text(hf, prompt + ex[chosen_key])[:max_seq_length]
-        r_ids = encode_mlx_text(hf, prompt + ex[rejected_key])[:max_seq_length]
-        pe = min(len(p_ids), len(c_ids), len(r_ids))
+        c_full = encode_mlx_text(hf, prompt + ex[chosen_key])
+        r_full = encode_mlx_text(hf, prompt + ex[rejected_key])
+        # Response boundary = the shared prompt-prefix length. min() guards the
+        # rare boundary-merge case where joining prompt+answer changes the token
+        # count of the prompt region below len(p_ids).
+        pe0 = min(len(p_ids), len(c_full), len(r_full))
+        # Reserve room for the chosen/rejected completion before truncating to
+        # max_seq_length. A plain [:max_seq_length] right-truncation drops the
+        # END of prompt+answer, so a long-prompt row keeps masked prompt tokens
+        # while dropping the answer tokens the DPO/ORPO loss actually scores
+        # (the [pe, seq_end) span): e.g. a 1900-token prompt with a 500-token
+        # answer at max_seq_length=2048 would score only the first ~148 answer
+        # tokens. TRL instead LEFT-truncates the prompt
+        # (prompt_input_ids[-max_prompt_length:]) and keeps the completion head
+        # (chosen_input_ids[:max_completion_length]) so the scored span survives.
+        # Mirror that: drop the over-budget tokens from the LEFT of the shared
+        # prompt (retain its tail nearest the response), sized by the LONGER of
+        # the two answers so pe stays identical for the chosen and rejected rows
+        # of the pair. A completion longer than max_seq_length is itself capped
+        # (its head kept), matching TRL's max_completion_length bound.
+        over = max(len(c_full), len(r_full)) - max_seq_length
+        drop = min(max(over, 0), pe0)
+        c_ids = c_full[drop:][:max_seq_length]
+        r_ids = r_full[drop:][:max_seq_length]
+        pe = pe0 - drop
         rows.append((pe, c_ids, r_ids))
 
     # If num_batches would truncate the run, pick a random subset of pairs

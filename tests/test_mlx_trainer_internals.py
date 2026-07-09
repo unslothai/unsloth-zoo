@@ -1193,6 +1193,86 @@ def test_grpo_and_preference_use_hf_aware_tokenizer_unwrap():
     assert "_hf_encoding_tokenizer(tokenizer)" in pref_src
 
 
+def test_preference_batches_preserve_completion_when_prompt_exceeds_budget():
+    # A preference row whose prompt+answer exceeds max_seq_length must keep the
+    # chosen/rejected answer tokens (the [pe, seq_end) span the DPO/ORPO loss
+    # scores), not right-truncate them away. Prompt=6 tokens (value 1), answers=4
+    # tokens each (values 2/3); prompt+answer=10 > max_seq_length=8, and the
+    # prompt alone (6) leaves only 2 slots. A plain [:8] would keep 6 prompt + 2
+    # answer tokens (dropping 2 of the 4 scored answer tokens); the completion-
+    # preserving truncation must drop 2 PROMPT tokens so all 4 answer tokens
+    # survive in the scored span.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = 0
+        bos_token = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [int(part) for part in text.split()]
+
+    dataset = [{
+        "prompt": "1 1 1 1 1 1",
+        "chosen": " 2 2 2 2",
+        "rejected": " 3 3 3 3",
+    }]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _Tok(), batch_size=1, max_seq_length=8,
+    )[0]
+    lengths = lengths.tolist()
+    rows = batch.tolist()
+    chosen_start, chosen_end = lengths[0]
+    rejected_start, rejected_end = lengths[1]
+
+    # All 4 answer tokens remain in the scored [start, end) completion span ...
+    assert chosen_end - chosen_start == 4
+    assert rejected_end - rejected_start == 4
+    # ... and every scored token is an answer token (2 / 3), never a prompt
+    # token (1) or padding (0).
+    assert rows[0][chosen_start:chosen_end] == [2, 2, 2, 2]
+    assert rows[1][rejected_start:rejected_end] == [3, 3, 3, 3]
+
+
+def test_grpo_prepare_data_normalizes_tokenizer_chat_template():
+    # GRPO must apply the configured chat_template override to the rollout
+    # tokenizer, mirroring the SFT/DPO data path (MLXTrainer._prepare_data).
+    # Otherwise _grpo_render_prompt renders chat prompts on the raw tokenizer:
+    # a MLXTrainingConfig(chat_template=...) override is silently ignored and a
+    # base tokenizer without a built-in template raises, even though the same
+    # config trains fine under SFT.
+    import inspect
+    import types
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+    from unsloth_zoo.mlx.utils import _hf_encoding_tokenizer
+
+    # Structural parity: the GRPO data path normalizes like the SFT/DPO one.
+    src = inspect.getsource(MLXGRPOTrainer._prepare_data)
+    assert "normalize_mlx_chat_template" in src
+
+    class _Tok:
+        eos_token_id = 0
+        chat_template = None  # base checkpoint: no built-in template
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = types.SimpleNamespace(_config={}, _hf_repo=None)
+    trainer.tokenizer = _Tok()
+    trainer.train_dataset = [{"prompt": [{"role": "user", "content": "hi"}]}]
+    raw_template = "{{ bos_token }}{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    trainer.args = types.SimpleNamespace(chat_template=raw_template)
+
+    batches, batch_iter = trainer._prepare_data(is_vlm=False)
+    # GRPO drives the loop with a rollout generator, not static batches.
+    assert batches is None
+    assert batch_iter is not None
+    # The tokenizer used to render rollout prompts now carries the override, so
+    # apply_chat_template renders (and no longer raises) on this base tokenizer.
+    hf = _hf_encoding_tokenizer(trainer.tokenizer)
+    assert getattr(hf, "chat_template", None) == raw_template
+
+
 def test_grpo_trainer_fills_defaults_from_base_config(monkeypatch):
     from unsloth_zoo.mlx.trainer import (
         MLXGRPOTrainer,

@@ -4117,6 +4117,27 @@ class MLXGRPOTrainer(MLXTrainer):
     def _prepare_data(self, is_vlm):
         if is_vlm:
             raise ValueError("GRPO is not yet supported for VLM models on MLX.")
+        # Apply the configured chat_template override to the tokenizer BEFORE the
+        # rollout generator renders chat-message prompts, mirroring the SFT/DPO
+        # data path (MLXTrainer._prepare_data). Without this, _grpo_render_prompt
+        # calls apply_chat_template on the raw, un-normalized tokenizer: a
+        # MLXTrainingConfig(chat_template=...) override would be silently ignored
+        # (rollouts rendered with the wrong template) and a tokenizer without a
+        # built-in template would raise, even though the same config trains fine
+        # under SFT/DPO. Normalizing here restores that parity. It is a no-op when
+        # chat_template is None, so default runs are unchanged.
+        args = self.args
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        model_name = getattr(self.model, "_hf_repo", None)
+        self.tokenizer = normalize_mlx_chat_template(
+            self.tokenizer,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
         # GRPO drives the loop with a rollout generator, not static batches.
         return None, self._grpo_rollout_generator()
 
