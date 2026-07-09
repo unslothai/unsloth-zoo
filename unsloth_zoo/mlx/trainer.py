@@ -3208,9 +3208,22 @@ class MLXTrainer:
         # Training loop — mlx-lm pattern
         model.train()
         start_time = time.perf_counter()
+        # Metric accumulators are split into a "committed" window (loss/tokens
+        # from optimizer steps that have already been APPLIED to the model but not
+        # yet logged) and a "pending" window (the micro-batches of the current
+        # accumulation window, which have NOT yet updated the model). HF only ever
+        # folds a completed optimizer step's loss into the logged tr_loss and never
+        # logs a not-yet-applied partial window (_maybe_log_save_evaluate logs only
+        # when state.global_step > _globalstep_last_logged, and its last epoch batch
+        # is force-applied as an optimizer step). Mirroring that split keeps a forced
+        # log (epoch-end / callback) and the post-loop flush emitting only committed
+        # metrics, while an abandoned partial window drops only its pending part.
         losses = 0
         n_tokens = 0
         steps = 0
+        pending_losses = 0
+        pending_n_tokens = 0
+        pending_steps = 0
         trained_tokens = 0
         train_time = 0
         grad_accum_state = None
@@ -3663,7 +3676,16 @@ class MLXTrainer:
             on_epoch_end path reuses the lockstep collectives, so DDP stays in step.
             """
             nonlocal batch_idx, total_steps
-            self.state.epoch = float(math.ceil(it_val / batches_per_epoch))
+            # Keep the callback-visible epoch FRACTIONAL for this truncated epoch's
+            # on_epoch_end, mirroring HF: state.epoch = epoch + (step+1)/steps_in_epoch
+            # is set at the last optimizer step and stays fractional when a callback
+            # breaks the epoch mid-way (transformers _inner_training_loop fires
+            # on_epoch_end without snapping state.epoch to the next integer). Snapping
+            # to ceil(it_val / batches_per_epoch) here would report a full epoch (e.g.
+            # 1.0) for a truncated one, making epoch-based integrations treat a
+            # partial epoch as completed. it_val / batches_per_epoch is the same
+            # fractional value the per-microstep update already set.
+            self.state.epoch = it_val / batches_per_epoch
             _fire("on_epoch_end")
             self._distributed_sync_control_actions()
             if (self.control.should_log or self.control.should_evaluate
@@ -3782,15 +3804,37 @@ class MLXTrainer:
                     else:
                         raise
 
-            losses += lvalue * toks
-            n_tokens += toks
-            steps += 1
+            # Accumulate into the PENDING window (this accumulation window's
+            # micro-batches). Fold into the COMMITTED window only once the
+            # optimizer step for the window has been applied (do_update), so a
+            # forced log or the post-loop flush never reports a not-yet-applied
+            # partial window, matching HF (a partial window is never logged and its
+            # loss is folded into tr_loss only after the optimizer step).
+            pending_losses += lvalue * toks
+            pending_n_tokens += toks
+            pending_steps += 1
+            if do_update:
+                # Window applied: fold pending into committed and reset pending.
+                # Evaluating the committed accumulators here materializes the folded
+                # pending contribution, so pending (now 0) needs no separate eval.
+                losses += pending_losses
+                n_tokens += pending_n_tokens
+                steps += pending_steps
+                pending_losses = 0
+                pending_n_tokens = 0
+                pending_steps = 0
+                _metric_eval = (losses, n_tokens)
+            else:
+                # Substep: only the pending window changed; committed is unchanged
+                # (already materialized at its last fold). Both are always arrays at
+                # this point, so mx.eval never sees a plain-int accumulator.
+                _metric_eval = (pending_losses, pending_n_tokens)
             if grad_norm is not None:
                 mx.eval(grad_norm)
             if grad_accum_state is not None:
-                mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
+                mx.eval(state, *_metric_eval, grad_accum_state[0], grad_accum_state[1])
             else:
-                mx.eval(state, losses, n_tokens)
+                mx.eval(state, *_metric_eval)
             if (
                 do_update
                 and grad_norm is None
@@ -3914,14 +3958,17 @@ class MLXTrainer:
                         accum_progress = 0
                         # The abandoned micro-batches never updated the model, so
                         # their loss/tokens must not surface in a forced epoch-end
-                        # log or inflate trained_tokens. Clear the metric window
-                        # here (steps==0 then suppresses the on_epoch_end forced
-                        # _run_training_log), mirroring that the discarded gradient
-                        # is dropped -- reporting un-applied data would misstate the
-                        # logged train loss and token throughput.
-                        losses = 0
-                        n_tokens = 0
-                        steps = 0
+                        # log or inflate trained_tokens. Drop ONLY the PENDING
+                        # window here (mirroring that the discarded gradient is
+                        # dropped) -- reporting un-applied data would misstate the
+                        # logged train loss and token throughput. The COMMITTED
+                        # window (already-applied optimizer steps not yet logged)
+                        # survives so a truncated epoch-end forced log still reports
+                        # the completed update, matching HF (which logs applied
+                        # steps at on_epoch_end, never the abandoned partial window).
+                        pending_losses = 0
+                        pending_n_tokens = 0
+                        pending_steps = 0
                         it = _honor_epoch_stop_skip(
                             it, self._global_step, grad_norm)
                     self.control.should_epoch_stop = False
@@ -4070,20 +4117,21 @@ class MLXTrainer:
         # folds the trailing tr_loss into _total_loss_scalar before computing the
         # returned train_loss; without this an early stop at an unlogged step would
         # return train_loss/trained_tokens of 0 despite completed training.
-        # Gate on accum_progress == 0 (a clean optimizer-step boundary): a stop
-        # from on_substep_end or an external cancel can break mid-accumulation with
-        # accum_progress > 0, and those micro-batches never reached an optimizer
-        # update (global_step unchanged, often 0). Flushing them would report a
-        # phantom on_log / trained_tokens for training that was never applied to the
-        # model; HF likewise suppresses that log (global_step == _globalstep_last_
-        # logged). The E-flush case still fires: an on_step_end callback stop breaks
-        # in the do_update branch where accum_progress was reset to 0. steps and
-        # accum_progress advance identically on every rank, so the guard is
-        # rank-consistent and _run_training_log's all-reduce stays in lockstep. A
-        # full run forces a log on the last step (current_step == total_steps) and
-        # the on_epoch_end above may also flush, both resetting steps to 0, so this
-        # never double-counts.
-        if steps > 0 and accum_progress == 0:
+        # Gate on the COMMITTED window (steps > 0): a stop from on_substep_end or an
+        # external cancel can break mid-accumulation with a PENDING partial window
+        # that never reached an optimizer update (its micro-batches never updated
+        # the model), but those live in pending_losses/pending_n_tokens/pending_steps
+        # and are excluded here, so the flush reports only applied steps -- HF
+        # likewise never logs a not-yet-applied window (global_step ==
+        # _globalstep_last_logged). Because committed excludes the pending window,
+        # this fires even when a partial window is pending after an earlier applied
+        # step (grad_accum>1, on_substep_end stop mid-window): the completed update
+        # is still emitted rather than dropped. steps advances identically on every
+        # rank, so the guard is rank-consistent and _run_training_log's all-reduce
+        # stays in lockstep. A full run forces a log on the last step (current_step
+        # == total_steps) and the on_epoch_end above may also flush, both resetting
+        # steps to 0, so this never double-counts.
+        if steps > 0:
             _run_training_log(self._global_step, None)
 
         avg_loss = (

@@ -3081,6 +3081,40 @@ def test_epoch_stop_budget_recompute_present_in_source():
     assert "n_batches * int(args.num_train_epochs)" in src
 
 
+def test_epoch_stop_skip_keeps_fractional_epoch():
+    # Codex NEW-d: "Keep early-stopped epoch values fractional." When a callback
+    # raises should_epoch_stop mid-epoch, _honor_epoch_stop_skip fires the truncated
+    # epoch's on_epoch_end. HF sets state.epoch = epoch + (step+1)/steps_in_epoch at
+    # the last optimizer step and does NOT snap it to the next integer when the epoch
+    # is cut short (transformers _inner_training_loop fires on_epoch_end with that
+    # fractional value). Snapping to ceil(it_val / batches_per_epoch) reported a full
+    # epoch (e.g. 1.0) for a truncated one, so an epoch-based integration treated a
+    # partial epoch as completed. The skip must set the fractional it_val /
+    # batches_per_epoch instead.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    skip_def = src.index("def _honor_epoch_stop_skip(")
+    skip_body = src[skip_def:src.index('_fire("on_epoch_end")', skip_def) + 40]
+    # The fractional value is assigned; the integer-snapping ceil form is gone.
+    assert "self.state.epoch = it_val / batches_per_epoch" in skip_body
+    assert "math.ceil(it_val / batches_per_epoch)" not in skip_body
+
+    # Pure-logic parity with HF: a callback stopping after the first optimizer step
+    # of a long epoch reports the true partial fraction, not 1.0. batches_per_epoch
+    # = 10, stop at the second micro-batch (it_val = 2, the first optimizer step for
+    # grad_accum=2): HF epoch = 0 + 2/10 = 0.2, not ceil(0.2) = 1.0.
+    batches_per_epoch = 10
+    it_val = 2
+    assert it_val / batches_per_epoch == pytest.approx(0.2)
+    assert float(__import__("math").ceil(it_val / batches_per_epoch)) == 1.0  # old bug value
+
+    # A stop deeper into a later epoch stays fractional and monotonic: epoch 2, three
+    # micro-batches in -> it_val = 23, fraction = 2.3 (HF: 2 + 3/10), never 3.0.
+    assert 23 / batches_per_epoch == pytest.approx(2.3)
+
+
 def test_pending_metrics_flushed_on_early_callback_stop():
     # Regression for "Flush metrics before honoring callback stops". A
     # should_training_stop callback (or external cancel) can break the loop at a
@@ -3098,11 +3132,12 @@ def test_pending_metrics_flushed_on_early_callback_stop():
     src = inspect.getsource(MLXTrainer._train_inner)
     loop_pos = src.index("while self._global_step < total_steps:")
     avg_pos = src.index("avg_loss = (")
-    # The flush is gated on a pending window AND a clean optimizer boundary (so a
-    # partial un-applied accumulation window is not flushed; see the partial-accum
-    # regression test).
-    assert "if steps > 0 and accum_progress == 0:" in src
-    flush_pos = src.index("if steps > 0 and accum_progress == 0:")
+    # The flush is gated on the COMMITTED window (steps > 0). Committed excludes any
+    # not-yet-applied PENDING partial window (those micro-batches live in
+    # pending_losses/pending_n_tokens/pending_steps), so the flush reports only
+    # applied optimizer steps -- no accum_progress==0 clause is needed anymore.
+    assert "if steps > 0:" in src
+    flush_pos = src.index("if steps > 0:")
     assert loop_pos < flush_pos < avg_pos
     assert "_run_training_log(self._global_step, None)" in src[flush_pos:avg_pos]
 
@@ -3305,51 +3340,190 @@ def test_run_training_log_guards_empty_window():
     assert "return" in body
 
 
-def test_early_stop_flush_skips_partial_accumulation():
-    # Regression for "Do not flush partial accumulation as a trained step". A stop
-    # from on_substep_end / external cancel can break mid-accumulation-window
-    # (accum_progress > 0) with micro-batches that never reached an optimizer update
-    # (global_step often 0). The post-loop E-flush must not report them as trained
-    # progress, so it is gated on a clean optimizer boundary (accum_progress == 0)
-    # as well as a pending window.
+def _simulate_forced_epoch_logs(grad_accum, bpe, n_microsteps):
+    """Simulate committed/pending metrics with a forced log at every epoch boundary.
+
+    Models Codex NEW-b: an epoch boundary that lands on a non-update substep fires
+    on_epoch_end, and a logging callback there forces should_log. _run_training_log
+    flushes the COMMITTED window only. Returns the list of logged windows (each the
+    number of micro-batches reported) so a caller can assert no not-yet-applied
+    micro-batch is logged and none is lost from a later window.
+    """
+    committed = 0
+    pending = 0
+    accum_progress = 0
+    logged_windows = []
+    logged_total = 0
+
+    def run_training_log():
+        nonlocal committed, logged_total
+        if committed == 0:            # HF guard: global_step > _globalstep_last_logged
+            return
+        logged_windows.append(committed)
+        logged_total += committed
+        committed = 0
+
+    for microstep in range(1, n_microsteps + 1):
+        do_update = (accum_progress + 1 >= grad_accum)
+        pending += 1
+        if do_update:
+            committed += pending
+            pending = 0
+            accum_progress = 0
+        else:
+            accum_progress += 1
+        # Forced log at an epoch boundary (fired from on_epoch_end).
+        if microstep % bpe == 0:
+            run_training_log()
+    # Post-loop committed flush (E-flush) emits any remaining applied window.
+    run_training_log()
+    return dict(
+        logged_windows=logged_windows,
+        logged_total=logged_total,
+        pending_leftover=pending,
+    )
+
+
+def test_forced_epoch_log_flushes_only_committed_window():
+    # Codex NEW-b: an epoch boundary on a non-update substep (grad_accum=2, bpe=3)
+    # that forces should_log must log only the COMMITTED (applied) window, never the
+    # pending partial window, and the pending micro-batch must still appear in a
+    # later window's log rather than being reset away.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    # Source: _run_training_log flushes/reset the COMMITTED counters (losses/
+    # n_tokens/steps); the fold into committed happens only under do_update, so a
+    # forced log entered from the substep on_epoch_end path never flushes pending.
+    src = inspect.getsource(MLXTrainer._train_inner)
+    log_body = src[src.index("def _run_training_log("):src.index("def _run_eval(")]
+    assert "pending_losses" not in log_body        # helper never reads/resets pending
+    assert "_distributed_all_sum(losses" in log_body
+    assert "losses = 0" in log_body                # resets committed only
+    # The fold adds the pending window into committed and then resets pending.
+    fold = src.index("losses += pending_losses")
+    assert "pending_losses = 0" in src[fold:fold + 300]
+
+    # Behaviour: over a 6-microstep run (two 3-batch epochs, grad_accum=2), the
+    # boundary microsteps 3 and 6 are substeps. The forced epoch-end logs report the
+    # applied windows only, and every micro-batch is accounted for exactly once
+    # across the logs (none logged before it was applied, none dropped afterwards).
+    sim = _simulate_forced_epoch_logs(grad_accum=2, bpe=3, n_microsteps=6)
+    # microsteps 1..6: updates at 2 (window 1+2), 4 (window 3+4), 6 (window 5+6).
+    # boundary log at microstep 3 flushes committed window {1,2}; at microstep 6 the
+    # update {5,6} commits first, so committed = {3,4}+{5,6} = 4 micro-batches.
+    assert sim["logged_windows"] == [2, 4]
+    assert sim["logged_total"] == 6                # every micro-batch logged once
+    assert sim["pending_leftover"] == 0            # nothing left un-applied
+
+
+def test_early_stop_flush_emits_committed_not_pending_partial_window():
+    # Regression for Codex NEW-a: "Preserve completed-step metrics across partial
+    # stops." With gradient_accumulation_steps>1, a stop from on_substep_end (or an
+    # external cancel) can break on a non-update substep AFTER an earlier optimizer
+    # step that has not hit logging_steps, so losses/n_tokens would contain both the
+    # APPLIED update and a new PENDING partial window. The old E-flush guard
+    # (accum_progress == 0) skipped the flush entirely in that case, dropping the
+    # completed update from the returned train_loss/trained_tokens. The fix splits
+    # committed (applied) from pending (not-yet-applied) metrics so the post-loop
+    # flush emits only committed -- fired on `if steps > 0:` regardless of a pending
+    # window -- matching HF, which folds every applied step's tr_loss into
+    # _total_loss_scalar but never logs a not-yet-applied partial window.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     src = inspect.getsource(MLXTrainer._train_inner)
-    assert "if steps > 0 and accum_progress == 0:" in src
+    # Per-microstep accumulation targets the PENDING window; the fold into the
+    # COMMITTED window happens only on an applied optimizer step (do_update).
+    assert "pending_losses += lvalue * toks" in src
+    assert "pending_n_tokens += toks" in src
+    assert "pending_steps += 1" in src
+    # The fold folds pending into committed and then resets pending to zero.
+    fold = src.index("losses += pending_losses")
+    fold_block = src[fold:fold + 300]
+    assert "n_tokens += pending_n_tokens" in fold_block
+    assert "steps += pending_steps" in fold_block
+    assert "pending_losses = 0" in fold_block
+    # The post-loop flush is gated only on the committed window (no accum_progress
+    # clause), so a completed update that shares a stop with a pending partial
+    # window is still emitted rather than dropped.
+    assert "if steps > 0:" in src
+    assert "if steps > 0 and accum_progress == 0:" not in src
 
 
-def test_substep_stop_leaves_partial_window_unflushed():
-    # Reachability for the partial-accumulation guard: a stop at the first substep
-    # of a grad_accum>1 window leaves accum_progress > 0 and global_step == 0 (no
-    # optimizer update applied), so the E-flush's `steps > 0 and accum_progress == 0`
-    # guard correctly skips it (no phantom trained_tokens at step 0), while an
-    # on_step_end stop at a completed step (accum_progress == 0) still flushes.
-    grad_accum = 4
+def _simulate_committed_pending(grad_accum, n_microsteps):
+    """Replicate the loop's committed/pending accumulation over n_microsteps.
+
+    Uses a unit loss/token contribution of 1 per micro-batch. Returns the terminal
+    committed/pending counters (mirroring losses/steps and pending_losses/
+    pending_steps) at a break after the last micro-batch, plus whether the post-loop
+    E-flush (gated on committed steps > 0) would fire.
+    """
+    committed_steps = 0
+    committed_toks = 0
+    pending_steps = 0
+    pending_toks = 0
     accum_progress = 0
-    global_step = 0
-    it = 1
-    do_update = (accum_progress + 1 >= grad_accum)   # False -> substep
-    assert do_update is False
-    accum_progress += 1                              # substep advances accum only
-    steps = 1
-    # Mid-window stop: partial window pending, nothing applied to the model.
-    assert accum_progress > 0 and global_step == 0
-    assert not (steps > 0 and accum_progress == 0)   # E-flush guard -> skip
-    # Contrast: a completed optimizer step resets accum_progress to 0, so the flush
-    # (E case) fires and reports the real applied step.
-    accum_progress_after_update = 0
-    steps_after_update = grad_accum
-    assert (steps_after_update > 0 and accum_progress_after_update == 0)
+    for _ in range(n_microsteps):
+        do_update = (accum_progress + 1 >= grad_accum)
+        pending_steps += 1
+        pending_toks += 1
+        if do_update:
+            committed_steps += pending_steps
+            committed_toks += pending_toks
+            pending_steps = 0
+            pending_toks = 0
+            accum_progress = 0
+        else:
+            accum_progress += 1
+    return dict(
+        committed_steps=committed_steps,
+        committed_toks=committed_toks,
+        pending_steps=pending_steps,
+        pending_toks=pending_toks,
+        eflush_fires=(committed_steps > 0),
+    )
 
 
-def test_substep_epoch_stop_discard_clears_metric_window():
-    # When a mid-epoch substep honors should_epoch_stop it abandons the partial
-    # accumulation window (grad_accum_state = None) -- those micro-batches never
-    # updated the model. Their loss/tokens must NOT surface in the forced
-    # on_epoch_end log or inflate trained_tokens, so the discard must also clear the
-    # metric accumulators (losses/n_tokens/steps). With them cleared, the steps==0
-    # early-return in _run_training_log suppresses the phantom epoch-end log.
+def test_substep_stop_flushes_committed_drops_pending_partial_window():
+    # Pure-logic proof of the Codex NEW-a fix. grad_accum=2, a stop lands on the
+    # first substep of a NEW window (microstep 3) that follows an already-APPLIED
+    # optimizer step (microstep 2). committed holds the applied window (micro-batches
+    # 1+2); pending holds the un-applied micro-batch 3. The E-flush fires on
+    # committed steps > 0 and reports ONLY the committed window (2 micro-batches),
+    # so the completed update is not dropped, and the pending micro-batch is not
+    # reported as trained.
+    state = _simulate_committed_pending(grad_accum=2, n_microsteps=3)
+    assert state["committed_steps"] == 2      # micro-batches 1+2 (applied window)
+    assert state["committed_toks"] == 2
+    assert state["pending_steps"] == 1        # micro-batch 3 (not applied)
+    assert state["eflush_fires"] is True      # committed window is flushed
+
+    # Contrast: a stop at the very first substep of the run (before any optimizer
+    # step) leaves committed empty and pending holding the un-applied micro-batch,
+    # so the E-flush is skipped (no phantom trained_tokens at global_step 0).
+    first = _simulate_committed_pending(grad_accum=4, n_microsteps=1)
+    assert first["committed_steps"] == 0
+    assert first["pending_steps"] == 1
+    assert first["eflush_fires"] is False
+
+    # A run that ends exactly on an applied optimizer step has no pending remainder,
+    # and the committed window flushes fully (parity with the pre-split E case).
+    aligned = _simulate_committed_pending(grad_accum=2, n_microsteps=4)
+    assert aligned["pending_steps"] == 0
+    assert aligned["committed_steps"] == 4
+    assert aligned["eflush_fires"] is True
+
+
+def test_substep_epoch_stop_discard_clears_only_pending_window():
+    # Codex NEW-b, discard side: when a mid-epoch substep honors should_epoch_stop it
+    # abandons the partial accumulation window (grad_accum_state = None) -- those
+    # micro-batches never updated the model. Their loss/tokens must NOT surface in a
+    # forced epoch-end log or inflate trained_tokens, so the discard clears ONLY the
+    # PENDING accumulators. The COMMITTED window (already-applied optimizer steps not
+    # yet logged) must survive, so a truncated epoch-end forced log still reports the
+    # completed update instead of dropping it (HF logs applied steps at on_epoch_end
+    # and never the abandoned partial window).
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -3358,10 +3532,16 @@ def test_substep_epoch_stop_discard_clears_metric_window():
     branch = src[substep:src.index("continue", substep)]
     discard = branch.index("grad_accum_state = None")
     skip = branch.index("_honor_epoch_stop_skip(")
-    # The three metric accumulators are zeroed in the discard block, before the skip.
-    for name in ("losses = 0", "n_tokens = 0", "steps = 0"):
+    # ONLY the pending accumulators are zeroed in the discard block, before the skip.
+    for name in ("pending_losses = 0", "pending_n_tokens = 0", "pending_steps = 0"):
         pos = branch.index(name, discard)
         assert discard < pos < skip, f"{name} must be cleared at the discard"
-    # The steps==0 guard that then suppresses the forced log is present.
-    log_src = inspect.getsource(MLXTrainer._train_inner)
-    assert "if steps == 0:" in log_src
+    # The committed accumulators must NOT be reset in the discard block (a bare
+    # "losses = 0" would drop a completed update); only the pending ones are.
+    for committed in ("losses = 0", "n_tokens = 0", "steps = 0"):
+        assert f"pending_{committed}" in branch
+        # No committed reset (a "losses = 0" not preceded by "pending_") in the discard.
+        assert f"\n                        {committed}" not in branch
+    # The steps==0 committed-window guard in _run_training_log still suppresses a
+    # forced log when nothing has been committed since the last log.
+    assert "if steps == 0:" in src
