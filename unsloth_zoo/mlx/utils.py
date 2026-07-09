@@ -1066,6 +1066,42 @@ def _hf_encoding_tokenizer(tokenizer):
     return getattr(tokenizer, "_tokenizer", tokenizer)
 
 
+def _common_prefix_len(*seqs):
+    """Length of the longest shared leading prefix across all sequences.
+
+    Locates the prompt/completion boundary for a preference pair from the
+    standalone-prompt ids (``p_ids``) and the two concatenated prompt+completion
+    encodings (``c_full``, ``r_full``). It is correct even when encoding
+    ``prompt + answer`` does not simply concatenate ``encode(prompt)`` and
+    ``encode(answer)``:
+
+    * When the tokenizer MERGES the boundary token -- the last prompt token and
+      the first chosen/rejected token fuse into a single id inside
+      ``encode(prompt + answer)`` -- the standalone prompt is no longer a true
+      prefix of the concatenation. A plain ``min(len(...))`` boundary then treats
+      the merged token (which carries part of the response) as prompt and masks
+      it out, and the chosen/rejected prompt prefixes can diverge before
+      ``len(p_ids)`` so the pair no longer shares a single ``response_start``.
+      Walking the shared prefix stops at the first divergent id, giving a boundary
+      that both rows agree on (``c_full[:pe] == r_full[:pe]`` by construction).
+    * When the tokenizer appends a prompt-only EOS during ``encode``
+      (``add_eos_token=True``), that EOS is absent at the prompt/completion seam
+      inside ``encode(prompt + answer)``; the shared prefix stops at it rather
+      than overcounting the prompt by one and masking the first completion token.
+    * In the normal case (``p_ids`` IS a true prefix of both completions) this
+      returns ``len(p_ids)`` -- identical to the old ``min(len(...))`` and a
+      no-op.
+    """
+    if not seqs:
+        return 0
+    limit = min(len(s) for s in seqs)
+    first = seqs[0]
+    i = 0
+    while i < limit and all(s[i] == first[i] for s in seqs[1:]):
+        i += 1
+    return i
+
+
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
@@ -1122,10 +1158,18 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         p_ids = encode_mlx_text(hf, prompt)
         c_full = _with_eos(encode_mlx_text(hf, prompt + ex[chosen_key]))
         r_full = _with_eos(encode_mlx_text(hf, prompt + ex[rejected_key]))
-        # Response boundary = the shared prompt-prefix length. min() guards the
-        # rare boundary-merge case where joining prompt+answer changes the token
-        # count of the prompt region below len(p_ids).
-        pe0 = min(len(p_ids), len(c_full), len(r_full))
+        # Response boundary = the shared prompt-prefix length: the longest prefix
+        # common to the standalone prompt and both concatenated rows. A plain
+        # min(len(...)) assumes p_ids is a true prefix of c_full/r_full, which
+        # breaks when the tokenizer merges the boundary token (last prompt token
+        # fuses with the first chosen/rejected token) or appends a prompt-only EOS
+        # during encode: the merged/EOS token then diverges from p_ids BEFORE
+        # len(p_ids), so min() would land past the true boundary (masking a
+        # response token as prompt) and the chosen/rejected prompt prefixes could
+        # differ. _common_prefix_len stops at the first divergence, so both rows
+        # keep a single response_start (c_full[:pe0] == r_full[:pe0]); it returns
+        # len(p_ids) unchanged in the normal true-prefix case (no-op).
+        pe0 = _common_prefix_len(p_ids, c_full, r_full)
         # Reserve room for the chosen/rejected completion before truncating to
         # max_seq_length. A plain [:max_seq_length] right-truncation drops the
         # END of prompt+answer, so a long-prompt row keeps masked prompt tokens

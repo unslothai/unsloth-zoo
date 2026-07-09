@@ -1264,6 +1264,70 @@ def test_preference_batches_append_eos_to_completions():
     assert rows[0][ce - 1] == 7 and rows[1][re_ - 1] == 7
 
 
+def test_preference_batches_common_prefix_boundary_under_token_merge():
+    # When the tokenizer MERGES the boundary token -- the last prompt token fuses
+    # with the first chosen/rejected token inside encode(prompt+answer) -- the
+    # standalone prompt is no longer a true prefix of the concatenation. A
+    # length-only min(len(p_ids), len(c_full), len(r_full)) boundary would then
+    # (a) treat the merged token (which carries part of the response) as prompt and
+    # mask it out of the scored [response_start, seq_end) span, and (b) land on a
+    # position where the chosen and rejected "prompt" prefixes DIFFER, so the pair
+    # no longer shares a single response_start. _common_prefix_len stops at the
+    # first divergent id, keeping the merged token in the response and a single
+    # response_start both rows agree on.
+    from unsloth_zoo.mlx.utils import (
+        create_preference_batches,
+        _common_prefix_len,
+    )
+
+    class _MergeTok:
+        eos_token_id = 7  # distinct from every content token below
+        bos_token = None
+
+        def encode(self, text, add_special_tokens=True):
+            # Standalone prompt "P" ends with a boundary token (9). Concatenating
+            # the answer FUSES that 9 with the first answer token into a NEW id
+            # (5 for chosen, 6 for rejected), so p_ids is not a prefix of either
+            # full encoding and the two prompt prefixes diverge at index 2.
+            table = {
+                "P": [1, 1, 9],
+                "PC": [1, 1, 5, 2, 2],
+                "PR": [1, 1, 6, 3, 3],
+            }
+            return list(table[text])
+
+    # The shared prefix across the standalone prompt and both concatenations is 2
+    # (the divergence index), NOT min(len(...)) == 3.
+    assert _common_prefix_len(
+        [1, 1, 9], [1, 1, 5, 2, 2, 7], [1, 1, 6, 3, 3, 7]
+    ) == 2
+    # Sanity: an ordinary true-prefix pair is a no-op (returns len(p_ids)).
+    assert _common_prefix_len([1, 1], [1, 1, 2, 2], [1, 1, 3, 3, 3]) == 2
+
+    dataset = [{"prompt": "P", "chosen": "C", "rejected": "R"}]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _MergeTok(), batch_size=1, max_seq_length=64,
+    )[0]
+    rows = batch.tolist()
+    lengths = lengths.tolist()
+    chosen_start, chosen_end = lengths[0]
+    rejected_start, rejected_end = lengths[1]
+
+    # Response boundary is the shared-prefix length (2), NOT min(len(p_ids)) == 3.
+    assert chosen_start == 2
+    assert rejected_start == 2
+    # Both rows keep the SAME prompt prefix up to the boundary; a min()-based
+    # boundary at 3 would put the diverging merged tokens (5 vs 6) inside the
+    # "prompt" region, so the pair would no longer share a response_start.
+    assert rows[0][:chosen_start] == [1, 1]
+    assert rows[1][:rejected_start] == [1, 1]
+    # The merged boundary token stays in the scored response span (5 for chosen,
+    # 6 for rejected), followed by the answer tokens and the appended EOS -- a
+    # min() boundary would have masked it out of the loss.
+    assert rows[0][chosen_start:chosen_end] == [5, 2, 2, 7]
+    assert rows[1][rejected_start:rejected_end] == [6, 3, 3, 7]
+
+
 def test_grpo_prepare_data_normalizes_tokenizer_chat_template():
     # GRPO must apply the configured chat_template override to the rollout
     # tokenizer, mirroring the SFT/DPO data path (MLXTrainer._prepare_data).
@@ -2380,6 +2444,97 @@ def test_grpo_rollout_excludes_view_added_token_columns_from_reward_kwargs(monke
     batch, lengths, advantages = next(gen)  # must not raise on leaked token kwargs
     assert batch.shape[0] == 2
     assert advantages.shape[0] == 2
+
+
+def test_grpo_rollout_passes_generated_completion_ids_to_reward_funcs(monkeypatch):
+    # TRL forwards the GENERATED completion_ids (per-completion token id lists) to
+    # every reward function so token-level rewards (length / special-token counts)
+    # can score the exact sampled tokens. The MLX rollout must do the same: a
+    # reward callback that declares a completion_ids parameter must receive the
+    # generated ids used to build the loss rows (the [response_start, end) span),
+    # not any dataset completion_ids column. The pass is signature-gated so a
+    # strict-signature reward (no completion_ids / no **kwargs) still works.
+    import types
+    import mlx_lm
+    from unsloth_zoo.mlx.trainer import (
+        MLXGRPOTrainer,
+        _reward_func_wants_completion_ids,
+    )
+
+    # Unit-level: the signature gate accepts a completion_ids param or **kwargs and
+    # rejects a strict signature that has neither.
+    assert _reward_func_wants_completion_ids(
+        lambda completions, prompts, completion_ids: None)
+    assert _reward_func_wants_completion_ids(
+        lambda completions, prompts, **kw: None)
+    assert not _reward_func_wants_completion_ids(
+        lambda completions, prompts, answer: None)
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    # Newer mlx-lm surfaces the generated ids (its signature has return_token_ids),
+    # so the rollout takes the comp_ids branch and scores the exact sampled tokens.
+    def _gen(model, tokenizer, prompts=None, max_tokens=None, sampler=None,
+             verbose=False, return_token_ids=False):
+        return types.SimpleNamespace(
+            texts=["aa", "bb"], token_ids=[[10, 11], [12, 13]])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    class _Model:
+        def __init__(self):
+            self.training = True
+        def eval(self):
+            self.training = False
+        def train(self, mode=True):
+            self.training = mode
+
+    captured = {}
+
+    # Token-level reward: declares completion_ids, so it must receive the generated
+    # ids. Also carries **kwargs to absorb the passed-through 'answer' column.
+    def reward_with_ids(completions=None, prompts=None, completion_ids=None, **kw):
+        captured["completion_ids"] = completion_ids
+        return [0.1, 0.2]
+
+    # Strict-signature reward (round-3 back-compat): accepts its real 'answer'
+    # column but NOT completion_ids and has no **kwargs; it must NOT be handed the
+    # generated completion_ids (that would raise TypeError: unexpected keyword).
+    def reward_strict(completions=None, prompts=None, answer=None):
+        captured["strict_ran"] = True
+        return [0.3, 0.4]
+
+    tok = _Tok()
+    original = [{"prompt": "p", "answer": "a"}]
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = _Model()
+    trainer.tokenizer = tok
+    trainer.train_dataset = original
+    trainer.reward_funcs = [reward_with_ids, reward_strict]
+    trainer.args = types.SimpleNamespace(
+        num_generations=2, temperature=1.0,
+        max_completion_length=4, max_seq_length=32,
+    )
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, advantages = next(gen)  # strict reward must not raise
+    rows = batch.tolist()
+    lens = lengths.tolist()
+    pe = lens[0][0]
+    # The completion_ids the reward received are the GENERATED ids that build the
+    # loss rows: exactly each row's scored [pe, end) span (generated ids [10, 11] /
+    # [12, 13] with the appended EOS 0), not the dataset column.
+    assert captured["completion_ids"] == [
+        rows[0][pe:lens[0][1]],
+        rows[1][pe:lens[1][1]],
+    ]
+    assert captured["completion_ids"] == [[10, 11, 0], [12, 13, 0]]
+    # The strict-signature reward still ran (received no completion_ids keyword).
+    assert captured["strict_ran"] is True
 
 
 def test_grpo_rollout_reencode_fallback_appends_eos_on_normal_stop(monkeypatch):

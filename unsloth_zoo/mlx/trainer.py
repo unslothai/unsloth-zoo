@@ -3796,6 +3796,34 @@ class MLXDPOTrainer(MLXTrainer):
                          data_collator, args, formatting_func, processor)
 
 
+def _reward_func_wants_completion_ids(func):
+    """True if a GRPO reward callable can receive the generated ``completion_ids``.
+
+    TRL passes the generated ``completion_ids`` (per-completion token id lists) to
+    every reward function so token-level rewards (length / special-token counts)
+    can score the exact sampled tokens. But a reward callback with a strict
+    signature -- only its real dataset columns, no ``**kwargs`` (e.g.
+    ``def r(completions, prompts, answer)``) -- is also a supported form here (the
+    reward-kwargs are sourced from the original dataset columns), so passing
+    ``completion_ids`` unconditionally would raise ``TypeError: unexpected keyword``
+    on such a function. Gate the pass on the signature: forward ``completion_ids``
+    only when the function declares a ``completion_ids`` parameter or accepts
+    ``**kwargs``; otherwise omit it (back-compat with strict-signature rewards).
+    """
+    import inspect
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        # Builtins / C callables that expose no signature: assume they cannot
+        # accept completion_ids rather than risk an unexpected-keyword crash.
+        return False
+    if "completion_ids" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 class MLXGRPOTrainer(MLXTrainer):
     """GRPO trainer mirroring TRL's GRPOTrainer. Forces loss_type='grpo'.
 
@@ -4068,16 +4096,103 @@ class MLXGRPOTrainer(MLXTrainer):
             # Exact generated IDs per completion (see _supports_token_ids note);
             # None when unavailable, in which case rows fall back to re-encoding.
             comp_ids = getattr(resp, "token_ids", None) if _supports_token_ids else None
+            # Build the concatenated group batch BEFORE scoring rewards so the
+            # exact per-completion generated ids that the loss will train on are
+            # available to the reward functions (TRL forwards these generated
+            # completion_ids to every reward func). The rows do not depend on the
+            # advantages, so building them first is a pure reorder of the prior
+            # rewards-then-rows sequence.
+            pe = len(pids)
+            # EOS re-append policy, shared by BOTH scoring paths (the comp_ids
+            # branch and the re-encode fallback). mlx-lm's batch_generate strips
+            # the terminal EOS from a normally-terminating row (finish_reason ==
+            # "stop") -- from the returned ids AND from resp.texts -- keeping all
+            # _gen_max tokens only when it truncated on length. TRL's GRPO
+            # completion mask is inclusive of that EOS (sequence_indices <=
+            # eos_idx), so the stop action gets advantage-weighted gradient/KL.
+            # Re-add the EOS when a row stopped normally (its completion is shorter
+            # than the generation cap _gen_max) so the loss scores the model's
+            # probability of stopping and does not bias completion-length/EOS
+            # behavior; a row at the cap was length-truncated (no EOS emitted) and
+            # is left as-is, mirroring TRL's default mask_truncated_completions=
+            # False. _gen_max already bounds the prompt + completion (+ this EOS)
+            # to max_seq_length, so the cut below never drops a reward-scored token.
+            # Only re-append when the stop token is unambiguous. mlx-lm stops on ANY
+            # id in the tokenizer's eos set and strips whichever one stopped the row
+            # without surfacing which, so for a model with multiple eos ids (e.g. a
+            # chat end-of-turn token distinct from eos_token_id) appending the
+            # singular hf.eos_token_id could train the probability of the WRONG
+            # terminal token. Re-append only when there is no multi-eos set or it is
+            # a single id equal to hf.eos_token_id; otherwise skip (leaving the stop
+            # action unscored is safer than scoring a wrong token). Single-eos
+            # models keep the exact prior behavior.
+            _eos_id = getattr(hf, "eos_token_id", None)
+            _mlx_eos = getattr(self.tokenizer, "eos_token_ids", None)
+            if isinstance(_mlx_eos, int):
+                _mlx_eos = [_mlx_eos]
+            _eos_unambiguous = (
+                _eos_id is not None
+                and (not _mlx_eos
+                     or (len(_mlx_eos) == 1 and _eos_id in _mlx_eos))
+            )
+            rows, lengths, completion_ids_list = [], [], []
+            for i, c in enumerate(comps):
+                if comp_ids is not None and comp_ids[i] is not None:
+                    # Score the EXACT generated continuation: prompt ids followed
+                    # by the sampled completion ids. This makes pe a true prefix
+                    # length by construction and avoids the decode->re-encode
+                    # roundtrip corrupting the tokens the policy generated. len(comp)
+                    # is the surfaced token count, so len(comp) < _gen_max marks a
+                    # normal stop (see the EOS policy above).
+                    comp = [int(t) for t in comp_ids[i]]
+                    if _eos_unambiguous and len(comp) < _gen_max:
+                        comp = comp + [int(_eos_id)]
+                    full = (pids + comp)[: args.max_seq_length]
+                else:
+                    # Fallback (older mlx-lm without generated-id surfacing):
+                    # guard the prompt+completion tokenization against the same
+                    # double BOS as the prompt above, and with the SAME guard so
+                    # the response boundary pe (from the guarded prompt encode)
+                    # stays a true prefix length of this full sequence.
+                    full = encode_mlx_text(hf, rendered + c)
+                    # Mirror the comp_ids branch's EOS re-append here too: on a
+                    # normal stop batch_generate already stripped the terminal EOS
+                    # from resp.texts, so the re-encoded row has none to score and
+                    # the loss/KL would silently stop training EOS/length behavior on
+                    # this compatibility path. The completion's re-encoded span is
+                    # len(full) - pe; when it is below the generation cap _gen_max the
+                    # row stopped normally, so append the EOS (a span at _gen_max was
+                    # length-truncated and is left as-is). _gen_max bounds pe + span
+                    # (+ EOS) to max_seq_length, so the cut below keeps the EOS.
+                    _comp_len = len(full) - pe
+                    if _eos_unambiguous and 0 <= _comp_len < _gen_max:
+                        full = full + [int(_eos_id)]
+                    full = full[: args.max_seq_length]
+                rows.append(full)
+                lengths.append([pe, len(full)])
+                # The exact generated completion ids the loss trains on for this
+                # row: the [pe, len(full)) span of `full`. Forwarded to reward
+                # funcs that declare a completion_ids parameter (below), matching
+                # TRL, which passes the GENERATED ids -- not any dataset
+                # completion_ids column -- to each reward function. Identical in
+                # both branches because full[pe:] is the response span whether
+                # `full` came from the comp_ids continuation or the re-encode
+                # fallback (pe is a true prefix length in each), so token-level
+                # rewards score the same tokens the policy is optimized on.
+                completion_ids_list.append(full[pe:])
+            L = max(len(r) for r in rows)
+            batch = mx.array([r + [pad_id] * (L - len(r)) for r in rows], dtype=mx.int32)
             # rewards: sum across reward functions (TRL-style). Pass through the
             # dataset row's other columns as kwargs (repeated per generation to
             # align row-for-row with completions), mirroring
-            # GRPOTrainer._calculate_rewards. 'prompt'/'completion'/
-            # 'completion_ids' are excluded exactly as TRL does. completion_ids
-            # are not passed to reward functions (and trainer_state is not
-            # available: there is no transformers TrainerState here), so they are
-            # left as follow-up rather than faked. Note the scoring path above
-            # does consume the generated ids (comp_ids) when mlx-lm surfaces
-            # them, so the loss runs on the sampled tokens.
+            # GRPOTrainer._calculate_rewards. The 'prompt'/'completion'/
+            # 'completion_ids' dataset columns are excluded exactly as TRL does;
+            # the GENERATED completion_ids (completion_ids_list above) are then
+            # forwarded separately, signature-gated so a strict-signature reward
+            # without a completion_ids parameter / **kwargs is not handed an
+            # unexpected keyword (see _reward_func_wants_completion_ids).
+            # trainer_state is not available here (no transformers TrainerState),
+            # so it is omitted rather than faked.
             reward_kwargs = {
                 k: [example[k]] * N
                 for k in example
@@ -4117,11 +4232,19 @@ class MLXGRPOTrainer(MLXTrainer):
                 _reward_completions = comps
             total = [0.0] * N
             for rf in self.reward_funcs:
-                vals = rf(
+                _call_kwargs = dict(
                     completions=_reward_completions,
                     prompts=[_reward_prompt] * N,
-                    **reward_kwargs,
                 )
+                _call_kwargs.update(reward_kwargs)
+                # Forward the generated completion_ids only to reward funcs that
+                # can accept them (declare a completion_ids parameter or **kwargs).
+                # A strict-signature reward (def r(completions, prompts, answer))
+                # is a supported form here, and handing it an unexpected
+                # completion_ids keyword would raise TypeError -- so gate the pass.
+                if _reward_func_wants_completion_ids(rf):
+                    _call_kwargs["completion_ids"] = completion_ids_list
+                vals = rf(**_call_kwargs)
                 # TRL's reward-function contract is one score per completion:
                 # len(vals) must equal N. A shorter list would leave the unfilled
                 # positions at their initial 0.0 (silently fabricating rewards and
@@ -4156,77 +4279,6 @@ class MLXGRPOTrainer(MLXTrainer):
             _mean = rewards.mean()
             _std = (((rewards - _mean) ** 2).sum() / (rewards.shape[0] - 1)) ** 0.5
             advantages = (rewards - _mean) / (_std + 1e-4)
-            # build the concatenated group batch
-            pe = len(pids)
-            # EOS re-append policy, shared by BOTH scoring paths (the comp_ids
-            # branch and the re-encode fallback). mlx-lm's batch_generate strips
-            # the terminal EOS from a normally-terminating row (finish_reason ==
-            # "stop") -- from the returned ids AND from resp.texts -- keeping all
-            # _gen_max tokens only when it truncated on length. TRL's GRPO
-            # completion mask is inclusive of that EOS (sequence_indices <=
-            # eos_idx), so the stop action gets advantage-weighted gradient/KL.
-            # Re-add the EOS when a row stopped normally (its completion is shorter
-            # than the generation cap _gen_max) so the loss scores the model's
-            # probability of stopping and does not bias completion-length/EOS
-            # behavior; a row at the cap was length-truncated (no EOS emitted) and
-            # is left as-is, mirroring TRL's default mask_truncated_completions=
-            # False. _gen_max already bounds the prompt + completion (+ this EOS)
-            # to max_seq_length, so the cut below never drops a reward-scored token.
-            # Only re-append when the stop token is unambiguous. mlx-lm stops on ANY
-            # id in the tokenizer's eos set and strips whichever one stopped the row
-            # without surfacing which, so for a model with multiple eos ids (e.g. a
-            # chat end-of-turn token distinct from eos_token_id) appending the
-            # singular hf.eos_token_id could train the probability of the WRONG
-            # terminal token. Re-append only when there is no multi-eos set or it is
-            # a single id equal to hf.eos_token_id; otherwise skip (leaving the stop
-            # action unscored is safer than scoring a wrong token). Single-eos
-            # models keep the exact prior behavior.
-            _eos_id = getattr(hf, "eos_token_id", None)
-            _mlx_eos = getattr(self.tokenizer, "eos_token_ids", None)
-            if isinstance(_mlx_eos, int):
-                _mlx_eos = [_mlx_eos]
-            _eos_unambiguous = (
-                _eos_id is not None
-                and (not _mlx_eos
-                     or (len(_mlx_eos) == 1 and _eos_id in _mlx_eos))
-            )
-            rows, lengths = [], []
-            for i, c in enumerate(comps):
-                if comp_ids is not None and comp_ids[i] is not None:
-                    # Score the EXACT generated continuation: prompt ids followed
-                    # by the sampled completion ids. This makes pe a true prefix
-                    # length by construction and avoids the decode->re-encode
-                    # roundtrip corrupting the tokens the policy generated. len(comp)
-                    # is the surfaced token count, so len(comp) < _gen_max marks a
-                    # normal stop (see the EOS policy above).
-                    comp = [int(t) for t in comp_ids[i]]
-                    if _eos_unambiguous and len(comp) < _gen_max:
-                        comp = comp + [int(_eos_id)]
-                    full = (pids + comp)[: args.max_seq_length]
-                else:
-                    # Fallback (older mlx-lm without generated-id surfacing):
-                    # guard the prompt+completion tokenization against the same
-                    # double BOS as the prompt above, and with the SAME guard so
-                    # the response boundary pe (from the guarded prompt encode)
-                    # stays a true prefix length of this full sequence.
-                    full = encode_mlx_text(hf, rendered + c)
-                    # Mirror the comp_ids branch's EOS re-append here too: on a
-                    # normal stop batch_generate already stripped the terminal EOS
-                    # from resp.texts, so the re-encoded row has none to score and
-                    # the loss/KL would silently stop training EOS/length behavior on
-                    # this compatibility path. The completion's re-encoded span is
-                    # len(full) - pe; when it is below the generation cap _gen_max the
-                    # row stopped normally, so append the EOS (a span at _gen_max was
-                    # length-truncated and is left as-is). _gen_max bounds pe + span
-                    # (+ EOS) to max_seq_length, so the cut below keeps the EOS.
-                    _comp_len = len(full) - pe
-                    if _eos_unambiguous and 0 <= _comp_len < _gen_max:
-                        full = full + [int(_eos_id)]
-                    full = full[: args.max_seq_length]
-                rows.append(full)
-                lengths.append([pe, len(full)])
-            L = max(len(r) for r in rows)
-            batch = mx.array([r + [pad_id] * (L - len(r)) for r in rows], dtype=mx.int32)
             yield batch, mx.array(lengths), advantages
 
     def _prepare_data(self, is_vlm):
