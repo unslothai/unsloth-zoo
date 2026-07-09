@@ -1439,10 +1439,14 @@ def test_should_epoch_stop_field_reset_and_honored():
     # only for materialized batches (a streaming iterator can't be index-skipped).
     assert "batch_idx += _skipped" in src
     assert "batch_iter is None" in src
-    # On the epoch-count-driven path the skipped batches also shrink the
-    # optimizer-step budget so the run does not overtrain past num_train_epochs;
-    # max_steps runs keep their fixed budget.
-    assert "total_steps - _skipped // grad_accum" in src
+    # On the epoch-count-driven path the shortened epoch also shrinks the
+    # optimizer-step budget so the run does not overtrain past num_train_epochs.
+    # The budget is recomputed from the micro-batches that remain after the skip
+    # (len(batches) - batch_idx), so even a sub-grad_accum skipped tail reduces it
+    # and the loop never wraps batches[idx % len] into already-seen data; the old
+    # `_skipped // grad_accum` under-counted such tails. max_steps runs keep their
+    # fixed budget.
+    assert "(len(batches) - batch_idx) // grad_accum" in src
     assert '_prepared_batches_include_epochs' in src
 
 
@@ -2925,3 +2929,154 @@ def test_substep_stop_not_preempted_by_epoch_end_eval_ddp(monkeypatch):
     assert rank1.stop_requested is False
     assert rank1._distributed_should_stop() is True
     assert rank1.stop_requested is True
+
+
+def _simulate_epoch_stop_loop(bpe, num_epochs, grad_accum, budget_rule,
+                              include_epochs=True, max_iters=100000):
+    """Replicate the flattened micro-batch loop's consume / skip / budget cadence.
+
+    Models a callback that sets should_epoch_stop on every optimizer step (i.e.
+    ends each epoch at its first update), which is the scenario Codex flagged: a
+    skipped tail smaller than grad_accum. Returns the terminal loop state and
+    whether the modulo fetch ever wrapped past the real materialized data.
+    """
+    n = bpe * num_epochs                    # len(batches): all epochs materialized
+    total_steps = max(1, n // grad_accum)
+    global_step = 0
+    batch_idx = 0
+    accum = 0
+    microstep = 0
+    wrapped = False
+    guard = 0
+    while global_step < total_steps:
+        guard += 1
+        if guard > max_iters:
+            raise RuntimeError("loop did not terminate")
+        it = microstep + 1
+        if batch_idx >= n:                  # batches[batch_idx % n] re-uses data
+            wrapped = True
+        batch_idx += 1
+        do_update = (accum + 1 >= grad_accum)
+        if not do_update:
+            accum += 1
+            microstep = it
+            continue
+        global_step += 1
+        accum = 0
+        # Callback keeps should_epoch_stop set: honor it at every mid-epoch update.
+        if it % bpe != 0:
+            next_boundary = ((it // bpe) + 1) * bpe
+            skipped = next_boundary - it
+            batch_idx += skipped
+            it = next_boundary
+            if include_epochs:
+                total_steps = budget_rule(total_steps, global_step, skipped,
+                                          grad_accum, n, batch_idx)
+        microstep = it
+    return dict(global_step=global_step, batch_idx=batch_idx,
+                wrapped=wrapped, total_steps=total_steps, n=n)
+
+
+def test_epoch_stop_budget_recompute_no_data_reuse():
+    # Regression for "Recompute remaining steps when skipping partial epochs".
+    # bpe=7, grad_accum=4, 3 epochs (total_steps = 21 // 4 = 5). A callback ends
+    # each epoch at its first optimizer step, so the skipped tail is 3 < grad_accum.
+    # The old budget rule reduced total_steps by `skipped // grad_accum == 0`, so
+    # the loop kept its original budget and wrapped batches[idx % 21] back into
+    # already-seen data (overtraining + phantom epoch events). The new rule
+    # recomputes the budget from the micro-batches that remain (len(batches) -
+    # batch_idx), stopping cleanly when the materialized data is exhausted.
+    def new_rule(total_steps, global_step, skipped, grad_accum, n, batch_idx):
+        return global_step + (n - batch_idx) // grad_accum
+
+    def old_rule(total_steps, global_step, skipped, grad_accum, n, batch_idx):
+        return max(global_step, total_steps - skipped // grad_accum)
+
+    new = _simulate_epoch_stop_loop(7, 3, 4, new_rule)
+    old = _simulate_epoch_stop_loop(7, 3, 4, old_rule)
+
+    # New rule: never re-reads data, one optimizer step per epoch, budget shrinks.
+    assert new["wrapped"] is False
+    assert new["global_step"] == 3
+    assert new["batch_idx"] <= new["n"]     # cursor never passes the real data end
+    assert new["total_steps"] == 3
+    # Old rule: the sub-grad_accum tail left the budget unchanged, so the loop
+    # cycled past the materialized data (the bug being fixed).
+    assert old["wrapped"] is True
+    assert old["global_step"] > new["global_step"]
+
+    # A skipped tail that IS a whole grad_accum window was already handled by the
+    # old rule; the new rule matches it (no regression on the aligned case).
+    aligned_new = _simulate_epoch_stop_loop(8, 3, 4, new_rule)
+    assert aligned_new["wrapped"] is False
+
+
+def test_epoch_stop_budget_recompute_present_in_source():
+    # Guard the exact recompute expression so the fix is not silently reverted to
+    # the floor-division form that under-counts sub-grad_accum tails.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert "(len(batches) - batch_idx) // grad_accum" in src
+    assert "total_steps - _skipped // grad_accum" not in src
+
+
+def test_pending_metrics_flushed_on_early_callback_stop():
+    # Regression for "Flush metrics before honoring callback stops". A
+    # should_training_stop callback (or external cancel) can break the loop at a
+    # step that is neither a logging_steps multiple nor the last step, so
+    # _run_training_log never ran for that window. trained_tokens and
+    # _train_loss_history are updated only inside _run_training_log, so without a
+    # post-loop flush the returned train_loss/trained_tokens would be 0 despite
+    # completed training. HF folds the trailing tr_loss into _total_loss_scalar
+    # before computing the returned train_loss; assert the equivalent flush exists,
+    # runs after the loop, is guarded by an unlogged-window check, and precedes the
+    # returned avg_loss.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    loop_pos = src.index("while self._global_step < total_steps:")
+    avg_pos = src.index("avg_loss = (")
+    assert "if steps > 0:" in src
+    flush_pos = src.index("if steps > 0:")
+    assert loop_pos < flush_pos < avg_pos
+    assert "_run_training_log(self._global_step, None)" in src[flush_pos:avg_pos]
+
+
+def test_max_steps_can_end_off_epoch_boundary():
+    # Reachability for the truncated-epoch on_epoch_end fix: max_steps rarely
+    # aligns to a dataset boundary. With batches_per_epoch=5, grad_accum=2,
+    # max_steps=3 the run ends at microstep 6, and 6 % 5 == 1 != 0, so the in-loop
+    # boundary dispatch (gated on microstep % batches_per_epoch == 0) never fires
+    # on_epoch_end for that final epoch.
+    batches_per_epoch = 5
+    grad_accum = 2
+    max_steps = 3
+    end_microstep = max_steps * grad_accum
+    assert end_microstep % batches_per_epoch != 0
+
+
+def test_on_epoch_end_fires_for_truncated_final_epoch():
+    # Regression for "Close open epochs before leaving the loop". HF fires
+    # on_epoch_end for a truncated final epoch after its inner step loop breaks
+    # (max_steps ending mid-dataset, or a should_training_stop mid-epoch). The MLX
+    # loop's only in-loop on_epoch_end dispatch is gated on
+    # microstep % batches_per_epoch == 0, so a mid-epoch exit would drop the event.
+    # Assert a post-loop dispatch closes the open epoch, guarded against a double
+    # fire at a natural boundary, before on_train_end.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    tail = src[src.index("Close a truncated final epoch"):src.index("avg_loss = (")]
+    assert "microstep % batches_per_epoch != 0" in tail
+    assert '_fire("on_epoch_end")' in tail
+    # The counter is advanced before the stop-break so a callback-stop exit still
+    # leaves microstep pointing at the finished step for the guard above (the
+    # assignment precedes the break comment + `if _sync_stop(): break`).
+    assert (
+        "microstep = it\n"
+        "            # Propagate any stop set by the tail callbacks"
+    ) in src

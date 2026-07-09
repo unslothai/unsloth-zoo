@@ -3910,25 +3910,73 @@ class MLXTrainer:
                     it = next_boundary
                     # For an epoch-count-driven run (num_train_epochs, not
                     # max_steps) a shortened epoch must also shrink the
-                    # optimizer-step budget, otherwise the loop keeps cycling into
-                    # extra data passes to reach the original step count -- i.e. it
-                    # overtrains past num_train_epochs instead of ending the epoch
-                    # early like HF. max_steps runs keep their fixed budget (HF runs
-                    # max_steps regardless of epoch stops). _skipped and the flag
-                    # are rank-consistent, so total_steps stays identical on every
-                    # rank and the loop bound remains in lockstep.
+                    # optimizer-step budget, otherwise the loop keeps cycling
+                    # batches[batch_idx % len(batches)] into extra data passes to
+                    # reach the original step count -- i.e. it overtrains past
+                    # num_train_epochs and fires phantom epoch events instead of
+                    # ending the epoch early like HF. Recompute the budget from the
+                    # micro-batches that actually remain after the skip (batch_idx
+                    # has advanced past the skipped tail): completed optimizer steps
+                    # plus one step per full grad_accum window of the unconsumed
+                    # data. Deriving it from (len(batches) - batch_idx) makes the
+                    # loop stop exactly when the materialized data is exhausted, so
+                    # it never wraps into already-seen batches. The previous
+                    # `_skipped // grad_accum` under-counted a sub-grad_accum tail
+                    # (a skipped tail smaller than grad_accum reduced the budget by
+                    # 0, leaving the wrap and the overtraining in place). batch_idx
+                    # and len(batches) are identical on every rank, so total_steps
+                    # stays in lockstep. max_steps runs keep their fixed budget (HF
+                    # runs max_steps regardless of epoch stops).
                     if getattr(self, "_prepared_batches_include_epochs", False):
-                        total_steps = max(
-                            self._global_step,
-                            total_steps - _skipped // grad_accum,
+                        total_steps = self._global_step + (
+                            (len(batches) - batch_idx) // grad_accum
                         )
                 self.control.should_epoch_stop = False
+            # Advance the completed-micro-batch counter before the stop check so a
+            # callback-stop break still leaves `microstep` pointing at the step
+            # just finished; the post-loop truncated-epoch on_epoch_end reads it to
+            # decide whether the final epoch was left open.
+            microstep = it
             # Propagate any stop set by the tail callbacks (on_step_end / on_log /
             # on_evaluate / on_save / on_epoch_end) to every rank before breaking,
             # so no rank is left waiting at the next collective.
             if _sync_stop():
                 break
-            microstep = it
+
+        # Close a truncated final epoch: if the loop left off mid-epoch (max_steps
+        # landing off a dataset boundary, or a should_training_stop break) the
+        # natural-boundary on_epoch_end never fired for that partial epoch. HF
+        # fires on_epoch_end for the truncated epoch after its inner step loop
+        # breaks (transformers _inner_training_loop), so mirror it here before the
+        # final metric flush and on_train_end. A natural boundary already fired it
+        # (microstep % batches_per_epoch == 0), as did the should_epoch_stop skip
+        # (which advances microstep to a boundary), so the guard prevents a double
+        # fire. batches_per_epoch and microstep are rank-consistent, so on_epoch_end
+        # and its synced log/eval/save run in DDP lockstep. Streaming runs have
+        # batches_per_epoch = None and never fire epoch callbacks, so they are
+        # unaffected.
+        if batches_per_epoch and microstep % batches_per_epoch != 0:
+            self.state.epoch = microstep / batches_per_epoch
+            _fire("on_epoch_end")
+            self._distributed_sync_control_actions()
+            if (self.control.should_log or self.control.should_evaluate
+                    or self.control.should_save):
+                _run_callback_control_actions(self._global_step, None)
+
+        # Flush any completed-but-unlogged optimizer-step window so the returned
+        # train_loss/trained_tokens include the final steps when training stops
+        # between log points (a should_training_stop callback or external cancel at
+        # a step that is not a logging_steps multiple and not the last step). HF
+        # folds the trailing tr_loss into _total_loss_scalar before computing the
+        # returned train_loss; without this an early stop at an unlogged step would
+        # return train_loss/trained_tokens of 0 despite completed training. steps is
+        # incremented identically on every rank, so the guard is rank-consistent and
+        # _run_training_log's all-reduce stays in lockstep. A full run forces a log
+        # on the last step (current_step == total_steps) and the on_epoch_end above
+        # may also flush, both resetting steps to 0, so this never double-counts.
+        if steps > 0:
+            _run_training_log(self._global_step, None)
+
         avg_loss = (
             sum(self._train_loss_history) / len(self._train_loss_history)
             if self._train_loss_history else 0.0
