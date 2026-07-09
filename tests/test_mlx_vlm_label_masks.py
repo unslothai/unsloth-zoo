@@ -485,10 +485,31 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     assert processor.images_seen[0] == ["embedded"]
 
 
-def test_vlm_top_level_image_key_is_not_cuda_images_alias():
+def test_vlm_top_level_image_key_supports_studio_adapter_shape(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
     from unsloth_zoo.mlx.utils import _extract_vlm_images
 
-    assert _extract_vlm_images({"image": "top-level"}, [], image_size=16) == []
+    def fail_process_vision_info(*_args, **_kwargs):
+        raise AssertionError("top-level image should be used before message fallback")
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fail_process_vision_info,
+    )
+
+    messages = [{"role": "user", "content": [{"type": "image"}]}]
+    assert _extract_vlm_images({"image": "top-level"}, messages, image_size=16) == ["top-level"]
+
+
+def test_vlm_top_level_images_key_still_wins_over_image_key():
+    from unsloth_zoo.mlx.utils import _extract_vlm_images
+
+    assert _extract_vlm_images(
+        {"images": ["plural"], "image": "singular"},
+        [],
+        image_size=16,
+    ) == ["plural"]
 
 
 def test_vlm_image_extraction_raises_process_errors_like_cuda(monkeypatch):

@@ -3525,6 +3525,10 @@ def _extract_vlm_images(
         image = item.get("images")
         if image is not None:
             images = image if isinstance(image, list) else [image]
+        elif "image" in item:
+            image = item.get("image")
+            if image is not None:
+                images = image if isinstance(image, list) else [image]
 
     if not images and isinstance(messages, list):
         for message in messages:
