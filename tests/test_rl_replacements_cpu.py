@@ -19,12 +19,18 @@ Covers:
   - `left_pack_padding` (stable sort that moves pad tokens to the right)
   - `align_logprobs_with_mask` (insert per-batch left padding into logprobs)
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
+  - `_warn_unsupported_grpo_options` (warn-once for TRL GRPO options the
+    optimized path does not implement: top_entropy_quantile, use_bias_correction_kl)
+  - `UnslothEfficientGRPO` at n_chunks=1 (the value production always passes)
+    stays numerically identical to a naive grpo_compute_loss autograd pass, and
+    the uniform div_(n_chunks) is only correct at n_chunks=1 for sum-normalized loss
   - `RL_REPLACEMENTS` dict integrity (every value is callable; the
     well-known public-API keys are populated).
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from types import SimpleNamespace
 
@@ -210,3 +216,179 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     }
     missing = expected - set(rr.RL_REPLACEMENTS.keys())
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# _warn_unsupported_grpo_options  (Issue 1: silently-ignored GRPO config options)
+# ---------------------------------------------------------------------------
+#
+# UnslothGRPOConfig forwards every TRL GRPOConfig field via **kwargs, but the
+# optimized GRPO path does not implement `top_entropy_quantile < 1.0` (entropy
+# masking) or `use_bias_correction_kl = True` (KL x importance-sampling ratio).
+# The helper warns once per trainer when either is set to a non-default value so
+# the user is not silently ignored. TRL GRPOConfig defaults (verified against
+# trl.trainer.grpo_config, TRL 1.7.1) are top_entropy_quantile=1.0 and
+# use_bias_correction_kl=False, so defaults must NOT warn.
+
+
+def _make_grpo_trainer(**args):
+    return SimpleNamespace(args=SimpleNamespace(**args))
+
+
+def test_warn_unsupported_grpo_options_silent_on_defaults(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+    # The guard flag is set even on defaults so the check runs at most once.
+    assert trainer._unsloth_grpo_unsupported_warned is True
+
+
+def test_warn_unsupported_grpo_options_silent_when_attrs_missing(caplog):
+    # Older TRL that does not expose these options -> defaults assumed -> no warning.
+    trainer = _make_grpo_trainer()
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+
+
+def test_warn_unsupported_grpo_options_fires_for_top_entropy_quantile(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.2, use_bias_correction_kl=False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "top_entropy_quantile=0.2" in msgs[0]
+    assert "use_bias_correction_kl" not in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_fires_for_use_bias_correction_kl(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "use_bias_correction_kl=True" in msgs[0]
+    assert "top_entropy_quantile" not in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_lists_both(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.5, use_bias_correction_kl=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "top_entropy_quantile=0.5" in msgs[0]
+    assert "use_bias_correction_kl=True" in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_fires_once(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.2)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+        rr._warn_unsupported_grpo_options(trainer)
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1  # guarded: at most once per trainer
+
+
+def test_warn_unsupported_grpo_options_registered():
+    assert rr.RL_REPLACEMENTS.get("_warn_unsupported_grpo_options") is rr._warn_unsupported_grpo_options
+
+
+# ---------------------------------------------------------------------------
+# UnslothEfficientGRPO batch chunking  (Issue 2: dead + incorrect n_chunks)
+# ---------------------------------------------------------------------------
+#
+# Production (grpo_accumulated_loss) always calls UnslothEfficientGRPO with
+# n_chunks=1. These tests pin two facts behind the Issue-2 change:
+#   (1) the n_chunks=1 path is numerically identical (loss AND gradient) to a
+#       direct autograd pass through grpo_compute_loss, so removing the dead
+#       n_chunks snapping is a pure no-op for the shipped code path, and
+#   (2) the uniform div_(n_chunks) is WRONG for n_chunks>1 on the globally
+#       sum-normalized loss types (dapo/cispo/vespo) -- which is exactly why
+#       re-enabling batch chunking was rejected in favor of fixing n_chunks at 1.
+
+
+@pytest.fixture
+def disable_dynamo():
+    # UnslothEfficientGRPO.forward wraps its inner step in torch.compile; disable
+    # dynamo so it runs eagerly on CPU. The math is identical to the compiled path.
+    import torch._dynamo
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    try:
+        yield
+    finally:
+        torch._dynamo.config.disable = prev
+
+
+def _grpo_loss_fixture(loss_type, B=6, T=5, V=17):
+    torch.manual_seed(123)
+    new = torch.randn(B, T, dtype=torch.float64)
+    old = new + 0.05 * torch.randn(B, T, dtype=torch.float64)
+    ref = new + 0.05 * torch.randn(B, T, dtype=torch.float64)
+    input_ids = torch.randint(0, V, (B, T))
+    mask = (torch.rand(B, T) > 0.3).to(torch.float64)
+    mask[:, 0] = 1.0  # guarantee at least one active token per row
+    advantages = torch.randn(B, dtype=torch.float64)
+    kwargs = dict(
+        loss_type=loss_type,
+        num_items_in_batch=float(mask.sum().item()),
+        num_processes=1,
+        current_gradient_accumulation_steps=1,
+        max_completion_length=T,
+    )
+    return new, old, ref, input_ids, mask, advantages, kwargs
+
+
+@pytest.mark.parametrize(
+    "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo"]
+)
+def test_efficient_grpo_nchunks1_matches_naive(loss_type, disable_dynamo):
+    beta = 0.04
+    lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+
+    new_ref = new.clone().requires_grad_(True)
+    loss_ref = rr.grpo_compute_loss(
+        ref, new_ref, old, None, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    loss_ref.backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages,
+        beta, None, 1, kwargs,
+    )
+    out[0].backward()
+
+    assert torch.allclose(
+        out[0].detach().double(), loss_ref.detach().double(), atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: loss mismatch"
+    assert torch.allclose(
+        new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: gradient mismatch"
+
+
+def test_efficient_grpo_uniform_div_is_wrong_above_one_chunk(disable_dynamo):
+    beta = 0.04
+    lm_head = torch.randn(17, 8, dtype=torch.float64)
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("dapo")
+
+    new_ref = new.clone().requires_grad_(True)
+    correct = rr.grpo_compute_loss(
+        ref, new_ref, old, None, input_ids, mask, beta, advantages, **kwargs
+    )[0].detach().double()
+
+    def eff(n_chunks):
+        ne = new.clone().requires_grad_(True)
+        return rr.UnslothEfficientGRPO.apply(
+            ne, old, ref, None, lm_head, input_ids, mask, advantages,
+            beta, None, n_chunks, kwargs,
+        )[0].detach().double()
+
+    # n_chunks=1 is exact; n_chunks=k makes the sum-normalized dapo loss k x too small.
+    assert torch.allclose(eff(1), correct, atol=1e-8, rtol=1e-6)
+    assert torch.allclose(eff(2), correct / 2, atol=1e-8, rtol=1e-6)
+    assert torch.allclose(eff(3), correct / 3, atol=1e-8, rtol=1e-6)
