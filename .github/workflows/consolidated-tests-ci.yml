@@ -404,6 +404,9 @@ jobs:
           python -m pytest tests/test_mlx_save_export_edge_cases.py -v
           python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
 
+      - name: pytest tests/test_fused_dft_loss.py (HARD GATE)
+        run: python -m pytest tests/test_fused_dft_loss.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
@@ -968,4 +971,3 @@ jobs:
             fi
           done
           [ "$failed" -eq 0 ] || exit 1
-
