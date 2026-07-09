@@ -2021,6 +2021,113 @@ def test_grpo_rollout_falls_back_to_reencode_without_token_ids(monkeypatch):
     assert lengths.tolist()[0][0] == 3
 
 
+def test_grpo_rollout_reencode_fallback_uses_common_prefix_boundary(monkeypatch):
+    # On older mlx-lm (no return_token_ids) the rollout re-encodes rendered + c.
+    # Encoding the concatenation is NOT a plain concat of encode(rendered) and
+    # encode(c): a BPE/SentencePiece tokenizer can MERGE the boundary token (the
+    # last prompt token fuses with the first completion token), so the standalone
+    # prompt ids stop being a true prefix of the re-encoded row. Reusing
+    # pe = len(pids) would then mask the wrong span (train a merged part-response
+    # token as prompt / drop the first real completion token) and forward the
+    # wrong completion_ids to reward funcs. The fallback must recompute the
+    # boundary as the shared prefix of the prompt ids and the re-encoded row (the
+    # same _common_prefix_len fix the preference path uses), not len(pids).
+    import types
+    import mlx_lm
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["gen", "gen"],
+    )
+    # eos_token_id None so the EOS re-append does not fire, isolating the boundary.
+    trainer.tokenizer.eos_token_id = None
+
+    def _merge_encode(text, add_special_tokens=True):
+        # Standalone prompt 'hello' -> [1, 2, 3]. The concatenated 'hello' + 'gen'
+        # MERGES the boundary token 3 with the first completion token into a
+        # single id 99: [1, 2, 99, 100]. The shared prefix is [1, 2] (length 2),
+        # so the true response boundary is 2, NOT len(pids) == 3.
+        if text == "hello":
+            return [1, 2, 3]
+        return [1, 2, 99, 100]
+
+    trainer.tokenizer.encode = _merge_encode
+
+    def _old_generate(model, tokenizer, prompts=None, max_tokens=None,
+                      sampler=None, verbose=False):
+        return types.SimpleNamespace(texts=["gen", "gen"])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _old_generate, raising=False)
+
+    gen = trainer._grpo_rollout_generator()
+    batch, lengths, _adv = next(gen)
+    lens = lengths.tolist()
+    rows = batch.tolist()
+    # Boundary is the shared-prefix length (2), NOT len(pids) == 3 (the merge bug).
+    assert lens[0][0] == 2
+    # The scored response span is the merged/real completion tokens after the seam.
+    assert rows[0][lens[0][0]:lens[0][1]] == [99, 100]
+
+
+def test_grpo_rollout_shuffles_prompt_order_by_default(monkeypatch):
+    # TRL's GRPO samples prompts with a shuffling sampler by DEFAULT
+    # (GRPOTrainer._get_train_sampler -> RepeatSampler(shuffle=shuffle_dataset),
+    # and GRPOConfig.shuffle_dataset defaults to True), so a run capped by
+    # max_steps below the dataset size still samples ACROSS the whole dataset. The
+    # MLX rollout must likewise visit prompts in a seeded permutation by default
+    # (a plain 0..N cycle would train only the ordered prefix under such a cap),
+    # and honor an explicit sequential-order request.
+    import types
+    import mlx_lm
+    import numpy as np
+    from unsloth_zoo.mlx.utils import _normalize_seed
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    monkeypatch.setattr(
+        mlx_lm, "batch_generate",
+        lambda *a, **k: types.SimpleNamespace(texts=["a", "b"]),
+        raising=False,
+    )
+
+    seen = []
+
+    def _reward(completions=None, prompts=None, **kw):
+        seen.append(prompts[0])
+        return [0.1, 0.2]
+
+    N = 8
+    seed = 123
+    dataset = [{"prompt": f"p{i}", "answer": str(i)} for i in range(N)]
+
+    # Default (shuffled): the visitation order is the seeded permutation.
+    seen.clear()
+    trainer = _make_ddp_grpo_trainer(0, 1, dataset, [_reward], _Tok())
+    trainer.args.seed = seed
+    gen = trainer._grpo_rollout_generator()
+    for _ in range(N):
+        next(gen)
+    perm = np.random.RandomState(_normalize_seed(seed)).permutation(N)
+    assert seen == [f"p{int(i)}" for i in perm]
+    # A seeded permutation of 8 rows is not the identity, so the prefix-only bug
+    # (visiting p0, p1, ... in order) is ruled out.
+    assert seen != [f"p{i}" for i in range(N)]
+
+    # Explicit sequential order is honored (byte-for-byte the old 0..N cycle).
+    seen.clear()
+    trainer = _make_ddp_grpo_trainer(0, 1, dataset, [_reward], _Tok())
+    trainer.args.preserve_dataset_order = True
+    gen = trainer._grpo_rollout_generator()
+    for _ in range(N):
+        next(gen)
+    assert seen == [f"p{i}" for i in range(N)]
+
+
 def test_create_preference_batches_samples_across_lengths_when_truncating():
     # With max_steps (num_batches) capping the run below the dataset size,
     # length-sorting then keeping the first chunks would train only on the
@@ -2089,6 +2196,57 @@ def test_create_preference_batches_guards_double_bos_on_chat_prompts():
     # BOS-prefixed text, so none may re-add a second BOS.
     assert tok.add_special_tokens_seen  # encode actually ran
     assert all(flag is False for flag in tok.add_special_tokens_seen)
+
+
+def test_preference_batches_render_conversational_rows_through_chat_template():
+    # TRL DPO/ORPO accept conversational (message-list) preference rows and
+    # normalize them via maybe_apply_chat_template (trl/data_utils.py:
+    # apply_chat_template renders prompt / prompt+chosen / prompt+rejected as
+    # strings, add_generation_prompt when the last prompt role is 'user'). The
+    # MLX builder must render message-list prompt/chosen/rejected through the chat
+    # template before encoding; string-concatenating and encoding the raw lists
+    # would crash (a list has no .startswith, and encode rejects a list of dicts),
+    # so common conversational preference datasets would fail before training.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = 0
+        bos_token = None
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False,
+                                continue_final_message=False):
+            parts = []
+            for m in messages:
+                tag = "U:" if m["role"] == "user" else "A:"
+                parts.append(tag + m["content"])
+            s = "".join(parts)
+            if add_generation_prompt:
+                s += "A:"
+            return s
+
+        def encode(self, text, add_special_tokens=True):
+            # An unrendered message list would raise here (ord on a dict), so
+            # reaching this with a plain string proves the chat render happened.
+            return [ord(ch) for ch in text]
+
+    dataset = [{
+        "prompt": [{"role": "user", "content": "hi"}],
+        "chosen": [{"role": "assistant", "content": "ok"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+    }]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _Tok(), batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )[0]
+    lens = lengths.tolist()
+    rows = batch.tolist()
+    # prompt renders to 'U:hiA:' (6 chars); prompt+chosen to 'U:hiA:ok'. The
+    # response boundary is the shared-prefix length 6, and the chosen/rejected
+    # completions ('ok' / 'no') + appended EOS follow it.
+    assert lens[0][0] == len("U:hiA:") == 6
+    assert rows[0][lens[0][0]:lens[0][1]] == [ord("o"), ord("k"), 0]
+    assert rows[1][lens[1][0]:lens[1][1]] == [ord("n"), ord("o"), 0]
 
 
 def test_train_on_responses_only_rejects_preference_loss_types():
@@ -3543,12 +3701,15 @@ def _make_ddp_grpo_trainer(rank, world, train_dataset, reward_funcs, tokenizer):
 
 def test_grpo_rollout_shards_prompt_cycle_across_ddp_ranks(monkeypatch):
     # Under MLX DDP every rank must roll out a DISJOINT slice of prompts
-    # (prompts[rank::world_size]) so the all-reduced gradient aggregates
+    # (order[rank::world_size]) so the all-reduced gradient aggregates
     # world_size distinct prompts' groups per step, mirroring the SFT path's
     # items[rank::world_size] slicing. Without the offset every rank starts idx
     # at 0 and picks the SAME prompt for every microbatch (duplicated rollout /
     # reward work, prompt diversity of one rank). Rank 1 of a 2-rank group starts
-    # at prompt 1 and strides by 2; world_size == 1 is the unchanged 0,1,2 cycle.
+    # at position 1 and strides by 2. This isolates the offset/stride mechanism
+    # from the (now default) seeded prompt shuffle by requesting sequential order,
+    # so the visitation order is the plain 0,1,2 cycle; the shuffle itself is
+    # covered separately (test_grpo_rollout_shuffles_prompt_order_by_default).
     import types
     import mlx_lm
 
@@ -3572,23 +3733,28 @@ def test_grpo_rollout_shards_prompt_cycle_across_ddp_ranks(monkeypatch):
 
     dataset = [{"prompt": f"p{i}", "answer": str(i)} for i in range(4)]
 
+    def _seq_trainer(rank, world):
+        t = _make_ddp_grpo_trainer(rank, world, dataset, [_reward], _Tok())
+        t.args.dataset_order = "sequential"
+        return t
+
     # Rank 1 of world 2: odd-indexed prompts 1, 3.
     seen_prompts.clear()
-    gen = _make_ddp_grpo_trainer(1, 2, dataset, [_reward], _Tok())._grpo_rollout_generator()
+    gen = _seq_trainer(1, 2)._grpo_rollout_generator()
     next(gen)
     next(gen)
     assert seen_prompts == ["p1", "p3"]
 
     # Rank 0 of world 2: even-indexed prompts 0, 2 -- disjoint from rank 1.
     seen_prompts.clear()
-    gen = _make_ddp_grpo_trainer(0, 2, dataset, [_reward], _Tok())._grpo_rollout_generator()
+    gen = _seq_trainer(0, 2)._grpo_rollout_generator()
     next(gen)
     next(gen)
     assert seen_prompts == ["p0", "p2"]
 
-    # Single GPU (world 1): unchanged sequential cycle 0, 1, 2.
+    # Single GPU (world 1): sequential cycle 0, 1, 2.
     seen_prompts.clear()
-    gen = _make_ddp_grpo_trainer(0, 1, dataset, [_reward], _Tok())._grpo_rollout_generator()
+    gen = _seq_trainer(0, 1)._grpo_rollout_generator()
     next(gen)
     next(gen)
     next(gen)

@@ -3968,8 +3968,12 @@ class MLXGRPOTrainer(MLXTrainer):
         """Infinite generator: each next() does generate->reward->advantage
         and yields (batch, lengths, advantages). Runs uncompiled."""
         import inspect as _inspect
+        import numpy as np
         from mlx_lm import batch_generate
         from mlx_lm.sample_utils import make_sampler
+        # _common_prefix_len: robust prompt/response boundary for the re-encode
+        # fallback (below). _normalize_seed: seeded prompt-order shuffle.
+        from .utils import _common_prefix_len, _normalize_seed
         # Newer mlx-lm (>= the return_token_ids addition) surfaces the exact
         # generated token IDs from batch_generate. Prefer them for scoring so the
         # GRPO loss/KL run on the sequence the policy actually sampled, rather
@@ -4023,11 +4027,38 @@ class MLXGRPOTrainer(MLXTrainer):
         # prompts' groups per global step, mirroring how the SFT path slices one
         # global batch (items[rank::world_size]). No-op at world_size == 1 (rank
         # 0, stride 1) -- the single-GPU path is byte-for-byte unchanged.
+        # Prompt visitation order. TRL's GRPO samples prompts with a shuffling
+        # sampler by DEFAULT (GRPOTrainer._get_train_sampler returns
+        # RepeatSampler(shuffle=self.shuffle_dataset) and GRPOConfig.shuffle_
+        # dataset defaults to True), so a run capped by max_steps below the
+        # dataset size still samples ACROSS the whole dataset. A plain sequential
+        # 0..N cycle (the prior behavior) would instead roll out only the ordered
+        # PREFIX under such a cap -- a silent, systematic bias in which prompts
+        # are ever trained (e.g. a large ordered dataset trains only its first
+        # max_steps rows). Mirror the SFT/preference builders (create_preference_
+        # batches / _create_labeled_batches, which shuffle before truncating):
+        # take a seeded permutation of the prompt order. The permutation is
+        # identical on every MLX DDP rank (same seed), so the rank-strided cycle
+        # below stays a disjoint shard (rank r still visits distinct prompts).
+        # Honor an explicit sequential-order request (preserve_dataset_order /
+        # dataset_order == "sequential"), matching the text/VLM dataset_order
+        # control; then the order is byte-for-byte the old 0..N cycle.
+        _sequential = (
+            getattr(args, "preserve_dataset_order", False)
+            or getattr(args, "dataset_order", "default") == "sequential"
+        )
+        if _sequential:
+            _order = list(range(len(prompts)))
+        else:
+            _perm = np.random.RandomState(
+                _normalize_seed(getattr(args, "seed", 42))
+            ).permutation(len(prompts))
+            _order = [int(i) for i in _perm]
         _ddp_rank = self.distributed_rank
         _ddp_world = self.distributed_world_size
         idx = _ddp_rank
         while True:
-            j = idx % len(prompts)
+            j = _order[idx % len(prompts)]
             prompt = prompts[j]
             example = examples[j]
             idx += _ddp_world
@@ -4148,6 +4179,9 @@ class MLXGRPOTrainer(MLXTrainer):
                     if _eos_unambiguous and len(comp) < _gen_max:
                         comp = comp + [int(_eos_id)]
                     full = (pids + comp)[: args.max_seq_length]
+                    # pids is a true prefix of full by construction here (full is
+                    # pids followed by the sampled ids), so the boundary is len(pids).
+                    _pe_row = pe
                 else:
                     # Fallback (older mlx-lm without generated-id surfacing):
                     # guard the prompt+completion tokenization against the same
@@ -4155,6 +4189,23 @@ class MLXGRPOTrainer(MLXTrainer):
                     # the response boundary pe (from the guarded prompt encode)
                     # stays a true prefix length of this full sequence.
                     full = encode_mlx_text(hf, rendered + c)
+                    # Recompute the prompt/response boundary from the SHARED prefix
+                    # of the standalone prompt ids and this re-encoded row, rather
+                    # than reusing pe = len(pids). Encoding rendered + c is not a
+                    # plain concatenation of encode(rendered) and encode(c): a
+                    # BPE/SentencePiece tokenizer can MERGE the boundary token (the
+                    # last prompt token fuses with the first completion token) or
+                    # append a prompt-only EOS, so pids stops being a true prefix of
+                    # full. Reusing len(pids) would then mask the wrong span -- the
+                    # loss/KL would train a merged (part-response) token as prompt or
+                    # drop the first real completion token -- and forward the wrong
+                    # completion_ids to the reward funcs. _common_prefix_len stops at
+                    # the first divergence (this is the SAME merge-bug fix the
+                    # preference path uses in create_preference_batches); it returns
+                    # len(pids) unchanged when pids IS a true prefix (a no-op on the
+                    # common case). Computed on the re-encoded ids BEFORE the EOS
+                    # re-append below, which only extends the completion.
+                    _pe_row = _common_prefix_len(pids, full)
                     # Mirror the comp_ids branch's EOS re-append here too: on a
                     # normal stop batch_generate already stripped the terminal EOS
                     # from resp.texts, so the re-encoded row has none to score and
@@ -4164,12 +4215,12 @@ class MLXGRPOTrainer(MLXTrainer):
                     # row stopped normally, so append the EOS (a span at _gen_max was
                     # length-truncated and is left as-is). _gen_max bounds pe + span
                     # (+ EOS) to max_seq_length, so the cut below keeps the EOS.
-                    _comp_len = len(full) - pe
+                    _comp_len = len(full) - _pe_row
                     if _eos_unambiguous and 0 <= _comp_len < _gen_max:
                         full = full + [int(_eos_id)]
                     full = full[: args.max_seq_length]
                 rows.append(full)
-                lengths.append([pe, len(full)])
+                lengths.append([_pe_row, len(full)])
                 # The exact generated completion ids the loss trains on for this
                 # row: the [pe, len(full)) span of `full`. Forwarded to reward
                 # funcs that declare a completion_ids parameter (below), matching
@@ -4177,9 +4228,9 @@ class MLXGRPOTrainer(MLXTrainer):
                 # completion_ids column -- to each reward function. Identical in
                 # both branches because full[pe:] is the response span whether
                 # `full` came from the comp_ids continuation or the re-encode
-                # fallback (pe is a true prefix length in each), so token-level
-                # rewards score the same tokens the policy is optimized on.
-                completion_ids_list.append(full[pe:])
+                # fallback (_pe_row is a true prefix length in each), so token-
+                # level rewards score the same tokens the policy is optimized on.
+                completion_ids_list.append(full[_pe_row:])
             L = max(len(r) for r in rows)
             batch = mx.array([r + [pad_id] * (L - len(r)) for r in rows], dtype=mx.int32)
             # rewards: sum across reward functions (TRL-style). Pass through the
