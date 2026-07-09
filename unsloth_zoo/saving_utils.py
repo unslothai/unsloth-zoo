@@ -1564,6 +1564,51 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         except Exception:
             pass
 
+    # Per-expert Linear MoE experts (gpt-oss bnb-4bit): PEFT stores one 2D LoRA per
+    # expert Linear (mlp.experts.gate_up_projs.<i> / down_projs.<i>), but the bf16
+    # checkpoint is the fused 3D group, which the mapping below misses. Fold each
+    # per-expert delta into its slice.
+    if is_gpt_oss_format:
+        _perexpert = {}
+        for _lk, _ls in converted_lora_weights.items():
+            if not isinstance(_lk, str):
+                continue
+            _m = re.match(r"^(.*\.experts)\.(gate_up_projs|down_projs)\.(\d+)$", _lk)
+            if _m is None:
+                continue
+            _fused_name = "gate_up_proj" if _m.group(2) == "gate_up_projs" else "down_proj"
+            _fused_key = f"{_m.group(1)}.{_fused_name}"
+            if _fused_key not in header_metadata:
+                continue
+            _perexpert.setdefault(_fused_key, {})[int(_m.group(3))] = (_lk, _ls)
+
+        for _fused_key, _experts in _perexpert.items():
+            if _fused_key in processed_mxfp4_keys:
+                continue
+            _fused_W = file.get_tensor(_fused_key)
+            if _fused_W.dim() != 3 or _fused_W.dtype in _FP8_WEIGHT_DTYPES:
+                continue
+            _num_experts_disk = _fused_W.shape[0]
+            _device = _active_merge_device()
+            _fused_dev = _fused_W.to(_device, dtype = torch.float32, non_blocking = True)
+            _merged_any = False
+            for _idx, (_lk, _ls) in _experts.items():
+                if _idx >= _num_experts_disk or _ls.lora_A is None or _ls.lora_B is None:
+                    continue
+                _w_lin = _fused_dev[_idx].transpose(0, 1).contiguous()
+                _merged_lin = _merge_lora(_w_lin, _ls, _fused_key + f".{_idx}")
+                _fused_dev[_idx] = _merged_lin.transpose(0, 1)
+                _merged_any = True
+                if _lk not in counted_lora_modules:
+                    count += 1
+                    counted_lora_modules.add(_lk)
+            if _merged_any:
+                _write_tensor_direct_torch(
+                    mm, header_metadata, length_of_header,
+                    _fused_key, _fused_dev.to(_fused_W.dtype), _fused_W.dtype,
+                )
+                processed_mxfp4_keys.add(_fused_key)
+
     # Build mapping from model LoRA module path -> safetensor expert prefix
     # Handles Gemma4 (.experts without .mlp), standard (.mlp.experts), and .moe patterns
     _moe_lora_to_shard_prefix = {}
@@ -1973,6 +2018,44 @@ def _mxfp4_base_returns_transposed(convert_cpu_variant, transformers_version):
         return True
 
 
+def _fold_perexpert_lora_into_fused(W, fused_base_name, converted_lora_weights):
+    """Fold per-expert Linear LoRA into a dequantized fused 3D expert group.
+
+    gpt-oss bnb-4bit stores experts as per-expert Linear ModuleLists
+    (gate_up_projs.<i> / down_projs.<i>); the exported checkpoint is the fused group
+    W (E, in, out) = the transpose of each expert Linear (out, in). Fold each adapter
+    into its slice via the standard Linear merge. Returns the number of experts
+    merged (0 when no per-expert adapter matches, so the caller's dense path is
+    unaffected).
+    """
+    if W is None or W.dim() != 3:
+        return 0
+    _m_base = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", fused_base_name)
+    if _m_base is None:
+        return 0
+    _experts_prefix = _m_base.group(1)
+    _perexpert_leaf = "gate_up_projs" if _m_base.group(2) == "gate_up_proj" else "down_projs"
+    _num_experts = W.shape[0]
+    folded = 0
+    for _lk, _ls in converted_lora_weights.items():
+        if not isinstance(_lk, str):
+            continue
+        _m = re.match(r"^(.*\.experts)\.(gate_up_projs|down_projs)\.(\d+)$", _lk)
+        if _m is None or _m.group(1) != _experts_prefix or _m.group(2) != _perexpert_leaf:
+            continue
+        _idx = int(_m.group(3))
+        if _idx >= _num_experts or _ls.lora_A is None or _ls.lora_B is None:
+            continue
+        _refuse_dora_on_moe(_ls)  # DoRA on packed experts is unsupported
+        # W[idx] is (in, out); _merge_lora expects a Linear weight (out, in).
+        _w_lin = W[_idx].transpose(0, 1).contiguous()
+        _merged = _merge_lora(_w_lin, _ls, f"{fused_base_name}.{_idx}")
+        W[_idx] = _merged.transpose(0, 1).to(dtype = W.dtype, device = W.device)
+        folded += 1
+    return folded
+pass
+
+
 @torch.inference_mode
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2100,8 +2183,15 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
                 else:
+                    # Per-expert Linear expert LoRA (gpt-oss bnb-4bit): the fused-name
+                    # lookup above misses it, so fold each delta into its slice of W.
+                    _folded = _fold_perexpert_lora_into_fused(W, base_name, converted_lora_weights)
+                    count += _folded
                     if UNSLOTH_ENABLE_LOGGING:
-                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
+                        if _folded:
+                            logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING {_folded} per-expert LoRA(s) into Key Group: {base_name}")
+                        else:
+                            logger.info(f"[DEBUG] DEQUANTIZING MXFP4 Key Group: {base_name}")
                 action_logged = True
 
             elif key.endswith("_scales"):
@@ -4012,6 +4102,15 @@ def _lora_key_has_backing(key, keys_set, count_packed_mxfp4 = True, valid_prefix
         return True                                          # mxfp4 packed (dequantized on save)
     if ".experts" in key or ".moe" in key:                   # fused / per-expert MoE
         base = key.replace(".base_layer", "")
+        # Per-expert Linear MoE (gpt-oss bnb-4bit) is backed by the fused
+        # gate_up_proj / down_proj (bf16 3D or mxfp4 packed _blocks/_scales).
+        _pe = re.match(r"^(.*\.experts)\.(gate_up_projs|down_projs)\.\d+$", base)
+        if _pe is not None:
+            _fused = _pe.group(1) + "." + ("gate_up_proj" if _pe.group(2) == "gate_up_projs" else "down_proj")
+            if _fused in keys_set:
+                return True
+            if count_packed_mxfp4 and (_fused + "_blocks") in keys_set and (_fused + "_scales") in keys_set:
+                return True
         cands = set()
         # Disk aliases: .moe -> .experts (Gemma4); .mlp.experts -> .block_sparse_moe.experts (legacy Mixtral).
         for b in (

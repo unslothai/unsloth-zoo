@@ -848,7 +848,9 @@ def make_baseline_loss_fn():
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = nn.losses.cross_entropy(logits, targets) * mask
             ntoks = mask.sum()
-            ce = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            # Raw ntoks (no safe denominator) to match mlx_lm default_loss
+            # byte-for-byte; the safe wrapper stays on the labels-aware path.
+            ce = ce.astype(mx.float32).sum() / ntoks
             if return_correct:
                 preds = mx.argmax(logits, axis=-1)
                 correct = ((preds == targets).astype(mx.float32) * mask).sum()
