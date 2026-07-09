@@ -839,6 +839,27 @@ pass
 RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
 
 
+def _snap_n_chunks(n_chunks, n_rows):
+    """Clamp an arbitrary unsloth_num_chunks request into the valid range for a batch of
+    n_rows and snap it to a divisor of n_rows, so UnslothEfficientGRPO always splits the
+    batch into equal chunks (a ragged last chunk changes tensor shapes and forces
+    torch.compile recompiles). Any int is accepted: -1 (or None) means the most chunks
+    (one row per chunk = n_rows); values below 1 clamp to 1 (whole batch); values above
+    n_rows clamp to n_rows; anything in between rounds up to the smallest divisor of
+    n_rows that is >= the request. The result is always a divisor of n_rows in [1, n_rows].
+    Matches the original numpy divisor-snap for requests >= 1."""
+    if n_rows < 1:
+        return 1
+    if n_chunks is None or n_chunks == -1:
+        n_chunks = n_rows
+    n_chunks = max(min(int(n_chunks), n_rows), 1)
+    while n_rows % n_chunks != 0:
+        n_chunks += 1
+    return n_chunks
+pass
+RL_REPLACEMENTS["_snap_n_chunks"] = _snap_n_chunks
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -1600,13 +1621,11 @@ def grpo_accumulated_loss(
         # padded fallback (packing disabled / unsupported / not verified for this length)
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
 
-    # Snap n_chunks to the smallest divisor of the row count that is >= n_chunks
-    # (see the note above; -1 means one row per chunk). Pure python on purpose: this
-    # runs once per step outside the compiled region and avoids a numpy dependency.
-    _grpo_rows = new_logprobs.shape[0]
-    if n_chunks is None or n_chunks == -1: n_chunks = _grpo_rows
-    n_chunks = max(min(int(n_chunks), _grpo_rows), 1)
-    while _grpo_rows % n_chunks != 0: n_chunks += 1
+    # Clamp n_chunks into range and snap to a divisor of the row count (see the note
+    # above; -1 means one row per chunk). Body-local import so the copy of this function
+    # inlined into the generated UnslothGRPOTrainer cache resolves the helper.
+    from unsloth_zoo.rl_replacements import _snap_n_chunks
+    n_chunks = _snap_n_chunks(n_chunks, new_logprobs.shape[0])
 
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(

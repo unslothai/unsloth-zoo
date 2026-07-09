@@ -428,3 +428,50 @@ def test_efficient_grpo_ragged_chunks_match(loss_type, disable_dynamo):
         f"{loss_type}: completion_length mismatch on ragged chunks"
     assert torch.allclose(kl_3, kl_1, atol=1e-6, rtol=1e-6), \
         f"{loss_type}: mean_kl mismatch on ragged chunks"
+
+
+# ---------------------------------------------------------------------------
+# _snap_n_chunks: any unsloth_num_chunks request -> a valid divisor in [1, n_rows]
+# ---------------------------------------------------------------------------
+#
+# unsloth_num_chunks accepts any int; the snap clamps it into range and rounds up to a
+# divisor of the batch row count so UnslothEfficientGRPO always splits into equal chunks.
+# -1/None -> n_rows (most chunks); < 1 -> 1; > n_rows -> n_rows; else next divisor up.
+
+
+@pytest.mark.parametrize("n_rows", [1, 2, 6, 7, 8, 12, 13])  # incl. primes 7, 13
+def test_snap_n_chunks_always_valid_divisor(n_rows):
+    candidates = [-100, -2, -1, 0, 1, 2, 3, 4, 5, n_rows - 1, n_rows, n_rows + 1, 1000, None]
+    for n in candidates:
+        r = rr._snap_n_chunks(n, n_rows)
+        assert 1 <= r <= n_rows, f"n={n} n_rows={n_rows} -> {r} out of range"
+        assert n_rows % r == 0, f"n={n} n_rows={n_rows} -> {r} not a divisor"
+
+
+def test_snap_n_chunks_sentinels_and_clamps():
+    assert rr._snap_n_chunks(-1, 6) == 6      # -1 = most chunks (one row per chunk)
+    assert rr._snap_n_chunks(None, 6) == 6    # None behaves like -1
+    assert rr._snap_n_chunks(0, 6) == 1       # below 1 clamps to whole batch
+    assert rr._snap_n_chunks(-5, 6) == 1      # any other negative clamps to 1
+    assert rr._snap_n_chunks(1000, 6) == 6    # above n_rows clamps to n_rows
+    assert rr._snap_n_chunks(1, 6) == 1       # whole batch
+    assert rr._snap_n_chunks(2, 6) == 2       # exact divisor kept
+    assert rr._snap_n_chunks(4, 6) == 6       # non-divisor rounds up (6 has no divisor 4 or 5)
+    assert rr._snap_n_chunks(4, 8) == 4       # exact divisor kept
+    assert rr._snap_n_chunks(3, 7) == 7       # prime: only 1 and 7
+
+
+def test_snap_n_chunks_matches_numpy_divisor_snap_for_positive_requests():
+    np = pytest.importorskip("numpy")
+
+    def numpy_snap(n_chunks, bsz):
+        factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
+        if n_chunks == -1:
+            n_chunks = bsz
+        return factors[min(np.searchsorted(factors, n_chunks), len(factors) - 1)]
+
+    for n_rows in [2, 6, 7, 8, 12, 13]:
+        for n in range(1, n_rows + 2):
+            assert rr._snap_n_chunks(n, n_rows) == numpy_snap(n, n_rows), (
+                f"n={n} n_rows={n_rows}"
+            )
