@@ -3527,7 +3527,7 @@ def _vlm_vision_part_state(messages):
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in ("image", "image_url", "video"):
+            if part.get("type") not in ("image", "image_url", "input_image", "video"):
                 continue
             if any(key in part for key in ("image", "image_url", "video")):
                 has_media_payload = True
