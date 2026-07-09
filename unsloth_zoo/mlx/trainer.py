@@ -3433,6 +3433,26 @@ class MLXTrainer:
                 "reward_funcs and generates rollouts). Use MLXGRPOTrainer instead "
                 "of the base MLXTrainer for loss_type='grpo'."
             )
+        # Reject unknown loss_type values before any batch construction. Only "sft"
+        # (default), "orpo", and "dpo" are implemented on the base MLXTrainer path
+        # ("grpo" is handled above via MLXGRPOTrainer). The loss selection in
+        # _train_inner and the preference branch below BOTH fall through to the
+        # SFT/CCE path for anything else, so a misconfigured preference run -- a typo
+        # like "dppo", or a real TRL DPO loss variant that is not implemented here
+        # ("ipo", "sigmoid", "hinge", "kto", ...) -- would silently optimize a plain
+        # cross-entropy objective instead of failing. Fail fast so the wrong
+        # objective is never trained.
+        _supported_loss_types = ("sft", "orpo", "dpo")
+        _loss_type = getattr(args, "loss_type", "sft")
+        if _loss_type not in _supported_loss_types:
+            raise ValueError(
+                f"Unsloth MLX: unsupported loss_type={_loss_type!r}. Supported "
+                f"values are {_supported_loss_types!r} (plus 'grpo' via "
+                "MLXGRPOTrainer). DPO loss variants such as 'ipo', 'sigmoid', or "
+                "'hinge' are not implemented on MLX; without this check they would "
+                "silently train a plain SFT cross-entropy objective. Use "
+                "loss_type='dpo' (sigmoid DPO), 'orpo', or 'sft'."
+            )
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3505,6 +3525,24 @@ class MLXTrainer:
                     "gradients instead of the intended global shard. Run DPO/ORPO "
                     "on a single GPU (world_size=1), or pre-shard the dataset "
                     "across ranks yourself before training."
+                )
+            if args.streaming:
+                # create_preference_batches materializes the WHOLE dataset: it
+                # collects every prompt/chosen/rejected row before batching and only
+                # honors num_batches afterwards, so an iterable/streaming dataset is
+                # fully consumed up front. The SFT/VLM paths honor streaming by
+                # returning a bounded iterator (iterate_training_batches /
+                # iterate_vlm_training_batches) that yields only max_steps worth of
+                # batches; the preference path has no such iterator, so
+                # args.streaming=True on an unbounded IterableDataset would hang or
+                # OOM instead of stopping at max_steps. Fail fast rather than blow up.
+                raise NotImplementedError(
+                    "Unsloth MLX: streaming DPO/ORPO preference training is not "
+                    "yet implemented. create_preference_batches materializes the "
+                    "entire dataset before batching, so an unbounded streaming "
+                    "dataset would hang or run out of memory instead of stopping "
+                    "at max_steps. Disable streaming (streaming=False) for "
+                    "DPO/ORPO, or use a finite (map-style) dataset."
                 )
             batches = create_preference_batches(
                 dataset=self.train_dataset,
@@ -3854,6 +3892,22 @@ class MLXGRPOTrainer(MLXTrainer):
         if not isinstance(reward_funcs, (list, tuple)):
             reward_funcs = [reward_funcs]
         self.reward_funcs = list(reward_funcs)
+        # GRPO requires at least one reward function (TRL's GRPOTrainer does too).
+        # An empty reward_funcs is accepted by the list coercion above, but then the
+        # rollout's reward loop has nothing to sum: every completion scores 0, so all
+        # group-relative advantages are 0 (r - mean == 0) and the policy receives no
+        # reward gradient -- a silent no-op that still looks like it is training
+        # (with grpo_beta=0/reference_free it is a pure no-op update). Fail fast at
+        # construction rather than train a degenerate objective.
+        if not self.reward_funcs:
+            raise ValueError(
+                "Unsloth: GRPO requires at least one reward function, but "
+                "reward_funcs is empty. With no reward function every completion "
+                "scores 0, so all group-relative advantages are 0 and the policy "
+                "receives no reward gradient (a silent no-op update). Pass a reward "
+                "callable (or a list of callables) as reward_funcs, matching TRL's "
+                "GRPOTrainer."
+            )
         super().__init__(model, tokenizer, train_dataset, eval_dataset,
                          None, None, None, None, args, formatting_func, processor)
 
@@ -3969,7 +4023,26 @@ class MLXGRPOTrainer(MLXTrainer):
         and yields (batch, lengths, advantages). Runs uncompiled."""
         import inspect as _inspect
         import numpy as np
-        from mlx_lm import batch_generate
+        # batch_generate is the rollout backend (one generate call per prompt group).
+        # It was added to mlx-lm in 0.28.0 (mlx-lm PR #443); the pyproject mlx extra
+        # only pins mlx-lm>=0.22.0, so a user on a declared-compatible 0.22-0.27.x
+        # install would hit a cryptic "cannot import name 'batch_generate'"
+        # ImportError on the first GRPO rollout. Surface a clear, actionable message
+        # naming the required floor instead (the SFT/DPO/ORPO paths never import
+        # batch_generate, so this only gates GRPO).
+        try:
+            from mlx_lm import batch_generate
+        except ImportError as _e:
+            try:
+                import mlx_lm as _mlx_lm_mod
+                _mlx_lm_ver = getattr(_mlx_lm_mod, "__version__", "unknown")
+            except Exception:
+                _mlx_lm_ver = "unknown"
+            raise ImportError(
+                "Unsloth: MLX GRPO training requires mlx-lm>=0.28.0, which added "
+                "batch_generate for rollout generation (found mlx-lm "
+                f"{_mlx_lm_ver}). Upgrade with `pip install -U mlx-lm`."
+            ) from _e
         from mlx_lm.sample_utils import make_sampler
         # _common_prefix_len: robust prompt/response boundary for the re-encode
         # fallback (below). _normalize_seed: seeded prompt-order shuffle.
@@ -4345,6 +4418,21 @@ class MLXGRPOTrainer(MLXTrainer):
         # under SFT/DPO. Normalizing here restores that parity. It is a no-op when
         # chat_template is None, so default runs are unchanged.
         args = self.args
+        # GRPO drives training from a rollout generator that first materializes the
+        # dataset: _grpo_prompts() walks every row and examples=list(...) consumes
+        # the whole dataset before the first generate call. An unbounded streaming
+        # IterableDataset would therefore hang (or OOM) before a single rollout,
+        # despite max_steps -- there is no streaming rollout path. Fail fast here
+        # (mirroring the SFT/preference streaming guards) rather than hang.
+        if getattr(args, "streaming", False):
+            raise NotImplementedError(
+                "Unsloth MLX: streaming GRPO training is not yet implemented. The "
+                "rollout generator materializes the whole dataset (it walks every "
+                "prompt and lists all rows) before the first generation, so an "
+                "unbounded streaming dataset would hang or run out of memory instead "
+                "of stopping at max_steps. Disable streaming (streaming=False) for "
+                "GRPO, or use a finite (map-style) dataset."
+            )
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
@@ -4732,6 +4820,24 @@ def train_on_responses_only(
     # per_device_train_batch_size=1 the chosen half is empty -> NaN. Mirror the
     # DPO+VLM / DPO+non-LoRA fail-fast guards rather than train silently on
     # corrupted pairs. (return_function=True has no trainer/_batches to corrupt.)
+    if trainer is not None and getattr(trainer.args, "loss_type", "sft") == "grpo":
+        # GRPO drives training from on-the-fly rollouts that need the ORIGINAL
+        # prompt rows (and each row's reward kwargs). train_on_responses_only builds
+        # response-only SFT batches and replaces trainer.train_dataset /
+        # _mlx_train_dataset_for_batches with the tokenized, response-masked rows, so
+        # the rollout's _grpo_prompts()/examples would then read those SFT rows
+        # instead of the user's prompt dataset -- corrupting every rollout (or
+        # erroring on the now-missing 'prompt' column). It is a no-op for GRPO
+        # regardless, so reject it up front (mirrors the DPO/ORPO guard below, which
+        # only catches those two loss_types).
+        raise ValueError(
+            "Unsloth: train_on_responses_only() builds response-only SFT batches "
+            "and replaces the training dataset, but GRPO trains from rollouts that "
+            "need the original prompt rows (and per-row reward kwargs). Applying it "
+            "to an MLXGRPOTrainer corrupts the rollout data. Remove the "
+            "train_on_responses_only() call for GRPO -- reward functions already "
+            "score only the generated completion."
+        )
     if trainer is not None and getattr(trainer.args, "loss_type", "sft") in (
         "dpo", "orpo",
     ):

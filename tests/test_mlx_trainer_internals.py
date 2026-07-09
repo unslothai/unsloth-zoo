@@ -3845,3 +3845,119 @@ def test_grpo_rollout_wraps_conversational_completions_for_reward_funcs(monkeypa
     )
     next(trainer._grpo_rollout_generator())
     assert seen["completions"] == ["hello", "world"]
+
+
+# ---------------------------------------------------------------------------
+# PR #832 round-7 review fixes: mlx-lm floor, empty rewards, streaming guards,
+# unsupported loss_type, GRPO train_on_responses_only.
+# ---------------------------------------------------------------------------
+def test_grpo_rollout_raises_clear_error_when_batch_generate_missing(monkeypatch):
+    # batch_generate was added to mlx-lm 0.28.0, but the pyproject mlx extra only
+    # pins mlx-lm>=0.22.0. On a declared-compatible 0.22-0.27.x install the
+    # `from mlx_lm import batch_generate` in the rollout would raise a cryptic
+    # "cannot import name 'batch_generate'". The rollout must surface a clear,
+    # actionable message naming the required floor instead.
+    import sys
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    # Simulate an mlx-lm older than 0.28.0 (no batch_generate export). The test
+    # mlx_lm stub fabricates any missing attribute via __getattr__, so swap in a
+    # bare module that lacks batch_generate to make `from mlx_lm import
+    # batch_generate` raise ImportError the way a real old install would.
+    fake_mlx_lm = types.ModuleType("mlx_lm")
+    fake_mlx_lm.__version__ = "0.27.1"
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+    gen = trainer._grpo_rollout_generator()
+    with pytest.raises(ImportError, match=r"mlx-lm>=0\.28\.0"):
+        next(gen)
+
+
+def test_grpo_trainer_rejects_empty_reward_funcs():
+    # An empty reward_funcs list is accepted by the list coercion, but then every
+    # completion scores 0, all group-relative advantages are 0, and the policy
+    # receives no reward gradient (a silent no-op update). TRL's GRPOTrainer
+    # requires at least one reward function; fail fast at construction.
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    with pytest.raises(ValueError, match="at least one reward function"):
+        MLXGRPOTrainer(
+            model=None, tokenizer=None, train_dataset=None, reward_funcs=[],
+        )
+
+
+def test_prepare_data_rejects_unsupported_loss_type():
+    # A real TRL DPO loss variant that is not implemented on MLX ("ipo", "sigmoid",
+    # ...) or a typo would otherwise fall through to the SFT/CCE path and silently
+    # train a plain cross-entropy objective. Fail fast on any loss_type outside
+    # {sft, orpo, dpo} (grpo is handled by MLXGRPOTrainer's own guard).
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    for lt in ("ipo", "sigmoid", "hinge", "kto", "dppo"):
+        inst = MLXTrainer.__new__(MLXTrainer)
+        inst.args = types.SimpleNamespace(loss_type=lt)
+        with pytest.raises(ValueError, match="unsupported loss_type"):
+            MLXTrainer._prepare_data(inst, is_vlm=False)
+
+
+def test_preference_prepare_data_fails_fast_under_streaming():
+    # create_preference_batches materializes the WHOLE dataset before batching, so
+    # an unbounded streaming IterableDataset would hang or OOM instead of stopping
+    # at max_steps. The preference path has no bounded streaming iterator (unlike
+    # SFT/VLM), so it must fail fast under streaming=True.
+    import types as _types
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXDPOConfig, MLXORPOConfig
+
+    class _Tok:
+        chat_template = "{{ messages }}"
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    for cfg_cls in (MLXDPOConfig, MLXORPOConfig):
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = cfg_cls(streaming=True)
+        trainer.model = _types.SimpleNamespace(_config={}, _hf_repo=None)
+        trainer.tokenizer = _Tok()
+        trainer.train_dataset = [{"prompt": "p", "chosen": "c", "rejected": "r"}]
+        trainer._batches = None
+        # Single-process group (cached so no real init runs): the DDP guard is a
+        # no-op here, so the streaming guard is what must fire.
+        trainer._distributed_initialized = True
+        trainer._distributed_world = None
+        trainer._distributed_world_size = 1
+        trainer._distributed_rank = 0
+        trainer._distributed_is_main_process = True
+        with pytest.raises(NotImplementedError, match="streaming DPO/ORPO"):
+            MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+
+def test_grpo_prepare_data_fails_fast_under_streaming(monkeypatch):
+    # The GRPO rollout generator materializes the whole dataset (walks every prompt
+    # and lists all rows) before the first generation, so an unbounded streaming
+    # dataset would hang before a single rollout despite max_steps. GRPO has no
+    # streaming rollout path, so _prepare_data must fail fast under streaming=True.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    trainer.args.streaming = True
+    with pytest.raises(NotImplementedError, match="streaming GRPO"):
+        trainer._prepare_data(is_vlm=False)
+
+
+def test_train_on_responses_only_rejects_grpo_loss_type():
+    # train_on_responses_only builds response-only SFT batches and replaces the
+    # training dataset, but GRPO trains from rollouts that need the original prompt
+    # rows (and per-row reward kwargs). It is not caught by the DPO/ORPO guard, so
+    # it must fail fast for grpo too rather than silently corrupt the rollout data.
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    trainer = types.SimpleNamespace(args=types.SimpleNamespace(loss_type="grpo"))
+    with pytest.raises(ValueError, match="GRPO trains from rollouts"):
+        train_on_responses_only(trainer)
