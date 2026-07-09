@@ -406,6 +406,12 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    # Full-batch normalizers threaded in by UnslothEfficientGRPO when the batch is
+    # split into n_chunks > 1 (None on the single-chunk path, where the local batch
+    # statistics below ARE the global ones). global_bsz is the full-batch row count;
+    # global_mask_sum is the full-batch mask.sum() (a 0-dim tensor, pre-clamped).
+    global_bsz      = kwargs.get("global_bsz", None)
+    global_mask_sum = kwargs.get("global_mask_sum", None)
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -562,20 +568,42 @@ def grpo_compute_loss(
     n_mask_per_reward = mask.sum(1)
 
     # https://github.com/huggingface/trl/blob/e8b8499f1f8d76838155b515e414ee98f757d6d5/trl/trainer/grpo_trainer.py#L1624
+    # When global_bsz / global_mask_sum are provided, every chunk divides its partial
+    # sum by the SAME full-batch constant, so summing the chunk losses reproduces the
+    # exact full-batch loss for any chunk sizes (equal or ragged), and each chunk's
+    # gradient (which only touches that chunk's rows) is already globally scaled.
     if loss_type in ["grpo", "sapo"]:
-        loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+        if global_bsz is not None:
+            loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).sum() / global_bsz
+        else:
+            loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo":
-        loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
+        if global_mask_sum is not None:
+            loss = (loss_i * mask).sum() / global_mask_sum
+        else:
+            loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
-        loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
+        if global_bsz is not None:
+            loss = (loss_i * mask).sum() / (global_bsz * max_completion_length)
+        else:
+            loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["cispo", "dapo", "vespo"]:
+        # num_items_in_batch / num_processes is already a full-batch (global)
+        # normalizer, identical for every chunk, so no chunk correction is needed.
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
-        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        if global_bsz is not None:
+            # .mean() over a (bsz, C) tensor is sum / (bsz * C); C (1 for sequence
+            # level, seq_len otherwise) is identical across chunks, so divide the
+            # chunk sum by the global element count global_bsz * C.
+            weighted = loss_i * mask.sum(1, keepdim=True)
+            loss = weighted.sum() / (global_bsz * weighted.size(-1))
+        else:
+            loss = (loss_i * mask.sum(1, keepdim=True)).mean()
         normalizer = current_gradient_accumulation_steps
         loss = loss / normalizer
     else:
@@ -611,6 +639,18 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
         if extra_kwargs is None:
             extra_kwargs = {}
+        total_rows = _new_logps.size(0)
+        if n_chunks != 1:
+            # Thread the full-batch normalizers into every chunk so each chunk's
+            # grpo_compute_loss divides its partial sum by the SAME global constant.
+            # The chunk losses then simply SUM to the exact full-batch loss for any
+            # chunk sizes (equal or ragged), and each chunk's gradient slice is
+            # already correctly globally scaled. Copy so the caller's dict (reused
+            # across steps) is not mutated. global_mask_sum mirrors the single-chunk
+            # path, which computes mask.sum() on the float32-cast mask.
+            extra_kwargs = dict(extra_kwargs)
+            extra_kwargs["global_bsz"] = total_rows
+            extra_kwargs["global_mask_sum"] = _mask.to(torch.float32).sum().clamp(min=1.0)
         def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, _mask  = grpo_compute_loss(
                 ref_logps,
@@ -647,6 +687,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             mask_j,
             advantages_j,
             scaling,
+            metric_scale,
             grad_inputs_j,
         ):
             (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl, chunk_delta, chunk_flat_is_ratio, chunk_coef_1)) = torch.func.grad_and_value(
@@ -655,12 +696,16 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 has_aux = True,
             )(new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling)
             accumulated_loss             .add_(unscaled_loss)
-            accumulated_completion_length.add_(chunk_completion_length)
-            accumulated_mean_kl          .add_(chunk_mean_kl)
-            accumulated_delta            .append(chunk_delta)
-            accumulated_flat_is_ratio    .append(chunk_flat_is_ratio)
-            accumulated_coef_1           .append(chunk_coef_1)
+            # completion_length and mean_kl are per-chunk ROW means; weighting each
+            # chunk by chunk_rows / total_rows makes the accumulated values exact
+            # global row means (no final division). metric_scale is 1.0 at n_chunks=1.
+            accumulated_completion_length.add_(chunk_completion_length * metric_scale)
+            accumulated_mean_kl          .add_(chunk_mean_kl * metric_scale)
             grad_inputs_j[:] = chunk_grad_input
+            # Return per-chunk tensors; the outer (uncompiled) loop appends them.
+            # Appending to the closed-over lists here would make dynamo guard on the
+            # list length and recompile one graph per chunk index.
+            return chunk_delta, chunk_flat_is_ratio, chunk_coef_1
         pass
 
         accumulate_chunk = torch.compile(
@@ -703,7 +748,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             #     mark_dynamic(old_hidden_states_j)
             # mark_dynamic(input_ids_j)
             # mark_dynamic(mask_j)
-            accumulate_chunk(
+            chunk_delta, chunk_flat_is_ratio, chunk_coef_1 = accumulate_chunk(
                 new_logps_j,
                 old_logps_j,
                 ref_logps_j,
@@ -712,18 +757,23 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 mask_j,
                 advantages_j,
                 scaling,
+                new_logps_j.size(0) / total_rows,
                 grad_inputs_j,
             )
+            accumulated_delta        .append(chunk_delta)
+            accumulated_flat_is_ratio.append(chunk_flat_is_ratio)
+            accumulated_coef_1       .append(chunk_coef_1)
         pass
 
-        # WARNING: this uniform /n_chunks is only correct at n_chunks == 1 (the value
-        # grpo_accumulated_loss always passes). Do NOT re-enable batch chunking without
-        # making it per-loss-type: sum-normalized dapo/cispo/vespo must not be divided
-        # again, bnpo needs the global mask.sum(), and non-divisor counts mis-weight all.
-        grad_inputs                  .div_(n_chunks)
-        accumulated_loss             .div_(n_chunks)
-        accumulated_completion_length.div_(n_chunks)
-        accumulated_mean_kl          .div_(n_chunks)
+        # No division by n_chunks here (loss, grad, or metrics). Every chunk's loss is
+        # already divided by the full-batch (global) normalizer: at n_chunks == 1 the
+        # local batch statistics in grpo_compute_loss ARE the global ones, at
+        # n_chunks > 1 forward threads global_bsz / global_mask_sum above, and
+        # cispo/dapo/vespo always normalize by the global num_items_in_batch. Summing
+        # the chunk losses therefore reproduces the exact full-batch loss for ANY
+        # chunk sizes (equal or ragged), and each chunk's gradient slice is already
+        # correctly globally scaled. Metrics are accumulated row-weighted (see
+        # accumulate_chunk), which sums to the exact global row means.
 
         if _sampling_per_token_logps is not None:
             accumulated_delta = torch.cat(accumulated_delta, dim=0)
@@ -848,12 +898,12 @@ def grpo_accumulated_loss(
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["use_vllm"] = trainer.use_vllm
-    # NOTE: `n_chunks` is NOT used to chunk the batch; .apply() below always passes 1.
-    # UnslothEfficientGRPO's uniform div_(n_chunks) is only correct at n_chunks=1: it
-    # would over-divide the sum-normalized dapo/cispo/vespo, mis-weight bnpo, and any
-    # non-divisor count mis-weights everything. The old "snap to a divisor of bsz" logic
-    # never reached .apply(), so it was dead code and is removed. The parameter stays in
-    # the signature because the caller passes it as a keyword.
+    # `n_chunks` (GRPOConfig.unsloth_num_chunks; -1 means one row per chunk) splits the
+    # batch inside UnslothEfficientGRPO. Each chunk is normalized by full-batch
+    # (global) constants, so any chunk count is numerically exact, but a ragged last
+    # chunk changes tensor shapes and forces torch.compile recompiles; snap n_chunks
+    # to the smallest divisor of bsz >= n_chunks so all chunks stay equal-sized.
+    # The snap runs on new_logprobs.shape[0] right before the .apply() call below.
 
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
@@ -1550,6 +1600,14 @@ def grpo_accumulated_loss(
         # padded fallback (packing disabled / unsupported / not verified for this length)
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
 
+    # Snap n_chunks to the smallest divisor of the row count that is >= n_chunks
+    # (see the note above; -1 means one row per chunk). Pure python on purpose: this
+    # runs once per step outside the compiled region and avoids a numpy dependency.
+    _grpo_rows = new_logprobs.shape[0]
+    if n_chunks is None or n_chunks == -1: n_chunks = _grpo_rows
+    n_chunks = max(min(int(n_chunks), _grpo_rows), 1)
+    while _grpo_rows % n_chunks != 0: n_chunks += 1
+
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
             new_logprobs,
@@ -1562,7 +1620,7 @@ def grpo_accumulated_loss(
             advantages,
             trainer.beta,
             trainer.accelerator.scaler,
-            1,  # n_chunks fixed at 1 (see note above)
+            n_chunks,
             kwargs
         )
 

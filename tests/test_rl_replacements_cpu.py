@@ -22,7 +22,8 @@ Covers:
   - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
     top_entropy_quantile, use_bias_correction_kl)
   - `UnslothEfficientGRPO` at n_chunks=1 matches a naive grpo_compute_loss pass,
-    and uniform div_(n_chunks) is only correct at n_chunks=1
+    and n_chunks>1 (equal or ragged chunks) is loss- and gradient-identical to
+    n_chunks=1 for every loss type (global normalizers threaded per chunk)
   - `RL_REPLACEMENTS` dict integrity (every value is callable; the
     well-known public-API keys are populated).
 """
@@ -291,12 +292,15 @@ def test_warn_unsupported_grpo_options_registered():
 
 
 # ---------------------------------------------------------------------------
-# UnslothEfficientGRPO batch chunking  (Issue 2: dead + incorrect n_chunks)
+# UnslothEfficientGRPO batch chunking
 # ---------------------------------------------------------------------------
-# Production always calls with n_chunks=1. These tests pin (1) n_chunks=1 is
-# numerically identical (loss and gradient) to a naive grpo_compute_loss pass, so
-# removing the dead snapping is a no-op, and (2) uniform div_(n_chunks) is wrong for
-# n_chunks>1 on sum-normalized dapo/cispo/vespo, hence fixing n_chunks at 1.
+# UnslothEfficientGRPO threads full-batch (global) normalizers into every chunk's
+# grpo_compute_loss call, so chunk losses sum to the exact full-batch loss and each
+# chunk's gradient slice is already globally scaled (no division by n_chunks). These
+# tests pin (1) n_chunks=1 is numerically identical (loss and gradient) to a naive
+# grpo_compute_loss pass (the global kwargs default to None, keeping the single-chunk
+# path bit-identical), and (2) n_chunks>1, including chunk counts that do not divide
+# the batch evenly, matches n_chunks=1 for every loss type in loss AND gradient.
 
 
 @pytest.fixture
@@ -360,24 +364,67 @@ def test_efficient_grpo_nchunks1_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
-def test_efficient_grpo_uniform_div_is_wrong_above_one_chunk(disable_dynamo):
-    beta = 0.04
-    lm_head = torch.randn(17, 8, dtype=torch.float64)
-    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("dapo")
+_ALL_LOSS_TYPES = ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo"]
 
-    new_ref = new.clone().requires_grad_(True)
-    correct = rr.grpo_compute_loss(
-        ref, new_ref, old, None, input_ids, mask, beta, advantages, **kwargs
-    )[0].detach().double()
 
-    def eff(n_chunks):
-        ne = new.clone().requires_grad_(True)
-        return rr.UnslothEfficientGRPO.apply(
-            ne, old, ref, None, lm_head, input_ids, mask, advantages,
-            beta, None, n_chunks, kwargs,
-        )[0].detach().double()
+def _run_efficient_grpo(new, old, ref, input_ids, mask, advantages, kwargs,
+                        n_chunks, beta=0.04):
+    lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
+    ne = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        ne, old, ref, None, lm_head, input_ids, mask, advantages,
+        beta, None, n_chunks, kwargs,
+    )
+    out[0].backward()
+    # (loss, completion_length, mean_kl, grad)
+    return out[0].detach().double(), out[1].detach().double(), \
+        out[2].detach().double(), ne.grad.clone()
 
-    # n_chunks=1 is exact; n_chunks=k makes the sum-normalized dapo loss k x too small.
-    assert torch.allclose(eff(1), correct, atol=1e-8, rtol=1e-6)
-    assert torch.allclose(eff(2), correct / 2, atol=1e-8, rtol=1e-6)
-    assert torch.allclose(eff(3), correct / 3, atol=1e-8, rtol=1e-6)
+
+@pytest.mark.parametrize("n_chunks", [2, 3, 4])
+@pytest.mark.parametrize("loss_type", _ALL_LOSS_TYPES)
+def test_efficient_grpo_nchunks_invariant(loss_type, n_chunks, disable_dynamo):
+    # Core correctness proof for batch chunking: n_chunks in {2,3,4} must give the
+    # same loss AND gradient (and folded metrics) as n_chunks=1 for every loss type.
+    # B=6 makes n_chunks=2,3 equal-sized splits; n_chunks=4 exercises a chunk count
+    # that does not divide the batch (torch.chunk(6, 4) -> 3 chunks of 2 rows).
+    fixture = _grpo_loss_fixture(loss_type, B=6)
+    new, old, ref, input_ids, mask, advantages, kwargs = fixture
+
+    loss_1, clen_1, kl_1, grad_1 = _run_efficient_grpo(*fixture, n_chunks=1)
+    loss_k, clen_k, kl_k, grad_k = _run_efficient_grpo(*fixture, n_chunks=n_chunks)
+
+    # The loss accumulator buffer in UnslothEfficientGRPO is float32, so summed
+    # chunk losses agree with the single-chunk loss at fp32 resolution; the fp64
+    # gradient below is the strict 1e-8 invariance proof.
+    assert torch.allclose(loss_k, loss_1, atol=1e-8, rtol=1e-6), \
+        f"{loss_type}: loss mismatch at n_chunks={n_chunks}"
+    assert torch.allclose(grad_k, grad_1, atol=1e-8, rtol=1e-8), \
+        f"{loss_type}: gradient mismatch at n_chunks={n_chunks}"
+    # Metrics accumulate in float32 buffers, so compare at fp32 resolution.
+    assert torch.allclose(clen_k, clen_1, atol=1e-6, rtol=1e-6), \
+        f"{loss_type}: completion_length mismatch at n_chunks={n_chunks}"
+    assert torch.allclose(kl_k, kl_1, atol=1e-6, rtol=1e-6), \
+        f"{loss_type}: mean_kl mismatch at n_chunks={n_chunks}"
+
+
+@pytest.mark.parametrize("loss_type", _ALL_LOSS_TYPES)
+def test_efficient_grpo_ragged_chunks_match(loss_type, disable_dynamo):
+    # Unequal chunk sizes must still be exact: B=7 with n_chunks=3 splits into
+    # (3, 3, 1)-row chunks. Global normalization makes ragged chunks correct too
+    # (the caller only snaps to divisors to avoid torch.compile recompiles).
+    fixture = _grpo_loss_fixture(loss_type, B=7)
+
+    loss_1, clen_1, kl_1, grad_1 = _run_efficient_grpo(*fixture, n_chunks=1)
+    loss_3, clen_3, kl_3, grad_3 = _run_efficient_grpo(*fixture, n_chunks=3)
+
+    # fp32 loss accumulator: see test_efficient_grpo_nchunks_invariant.
+    assert torch.allclose(loss_3, loss_1, atol=1e-8, rtol=1e-6), \
+        f"{loss_type}: loss mismatch on ragged chunks"
+    assert torch.allclose(grad_3, grad_1, atol=1e-8, rtol=1e-8), \
+        f"{loss_type}: gradient mismatch on ragged chunks"
+    # Metrics accumulate in float32 buffers, so compare at fp32 resolution.
+    assert torch.allclose(clen_3, clen_1, atol=1e-6, rtol=1e-6), \
+        f"{loss_type}: completion_length mismatch on ragged chunks"
+    assert torch.allclose(kl_3, kl_1, atol=1e-6, rtol=1e-6), \
+        f"{loss_type}: mean_kl mismatch on ragged chunks"
