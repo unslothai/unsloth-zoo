@@ -640,3 +640,48 @@ def test_copy_source_sidecars_skips_packed_quant_descriptors(tmp_path):
     assert "config.json" not in present
     assert "model-00001-of-00001.safetensors" not in present
     assert copied == 2
+
+
+def test_gptq_dequantize_weight_zero_point_zero_boundary():
+    # Regression: AutoGPTQ v1 stores the zero-point minus one and the forward
+    # re-masks: zeros = (zeros + 1) & 0xF. Stored nibble 15 encodes zero-point 0
+    # ((0 - 1) mod 16 == 15), so it must dequantize with effective zero 0, not 16.
+    # A missing re-mask adds a constant 16*scale error to the affected columns
+    # (reachable on asymmetric checkpoints with an all-nonnegative group).
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    inn, out, gs = 16, 8, 8
+    groups = inn // gs
+    rng = np.random.default_rng(7)
+    q = rng.integers(0, 16, size=(inn, out)).astype(np.int64)
+    stored_zero = rng.integers(0, 16, size=(groups, out)).astype(np.int64)
+    stored_zero[0, 0] = 15                       # zero-point 0 boundary
+    stored_zero[-1, -1] = 15
+    scales = rng.random((groups, out)).astype(np.float32) + 0.1
+    g_idx = (np.arange(inn) // gs).astype(np.int32)
+    eff_zero = (stored_zero + 1) & 0xF           # correct AutoGPTQ v1 recovery
+    ref = np.zeros((out, inn), dtype=np.float32)
+    for i in range(inn):
+        g = int(g_idx[i])
+        ref[:, i] = (q[i] - eff_zero[g]) * scales[g]
+    dense = ml._gptq_dequantize_weight(
+        mx.array(_pack_qweight_gptq(q)),
+        mx.array(_pack_qzeros_gptq(stored_zero)),
+        mx.array(scales),
+        mx.array(g_idx),
+        bits=4,
+    )
+    got = np.asarray(dense).astype(np.float32)
+    assert np.allclose(got, ref, atol=1e-3), np.abs(got - ref).max()
+
+
+def test_gptq_v2_checkpoint_rejected():
+    # GPTQ v2 (checkpoint_format="gptq_v2") stores zeros raw (no -1 offset), so
+    # dequantizing with the v1 (+1) convention is a silent off-by-one on every
+    # zero-point. It must be rejected clearly rather than mis-decoded.
+    import unsloth_zoo.mlx.loader as ml
+    with pytest.raises(NotImplementedError, match="v2"):
+        ml._materialize_dequantized_hf_checkpoint(
+            "/nonexistent", {}, "gptq",
+            {"bits": 4, "group_size": 128, "checkpoint_format": "gptq_v2"},
+        )

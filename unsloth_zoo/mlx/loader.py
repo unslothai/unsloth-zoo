@@ -3403,7 +3403,13 @@ def _gptq_dequantize_weight(qweight, qzeros, scales, g_idx, bits=4):
     w = (mx.right_shift(qw[:, None, :], shifts[None, :, None]) & 0xF)
     w = w.reshape(-1, qw.shape[1]).astype(mx.float32)   # [in, out]
     z = (mx.right_shift(qz[:, :, None], shifts[None, None, :]) & 0xF)
-    z = z.reshape(qz.shape[0], -1).astype(mx.float32) + 1.0   # [groups, out]
+    # AutoGPTQ v1 stores the zero-point minus one; recover it with
+    # (stored + 1) & 0xF. The re-mask matters at stored nibble 15 (which encodes
+    # zero-point 0): (15 + 1) & 0xF == 0, not 16. Masking before the add, or
+    # omitting the wrap, shifts those output columns by a constant 16*scale on
+    # asymmetric checkpoints that contain an all-nonnegative group. Mirrors
+    # AutoGPTQ's forward: zeros = (zeros + 1) & 0xF.
+    z = ((z.reshape(qz.shape[0], -1) + 1) & 0xF).astype(mx.float32)   # [groups, out]
     g = g_idx.astype(mx.int32)                          # [in]
     eff = (w - z[g]) * scales[g]                        # [in, out]
     return mx.transpose(eff)                            # [out, in]
@@ -3650,6 +3656,20 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
             f"Unsloth: {method.upper()} runtime dequant on MLX currently supports "
             f"4-bit checkpoints only (got bits={bits})."
         )
+    if method == "gptq":
+        # GPTQ v2 (GPTQModel checkpoint_format="gptq_v2") stores the zero-point
+        # RAW (no -1 offset), unlike AutoGPTQ v1 which _gptq_dequantize_weight
+        # assumes via (stored + 1) & 0xF. Dequantizing a v2 checkpoint with the v1
+        # convention would be off by one quant level on every zero-point (silent
+        # garbage), so reject it clearly rather than mis-decode.
+        _ckpt_fmt = str(quant_config.get("checkpoint_format", "") or "").lower()
+        if _ckpt_fmt in ("gptq_v2", "gptqv2"):
+            raise NotImplementedError(
+                "Unsloth: GPTQ v2 checkpoints (checkpoint_format='gptq_v2') use a "
+                "different zero-point convention than AutoGPTQ v1 and are not yet "
+                "supported for MLX runtime dequant. Convert to the v1 GPTQ format, "
+                "or use a v1 GPTQ / AWQ checkpoint."
+            )
 
     shard_paths = sorted(glob.glob(os.path.join(local_path, "*.safetensors")))
     if not shard_paths:
