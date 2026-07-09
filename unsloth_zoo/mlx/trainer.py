@@ -498,6 +498,33 @@ def _clip_grad_norm_fp32(grad, max_norm):
     return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
 
 
+def _mlx_identity(x):
+    return x
+
+
+def _mlx_disable_lora_dropout(model):
+    """Neutralize LoRA/DoRA adapter dropout for TRL DPO/ORPO parity.
+
+    TRL's DPOConfig and ORPOConfig default ``disable_dropout=True`` and call
+    ``disable_dropout_in_model`` (trl/trainer/dpo_trainer.py:378-381,
+    trl/trainer/orpo_trainer.py:302-303), so the preference log-prob forwards are
+    DETERMINISTIC. The MLX preference loss runs inside the train()-mode step
+    (``model.train()`` at the loop start), where a per-step ``model.eval()`` is
+    unreliable, so neutralize the adapter dropout once at setup instead: mlx-lm's
+    LoRALinear/DoRALinear apply ``self.dropout(x)`` before the low-rank matmul, so
+    replacing that module with identity makes the policy forward deterministic
+    (for referenced DPO the reference forward is already clean via scale=0, which
+    zeros the delta regardless of the mask). ``lora_dropout=0`` is already a no-op,
+    so default configs are unaffected. Only ORPO/DPO call this; SFT keeps dropout.
+    """
+    count = 0
+    for _, mod in iter_mlx_lora_modules(model):
+        if getattr(mod, "dropout", None) is not None:
+            mod.dropout = _mlx_identity
+            count += 1
+    return count
+
+
 def _prune_stale_checkpoints(output_dir, save_total_limit):
     """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
 
@@ -2043,6 +2070,11 @@ class MLXTrainer:
         else:
             if getattr(args, "loss_type", "sft") == "orpo":
                 _ob = getattr(args, "orpo_beta", 0.1)
+                # TRL's ORPOConfig defaults disable_dropout=True; the single ORPO
+                # forward (SFT + odds-ratio) runs under train() mode, so nonzero
+                # LoRA dropout would perturb the policy log-probs vs TRL. Disable
+                # it (no-op when lora_dropout=0).
+                _mlx_disable_lora_dropout(model)
                 loss_fn = make_orpo_loss_fn(beta=_ob)
                 print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
             elif getattr(args, "loss_type", "sft") == "dpo":
@@ -2073,6 +2105,14 @@ class MLXTrainer:
                 # DPO reward is not corrupted by reference-side NEFTune noise.
                 _neft = getattr(self, "_neftune_emb", None)
                 _neftune_mods = [_neft] if _neft is not None else []
+                # TRL's DPOConfig defaults disable_dropout=True. The DPO policy
+                # forward runs under train() mode, so nonzero LoRA dropout would
+                # perturb the policy log-probs (and, for referenced DPO, the
+                # policy and reference forwards would even see different masks)
+                # and bias the preference margin vs TRL. Disable it (no-op when
+                # lora_dropout=0); the reference forward is already clean via
+                # scale=0.
+                _mlx_disable_lora_dropout(model)
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods,
                                            reference_free=_rf,
                                            neftune_mods=_neftune_mods)

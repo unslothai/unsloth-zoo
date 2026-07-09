@@ -2357,6 +2357,81 @@ def test_dpo_reference_collects_nested_lora_modules():
     assert all(hasattr(m, "lora_a") and hasattr(m, "lora_b") for m in mods)
 
 
+def test_preference_disable_lora_dropout_neutralizes_adapter_dropout():
+    # Regression (DROPOUT-PREFERENCE): TRL's DPOConfig/ORPOConfig default
+    # disable_dropout=True and call disable_dropout_in_model
+    # (trl/trainer/dpo_trainer.py:378-381, orpo_trainer.py:302-303), so preference
+    # log-prob forwards are DETERMINISTIC. mlx-lm's LoRALinear applies
+    # self.dropout(x) before the low-rank matmul, and the MLX preference loss runs
+    # under model.train(); a nonzero lora_dropout (get_peft_model(..., lora_dropout=)
+    # is a reachable common setting) would make the POLICY log-probs stochastic and
+    # diverge from TRL. _mlx_disable_lora_dropout must replace every adapter's
+    # dropout with a deterministic identity (lora_dropout=0 stays a no-op).
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout, _mlx_identity
+    from unsloth_zoo.mlx.utils import _get_mlx_dropout_probability
+
+    class _Dropout:
+        # Stand-in for mlx.nn.Dropout: keep-prob in _p_1, applies a mask on call.
+        def __init__(self, p):
+            self._p_1 = 1.0 - p
+            self.calls = 0
+
+        def __call__(self, x):
+            self.calls += 1
+            return x
+
+    class Adapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = torch.zeros(2, 4)
+            self.lora_b = torch.zeros(4, 2)
+            self.dropout = _Dropout(0.5)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = Adapter()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Block(), Block()]
+
+    model = Model()
+    # Before: active adapter dropout with probability 0.5.
+    before = [_get_mlx_dropout_probability(b.q_proj.dropout) for b in model.layers]
+    assert before == [pytest.approx(0.5), pytest.approx(0.5)]
+
+    count = _mlx_disable_lora_dropout(model)
+    assert count == 2
+    for blk in model.layers:
+        assert blk.q_proj.dropout is _mlx_identity
+        assert _get_mlx_dropout_probability(blk.q_proj.dropout) == 0.0
+    # Identity is a deterministic passthrough (no fresh mask).
+    sentinel = object()
+    assert model.layers[0].q_proj.dropout(sentinel) is sentinel
+
+
+def test_preference_setup_disables_dropout_for_orpo_and_dpo():
+    # The ORPO and DPO branches of _train_inner must call
+    # _mlx_disable_lora_dropout(model) before building the preference loss fn
+    # (mirroring TRL's disable_dropout=True default). Source-inspection guarded so
+    # the wiring cannot silently regress, matching the DoRA-guard test.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    disable = "_mlx_disable_lora_dropout(model)"
+    orpo_builder = src.index("make_orpo_loss_fn(beta=")
+    dpo_builder = src.index("make_dpo_loss_fn(beta=")
+    orpo_branch = src.index('== "orpo"')
+    dpo_branch = src.index('== "dpo"')
+    # A disable call sits inside each branch, before that branch's loss builder.
+    assert disable in src[orpo_branch:orpo_builder]
+    assert disable in src[dpo_branch:dpo_builder]
+
+
 class _StubLM:
     def __init__(self, vocab):
         self.vocab = vocab
@@ -2578,6 +2653,145 @@ def test_preference_default_order_truncation_samples_across_lengths():
     assert max(selected_lengths) > 6, (
         f"truncation still biased toward shortest pairs: {selected_lengths}"
     )
+
+
+class _RecordingChatTemplateTokenizer:
+    # Records every apply_chat_template call so a test can assert which kwargs
+    # (tools / chat_template_kwargs) were threaded through, and folds them into
+    # the rendered text so a tool/thinking template renders differently.
+    eos_token_id = 0
+    bos_token = None
+
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, messages, tokenize=False,
+                            add_generation_prompt=False,
+                            continue_final_message=False,
+                            tools=None, **kwargs):
+        self.calls.append({"tools": tools, "kwargs": dict(kwargs)})
+        parts = []
+        for m in messages:
+            tag = "U:" if m["role"] == "user" else "A:"
+            parts.append(tag + m["content"])
+        s = "".join(parts)
+        if tools:
+            # Prefix (shared by prompt / prompt+chosen / prompt+rejected) so the
+            # prompt boundary is preserved while proving tools reached the render.
+            s = "T{}|".format(len(tools)) + s
+        if kwargs.get("enable_thinking") is False:
+            s = "NT|" + s
+        if add_generation_prompt:
+            s += "A:"
+        return s
+
+    def encode(self, text, add_special_tokens=True):
+        # A raw message list would raise here; reaching this with a plain string
+        # proves the chat render ran.
+        return [ord(ch) % 100 for ch in text]
+
+
+def test_preference_conversational_render_threads_tools_and_template_kwargs():
+    # Regression (CHAT-TEMPLATE-KWARGS): _render_preference_example rendered
+    # conversational preference rows through apply_chat_template but DROPPED the
+    # per-row `tools` schema and `chat_template_kwargs`. TRL's apply_chat_template
+    # threads both into every render of a preference row (prompt, prompt+chosen,
+    # prompt+rejected -- trl/data_utils.py: tools=tools,
+    # **example.get("chat_template_kwargs", {})), and this codebase's SFT
+    # conversational path threads the same per-row fields
+    # (_tokenize_mlx_conversational_prompt_completion). Dropping them makes a
+    # tool/function-calling template render WITHOUT its tool block (or raise) and
+    # ignores a per-row template knob (e.g. Qwen3 enable_thinking), so ORPO/DPO
+    # trains on different text than SFT/TRL for the identical row. The builder
+    # must thread ex-level tools / chat_template_kwargs into all three renders.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    row = {
+        "prompt": [{"role": "user", "content": "hi"}],
+        "chosen": [{"role": "assistant", "content": "ok"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+        "tools": tools,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    tok = _RecordingChatTemplateTokenizer()
+    with_tools = create_preference_batches(
+        [dict(row)], tok, batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )
+    # Threaded into ALL THREE renders (prompt, prompt+chosen, prompt+rejected).
+    assert len(tok.calls) == 3
+    for call in tok.calls:
+        assert call["tools"] == tools
+        assert call["kwargs"].get("enable_thinking") is False
+
+    # And it actually changes the tokenized batch: a control row WITHOUT tools /
+    # chat_template_kwargs renders (and encodes) differently. This also confirms
+    # the no-field path stays clean (no tools kwarg injected -> a tokenizer whose
+    # apply_chat_template lacks a tools= parameter keeps working).
+    plain_row = {k: row[k] for k in ("prompt", "chosen", "rejected")}
+    ctrl_tok = _RecordingChatTemplateTokenizer()
+    without_tools = create_preference_batches(
+        [plain_row], ctrl_tok, batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )
+    for call in ctrl_tok.calls:
+        assert call["tools"] is None
+        assert call["kwargs"] == {}
+    assert with_tools[0][0].tolist() != without_tools[0][0].tolist()
+
+
+def test_preference_step_run_reshuffles_batch_order_each_pass():
+    # Regression (EPOCH-LOOP-BATCHES): create_preference_batches built ONE
+    # length-sorted pass of `starts`; when num_batches (= max_steps * grad_accum)
+    # spans MORE than one pass, the trainer modulo-cycles that fixed list
+    # (batches[batch_idx % len(batches)]), repeating the SAME short->long order
+    # every epoch -- unlike the SFT path, which reshuffles per epoch via
+    # mlx_lm.iterate_batches(loop=True). The default-order builder must emit a
+    # fresh permutation per pass up to num_batches so each cycled epoch differs.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _LenTokenizer:
+        bos_token = None
+        eos_token_id = None  # no EOS append -> exact control of row lengths
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(tok[0]) for tok in text.split()]
+
+    # 6 pairs with strictly increasing chosen length -> each pair is identifiable
+    # by its chosen seq_end. batch_size=1 -> one pair per batch, 6 batches/pass.
+    dataset = [
+        {
+            "prompt": "p ",
+            "chosen": " ".join(["c"] * (i + 1)),
+            "rejected": " ".join(["r"] * (i + 1)),
+        }
+        for i in range(6)
+    ]
+    num_batches = 12  # two full passes over the 6 pairs
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=_LenTokenizer(),
+        batch_size=1,
+        max_seq_length=64,
+        pad_to_multiple=1,
+        num_batches=num_batches,
+        dataset_order="default",
+        seed=0,
+    )
+    # The fix materializes num_batches batches (so the trainer's modulo-cycle
+    # never wraps a single fixed pass); the old code returned only one pass (6).
+    assert len(batches) == num_batches
+    ids = [int(lengths.tolist()[0][1]) for _, lengths, _ in batches]
+    pass1, pass2 = ids[:6], ids[6:]
+    # Each pass is a full permutation over the same 6 pairs...
+    assert sorted(pass1) == sorted(pass2)
+    assert len(set(pass1)) == 6
+    # ...but the passes differ (reshuffled per epoch, not a repeated fixed order).
+    assert pass1 != pass2
+    # And the first pass is not the biased short->long length-sorted order.
+    assert pass1 != sorted(pass1)
 
 
 def test_preference_loss_rejects_prebuilt_sft_labeled_batches():

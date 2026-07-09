@@ -1063,7 +1063,8 @@ def _is_conversational_messages(value):
     )
 
 
-def _render_preference_example(tokenizer, prompt, chosen, rejected):
+def _render_preference_example(tokenizer, prompt, chosen, rejected,
+                               tools=None, chat_template_kwargs=None):
     """Return (prompt_str, prompt_chosen_str, prompt_rejected_str) for one
     preference row, rendering conversational (message-list) rows through the
     tokenizer chat template.
@@ -1083,6 +1084,21 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected):
     operates on the rendered strings exactly as it does for pre-rendered string
     prompts. Plain string rows fall through unchanged (byte-identical to the
     prior concat).
+
+    ``tools`` / ``chat_template_kwargs`` are the per-row function-calling schema
+    and extra template kwargs. TRL's apply_chat_template threads them into EVERY
+    render of a preference row (prompt, prompt+chosen, prompt+rejected --
+    trl/data_utils.py: tools=tools, **example.get("chat_template_kwargs", {})),
+    and this codebase's SFT conversational path threads the same per-row fields
+    (_tokenize_mlx_conversational_prompt_completion / the assistant-mask row:
+    tools=item.get("tools"), **item.get("chat_template_kwargs", {})). Dropping
+    them here would (a) render a tool/function-calling template WITHOUT its tool
+    schema (raising inside templates that reference ``tools``, or omitting the
+    tool block), and (b) ignore a per-row chat_template_kwargs knob (e.g. Qwen3
+    ``enable_thinking``), so ORPO/DPO would train on DIFFERENT text than the SFT
+    path and TRL for the identical row. Thread them into all three renders to
+    match. Only affects the conversational branch; plain string rows ignore them
+    (TRL's maybe_apply_chat_template is a no-op on non-conversational rows).
     """
     if _is_conversational_messages(prompt):
         last_role = prompt[-1].get("role")
@@ -1095,19 +1111,32 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected):
                 "Unsloth MLX preference: conversational chat prompt has invalid "
                 f"last-message role {last_role!r}; expected 'user' or 'assistant'."
             )
+        # Only inject tools / chat_template_kwargs when the row actually carries
+        # them, so rows WITHOUT these fields render byte-identically to before
+        # (and tokenizers whose apply_chat_template omits a tools= parameter keep
+        # working). A real HF tokenizer defaults tools=None, so this is equivalent
+        # to TRL's unconditional tools=tools for the no-tools case.
+        extra_kwargs = dict(chat_template_kwargs or {})
+        if tools is not None:
+            extra_kwargs["tools"] = tools
         prompt_str = tokenizer.apply_chat_template(
             prompt, tokenize=False,
             add_generation_prompt=add_gen, continue_final_message=cont,
+            **extra_kwargs,
         )
         prompt_chosen_str = tokenizer.apply_chat_template(
             list(prompt) + list(chosen), tokenize=False,
+            **extra_kwargs,
         )
         prompt_rejected_str = tokenizer.apply_chat_template(
             list(prompt) + list(rejected), tokenize=False,
+            **extra_kwargs,
         )
         return prompt_str, prompt_chosen_str, prompt_rejected_str
     # Standard string preference row (or a prompt already rendered to a chat
-    # string): concatenate, matching the prior behavior exactly.
+    # string): concatenate, matching the prior behavior exactly. tools /
+    # chat_template_kwargs do not apply to non-conversational rows (TRL's
+    # maybe_apply_chat_template is a no-op on them).
     return prompt, prompt + chosen, prompt + rejected
 
 
@@ -1215,12 +1244,21 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                 f"columns; got {sorted(ex.keys())}."
             )
         prompt = ex[prompt_key]
+        # Per-row function-calling schema / extra chat-template kwargs, threaded
+        # into the conversational render below exactly as the SFT path and TRL's
+        # apply_chat_template do (tools=item.get("tools"),
+        # **item.get("chat_template_kwargs", {})). No-op for plain string rows.
+        _ex_tools = ex.get("tools") if isinstance(ex, Mapping) else None
+        _ex_template_kwargs = (
+            ex.get("chat_template_kwargs") if isinstance(ex, Mapping) else None
+        )
         # Conversational (message-list) prompt/chosen/rejected are rendered
         # through the chat template first (TRL maybe_apply_chat_template parity);
         # standard string rows pass through unchanged. This yields the prompt
         # string and the two prompt+completion strings the encodes below expect.
         prompt, chosen_full_text, rejected_full_text = _render_preference_example(
-            tokenizer, prompt, ex[chosen_key], ex[rejected_key]
+            tokenizer, prompt, ex[chosen_key], ex[rejected_key],
+            tools=_ex_tools, chat_template_kwargs=_ex_template_kwargs,
         )
         # Use the shared text encoder (same as the SFT path) so a prompt that
         # was already rendered with the chat template's leading BOS does not get
@@ -1242,25 +1280,40 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     # "sequential": leave rows in dataset order (CUDA SequentialSampler parity).
 
     # Group rows into fixed-size batch chunks. For the default length-sort order,
-    # permute the BATCH order before truncating to num_batches so a step-limited
-    # (max_steps>0) run samples across the whole length distribution instead of
-    # keeping only the shortest pairs. Without this, the length-sort above puts the
-    # shortest pairs first and the num_batches break below would train ORPO/DPO on
-    # only the shortest prompts/completions and silently ignore the rest. The
-    # text/SFT path avoids the same bias by shuffling batch order inside
-    # mlx_lm.iterate_batches (see create_batches, loop=(num_batches is not None)).
-    # "sequential"/"torch_randperm" already carry the user's intended row order, so
-    # their leading num_batches are not length-biased -- leave those orders as-is.
-    # Use numpy (not _torch_randperm_order) so the DEFAULT path stays torch-free:
-    # MLX/Apple Silicon installs have no torch, and only the opt-in
-    # dataset_order="torch_randperm" mode may require it. RandomState.permutation
-    # is deterministic under the normalized seed, mirroring the text path's
-    # np.random shuffling.
-    starts = list(range(0, len(rows), batch_size))
-    if (order_mode == "default" and num_batches is not None
-            and len(starts) > num_batches):
-        perm = np.random.RandomState(_normalize_seed(seed)).permutation(len(starts))
-        starts = [starts[int(i)] for i in perm]
+    # RESHUFFLE the BATCH order on every pass, then take the first num_batches,
+    # mirroring the text/SFT path (mlx_lm.iterate_batches with loop=True draws a
+    # fresh np.random.permutation on each pass; see create_batches,
+    # loop=(num_batches is not None)). Two problems this fixes:
+    #   1) A single length-sorted pass puts the shortest pairs first, so a
+    #      step-limited (max_steps>0) run whose num_batches is SMALLER than one
+    #      pass would train ORPO/DPO only on the shortest prompts/completions and
+    #      silently ignore the rest.
+    #   2) When num_batches (= max_steps * grad_accum) spans MORE than one pass,
+    #      the trainer modulo-cycles the returned list (batches[batch_idx % len]).
+    #      Materializing a single fixed pass would then repeat the SAME
+    #      length-sorted short->long order every epoch, biasing small-dataset /
+    #      long-max_steps runs toward one deterministic pass order (whereas SFT,
+    #      via iterate_batches loop=True, reshuffles each epoch). Emitting a fresh
+    #      permutation per pass up to num_batches makes each cycled epoch a
+    #      distinct order, matching the SFT/TRL per-epoch reshuffle.
+    # Drawing successive permutations from ONE seeded RandomState keeps a single
+    # sub-epoch selection byte-identical to the prior permute-then-truncate (the
+    # first permutation, first num_batches). "sequential"/"torch_randperm" already
+    # carry the user's intended row order (SequentialSampler / seeded RandomSampler
+    # parity), so leave those single-pass orders as-is. Use numpy (not
+    # _torch_randperm_order) so the DEFAULT path stays torch-free: MLX/Apple
+    # Silicon installs have no torch, and only the opt-in
+    # dataset_order="torch_randperm" mode may require it.
+    base_starts = list(range(0, len(rows), batch_size))
+    if order_mode == "default" and num_batches is not None and base_starts:
+        rng = np.random.RandomState(_normalize_seed(seed))
+        starts = []
+        while len(starts) < num_batches:
+            perm = rng.permutation(len(base_starts))
+            starts.extend(base_starts[int(i)] for i in perm)
+        starts = starts[:num_batches]
+    else:
+        starts = base_starts
 
     out = []
     for i in starts:
