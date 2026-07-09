@@ -2020,6 +2020,57 @@ def test_preference_tokenizer_keeps_public_hf_fast_tokenizer_api():
     assert _hf_encoding_tokenizer(_Wrapper(inner)) is inner
 
 
+def test_preference_batches_render_conversational_rows_through_chat_template():
+    # TRL DPO/ORPO accept conversational (message-list) preference rows and
+    # normalize them via maybe_apply_chat_template (trl/data_utils.py:
+    # apply_chat_template renders prompt / prompt+chosen / prompt+rejected as
+    # strings, add_generation_prompt when the last prompt role is 'user'). The
+    # MLX builder must render message-list prompt/chosen/rejected through the chat
+    # template before encoding; string-concatenating and encoding the raw lists
+    # would crash (a list has no .startswith, and encode rejects a list of dicts),
+    # so common conversational preference datasets would fail before training.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = 0
+        bos_token = None
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False,
+                                continue_final_message=False):
+            parts = []
+            for m in messages:
+                tag = "U:" if m["role"] == "user" else "A:"
+                parts.append(tag + m["content"])
+            s = "".join(parts)
+            if add_generation_prompt:
+                s += "A:"
+            return s
+
+        def encode(self, text, add_special_tokens=True):
+            # An unrendered message list would raise here (ord on a dict), so
+            # reaching this with a plain string proves the chat render happened.
+            return [ord(ch) for ch in text]
+
+    dataset = [{
+        "prompt": [{"role": "user", "content": "hi"}],
+        "chosen": [{"role": "assistant", "content": "ok"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+    }]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _Tok(), batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )[0]
+    lens = lengths.tolist()
+    rows = batch.tolist()
+    # prompt renders to 'U:hiA:' (6 chars); prompt+chosen to 'U:hiA:ok'. The
+    # response boundary is the shared-prefix length 6, and the chosen/rejected
+    # completions ('ok' / 'no') + appended EOS follow it.
+    assert lens[0][0] == len("U:hiA:") == 6
+    assert rows[0][lens[0][0]:lens[0][1]] == [ord("o"), ord("k"), 0]
+    assert rows[1][lens[1][0]:lens[1][1]] == [ord("n"), ord("o"), 0]
+
+
 def test_create_preference_batches_runs_with_plain_fast_tokenizer():
     # End-to-end: batching a plain PreTrainedTokenizerFast must not raise.
     from unsloth_zoo.mlx.utils import create_preference_batches

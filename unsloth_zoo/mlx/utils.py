@@ -1054,6 +1054,63 @@ def _common_prefix_len(*seqs):
     return i
 
 
+def _is_conversational_messages(value):
+    """True if value is a non-empty list of {"role","content"} message dicts."""
+    return (
+        isinstance(value, list) and len(value) > 0
+        and isinstance(value[0], dict)
+        and "role" in value[0] and "content" in value[0]
+    )
+
+
+def _render_preference_example(tokenizer, prompt, chosen, rejected):
+    """Return (prompt_str, prompt_chosen_str, prompt_rejected_str) for one
+    preference row, rendering conversational (message-list) rows through the
+    tokenizer chat template.
+
+    TRL's DPO/ORPO natively accept BOTH the standard (string) and the
+    conversational (message-list) preference formats: their dataset pipeline
+    runs maybe_apply_chat_template, which for a conversational row applies
+    apply_chat_template (trl/data_utils.py) to render the prompt, prompt+chosen
+    and prompt+rejected as strings (add_generation_prompt when the last prompt
+    role is 'user', continue_final_message when it is 'assistant'), and is a
+    no-op on string rows. Without this, string-concatenating message LISTS
+    (``prompt + chosen``) and calling encode_mlx_text on them raises -- encode
+    does ``text.startswith(bos_token)`` (lists have no ``.startswith``) and then
+    ``tokenizer.encode`` on a list of dicts -- so the very common conversational
+    preference datasets crash before any training. Mirror TRL and the SFT chat
+    render path here so both formats train; the downstream boundary split then
+    operates on the rendered strings exactly as it does for pre-rendered string
+    prompts. Plain string rows fall through unchanged (byte-identical to the
+    prior concat).
+    """
+    if _is_conversational_messages(prompt):
+        last_role = prompt[-1].get("role")
+        if last_role == "user":
+            add_gen, cont = True, False
+        elif last_role == "assistant":
+            add_gen, cont = False, True
+        else:
+            raise ValueError(
+                "Unsloth MLX preference: conversational chat prompt has invalid "
+                f"last-message role {last_role!r}; expected 'user' or 'assistant'."
+            )
+        prompt_str = tokenizer.apply_chat_template(
+            prompt, tokenize=False,
+            add_generation_prompt=add_gen, continue_final_message=cont,
+        )
+        prompt_chosen_str = tokenizer.apply_chat_template(
+            list(prompt) + list(chosen), tokenize=False,
+        )
+        prompt_rejected_str = tokenizer.apply_chat_template(
+            list(prompt) + list(rejected), tokenize=False,
+        )
+        return prompt_str, prompt_chosen_str, prompt_rejected_str
+    # Standard string preference row (or a prompt already rendered to a chat
+    # string): concatenate, matching the prior behavior exactly.
+    return prompt, prompt + chosen, prompt + rejected
+
+
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
@@ -1158,14 +1215,21 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                 f"columns; got {sorted(ex.keys())}."
             )
         prompt = ex[prompt_key]
+        # Conversational (message-list) prompt/chosen/rejected are rendered
+        # through the chat template first (TRL maybe_apply_chat_template parity);
+        # standard string rows pass through unchanged. This yields the prompt
+        # string and the two prompt+completion strings the encodes below expect.
+        prompt, chosen_full_text, rejected_full_text = _render_preference_example(
+            tokenizer, prompt, ex[chosen_key], ex[rejected_key]
+        )
         # Use the shared text encoder (same as the SFT path) so a prompt that
         # was already rendered with the chat template's leading BOS does not get
         # a second BOS from encode()'s default add_special_tokens=True. Raw
         # hf.encode here would train ORPO/DPO on duplicated special tokens and
         # diverge from the rest of the MLX trainer for identical rendered text.
         p_ids = encode_mlx_text(hf, prompt)
-        c_full = _with_eos(encode_mlx_text(hf, prompt + ex[chosen_key]))
-        r_full = _with_eos(encode_mlx_text(hf, prompt + ex[rejected_key]))
+        c_full = _with_eos(encode_mlx_text(hf, chosen_full_text))
+        r_full = _with_eos(encode_mlx_text(hf, rejected_full_text))
         pe, c_ids, r_ids = _truncate_preference_pair(p_ids, c_full, r_full)
         rows.append((pe, c_ids, r_ids))
 
