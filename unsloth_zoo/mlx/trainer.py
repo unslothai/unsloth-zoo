@@ -1798,9 +1798,15 @@ class MLXTrainer:
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
+            # NEFTune is a training-only augmentation. The DPO/ORPO reference
+            # forward (adapters off) runs with the model still in train(), so it
+            # flips this flag off to compute a CLEAN, noise-free reference (see
+            # make_dpo_loss_fn); the policy forward keeps it True and stays noisy.
+            _neftune_noise_enabled = True
             def __call__(self, x):
                 out = _Base.__call__(self, x)
-                if getattr(self, "training", False):
+                if (getattr(self, "training", False)
+                        and getattr(self, "_neftune_noise_enabled", True)):
                     dim = out.shape[-1] * out.shape[-2]
                     scale = _alpha / (dim ** 0.5)
                     noise = mx.random.uniform(
@@ -2061,7 +2067,15 @@ class MLXTrainer:
                         "plain LoRA adapter, or pass reference_free=True to train "
                         "without a reference."
                     )
-                loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
+                # NEFTune (if installed by _install_neftune) noises the input
+                # embeddings while training; hand the wrapped module to the loss
+                # so the reference (adapters-off) forward can run it clean and the
+                # DPO reward is not corrupted by reference-side NEFTune noise.
+                _neft = getattr(self, "_neftune_emb", None)
+                _neftune_mods = [_neft] if _neft is not None else []
+                loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods,
+                                           reference_free=_rf,
+                                           neftune_mods=_neftune_mods)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
             elif use_cce:

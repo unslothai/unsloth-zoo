@@ -2143,6 +2143,105 @@ def test_preference_long_prompt_preserves_response_span():
     assert c_start > 0
 
 
+def test_common_prefix_len_locates_prompt_boundary():
+    # The prompt/completion boundary is the longest prefix shared by the
+    # standalone prompt ids and both concatenated prompt+completion rows.
+    from unsloth_zoo.mlx.utils import _common_prefix_len
+
+    # add_eos_token=True: the standalone prompt carries a trailing EOS (9) that
+    # is absent at the seam, so the boundary is the prompt length (3), NOT
+    # min(len)=4 (which would mask out the first completion token).
+    assert _common_prefix_len([1, 2, 3, 9], [1, 2, 3, 4, 5, 9], [1, 2, 3, 6, 9]) == 3
+    # Normal case: the standalone prompt is a true prefix -> len(prompt), which
+    # equals the old min(len) (the fix is a no-op here).
+    assert _common_prefix_len([1, 2, 3], [1, 2, 3, 4, 5], [1, 2, 3, 6]) == 3
+    # Boundary token merged in context: the shared prefix is shorter than every
+    # sequence length, so min(len) would have overcounted the prompt.
+    assert _common_prefix_len([1, 2, 3], [1, 2, 7, 8], [1, 2, 9]) == 2
+
+
+def test_preference_boundary_excludes_prompt_only_eos():
+    # Regression: a tokenizer configured to append EOS during encode
+    # (add_special_tokens=True, e.g. a LLaMA tokenizer loaded with
+    # add_eos_token=True) makes the standalone prompt ids end with a prompt-only
+    # EOS that is not present at the prompt/completion seam of
+    # encode(prompt + completion). The old min(len) boundary then sat one token
+    # PAST the true boundary, so the ORPO/DPO loss mask dropped the first
+    # completion token (and for a one-token completion scored only EOS). The
+    # boundary must be the shared prompt prefix, excluding the prompt-only EOS.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    EOS_ID = 999
+
+    class _EosAppendTokenizer:
+        # Not a PreTrainedTokenizerBase and no _tokenizer attr -> used directly.
+        # add_special_tokens=True appends EOS; no BOS, to isolate the trailing
+        # EOS behavior. Trailing prompt space keeps prompt+completion splitting
+        # cleanly (no boundary-token merge).
+        bos_token = None
+        eos_token_id = EOS_ID
+
+        def encode(self, text, add_special_tokens=True):
+            ids = [ord(tok[0]) for tok in text.split()]
+            if add_special_tokens:
+                ids = ids + [EOS_ID]
+            return ids
+
+    dataset = [{"prompt": "a b c ", "chosen": "x y", "rejected": "z"}]
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=_EosAppendTokenizer(),
+        batch_size=1,
+        max_seq_length=64,
+        pad_to_multiple=1,
+        dataset_order="sequential",
+    )
+    batch, lengths, _extra = batches[0]
+    chosen = [int(t) for t in batch[0].tolist()]
+    rejected = [int(t) for t in batch[1].tolist()]
+    c_start, c_end = int(lengths[0][0]), int(lengths[0][1])
+    r_start, r_end = int(lengths[1][0]), int(lengths[1][1])
+
+    # Prompt is [a, b, c] = 3 ids; the prompt-only EOS must NOT be counted, so
+    # response_start is 3 (min(len) would have made it 4). Both rows share it.
+    assert c_start == 3, f"prompt-only EOS leaked into response_start: {c_start}"
+    assert c_start == r_start
+    # The first completion token stays inside the loss span (was masked out), and
+    # the one-token rejected completion is scored on 'z', not only its EOS.
+    assert chosen[c_start] == ord("x")
+    assert chosen[c_start:c_end] == [ord("x"), ord("y"), EOS_ID]
+    assert rejected[r_start:r_end] == [ord("z"), EOS_ID]
+
+
+def test_preference_boundary_common_prefix_is_noop_without_prompt_eos():
+    # No add_eos_token: the standalone prompt IS a true prefix of both rows, so
+    # the common-prefix boundary equals the old min(len) -- an exact no-op.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    EOS_ID = 500
+
+    class _NoEosTokenizer:
+        bos_token = None
+        eos_token_id = EOS_ID
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(tok[0]) for tok in text.split()]  # never appends EOS
+
+    dataset = [{"prompt": "a b c ", "chosen": "x y", "rejected": "z"}]
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=_NoEosTokenizer(),
+        batch_size=1,
+        max_seq_length=64,
+        pad_to_multiple=1,
+        dataset_order="sequential",
+    )
+    _batch, lengths, _extra = batches[0]
+    # p_ids = [a, b, c] (3 ids), a true prefix -> boundary unchanged at 3.
+    assert int(lengths[0][0]) == 3
+    assert int(lengths[1][0]) == 3
+
+
 def test_dpo_reference_collects_nested_lora_modules():
     # Regression: the DPO reference collected adapters with
     #   tree_flatten(model, is_leaf=lambda x: isinstance(x, LoRALinear)),
@@ -2269,6 +2368,88 @@ def test_dpo_reference_guard_rejects_dora_adapters():
     guard_region = src[src.index("_lora_mods = [mod"):dpo_builder]
     assert "not _rf" in guard_region
     assert "reference_free=True" in src  # the error points at the escape hatch
+
+
+def test_dpo_reference_disables_neftune_noise(monkeypatch):
+    # Regression: NEFTune adds fresh random noise to the input embeddings whenever
+    # the module is training, and the DPO loop keeps the model in train() for BOTH
+    # forwards. The reference (adapters-off) forward only zeroes the LoRA scales,
+    # so without an explicit disable it compared the policy against a SECOND noisy
+    # base-model pass -- the DPO reward then carried random NEFTune noise instead
+    # of the frozen reference logps (TRL computes the reference clean). The
+    # reference forward must silence the wrapped embedding, keep the policy
+    # forward noisy, and restore the flag afterwards.
+    from unsloth_zoo.mlx.utils import make_dpo_loss_fn
+
+    class _NeftuneEmbed:
+        # Mirrors trainer.py _NEFTuneEmbed's gate: noise fires only when the
+        # module is training AND noise is enabled. Records the gate per forward.
+        _neftune_noise_enabled = True
+
+        def __init__(self):
+            self.training = True
+            self.saw_noise = []
+
+        def __call__(self, x):
+            active = (getattr(self, "training", False)
+                      and getattr(self, "_neftune_noise_enabled", True))
+            self.saw_noise.append(active)
+            return x
+
+    class _LoRAMod:
+        def __init__(self):
+            self.scale = 2.0
+
+    class _ModelWithNeftune:
+        def __init__(self, embed, vocab):
+            self.embed = embed
+            self.vocab = vocab
+
+        def __call__(self, x):
+            import mlx.core as mx
+            self.embed(x)  # exercises the NEFTune gate on every forward
+            return mx.zeros((x.shape[0], x.shape[1], self.vocab))
+
+    _patch_per_token_ce(monkeypatch)
+    embed = _NeftuneEmbed()
+    lora = _LoRAMod()
+    model = _ModelWithNeftune(embed, vocab=8)
+    batch, lengths = _preference_batch()
+
+    loss_fn = make_dpo_loss_fn(
+        beta=0.1, lora_mods=[lora], reference_free=False, neftune_mods=[embed],
+    )
+    loss_fn(model, batch, lengths)
+
+    # Two forwards in order: policy (noisy) then reference (clean).
+    assert embed.saw_noise == [True, False], embed.saw_noise
+    # The disable flag and the LoRA scale are both restored after the reference.
+    assert getattr(embed, "_neftune_noise_enabled", True) is True
+    assert lora.scale == 2.0
+
+
+def test_neftune_noise_disable_flag_shared_across_reference_pass():
+    # The clean-reference contract spans two files: trainer.py's _NEFTuneEmbed
+    # must gate its noise on `_neftune_noise_enabled` (not `training` alone),
+    # _train_inner must hand the wrapped embedding to make_dpo_loss_fn via
+    # `neftune_mods`, and make_dpo_loss_fn must flip that flag off for the
+    # reference forward. Pin all three so a rename in one file cannot silently
+    # re-introduce reference-side NEFTune noise.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.utils import make_dpo_loss_fn
+
+    neftune_src = inspect.getsource(MLXTrainer._install_neftune)
+    # Declared as the default and read in the noise gate (>= 2 references).
+    assert neftune_src.count("_neftune_noise_enabled") >= 2, neftune_src
+    assert 'getattr(self, "_neftune_noise_enabled"' in neftune_src
+
+    inner_src = inspect.getsource(MLXTrainer._train_inner)
+    assert "neftune_mods=" in inner_src
+    assert "_neftune_emb" in inner_src
+
+    dpo_src = inspect.getsource(make_dpo_loss_fn)
+    assert "_neftune_noise_enabled = False" in dpo_src
 
 
 def test_preference_default_order_truncation_samples_across_lengths():

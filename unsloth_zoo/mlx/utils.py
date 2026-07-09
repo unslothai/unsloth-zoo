@@ -907,7 +907,8 @@ def make_orpo_loss_fn(beta=0.1):
     return loss_fn
 
 
-def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
+def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False,
+                     neftune_mods=None):
     """Create a DPO (Direct Preference Optimization) loss function.
 
     Operates on a concatenated [chosen; rejected] batch (same layout as
@@ -924,8 +925,19 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
 
     ``lora_mods`` is the list of LoRALinear modules to toggle; collected once
     by the trainer at setup.
+
+    ``neftune_mods`` is the list of NEFTune-wrapped embedding modules (empty
+    unless ``neftune_noise_alpha > 0``). NEFTune adds fresh random noise to the
+    input embeddings whenever the module is training, and the DPO loop keeps the
+    model in train() for both forwards. Left alone, the reference (adapters-off)
+    forward would compare the policy against a SECOND noisy base-model pass, so
+    the DPO reward would carry random NEFTune noise. To keep the reference clean
+    (matching TRL, whose frozen reference logps are computed without NEFTune),
+    the reference pass temporarily disables the noise on these modules and
+    restores it in a finally block, so only the policy forward is augmented.
     """
     _mods = list(lora_mods) if lora_mods is not None else []
+    _neftune = list(neftune_mods) if neftune_mods is not None else []
     if not _mods and not reference_free:
         raise ValueError(
             "Unsloth: DPO with a reference model is not yet supported for full "
@@ -956,14 +968,27 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
             ref_r = mx.zeros(pol_r.shape)
         else:
             saved = [md.scale for md in _mods]
+            # Also silence NEFTune for the reference forward: the model stays in
+            # train() so the wrapped embedding would otherwise inject fresh random
+            # noise, making the "frozen" reference logps noisy and corrupting
+            # log(pi_policy / pi_ref). Disabling the noise flag (default True)
+            # yields a clean reference while the policy forward above keeps its
+            # NEFTune augmentation. Restored in finally alongside the LoRA scales.
+            neft_saved = [
+                getattr(m, "_neftune_noise_enabled", True) for m in _neftune
+            ]
             try:
                 for md in _mods:
                     md.scale = 0.0
+                for m in _neftune:
+                    m._neftune_noise_enabled = False
                 ref, _ = _row_logp_and_mask(model, batch, lengths)
                 ref = mx.stop_gradient(ref)
             finally:
                 for md, s in zip(_mods, saved):
                     md.scale = s
+                for m, s in zip(_neftune, neft_saved):
+                    m._neftune_noise_enabled = s
             ref_c, ref_r = ref[:B], ref[B:]
 
         logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
@@ -995,6 +1020,38 @@ def _hf_encoding_tokenizer(tokenizer):
     except Exception:
         pass
     return getattr(tokenizer, "_tokenizer", tokenizer)
+
+
+def _common_prefix_len(*seqs):
+    """Length of the longest shared leading prefix across all sequences.
+
+    Locates the prompt/completion boundary for a preference pair from the
+    standalone-prompt ids (``p_ids``) and the two concatenated prompt+completion
+    encodings (``c_full``, ``r_full``). It is correct whether or not the
+    tokenizer appends an end-of-sequence special token during ``encode``:
+
+    * With ``add_eos_token=True`` (e.g. a LLaMA tokenizer loaded that way), the
+      standalone prompt carries a trailing prompt-only EOS that is NOT present at
+      the prompt/completion seam inside ``encode(prompt + completion)``. A plain
+      ``min(len(...))`` boundary would then overcount the prompt by that EOS and
+      mask out (or, for a one-token completion, score only) the first completion
+      token. Walking the shared prefix stops at the first divergent id (the
+      prompt EOS vs. the first completion token), giving the true boundary.
+    * In the normal case (no prompt EOS) the standalone prompt IS a true prefix
+      of both completions, so this returns ``len(p_ids)`` -- identical to the old
+      ``min(len(...))`` and a no-op. It is also strictly more correct when the
+      concatenated tokenization merges the boundary token: the shared prefix is
+      then shorter than ``len(p_ids)``, so both rows keep a single, real
+      ``response_start`` (``c_full[:pe] == r_full[:pe]`` holds by construction).
+    """
+    if not seqs:
+        return 0
+    limit = min(len(s) for s in seqs)
+    first = seqs[0]
+    i = 0
+    while i < limit and all(s[i] == first[i] for s in seqs[1:]):
+        i += 1
+    return i
 
 
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
@@ -1064,10 +1121,15 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         # collapse to prompt-only tokens and the [response_start, seq_end) span
         # would be empty -> no ORPO/DPO preference signal for that pair.
         #
-        # ``p_len`` is the shared prompt boundary. The min() guards the rare case
-        # where concatenated tokenization merges the boundary token so the prompt
-        # prefix is shorter than len(p_ids) (same contract as the untruncated pe).
-        p_len = min(len(p_ids), len(c_full), len(r_full))
+        # ``p_len`` is the shared prompt boundary: the longest prefix common to
+        # the standalone prompt and both concatenated prompt+completion rows. A
+        # plain min(len(...)) breaks when the tokenizer appends EOS during encode
+        # (add_eos_token=True): p_ids then ends with a prompt-only EOS absent at
+        # the prompt/completion seam, so min(len) lands one token past the true
+        # boundary and masks out the first completion token. The common prefix
+        # stops at that EOS-vs-first-completion divergence (and also at any
+        # merged boundary token), so it is correct with or without a prompt EOS.
+        p_len = _common_prefix_len(p_ids, c_full, r_full)
         resp_c = c_full[p_len:]
         resp_r = r_full[p_len:]
         longer_resp = max(len(resp_c), len(resp_r))
@@ -1125,11 +1187,16 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     # mlx_lm.iterate_batches (see create_batches, loop=(num_batches is not None)).
     # "sequential"/"torch_randperm" already carry the user's intended row order, so
     # their leading num_batches are not length-biased -- leave those orders as-is.
+    # Use numpy (not _torch_randperm_order) so the DEFAULT path stays torch-free:
+    # MLX/Apple Silicon installs have no torch, and only the opt-in
+    # dataset_order="torch_randperm" mode may require it. RandomState.permutation
+    # is deterministic under the normalized seed, mirroring the text path's
+    # np.random shuffling.
     starts = list(range(0, len(rows), batch_size))
     if (order_mode == "default" and num_batches is not None
             and len(starts) > num_batches):
-        perm = _torch_randperm_order(len(starts), _normalize_seed(seed))
-        starts = [starts[i] for i in perm]
+        perm = np.random.RandomState(_normalize_seed(seed)).permutation(len(starts))
+        starts = [starts[int(i)] for i in perm]
 
     out = []
     for i in starts:
