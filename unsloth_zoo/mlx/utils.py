@@ -1115,8 +1115,24 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         rows = [rows[i] for i in order]
     # "sequential": leave rows in dataset order (CUDA SequentialSampler parity).
 
+    # Group rows into fixed-size batch chunks. For the default length-sort order,
+    # permute the BATCH order before truncating to num_batches so a step-limited
+    # (max_steps>0) run samples across the whole length distribution instead of
+    # keeping only the shortest pairs. Without this, the length-sort above puts the
+    # shortest pairs first and the num_batches break below would train ORPO/DPO on
+    # only the shortest prompts/completions and silently ignore the rest. The
+    # text/SFT path avoids the same bias by shuffling batch order inside
+    # mlx_lm.iterate_batches (see create_batches, loop=(num_batches is not None)).
+    # "sequential"/"torch_randperm" already carry the user's intended row order, so
+    # their leading num_batches are not length-biased -- leave those orders as-is.
+    starts = list(range(0, len(rows), batch_size))
+    if (order_mode == "default" and num_batches is not None
+            and len(starts) > num_batches):
+        perm = _torch_randperm_order(len(starts), _normalize_seed(seed))
+        starts = [starts[i] for i in perm]
+
     out = []
-    for i in range(0, len(rows), batch_size):
+    for i in starts:
         chunk = rows[i:i + batch_size]
         Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
         if pad_to_multiple:

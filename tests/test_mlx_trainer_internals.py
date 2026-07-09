@@ -2269,3 +2269,103 @@ def test_dpo_reference_guard_rejects_dora_adapters():
     guard_region = src[src.index("_lora_mods = [mod"):dpo_builder]
     assert "not _rf" in guard_region
     assert "reference_free=True" in src  # the error points at the escape hatch
+
+
+def test_preference_default_order_truncation_samples_across_lengths():
+    # Regression: create_preference_batches length-sorted rows (default order) then
+    # truncated to the first num_batches (= max_steps * grad_accum), so a
+    # step-limited ORPO/DPO run trained only on the SHORTEST pairs and silently
+    # ignored the rest of the dataset. The text/SFT path avoids this bias by
+    # shuffling batch order before truncating (mlx_lm.iterate_batches, via
+    # create_batches loop=(num_batches is not None)); the preference path must
+    # likewise sample across the length distribution.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _LenTokenizer:
+        # Not a PreTrainedTokenizerBase and no _tokenizer attr -> used directly.
+        bos_token = None
+        eos_token_id = None  # no EOS append -> exact control of row lengths
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(tok[0]) for tok in text.split()]
+
+    # 20 pairs with strictly increasing response length (1..20 tokens), short
+    # shared prompt. batch_size=1 -> one batch per pair; chosen length = i + 2.
+    dataset = [
+        {
+            "prompt": "p ",
+            "chosen": " ".join(["c"] * (i + 1)),
+            "rejected": " ".join(["r"] * (i + 1)),
+        }
+        for i in range(20)
+    ]
+    num_batches = 5
+    batches = create_preference_batches(
+        dataset=dataset,
+        tokenizer=_LenTokenizer(),
+        batch_size=1,
+        max_seq_length=64,
+        pad_to_multiple=1,
+        num_batches=num_batches,
+        dataset_order="default",
+        seed=0,
+    )
+    assert len(batches) == num_batches
+    # chosen row is batch[0]; its length is lengths[0][1] (seq_end). The five
+    # globally-shortest pairs have chosen length 2..6, so a sort-then-take-first
+    # truncation would cap the selection at length 6. The fix samples across the
+    # length buckets, so at least one longer pair (length > 6) is present.
+    selected_lengths = sorted(int(lengths[0][1]) for _, lengths, _ in batches)
+    assert max(selected_lengths) > 6, (
+        f"truncation still biased toward shortest pairs: {selected_lengths}"
+    )
+
+
+def test_preference_loss_rejects_prebuilt_sft_labeled_batches():
+    # Regression: train_on_responses_only pre-populates trainer._batches with SFT
+    # (input_ids, lengths, labels) rows. _prepare_data returned those before the
+    # ORPO/DPO preference branch, so the preference loss -- which ignores labels and
+    # reads B = batch.shape[0] // 2 as pairs -- silently paired unrelated rows and
+    # optimized the wrong objective, also bypassing create_preference_batches'
+    # prompt/chosen/rejected column validation. _prepare_data must reject prebuilt
+    # SFT-labeled batches for orpo/dpo while still accepting preference-layout
+    # (labels=None) prebuilt batches.
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    for loss_type in ("orpo", "dpo"):
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(
+            max_steps=1, loss_type=loss_type,
+        )
+        sft_batch = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
+        sft_lengths = mx.array([[1, 3], [1, 3]])
+        sft_labels = mx.array([[-100, 2, 3], [-100, 5, 6]])
+        trainer._batches = [(sft_batch, sft_lengths, sft_labels)]
+        with pytest.raises(ValueError, match="not compatible with ORPO/DPO"):
+            MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+
+        # Preference-layout prebuilt batches (labels=None) must pass through
+        # unchanged -- the guard only rejects SFT-labeled prebuilt batches.
+        pref_batch = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
+        pref_lengths = mx.array([[1, 3], [1, 3]])
+        trainer._batches = [(pref_batch, pref_lengths, None)]
+        batches, batch_iter = MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+        assert batches is trainer._batches
+        assert batch_iter is None
+
+
+def test_sft_loss_type_still_accepts_prebuilt_response_masked_batches():
+    # Guard boundary: prebuilt SFT-labeled batches (train_on_responses_only) must
+    # remain valid for ordinary SFT runs (loss_type='sft'); only orpo/dpo reject.
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    MLXTrainerCls, trainer = _make_mlx_text_trainer(max_steps=1)
+    assert trainer.args.loss_type == "sft"
+    sft_batch = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
+    sft_lengths = mx.array([[1, 3], [1, 3]])
+    sft_labels = mx.array([[-100, 2, 3], [-100, 5, 6]])
+    trainer._batches = [(sft_batch, sft_lengths, sft_labels)]
+    batches, batch_iter = MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+    assert batches is trainer._batches
+    assert batch_iter is None

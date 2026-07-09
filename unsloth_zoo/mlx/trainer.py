@@ -3317,6 +3317,27 @@ class MLXTrainer:
             )
 
         if self._batches is not None:
+            # Prebuilt batches carrying SFT labels -- (input_ids, lengths, labels),
+            # e.g. from train_on_responses_only -- are NOT the concatenated
+            # [chosen; rejected] preference layout the ORPO/DPO loss requires. That
+            # loss ignores labels and reads B = batch.shape[0] // 2 as pairs, so it
+            # would silently pair unrelated rows and optimize the wrong objective,
+            # while also bypassing create_preference_batches' prompt/chosen/rejected
+            # column validation. Preference batches use labels=None, so reject only
+            # the labeled (SFT) prebuilt batches and leave preference ones untouched.
+            if getattr(args, "loss_type", "sft") in ("orpo", "dpo") and any(
+                len(b) >= 3 and b[2] is not None for b in self._batches
+            ):
+                raise ValueError(
+                    "Unsloth: train_on_responses_only / response-masked (prebuilt "
+                    "SFT) batches are not compatible with ORPO/DPO. Those rows are "
+                    "(input_ids, lengths, labels) SFT batches, but the ORPO/DPO loss "
+                    "expects a concatenated [chosen; rejected] preference layout and "
+                    "would silently pair unrelated rows and optimize the wrong "
+                    "objective. Remove train_on_responses_only for preference "
+                    "training (ORPO/DPO already supervise only the response span), "
+                    "or set loss_type='sft'."
+                )
             return self._batches, None
 
         total_batches_needed = (
