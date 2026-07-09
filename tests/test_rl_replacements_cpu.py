@@ -25,6 +25,7 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -210,3 +211,87 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     }
     missing = expected - set(rr.RL_REPLACEMENTS.keys())
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# get_off_policy_mask adapter (DeepSeek-V3.2 off-policy sequence mask)
+# ---------------------------------------------------------------------------
+#
+# TRL added GRPOTrainer.get_off_policy_mask in 0.27.0 with a 3rd parameter named
+# `old_per_token_logps` and renamed it to `sampling_per_token_logps` in 0.27.1
+# (huggingface/trl#4857). rl_replacements used to call it with a hardcoded
+# `old_per_token_logps=` keyword, which raises TypeError on TRL >= 0.27.1 whenever
+# `off_policy_mask_threshold` is set. grpo_compute_loss now passes a version-stable
+# keyword and grpo_accumulated_loss adapts it to the installed parameter name
+# (outside the torch.compiled hot path).
+
+
+def test_grpo_compute_loss_uses_version_stable_off_policy_keyword():
+    src = inspect.getsource(rr.grpo_compute_loss)
+    flat = src.replace(" ", "")
+    # The off-policy branch calls get_off_policy_mask with the mismatch logprobs.
+    assert "get_off_policy_mask(" in src
+    assert "sampling_per_token_logps=sampling_per_token_logps" in flat, (
+        "grpo_compute_loss must pass the version-stable keyword; the adapter in "
+        "grpo_accumulated_loss maps it to the installed TRL parameter name."
+    )
+    # The removed TRL 0.27.0 keyword must NOT be passed here -- it is the crash source
+    # on TRL >= 0.27.1 and branching on it would live inside the compiled function.
+    assert "old_per_token_logps=" not in src, (
+        "grpo_compute_loss must not hardcode the old_per_token_logps= keyword "
+        "(TypeError on TRL >= 0.27.1)."
+    )
+
+
+def test_grpo_accumulated_loss_adapts_both_trl_off_policy_signatures():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    flat = src.replace(" ", "")
+    # Version detection happens here (eager, outside torch.compile), not in the loss.
+    assert "signature(" in src and "get_off_policy_mask" in src
+    # The adapter forwards the stable arg to BOTH the TRL 0.27.0 parameter name and
+    # the TRL >= 0.27.1 name, so it works across the huggingface/trl#4857 rename.
+    assert "old_per_token_logps=sampling_per_token_logps" in flat
+    assert "sampling_per_token_logps=sampling_per_token_logps" in flat
+
+
+def test_installed_trl_get_off_policy_mask_needs_signature_adapter():
+    """Behavioral pin against the actually-installed TRL: calling
+    get_off_policy_mask with the wrong (renamed-away) keyword raises TypeError,
+    while the installed name returns the (B, 1) Keep/Drop mask. This is the exact
+    failure the adapter routes around."""
+    pytest.importorskip("trl")
+    try:
+        from trl.trainer.grpo_trainer import GRPOTrainer
+    except Exception:  # pragma: no cover - environment dependent
+        pytest.skip("trl GRPOTrainer not importable")
+    fn = getattr(GRPOTrainer, "get_off_policy_mask", None)
+    if fn is None:
+        pytest.skip("TRL < 0.27.0 has no get_off_policy_mask")
+
+    params = list(inspect.signature(fn).parameters)
+    # (advantages, per_token_logps, <mismatch logprobs>, mask, off_policy_threshold)
+    mismatch_kw = params[2]
+    assert mismatch_kw in ("old_per_token_logps", "sampling_per_token_logps")
+    wrong_kw = (
+        "sampling_per_token_logps"
+        if mismatch_kw == "old_per_token_logps"
+        else "old_per_token_logps"
+    )
+
+    B, T = 4, 5
+    common = dict(
+        advantages=torch.randn(B, 1),
+        per_token_logps=torch.randn(B, T),
+        mask=torch.ones(B, T),
+        off_policy_threshold=0.5,
+    )
+    mismatch = torch.randn(B, T)
+
+    # Hardcoding the wrong keyword is the bug.
+    with pytest.raises(TypeError):
+        fn(**common, **{wrong_kw: mismatch})
+
+    # Routing to the installed name (what the adapter does) works.
+    out = fn(**common, **{mismatch_kw: mismatch})
+    assert out.shape == (B, 1)
+    assert set(out.unique().tolist()) <= {0.0, 1.0}

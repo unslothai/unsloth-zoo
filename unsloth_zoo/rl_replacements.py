@@ -425,10 +425,16 @@ def grpo_compute_loss(
         advantages = advantages.unsqueeze(1)
 
     if off_policy_mask_threshold is not None:
+        # DeepSeek-V3.2 off-policy sequence mask. `sampling_per_token_logps` (the vLLM sampling
+        # logprobs) captures the training/inference mismatch; fall back to `old` when it is None,
+        # matching TRL's inputs.get("sampling_per_token_logps", old_per_token_logps). The callable
+        # in kwargs is a signature-stable adapter installed in grpo_accumulated_loss, so this call
+        # stays fixed across TRL versions without any signature introspection inside this compiled
+        # function (avoids graph breaks).
         off_policy_mask = get_off_policy_mask(
             advantages=advantages,
             per_token_logps=new,
-            old_per_token_logps=old,
+            sampling_per_token_logps=sampling_per_token_logps if sampling_per_token_logps is not None else old,
             mask=mask,
             off_policy_threshold=off_policy_mask_threshold,
         )
@@ -798,8 +804,49 @@ def grpo_accumulated_loss(
     kwargs["vespo_k_neg"] = trainer.args.vespo_k_neg if hasattr(trainer.args, "vespo_k_neg") else 3.0
     kwargs["vespo_lambda_pos"] = trainer.args.vespo_lambda_pos if hasattr(trainer.args, "vespo_lambda_pos") else 3.0
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
-    kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
-    kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    off_policy_mask_threshold = trainer.args.off_policy_mask_threshold if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    kwargs["off_policy_mask_threshold"] = off_policy_mask_threshold
+    # get_off_policy_mask (DeepSeek-V3.2 off-policy sequence mask) only exists on TRL >= 0.27.0. Its
+    # 3rd parameter was named `old_per_token_logps` in 0.27.0 and renamed to `sampling_per_token_logps`
+    # in 0.27.1 (huggingface/trl#4857), so a fixed keyword call crashes on one side of that rename.
+    # Wrap it in a signature-stable adapter here, outside the torch.compiled loss, so grpo_compute_loss
+    # always calls it with one keyword (sampling_per_token_logps). Detect the real parameter name once
+    # via inspect and cache the adapter on the trainer, so the same object is reused across steps
+    # (a fresh closure every step would re-trigger torch.compile).
+    _off_policy_mask_fn = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
+    if _off_policy_mask_fn is None or off_policy_mask_threshold is None:
+        kwargs["get_off_policy_mask"] = None
+    else:
+        _adapter = getattr(trainer, "_unsloth_off_policy_mask_adapter", None)
+        if getattr(_adapter, "_unsloth_wrapped", None) is not _off_policy_mask_fn:
+            import inspect as _inspect
+            try:
+                _params = _inspect.signature(_off_policy_mask_fn).parameters
+            except (TypeError, ValueError):
+                _params = {}
+            if "old_per_token_logps" in _params and "sampling_per_token_logps" not in _params:
+                # TRL 0.27.0 named the mismatch-logprobs parameter old_per_token_logps.
+                def _adapter(advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold):
+                    return _off_policy_mask_fn(
+                        advantages=advantages,
+                        per_token_logps=per_token_logps,
+                        old_per_token_logps=sampling_per_token_logps,
+                        mask=mask,
+                        off_policy_threshold=off_policy_threshold,
+                    )
+            else:
+                # TRL >= 0.27.1 / 1.7.x use sampling_per_token_logps (also the default going forward).
+                def _adapter(advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold):
+                    return _off_policy_mask_fn(
+                        advantages=advantages,
+                        per_token_logps=per_token_logps,
+                        sampling_per_token_logps=sampling_per_token_logps,
+                        mask=mask,
+                        off_policy_threshold=off_policy_threshold,
+                    )
+            _adapter._unsloth_wrapped = _off_policy_mask_fn
+            trainer._unsloth_off_policy_mask_adapter = _adapter
+        kwargs["get_off_policy_mask"] = _adapter
     kwargs["use_vllm"] = trainer.use_vllm
     # Snap n_chunks to the closest divisor of bsz.
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
