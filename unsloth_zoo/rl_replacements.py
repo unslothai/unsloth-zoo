@@ -392,6 +392,9 @@ def grpo_compute_loss(
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
+    # The off-policy mask uses vLLM sampling logprobs whenever the batch supplies them (matching TRL);
+    # the vLLM importance-sampling ratio is applied to the loss only when this flag is on.
+    vllm_importance_sampling_correction = kwargs.get("vllm_importance_sampling_correction", False)
     vllm_importance_sampling_mode = kwargs.get("vllm_importance_sampling_mode", "sequence_mask")
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
     vllm_importance_sampling_clip_min = kwargs.get("vllm_importance_sampling_clip_min", None)
@@ -441,7 +444,7 @@ def grpo_compute_loss(
         )
 
     with torch.no_grad():
-        if use_vllm and sampling_per_token_logps is not None:
+        if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
             # Filter out extra leading prompt tokens after left-padding input_ids.
             # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
             importance_sampling_ratio = (old - sampling_per_token_logps) * mask
@@ -550,7 +553,7 @@ def grpo_compute_loss(
     if off_policy_mask_threshold is not None:
         loss_i = loss_i * off_policy_mask
 
-    if use_vllm and sampling_per_token_logps is not None:
+    if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
         # vespo applies the IS ratio inside get_gamma_weights, so skip it here.
         if loss_type != "vespo":
             loss_i = loss_i * importance_sampling_ratio
@@ -783,7 +786,10 @@ def grpo_accumulated_loss(
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
-    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
+    # Thread vLLM sampling logprobs whenever the batch has them so the off-policy mask can use them
+    # (matching TRL, which feeds them to get_off_policy_mask regardless of IS correction). The IS
+    # ratio itself stays gated on vllm_importance_sampling_correction inside grpo_compute_loss.
+    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
@@ -847,6 +853,7 @@ def grpo_accumulated_loss(
             trainer._unsloth_off_policy_mask_adapter = _adapter
         kwargs["get_off_policy_mask"] = _adapter
     kwargs["use_vllm"] = trainer.use_vllm
+    kwargs["vllm_importance_sampling_correction"] = getattr(trainer, "vllm_importance_sampling_correction", False)
     # Snap n_chunks to the closest divisor of bsz.
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -916,7 +923,7 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
 
-        if trainer.use_vllm and sampling_per_token_logps is not None and getattr(trainer, "vllm_importance_sampling_correction", False):
+        if trainer.use_vllm and sampling_per_token_logps is not None:
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         else:
             sampling_per_token_logps = None
