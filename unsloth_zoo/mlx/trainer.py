@@ -3882,9 +3882,17 @@ class MLXTrainer:
                 # only the truncated-epoch skip fires it (mid-epoch).
                 if (batches_per_epoch and batch_iter is None
                         and _sync_epoch_stop()):
-                    grad_accum_state = None      # abandon the partial window
-                    accum_progress = 0
                     if it % batches_per_epoch != 0:
+                        # Mid-epoch: abandon the partial accumulation window like
+                        # HF's mid-window break, then skip the epoch's remaining
+                        # micro-batches. Only here -- at a boundary substep
+                        # (it % batches_per_epoch == 0) there is no tail to skip and
+                        # the normal loop carries this micro-batch's gradient into
+                        # the next accumulation window, so discarding it would drop
+                        # the epoch's final batch from the optimizer update while
+                        # its loss/tokens were already counted.
+                        grad_accum_state = None      # abandon the partial window
+                        accum_progress = 0
                         it = _honor_epoch_stop_skip(
                             it, self._global_step, grad_norm)
                     self.control.should_epoch_stop = False
@@ -4002,7 +4010,29 @@ class MLXTrainer:
             self._distributed_sync_control_actions()
             if (self.control.should_log or self.control.should_evaluate
                     or self.control.should_save):
-                _run_callback_control_actions(self._global_step, None)
+                # A callback that stopped training mid-epoch (should_training_stop)
+                # has already latched stop_requested via the tail _sync_stop(), so
+                # a requested epoch-end eval would hit _evaluate_batch_totals'
+                # `not stop_requested` gate, skip every batch, and dispatch a
+                # phantom 0.0 eval to on_log/on_evaluate -- corrupting best-model /
+                # early-stopping state. HF runs a real epoch-end eval for a callback
+                # stop (_maybe_log_save_evaluate before the loop break), so lift the
+                # callback stop around these final actions and restore it after. A
+                # hard external cancel (stop_requested without a callback
+                # should_training_stop) keeps its suppression: skip the actions
+                # entirely rather than emit a phantom eval. should_training_stop is
+                # rank-0 only, so OR-reduce it for a rank-consistent decision; the
+                # synced control flags above already put every rank in this branch,
+                # so the collective stays in lockstep.
+                _callback_stop = self._distributed_any_flag(
+                    getattr(self.control, "should_training_stop", False))
+                if not self.stop_requested or _callback_stop:
+                    _restore_stop = self.stop_requested
+                    self.stop_requested = False
+                    try:
+                        _run_callback_control_actions(self._global_step, None)
+                    finally:
+                        self.stop_requested = _restore_stop
 
         # Flush any completed-but-unlogged optimizer-step window so the returned
         # train_loss/trained_tokens include the final steps when training stops

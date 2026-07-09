@@ -3158,3 +3158,72 @@ def test_substep_can_be_mid_epoch_with_grad_accum():
     do_update = (accum_progress + 1 >= grad_accum)   # False -> substep
     assert do_update is False
     assert it % batches_per_epoch != 0               # mid-epoch
+
+
+def test_boundary_substep_epoch_stop_keeps_gradient():
+    # Regression for "Preserve boundary substep gradients on epoch-stop". The
+    # substep should_epoch_stop branch must only abandon the accumulation window
+    # for an ACTUAL mid-epoch skip (it % batches_per_epoch != 0). At a boundary
+    # substep the normal loop carries the micro-batch's gradient into the next
+    # window, so `grad_accum_state = None` must sit INSIDE the mid-epoch guard, not
+    # before it -- otherwise the epoch's final batch gradient is dropped while its
+    # loss/tokens were already counted (losses += lvalue * toks).
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    substep = src.index("if not do_update:")
+    branch = src[substep:src.index("continue", substep)]
+    guard_pos = branch.index("if it % batches_per_epoch != 0:")
+    discard_pos = branch.index("grad_accum_state = None")
+    reset_pos = branch.index("self.control.should_epoch_stop = False")
+    # The window discard is guarded by (follows) the mid-epoch check, and both
+    # precede the should_epoch_stop reset.
+    assert guard_pos < discard_pos < reset_pos
+    # The skip helper is also inside the mid-epoch guard.
+    assert guard_pos < branch.index("_honor_epoch_stop_skip(")
+
+
+def test_boundary_can_be_substep_with_grad_accum():
+    # Reachability for the boundary-substep case: a non-update microstep that is
+    # ALSO an epoch boundary exists. batches_per_epoch=3, grad_accum=2: it=1 is a
+    # substep, it=2 an optimizer step, it=3 a substep AND 3 % 3 == 0 (boundary). A
+    # callback setting should_epoch_stop at it=3 must NOT discard the carried
+    # gradient.
+    grad_accum = 2
+    batches_per_epoch = 3
+    accum_progress = 0
+    states = []
+    for it in range(1, batches_per_epoch + 1):
+        do_update = (accum_progress + 1 >= grad_accum)
+        states.append((it, do_update, it % batches_per_epoch == 0))
+        accum_progress = 0 if do_update else accum_progress + 1
+    # it=3: a substep (not an optimizer update) that is also an epoch boundary.
+    assert (3, False, True) in states
+
+
+def test_post_loop_epoch_end_runs_eval_for_callback_stop():
+    # Regression for "Defer callback stops through final epoch-end eval". The
+    # post-loop truncated on_epoch_end runs after the tail _sync_stop() latched
+    # stop_requested, so a callback-requested epoch-end eval would hit
+    # _evaluate_batch_totals' `not stop_requested` gate, skip every batch, and
+    # dispatch a phantom 0.0 eval to on_log/on_evaluate -- corrupting best/early-
+    # stop state. HF runs a real epoch-end eval for a callback stop, so lift the
+    # callback stop around the final actions and restore it; a hard external cancel
+    # (stop_requested without should_training_stop) keeps its suppression.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    tail = src[src.index("Close a truncated final epoch"):src.index("avg_loss = (")]
+    # Callback-stop vs external-cancel distinguished rank-consistently.
+    assert "_callback_stop = self._distributed_any_flag(" in tail
+    assert 'getattr(self.control, "should_training_stop", False)' in tail
+    # Run the final actions on a normal exit OR a callback stop; suppress a hard
+    # external cancel. Lift stop_requested around the actions, then restore it.
+    assert "if not self.stop_requested or _callback_stop:" in tail
+    assert "self.stop_requested = False" in tail
+    assert "self.stop_requested = _restore_stop" in tail
+    # The lift/restore wraps the control actions (try/finally) so the stop is
+    # always restored even if the eval raises.
+    assert "finally:" in tail
