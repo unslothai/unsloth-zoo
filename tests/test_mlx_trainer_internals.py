@@ -1309,6 +1309,27 @@ def test_callback_state_num_input_tokens_seen_uses_reduced_global_count():
     assert "_mlx_batch_input_token_count(batch_data)" in src
 
 
+def test_num_input_tokens_seen_incremented_before_on_optimizer_step():
+    # HF advances TrainerState.num_input_tokens_seen right after the forward pass,
+    # BEFORE firing on_optimizer_step (transformers Trainer._inner_training_loop),
+    # so a callback that reports or stops on a token budget observes this step's
+    # tokens at the step it fires on. The MLX loop must increment ahead of the
+    # on_optimizer_step fire; incrementing after would make the callback lag one
+    # optimizer step behind the true token count.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    incr_at = src.index("self.state.num_input_tokens_seen +=")
+    fire_at = src.index('_fire("on_optimizer_step")')
+    assert incr_at < fire_at, (
+        "num_input_tokens_seen must be incremented before on_optimizer_step fires"
+    )
+    # And still after the all-reduce that produces the global count it consumes.
+    reduce_at = src.index("global_input_toks = self._distributed_all_sum(")
+    assert reduce_at < incr_at
+
+
 def test_mlx_batch_input_token_count_counts_all_positions():
     # The helper feeding num_input_tokens_seen must count every input position
     # (prompt + response + padding), matching HF's input_ids.numel(), for both
@@ -1407,14 +1428,41 @@ def test_callback_batches_per_epoch_uses_single_pass_for_max_steps():
     t._prepared_batches_include_epochs = False
     # One pass = ceil(8 / (2*1)) = 4 micro-batches, not the 100-batch run length.
     assert t._callback_batches_per_epoch(list(range(100))) == 4
-    # Clamp: if the whole run is shorter than one pass, cap at the run length.
-    assert t._callback_batches_per_epoch(list(range(3))) == 3
+    # No upper clamp to the run length: even when the whole max_steps run is
+    # shorter than one dataset pass, the per-epoch denominator stays one_pass so
+    # state.epoch = it / one_pass reports the true fraction of a pass. Clamping to
+    # the run length (min(one_pass, total)) would make a sub-one-pass run report a
+    # full 1.0 epoch instead of HF's fractional value.
+    assert t._callback_batches_per_epoch(list(range(3))) == 4
 
     # The epoch-based path (max_steps<=0, num_train_epochs>0) is unchanged.
     t2 = MLXTrainer.__new__(MLXTrainer)
     t2.args = MLXTrainingConfig(num_train_epochs=3, max_steps=-1)
     t2._prepared_batches_include_epochs = True
     assert t2._callback_batches_per_epoch(list(range(12))) == 4  # 12 // 3
+
+
+def test_callback_batches_per_epoch_sub_one_pass_reports_fractional_epoch():
+    # A max_steps run that stops before completing even one dataset pass must
+    # report a FRACTIONAL state.epoch (HF: global_step / (updates per pass)), not a
+    # spurious full 1.0. Bug: min(one_pass, total) clamped the per-epoch denominator
+    # down to the (short) run length, so state.epoch = it / batches_per_epoch hit
+    # 1.0 by the end of the run. Fix: max(1, one_pass) keeps the true pass length.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    t = MLXTrainer.__new__(MLXTrainer)
+    # 100 examples, per_device 1 -> one_pass = 100 micro-batches, but max_steps=10
+    # means the whole run is only 10 micro-batches (a tenth of a pass).
+    t.args = MLXTrainingConfig(max_steps=10, per_device_train_batch_size=1)
+    t._distributed_world_size = 1
+    t._mlx_train_dataset_for_batches = list(range(100))
+    t.train_dataset = t._mlx_train_dataset_for_batches
+    t._prepared_batches_include_epochs = False
+    bpe = t._callback_batches_per_epoch(list(range(10)))  # run length = 10
+    assert bpe == 100, "denominator must be one_pass (100), not the run length (10)"
+    # After the whole 10-step run, state.epoch = it / bpe = 10/100 = 0.1 (HF value),
+    # whereas the old clamp gave 10/10 = 1.0 (a full phantom epoch).
+    assert 10 / bpe == 0.1
 
 
 def test_should_epoch_stop_field_reset_and_honored():
@@ -2296,10 +2344,13 @@ def test_on_optimizer_step_defers_callback_stop_until_after_same_step_eval():
 
     src = inspect.getsource(MLXTrainer._train_inner)
     opt_step = src.index('_fire("on_optimizer_step")')
-    # The shared post-update bookkeeping begins once the do_update branch closes;
-    # bound the inspected region there so we only look at what runs between the
-    # on_optimizer_step event and the rest of the same step.
-    region_end = src.index("self.state.num_input_tokens_seen", opt_step)
+    # The shared post-update bookkeeping begins once the do_update branch closes
+    # (the `if batches_per_epoch:` epoch update that runs every microstep); bound
+    # the inspected region there so we only look at what runs between the
+    # on_optimizer_step event and the rest of the same step. (num_input_tokens_seen
+    # is now incremented ahead of on_optimizer_step, so it no longer marks the
+    # branch close.)
+    region_end = src.index("if batches_per_epoch:", opt_step)
     tail_stop = src.index("if _sync_stop():", region_end)
     # Strip comment lines so the prose describing the deferral is not mistaken
     # for the code that performs it.
@@ -3290,3 +3341,27 @@ def test_substep_stop_leaves_partial_window_unflushed():
     accum_progress_after_update = 0
     steps_after_update = grad_accum
     assert (steps_after_update > 0 and accum_progress_after_update == 0)
+
+
+def test_substep_epoch_stop_discard_clears_metric_window():
+    # When a mid-epoch substep honors should_epoch_stop it abandons the partial
+    # accumulation window (grad_accum_state = None) -- those micro-batches never
+    # updated the model. Their loss/tokens must NOT surface in the forced
+    # on_epoch_end log or inflate trained_tokens, so the discard must also clear the
+    # metric accumulators (losses/n_tokens/steps). With them cleared, the steps==0
+    # early-return in _run_training_log suppresses the phantom epoch-end log.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    substep = src.index("if not do_update:")
+    branch = src[substep:src.index("continue", substep)]
+    discard = branch.index("grad_accum_state = None")
+    skip = branch.index("_honor_epoch_stop_skip(")
+    # The three metric accumulators are zeroed in the discard block, before the skip.
+    for name in ("losses = 0", "n_tokens = 0", "steps = 0"):
+        pos = branch.index(name, discard)
+        assert discard < pos < skip, f"{name} must be cleared at the discard"
+    # The steps==0 guard that then suppresses the forced log is present.
+    log_src = inspect.getsource(MLXTrainer._train_inner)
+    assert "if steps == 0:" in log_src

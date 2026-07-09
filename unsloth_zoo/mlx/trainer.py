@@ -1496,7 +1496,10 @@ class MLXTrainer:
         # micro-batch consumes per_device_train_batch_size * world_size rows),
         # matching HF's len(dataloader)-based epoch accounting for max_steps. This
         # only affects the callback-visible epoch value/cadence, never the
-        # training data or gradient steps, and is clamped into [1, total].
+        # training data or gradient steps. Floored at 1 but never upper-clamped:
+        # a sub-one-pass max_steps run (max_steps < one dataset pass) must report
+        # the true fractional epoch (e.g. state.epoch ~ 0.1), matching HF, not a
+        # spurious full 1.0.
         if int(getattr(self.args, "max_steps", 0) or 0) > 0:
             per_device = int(getattr(self.args, "per_device_train_batch_size", 0) or 0)
             world = int(getattr(self, "_distributed_world_size", 1) or 1)
@@ -1509,7 +1512,7 @@ class MLXTrainer:
                 n_examples = 0
             if per_device > 0 and n_examples > 0:
                 one_pass = math.ceil(n_examples / (per_device * max(1, world)))
-                return max(1, min(one_pass, total))
+                return max(1, one_pass)
         return total
 
     def _metric_for_best_model_name(self, metrics=None, require=False):
@@ -3826,6 +3829,16 @@ class MLXTrainer:
                 stream=mx.cpu,
             )
             mx.eval(global_input_toks)
+            # HF's TrainerState.num_input_tokens_seen is a global (all-rank
+            # gathered) count of INPUT tokens; callbacks that report or stop on a
+            # token budget read it directly. Use the all-reduced input-token count
+            # (not global_toks, which is the supervised/label-token count, nor the
+            # rank-local value which would undercount by ~world_size under DDP).
+            # Increment BEFORE on_optimizer_step: HF advances num_input_tokens_seen
+            # right after the forward, ahead of the on_optimizer_step callback
+            # (transformers trainer.py), so a token-budget callback observes this
+            # microbatch's tokens at the step it fires on.
+            self.state.num_input_tokens_seen += int(global_input_toks.item())
             if do_update:
                 _fire("on_optimizer_step")
                 # Do NOT latch a callback should_training_stop into stop_requested
@@ -3842,12 +3855,6 @@ class MLXTrainer:
                 # _sync_stop() after the same-step log/eval/save, mirroring the
                 # on_step_end deferral below.
                 self._distributed_should_stop()
-            # HF's TrainerState.num_input_tokens_seen is a global (all-rank
-            # gathered) count of INPUT tokens; callbacks that report or stop on a
-            # token budget read it directly. Use the all-reduced input-token count
-            # (not global_toks, which is the supervised/label-token count, nor the
-            # rank-local value which would undercount by ~world_size under DDP).
-            self.state.num_input_tokens_seen += int(global_input_toks.item())
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
             train_time += time.perf_counter() - tic
@@ -3905,6 +3912,16 @@ class MLXTrainer:
                         # its loss/tokens were already counted.
                         grad_accum_state = None      # abandon the partial window
                         accum_progress = 0
+                        # The abandoned micro-batches never updated the model, so
+                        # their loss/tokens must not surface in a forced epoch-end
+                        # log or inflate trained_tokens. Clear the metric window
+                        # here (steps==0 then suppresses the on_epoch_end forced
+                        # _run_training_log), mirroring that the discarded gradient
+                        # is dropped -- reporting un-applied data would misstate the
+                        # logged train loss and token throughput.
+                        losses = 0
+                        n_tokens = 0
+                        steps = 0
                         it = _honor_epoch_stop_skip(
                             it, self._global_step, grad_norm)
                     self.control.should_epoch_stop = False
