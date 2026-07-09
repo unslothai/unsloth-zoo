@@ -316,6 +316,24 @@ def disable_dynamo():
         torch._dynamo.config.disable = prev
 
 
+def _vespo_gamma_weights(advantages, log_ratio_per_token, mask, importance_sampling_ratio,
+                         k_pos=2.0, lambda_pos=3.0, k_neg=3.0, lambda_neg=2.0):
+    # Faithful per-sequence VESPO gamma weights (mirrors TRL GRPOTrainer.get_gamma_weights):
+    # phi(w) = e^lambda * w^k * e^{-lambda w} with w the sequence-level ratio. Each row depends
+    # only on its own tokens (seq_log_ratio sums over that row), so it is chunk-invariant.
+    lower = math.log(1e-8)
+    seq_log_ratio = (torch.clamp(log_ratio_per_token, -20.0, 20.0) * mask).sum(-1, keepdim=True)
+    if importance_sampling_ratio is not None:
+        seq_log_ratio = seq_log_ratio + torch.clamp(
+            torch.log(importance_sampling_ratio), lower, 20.0
+        ).sum(-1, keepdim=True)
+    log_w = torch.clamp(seq_log_ratio, lower, 20.0)
+    w = torch.exp(log_w)
+    k = torch.where(advantages >= 0, k_pos, k_neg)
+    lam = torch.where(advantages >= 0, lambda_pos, lambda_neg)
+    return torch.exp(lam + k * log_w - lam * w).detach()
+
+
 def _grpo_loss_fixture(loss_type, B=6, T=5, V=17):
     torch.manual_seed(123)
     new = torch.randn(B, T, dtype=torch.float64)
@@ -332,6 +350,9 @@ def _grpo_loss_fixture(loss_type, B=6, T=5, V=17):
         current_gradient_accumulation_steps=1,
         max_completion_length=T,
     )
+    if loss_type == "vespo":
+        # vespo raises without a get_gamma_weights callable (TRL 0.26+ supplies it).
+        kwargs["get_gamma_weights"] = _vespo_gamma_weights
     return new, old, ref, input_ids, mask, advantages, kwargs
 
 
@@ -364,7 +385,7 @@ def test_efficient_grpo_nchunks1_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
-_ALL_LOSS_TYPES = ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo"]
+_ALL_LOSS_TYPES = ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
 
 
 def _run_efficient_grpo(new, old, ref, input_ids, mask, advantages, kwargs,
