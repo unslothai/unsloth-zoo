@@ -3513,6 +3513,33 @@ def _resize_vlm_images(images, image_size):
     return resized
 
 
+def _vlm_vision_part_state(messages):
+    has_bare_placeholder = False
+    has_media_payload = False
+    if not isinstance(messages, list):
+        return has_bare_placeholder, has_media_payload
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("image", "image_url", "video"):
+                continue
+            if any(key in part for key in ("image", "image_url", "video")):
+                has_media_payload = True
+            else:
+                has_bare_placeholder = True
+    return has_bare_placeholder, has_media_payload
+
+
+def _vlm_bare_placeholder_error(exc):
+    return "image, image_url or video should in content" in str(exc)
+
+
 def _extract_vlm_images(
     item,
     messages,
@@ -3522,6 +3549,7 @@ def _extract_vlm_images(
 ):
     images = []
     top_level_image = []
+    has_bare_placeholder, has_media_payload = _vlm_vision_part_state(messages)
     if isinstance(item, dict):
         image = item.get("images")
         if image is not None:
@@ -3554,10 +3582,16 @@ def _extract_vlm_images(
                     images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
         except Exception as exc:
             process_error = exc
-            if not top_level_image and not suppress_process_errors:
+            can_fallback = (
+                top_level_image
+                and has_bare_placeholder
+                and not has_media_payload
+                and _vlm_bare_placeholder_error(exc)
+            )
+            if not can_fallback and not suppress_process_errors:
                 raise
 
-    if not images and top_level_image:
+    if not images and top_level_image and not has_media_payload:
         images = top_level_image
     if not images and process_error is not None and not suppress_process_errors:
         raise process_error
