@@ -1389,11 +1389,20 @@ def grpo_accumulated_loss(
                     hidden_states, lm_head, index, *ctx.args
                 )
 
-            torch.autograd.backward(output, grad_output)
+            # Use torch.autograd.grad (not torch.autograd.backward) so we return each
+            # input's LOCAL gradient contribution. torch.autograd.backward writes into the
+            # leaf .grad attributes; returning lm_head.grad would then be double-counted by
+            # the outer engine's AccumulateGrad (2x for a single use, more when lm_head is
+            # shared across chunks) and would corrupt any grad already accumulated on lm_head.
+            grad_inputs = torch.autograd.grad(
+                output,
+                (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
+                grad_output,
+            )
 
             return (
-                hidden_states.grad,
-                lm_head.grad if ctx.lm_head_requires_grad else None,
+                grad_inputs[0],
+                grad_inputs[1] if ctx.lm_head_requires_grad else None,
                 None,
                 None,
                 None,

@@ -25,6 +25,7 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -210,3 +211,83 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     }
     missing = expected - set(rr.RL_REPLACEMENTS.keys())
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# Unsloth_Offloaded_Log_Softmax backward returns LOCAL input gradients
+# ---------------------------------------------------------------------------
+#
+# The offloaded log-softmax Function recomputes its output in backward. It must return
+# each input's local gradient contribution. Using torch.autograd.backward (which writes
+# leaf .grad) and returning lm_head.grad double-counts: the outer engine's AccumulateGrad
+# adds it again (2x for a single use, more when lm_head is shared across chunks) and
+# corrupts any grad already accumulated on lm_head. torch.autograd.grad returns the local
+# grads without touching leaf .grad. Reachable on the offload path (long-completion /
+# large-batch GRPO) whenever lm_head / tied embeddings are trainable; frozen lm_head
+# (standard LoRA) returns None and is unaffected.
+
+
+def test_offloaded_log_softmax_uses_autograd_grad_not_backward():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert "class Unsloth_Offloaded_Log_Softmax" in src
+    # The fix: local grads via torch.autograd.grad, not backward + leaf .grad return.
+    assert "torch.autograd.grad(" in src
+    assert "torch.autograd.backward(output, grad_output)" not in src
+    assert "lm_head.grad if ctx.lm_head_requires_grad else None" not in src
+
+
+def _recompute_fn(use_backward):
+    # Mirrors the offloaded Function's recompute-in-backward over a plain inner op (x @ W).
+    # use_backward=True is the buggy variant (autograd.backward + return the leaf .grad),
+    # use_backward=False is the fix (autograd.grad returns the local contribution).
+    class _Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, W):
+            ctx.x = x.detach()
+            ctx.W = W
+            ctx.W_rg = W.requires_grad
+            with torch.no_grad():
+                return x @ W
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x = ctx.x.clone().requires_grad_(True)
+            W = ctx.W
+            with torch.enable_grad():
+                out = x @ W
+            if use_backward:
+                torch.autograd.backward(out, grad_output)
+                return x.grad, (W.grad if ctx.W_rg else None)
+            grads = torch.autograd.grad(out, (x, W) if ctx.W_rg else (x,), grad_output)
+            return grads[0], (grads[1] if ctx.W_rg else None)
+
+    return _Fn
+
+
+def _weight_grad(op, shared, preexisting):
+    # Accumulate W.grad through `op` (either a custom Function.apply or plain matmul), for
+    # a single use and for two uses sharing W, optionally starting from a pre-existing grad.
+    torch.manual_seed(0)
+    x1 = torch.randn(6, 8)
+    x2 = torch.randn(6, 8)
+    W = torch.randn(8, 10, requires_grad=True)
+    g1 = torch.randn(6, 10)
+    g2 = torch.randn(6, 10)
+    W.grad = torch.randn(8, 10) if preexisting else None
+    torch.autograd.backward(op(x1, W), g1, retain_graph=True)
+    if shared:
+        torch.autograd.backward(op(x2, W), g2)
+    return W.grad.clone()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting):
+    # Oracle: plain autograd through the same op, no custom Function.
+    ref = _weight_grad(lambda x, W: x @ W, shared, preexisting)
+    # The fix (autograd.grad) matches the oracle exactly.
+    fixed = _recompute_fn(use_backward=False)
+    assert torch.allclose(_weight_grad(fixed.apply, shared, preexisting), ref, atol=1e-6)
+    # The buggy pattern (autograd.backward + return leaf .grad) diverges -- guards the test.
+    buggy = _recompute_fn(use_backward=True)
+    assert not torch.allclose(_weight_grad(buggy.apply, shared, preexisting), ref, atol=1e-4)
