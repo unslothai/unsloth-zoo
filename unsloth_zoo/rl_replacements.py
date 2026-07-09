@@ -786,10 +786,17 @@ def grpo_accumulated_loss(
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
-    # Thread vLLM sampling logprobs whenever the batch has them so the off-policy mask can use them
-    # (matching TRL, which feeds them to get_off_policy_mask regardless of IS correction). The IS
-    # ratio itself stays gated on vllm_importance_sampling_correction inside grpo_compute_loss.
-    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None)
+    # Thread vLLM sampling logprobs when something actually consumes them: the off-policy mask
+    # (off_policy_mask_threshold) or the IS ratio (vllm_importance_sampling_correction). The mask
+    # needs them regardless of IS correction (matching TRL, which feeds them to get_off_policy_mask
+    # either way); the IS ratio stays gated on the correction flag inside grpo_compute_loss. On the
+    # plain vLLM path (neither active) they are dropped so nothing pays for an unused aligned/compiled
+    # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
+    _sampling_logps_used = (
+        getattr(trainer, "vllm_importance_sampling_correction", False)
+        or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
+    )
+    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if _sampling_logps_used else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)

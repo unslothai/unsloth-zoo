@@ -446,3 +446,17 @@ def test_off_policy_adapter_cache_compares_bound_method_by_value():
     assert t.get_off_policy_mask is not t.get_off_policy_mask  # fresh object each access
     assert t.get_off_policy_mask == t.get_off_policy_mask      # but equal by value
     assert (None != t.get_off_policy_mask) is True             # first-call guard still rebuilds
+
+
+def test_sampling_logps_gated_on_actual_consumer():
+    # grpo_accumulated_loss must keep vLLM sampling logps only when the off-policy mask
+    # (off_policy_mask_threshold) or the IS ratio (vllm_importance_sampling_correction)
+    # consumes them - otherwise the plain vLLM path pays for an unused aligned/compiled
+    # input and UnslothEfficientGRPO returns empty (not None) delta/flat_is_ratio.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    flat = src.replace(" ", "")
+    assert "_sampling_logps_used" in src
+    assert "vllm_importance_sampling_correction" in src
+    assert 'getattr(trainer.args,"off_policy_mask_threshold",None)isnotNone' in flat
+    # The gate must actually condition the read (not keep sampling unconditionally).
+    assert 'kwargs.get("sampling_per_token_logps",None)if_sampling_logps_usedelseNone' in flat
