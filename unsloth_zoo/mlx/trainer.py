@@ -3313,6 +3313,24 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        # Reject unknown loss_type values before any batch construction. Only
+        # "sft" (default), "orpo", and "dpo" are implemented on MLX. The loss
+        # selection in _train_inner and the preference branch below BOTH fall
+        # through to the SFT/CCE path for anything else, so a misconfigured
+        # preference run -- a typo like "dppo", or a real TRL DPO loss_type that
+        # is not implemented here ("ipo", "sigmoid", "hinge", "kto", ...) -- would
+        # silently optimize a plain cross-entropy objective instead of failing.
+        # Fail fast so the wrong objective is never trained.
+        _supported_loss_types = ("sft", "orpo", "dpo")
+        _loss_type = getattr(args, "loss_type", "sft")
+        if _loss_type not in _supported_loss_types:
+            raise ValueError(
+                f"Unsloth MLX: unsupported loss_type={_loss_type!r}. Supported "
+                f"values are {_supported_loss_types!r}. DPO loss variants such as "
+                "'ipo', 'sigmoid', or 'hinge' are not implemented on MLX; without "
+                "this check they would silently train a plain SFT cross-entropy "
+                "objective. Use loss_type='dpo' (sigmoid DPO), 'orpo', or 'sft'."
+            )
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3366,6 +3384,52 @@ class MLXTrainer:
             if is_vlm:
                 raise ValueError(
                     f"{args.loss_type.upper()} is not yet supported for VLM models on MLX."
+                )
+            if self.distributed_world_size > 1:
+                # Multi-GPU (MLX DDP) DPO/ORPO is not sharded. The SFT/VLM data
+                # path builds a global micro-batch and hands each rank its own
+                # slice (comm_group is threaded into create_batches /
+                # iterate_training_batches / create_vlm_batches), so the gradients
+                # _apply_update all-reduces cover the intended global batch.
+                # create_preference_batches takes no comm_group/rank argument:
+                # every rank would build the SAME sorted preference batches
+                # (identical seed, data, sort) and _apply_update would all-reduce
+                # duplicate gradients, so multi-GPU training would silently train
+                # on one rank's stream rather than the global shard (and, under a
+                # max_steps random-subset cap, on the same reduced subset on every
+                # rank). Correctly sharding the concatenated [chosen; rejected]
+                # builder (global-batch construction plus cross-rank tail padding
+                # so collectives stay aligned) cannot be validated on the
+                # single-process CI, so fail fast rather than mistrain. No-op at
+                # world_size == 1 (the common single-GPU case).
+                raise NotImplementedError(
+                    "Unsloth MLX: distributed (multi-GPU) DPO/ORPO preference "
+                    "training is not yet implemented "
+                    f"(distributed_world_size={self.distributed_world_size}). The "
+                    "preference batches are not sharded across ranks, so every "
+                    "rank would train on identical data and all-reduce duplicate "
+                    "gradients instead of the intended global shard. Run DPO/ORPO "
+                    "on a single GPU (world_size=1), or pre-shard the dataset "
+                    "across ranks yourself before training."
+                )
+            if args.streaming:
+                # create_preference_batches materializes the WHOLE dataset: it
+                # collects every prompt/chosen/rejected row before batching and
+                # only honors num_batches afterwards, so an iterable/streaming
+                # dataset is fully consumed up front. The SFT/VLM paths honor
+                # streaming by returning a bounded iterator
+                # (iterate_training_batches / iterate_vlm_training_batches) that
+                # yields only max_steps worth of batches; the preference path has
+                # no such iterator, so args.streaming=True on an unbounded
+                # IterableDataset would hang or OOM instead of stopping at
+                # max_steps. Fail fast rather than silently blow up.
+                raise NotImplementedError(
+                    "Unsloth MLX: streaming DPO/ORPO preference training is not "
+                    "yet implemented. create_preference_batches materializes the "
+                    "entire dataset before batching, so an unbounded streaming "
+                    "dataset would hang or run out of memory instead of stopping "
+                    "at max_steps. Disable streaming (streaming=False) for "
+                    "DPO/ORPO, or use a finite (map-style) dataset."
                 )
             batches = create_preference_batches(
                 dataset=self.train_dataset,

@@ -2577,3 +2577,73 @@ def test_sft_loss_type_still_accepts_prebuilt_response_masked_batches():
     batches, batch_iter = MLXTrainerCls._prepare_data(trainer, is_vlm=False)
     assert batches is trainer._batches
     assert batch_iter is None
+
+
+def _pin_distributed(trainer, world_size):
+    # Bypass the lazy mx.distributed.init() in _ensure_distributed so the
+    # data-routing tests can pin an exact world size without a real runtime.
+    trainer._distributed_initialized = True
+    trainer._distributed_world = None
+    trainer._distributed_rank = 0
+    trainer._distributed_world_size = world_size
+
+
+def test_preference_distributed_ddp_fails_fast_instead_of_duplicating():
+    # Regression (DDP-SHARD): create_preference_batches takes no comm_group/rank
+    # argument, so under MLX DDP (world_size>1) every rank builds the SAME sorted
+    # preference batches and _apply_update all-reduces DUPLICATE gradients --
+    # effectively single-rank training on identical data (and, under a max_steps
+    # random-subset cap, the same reduced subset on every rank) with inflated
+    # pair/step logging. The SFT/VLM paths thread comm_group through and rank-slice,
+    # so multi-rank IS a real path here. Until the preference builder is sharded,
+    # _prepare_data must fail fast rather than silently mistrain.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    for loss_type in ("orpo", "dpo"):
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(
+            max_steps=1, loss_type=loss_type,
+        )
+        _pin_distributed(trainer, world_size=2)
+        with pytest.raises(NotImplementedError, match="distributed"):
+            MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+
+
+def test_preference_streaming_fails_fast_instead_of_materializing():
+    # Regression (STREAMING): args.streaming is honored on the SFT/VLM paths
+    # (they return a bounded iterator via iterate_training_batches /
+    # iterate_vlm_training_batches that stops at max_steps), but the ORPO/DPO
+    # branch always calls create_preference_batches, which consumes the ENTIRE
+    # dataset before honoring num_batches. On an unbounded IterableDataset that
+    # hangs or OOMs instead of taking max_steps, so _prepare_data must reject
+    # streaming for orpo/dpo rather than silently materialize the stream.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    for loss_type in ("orpo", "dpo"):
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(
+            max_steps=1, loss_type=loss_type, streaming=True,
+        )
+        _pin_distributed(trainer, world_size=1)  # single-GPU; only streaming trips
+        with pytest.raises(NotImplementedError, match="streaming"):
+            MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+
+
+def test_unknown_loss_type_rejected_before_batching():
+    # Regression (UNKNOWN-LOSS-TYPE): only "sft"/"orpo"/"dpo" are implemented on
+    # MLX. Any other value falls through the loss selection AND the preference
+    # branch to the SFT/CCE path, so a misconfigured preference run (a typo, or a
+    # real TRL DPO loss like "ipo"/"sigmoid"/"hinge" not implemented here) would
+    # silently optimize plain cross-entropy. _prepare_data must fail fast.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    for bad in ("ipo", "sigmoid", "hinge", "kto", "dppo"):
+        MLXTrainerCls, trainer = _make_mlx_text_trainer(max_steps=1, loss_type=bad)
+        with pytest.raises(ValueError, match="unsupported loss_type"):
+            MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+
+    # Implemented loss_types clear the loss_type gate: with world_size>1 'dpo'
+    # trips the distributed guard (NotImplementedError), proving it passed the
+    # loss_type ValueError rather than being rejected as unknown.
+    MLXTrainerCls, trainer = _make_mlx_text_trainer(max_steps=1, loss_type="dpo")
+    _pin_distributed(trainer, world_size=2)
+    with pytest.raises(NotImplementedError):
+        MLXTrainerCls._prepare_data(trainer, is_vlm=False)
