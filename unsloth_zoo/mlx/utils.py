@@ -1276,6 +1276,17 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
         if pad_to_multiple:
             Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+        # Clamp the pad_to_multiple round-up back to max_seq_length, matching the
+        # SFT/text path (_create_labeled_batches: padded_len = min(padded_len,
+        # max_seq_length)). Every row here is already truncated to max_seq_length
+        # (c_ids/r_ids above), so the batch width never needs to exceed it; without
+        # this clamp a max_seq_length that is not a multiple of pad_to_multiple
+        # (e.g. 1025 -> 1056) would round the batch above the configured cap and run
+        # the preference forward over extra padded positions, wasting memory and
+        # potentially overrunning a model's position/cache limit for users who set a
+        # tight context. min() never drops a real token because Lmax_rounded and
+        # max_seq_length are both >= the longest row in the chunk.
+        Lmax = min(Lmax, max_seq_length)
         chosen_rows, rejected_rows, lengths = [], [], []
         for pe, c, r in chunk:
             chosen_rows.append(c + [pad_id] * (Lmax - len(c)))

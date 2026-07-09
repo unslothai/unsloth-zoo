@@ -1264,6 +1264,43 @@ def test_preference_batches_append_eos_to_completions():
     assert rows[0][ce - 1] == 7 and rows[1][re_ - 1] == 7
 
 
+def test_preference_batches_clamp_padding_to_max_seq_length():
+    # When max_seq_length is not a multiple of pad_to_multiple, the per-batch
+    # pad_to_multiple round-up must be clamped back to max_seq_length, mirroring
+    # the SFT/text path (_create_labeled_batches: padded_len = min(padded_len,
+    # max_seq_length)). Here max_seq_length=40 with the default pad_to_multiple=32
+    # would round a full row up to 64 without the clamp, running the preference
+    # forward over 24 extra padded positions and potentially overrunning a tight
+    # context cap. Each row is already truncated to max_seq_length, so the batch
+    # width must equal max_seq_length exactly, never the rounded-up 64.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = 7
+        bos_token = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [int(part) for part in text.split()]
+
+    # prompt=1 token, chosen/rejected each 40 answer tokens: prompt+answer(+EOS)
+    # exceeds max_seq_length=40, so each row is truncated to exactly 40 tokens.
+    dataset = [{
+        "prompt": "1",
+        "chosen": " " + " ".join(["2"] * 40),
+        "rejected": " " + " ".join(["3"] * 40),
+    }]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _Tok(), batch_size=1, max_seq_length=40,
+    )[0]
+    rows = batch.tolist()
+    # Batch width is clamped to max_seq_length (40), not rounded up to 64.
+    assert len(rows[0]) == 40
+    assert len(rows[1]) == 40
+    # The scored completion span still fits within the clamped width.
+    for start, end in lengths.tolist():
+        assert 0 <= start <= end <= 40
+
+
 def test_preference_batches_common_prefix_boundary_under_token_merge():
     # When the tokenizer MERGES the boundary token -- the last prompt token fuses
     # with the first chosen/rejected token inside encode(prompt+answer) -- the
@@ -1579,6 +1616,22 @@ def test_grpo_rollout_rejects_single_generation(monkeypatch):
     )
     gen = trainer._grpo_rollout_generator()
     with pytest.raises(ValueError, match="num_generations >= 2"):
+        next(gen)
+
+
+def test_grpo_rollout_rejects_empty_dataset(monkeypatch):
+    # An empty (or fully filtered) prompt dataset must fail fast with the same
+    # clear "No GRPO prompts found" message on the default max_steps>0 path, not
+    # crash with an opaque ZeroDivisionError from "_order[idx % len(prompts)]"
+    # once the rollout loop starts. The epoch path already validates this in
+    # _prepare_data; the generator guard extends it to every entry path.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.0, 0.0]],
+    )
+    trainer.train_dataset = []
+    gen = trainer._grpo_rollout_generator()
+    with pytest.raises(ValueError, match="No GRPO prompts found"):
         next(gen)
 
 

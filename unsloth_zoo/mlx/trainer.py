@@ -4256,6 +4256,18 @@ class MLXGRPOTrainer(MLXTrainer):
             )
         sampler = make_sampler(temp=float(_temp))
         prompts = self._grpo_prompts()
+        # Fail fast on an empty prompt set. The epoch path (_prepare_data) already
+        # raises "No GRPO prompts found" for max_steps<=0/num_train_epochs>0, but the
+        # default max_steps>0 path never runs that check, so an empty or fully
+        # filtered dataset would reach the "_order[idx % len(prompts)]" fetch below
+        # with len(prompts)==0 and crash with an opaque ZeroDivisionError (integer
+        # modulo by zero) inside the rollout loop. Surface the same clear dataset
+        # message here so every entry path reports the empty dataset up front.
+        if not prompts:
+            raise ValueError(
+                "No GRPO prompts found. Check your dataset and the "
+                "'prompt' column."
+            )
         # Full dataset rows, in the same order as prompts, so reward_kwargs can
         # pass through each row's other columns (e.g. 'answer'). prompt and
         # example are indexed by the SAME cycled index below to stay aligned.
