@@ -1087,7 +1087,19 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
       lengths: (2B, 2) — per row [response_start, seq_end)
     """
     hf = _hf_encoding_tokenizer(tokenizer)
-    pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
+    eos_id = hf.eos_token_id
+    pad_id = eos_id if eos_id is not None else 0
+
+    def _with_eos(ids):
+        # TRL appends the EOS id to each DPO/ORPO completion
+        # (add_eos_token_if_needed), guarded against a double EOS, so the model
+        # learns to stop. Append BEFORE the max_seq_length truncation below; EOS
+        # lands after the prompt boundary, inside the scored [response_start,
+        # seq_end) span, so it is trained on -- matching TRL. No-op when the
+        # tokenizer has no eos_token or the text already ends with EOS.
+        if eos_id is not None and (not ids or ids[-1] != eos_id):
+            return ids + [eos_id]
+        return ids
 
     rows = []
     for ex in dataset:
@@ -1108,8 +1120,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         # add_special_tokens only when the text already starts with the BOS, so
         # plain non-BOS strings and tokenizers without a bos_token are unchanged.
         p_ids = encode_mlx_text(hf, prompt)
-        c_full = encode_mlx_text(hf, prompt + ex[chosen_key])
-        r_full = encode_mlx_text(hf, prompt + ex[rejected_key])
+        c_full = _with_eos(encode_mlx_text(hf, prompt + ex[chosen_key]))
+        r_full = _with_eos(encode_mlx_text(hf, prompt + ex[rejected_key]))
         # Response boundary = the shared prompt-prefix length. min() guards the
         # rare boundary-merge case where joining prompt+answer changes the token
         # count of the prompt region below len(p_ids).

@@ -1205,7 +1205,7 @@ def test_preference_batches_preserve_completion_when_prompt_exceeds_budget():
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _Tok:
-        eos_token_id = 0
+        eos_token_id = 7  # distinct from prompt (1) / answer (2, 3) tokens
         bos_token = None
 
         def encode(self, text, add_special_tokens=True):
@@ -1224,13 +1224,44 @@ def test_preference_batches_preserve_completion_when_prompt_exceeds_budget():
     chosen_start, chosen_end = lengths[0]
     rejected_start, rejected_end = lengths[1]
 
-    # All 4 answer tokens remain in the scored [start, end) completion span ...
-    assert chosen_end - chosen_start == 4
-    assert rejected_end - rejected_start == 4
-    # ... and every scored token is an answer token (2 / 3), never a prompt
-    # token (1) or padding (0).
-    assert rows[0][chosen_start:chosen_end] == [2, 2, 2, 2]
-    assert rows[1][rejected_start:rejected_end] == [3, 3, 3, 3]
+    # The 4 answer tokens plus the appended EOS (5 total) all remain in the scored
+    # [start, end) completion span; the completion-preserving truncation dropped
+    # PROMPT tokens (not answer tokens) to fit max_seq_length=8.
+    assert chosen_end - chosen_start == 5
+    assert rejected_end - rejected_start == 5
+    # Every scored token is an answer token (2 / 3) followed by the EOS (7),
+    # never a prompt token (1).
+    assert rows[0][chosen_start:chosen_end] == [2, 2, 2, 2, 7]
+    assert rows[1][rejected_start:rejected_end] == [3, 3, 3, 3, 7]
+
+
+def test_preference_batches_append_eos_to_completions():
+    # TRL appends the EOS id to each DPO/ORPO completion so the model learns to
+    # stop. The scored [response_start, seq_end) span must therefore end with the
+    # tokenizer's eos_token_id (guarded against a double EOS). No truncation here
+    # (well under max_seq_length), isolating the EOS-append behavior.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = 7  # distinct from prompt (1) / answer (2, 3) tokens
+        bos_token = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [int(part) for part in text.split()]
+
+    dataset = [{"prompt": "1 1", "chosen": " 2 2", "rejected": " 3 3 3"}]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _Tok(), batch_size=1, max_seq_length=64,
+    )[0]
+    lengths = lengths.tolist()
+    rows = batch.tolist()
+    cs, ce = lengths[0]
+    rs, re_ = lengths[1]
+    # Chosen completion "2 2" -> [2, 2, 7]; rejected "3 3 3" -> [3, 3, 3, 7].
+    assert rows[0][cs:ce] == [2, 2, 7]
+    assert rows[1][rs:re_] == [3, 3, 3, 7]
+    # The EOS is the last scored token of each completion.
+    assert rows[0][ce - 1] == 7 and rows[1][re_ - 1] == 7
 
 
 def test_grpo_prepare_data_normalizes_tokenizer_chat_template():
@@ -1953,8 +1984,9 @@ def test_create_preference_batches_samples_across_lengths_when_truncating():
         pad_to_multiple=0, num_batches=2, seed=42,
     )
     assert len(batches) == 2
-    # Recover kept pair indices from the unpadded chosen length (== i+1).
-    kept = sorted(int(l.tolist()[0][1]) - 1 for _, l, _ in batches)
+    # Recover kept pair indices from the unpadded chosen length. Pair i has i+1
+    # response tokens plus the appended EOS, so seq_end == i+2.
+    kept = sorted(int(l.tolist()[0][1]) - 2 for _, l, _ in batches)
     order = np.random.RandomState(_normalize_seed(42)).permutation(N)
     expected = sorted(int(i) for i in order[:2])
     assert kept == expected
