@@ -1274,50 +1274,70 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     # rows are collected in dataset order above; reorder per the requested mode.
     if order_mode == "default":
         rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
-    elif order_mode == "torch_randperm":
-        order = _torch_randperm_order(len(rows), _normalize_seed(seed))
-        rows = [rows[i] for i in order]
     # "sequential": leave rows in dataset order (CUDA SequentialSampler parity).
+    # "torch_randperm" permutes the ROWS per pass below (RandomSampler parity),
+    # so it is intentionally NOT pre-permuted here.
 
-    # Group rows into fixed-size batch chunks. For the default length-sort order,
-    # RESHUFFLE the BATCH order on every pass, then take the first num_batches,
-    # mirroring the text/SFT path (mlx_lm.iterate_batches with loop=True draws a
-    # fresh np.random.permutation on each pass; see create_batches,
-    # loop=(num_batches is not None)). Two problems this fixes:
+    # Group rows into fixed-size batch chunks, then RESHUFFLE the pass order on
+    # every epoch and take the first num_batches, mirroring the text/SFT path
+    # (mlx_lm.iterate_batches with loop=True draws a fresh permutation per pass;
+    # see create_batches, loop=(num_batches is not None)) and the text
+    # create_ordered_batches (which reseeds its order per epoch). Two problems
+    # this fixes:
     #   1) A single length-sorted pass puts the shortest pairs first, so a
     #      step-limited (max_steps>0) run whose num_batches is SMALLER than one
     #      pass would train ORPO/DPO only on the shortest prompts/completions and
     #      silently ignore the rest.
     #   2) When num_batches (= max_steps * grad_accum) spans MORE than one pass,
     #      the trainer modulo-cycles the returned list (batches[batch_idx % len]).
-    #      Materializing a single fixed pass would then repeat the SAME
-    #      length-sorted short->long order every epoch, biasing small-dataset /
-    #      long-max_steps runs toward one deterministic pass order (whereas SFT,
-    #      via iterate_batches loop=True, reshuffles each epoch). Emitting a fresh
-    #      permutation per pass up to num_batches makes each cycled epoch a
-    #      distinct order, matching the SFT/TRL per-epoch reshuffle.
-    # Drawing successive permutations from ONE seeded RandomState keeps a single
-    # sub-epoch selection byte-identical to the prior permute-then-truncate (the
-    # first permutation, first num_batches). "sequential"/"torch_randperm" already
-    # carry the user's intended row order (SequentialSampler / seeded RandomSampler
-    # parity), so leave those single-pass orders as-is. Use numpy (not
-    # _torch_randperm_order) so the DEFAULT path stays torch-free: MLX/Apple
-    # Silicon installs have no torch, and only the opt-in
-    # dataset_order="torch_randperm" mode may require it.
+    #      Materializing a single fixed pass would then repeat the SAME order
+    #      every epoch, biasing small-dataset / long-max_steps runs toward one
+    #      deterministic pass order (whereas SFT, via iterate_batches loop=True,
+    #      reshuffles each epoch). Emitting a fresh order per pass up to
+    #      num_batches makes each cycled epoch distinct, matching the SFT/TRL
+    #      per-epoch reshuffle.
+    # The DEFAULT (length-sort) mode reshuffles the BATCH order from ONE seeded
+    # numpy RandomState so the DEFAULT path stays torch-free (MLX/Apple Silicon
+    # installs have no torch). The opt-in "torch_randperm" mode instead redraws a
+    # fresh seeded ROW permutation per pass (base_seed + epoch), exactly like the
+    # text path's create_ordered_batches, so a modulo-cycled multi-pass run does
+    # not replay the same "random" order every epoch (CUDA RandomSampler parity).
+    # Both keep a single sub-epoch selection byte-identical to the prior
+    # single-pass materialization: pass 0 uses base_seed (the first permutation),
+    # first num_batches. "sequential" carries the user's intended fixed order
+    # (SequentialSampler parity), so it is left single-pass.
     base_starts = list(range(0, len(rows), batch_size))
     if order_mode == "default" and num_batches is not None and base_starts:
         rng = np.random.RandomState(_normalize_seed(seed))
-        starts = []
-        while len(starts) < num_batches:
+        ordered_starts = []
+        while len(ordered_starts) < num_batches:
             perm = rng.permutation(len(base_starts))
-            starts.extend(base_starts[int(i)] for i in perm)
-        starts = starts[:num_batches]
+            ordered_starts.extend(base_starts[int(i)] for i in perm)
+        chunks = [rows[s:s + batch_size] for s in ordered_starts[:num_batches]]
+    elif order_mode == "torch_randperm" and num_batches is not None and rows:
+        base_seed = _normalize_seed(seed)
+        chunks = []
+        epoch = 0
+        while len(chunks) < num_batches:
+            order = _torch_randperm_order(len(rows), base_seed + epoch)
+            rows_epoch = [rows[i] for i in order]
+            chunks.extend(
+                rows_epoch[j:j + batch_size]
+                for j in range(0, len(rows_epoch), batch_size)
+            )
+            epoch += 1
+        chunks = chunks[:num_batches]
+    elif order_mode == "torch_randperm":
+        # num_batches is None (or no rows): a single seeded permutation,
+        # identical to pass 0 (base_seed) of the multi-pass branch above.
+        order = _torch_randperm_order(len(rows), _normalize_seed(seed))
+        rows_ordered = [rows[i] for i in order]
+        chunks = [rows_ordered[s:s + batch_size] for s in base_starts]
     else:
-        starts = base_starts
+        chunks = [rows[s:s + batch_size] for s in base_starts]
 
     out = []
-    for i in starts:
-        chunk = rows[i:i + batch_size]
+    for chunk in chunks:
         Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
         if pad_to_multiple:
             Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
@@ -6286,6 +6306,71 @@ def _get_mlx_dropout_probability(drop):
         except (TypeError, ValueError):
             pass
     return 0.0
+
+
+def _iter_mlx_dropout_modules(model):
+    """Yield every dropout-type module in the model tree (TRL parity).
+
+    TRL's ``disable_dropout_in_model`` (trl/trainer/utils.py) walks
+    ``model.modules()`` and zeroes EVERY ``nn.Dropout``, not just adapter
+    dropout. The MLX equivalent walks ``model.named_modules()`` and matches
+    mlx.nn's Dropout family (Dropout/Dropout2d/Dropout3d, which store the
+    keep-probability in ``_p_1``). Detection is by ``isinstance`` against the
+    installed mlx.nn dropout classes when available, plus a structural fallback
+    (a numeric ``_p_1`` keep-prob marker or a ``*Dropout`` class name) so it also
+    fires under the torch-backed test shim and for any dropout-like leaf.
+    """
+    dropout_types = ()
+    try:
+        import mlx.nn as _mlx_nn
+        dropout_types = tuple(
+            cls for cls in (
+                getattr(_mlx_nn, name, None)
+                for name in ("Dropout", "Dropout2d", "Dropout3d")
+            )
+            if isinstance(cls, type)
+        )
+    except Exception:
+        dropout_types = ()
+    named = getattr(model, "named_modules", None)
+    if not callable(named):
+        return
+    for _, mod in named():
+        if mod is None:
+            continue
+        if (
+            (dropout_types and isinstance(mod, dropout_types))
+            or getattr(mod, "_p_1", None) is not None
+            or type(mod).__name__.endswith("Dropout")
+        ):
+            yield mod
+
+
+def _disable_mlx_base_dropout(model):
+    """Neutralize every dropout module in the model tree in place (TRL parity).
+
+    Mirrors TRL's ``disable_dropout_in_model``, which sets ``module.p = 0`` on
+    every ``nn.Dropout`` so the DPO/ORPO forwards are deterministic under
+    ``disable_dropout=True``. ``_mlx_disable_lora_dropout`` already replaces the
+    LoRA/DoRA adapter dropout; this walks the WHOLE tree so a base transformer
+    that carries residual/attention dropout is disabled too. mlx-lm's base
+    transformers currently ship no dropout, so for common models this is a safe
+    no-op superset. Setting ``mlx.nn.Dropout._p_1 = 1`` makes its forward an
+    identity passthrough (``Dropout.__call__`` returns ``x`` unchanged when
+    ``_p_1 == 1``); ``.p = 0`` covers torch-style dropout leaves. Returns the
+    count of modules that were actually ACTIVE (dropout probability > 0) so an
+    already-off model reports 0.
+    """
+    count = 0
+    for mod in _iter_mlx_dropout_modules(model):
+        was_active = _get_mlx_dropout_probability(mod) > 0.0
+        if getattr(mod, "_p_1", None) is not None:
+            mod._p_1 = 1.0
+        if getattr(mod, "p", None) is not None:
+            mod.p = 0
+        if was_active:
+            count += 1
+    return count
 
 
 def _coerce_mlx_lora_scale(scale, default=1.0):

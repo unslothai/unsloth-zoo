@@ -189,6 +189,7 @@ from .utils import (
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
+    _disable_mlx_base_dropout,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -516,12 +517,20 @@ def _mlx_disable_lora_dropout(model):
     (for referenced DPO the reference forward is already clean via scale=0, which
     zeros the delta regardless of the mask). ``lora_dropout=0`` is already a no-op,
     so default configs are unaffected. Only ORPO/DPO call this; SFT keeps dropout.
+
+    TRL's ``disable_dropout_in_model`` disables EVERY ``nn.Dropout`` in the model
+    tree, not only the adapters, so for exact parity also walk the whole module
+    tree and neutralize any base-model dropout in place. mlx-lm's base
+    transformers ship no dropout today, so that pass is a safe no-op superset for
+    common models, but it keeps ORPO/DPO deterministic even for an architecture
+    that does add residual/attention dropout.
     """
     count = 0
     for _, mod in iter_mlx_lora_modules(model):
         if getattr(mod, "dropout", None) is not None:
             mod.dropout = _mlx_identity
             count += 1
+    count += _disable_mlx_base_dropout(model)
     return count
 
 

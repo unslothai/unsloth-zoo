@@ -2432,6 +2432,53 @@ def test_preference_setup_disables_dropout_for_orpo_and_dpo():
     assert disable in src[dpo_branch:dpo_builder]
 
 
+def test_preference_disable_dropout_neutralizes_base_model_dropout():
+    # Regression (ALL-MODEL-DROPOUT): TRL's disable_dropout_in_model
+    # (trl/trainer/utils.py) zeroes EVERY nn.Dropout in the model tree, not just
+    # the adapters, so the DPO/ORPO log-prob forwards are deterministic under
+    # disable_dropout=True. _mlx_disable_lora_dropout neutralizes the LoRA adapter
+    # dropout AND must walk the whole module tree to neutralize any base-model
+    # dropout (e.g. residual/attention dropout) in place, matching TRL exactly.
+    # mlx-lm base transformers ship no dropout today, so for common models this is
+    # a safe no-op superset; the walk keeps it correct for one that does.
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout
+    from unsloth_zoo.mlx.utils import _get_mlx_dropout_probability
+
+    class _BaseDropout(nn.Module):
+        # Stand-in for mlx.nn.Dropout: keep-prob in _p_1, identity when _p_1 == 1.
+        def __init__(self, p):
+            super().__init__()
+            self._p_1 = 1.0 - p
+
+        def __call__(self, x):
+            return x
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.resid_dropout = _BaseDropout(0.3)  # NON-LoRA base-model dropout
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Attention(), Attention()]
+
+    model = Model()
+    # No LoRA modules here -- only base-model dropout, active at p=0.3.
+    before = [_get_mlx_dropout_probability(l.resid_dropout) for l in model.layers]
+    assert before == [pytest.approx(0.3), pytest.approx(0.3)]
+
+    count = _mlx_disable_lora_dropout(model)
+
+    # Every base dropout is neutralized in place (p=0 / keep-prob 1), and both
+    # previously-active dropouts are reported in the disabled count.
+    assert count == 2
+    for l in model.layers:
+        assert l.resid_dropout._p_1 == 1.0
+        assert _get_mlx_dropout_probability(l.resid_dropout) == 0.0
+
+
 class _StubLM:
     def __init__(self, vocab):
         self.vocab = vocab
@@ -2500,6 +2547,104 @@ def test_orpo_loss_returns_pair_count_not_token_count(monkeypatch):
     loss_fn = make_orpo_loss_fn(beta=0.1)
     _loss, count = loss_fn(_StubLM(8), batch, lengths)
     assert int(count) == 2  # pair count (B), not the response-token count
+
+
+def test_orpo_nll_covers_full_prompt_and_response(monkeypatch):
+    # Regression (ORPO-NLL parity): TRL 0.25.1 computes the ORPO chosen_nll_loss
+    # over the FULL prompt+response for decoder-only models. concatenated_forward
+    # builds its NLL labels from concatenated_input_ids masked ONLY by the
+    # attention_mask (padding), NOT by the prompt/response boundary
+    # (orpo_trainer.py:780-785, comment: "orpo chosen nll loss is computed over the
+    # full prompt and response"). Only the odds-ratio logps use the prompt-masked
+    # concatenated_labels via get_batch_logps. So the MLX SFT/NLL term must span
+    # prompt+response (all non-pad chosen tokens); masking it to the response span
+    # would DIVERGE from TRL. Pin the full-span behavior so it cannot regress to a
+    # response-only mask.
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.utils import make_orpo_loss_fn
+
+    # One pair, L=6. Chosen: prompt at orig positions 0,1,2 and response at 3,4,5;
+    # response_start=3, seq_end=6. targets = batch[:,1:], so the two PROMPT target
+    # positions (orig 1,2) carry a large per-token CE and the three response
+    # targets (orig 3,4,5) a small one, so the SFT mean differs sharply between a
+    # full-span mask and a response-only mask.
+    ce = torch.tensor(
+        [[10.0, 10.0, 1.0, 1.0, 1.0],
+         [10.0, 10.0, 1.0, 1.0, 1.0]]
+    )
+    monkeypatch.setattr(
+        nn.losses, "cross_entropy", lambda logits, targets, **kw: ce
+    )
+    batch = mx.array(
+        [[7, 7, 7, 8, 8, 8],   # chosen: prompt orig 0,1,2 ; response orig 3,4,5
+         [7, 7, 7, 9, 9, 9]],  # rejected
+        dtype=mx.int32,
+    )
+    lengths = mx.array([[3, 6], [3, 6]])
+
+    # beta=0 isolates the SFT/NLL term: loss == chosen_nll over the masked span.
+    loss_fn = make_orpo_loss_fn(beta=0.0)
+    loss, _ = loss_fn(_StubLM(16), batch, lengths)
+    full_span = (10.0 + 10.0 + 1.0 + 1.0 + 1.0) / 5.0   # prompt+response tokens
+    response_only = (1.0 + 1.0 + 1.0) / 3.0             # response tokens alone
+    assert float(loss) == pytest.approx(full_span)
+    # Guard the exact divergence a response-only "fix" would introduce.
+    assert float(loss) != pytest.approx(response_only)
+
+
+def test_preference_torch_randperm_reshuffles_across_passes():
+    # Regression (TORCH-RANDPERM-RESHUFFLE): dataset_order="torch_randperm" mirrors
+    # CUDA's RandomSampler, which reshuffles every epoch, and the text path
+    # create_ordered_batches reseeds its torch_randperm order per epoch
+    # (_torch_randperm_order(..., base_seed + epoch)). The preference path built a
+    # SINGLE seeded permutation; when num_batches spans more than one pass the
+    # trainer modulo-cycles the returned list (batches[batch_idx % len]) and
+    # replayed the SAME "random" order every epoch. It must instead redraw a fresh
+    # per-pass permutation up to num_batches -- like the default-order fix and the
+    # text path -- while keeping the first sub-epoch byte-identical.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [(sum(ord(c) for c in w) % 900) + 1 for w in text.split()]
+
+    dataset = [
+        {"prompt": "shared", "chosen": f"resp{i}", "rejected": f"rej{i}"}
+        for i in range(4)
+    ]
+
+    def _run(num_batches):
+        batches = create_preference_batches(
+            dataset=dataset,
+            tokenizer=_Tok(),
+            batch_size=1,
+            max_seq_length=64,
+            pad_to_multiple=1,
+            num_batches=num_batches,
+            dataset_order="torch_randperm",
+            seed=3407,
+        )
+        # batch_size=1 -> each batch is exactly one pair; its (chosen, rejected)
+        # token content is a stable signature identifying that pair.
+        return [tuple(map(tuple, b.tolist())) for b, _l, _ in batches]
+
+    # 4 pairs, batch_size=1 -> 4 batches per pass; 8 spans two passes.
+    multi = _run(8)
+    assert len(multi) == 8
+    pass0, pass1 = multi[:4], multi[4:]
+
+    # Same 4 pairs each pass (a genuine reshuffle, not a different subset) ...
+    assert set(pass0) == set(pass1)
+    assert len(set(pass0)) == 4
+    # ... but a DIFFERENT order across passes (seed 3407 vs 3408 permutations).
+    assert pass0 != pass1
+
+    # Byte-identity: the first pass equals the prior single-pass materialization.
+    single = _run(4)
+    assert single == pass0
 
 
 def test_dpo_reference_guard_rejects_dora_adapters():
