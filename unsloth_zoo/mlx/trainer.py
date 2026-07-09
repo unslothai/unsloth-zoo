@@ -432,22 +432,51 @@ def _mlx_identity(x):
     return x
 
 
+def _mlx_is_dropout_module(mod):
+    """Whether ``mod`` is an nn.Dropout-like module.
+
+    mlx.nn.Dropout stores its keep-probability in ``_p_1`` (== 1 - p); match on
+    that (real mlx) or on a ``*Dropout`` class name (shims / ported modules) so
+    both are covered. A LoRA dropout already replaced by ``_mlx_identity`` (a
+    plain function, not a module) matches neither, so it is not re-counted.
+    """
+    return hasattr(mod, "_p_1") or type(mod).__name__.endswith("Dropout")
+
+
 def _mlx_disable_lora_dropout(model):
-    """Disable adapter dropout for TRL DPO/ORPO parity.
+    """Disable dropout for TRL DPO/ORPO parity (disable_dropout_in_model).
 
     TRL's DPOConfig and ORPOConfig default disable_dropout=True and call
-    disable_dropout_in_model, so the preference log-prob forwards are
-    deterministic. The MLX preference loss runs inside the train()-mode compiled
-    step, where a per-step model.eval() is unreliable, so neutralize the LoRA/DoRA
-    dropout once at setup instead: mlx-lm's LoRALinear/DoRALinear call
-    self.dropout(x), so replacing it with identity makes the forward
-    deterministic. lora_dropout=0 is already a no-op, so default configs are
+    disable_dropout_in_model, which sets ``p = 0`` on EVERY ``nn.Dropout`` in the
+    model, so the preference log-prob forwards are deterministic. The MLX
+    preference loss runs inside the train()-mode compiled step, where a per-step
+    model.eval() is unreliable, so neutralize dropout once at setup instead:
+
+    1. LoRA/DoRA adapter dropout: mlx-lm's LoRALinear/DoRALinear call
+       ``self.dropout(x)``, so replacing that submodule with identity makes the
+       adapter forward deterministic.
+    2. Every other ``nn.Dropout`` in the module tree, matching TRL's
+       disable_dropout_in_model (not just adapters). mlx-lm base LMs currently
+       carry no standalone dropout, so this is a no-op superset there, but an
+       HF-ported / custom mlx model may, and under train() that dropout would
+       perturb the log-probs vs TRL. mlx.nn.Dropout's ``__call__`` returns its
+       input unchanged when ``_p_1 == 1.0`` (p == 0), so set it in place, mirroring
+       TRL's ``module.p = 0``.
+
+    lora_dropout=0 is already a no-op, so default (dropout-free) configs are
     unaffected. NOT applied to GRPO, whose TRL default disable_dropout is False.
     """
     count = 0
     for _, mod in iter_mlx_lora_modules(model):
         if getattr(mod, "dropout", None) is not None:
             mod.dropout = _mlx_identity
+            count += 1
+    for _, mod in model.named_modules():
+        if _mlx_is_dropout_module(mod):
+            if hasattr(mod, "_p_1"):
+                mod._p_1 = 1.0
+            if hasattr(mod, "p"):
+                mod.p = 0.0
             count += 1
     return count
 
@@ -728,7 +757,7 @@ class MLXGRPOConfig(MLXTrainingConfig):
     Use with MLXGRPOTrainer (pass reward_funcs to the trainer)."""
     loss_type: str = "grpo"
     num_generations: int = 4          # completions per prompt (the group)
-    grpo_beta: float = 0.04           # KL penalty weight (TRL default)
+    grpo_beta: float = 0.0            # KL penalty weight (TRL GRPOConfig.beta default 0.0: no reference/KL unless set)
     grpo_epsilon: float = 0.2         # PPO clip epsilon (low and high)
     temperature: float = 1.0          # rollout sampling temperature
     max_completion_length: int = 128  # max new tokens per completion
@@ -2177,7 +2206,7 @@ class MLXTrainer:
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
             elif getattr(args, "loss_type", "sft") == "grpo":
-                _gb = getattr(args, "grpo_beta", 0.04)
+                _gb = getattr(args, "grpo_beta", 0.0)
                 _ge = getattr(args, "grpo_epsilon", 0.2)
                 _grf = bool(getattr(args, "reference_free", False))
                 _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
@@ -4056,7 +4085,7 @@ class MLXGRPOTrainer(MLXTrainer):
         import mlx.core as mx
         import mlx.nn as nn
         args = self.args
-        if (getattr(args, "grpo_beta", 0.04) == 0.0
+        if (getattr(args, "grpo_beta", 0.0) == 0.0
                 or bool(getattr(args, "reference_free", False))):
             return None
         mods = [mod for _, mod in iter_mlx_lora_modules(self.model)]
@@ -4254,6 +4283,9 @@ class MLXGRPOTrainer(MLXTrainer):
             _order = [int(i) for i in _perm]
         _ddp_rank = self.distributed_rank
         _ddp_world = self.distributed_world_size
+        # Base seed for the per-rollout sampling RNG (below). Same source as the
+        # seeded prompt permutation above, so both derive from args.seed.
+        _base_seed = _normalize_seed(getattr(args, "seed", 42))
         # Resume: start the cursor already advanced past the rollouts the killed
         # run completed (skip_rollouts * world_size), landing on exactly the prompt
         # the generic consume-based fast-forward would have reached -- but without
@@ -4261,6 +4293,11 @@ class MLXGRPOTrainer(MLXTrainer):
         # _fast_forward_resume_batches). skip_rollouts == 0 (fresh run) is the
         # byte-for-byte prior behavior.
         idx = _ddp_rank + int(skip_rollouts) * _ddp_world
+        # Rank-local rollout counter, started past the skipped rollouts on resume so
+        # the per-rollout sampling seed (below) is a function of this index: rollout
+        # k samples identically whether reached fresh (index counts 0,1,2,...) or via
+        # resume (skip_rollouts lands the index on the same k).
+        _rollout_index = int(skip_rollouts)
         while True:
             j = _order[idx % len(prompts)]
             prompt = prompts[j]
@@ -4290,6 +4327,24 @@ class MLXGRPOTrainer(MLXTrainer):
             # policy than the one that generated the tokens. Generate in eval mode
             # and restore the prior training mode (mirrors _grpo_mean_kl /
             # _grpo_ref_kl). Dropout=0 models are unaffected (eval is a no-op there).
+            #
+            # Per-rollout deterministic sampling seed. GRPO rollout sampling draws
+            # from the process-global mx.random state; seeding it only ONCE up front
+            # (_maybe_seed_grpo_rng) makes a RESUMED run start from the initial RNG
+            # subsequence rather than the state an uninterrupted run would hold after
+            # this many rollouts, so the first resumed rollout would sample DIFFERENT
+            # completions/rewards/gradients despite the same seed. Derive the seed
+            # from the rank-local rollout index instead (folding in rank so DDP ranks
+            # draw distinct groups): rollout k samples identically whether reached
+            # fresh or via resume -> same seed -> same completions, making resume
+            # bit-reproducible while keeping fresh runs reproducible. numpy
+            # SeedSequence mixes the three inputs into a well-separated stream per
+            # rollout (no cross-rollout correlation). Seed just before generation;
+            # nothing between here and batch_generate draws from mx.random.
+            mx.random.seed(int(np.random.SeedSequence(
+                [int(_base_seed), int(_ddp_rank), int(_rollout_index)]
+            ).generate_state(1)[0]))
+            _rollout_index += 1
             was_training = self.model.training
             self.model.eval()
             try:

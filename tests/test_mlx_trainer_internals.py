@@ -4205,3 +4205,131 @@ def test_grpo_rollout_omits_trainer_state_for_strict_reward(monkeypatch):
     gen = trainer._grpo_rollout_generator()
     next(gen)
     assert ran == {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# PR #832 review round: GRPO KL default (TRL GRPOConfig.beta 0.0), resume-
+# reproducible per-rollout sampling seed, and TRL-parity full-tree dropout
+# disable for DPO/ORPO.
+# ---------------------------------------------------------------------------
+
+def test_grpo_config_default_beta_is_zero_no_kl_path():
+    # TRL GRPOConfig.beta defaults to 0.0 (reference model / KL loaded only when
+    # set > 0). The MLX default must match: a plain MLXGRPOConfig() must not enable
+    # the KL path, which would otherwise silently add an unrequested KL term for
+    # LoRA runs and trip the no-reference guard for non-LoRA full-finetune runs.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+    from unsloth_zoo.mlx.utils import make_grpo_loss_fn
+
+    assert MLXGRPOConfig().grpo_beta == 0.0
+    # The loss builder's default matches, so the reference/KL branch is off ...
+    assert inspect.signature(make_grpo_loss_fn).parameters["beta"].default == 0.0
+    # ... and building the default loss with no LoRA reference does NOT raise the
+    # no-reference guard (KL path is disabled at beta == 0).
+    make_grpo_loss_fn()  # default beta 0.0, no lora_mods -> no reference/KL
+    make_grpo_loss_fn(beta=0.0, lora_mods=None)
+    # But an OPT-IN non-zero beta with no LoRA reference DOES raise, confirming the
+    # guard fires only when KL is actually requested (so default runs never hit it).
+    with pytest.raises(ValueError, match="not yet supported for full"):
+        make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False)
+
+
+def test_grpo_rollout_sampling_is_resume_reproducible(monkeypatch):
+    # The round-8 fix seeds mx.random ONCE up front and, on resume, only advances
+    # the prompt cursor -- so a resumed run's first rollout samples from the initial
+    # RNG subsequence, not the state an uninterrupted run would hold after N
+    # rollouts, and its completions/rewards/gradients diverge despite the same seed.
+    # The rollout must instead derive a per-rollout seed from the rollout index, so
+    # rollout k samples IDENTICALLY whether reached fresh or via resume.
+    import mlx_lm
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    def _gen(*a, **k):
+        # Draw one token per completion from the (per-rollout-seeded) global RNG,
+        # so the returned completions reflect the sampling RNG state. mx.random.seed
+        # maps to torch.manual_seed under the shim, so torch's global RNG is the one
+        # the rollout seeds.
+        prompts = k.get("prompts")
+        n = len(prompts)
+        toks = [int(torch.randint(0, 10 ** 6, (1,)).item()) for _ in range(n)]
+        return types.SimpleNamespace(texts=[f"c{t}" for t in toks])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    captured = []
+
+    def _reward(completions=None, prompts=None, **kw):
+        captured.append(list(completions))
+        return [0.1, 0.2]
+
+    N = 6
+    dataset = [{"prompt": f"p{i}"} for i in range(N)]
+
+    def _mk():
+        t = _make_ddp_grpo_trainer(0, 1, dataset, [_reward], _Tok())
+        t.args.preserve_dataset_order = True  # sequential cursor: index k -> prompt k
+        t.args.seed = 42
+        return t
+
+    # Fresh run: step through rollouts 0..3, recording each rollout's completions.
+    captured.clear()
+    fresh = _mk()._grpo_rollout_generator()
+    for _ in range(4):
+        next(fresh)
+    fresh_seq = list(captured)
+    fresh_at_3 = fresh_seq[3]
+    # The per-rollout seed genuinely varies the sampling (else a constant mock would
+    # pass the resume check trivially): distinct rollout indices sample differently.
+    assert fresh_seq[0] != fresh_seq[3]
+
+    # Resumed run at index 3: the first (and only) rollout must REPRODUCE index 3
+    # bit-for-bit, even though the fresh run drew RNG for indices 0..2 in between.
+    captured.clear()
+    resumed = _mk()._grpo_rollout_generator(skip_rollouts=3)
+    next(resumed)
+    assert captured[0] == fresh_at_3
+
+
+def test_disable_dropout_neutralizes_base_model_dropout():
+    # TRL's disable_dropout_in_model sets p = 0 on EVERY nn.Dropout, not only the
+    # LoRA adapter dropout. The MLX disable must likewise walk the whole module tree
+    # and neutralize a standalone (non-LoRA) Dropout in place. mlx.nn.Dropout is a
+    # no-op when its keep-prob _p_1 == 1.0 (p == 0), so setting it there matches
+    # TRL's module.p = 0.
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout
+
+    class StubDropout(nn.Module):
+        def __init__(self, p=0.5):
+            super().__init__()
+            self._p_1 = 1.0 - p  # mlx.nn.Dropout keep-prob convention
+
+        def __call__(self, x):
+            if self._p_1 == 1.0:
+                return x
+            return x * 0.0  # active dropout stand-in: zeros its input
+
+    class Root(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.drop = StubDropout(0.5)
+
+    root = Root()
+    x = mx.ones((2, 4))
+    # Active before the disable: the stub Dropout zeros its input.
+    assert root.drop(x).tolist() == (x * 0.0).tolist()
+
+    n = _mlx_disable_lora_dropout(root)
+
+    # The one standalone (non-LoRA) Dropout was neutralized ...
+    assert n == 1
+    assert root.drop._p_1 == 1.0
+    # ... so its forward is now identity, matching disable_dropout_in_model.
+    assert root.drop(x).tolist() == x.tolist()

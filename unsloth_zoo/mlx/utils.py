@@ -957,7 +957,7 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
         return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
 
-def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
+def make_grpo_loss_fn(beta=0.0, lora_mods=None, reference_free=False,
                       epsilon_low=0.2, epsilon_high=0.2, temperature=1.0):
     """Create a GRPO loss function (TRL-parity, token-level).
 
