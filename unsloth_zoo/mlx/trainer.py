@@ -2455,15 +2455,28 @@ class MLXTrainer:
             )
 
         grad_accum = args.gradient_accumulation_steps
+        # Conceptual total micro-batches for an epoch-count-driven run, used to
+        # shrink the optimizer-step budget when a should_epoch_stop callback skips
+        # an epoch's tail (see _honor_epoch_stop_skip below). None for max_steps
+        # runs (fixed budget) and single-pass runs (no epoch cycling). On the
+        # default batching path `batches` holds ONE dataset pass cycled
+        # num_train_epochs times via batches[idx % len], so the conceptual total is
+        # len(batches) * num_train_epochs; on the torch_randperm path
+        # (_prepared_batches_include_epochs) `batches` already holds every epoch.
+        _epoch_stop_total_microbatches = None
         if args.max_steps > 0:
             total_steps = args.max_steps
         elif batches is not None:
             n_batches = len(batches)
             if getattr(self, "_prepared_batches_include_epochs", False):
                 total_steps = n_batches // grad_accum
+                _epoch_stop_total_microbatches = n_batches
             elif args.num_train_epochs > 0:
                 # Epoch-based: total micro-batches = epochs * batches_per_epoch
                 total_steps = (n_batches * args.num_train_epochs) // grad_accum
+                _epoch_stop_total_microbatches = (
+                    n_batches * int(args.num_train_epochs)
+                )
             else:
                 total_steps = n_batches // grad_accum
             total_steps = max(1, total_steps)
@@ -3621,6 +3634,47 @@ class MLXTrainer:
 
             return result
 
+        def _honor_epoch_stop_skip(it_val, current_step, grad_norm):
+            """End the current epoch early for a should_epoch_stop callback.
+
+            Fires the truncated epoch's on_epoch_end plus any synced log/eval/save,
+            fast-forwards the batch cursor to the next epoch boundary, and shrinks
+            the optimizer-step budget so the loop does not cycle
+            batches[batch_idx % len(batches)] into extra data passes. Caller has
+            confirmed _sync_epoch_stop() and a mid-epoch position
+            (it_val % batches_per_epoch != 0). Returns the new `it` at the boundary.
+            All arithmetic is rank-consistent (it_val, batches_per_epoch, batch_idx
+            and _epoch_stop_total_microbatches are identical on every rank) and the
+            on_epoch_end path reuses the lockstep collectives, so DDP stays in step.
+            """
+            nonlocal batch_idx, total_steps
+            self.state.epoch = float(math.ceil(it_val / batches_per_epoch))
+            _fire("on_epoch_end")
+            self._distributed_sync_control_actions()
+            if (self.control.should_log or self.control.should_evaluate
+                    or self.control.should_save):
+                _run_callback_control_actions(current_step, grad_norm)
+            next_boundary = (
+                (it_val // batches_per_epoch) + 1
+            ) * batches_per_epoch
+            batch_idx += next_boundary - it_val
+            # An epoch-count-driven run (num_train_epochs, not max_steps) must
+            # shrink the budget after a skip, else the loop keeps cycling into
+            # extra passes and overtrains past num_train_epochs. Recompute from the
+            # micro-batches that remain (conceptual total minus the advanced
+            # cursor). Using _epoch_stop_total_microbatches covers BOTH epoch
+            # layouts: the default path where `batches` is one cycled pass
+            # (total = len(batches) * num_train_epochs) and the torch_randperm path
+            # where it is every epoch (total = len(batches)); the earlier
+            # flag-gated len(batches) form silently skipped the default path.
+            # max_steps runs keep their fixed budget (_epoch_stop_total_microbatches
+            # is None).
+            if _epoch_stop_total_microbatches is not None:
+                total_steps = self._global_step + (
+                    (_epoch_stop_total_microbatches - batch_idx) // grad_accum
+                )
+            return next_boundary
+
         # DDP-lockstep microstep loop. global_step advances only on optimizer
         # updates; _distributed_should_stop() OR-reduces stop_requested at the
         # top so an early stop (external cancel or an HF stop callback that ran
@@ -3811,6 +3865,29 @@ class MLXTrainer:
                 # collectives on every rank (it/batches_per_epoch are rank-
                 # consistent), so DDP stays in lockstep.
                 _maybe_callback_epoch_end(it, self._global_step, grad_norm)
+                # Honor should_epoch_stop set from on_substep_end. HF checks
+                # should_epoch_stop after every inner-loop iteration -- including
+                # non-update substeps -- and breaks immediately, abandoning the
+                # partial accumulation window (transformers _inner_training_loop:
+                # the should_epoch_stop/should_training_stop break fires after
+                # on_substep_end, before any deferred optimizer step). Without this
+                # the loop would finish the current window and apply an extra
+                # optimizer update using the ended epoch's tail (and, when
+                # batches_per_epoch is not a multiple of grad_accum, wrapped
+                # next-epoch) batches. Discard the partial gradient and skip to the
+                # next boundary, matching HF. Only for materialized batches; gated
+                # on the all-reduced flag so every rank abandons the same window and
+                # skips the same micro-batches in lockstep. A natural boundary
+                # already fired on_epoch_end via _maybe_callback_epoch_end above, so
+                # only the truncated-epoch skip fires it (mid-epoch).
+                if (batches_per_epoch and batch_iter is None
+                        and _sync_epoch_stop()):
+                    grad_accum_state = None      # abandon the partial window
+                    accum_progress = 0
+                    if it % batches_per_epoch != 0:
+                        it = _honor_epoch_stop_skip(
+                            it, self._global_step, grad_norm)
+                    self.control.should_epoch_stop = False
                 # Apply any deferred callback stop (from on_substep_end or the
                 # epoch-end callbacks) now that the epoch-end eval has run. This
                 # tail _sync_stop() runs on every rank in the same order as the
@@ -3881,56 +3958,20 @@ class MLXTrainer:
             # (control.should_epoch_stop), mirroring HF's `if should_epoch_stop:
             # break` of the per-epoch step loop: end this epoch now and skip its
             # remaining micro-batches so the next iteration begins a fresh epoch.
-            # Applied only here, at a clean optimizer-step boundary (accum_progress
-            # was just reset to 0), so no partial gradient accumulation is
-            # abandoned, and only for materialized batches (batch_idx is an index
-            # we can advance) -- a streaming iterator cannot be index-skipped, so
-            # it keeps the flag until the next epoch begin resets it, without a
-            # data skip. The skip is rank-consistent arithmetic gated on the
-            # all-reduced flag (_sync_epoch_stop), and its on_epoch_end reuses the
-            # same lockstep collectives as _maybe_callback_epoch_end, so DDP stays
-            # in lockstep.
+            # Applied here at a clean optimizer-step boundary (accum_progress was
+            # just reset to 0), so no partial gradient accumulation is abandoned,
+            # and only for materialized batches (batch_idx is an index we can
+            # advance) -- a streaming iterator cannot be index-skipped, so it keeps
+            # the flag until the next epoch begin resets it, without a data skip.
+            # The skip is rank-consistent arithmetic gated on the all-reduced flag
+            # (_sync_epoch_stop), and its on_epoch_end reuses the same lockstep
+            # collectives, so DDP stays in lockstep. A natural boundary already
+            # fired on_epoch_end via _maybe_callback_epoch_end above, so only skip
+            # when mid-epoch.
             if (batches_per_epoch and batch_iter is None
                     and _sync_epoch_stop()):
                 if it % batches_per_epoch != 0:
-                    # Mid-epoch: fire the truncated epoch's on_epoch_end (a natural
-                    # boundary already fired it via _maybe_callback_epoch_end above)
-                    # and its synced log/eval/save, then skip to the next boundary.
-                    self.state.epoch = float(math.ceil(it / batches_per_epoch))
-                    _fire("on_epoch_end")
-                    self._distributed_sync_control_actions()
-                    if (self.control.should_log or self.control.should_evaluate
-                            or self.control.should_save):
-                        _run_callback_control_actions(current_step, grad_norm)
-                    next_boundary = (
-                        (it // batches_per_epoch) + 1
-                    ) * batches_per_epoch
-                    _skipped = next_boundary - it
-                    batch_idx += _skipped
-                    it = next_boundary
-                    # For an epoch-count-driven run (num_train_epochs, not
-                    # max_steps) a shortened epoch must also shrink the
-                    # optimizer-step budget, otherwise the loop keeps cycling
-                    # batches[batch_idx % len(batches)] into extra data passes to
-                    # reach the original step count -- i.e. it overtrains past
-                    # num_train_epochs and fires phantom epoch events instead of
-                    # ending the epoch early like HF. Recompute the budget from the
-                    # micro-batches that actually remain after the skip (batch_idx
-                    # has advanced past the skipped tail): completed optimizer steps
-                    # plus one step per full grad_accum window of the unconsumed
-                    # data. Deriving it from (len(batches) - batch_idx) makes the
-                    # loop stop exactly when the materialized data is exhausted, so
-                    # it never wraps into already-seen batches. The previous
-                    # `_skipped // grad_accum` under-counted a sub-grad_accum tail
-                    # (a skipped tail smaller than grad_accum reduced the budget by
-                    # 0, leaving the wrap and the overtraining in place). batch_idx
-                    # and len(batches) are identical on every rank, so total_steps
-                    # stays in lockstep. max_steps runs keep their fixed budget (HF
-                    # runs max_steps regardless of epoch stops).
-                    if getattr(self, "_prepared_batches_include_epochs", False):
-                        total_steps = self._global_step + (
-                            (len(batches) - batch_idx) // grad_accum
-                        )
+                    it = _honor_epoch_stop_skip(it, current_step, grad_norm)
                 self.control.should_epoch_stop = False
             # Advance the completed-micro-batch counter before the stop check so a
             # callback-stop break still leaves `microstep` pointing at the step

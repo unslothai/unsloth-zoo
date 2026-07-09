@@ -1435,19 +1435,21 @@ def test_should_epoch_stop_field_reset_and_honored():
     assert "def _sync_epoch_stop" in src
     assert "_distributed_any_flag(self.control.should_epoch_stop)" in src
     assert "_sync_epoch_stop()" in src
-    # The honor fast-forwards the batch cursor to the next epoch boundary, and
-    # only for materialized batches (a streaming iterator can't be index-skipped).
-    assert "batch_idx += _skipped" in src
+    # The honor fast-forwards the batch cursor to the next epoch boundary (shared
+    # skip helper), and only for materialized batches (a streaming iterator can't
+    # be index-skipped).
+    assert "def _honor_epoch_stop_skip" in src
+    assert "batch_idx += next_boundary - it_val" in src
     assert "batch_iter is None" in src
-    # On the epoch-count-driven path the shortened epoch also shrinks the
+    # On an epoch-count-driven path the shortened epoch also shrinks the
     # optimizer-step budget so the run does not overtrain past num_train_epochs.
     # The budget is recomputed from the micro-batches that remain after the skip
-    # (len(batches) - batch_idx), so even a sub-grad_accum skipped tail reduces it
-    # and the loop never wraps batches[idx % len] into already-seen data; the old
-    # `_skipped // grad_accum` under-counted such tails. max_steps runs keep their
-    # fixed budget.
-    assert "(len(batches) - batch_idx) // grad_accum" in src
-    assert '_prepared_batches_include_epochs' in src
+    # (conceptual total minus the advanced cursor). Using
+    # _epoch_stop_total_microbatches covers BOTH epoch layouts (the default cycled
+    # single-pass and the torch_randperm materialized-all-epochs path); the old
+    # flag-gated len(batches) form skipped the default path.
+    assert "(_epoch_stop_total_microbatches - batch_idx) // grad_accum" in src
+    assert '_epoch_stop_total_microbatches' in src
 
 
 def test_train_entry_clears_stale_stop_before_setup():
@@ -3013,13 +3015,19 @@ def test_epoch_stop_budget_recompute_no_data_reuse():
 
 def test_epoch_stop_budget_recompute_present_in_source():
     # Guard the exact recompute expression so the fix is not silently reverted to
-    # the floor-division form that under-counts sub-grad_accum tails.
+    # the floor-division form that under-counts sub-grad_accum tails, nor re-gated
+    # on _prepared_batches_include_epochs (which skipped the default path).
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     src = inspect.getsource(MLXTrainer._train_inner)
-    assert "(len(batches) - batch_idx) // grad_accum" in src
+    assert "(_epoch_stop_total_microbatches - batch_idx) // grad_accum" in src
     assert "total_steps - _skipped // grad_accum" not in src
+    # The recompute is driven by the conceptual total micro-batches, which is set
+    # for both epoch layouts (default cycled pass and torch_randperm), so it is not
+    # gated behind _prepared_batches_include_epochs. The default (flag=False) path
+    # multiplies the single materialized pass by num_train_epochs.
+    assert "n_batches * int(args.num_train_epochs)" in src
 
 
 def test_pending_metrics_flushed_on_early_callback_stop():
@@ -3080,3 +3088,73 @@ def test_on_epoch_end_fires_for_truncated_final_epoch():
         "microstep = it\n"
         "            # Propagate any stop set by the tail callbacks"
     ) in src
+
+
+def test_epoch_stop_budget_default_path_no_data_reuse():
+    # Regression for "Shrink epoch-stop budgets for default epoch runs". On the
+    # default batching path (_prepared_batches_include_epochs=False, the documented
+    # dataset_order="default") `batches` is ONE dataset pass cycled
+    # num_train_epochs times via batches[idx % len], and the round-14 recompute was
+    # gated behind that flag, so a should_epoch_stop callback advanced batch_idx but
+    # never shrank total_steps -- the loop wrapped batches[idx % len] into extra
+    # passes (phantom epochs, overtraining). The unified recompute uses the
+    # conceptual total micro-batches (len(batches)*num_train_epochs on this path)
+    # regardless of the flag. The simulation's n = bpe*num_epochs is that
+    # conceptual total.
+    def unified_rule(total_steps, global_step, skipped, grad_accum, n, batch_idx):
+        return global_step + (n - batch_idx) // grad_accum
+
+    def flag_gated_default_rule(total_steps, global_step, skipped, grad_accum,
+                                n, batch_idx):
+        # Old default-path behavior: recompute gated out (flag False) -> no change.
+        return total_steps
+
+    fixed = _simulate_epoch_stop_loop(7, 3, 4, unified_rule)
+    buggy = _simulate_epoch_stop_loop(7, 3, 4, flag_gated_default_rule)
+
+    assert fixed["wrapped"] is False
+    assert fixed["global_step"] == 3               # 3 epochs, one opt-step each
+    assert fixed["batch_idx"] <= fixed["n"]
+    # The un-shrunk default-path budget cycles past the real data (the G bug).
+    assert buggy["wrapped"] is True
+    assert buggy["global_step"] > fixed["global_step"]
+
+
+def test_substep_honors_epoch_stop_abandons_window():
+    # Regression for "Honor epoch-stop requests from substep callbacks". With
+    # grad_accum>1 a callback can set should_epoch_stop from on_substep_end on a
+    # non-update microstep. HF checks should_epoch_stop after every inner-loop
+    # iteration (substeps included) and breaks mid-accumulation-window, abandoning
+    # the partial gradient. The substep branch must therefore also check
+    # _sync_epoch_stop, discard the partial window (grad_accum_state = None) and
+    # skip to the next boundary via the shared helper -- not finish the window and
+    # apply an extra optimizer update on the ended epoch's (or wrapped next-epoch's)
+    # data.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    substep = src.index("if not do_update:")
+    branch = src[substep:src.index("continue", substep)]
+    assert "_sync_epoch_stop()" in branch
+    assert "grad_accum_state = None" in branch          # abandon the partial window
+    assert "_honor_epoch_stop_skip(" in branch
+    # The epoch-stop check comes after on_substep_end / _maybe_callback_epoch_end so
+    # a boundary substep still fires its natural on_epoch_end exactly once.
+    assert branch.index('_fire("on_substep_end")') < branch.index("_sync_epoch_stop()")
+    assert branch.index("_maybe_callback_epoch_end(") < branch.index("_sync_epoch_stop()")
+
+
+def test_substep_can_be_mid_epoch_with_grad_accum():
+    # Reachability for the substep epoch-stop fix: a non-update microstep mid-epoch
+    # exists. grad_accum=3, batches_per_epoch=6: microstep it=1 is a substep
+    # (accum 0->1, not an optimizer step) and 1 % 6 != 0 (mid-epoch), so a callback
+    # setting should_epoch_stop from on_substep_end lands on a mid-epoch substep the
+    # branch must honor.
+    grad_accum = 3
+    batches_per_epoch = 6
+    accum_progress = 0
+    it = 1
+    do_update = (accum_progress + 1 >= grad_accum)   # False -> substep
+    assert do_update is False
+    assert it % batches_per_epoch != 0               # mid-epoch
