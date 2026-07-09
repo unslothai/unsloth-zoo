@@ -3479,6 +3479,33 @@ class MLXTrainer:
                 raise ValueError(
                     f"{args.loss_type.upper()} is not yet supported for VLM models on MLX."
                 )
+            if self.distributed_world_size > 1:
+                # Multi-GPU (MLX DDP) DPO/ORPO is not sharded. The SFT/VLM data
+                # path builds a global micro-batch and hands each rank its own
+                # slice (items[rank::world_size] via _create_distributed_text_
+                # batches / _rank_slice_distributed_batch), so the gradients that
+                # _apply_update all-reduces cover the intended global batch.
+                # create_preference_batches has no comm_group/rank argument: every
+                # rank would build the SAME sorted preference batches (identical
+                # seed, data, sort) and _apply_update would all-reduce duplicate
+                # gradients, so multi-GPU training would silently mistrain on one
+                # rank's stream rather than the global shard (and, under a
+                # max_steps random-subset cap, on the same reduced subset on every
+                # rank). Correctly sharding the concatenated [chosen; rejected]
+                # builder (global-batch construction plus cross-rank tail padding
+                # so collectives stay aligned) cannot be validated on the single-
+                # process CI, so fail fast rather than mistrain. This is a no-op
+                # at world_size == 1 (the common single-GPU case).
+                raise NotImplementedError(
+                    "Unsloth MLX: distributed (multi-GPU) DPO/ORPO preference "
+                    "training is not yet implemented "
+                    f"(distributed_world_size={self.distributed_world_size}). The "
+                    "preference batches are not sharded across ranks, so every "
+                    "rank would train on identical data and all-reduce duplicate "
+                    "gradients instead of the intended global shard. Run DPO/ORPO "
+                    "on a single GPU (world_size=1), or pre-shard the dataset "
+                    "across ranks yourself before training."
+                )
             batches = create_preference_batches(
                 dataset=self.train_dataset,
                 tokenizer=self.tokenizer,
@@ -3958,12 +3985,24 @@ class MLXGRPOTrainer(MLXTrainer):
         # prompts, answer)) would crash on the unexpected token kwargs. The
         # original rows carry exactly the user's columns.
         examples = list(self._train_dataset_for_batches())
-        idx = 0
+        # Shard the prompt cycle across MLX DDP ranks. Without an offset every
+        # rank starts idx at 0 and steps by 1, so all ranks roll out the SAME
+        # prompt row for every microbatch and the gradients _apply_update all-
+        # reduces carry the prompt diversity of a single rank (duplicated rollout
+        # and reward work on the other ranks). Start each rank at its own rank
+        # index and stride by world_size so rank r rolls out prompts[r::world_
+        # size]; the all-reduced gradient then aggregates world_size distinct
+        # prompts' groups per global step, mirroring how the SFT path slices one
+        # global batch (items[rank::world_size]). No-op at world_size == 1 (rank
+        # 0, stride 1) -- the single-GPU path is byte-for-byte unchanged.
+        _ddp_rank = self.distributed_rank
+        _ddp_world = self.distributed_world_size
+        idx = _ddp_rank
         while True:
             j = idx % len(prompts)
             prompt = prompts[j]
             example = examples[j]
-            idx += 1
+            idx += _ddp_world
             # Render through the wrapper-level tokenizer (self.tokenizer) so a
             # wrapper-level custom chat template (mlx-lm TokenizerWrapper) or the
             # chat_template override normalized in _prepare_data is honored,
@@ -4044,9 +4083,45 @@ class MLXGRPOTrainer(MLXTrainer):
                 for k in example
                 if k not in ("prompt", "completion", "completion_ids")
             }
+            # TRL converts the generated completion TEXT back into assistant-
+            # message lists before calling custom reward functions when the prompt
+            # is conversational (grpo_trainer.py: for a conversational input,
+            # completions.append([{"role":"assistant","content": bootstrap +
+            # completion}])). A chat-style reward function that indexes message
+            # roles/content (e.g. completion[0]["content"]) would otherwise crash
+            # or score the wrong payload on the raw generated string. Mirror TRL:
+            # wrap each completion as a single assistant message when the row's
+            # prompt is a list of {"role","content"} message dicts; a plain-string
+            # prompt keeps the raw-string completions (back-compat / no-op). When
+            # the last prompt message is itself an assistant turn being continued
+            # (continue_final_message), TRL drops it from the prompt passed to the
+            # reward and prepends its content to each completion (the bootstrap
+            # prefix); replicate that without mutating the shared prompt row.
+            if (
+                isinstance(prompt, list) and prompt
+                and isinstance(prompt[0], dict)
+                and "role" in prompt[0] and "content" in prompt[0]
+            ):
+                if prompt[-1].get("role") == "assistant":
+                    _bootstrap = prompt[-1].get("content", "")
+                    _reward_prompt = prompt[:-1]
+                else:
+                    _bootstrap = ""
+                    _reward_prompt = prompt
+                _reward_completions = [
+                    [{"role": "assistant", "content": _bootstrap + c}]
+                    for c in comps
+                ]
+            else:
+                _reward_prompt = prompt
+                _reward_completions = comps
             total = [0.0] * N
             for rf in self.reward_funcs:
-                vals = rf(completions=comps, prompts=[prompt] * N, **reward_kwargs)
+                vals = rf(
+                    completions=_reward_completions,
+                    prompts=[_reward_prompt] * N,
+                    **reward_kwargs,
+                )
                 # TRL's reward-function contract is one score per completion:
                 # len(vals) must equal N. A shorter list would leave the unfilled
                 # positions at their initial 0.0 (silently fabricating rewards and

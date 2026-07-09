@@ -3311,3 +3311,216 @@ def test_grpo_loss_temperature_scales_logits():
     # ... and the logged-KL probe (MLXGRPOTrainer) scales logits by the same temp.
     ksrc = inspect.getsource(MLXGRPOTrainer._grpo_mean_kl)
     assert "logits = logits / _temp" in ksrc
+
+
+# ---------------------------------------------------------------------------
+# PR #832 review: MLX DDP sharding for GRPO/preference, and conversational GRPO
+# reward-completion wrapping (TRL parity).
+# ---------------------------------------------------------------------------
+
+def test_preference_prepare_data_fails_fast_under_distributed_ddp():
+    # Multi-GPU (MLX DDP) DPO/ORPO is NOT sharded: create_preference_batches has
+    # no comm_group/rank argument, so every rank builds the same sorted
+    # preference batches (identical seed/data/sort) and _apply_update all-reduces
+    # duplicate gradients -- silently mistraining on one rank's stream instead of
+    # the intended global shard (unlike the SFT path, which slices
+    # items[rank::world_size]). Correctly sharding the concatenated
+    # [chosen; rejected] builder cannot be validated on single-process CI, so the
+    # preference path must fail fast under world_size > 1 rather than mistrain.
+    import types
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXDPOConfig, MLXORPOConfig
+
+    class _Tok:
+        chat_template = "{{ messages }}"
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    for cfg_cls in (MLXDPOConfig, MLXORPOConfig):
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = cfg_cls()
+        trainer.model = types.SimpleNamespace(_config={}, _hf_repo=None)
+        trainer.tokenizer = _Tok()
+        trainer.train_dataset = [{"prompt": "p", "chosen": "c", "rejected": "r"}]
+        trainer._batches = None
+        # Simulate a 2-rank MLX DDP group (cached so no real init runs).
+        trainer._distributed_initialized = True
+        trainer._distributed_world = object()
+        trainer._distributed_world_size = 2
+        trainer._distributed_rank = 0
+        trainer._distributed_is_main_process = True
+        with pytest.raises(NotImplementedError, match="distributed"):
+            MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+
+def _make_ddp_grpo_trainer(rank, world, train_dataset, reward_funcs, tokenizer):
+    """MLXGRPOTrainer shell wired for a specific (rank, world) DDP group."""
+    import types
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    class _Model:
+        def __init__(self):
+            self.training = True
+
+        def eval(self):
+            self.training = False
+
+        def train(self, mode=True):
+            self.training = mode
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = _Model()
+    trainer.tokenizer = tokenizer
+    trainer.train_dataset = train_dataset
+    trainer.reward_funcs = list(reward_funcs)
+    trainer.args = types.SimpleNamespace(
+        num_generations=2, temperature=1.0,
+        max_completion_length=4, max_seq_length=32,
+    )
+    trainer._distributed_initialized = True
+    trainer._distributed_world = object()
+    trainer._distributed_rank = rank
+    trainer._distributed_world_size = world
+    trainer._distributed_is_main_process = rank == 0
+    return trainer
+
+
+def test_grpo_rollout_shards_prompt_cycle_across_ddp_ranks(monkeypatch):
+    # Under MLX DDP every rank must roll out a DISJOINT slice of prompts
+    # (prompts[rank::world_size]) so the all-reduced gradient aggregates
+    # world_size distinct prompts' groups per step, mirroring the SFT path's
+    # items[rank::world_size] slicing. Without the offset every rank starts idx
+    # at 0 and picks the SAME prompt for every microbatch (duplicated rollout /
+    # reward work, prompt diversity of one rank). Rank 1 of a 2-rank group starts
+    # at prompt 1 and strides by 2; world_size == 1 is the unchanged 0,1,2 cycle.
+    import types
+    import mlx_lm
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    monkeypatch.setattr(
+        mlx_lm, "batch_generate",
+        lambda *a, **k: types.SimpleNamespace(texts=["a", "b"]),
+        raising=False,
+    )
+
+    seen_prompts = []
+
+    def _reward(completions=None, prompts=None, **kw):
+        seen_prompts.append(prompts[0])
+        return [0.1, 0.2]
+
+    dataset = [{"prompt": f"p{i}", "answer": str(i)} for i in range(4)]
+
+    # Rank 1 of world 2: odd-indexed prompts 1, 3.
+    seen_prompts.clear()
+    gen = _make_ddp_grpo_trainer(1, 2, dataset, [_reward], _Tok())._grpo_rollout_generator()
+    next(gen)
+    next(gen)
+    assert seen_prompts == ["p1", "p3"]
+
+    # Rank 0 of world 2: even-indexed prompts 0, 2 -- disjoint from rank 1.
+    seen_prompts.clear()
+    gen = _make_ddp_grpo_trainer(0, 2, dataset, [_reward], _Tok())._grpo_rollout_generator()
+    next(gen)
+    next(gen)
+    assert seen_prompts == ["p0", "p2"]
+
+    # Single GPU (world 1): unchanged sequential cycle 0, 1, 2.
+    seen_prompts.clear()
+    gen = _make_ddp_grpo_trainer(0, 1, dataset, [_reward], _Tok())._grpo_rollout_generator()
+    next(gen)
+    next(gen)
+    next(gen)
+    assert seen_prompts == ["p0", "p1", "p2"]
+
+
+def test_grpo_rollout_wraps_conversational_completions_for_reward_funcs(monkeypatch):
+    # TRL converts the generated completion TEXT into assistant-message lists
+    # before calling reward functions when the prompt is conversational
+    # (grpo_trainer.py: completions.append([{"role":"assistant","content":
+    # bootstrap + completion}])), so a chat-style reward fn indexing message
+    # roles/content receives the expected shape. A raw generated string would
+    # crash such a reward fn. Plain-string prompts keep raw-string completions.
+    import types
+    import mlx_lm
+
+    class _Tok:
+        eos_token_id = 0
+        bos_token = None
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False,
+                                continue_final_message=False):
+            return "RENDER:" + messages[-1]["content"]
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    monkeypatch.setattr(
+        mlx_lm, "batch_generate",
+        lambda *a, **k: types.SimpleNamespace(texts=["hello", "world"]),
+        raising=False,
+    )
+
+    seen = {}
+
+    def _chat_reward(completions=None, prompts=None, **kw):
+        # Indexes message structure -- would crash on a raw string completion.
+        seen["completions"] = completions
+        seen["prompts"] = prompts
+        return [float(len(c[0]["content"])) for c in completions]
+
+    # Conversational prompt (last role user): completions wrapped as assistant
+    # messages with no bootstrap prefix; the reward prompt is the message list.
+    seen.clear()
+    trainer = _make_ddp_grpo_trainer(
+        0, 1, [{"prompt": [{"role": "user", "content": "hi"}], "answer": "x"}],
+        [_chat_reward], _Tok(),
+    )
+    next(trainer._grpo_rollout_generator())
+    assert seen["completions"] == [
+        [{"role": "assistant", "content": "hello"}],
+        [{"role": "assistant", "content": "world"}],
+    ]
+    assert seen["prompts"][0] == [{"role": "user", "content": "hi"}]
+
+    # Continued final assistant message: TRL drops it from the reward prompt and
+    # bootstraps each completion with its content.
+    seen.clear()
+    trainer = _make_ddp_grpo_trainer(
+        0, 1,
+        [{
+            "prompt": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "PRE"},
+            ],
+            "answer": "x",
+        }],
+        [_chat_reward], _Tok(),
+    )
+    next(trainer._grpo_rollout_generator())
+    assert seen["completions"] == [
+        [{"role": "assistant", "content": "PREhello"}],
+        [{"role": "assistant", "content": "PREworld"}],
+    ]
+    assert seen["prompts"][0] == [{"role": "user", "content": "hi"}]
+
+    # Plain-string prompt: raw-string completions (back-compat / no-op).
+    seen.clear()
+
+    def _string_reward(completions=None, prompts=None, **kw):
+        seen["completions"] = completions
+        return [float(len(c)) for c in completions]
+
+    trainer = _make_ddp_grpo_trainer(
+        0, 1, [{"prompt": "plain prompt", "answer": "x"}],
+        [_string_reward], _Tok(),
+    )
+    next(trainer._grpo_rollout_generator())
+    assert seen["completions"] == ["hello", "world"]
