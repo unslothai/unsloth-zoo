@@ -3529,7 +3529,7 @@ def _vlm_vision_part_state(messages):
                 continue
             if part.get("type") not in ("image", "image_url", "input_image", "video"):
                 continue
-            if any(key in part for key in ("image", "image_url", "video")):
+            if any(key in part for key in ("image", "image_url", "input_image", "video")):
                 has_media_payload = True
             else:
                 bare_placeholder_types.add(part.get("type"))
@@ -3550,7 +3550,7 @@ def _extract_vlm_images(
     images = []
     top_level_image = []
     bare_placeholder_types, has_media_payload = _vlm_vision_part_state(messages)
-    has_bare_image_placeholder = "image" in bare_placeholder_types
+    has_only_bare_image_placeholders = bare_placeholder_types == {"image"}
     if isinstance(item, dict):
         image = item.get("images")
         if image is not None:
@@ -3585,14 +3585,14 @@ def _extract_vlm_images(
             process_error = exc
             can_fallback = (
                 top_level_image
-                and has_bare_image_placeholder
+                and has_only_bare_image_placeholders
                 and not has_media_payload
                 and _vlm_bare_placeholder_error(exc)
             )
             if not can_fallback and not suppress_process_errors:
                 raise
 
-    if not images and top_level_image and has_bare_image_placeholder and not has_media_payload:
+    if not images and top_level_image and has_only_bare_image_placeholders and not has_media_payload:
         images = top_level_image
     if not images and process_error is not None and not suppress_process_errors:
         raise process_error
