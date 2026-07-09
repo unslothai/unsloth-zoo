@@ -1204,6 +1204,14 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
         if pad_to_multiple:
             Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+            # Cap the rounded padded length back to max_seq_length. Rows were
+            # already truncated to max_seq_length, but rounding up to
+            # pad_to_multiple overshoots it when max_seq_length is not a multiple
+            # (e.g. max_seq_length=50, pad_to_multiple=64 -> 64), which would make
+            # the ORPO/DPO forwards process sequences past the configured limit
+            # and defeat memory / context-limit experiments. The text batching
+            # path caps the same way.
+            Lmax = min(Lmax, max_seq_length)
         chosen_rows, rejected_rows, lengths = [], [], []
         for pe, c, r in chunk:
             chosen_rows.append(c + [pad_id] * (Lmax - len(c)))

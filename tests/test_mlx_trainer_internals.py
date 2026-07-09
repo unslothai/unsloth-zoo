@@ -2143,6 +2143,33 @@ def test_preference_long_prompt_preserves_response_span():
     assert c_start > 0
 
 
+def test_preference_padding_capped_at_max_seq_length():
+    # When max_seq_length is not a multiple of pad_to_multiple, rows are truncated
+    # to max_seq_length but rounding the batch pad length Lmax up to the multiple
+    # would overshoot the cap (e.g. a 50-token row rounds to 64), making ORPO/DPO
+    # forwards process sequences past the configured limit. Lmax must be capped
+    # back to max_seq_length, matching the text batching path.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _WordTokenizer:
+        bos_token = None
+        eos_token_id = 999
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(tok[0]) for tok in text.split()]
+
+    # 60-token prompt forces truncation to max_seq_length=50; with pad_to_multiple
+    # =64 the un-capped Lmax would round to 64.
+    prompt = " ".join(["w"] * 60) + " "
+    dataset = [{"prompt": prompt, "chosen": "yes", "rejected": "no"}]
+    batch, _lengths, _ = create_preference_batches(
+        dataset=dataset, tokenizer=_WordTokenizer(), batch_size=1,
+        max_seq_length=50, pad_to_multiple=64, dataset_order="sequential",
+    )[0]
+    # Padded sequence length (axis 1) is capped at 50, not rounded up to 64.
+    assert batch.shape[1] == 50
+
+
 def test_common_prefix_len_locates_prompt_boundary():
     # The prompt/completion boundary is the longest prefix shared by the
     # standalone prompt ids and both concatenated prompt+completion rows.
