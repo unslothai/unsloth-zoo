@@ -5904,23 +5904,11 @@ def _extract_mlx_lora_parameters(model):
             rank = int(a_shape[-1])
         scale = getattr(m, "scale", 1.0)
 
-        drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
-        if drop is None:
-            dropout = 0.0
-        else:
-            keep = getattr(drop, "_p_1", None)
-            if keep is not None:
-                try:
-                    dropout = float(1.0 - float(keep))
-                except (TypeError, ValueError):
-                    dropout = 0.0
-            else:
-                p = getattr(drop, "p", None)
-                try:
-                    dropout = float(p) if p is not None else 0.0
-                except (TypeError, ValueError):
-                    dropout = 0.0
+        # Prefer the pre-disable stash so a checkpoint saved after ORPO/DPO
+        # (which swaps the live adapter dropout for an identity) still records
+        # the configured lora_dropout instead of 0.0; falls back to the live
+        # dropout module (mlx.nn.Dropout keep-prob in _p_1, else .p) otherwise.
+        dropout = _read_mlx_lora_dropout(m)
         break
     return rank, scale, dropout
 
@@ -6262,6 +6250,27 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
+def _read_mlx_lora_dropout(module):
+    """Return a LoRA module's CONFIGURED dropout probability for adapter_config.
+
+    ORPO/DPO neutralize adapter dropout for deterministic preference forwards by
+    replacing ``module.dropout`` with an identity (``_mlx_disable_lora_dropout``),
+    which erases the probability the live module would otherwise report -- so a
+    naive ``_get_mlx_dropout_probability(module.dropout)`` at save time would
+    persist ``dropout=0.0`` and break reload parity with the trained LoRA config.
+    That disable stashes the original probability on
+    ``module._unsloth_orig_lora_dropout`` first, so prefer it here and fall back
+    to reading the live dropout module for SFT / never-disabled adapters.
+    """
+    stashed = getattr(module, "_unsloth_orig_lora_dropout", None)
+    if stashed is not None:
+        try:
+            return float(stashed)
+        except (TypeError, ValueError):
+            pass
+    return _get_mlx_dropout_probability(getattr(module, "dropout", None))
+
+
 def _coerce_mlx_lora_scale(scale, default=1.0):
     """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
 
@@ -6535,9 +6544,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
-                lora_dropout = _get_mlx_dropout_probability(
-                    getattr(module, "dropout", None)
-                )
+                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
+                # still records the configured lora_dropout rather than 0.0.
+                lora_dropout = _read_mlx_lora_dropout(module)
 
         # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:

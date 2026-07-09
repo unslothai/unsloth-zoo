@@ -4333,3 +4333,199 @@ def test_disable_dropout_neutralizes_base_model_dropout():
     assert root.drop._p_1 == 1.0
     # ... so its forward is now identity, matching disable_dropout_in_model.
     assert root.drop(x).tolist() == x.tolist()
+
+
+# ---------------------------------------------------------------------------
+# PR #832 round-10 review fixes.
+# ---------------------------------------------------------------------------
+
+
+def test_preference_disable_dropout_preserves_saved_lora_dropout_metadata():
+    # Regression (DROPOUT-METADATA, PORTED FROM #830 -- shared _mlx_disable_lora_
+    # dropout + adapter-save read-sites): _mlx_disable_lora_dropout replaces each
+    # adapter's dropout with _mlx_identity to make the ORPO/DPO forward
+    # deterministic. That runs at setup, BEFORE save_model, and permanently
+    # mutates the live module -- so the save path (_extract_mlx_lora_parameters /
+    # save_model / _enrich_mlx_adapter_config), which reads lora_dropout back off
+    # the live module, would record dropout=0.0 in adapter_config.json for a run
+    # trained with nonzero lora_dropout, and the reloaded adapter would no longer
+    # match the original LoRA config. The disable must stash the configured
+    # probability first so the forward stays deterministic AND the saved metadata
+    # stays correct.
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout, _mlx_identity
+    from unsloth_zoo.mlx.utils import (
+        _extract_mlx_lora_parameters,
+        _read_mlx_lora_dropout,
+        _get_mlx_dropout_probability,
+    )
+
+    class _Dropout(nn.Module):
+        # Stand-in for mlx.nn.Dropout: keep-prob in _p_1, identity when _p_1 == 1.
+        def __init__(self, p):
+            super().__init__()
+            self._p_1 = 1.0 - p
+
+        def __call__(self, x):
+            return x
+
+    class Adapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = mx.zeros((4, 8))
+            self.lora_b = mx.zeros((8, 4))
+            self.dropout = _Dropout(0.25)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = Adapter()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Block(), Block()]
+
+    model = Model()
+    # Baseline: the save path reads the configured lora_dropout off the live
+    # module (rank comes from lora_a's trailing axis: shape (4, 8) -> 8).
+    rank_before, _scale_before, dropout_before = _extract_mlx_lora_parameters(model)
+    assert rank_before == 8
+    assert dropout_before == pytest.approx(0.25)
+
+    _mlx_disable_lora_dropout(model)
+
+    # The forward is now a deterministic identity (dropout genuinely disabled)...
+    for blk in model.layers:
+        assert blk.q_proj.dropout is _mlx_identity
+        assert _get_mlx_dropout_probability(blk.q_proj.dropout) == 0.0
+        # ...but the stash preserves the configured probability for the save path.
+        assert blk.q_proj._unsloth_orig_lora_dropout == pytest.approx(0.25)
+        assert _read_mlx_lora_dropout(blk.q_proj) == pytest.approx(0.25)
+
+    # So the adapter_config still reports the ORIGINAL dropout after ORPO/DPO,
+    # not 0.0 -- reload parity with the trained LoRA config is preserved.
+    rank_after, _scale_after, dropout_after = _extract_mlx_lora_parameters(model)
+    assert rank_after == 8
+    assert dropout_after == pytest.approx(0.25)
+
+
+def test_preference_disable_dropout_all_save_read_sites_use_the_stash():
+    # The stash only fixes the regression if EVERY adapter-save read-site routes
+    # through _read_mlx_lora_dropout instead of reading dropout off the (now
+    # identity) live module. Guard the three save read-sites structurally so a
+    # future edit that reintroduces a raw _get_mlx_dropout_probability(module.
+    # dropout) at save time is caught.
+    import inspect
+    from unsloth_zoo.mlx import trainer as trainer_mod, utils as utils_mod
+
+    save_src = inspect.getsource(trainer_mod.MLXTrainer.save_model)
+    assert "_read_mlx_lora_dropout(m)" in save_src
+    assert "_get_mlx_dropout_probability" not in save_src
+
+    extract_src = inspect.getsource(utils_mod._extract_mlx_lora_parameters)
+    assert "_read_mlx_lora_dropout(m)" in extract_src
+
+    enrich_src = inspect.getsource(utils_mod._enrich_mlx_adapter_config)
+    assert "_read_mlx_lora_dropout(module)" in enrich_src
+
+    # The disable stashes before the identity swap.
+    disable_src = inspect.getsource(trainer_mod._mlx_disable_lora_dropout)
+    assert "_unsloth_orig_lora_dropout" in disable_src
+    stash_at = disable_src.index("_unsloth_orig_lora_dropout")
+    swap_at = disable_src.index("mod.dropout = _mlx_identity")
+    assert stash_at < swap_at
+
+
+def _make_grpo_trainer_for_prepare_data(prompts, args):
+    import types
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    class _Tok:
+        eos_token_id = 0
+        chat_template = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = types.SimpleNamespace(_config={}, _hf_repo=None)
+    trainer.tokenizer = _Tok()
+    trainer.train_dataset = [{"prompt": p} for p in prompts]
+    trainer._distributed_world_size = 1
+    trainer._distributed_initialized = True
+    trainer.args = args
+    return trainer
+
+
+def test_grpo_prepare_data_plans_epoch_steps_for_finite_dataset():
+    # Regression (EPOCH-GRPO): a finite GRPO run configured the standard HF/TRL
+    # way (max_steps<=0, num_train_epochs>0) must NOT be rejected as streaming.
+    # GRPO's _prepare_data returns batches=None (a rollout generator), so
+    # _train_inner cannot count materialized batches; it previously fell into the
+    # streaming branch and raised "num_train_epochs requires a finite dataset"
+    # even though train_dataset is finite. _prepare_data now plans the step total
+    # from the finite prompt set, mirroring the SFT/DPO epoch formula
+    # (batches_per_epoch * num_epochs // grad_accum).
+    import types
+
+    template = "{{ bos_token }}{% for m in messages %}{{ m['content'] }}{% endfor %}"
+
+    # 4 prompts, grad_accum=1, world=1, 2 epochs -> (4 * 2) // 1 = 8 steps.
+    args = types.SimpleNamespace(
+        chat_template=template,
+        max_steps=-1,
+        num_train_epochs=2,
+        gradient_accumulation_steps=1,
+        streaming=False,
+    )
+    trainer = _make_grpo_trainer_for_prepare_data(["a", "b", "c", "d"], args)
+    batches, batch_iter = trainer._prepare_data(is_vlm=False)
+    assert batches is None
+    assert batch_iter is not None
+    assert trainer._grpo_epoch_total_steps == 8
+
+    # grad_accum=2 halves the optimizer steps: (4 * 3) // 2 = 6.
+    args3 = types.SimpleNamespace(
+        chat_template=template,
+        max_steps=0,
+        num_train_epochs=3,
+        gradient_accumulation_steps=2,
+        streaming=False,
+    )
+    trainer3 = _make_grpo_trainer_for_prepare_data(["a", "b", "c", "d"], args3)
+    trainer3._prepare_data(is_vlm=False)
+    assert trainer3._grpo_epoch_total_steps == 6
+
+
+def test_grpo_prepare_data_leaves_epoch_plan_none_when_max_steps_set():
+    # max_steps>0 keeps the existing behavior (num_train_epochs ignored, matching
+    # HF), so no epoch plan is stashed and _train_inner uses max_steps directly.
+    import types
+
+    template = "{{ bos_token }}{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    args = types.SimpleNamespace(
+        chat_template=template,
+        max_steps=5,
+        num_train_epochs=3,
+        gradient_accumulation_steps=1,
+        streaming=False,
+    )
+    trainer = _make_grpo_trainer_for_prepare_data(["a", "b", "c", "d"], args)
+    trainer._prepare_data(is_vlm=False)
+    assert trainer._grpo_epoch_total_steps is None
+
+
+def test_train_inner_uses_grpo_epoch_plan_before_streaming_raise():
+    # Structural guard: _train_inner must consult the stashed GRPO epoch plan in
+    # its total_steps selection BEFORE the streaming "num_train_epochs requires a
+    # finite dataset" raise, so the finite epoch-based GRPO path no longer errors.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert "_grpo_epoch_total_steps" in src
+    plan_at = src.index("_grpo_epoch_total_steps")
+    raise_at = src.index("num_train_epochs requires a finite dataset")
+    assert plan_at < raise_at

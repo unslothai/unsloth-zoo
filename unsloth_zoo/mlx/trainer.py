@@ -192,6 +192,8 @@ from .utils import (
     collect_mlx_lora_adapter_tensors,
     model_has_non_lora_trainable_params,
     iter_mlx_lora_modules,
+    _get_mlx_dropout_probability,
+    _read_mlx_lora_dropout,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -469,6 +471,20 @@ def _mlx_disable_lora_dropout(model):
     count = 0
     for _, mod in iter_mlx_lora_modules(model):
         if getattr(mod, "dropout", None) is not None:
+            # Stash the configured dropout probability BEFORE swapping in the
+            # identity. Replacing mod.dropout with _mlx_identity makes the
+            # forward deterministic but ERASES the probability the save path
+            # (_extract_mlx_lora_parameters / save_model / _enrich_mlx_adapter_
+            # config) reads back off the live module -- so a checkpoint saved
+            # after ORPO/DPO would record dropout=0.0 in adapter_config.json and
+            # no longer match the trained LoRA config on reload. _read_mlx_lora_
+            # dropout prefers this stash. Guard with hasattr so a repeated
+            # disable (reused trainer) keeps the ORIGINAL value instead of
+            # re-reading 0.0 off the already-neutralized module.
+            if not hasattr(mod, "_unsloth_orig_lora_dropout"):
+                mod._unsloth_orig_lora_dropout = _get_mlx_dropout_probability(
+                    mod.dropout
+                )
             mod.dropout = _mlx_identity
             count += 1
     for _, mod in model.named_modules():
@@ -2276,6 +2292,15 @@ class MLXTrainer:
             else:
                 total_steps = n_batches // grad_accum
             total_steps = max(1, total_steps)
+        elif getattr(self, "_grpo_epoch_total_steps", None) is not None:
+            # GRPO drives the loop from a rollout generator, so _prepare_data
+            # returns batches=None even though its train_dataset is finite. An
+            # epoch-based GRPO run (max_steps<=0, num_train_epochs>0) therefore
+            # cannot count batches here; its planned step total was computed in
+            # MLXGRPOTrainer._prepare_data from the finite prompt set and stashed.
+            # Use it so num_train_epochs works for GRPO like it does for SFT/DPO,
+            # instead of misreporting the finite dataset as streaming below.
+            total_steps = max(1, int(self._grpo_epoch_total_steps))
         else:
             # Streaming mode — must have max_steps
             if args.num_train_epochs > 0:
@@ -3770,7 +3795,7 @@ class MLXTrainer:
         """Save LoRA adapters or full merged model (if no LoRA)."""
         from .utils import (
             _coerce_mlx_lora_scale,
-            _get_mlx_dropout_probability,
+            _read_mlx_lora_dropout,
             _infer_mlx_lora_rank,
             save_merged_model,
         )
@@ -3797,9 +3822,10 @@ class MLXTrainer:
                 # _coerce handles LoRASwitchLinear's per-expert mx.array where
                 # raw float()/.item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
-                _lora_dropout = _get_mlx_dropout_probability(
-                    getattr(m, "dropout", None)
-                )
+                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
+                # (which swapped the live dropout for an identity) still records
+                # the configured lora_dropout, not 0.0.
+                _lora_dropout = _read_mlx_lora_dropout(m)
                 break
 
             from .utils import _get_transformer_layers
@@ -4651,6 +4677,35 @@ class MLXGRPOTrainer(MLXTrainer):
             is_vlm=False,
             strict=False,
         )
+        # Epoch-based finite GRPO (TRL/HF's standard num_train_epochs path). The
+        # rollout generator returned below is an infinite cycle over the finite
+        # prompt set (idx % len(prompts)), so batches is None and _train_inner --
+        # which counts materialized batches -- cannot derive the step total and
+        # would otherwise fall into its streaming branch and wrongly raise
+        # "num_train_epochs requires a finite dataset" for this finite dataset.
+        # Compute the planned optimizer steps here instead, mirroring the SFT/DPO
+        # epoch formula (total_steps = batches_per_epoch * num_epochs // grad_accum,
+        # _train_inner:2289). One GRPO microbatch rolls out one prompt PER RANK
+        # (rank r visits prompts[r::world_size], the rollout generator's stride),
+        # so a rank's batches_per_epoch is ceil(len(prompts)/world_size). max_steps
+        # > 0 keeps the existing behavior (num_train_epochs ignored, matching HF),
+        # so only the epoch path stashes a value; otherwise leave it None.
+        self._grpo_epoch_total_steps = None
+        if (getattr(args, "max_steps", 0) <= 0
+                and getattr(args, "num_train_epochs", 0) > 0):
+            n_prompts = len(self._grpo_prompts())
+            if n_prompts == 0:
+                raise ValueError(
+                    "No GRPO prompts found. Check your dataset and the "
+                    "'prompt' column."
+                )
+            grad_accum = max(1, int(args.gradient_accumulation_steps))
+            world = max(1, int(getattr(self, "distributed_world_size", 1) or 1))
+            batches_per_epoch = math.ceil(n_prompts / world)
+            total_steps = int(
+                (batches_per_epoch * args.num_train_epochs) // grad_accum
+            )
+            self._grpo_epoch_total_steps = max(1, total_steps)
         # GRPO drives the loop with a rollout generator, not static batches.
         return None, self._grpo_rollout_generator()
 
