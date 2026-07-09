@@ -1353,9 +1353,48 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             # Detach so we don't keep the graph (and extra memory) on CPU.
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
+            detached_hidden_states = hidden_states.detach().contiguous()
             ctx.device = hidden_states.device
-            ctx.dtype = hidden_states.dtype
+            ctx.copy_event = None
+
+            saved_hidden_states = None
+            if detached_hidden_states.is_cuda:
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(detached_hidden_states.device)
+                    tensor_bytes = detached_hidden_states.numel() * detached_hidden_states.element_size()
+                except Exception:
+                    free_bytes, tensor_bytes = 0, 1
+                if tensor_bytes * 4 <= free_bytes:
+                    # Plenty of GPU headroom: skip the CPU round-trip (2 PCIe copies).
+                    # The storage already lives on the GPU, so keeping this alias adds
+                    # no allocation; we still checkpoint the big logits via recompute.
+                    saved_hidden_states = detached_hidden_states
+                else:
+                    # Offload through a pinned host buffer on a side stream so the D2H
+                    # copy is truly asynchronous (it overlaps the no_grad forward below)
+                    # and the H2D reload in backward is fast. The event sync in backward
+                    # is required: without it the pinned non_blocking copy is a
+                    # use-before-copy race.
+                    try:
+                        pinned_buffer = torch.empty_like(detached_hidden_states, device = "cpu", pin_memory = True)
+                    except (RuntimeError, OSError):
+                        pinned_buffer = None
+                    if pinned_buffer is not None:
+                        current_stream = torch.cuda.current_stream(detached_hidden_states.device)
+                        copy_stream = torch.cuda.Stream(device = detached_hidden_states.device)
+                        copy_stream.wait_stream(current_stream)
+                        with torch.cuda.stream(copy_stream):
+                            pinned_buffer.copy_(detached_hidden_states, non_blocking = True)
+                        # Keep the GPU storage alive until the side-stream copy finishes.
+                        detached_hidden_states.record_stream(copy_stream)
+                        copy_event = torch.cuda.Event()
+                        copy_event.record(copy_stream)
+                        saved_hidden_states = pinned_buffer
+                        ctx.copy_event = copy_event
+            if saved_hidden_states is None:
+                # CPU tensor, no CUDA, or pinned allocation failed: original pageable path.
+                saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)
+            ctx.saved_hidden_states = saved_hidden_states
 
             ctx.lm_head = lm_head
             ctx.lm_head_requires_grad = lm_head.requires_grad
@@ -1371,17 +1410,19 @@ def grpo_accumulated_loss(
 
         @staticmethod
         def backward(ctx, grad_output):
-            hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
-            hidden_states = hidden_states.to(ctx.dtype)
+            saved_hidden_states = ctx.saved_hidden_states
+            if saved_hidden_states.is_cuda:
+                # Kept on GPU: no reload needed.
+                hidden_states = saved_hidden_states
+            else:
+                if ctx.copy_event is not None:
+                    # Order the H2D reload after the async D2H offload completes.
+                    ctx.copy_event.wait(torch.cuda.current_stream(ctx.device))
+                # Saved tensor keeps the forward dtype, so no cast is needed here.
+                hidden_states = to_device(saved_hidden_states, ctx.device)
             hidden_states.requires_grad_(True)
 
             lm_head = ctx.lm_head
-            # #Possibly redundant lines
-            # if ctx.lm_head_requires_grad:
-            #     hidden_states.requires_grad_(True)
-            # else:
-            #     lm_head = lm_head.detach()
-
             index = ctx.index
 
             with torch.enable_grad():

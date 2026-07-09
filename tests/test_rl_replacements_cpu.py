@@ -291,3 +291,84 @@ def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting)
     # The buggy pattern (autograd.backward + return leaf .grad) diverges -- guards the test.
     buggy = _recompute_fn(use_backward=True)
     assert not torch.allclose(_weight_grad(buggy.apply, shared, preexisting), ref, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Unsloth_Offloaded_Log_Softmax offload paths (pinned / keep-on-GPU / CPU)
+# ---------------------------------------------------------------------------
+#
+# Forward offloads hidden_states to a pinned host buffer on a side stream (async
+# D2H) when the GPU is tight, keeps the alias on GPU when there is headroom, and
+# falls back to a plain pageable copy on CPU / no CUDA / pinned-alloc failure.
+# The event sync in backward is load-bearing: a pinned non_blocking copy without
+# it is a use-before-copy race. These tests pin the CPU fallback numerics and
+# the CUDA-path source invariants (all CUDA calls guarded by is_cuda).
+
+
+def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
+                                 logit_scale_multiply, logit_scale_divide,
+                                 logit_softcapping, temperature):
+    # Eager mirror of chunked_hidden_states_selective_log_softmax (no compile).
+    logits = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.dtype) @ lm_head.t()
+    if logit_scale_multiply != 0.0:
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide != 0.0:
+        logits = logits / logit_scale_divide
+    if logit_softcapping != 0.0:
+        logits = logit_softcapping * torch.tanh(logits / logit_softcapping)
+    logits = logits.to(torch.float32)
+    if temperature != 1.0:
+        logits = logits / temperature
+    flat_index = index.reshape(-1)
+    selected = torch.gather(logits, dim=-1, index=flat_index.unsqueeze(-1)).squeeze(-1)
+    out = selected - torch.logsumexp(logits, dim=-1)
+    return out.reshape(index.shape)
+
+
+def _extract_offloaded_log_softmax(inner_fn):
+    # Exec the nested to_device + Unsloth_Offloaded_Log_Softmax block from the
+    # real source against `inner_fn`, exactly like the generated trainer inlines it.
+    import textwrap
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    block = textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
+    ns = {"torch": torch, "chunked_hidden_states_selective_log_softmax": inner_fn}
+    exec(block, ns)
+    return ns["Unsloth_Offloaded_Log_Softmax"]
+
+
+@pytest.mark.parametrize("lm_requires_grad", [False, True])
+def test_offloaded_log_softmax_cpu_path_grads_bitwise_exact(lm_requires_grad):
+    Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
+    args = (4, 1.5, 2.0, 20.0, 0.8)
+
+    def run(op):
+        torch.manual_seed(0)
+        hs = (torch.randn(3, 32, 16) * 0.02).requires_grad_(True)
+        lm = (torch.randn(64, 16) * 0.02).requires_grad_(lm_requires_grad)
+        idx = torch.randint(0, 64, (3, 32))
+        go = torch.randn(3, 32)
+        out = op(hs, lm, idx, *args)
+        out.backward(go)
+        return out.detach(), hs.grad, (lm.grad if lm_requires_grad else None)
+
+    out_ref, hs_ref, lm_ref = run(_eager_selective_log_softmax)
+    out_fn, hs_fn, lm_fn = run(Fn.apply)
+    assert torch.equal(out_fn, out_ref)
+    assert torch.equal(hs_fn, hs_ref)
+    if lm_requires_grad:
+        assert torch.equal(lm_fn, lm_ref)
+
+
+def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    fwd = src[src.index("class Unsloth_Offloaded_Log_Softmax"):src.index("def efficient_log_softmax")]
+    # The pinned non_blocking D2H must record an event on the copy stream, keep
+    # the source storage alive across streams, and backward must wait on it.
+    assert "pin_memory = True" in fwd
+    assert "copy_event.record(copy_stream)" in fwd
+    assert "record_stream(copy_stream)" in fwd
+    assert "ctx.copy_event.wait(" in fwd
+    # All CUDA-only machinery stays behind an is_cuda check so CPU / no-CUDA
+    # (Windows, Mac) still take the plain pageable path.
+    assert "is_cuda" in fwd
+    assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
