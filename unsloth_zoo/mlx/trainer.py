@@ -5093,8 +5093,12 @@ def train_on_responses_only(
     # chosen/rejected examples (garbage gradient), and at
     # per_device_train_batch_size=1 the chosen half is empty -> NaN. Mirror the
     # DPO+VLM / DPO+non-LoRA fail-fast guards rather than train silently on
-    # corrupted pairs. (return_function=True has no trainer/_batches to corrupt.)
-    if trainer is not None and getattr(trainer.args, "loss_type", "sft") == "grpo":
+    # corrupted pairs. return_function=True only builds and returns the masking
+    # closure (it never touches trainer._batches or the dataset) and is a
+    # supported way to reuse the trainer's tokenizer/template autodetection, so
+    # the guards below skip it and only block the mutating trainer path.
+    if (trainer is not None and not return_function
+            and getattr(trainer.args, "loss_type", "sft") == "grpo"):
         # GRPO drives training from on-the-fly rollouts that need the ORIGINAL
         # prompt rows (and each row's reward kwargs). train_on_responses_only builds
         # response-only SFT batches and replaces trainer.train_dataset /
@@ -5112,9 +5116,8 @@ def train_on_responses_only(
             "train_on_responses_only() call for GRPO -- reward functions already "
             "score only the generated completion."
         )
-    if trainer is not None and getattr(trainer.args, "loss_type", "sft") in (
-        "dpo", "orpo",
-    ):
+    if (trainer is not None and not return_function
+            and getattr(trainer.args, "loss_type", "sft") in ("dpo", "orpo")):
         raise ValueError(
             "Unsloth: train_on_responses_only() masks SFT completion tokens and is "
             "incompatible with preference losses. DPO/ORPO build their own "

@@ -4016,6 +4016,39 @@ def test_train_on_responses_only_rejects_grpo_loss_type():
         train_on_responses_only(trainer)
 
 
+def test_train_on_responses_only_return_function_allowed_for_grpo(monkeypatch):
+    # return_function=True only builds and returns the masking closure; it never
+    # touches trainer._batches or the dataset, and reusing the trainer's
+    # tokenizer/template autodetection is a supported call. The grpo/dpo/orpo
+    # guards must therefore skip the closure-return path and only block the
+    # mutating trainer path (which stays rejected by the test above).
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    class CallableTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+    def fake_hf(trainer, *, instruction_part=None, response_part=None,
+                force_match=True, tokenizer=None, return_function=False,
+                num_proc=None, last_response_only=False):
+        return lambda batch: batch
+
+    monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    for loss_type in ("grpo", "dpo", "orpo"):
+        trainer = types.SimpleNamespace(
+            args=types.SimpleNamespace(loss_type=loss_type),
+            tokenizer=CallableTokenizer(),
+        )
+        fn = train_on_responses_only(
+            trainer,
+            instruction_part="<user>",
+            response_part="<assistant>",
+            return_function=True,
+        )
+        assert callable(fn)
+
+
 # ---------------------------------------------------------------------------
 # PR #832 review: GRPO resume must not replay rollouts, the MLX RNG must be
 # seeded from args.seed for reproducible sampling, temperature <= 0 must fail
