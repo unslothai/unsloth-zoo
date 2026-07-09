@@ -19,11 +19,10 @@ Covers:
   - `left_pack_padding` (stable sort that moves pad tokens to the right)
   - `align_logprobs_with_mask` (insert per-batch left padding into logprobs)
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
-  - `_warn_unsupported_grpo_options` (warn-once for TRL GRPO options the
-    optimized path does not implement: top_entropy_quantile, use_bias_correction_kl)
-  - `UnslothEfficientGRPO` at n_chunks=1 (the value production always passes)
-    stays numerically identical to a naive grpo_compute_loss autograd pass, and
-    the uniform div_(n_chunks) is only correct at n_chunks=1 for sum-normalized loss
+  - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
+    top_entropy_quantile, use_bias_correction_kl)
+  - `UnslothEfficientGRPO` at n_chunks=1 matches a naive grpo_compute_loss pass,
+    and uniform div_(n_chunks) is only correct at n_chunks=1
   - `RL_REPLACEMENTS` dict integrity (every value is callable; the
     well-known public-API keys are populated).
 """
@@ -221,14 +220,9 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
 # ---------------------------------------------------------------------------
 # _warn_unsupported_grpo_options  (Issue 1: silently-ignored GRPO config options)
 # ---------------------------------------------------------------------------
-#
-# UnslothGRPOConfig forwards every TRL GRPOConfig field via **kwargs, but the
-# optimized GRPO path does not implement `top_entropy_quantile < 1.0` (entropy
-# masking) or `use_bias_correction_kl = True` (KL x importance-sampling ratio).
-# The helper warns once per trainer when either is set to a non-default value so
-# the user is not silently ignored. TRL GRPOConfig defaults (verified against
-# trl.trainer.grpo_config, TRL 1.7.1) are top_entropy_quantile=1.0 and
-# use_bias_correction_kl=False, so defaults must NOT warn.
+# The fast GRPO path ignores top_entropy_quantile < 1.0 and use_bias_correction_kl
+# = True; the helper warns once per trainer on non-defaults only (TRL 1.7.1 defaults
+# are 1.0 and False, so defaults must NOT warn).
 
 
 def _make_grpo_trainer(**args):
@@ -240,12 +234,12 @@ def test_warn_unsupported_grpo_options_silent_on_defaults(caplog):
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
     assert caplog.records == []
-    # The guard flag is set even on defaults so the check runs at most once.
+    # Flag set even on defaults so the check runs at most once.
     assert trainer._unsloth_grpo_unsupported_warned is True
 
 
 def test_warn_unsupported_grpo_options_silent_when_attrs_missing(caplog):
-    # Older TRL that does not expose these options -> defaults assumed -> no warning.
+    # Missing attrs -> defaults assumed -> no warning.
     trainer = _make_grpo_trainer()
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
@@ -289,7 +283,7 @@ def test_warn_unsupported_grpo_options_fires_once(caplog):
         rr._warn_unsupported_grpo_options(trainer)
         rr._warn_unsupported_grpo_options(trainer)
     msgs = [r.getMessage() for r in caplog.records]
-    assert len(msgs) == 1  # guarded: at most once per trainer
+    assert len(msgs) == 1
 
 
 def test_warn_unsupported_grpo_options_registered():
@@ -299,15 +293,10 @@ def test_warn_unsupported_grpo_options_registered():
 # ---------------------------------------------------------------------------
 # UnslothEfficientGRPO batch chunking  (Issue 2: dead + incorrect n_chunks)
 # ---------------------------------------------------------------------------
-#
-# Production (grpo_accumulated_loss) always calls UnslothEfficientGRPO with
-# n_chunks=1. These tests pin two facts behind the Issue-2 change:
-#   (1) the n_chunks=1 path is numerically identical (loss AND gradient) to a
-#       direct autograd pass through grpo_compute_loss, so removing the dead
-#       n_chunks snapping is a pure no-op for the shipped code path, and
-#   (2) the uniform div_(n_chunks) is WRONG for n_chunks>1 on the globally
-#       sum-normalized loss types (dapo/cispo/vespo) -- which is exactly why
-#       re-enabling batch chunking was rejected in favor of fixing n_chunks at 1.
+# Production always calls with n_chunks=1. These tests pin (1) n_chunks=1 is
+# numerically identical (loss and gradient) to a naive grpo_compute_loss pass, so
+# removing the dead snapping is a no-op, and (2) uniform div_(n_chunks) is wrong for
+# n_chunks>1 on sum-normalized dapo/cispo/vespo, hence fixing n_chunks at 1.
 
 
 @pytest.fixture

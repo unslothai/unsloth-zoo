@@ -716,13 +716,10 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             )
         pass
 
-        # WARNING: this uniform /n_chunks is only correct for n_chunks == 1 (the value
-        # grpo_accumulated_loss always passes). Do NOT re-enable batch chunking
-        # (n_chunks > 1) without first making this per-loss-type correct: the row-mean
-        # types (grpo/sapo/dr_grpo/luspo) need exactly equal chunks, the globally
-        # sum-normalized types (dapo/cispo/vespo) must NOT be divided again (each chunk
-        # already divides by the global normalizer), token-normalized bnpo needs the
-        # global mask.sum() as its normalizer, and non-divisor counts mis-weight everything.
+        # WARNING: this uniform /n_chunks is only correct at n_chunks == 1 (the value
+        # grpo_accumulated_loss always passes). Do NOT re-enable batch chunking without
+        # making it per-loss-type: sum-normalized dapo/cispo/vespo must not be divided
+        # again, bnpo needs the global mask.sum(), and non-divisor counts mis-weight all.
         grad_inputs                  .div_(n_chunks)
         accumulated_loss             .div_(n_chunks)
         accumulated_completion_length.div_(n_chunks)
@@ -757,27 +754,17 @@ RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options the optimized GRPO path
-    does not implement, so that setting them is not silently ignored.
-
-    UnslothGRPOConfig forwards every TRL GRPOConfig field through **kwargs, but the
-    fast path here (grpo_accumulated_loss / grpo_compute_loss) does not implement:
-      - top_entropy_quantile < 1.0  (entropy masking from "Beyond the 80/20 Rule";
-        only the top-quantile-entropy tokens should be backpropagated)
-      - use_bias_correction_kl = True  (DeepSeek-V3.2: multiplies the KL term by the
-        importance-sampling ratio)
-    A user who sets either would otherwise get plain GRPO with no error and no effect.
-
-    TRL GRPOConfig defaults (verified against trl.trainer.grpo_config: TRL 1.7.1) are
-    top_entropy_quantile = 1.0 and use_bias_correction_kl = False, so only non-default
-    values trigger the warning. This only warns; it does not implement the features.
+    ignores, so setting them is not silently dropped. UnslothGRPOConfig forwards every
+    field via **kwargs, but the fast path does not implement top_entropy_quantile < 1.0
+    (entropy masking) or use_bias_correction_kl = True (KL x importance-sampling ratio).
+    TRL defaults (grpo_config, TRL 1.7.1) are 1.0 and False, so only non-defaults warn.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
         return
     args = getattr(trainer, "args", None)
 
     unsupported = []
-    # Older TRL may lack these attributes; fall back to the TRL defaults so we never
-    # warn on a config that simply does not expose the option.
+    # Older TRL may lack these attributes; fall back to defaults so we never warn.
     top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
     if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
         unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
@@ -795,7 +782,7 @@ def _warn_unsupported_grpo_options(trainer):
         except Exception:
             import warnings as _warnings
             _warnings.warn(message)
-    # Set the flag after the first evaluation so the check runs at most once per trainer.
+    # Flag set after first check so it runs at most once per trainer.
     trainer._unsloth_grpo_unsupported_warned = True
     return
 pass
@@ -816,11 +803,8 @@ def grpo_accumulated_loss(
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
-    # Warn once if the user set TRL GRPO options the optimized path does not implement
-    # (top_entropy_quantile < 1.0, use_bias_correction_kl = True). They are accepted via
-    # UnslothGRPOConfig's **kwargs passthrough but would otherwise be silently ignored.
-    # Imported here (not at module scope) so the inlined copy of this function in the
-    # generated UnslothGRPOTrainer cache resolves the helper from the installed package.
+    # Warn once about **kwargs-passthrough GRPO options the fast path ignores. Imported
+    # here (not module scope) so the inlined copy in the generated trainer cache resolves.
     try:
         from unsloth_zoo.rl_replacements import _warn_unsupported_grpo_options
         _warn_unsupported_grpo_options(trainer)
@@ -864,18 +848,12 @@ def grpo_accumulated_loss(
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["use_vllm"] = trainer.use_vllm
-    # NOTE: `n_chunks` (from GRPOConfig.unsloth_num_chunks, default -1) is intentionally
-    # NOT used to chunk the batch inside UnslothEfficientGRPO; the .apply() call below always
-    # passes n_chunks = 1. UnslothEfficientGRPO.forward divides the summed loss and gradient
-    # uniformly by n_chunks, which is only correct for the row-mean loss types
-    # (grpo/sapo/dr_grpo/luspo) and only with exactly equal chunks. It is wrong for the
-    # globally sum-normalized types (dapo/cispo/vespo already divide by a global normalizer
-    # per chunk, so summing the chunks is exact and a further /n_chunks makes the loss
-    # n_chunks x too small), it mis-weights token-count-normalized bnpo, and any non-divisor
-    # chunk count mis-weights every type. The previous "snap n_chunks to a divisor of bsz"
-    # logic computed a value that was never threaded through to .apply(), so it was dead
-    # code; it is removed here to avoid a misleading, silently-ignored parameter. The
-    # parameter is kept in the signature because the caller passes it as a keyword.
+    # NOTE: `n_chunks` is NOT used to chunk the batch; .apply() below always passes 1.
+    # UnslothEfficientGRPO's uniform div_(n_chunks) is only correct at n_chunks=1: it
+    # would over-divide the sum-normalized dapo/cispo/vespo, mis-weight bnpo, and any
+    # non-divisor count mis-weights everything. The old "snap to a divisor of bsz" logic
+    # never reached .apply(), so it was dead code and is removed. The parameter stays in
+    # the signature because the caller passes it as a keyword.
 
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
@@ -1584,7 +1562,7 @@ def grpo_accumulated_loss(
             advantages,
             trainer.beta,
             trainer.accelerator.scaler,
-            1,  # n_chunks fixed at 1: uniform div_(n_chunks) is not correct for all loss types (see note above)
+            1,  # n_chunks fixed at 1 (see note above)
             kwargs
         )
 
