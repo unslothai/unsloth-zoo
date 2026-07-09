@@ -288,3 +288,58 @@ def test_installed_trl_get_off_policy_mask_needs_signature_adapter():
     out = fn(**common, **{mismatch_kw: mismatch})
     assert out.shape == (B, 1)
     assert set(out.unique().tolist()) <= {0.0, 1.0}
+
+
+# ---------------------------------------------------------------------------
+# off-policy mask None fallback (num_iterations == 1, no vLLM)
+# ---------------------------------------------------------------------------
+#
+# TRL defaults old_per_token_logps to per_token_logps.detach() when it is absent
+# (num_iterations == 1), then feeds that as the mismatch logprobs, so
+# get_off_policy_mask never receives None. grpo_compute_loss must do the same:
+# when both sampling_per_token_logps and old are None, fall back to new.detach().
+# get_off_policy_mask computes `mismatch - per_token_logps.detach()`, so None would
+# crash; new.detach() gives a zero-KL keep-all mask.
+
+
+def _trl_faithful_off_policy_mask(
+    advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold
+):
+    # Byte-for-byte TRL GRPOTrainer.get_off_policy_mask: crashes on a None mismatch.
+    kl_div = sampling_per_token_logps - per_token_logps.detach()
+    seq_kl_sum = (kl_div * mask).sum(dim=1, keepdim=True)
+    avg_seq_kl = seq_kl_sum / mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+    is_pos_adv = advantages >= 0
+    is_low_kl = avg_seq_kl <= off_policy_threshold
+    return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)
+
+
+def test_grpo_compute_loss_off_policy_mask_falls_back_to_new_when_old_absent():
+    B, T, V = 4, 5, 11
+    torch.manual_seed(0)
+    new = torch.randn(B, T, dtype=torch.float64, requires_grad=True)
+    input_ids = torch.randint(0, V, (B, T))
+    mask = torch.ones(B, T, dtype=torch.float64)
+    advantages = torch.randn(B, dtype=torch.float64)
+
+    # num_iterations == 1 with no vLLM: old and sampling are both None.
+    loss, *_ = rr.grpo_compute_loss(
+        None, new, None, None, input_ids, mask, 0.0, advantages,
+        loss_type="grpo",
+        num_items_in_batch=float(mask.sum().item()),
+        num_processes=1,
+        current_gradient_accumulation_steps=1,
+        max_completion_length=T,
+        get_off_policy_mask=_trl_faithful_off_policy_mask,
+        off_policy_mask_threshold=0.5,
+    )
+    # No TypeError from a None mismatch, and a real finite loss came out.
+    assert torch.isfinite(loss)
+
+
+def test_grpo_compute_loss_source_has_new_detach_off_policy_fallback():
+    flat = inspect.getsource(rr.grpo_compute_loss).replace(" ", "")
+    # The mismatch logprobs must fall back to new.detach() when old is also None,
+    # matching TRL's old_per_token_logps = per_token_logps.detach() default.
+    assert "new.detach()" in flat
+    assert "oldifoldisnotNoneelsenew.detach()" in flat

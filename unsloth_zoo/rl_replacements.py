@@ -425,14 +425,17 @@ def grpo_compute_loss(
         advantages = advantages.unsqueeze(1)
 
     if off_policy_mask_threshold is not None:
-        # DeepSeek-V3.2 off-policy mask. `sampling_per_token_logps` (vLLM sampling logprobs) is the
-        # training/inference mismatch; fall back to `old` when None. The callable is a signature-stable
-        # adapter installed in grpo_accumulated_loss, so this stays fixed across TRL versions with no
-        # signature introspection inside this compiled function (avoids graph breaks).
+        # DeepSeek-V3.2 off-policy mask. The mismatch logprobs are sampling_per_token_logps (vLLM
+        # sampling logprobs) if present, else old, else new.detach() when both are absent
+        # (num_iterations == 1 with no vLLM). This mirrors TRL, which defaults old_per_token_logps to
+        # per_token_logps.detach() so get_off_policy_mask never receives None (it computes
+        # mismatch - per_token_logps.detach(), so new.detach() yields a zero-KL keep-all mask). The
+        # callable is a signature-stable adapter installed in grpo_accumulated_loss, so this stays
+        # fixed across TRL versions with no signature introspection inside this compiled function.
         off_policy_mask = get_off_policy_mask(
             advantages=advantages,
             per_token_logps=new,
-            sampling_per_token_logps=sampling_per_token_logps if sampling_per_token_logps is not None else old,
+            sampling_per_token_logps=sampling_per_token_logps if sampling_per_token_logps is not None else (old if old is not None else new.detach()),
             mask=mask,
             off_policy_threshold=off_policy_mask_threshold,
         )
