@@ -203,6 +203,7 @@ from .utils import (
     _get_text_model,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
+    _normalize_seed,
 )
 from .compile import (
     build_compile_policy,
@@ -2040,6 +2041,51 @@ class MLXTrainer:
             except Exception:
                 pass
 
+    def _fast_forward_resume_batches(self, batch_iter, n_skip):
+        """Advance a streaming batch iterator to the resume position.
+
+        Base (streaming SFT/VLM/text) path: pull and discard ``n_skip`` batches.
+        create_batches / iterate_*_batches is deterministic under the same seed,
+        so consuming N batches reproduces the data ordering the killed run saw,
+        and each ``next`` is cheap and side-effect free. MLXGRPOTrainer overrides
+        this: its ``batch_iter`` is an on-policy rollout generator, so consuming
+        it would regenerate + re-score every skipped rollout rather than just
+        advance a cursor (see the override).
+        """
+        for _ in range(n_skip):
+            try:
+                next(batch_iter)
+            except StopIteration:
+                raise RuntimeError(
+                    f"Unsloth: streaming dataset exhausted while "
+                    f"fast-forwarding {n_skip} batches to the resume position. "
+                    f"Dataset may be shorter than the killed run consumed."
+                ) from None
+        return batch_iter
+
+    def _maybe_seed_grpo_rng(self):
+        """Seed the global MLX RNG from ``args.seed`` for GRPO reproducibility.
+
+        GRPO rollout sampling (``make_sampler``) draws from the process-global
+        ``mx.random`` state, which nothing else seeds from ``args.seed`` (only the
+        numpy prompt permutation is seeded). Without this, re-running an identical
+        GRPO job -- or running one after any prior ``mx.random`` use in the same
+        process -- samples different completions / rewards, breaking
+        reproducibility; TRL seeds the process RNG via ``set_seed(args.seed)``
+        (transformers Trainer). Offset by rank so DDP ranks draw distinct
+        completions yet stay deterministic. No-op for non-GRPO losses (SFT / DPO /
+        ORPO do not sample), leaving their RNG behavior byte-for-byte unchanged.
+        Returns the applied seed, or ``None`` when it did not seed.
+        """
+        args = self.args
+        if getattr(args, "loss_type", "sft") != "grpo":
+            return None
+        seed = (
+            _normalize_seed(getattr(args, "seed", 42)) + int(self.distributed_rank)
+        ) % (2 ** 32)
+        mx.random.seed(int(seed))
+        return int(seed)
+
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
         args = self.args
@@ -2212,6 +2258,11 @@ class MLXTrainer:
                 "max_steps must be > 0 when using streaming mode."
             )
 
+        # Total planned optimizer steps for this run. Exposed so the GRPO rollout
+        # can surface a minimal trainer_state (global_step / max_steps) to reward
+        # funcs that declare it, mirroring TRL (see _reward_func_wants_trainer_state).
+        self._planned_total_steps = total_steps
+
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
 
@@ -2336,6 +2387,11 @@ class MLXTrainer:
             )
         _clip_grad_value = max_grad_value > 0
         _clip_grad_leaf_norm = max_grad_leaf_norm > 0
+        # Seed the global MLX RNG (GRPO only) BEFORE capturing `state` below, so
+        # the seeded mx.random.state is the one the compiled step threads and the
+        # rollout sampler draws from -- making GRPO completions/rewards
+        # reproducible run-to-run. No-op for SFT/DPO/ORPO.
+        self._maybe_seed_grpo_rng()
         state = [model.state, optimizer.state, mx.random.state]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
@@ -2861,18 +2917,17 @@ class MLXTrainer:
 
         # Streaming mode: fast-forward the iterator to the resume position.
         # The seed is the same and create_batches/iterate_*_batches is
-        # deterministic, so consuming N batches gives us the same data
-        # ordering the killed run would have produced.
+        # deterministic, so consuming N batches gives the same data ordering the
+        # killed run produced. GRPO overrides _fast_forward_resume_batches: its
+        # batch_iter is an on-policy rollout generator, so consuming it would
+        # regenerate + re-score every skipped rollout with the already-updated
+        # checkpoint model (slow, side-effecting, RNG-desyncing) instead of just
+        # advancing a prompt cursor. Dispatch through the hook so each trainer
+        # skips correctly.
         if _resume_step > 0 and batch_iter is not None:
-            for _ in range(_resume_step * grad_accum):
-                try:
-                    next(batch_iter)
-                except StopIteration:
-                    raise RuntimeError(
-                        f"Unsloth: streaming dataset exhausted while "
-                        f"fast-forwarding to resume step {_resume_step}. "
-                        f"Dataset may be shorter than the killed run consumed."
-                    ) from None
+            batch_iter = self._fast_forward_resume_batches(
+                batch_iter, _resume_step * grad_accum,
+            )
 
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""
@@ -3862,6 +3917,33 @@ def _reward_func_wants_completion_ids(func):
     )
 
 
+def _reward_func_wants_trainer_state(func):
+    """True if a GRPO reward callable can receive ``trainer_state``.
+
+    TRL passes ``trainer_state`` (its ``transformers.TrainerState``) to every
+    reward function so rewards can shape by training progress -- e.g. curriculum
+    rewards keyed on the current step (grpo_trainer.py: ``reward_kwargs[
+    "trainer_state"] = self.state``). A reward that declares a REQUIRED
+    ``trainer_state`` parameter (no default, no ``**kwargs``) would otherwise
+    raise ``TypeError: missing required argument`` here, since the rollout call
+    only supplies completions / prompts / dataset columns. Mirror the
+    ``completion_ids`` gate: forward ``trainer_state`` only when the function
+    declares a ``trainer_state`` parameter or accepts ``**kwargs``; otherwise
+    omit it (back-compat with strict-signature rewards that neither want nor
+    accept it).
+    """
+    import inspect
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if "trainer_state" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 class MLXGRPOTrainer(MLXTrainer):
     """GRPO trainer mirroring TRL's GRPOTrainer. Forces loss_type='grpo'.
 
@@ -4018,11 +4100,34 @@ class MLXGRPOTrainer(MLXTrainer):
         mx.eval(kl)
         return float(kl.item())
 
-    def _grpo_rollout_generator(self):
+    def _fast_forward_resume_batches(self, batch_iter, n_skip):
+        """Resume a GRPO run WITHOUT replaying rollouts.
+
+        The base implementation fast-forwards by consuming ``n_skip`` items from
+        ``batch_iter``. For GRPO that iterator is the on-policy rollout generator,
+        so each consumed item would generate ``num_generations`` completions with
+        the ALREADY-updated checkpoint model, re-run the (possibly side-effecting)
+        reward functions on them, and advance the sampling RNG by a different,
+        stop-length-dependent amount -- making resume slow, non-reproducible, and
+        divergent from the killed run's trajectory. TRL's resume advances only the
+        prompt sampler and never regenerates skipped rollouts. Match that: rebuild
+        the generator with its prompt cursor advanced past the completed rollouts,
+        so training resumes at the correct prompt position with no regeneration or
+        scoring. The passed-in (still un-started) generator is discarded.
+        """
+        return self._grpo_rollout_generator(skip_rollouts=n_skip)
+
+    def _grpo_rollout_generator(self, skip_rollouts=0):
         """Infinite generator: each next() does generate->reward->advantage
-        and yields (batch, lengths, advantages). Runs uncompiled."""
+        and yields (batch, lengths, advantages). Runs uncompiled.
+
+        ``skip_rollouts`` advances the prompt cursor past that many rollouts
+        WITHOUT generating or scoring them (used by resume; see
+        _fast_forward_resume_batches).
+        """
         import inspect as _inspect
         import numpy as np
+        from types import SimpleNamespace
         # batch_generate is the rollout backend (one generate call per prompt group).
         # It was added to mlx-lm in 0.28.0 (mlx-lm PR #443); the pyproject mlx extra
         # only pins mlx-lm>=0.22.0, so a user on a declared-compatible 0.22-0.27.x
@@ -4074,7 +4179,27 @@ class MLXGRPOTrainer(MLXTrainer):
                 "group, so every group-relative advantage is 0 and the policy "
                 "receives no reward gradient. Set num_generations to 2 or more."
             )
-        sampler = make_sampler(temp=getattr(args, "temperature", 1.0))
+        # GRPO needs stochastic sampling to produce a diverse group. At
+        # temperature <= 0, make_sampler is greedy argmax, so all num_generations
+        # completions of a prompt are IDENTICAL: deterministic reward funcs then
+        # score them equally, every group has zero reward variance, and all
+        # group-relative advantages are 0 -- the policy receives no reward
+        # gradient (a silent no-op GRPO objective; with grpo_beta>0 only the KL
+        # term trains). This is the same zero-variance failure the N<2 guard
+        # above rejects. TRL's GRPO samples with temperature>0 (GRPOConfig default
+        # 1.0). Fail fast rather than silently train a no-op. The default here is
+        # 1.0, so normal runs are unaffected.
+        _temp = getattr(args, "temperature", 1.0)
+        if _temp is None or float(_temp) <= 0.0:
+            raise ValueError(
+                "Unsloth: GRPO requires temperature > 0 (got "
+                f"{_temp!r}). At temperature <= 0 sampling is greedy argmax, so "
+                "all num_generations completions of a prompt are identical, every "
+                "group has zero reward variance, and all group-relative advantages "
+                "are 0 -- the policy receives no reward gradient (a silent no-op). "
+                "Set a positive temperature (TRL's GRPO default is 1.0)."
+            )
+        sampler = make_sampler(temp=float(_temp))
         prompts = self._grpo_prompts()
         # Full dataset rows, in the same order as prompts, so reward_kwargs can
         # pass through each row's other columns (e.g. 'answer'). prompt and
@@ -4129,7 +4254,13 @@ class MLXGRPOTrainer(MLXTrainer):
             _order = [int(i) for i in _perm]
         _ddp_rank = self.distributed_rank
         _ddp_world = self.distributed_world_size
-        idx = _ddp_rank
+        # Resume: start the cursor already advanced past the rollouts the killed
+        # run completed (skip_rollouts * world_size), landing on exactly the prompt
+        # the generic consume-based fast-forward would have reached -- but without
+        # regenerating or scoring any skipped rollout (see
+        # _fast_forward_resume_batches). skip_rollouts == 0 (fresh run) is the
+        # byte-for-byte prior behavior.
+        idx = _ddp_rank + int(skip_rollouts) * _ddp_world
         while True:
             j = _order[idx % len(prompts)]
             prompt = prompts[j]
@@ -4314,9 +4445,9 @@ class MLXGRPOTrainer(MLXTrainer):
             # the GENERATED completion_ids (completion_ids_list above) are then
             # forwarded separately, signature-gated so a strict-signature reward
             # without a completion_ids parameter / **kwargs is not handed an
-            # unexpected keyword (see _reward_func_wants_completion_ids).
-            # trainer_state is not available here (no transformers TrainerState),
-            # so it is omitted rather than faked.
+            # unexpected keyword (see _reward_func_wants_completion_ids). A minimal
+            # trainer_state (global_step / max_steps) is likewise forwarded, gated,
+            # to rewards that declare it (see _reward_func_wants_trainer_state).
             reward_kwargs = {
                 k: [example[k]] * N
                 for k in example
@@ -4354,6 +4485,19 @@ class MLXGRPOTrainer(MLXTrainer):
             else:
                 _reward_prompt = prompt
                 _reward_completions = comps
+            # Minimal trainer_state for progress-aware (e.g. curriculum) rewards,
+            # mirroring TRL's reward_kwargs["trainer_state"] = self.state. Only the
+            # fields the trainer actually tracks are exposed (no fabrication):
+            # global_step (completed optimizer steps so far -- self._global_step is
+            # set to the last completed step before this rollout runs, matching
+            # TRL's state.global_step during generation) and max_steps (the run's
+            # planned total, stashed in _train_inner). Built per rollout so
+            # global_step reflects the current step. getattr defaults keep the
+            # standalone-generator harness (no _train_inner) working.
+            _trainer_state = SimpleNamespace(
+                global_step=int(getattr(self, "_global_step", 0)),
+                max_steps=getattr(self, "_planned_total_steps", None),
+            )
             total = [0.0] * N
             for rf in self.reward_funcs:
                 _call_kwargs = dict(
@@ -4368,6 +4512,14 @@ class MLXGRPOTrainer(MLXTrainer):
                 # completion_ids keyword would raise TypeError -- so gate the pass.
                 if _reward_func_wants_completion_ids(rf):
                     _call_kwargs["completion_ids"] = completion_ids_list
+                # Forward trainer_state only to rewards that declare it (a
+                # trainer_state parameter or **kwargs); a reward that REQUIRES it
+                # (curriculum rewards keyed on the step) would otherwise raise
+                # TypeError for a missing argument, and a strict-signature reward
+                # that neither wants nor accepts it must not be handed an
+                # unexpected keyword. Mirrors the completion_ids gate.
+                if _reward_func_wants_trainer_state(rf):
+                    _call_kwargs["trainer_state"] = _trainer_state
                 vals = rf(**_call_kwargs)
                 # TRL's reward-function contract is one score per completion:
                 # len(vals) must equal N. A shorter list would leave the unfilled

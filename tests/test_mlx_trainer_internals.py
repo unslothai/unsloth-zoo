@@ -3961,3 +3961,247 @@ def test_train_on_responses_only_rejects_grpo_loss_type():
     trainer = types.SimpleNamespace(args=types.SimpleNamespace(loss_type="grpo"))
     with pytest.raises(ValueError, match="GRPO trains from rollouts"):
         train_on_responses_only(trainer)
+
+
+# ---------------------------------------------------------------------------
+# PR #832 review: GRPO resume must not replay rollouts, the MLX RNG must be
+# seeded from args.seed for reproducible sampling, temperature <= 0 must fail
+# fast (silent no-op), and reward funcs declaring trainer_state must receive a
+# minimal state (TRL parity).
+# ---------------------------------------------------------------------------
+
+def test_grpo_resume_skips_rollout_replay_and_advances_prompt_cursor(monkeypatch):
+    # On resume, _train_inner fast-forwards a non-None batch_iter to the resume
+    # position. For GRPO that iterator is the on-policy rollout generator, so the
+    # generic consume-based fast-forward would REGENERATE num_generations
+    # completions per skipped step with the already-updated checkpoint model and
+    # re-run the (possibly side-effecting) reward funcs -- slow, non-reproducible,
+    # and divergent from the killed run. The GRPO override must instead advance
+    # only the prompt cursor: no generation, no scoring, landing on the correct
+    # resume prompt.
+    import mlx_lm
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    calls = {"generate": 0}
+
+    def _gen(model, tokenizer, prompts=None, max_tokens=None, sampler=None,
+             verbose=False, return_token_ids=False):
+        calls["generate"] += 1
+        return types.SimpleNamespace(texts=["a", "b"], token_ids=[[7], [8]])
+
+    monkeypatch.setattr(mlx_lm, "batch_generate", _gen, raising=False)
+
+    seen_prompts = []
+
+    def _reward(completions=None, prompts=None, **kw):
+        seen_prompts.append(prompts[0])
+        return [0.1, 0.2]
+
+    N = 6
+    dataset = [{"prompt": f"p{i}", "answer": str(i)} for i in range(N)]
+    trainer = _make_ddp_grpo_trainer(0, 1, dataset, [_reward], _Tok())
+    trainer.args.preserve_dataset_order = True  # sequential 0..N cursor
+
+    old_gen = trainer._grpo_rollout_generator()
+    new_gen = trainer._fast_forward_resume_batches(old_gen, 3)
+
+    # The resume fast-forward regenerated / re-scored NOTHING.
+    assert calls["generate"] == 0
+    assert seen_prompts == []
+
+    # The first post-resume rollout lands on prompt index 3 (where the killed run
+    # would train next), and only THAT rollout generates.
+    next(new_gen)
+    assert calls["generate"] == 1
+    assert seen_prompts == ["p3"]
+
+
+def test_base_fast_forward_resume_consumes_stream_but_grpo_overrides():
+    # The base (streaming SFT) fast-forward advances by consuming n_skip items;
+    # GRPO overrides it so it does NOT consume its rollout generator.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXGRPOTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    out = trainer._fast_forward_resume_batches(iter(range(10)), 4)
+    assert next(out) == 4  # first four items were consumed
+
+    # The override is a distinct implementation (no consume-based replay).
+    assert (MLXGRPOTrainer._fast_forward_resume_batches
+            is not MLXTrainer._fast_forward_resume_batches)
+    grpo_src = inspect.getsource(MLXGRPOTrainer._fast_forward_resume_batches)
+    assert "skip_rollouts" in grpo_src
+    assert "next(" not in grpo_src  # no consume/regeneration in the GRPO path
+
+
+def test_grpo_resume_cursor_matches_generic_fast_forward_position(monkeypatch):
+    # The skip_rollouts cursor must land on EXACTLY the prompt the old
+    # consume-based fast-forward reached (rank + n_skip * world for the next
+    # rollout), so resume trains the same prompt sequence -- just without
+    # regenerating the skipped ones. Verify against the reference cursor formula.
+    import mlx_lm
+
+    class _Tok:
+        eos_token_id = 0
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    monkeypatch.setattr(
+        mlx_lm, "batch_generate",
+        lambda *a, **k: types.SimpleNamespace(texts=["a", "b"]),
+        raising=False,
+    )
+
+    seen = []
+
+    def _reward(completions=None, prompts=None, **kw):
+        seen.append(prompts[0])
+        return [0.1, 0.2]
+
+    N = 5
+    dataset = [{"prompt": f"p{i}", "answer": str(i)} for i in range(N)]
+    # Rank 1 of a 2-rank group, sequential order: consume-based fast-forward would
+    # leave idx at rank + n_skip*world = 1 + 3*2 = 7 -> prompt index 7 % 5 == 2.
+    trainer = _make_ddp_grpo_trainer(1, 2, dataset, [_reward], _Tok())
+    trainer.args.preserve_dataset_order = True
+    gen = trainer._fast_forward_resume_batches(
+        trainer._grpo_rollout_generator(), 3,
+    )
+    next(gen)
+    assert seen == ["p2"]
+
+
+def test_grpo_seeds_mlx_rng_from_args_seed_with_rank_offset(monkeypatch):
+    # GRPO rollout sampling draws from the global MLX RNG, which nothing seeds
+    # from args.seed. _maybe_seed_grpo_rng must seed it (rank-offset so DDP ranks
+    # draw distinct completions yet stay deterministic), mirroring TRL's
+    # set_seed(args.seed).
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import _normalize_seed
+
+    seen = {}
+    monkeypatch.setattr(mx.random, "seed",
+                        lambda s: seen.__setitem__("seed", s))
+
+    trainer = _make_ddp_grpo_trainer(
+        2, 4, [{"prompt": "p"}],
+        [lambda completions=None, prompts=None, **kw: [0.0, 0.0]], object(),
+    )
+    trainer.args.loss_type = "grpo"
+    trainer.args.seed = 100
+    applied = trainer._maybe_seed_grpo_rng()
+    assert applied == seen["seed"] == (_normalize_seed(100) + 2) % (2 ** 32)
+
+
+def test_maybe_seed_grpo_rng_is_noop_for_non_grpo(monkeypatch):
+    # SFT/DPO/ORPO do not sample; seeding is scoped to GRPO so their existing RNG
+    # behavior is byte-for-byte unchanged.
+    import mlx.core as mx
+
+    seen = {}
+    monkeypatch.setattr(mx.random, "seed",
+                        lambda s: seen.__setitem__("seed", s))
+
+    trainer = _make_ddp_grpo_trainer(
+        0, 1, [{"prompt": "p"}],
+        [lambda completions=None, prompts=None, **kw: [0.0, 0.0]], object(),
+    )
+    trainer.args.loss_type = "sft"
+    assert trainer._maybe_seed_grpo_rng() is None
+    assert "seed" not in seen
+
+
+def test_train_inner_seeds_grpo_rng_before_capturing_state():
+    # The seed must be applied BEFORE `state = [..., mx.random.state]` is captured,
+    # so the compiled step threads the seeded RNG (else the captured reference
+    # would be stale and the seed ignored by the grad step).
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    seed_call = src.index("self._maybe_seed_grpo_rng()")
+    state_capture = src.index(
+        "state = [model.state, optimizer.state, mx.random.state]"
+    )
+    assert seed_call < state_capture
+
+
+@pytest.mark.parametrize("bad_temp", [0.0, -0.5])
+def test_grpo_rollout_rejects_non_positive_temperature(monkeypatch, bad_temp):
+    # temperature <= 0 -> greedy argmax -> identical completions per group ->
+    # zero reward variance -> all advantages 0 -> silent no-op GRPO objective.
+    # Fail fast, mirroring the num_generations<2 guard.
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[lambda completions=None, prompts=None, **kw: [0.1, 0.2]],
+        batch_texts=["a", "b"],
+    )
+    trainer.args.temperature = bad_temp
+    gen = trainer._grpo_rollout_generator()
+    with pytest.raises(ValueError, match="temperature > 0"):
+        next(gen)
+
+
+def test_grpo_config_default_temperature_is_positive():
+    # The default must be > 0 so the new guard never fires on a normal run.
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+
+    assert MLXGRPOConfig().temperature > 0
+
+
+def test_grpo_rollout_passes_trainer_state_to_declaring_reward(monkeypatch):
+    # TRL forwards trainer_state (transformers TrainerState) to every reward func
+    # for progress-aware (e.g. curriculum) shaping. A reward that declares a
+    # REQUIRED trainer_state param would otherwise raise TypeError before the
+    # first rollout. Signature-gate the pass and hand it a minimal state exposing
+    # the real global_step / max_steps the trainer tracks.
+    from unsloth_zoo.mlx.trainer import _reward_func_wants_trainer_state
+
+    assert _reward_func_wants_trainer_state(
+        lambda completions, prompts, trainer_state: None)
+    assert _reward_func_wants_trainer_state(
+        lambda completions, prompts, **kw: None)
+    assert not _reward_func_wants_trainer_state(
+        lambda completions, prompts, answer: None)
+
+    captured = {}
+
+    def curriculum_reward(completions, prompts, answer, trainer_state):
+        # Required trainer_state (no default, no **kwargs): must be supplied.
+        captured["global_step"] = trainer_state.global_step
+        captured["max_steps"] = trainer_state.max_steps
+        return [0.1, 0.2]
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[curriculum_reward], batch_texts=["a", "b"],
+    )
+    trainer._global_step = 5
+    trainer._planned_total_steps = 20
+    gen = trainer._grpo_rollout_generator()
+    next(gen)  # must not raise TypeError for the required trainer_state param
+    assert captured == {"global_step": 5, "max_steps": 20}
+
+
+def test_grpo_rollout_omits_trainer_state_for_strict_reward(monkeypatch):
+    # A strict-signature reward (no trainer_state, no **kwargs) must NOT be handed
+    # a trainer_state keyword (that would raise TypeError: unexpected keyword).
+    ran = {}
+
+    def strict_reward(completions=None, prompts=None, answer=None):
+        ran["ok"] = True
+        return [0.1, 0.2]
+
+    trainer = _make_grpo_trainer_for_rollout(
+        monkeypatch, num_generations=2,
+        reward_funcs=[strict_reward], batch_texts=["a", "b"],
+    )
+    gen = trainer._grpo_rollout_generator()
+    next(gen)
+    assert ran == {"ok": True}
