@@ -2248,3 +2248,24 @@ def test_orpo_loss_returns_pair_count_not_token_count(monkeypatch):
     loss_fn = make_orpo_loss_fn(beta=0.1)
     _loss, count = loss_fn(_StubLM(8), batch, lengths)
     assert int(count) == 2  # pair count (B), not the response-token count
+
+
+def test_dpo_reference_guard_rejects_dora_adapters():
+    # DPO obtains the reference by zeroing the LoRA scale, but a DoRA layer still
+    # applies its trainable magnitude m/||W|| (initialized to ||W|| but drifting as
+    # m trains), so the reference would no longer be the frozen base and the DPO
+    # gradient would be wrong. The setup must reject DoRA for referenced (not
+    # reference_free) DPO before building the loss, gated so plain LoRA is untouched.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    guard = 'type(m).__name__.startswith("DoRA")'
+    assert guard in src
+    dpo_builder = src.index("make_dpo_loss_fn(beta=")
+    # The DoRA guard precedes the DPO loss builder ...
+    assert src.index(guard) < dpo_builder
+    # ... and is gated on a referenced (not reference_free) run.
+    guard_region = src[src.index("_lora_mods = [mod"):dpo_builder]
+    assert "not _rf" in guard_region
+    assert "reference_free=True" in src  # the error points at the escape hatch

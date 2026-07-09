@@ -2048,6 +2048,19 @@ class MLXTrainer:
                 # LoRAEmbedding, LoRASwitchLinear and DoRA adapters are all
                 # collected for the reference (adapters-off) pass.
                 _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
+                if (_lora_mods and not _rf
+                        and any(type(m).__name__.startswith("DoRA")
+                                for m in _lora_mods)):
+                    raise ValueError(
+                        "Unsloth: DPO with a reference is not supported for DoRA "
+                        "adapters. The reference is obtained by zeroing the LoRA "
+                        "scale, but a DoRA layer still applies its trainable "
+                        "magnitude m/||W|| (initialized to ||W|| but drifting as m "
+                        "trains), so the reference would no longer be the frozen "
+                        "initial policy and the DPO gradient would be wrong. Use a "
+                        "plain LoRA adapter, or pass reference_free=True to train "
+                        "without a reference."
+                    )
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
