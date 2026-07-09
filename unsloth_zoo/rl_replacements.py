@@ -823,7 +823,11 @@ def grpo_accumulated_loss(
         kwargs["get_off_policy_mask"] = None
     else:
         _adapter = getattr(trainer, "_unsloth_off_policy_mask_adapter", None)
-        if getattr(_adapter, "_unsloth_wrapped", None) is not _off_policy_mask_fn:
+        # Compare by value, not identity: trainer.get_off_policy_mask returns a fresh bound-method
+        # object on every access, so `is not` would always miss and rebuild the adapter each step
+        # (re-triggering torch.compile). `!=` on bound methods compares __self__ and __func__, so the
+        # cached adapter is reused; the first call still rebuilds since None != the bound method.
+        if getattr(_adapter, "_unsloth_wrapped", None) != _off_policy_mask_fn:
             import inspect as _inspect
             try:
                 _params = _inspect.signature(_off_policy_mask_fn).parameters

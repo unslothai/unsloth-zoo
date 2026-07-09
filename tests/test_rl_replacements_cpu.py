@@ -427,3 +427,22 @@ def test_grpo_compute_loss_is_ratio_blocks_gated_on_correction_flag_source():
     flat = inspect.getsource(rr.grpo_compute_loss).replace(" ", "")
     # Both IS-ratio blocks must require the correction flag; the off-policy mask call must not.
     assert flat.count("sampling_per_token_logpsisnotNoneandvllm_importance_sampling_correction") >= 2
+
+
+def test_off_policy_adapter_cache_compares_bound_method_by_value():
+    # trainer.get_off_policy_mask returns a fresh bound-method object every access, so the adapter
+    # cache must compare `_unsloth_wrapped` by value (`!=`), not identity (`is not`) - otherwise the
+    # cache never hits and a new closure is built every step, re-triggering torch.compile.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert 'getattr(_adapter, "_unsloth_wrapped", None) != _off_policy_mask_fn' in src
+    assert 'getattr(_adapter, "_unsloth_wrapped", None) is not _off_policy_mask_fn' not in src
+
+    # Behavioral proof of the underlying semantics the fix relies on.
+    class _T:
+        def get_off_policy_mask(self):  # pragma: no cover - only identity/eq is exercised
+            pass
+
+    t = _T()
+    assert t.get_off_policy_mask is not t.get_off_policy_mask  # fresh object each access
+    assert t.get_off_policy_mask == t.get_off_policy_mask      # but equal by value
+    assert (None != t.get_off_policy_mask) is True             # first-call guard still rebuilds
