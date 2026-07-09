@@ -485,12 +485,12 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     assert processor.images_seen[0] == ["embedded"]
 
 
-def test_vlm_top_level_image_key_supports_studio_adapter_shape(monkeypatch):
+def test_vlm_top_level_image_key_falls_back_after_bare_placeholder_error(monkeypatch):
     import unsloth_zoo.vision_utils as vision_utils
     from unsloth_zoo.mlx.utils import _extract_vlm_images
 
     def fail_process_vision_info(*_args, **_kwargs):
-        raise AssertionError("top-level image should be used before message fallback")
+        raise ValueError("image, image_url or video should in content.")
 
     monkeypatch.setattr(
         vision_utils,
@@ -500,6 +500,39 @@ def test_vlm_top_level_image_key_supports_studio_adapter_shape(monkeypatch):
 
     messages = [{"role": "user", "content": [{"type": "image"}]}]
     assert _extract_vlm_images({"image": "top-level"}, messages, image_size=16) == ["top-level"]
+
+
+def test_vlm_collate_passes_studio_top_level_image_to_processor(monkeypatch):
+    import unsloth_zoo.vision_utils as vision_utils
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    def fail_process_vision_info(*_args, **_kwargs):
+        raise ValueError("image, image_url or video should in content.")
+
+    monkeypatch.setattr(
+        vision_utils,
+        "process_vision_info",
+        fail_process_vision_info,
+    )
+
+    processor = _ConversationalPromptCompletionProcessor()
+    _collate_vlm_batch(
+        [{
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Q"},
+                ],
+            }],
+            "image": "top-level",
+        }],
+        processor,
+        max_seq_length=8,
+        image_size=16,
+    )
+
+    assert processor.images_seen == [["top-level"]]
 
 
 def test_vlm_top_level_images_key_still_wins_over_image_key():

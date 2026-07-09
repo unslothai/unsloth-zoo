@@ -3521,6 +3521,7 @@ def _extract_vlm_images(
     suppress_process_errors=False,
 ):
     images = []
+    top_level_image = []
     if isinstance(item, dict):
         image = item.get("images")
         if image is not None:
@@ -3528,7 +3529,7 @@ def _extract_vlm_images(
         elif "image" in item:
             image = item.get("image")
             if image is not None:
-                images = image if isinstance(image, list) else [image]
+                top_level_image = image if isinstance(image, list) else [image]
 
     if not images and isinstance(messages, list):
         for message in messages:
@@ -3541,6 +3542,7 @@ def _extract_vlm_images(
                     if image is not None:
                         images.append(image)
 
+    process_error = None
     if not images and isinstance(messages, list):
         try:
             from ..vision_utils import process_vision_info
@@ -3550,9 +3552,15 @@ def _extract_vlm_images(
                 maybe_images = extracted[0]
                 if maybe_images is not None:
                     images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
-        except Exception:
-            if not suppress_process_errors:
+        except Exception as exc:
+            process_error = exc
+            if not top_level_image and not suppress_process_errors:
                 raise
+
+    if not images and top_level_image:
+        images = top_level_image
+    if not images and process_error is not None and not suppress_process_errors:
+        raise process_error
 
     return _resize_vlm_images(images, image_size)
 
