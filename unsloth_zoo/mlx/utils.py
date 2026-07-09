@@ -958,7 +958,7 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False):
     return loss_fn
 
 def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
-                      epsilon_low=0.2, epsilon_high=0.2):
+                      epsilon_low=0.2, epsilon_high=0.2, temperature=1.0):
     """Create a GRPO loss function (TRL-parity, token-level).
 
     Signature matches the other loss fns so it drops into the trainer's text
@@ -991,6 +991,15 @@ def make_grpo_loss_fn(beta=0.04, lora_mods=None, reference_free=False,
         inp = batch[:, :-1]
         tgt = batch[:, 1:]
         logits = model(inp)
+        # TRL scales logits by the sampling temperature before every log-prob used
+        # in the GRPO loss (policy, old, and reference: grpo_trainer.py
+        # `logits = logits / self.temperature`), so the log-probs match the
+        # tempered distribution the completions were actually sampled from.
+        # Without it the policy-gradient magnitude (~1/T) and the k3 KL term
+        # diverge from TRL whenever temperature != 1.0; they agree exactly at the
+        # default 1.0. old_logp derives from this pol_logp, so it is scaled too.
+        if temperature != 1.0:
+            logits = logits / temperature
         steps = mx.arange(1, tgt.shape[1] + 1)
         mask = mx.logical_and(
             steps >= lengths[:, 0:1], steps < lengths[:, 1:]

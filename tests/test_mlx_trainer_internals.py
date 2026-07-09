@@ -2970,3 +2970,26 @@ def test_quantized_linear_forward():
     # x @ W.T  with W = [[0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7]] = [28, 28]
     out = layer(x)
     torch.testing.assert_close(out, torch.tensor([[28.0, 28.0]]))
+
+
+def test_grpo_loss_temperature_scales_logits():
+    # TRL scales logits by the sampling temperature before every log-prob used in
+    # the GRPO loss (policy/old/reference: grpo_trainer.py logits = logits /
+    # self.temperature), so the policy-gradient magnitude (~1/T) and the k3 KL term
+    # match TRL at temperature != 1.0; they agree exactly at the default 1.0. The
+    # untempered version diverged from TRL whenever a user set temperature != 1.
+    import inspect
+    from unsloth_zoo.mlx.utils import make_grpo_loss_fn
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXGRPOTrainer
+
+    sig = inspect.signature(make_grpo_loss_fn)
+    assert "temperature" in sig.parameters
+    assert sig.parameters["temperature"].default == 1.0
+    lsrc = inspect.getsource(make_grpo_loss_fn)
+    assert "logits = logits / temperature" in lsrc
+    # The trainer passes the rollout sampling temperature into the loss builder ...
+    tsrc = inspect.getsource(MLXTrainer._train_inner)
+    assert 'temperature=float(getattr(args, "temperature", 1.0)' in tsrc
+    # ... and the logged-KL probe (MLXGRPOTrainer) scales logits by the same temp.
+    ksrc = inspect.getsource(MLXGRPOTrainer._grpo_mean_kl)
+    assert "logits = logits / _temp" in ksrc

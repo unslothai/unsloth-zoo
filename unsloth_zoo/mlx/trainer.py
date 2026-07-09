@@ -2162,7 +2162,8 @@ class MLXTrainer:
                         "reference_free=True) to train without the KL term."
                     )
                 loss_fn = make_grpo_loss_fn(beta=_gb, lora_mods=_lora_mods,
-                    reference_free=_grf, epsilon_low=_ge, epsilon_high=_ge)
+                    reference_free=_grf, epsilon_low=_ge, epsilon_high=_ge,
+                    temperature=float(getattr(args, "temperature", 1.0) or 1.0))
                 print("Unsloth: Using GRPO loss (beta=" + str(_gb) + ").")
             elif use_cce:
                 loss_fn = make_cce_loss_fn(model)
@@ -3861,9 +3862,15 @@ class MLXGRPOTrainer(MLXTrainer):
         if not mods:
             return None
 
+        _temp = float(getattr(args, "temperature", 1.0) or 1.0)
+
         def _logp_mask(b, ln):
             inp, tgt = b[:, :-1], b[:, 1:]
             logits = self.model(inp)
+            # Match make_grpo_loss_fn: temperature-scale logits so the logged KL is
+            # computed on the same tempered distribution as the loss KL term.
+            if _temp != 1.0:
+                logits = logits / _temp
             steps = mx.arange(1, tgt.shape[1] + 1)
             mask = mx.logical_and(
                 steps >= ln[:, 0:1], steps < ln[:, 1:]
