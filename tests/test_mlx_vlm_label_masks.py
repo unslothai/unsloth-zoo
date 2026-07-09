@@ -525,6 +525,14 @@ def test_vlm_top_level_images_key_still_wins_over_image_key():
     ) == ["plural"]
 
 
+def test_vlm_top_level_image_key_requires_bare_image_placeholder():
+    from unsloth_zoo.mlx.utils import _extract_vlm_images
+
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Q"}]}]
+    assert _extract_vlm_images({"image": "top-level"}, messages, image_size=16) == []
+    assert _extract_vlm_images({"image": "top-level"}, [], image_size=16) == []
+
+
 def test_vlm_image_extraction_raises_process_errors_like_cuda(monkeypatch):
     import unsloth_zoo.vision_utils as vision_utils
     from unsloth_zoo.mlx.utils import _extract_vlm_images

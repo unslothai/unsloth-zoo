@@ -3514,10 +3514,10 @@ def _resize_vlm_images(images, image_size):
 
 
 def _vlm_vision_part_state(messages):
-    has_bare_placeholder = False
+    bare_placeholder_types = set()
     has_media_payload = False
     if not isinstance(messages, list):
-        return has_bare_placeholder, has_media_payload
+        return bare_placeholder_types, has_media_payload
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -3532,8 +3532,8 @@ def _vlm_vision_part_state(messages):
             if any(key in part for key in ("image", "image_url", "video")):
                 has_media_payload = True
             else:
-                has_bare_placeholder = True
-    return has_bare_placeholder, has_media_payload
+                bare_placeholder_types.add(part.get("type"))
+    return bare_placeholder_types, has_media_payload
 
 
 def _vlm_bare_placeholder_error(exc):
@@ -3549,7 +3549,8 @@ def _extract_vlm_images(
 ):
     images = []
     top_level_image = []
-    has_bare_placeholder, has_media_payload = _vlm_vision_part_state(messages)
+    bare_placeholder_types, has_media_payload = _vlm_vision_part_state(messages)
+    has_bare_image_placeholder = "image" in bare_placeholder_types
     if isinstance(item, dict):
         image = item.get("images")
         if image is not None:
@@ -3584,14 +3585,14 @@ def _extract_vlm_images(
             process_error = exc
             can_fallback = (
                 top_level_image
-                and has_bare_placeholder
+                and has_bare_image_placeholder
                 and not has_media_payload
                 and _vlm_bare_placeholder_error(exc)
             )
             if not can_fallback and not suppress_process_errors:
                 raise
 
-    if not images and top_level_image and not has_media_payload:
+    if not images and top_level_image and has_bare_image_placeholder and not has_media_payload:
         images = top_level_image
     if not images and process_error is not None and not suppress_process_errors:
         raise process_error
