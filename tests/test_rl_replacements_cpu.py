@@ -213,17 +213,10 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
 
 
-# ---------------------------------------------------------------------------
-# get_off_policy_mask adapter (DeepSeek-V3.2 off-policy sequence mask)
-# ---------------------------------------------------------------------------
-#
-# TRL added GRPOTrainer.get_off_policy_mask in 0.27.0 with a 3rd parameter named
-# `old_per_token_logps` and renamed it to `sampling_per_token_logps` in 0.27.1
-# (huggingface/trl#4857). rl_replacements used to call it with a hardcoded
-# `old_per_token_logps=` keyword, which raises TypeError on TRL >= 0.27.1 whenever
-# `off_policy_mask_threshold` is set. grpo_compute_loss now passes a version-stable
-# keyword and grpo_accumulated_loss adapts it to the installed parameter name
-# (outside the torch.compiled hot path).
+# get_off_policy_mask adapter: TRL renamed its 3rd parameter old_per_token_logps ->
+# sampling_per_token_logps in 0.27.1 (huggingface/trl#4857), so the old hardcoded keyword
+# crashed on TRL >= 0.27.1. grpo_compute_loss now passes a version-stable keyword that
+# grpo_accumulated_loss adapts to the installed parameter name.
 
 
 def test_grpo_compute_loss_uses_version_stable_off_policy_keyword():

@@ -425,12 +425,10 @@ def grpo_compute_loss(
         advantages = advantages.unsqueeze(1)
 
     if off_policy_mask_threshold is not None:
-        # DeepSeek-V3.2 off-policy sequence mask. `sampling_per_token_logps` (the vLLM sampling
-        # logprobs) captures the training/inference mismatch; fall back to `old` when it is None,
-        # matching TRL's inputs.get("sampling_per_token_logps", old_per_token_logps). The callable
-        # in kwargs is a signature-stable adapter installed in grpo_accumulated_loss, so this call
-        # stays fixed across TRL versions without any signature introspection inside this compiled
-        # function (avoids graph breaks).
+        # DeepSeek-V3.2 off-policy mask. `sampling_per_token_logps` (vLLM sampling logprobs) is the
+        # training/inference mismatch; fall back to `old` when None. The callable is a signature-stable
+        # adapter installed in grpo_accumulated_loss, so this stays fixed across TRL versions with no
+        # signature introspection inside this compiled function (avoids graph breaks).
         off_policy_mask = get_off_policy_mask(
             advantages=advantages,
             per_token_logps=new,
@@ -806,13 +804,11 @@ def grpo_accumulated_loss(
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     off_policy_mask_threshold = trainer.args.off_policy_mask_threshold if hasattr(trainer.args, "off_policy_mask_threshold") else None
     kwargs["off_policy_mask_threshold"] = off_policy_mask_threshold
-    # get_off_policy_mask (DeepSeek-V3.2 off-policy sequence mask) only exists on TRL >= 0.27.0. Its
-    # 3rd parameter was named `old_per_token_logps` in 0.27.0 and renamed to `sampling_per_token_logps`
-    # in 0.27.1 (huggingface/trl#4857), so a fixed keyword call crashes on one side of that rename.
-    # Wrap it in a signature-stable adapter here, outside the torch.compiled loss, so grpo_compute_loss
-    # always calls it with one keyword (sampling_per_token_logps). Detect the real parameter name once
-    # via inspect and cache the adapter on the trainer, so the same object is reused across steps
-    # (a fresh closure every step would re-trigger torch.compile).
+    # get_off_policy_mask exists on TRL >= 0.27.0; its 3rd parameter was `old_per_token_logps` in 0.27.0
+    # and renamed to `sampling_per_token_logps` in 0.27.1 (huggingface/trl#4857), so a fixed keyword call
+    # crashes on one side of the rename. Wrap it in a signature-stable adapter here, outside the compiled
+    # loss, so grpo_compute_loss always calls it with one keyword. Detect the real name once via inspect
+    # and cache the adapter on the trainer; a fresh closure every step would re-trigger torch.compile.
     _off_policy_mask_fn = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     if _off_policy_mask_fn is None or off_policy_mask_threshold is None:
         kwargs["get_off_policy_mask"] = None
