@@ -3251,6 +3251,18 @@ class MLXTrainer:
             rank 0 only.
             """
             nonlocal losses, n_tokens, steps, train_time, trained_tokens
+            # Nothing accumulated since the last log: an on_epoch_end (or other)
+            # callback can force should_log again on a step that already logged
+            # (e.g. logging_steps=1 at a dataset boundary), and the accumulators are
+            # plain-int 0 after a reset, so _distributed_all_sum returns an int and
+            # metric_tokens.item() below would raise (single process) / a real log
+            # would divide by zero. Skip like HF, which guards its log on
+            # state.global_step > self._globalstep_last_logged. steps advances
+            # identically on every rank, so this early-return stays in lockstep
+            # (no rank reaches the collective all-sum without the others).
+            if steps == 0:
+                self.control.should_log = False
+                return
             metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
             metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
             mx.eval(metric_losses, metric_tokens)
@@ -4040,12 +4052,21 @@ class MLXTrainer:
         # a step that is not a logging_steps multiple and not the last step). HF
         # folds the trailing tr_loss into _total_loss_scalar before computing the
         # returned train_loss; without this an early stop at an unlogged step would
-        # return train_loss/trained_tokens of 0 despite completed training. steps is
-        # incremented identically on every rank, so the guard is rank-consistent and
-        # _run_training_log's all-reduce stays in lockstep. A full run forces a log
-        # on the last step (current_step == total_steps) and the on_epoch_end above
-        # may also flush, both resetting steps to 0, so this never double-counts.
-        if steps > 0:
+        # return train_loss/trained_tokens of 0 despite completed training.
+        # Gate on accum_progress == 0 (a clean optimizer-step boundary): a stop
+        # from on_substep_end or an external cancel can break mid-accumulation with
+        # accum_progress > 0, and those micro-batches never reached an optimizer
+        # update (global_step unchanged, often 0). Flushing them would report a
+        # phantom on_log / trained_tokens for training that was never applied to the
+        # model; HF likewise suppresses that log (global_step == _globalstep_last_
+        # logged). The E-flush case still fires: an on_step_end callback stop breaks
+        # in the do_update branch where accum_progress was reset to 0. steps and
+        # accum_progress advance identically on every rank, so the guard is
+        # rank-consistent and _run_training_log's all-reduce stays in lockstep. A
+        # full run forces a log on the last step (current_step == total_steps) and
+        # the on_epoch_end above may also flush, both resetting steps to 0, so this
+        # never double-counts.
+        if steps > 0 and accum_progress == 0:
             _run_training_log(self._global_step, None)
 
         avg_loss = (

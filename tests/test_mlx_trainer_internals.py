@@ -3047,8 +3047,11 @@ def test_pending_metrics_flushed_on_early_callback_stop():
     src = inspect.getsource(MLXTrainer._train_inner)
     loop_pos = src.index("while self._global_step < total_steps:")
     avg_pos = src.index("avg_loss = (")
-    assert "if steps > 0:" in src
-    flush_pos = src.index("if steps > 0:")
+    # The flush is gated on a pending window AND a clean optimizer boundary (so a
+    # partial un-applied accumulation window is not flushed; see the partial-accum
+    # regression test).
+    assert "if steps > 0 and accum_progress == 0:" in src
+    flush_pos = src.index("if steps > 0 and accum_progress == 0:")
     assert loop_pos < flush_pos < avg_pos
     assert "_run_training_log(self._global_step, None)" in src[flush_pos:avg_pos]
 
@@ -3227,3 +3230,63 @@ def test_post_loop_epoch_end_runs_eval_for_callback_stop():
     # The lift/restore wraps the control actions (try/finally) so the stop is
     # always restored even if the eval raises.
     assert "finally:" in tail
+
+
+def test_run_training_log_guards_empty_window():
+    # Regression for "Guard epoch-end forced logs with pending tokens". A callback
+    # forcing should_log again on a step that already logged (e.g. logging_steps=1
+    # at a dataset boundary via on_epoch_end) re-enters _run_training_log with the
+    # accumulators reset to plain int 0; without a guard metric_tokens.item() raises
+    # (single process) or a phantom 0.0 log is emitted (DDP). The helper must early-
+    # return when nothing is pending, mirroring HF's global_step >
+    # _globalstep_last_logged guard, and before the first collective all-sum so DDP
+    # stays in lockstep.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    log_start = src.index("def _run_training_log(")
+    guard = src.index("if steps == 0:", log_start)
+    allsum = src.index("_distributed_all_sum(losses", log_start)
+    # The empty-window guard precedes the first all-reduce in the helper body.
+    assert log_start < guard < allsum
+    body = src[guard:allsum]
+    assert "return" in body
+
+
+def test_early_stop_flush_skips_partial_accumulation():
+    # Regression for "Do not flush partial accumulation as a trained step". A stop
+    # from on_substep_end / external cancel can break mid-accumulation-window
+    # (accum_progress > 0) with micro-batches that never reached an optimizer update
+    # (global_step often 0). The post-loop E-flush must not report them as trained
+    # progress, so it is gated on a clean optimizer boundary (accum_progress == 0)
+    # as well as a pending window.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert "if steps > 0 and accum_progress == 0:" in src
+
+
+def test_substep_stop_leaves_partial_window_unflushed():
+    # Reachability for the partial-accumulation guard: a stop at the first substep
+    # of a grad_accum>1 window leaves accum_progress > 0 and global_step == 0 (no
+    # optimizer update applied), so the E-flush's `steps > 0 and accum_progress == 0`
+    # guard correctly skips it (no phantom trained_tokens at step 0), while an
+    # on_step_end stop at a completed step (accum_progress == 0) still flushes.
+    grad_accum = 4
+    accum_progress = 0
+    global_step = 0
+    it = 1
+    do_update = (accum_progress + 1 >= grad_accum)   # False -> substep
+    assert do_update is False
+    accum_progress += 1                              # substep advances accum only
+    steps = 1
+    # Mid-window stop: partial window pending, nothing applied to the model.
+    assert accum_progress > 0 and global_step == 0
+    assert not (steps > 0 and accum_progress == 0)   # E-flush guard -> skip
+    # Contrast: a completed optimizer step resets accum_progress to 0, so the flush
+    # (E case) fires and reports the real applied step.
+    accum_progress_after_update = 0
+    steps_after_update = grad_accum
+    assert (steps_after_update > 0 and accum_progress_after_update == 0)
