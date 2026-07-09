@@ -72,9 +72,10 @@ __all__ = [
     "fast_linear_cross_entropy",
     "_unsloth_get_batch_samples",
     "unsloth_fused_ce_loss",
+    "unsloth_fused_dft_loss",
 ]
 
-from .fused_losses import unsloth_fused_ce_loss
+from .fused_losses import unsloth_fused_ce_loss, unsloth_fused_dft_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3

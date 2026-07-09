@@ -16,8 +16,10 @@
 
 __all__ = [
     "unsloth_fused_ce_loss",
+    "unsloth_fused_dft_loss",
     "apply_autograd_function",
     "compute_fused_ce_loss",
+    "compute_fused_dft_loss",
 ]
 
 import torch
@@ -46,9 +48,13 @@ try:
 except Exception:
     pass
 
-# Module-level flag: None = untested, True = works, False = skip compile.
+# Module-level compile flag shared by all inner fused losses (CE, DFT, etc.):
+# None = untested, True = works, False = skip compile. A loss that skips the
+# probe because another loss already set this True still gets one guarded
+# compiled fast-path call before it is considered proven.
 _FUSED_CE_COMPILE_SUPPORTED = None if \
     os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
+_FUSED_CE_COMPILE_FASTPATH_PROVEN = set()
 
 @functools.cache
 def _get_mapping(autograd):
@@ -132,6 +138,86 @@ def compute_fused_ce_loss(
     # Scale loss if needed for mixed precision training
     scaled_loss = loss * scaling if scaling is not None else loss
     # Must add .loss.detach otherwise autograd uses 2x VRAM
+    return scaled_loss, (loss.detach(),)
+pass
+
+
+def compute_fused_dft_loss(
+    hidden_states  : torch.Tensor,
+    lm_head_weight : torch.Tensor,
+    lm_head_bias   : Optional[torch.Tensor],
+    labels         : torch.Tensor,
+    n_items        : Optional[torch.Tensor] = None,
+    scaling        : Optional[float] = None,
+    shift_labels   : bool = True,
+    **kwargs,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor,],]:
+    """
+    Computes stop_gradient(exp(-NLL_t)) * NLL_t over target tokens.
+    The signature and return contract intentionally match compute_fused_ce_loss.
+    """
+    ignore_index = int(kwargs.get("ignore_index", -100))
+    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
+    if label_smoothing != 0.0:
+        raise ValueError("Fused DFT loss does not support label_smoothing != 0.0")
+
+    device = lm_head_weight.device
+    if shift_labels:
+        _labels = torch.empty_like(labels, device = device)
+        _labels[..., :-1] = labels[..., 1:]
+        _labels[..., -1] = ignore_index
+        labels = _labels
+    else:
+        labels = labels.to(device = device)
+    pass
+
+    logits = torch.nn.functional.linear(
+        hidden_states.to(dtype = lm_head_weight.dtype, device = device),
+        lm_head_weight,
+        lm_head_bias,
+    )
+    vocab_size = lm_head_weight.shape[0]
+
+    # Apply the same logit transforms as fused CE before computing NLL.
+    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
+    logit_scale_divide = kwargs.get("logit_scale_divide", None)
+    logit_softcapping = kwargs.get("logit_softcapping", None)
+    if logit_scale_multiply != 0 and logit_scale_multiply is not None:
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide != 0 and logit_scale_divide is not None:
+        logits = logits / logit_scale_divide
+    if logit_softcapping != 0 and logit_softcapping is not None:
+        logits = logits / logit_softcapping
+        logits = torch.tanh(logits)
+        logits = logits * logit_softcapping
+
+    flat_logits = logits.view(-1, vocab_size).float().contiguous()
+    flat_labels = labels.contiguous().view(-1).to(device = device).contiguous()
+    valid = flat_labels != ignore_index
+    safe_labels = flat_labels.masked_fill(~valid, 0)
+    # Ignored rows may contain non-finite logits; sanitize before log_softmax
+    # so both forward and backward remain hard-zeroed for ignored targets.
+    flat_logits = torch.where(
+        valid.unsqueeze(1),
+        flat_logits,
+        torch.zeros((), dtype = flat_logits.dtype, device = flat_logits.device),
+    )
+    logprobs = torch.nn.functional.log_softmax(flat_logits, dim = -1)
+    token_nll = -logprobs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
+    valid_float = valid.to(dtype = token_nll.dtype)
+    weights = torch.exp(-token_nll.detach()) * valid_float
+
+    if n_items is None:
+        divisor = valid_float.sum()
+    elif torch.is_tensor(n_items):
+        divisor = n_items.to(device = device, dtype = token_nll.dtype)
+    else:
+        divisor = torch.tensor(n_items, dtype = token_nll.dtype, device = device)
+    if divisor.numel() != 1: divisor = divisor.ravel()[0]
+    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+
+    loss = (token_nll * weights).sum() / divisor
+    scaled_loss = loss * scaling if scaling is not None else loss
     return scaled_loss, (loss.detach(),)
 pass
 
@@ -246,13 +332,16 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         bsz, qlen, hd = hidden_states.shape
         accumulated_loss = torch.zeros(1, device = device)[0]
+        loss_name = "DFT" if loss_function is compute_fused_dft_loss else \
+            "CE" if loss_function is compute_fused_ce_loss else \
+            getattr(loss_function, "__name__", "custom")
         # Chunk hidden_states and labels
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
             n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
         if UNSLOTH_ENABLE_LOGGING:
-            logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
+            logger.info(f"Fused {loss_name} Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
         __shift_states = torch.chunk(hidden_states.reshape(-1, hd), n_chunks, dim = 0)
         __grad_inputs  = torch.chunk(grad_inputs.view(-1, hd),   n_chunks, dim = 0)
@@ -381,6 +470,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     **extra_kwargs,
                 )
                 _FUSED_CE_COMPILE_SUPPORTED = True
+                _FUSED_CE_COMPILE_FASTPATH_PROVEN.add(loss_function)
             except Exception:
                 _FUSED_CE_COMPILE_SUPPORTED = False
                 torch._dynamo.reset()
@@ -422,8 +512,54 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
         else:
             # Fast path: compile status already known, original main branch loop
-            for (grad_inputs_j, hidden_states_j, labels_j,) in \
-                zip(__grad_inputs, __shift_states, __shift_labels,):
+            _iter = iter(zip(__grad_inputs, __shift_states, __shift_labels,))
+            if torch_compile and accumulate_chunk is not uncompiled_accumulate_chunk and \
+                loss_function not in _FUSED_CE_COMPILE_FASTPATH_PROVEN:
+
+                grad_inputs_j, hidden_states_j, labels_j = next(_iter)
+                try:
+                    accumulate_chunk(
+                        n_chunks = n_chunks,
+                        grad_inputs_j = grad_inputs_j,
+                        grad_lm_head = grad_lm_head,
+                        grad_lm_head_bias = grad_lm_head_bias,
+                        hidden_states_j = hidden_states_j,
+                        lm_head_weight = lm_head_weight,
+                        lm_head_bias = lm_head_bias,
+                        labels_j = labels_j,
+                        divisor = divisor,
+                        scaling = scaling,
+                        shift_labels = shift_labels,
+                        **extra_kwargs,
+                    )
+                    _FUSED_CE_COMPILE_FASTPATH_PROVEN.add(loss_function)
+                except Exception:
+                    _FUSED_CE_COMPILE_SUPPORTED = False
+                    torch._dynamo.reset()
+                    accumulated_loss.zero_()
+                    if not overwrite:
+                        grad_inputs.zero_()
+                    if grad_lm_head is not None: grad_lm_head.zero_()
+                    if grad_lm_head_bias is not None: grad_lm_head_bias.zero_()
+                    accumulate_chunk = uncompiled_accumulate_chunk
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"Fused {loss_name} Loss compile failed on fast path; retrying without torch.compile")
+                    accumulate_chunk(
+                        n_chunks = n_chunks,
+                        grad_inputs_j = grad_inputs_j,
+                        grad_lm_head = grad_lm_head,
+                        grad_lm_head_bias = grad_lm_head_bias,
+                        hidden_states_j = hidden_states_j,
+                        lm_head_weight = lm_head_weight,
+                        lm_head_bias = lm_head_bias,
+                        labels_j = labels_j,
+                        divisor = divisor,
+                        scaling = scaling,
+                        shift_labels = shift_labels,
+                        **extra_kwargs,
+                    )
+
+            for (grad_inputs_j, hidden_states_j, labels_j,) in _iter:
                 accumulate_chunk(
                     n_chunks = n_chunks,
                     grad_inputs_j = grad_inputs_j,
@@ -576,6 +712,64 @@ def unsloth_fused_ce_loss(
 
     return apply_autograd_function(UnslothFusedLoss, dict(
         loss_function = compute_fused_ce_loss,
+        hidden_states = hidden_states,
+        lm_head_weight = lm_head_weight,
+        lm_head_bias = lm_head_bias,
+        labels = labels,
+        mask = mask,
+        n_items = n_items,
+        scaling = scaling,
+        shift_labels = shift_labels,
+        target_gb = target_gb,
+        torch_compile = torch_compile,
+        overwrite = overwrite,
+        extra_kwargs = kwargs,
+    ))
+pass
+
+def unsloth_fused_dft_loss(
+    trainer,
+    hidden_states  : torch.Tensor,
+    lm_head_weight : torch.Tensor,
+    lm_head_bias   : Optional[torch.Tensor],
+    labels         : torch.Tensor,
+    mask           : Optional[torch.Tensor] = None,
+    n_items        : Optional[torch.Tensor] = None,
+    scaling        : Optional[float] = None,
+    target_gb      : Optional[int] = None,
+    torch_compile  : Optional[bool] = True,
+    overwrite      : Optional[bool] = False,
+    shift_labels   : bool = True,
+    **kwargs,
+):
+    """
+    Computes chunked fused DFT loss over chunk(X) @ W + b.
+    * shift_labels=True (default) shifts internally: hidden_states[..., :-1] and labels[..., 1:].
+      Set False when caller already pre-shifted (e.g. trl padding_free).
+    * Without n_chunks or target_gb, inherits UnslothFusedLoss's automatic,
+      4 GiB-capped chunk sizing.
+    * Allows scaling factor from mixed precision fp16, fp8
+    * target_gb specifies the max GB memory the fused loss can use - default detects VRAM left
+    * Upcasts to float32 and allows kwargs to have:
+    1) logit_scale_multiply (X = X * logit_scale_multiply)
+    2) logit_scale_divide   (X = X / logit_scale_divide)
+    3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
+    """
+    scaler = trainer.accelerator.scaler if trainer is not None else None
+    scaling = scaler.get_scale() if scaler is not None else scaling
+    if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
+    if TARGET_GB: target_gb = float(TARGET_GB)
+    elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
+
+    if float(kwargs.get("label_smoothing", 0.0)) != 0.0:
+        raise ValueError("Fused DFT loss does not support label_smoothing != 0.0")
+
+    device = lm_head_weight.device
+    if hidden_states.device != device:
+        hidden_states = hidden_states.to(device = device)
+
+    return apply_autograd_function(UnslothFusedLoss, dict(
+        loss_function = compute_fused_dft_loss,
         hidden_states = hidden_states,
         lm_head_weight = lm_head_weight,
         lm_head_bias = lm_head_bias,

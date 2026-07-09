@@ -109,6 +109,9 @@ jobs:
             tests/test_hf_xet_fallback.py \
             -v
 
+      - name: pytest tests/test_fused_dft_loss.py (HARD GATE)
+        run: python -m pytest tests/test_fused_dft_loss.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
