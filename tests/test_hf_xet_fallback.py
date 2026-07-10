@@ -2369,6 +2369,46 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
         variant = "fp16") is True
 
 
+def test_post_accepts_nonstandard_sharded_variant_names(tmp_path):
+    """Variant analog of #889: a variant sharded with NON-standard shard names the variant-weight regex
+    misses (the format suffix kept in the middle) is enumerated through model.safetensors.index.fp16.json,
+    so the post-download gate must accept it rather than raise a spurious DownloadStallError. Shard
+    completeness is still enforced via the index: a missing shard is rejected."""
+    shards = ["model.fp16.safetensors-00001-of-00002.safetensors",
+              "model.fp16.safetensors-00002-of-00002.safetensors"]
+    # Complete cache with the non-standard variant shard names -> accepted.
+    snap, blob = _mk_snapshot(tmp_path, "varnonstd")
+    (snap / "config.json").write_text("{}")
+    for s in shards:
+        (snap / s).symlink_to(blob)
+    (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+    # Same layout but one shard missing -> still rejected (Invariant B validates via the index).
+    snap2, blob2 = _mk_snapshot(tmp_path, "varnonstd_missing")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / shards[0]).symlink_to(blob2)
+    (snap2 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+    # The variant index does not rescue when its format is ignored (load reads .bin only).
+    snap3, blob3 = _mk_snapshot(tmp_path, "varnonstd_ignored")
+    (snap3 / "config.json").write_text("{}")
+    for s in shards:
+        (snap3 / s).symlink_to(blob3)
+    (snap3 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.safetensors"],
+        variant = "fp16") is False
+
+
 def test_post_download_rejects_patterned_canonical_only_for_variant(tmp_path):
     """The variant check applies to the patterned branch too: a subfolder variant request kept only the canonical weight is rejected."""
     snap, blob = _mk_snapshot(tmp_path, "subvar")

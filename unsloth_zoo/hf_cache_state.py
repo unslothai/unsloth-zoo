@@ -336,6 +336,28 @@ def _filter_paths(
         return list(paths)
 
 
+def _read_format_kept(weight_name: str, ignore_patterns: "Optional[list]") -> bool:
+    """Whether a weight of *weight_name*'s format survives the ignore filter -- i.e. the load actually
+    reads it, so its presence (or an index enumerating it) is real evidence and not a stale
+    excluded-format artifact (a ``pytorch_model.bin`` under ``ignore=['*.bin']``). Shared by the presence
+    checks (Invariant A) and the shard-completeness checks (Invariant B) so both judge the ignore filter
+    identically. *ignore_patterns* must be a normalized list (see ``_as_pattern_list``) or None."""
+    if not ignore_patterns:
+        return True
+    return bool(_filter_paths([weight_name], None, ignore_patterns))
+
+
+def _index_weight_probe(index_name: str, variant: "Optional[str]" = None) -> str:
+    """The canonical ROOT weight filename whose FORMAT a shard *index* enumerates, used as the ignore
+    filter probe: a ``.safetensors.index.`` index -> ``model[.<variant>].safetensors``, any other (``.bin
+    .index.``) -> ``pytorch_model[.<variant>].bin``. Centralizes the safetensors-vs-bin split so the
+    presence checks (Invariant A) and completeness checks (Invariant B) map an index to the SAME probe."""
+    token = f".{variant}" if variant else ""
+    if ".safetensors.index." in index_name:
+        return f"model{token}.safetensors"
+    return f"pytorch_model{token}.bin"
+
+
 def _broken_symlink_rel_paths(snapshot_dir: Path) -> list:
     """Repo-relative posix paths of every dangling symlink in *snapshot_dir*, so the interrupted-download
     signal can be scoped to the files a request selects."""
@@ -516,29 +538,26 @@ def _canonical_root_weights_complete(
         elif _safe_is_file(entry):
             root_files.add(entry.name)
 
-    def _format_kept(weight_name: str) -> bool:
-        # The read format must survive the ignore filter, else the file is a stale excluded-format artifact.
-        if not ignore_patterns:
-            return True
-        return bool(_filter_paths([weight_name], None, ignore_patterns))
-
-    st_index = next((e for e in root_indices if ".safetensors.index." in e.name), None)
-    bin_index = next((e for e in root_indices if ".bin.index." in e.name), None)
+    # Map each present root index to the weight it enumerates, so the format split is single-sourced in
+    # _index_weight_probe (each canonical index maps to a distinct format, so no probe collides).
+    index_by_read = {_index_weight_probe(e.name): e for e in root_indices}
+    st_index = index_by_read.get("model.safetensors")
+    bin_index = index_by_read.get("pytorch_model.bin")
     # transformers' local precedence, mirrored: single safetensors before the safetensors index,
     # safetensors before the .bin single, .bin single before the .bin index. So a complete single weight
     # is never masked by a stale index, and an incomplete PREFERRED safetensors index is breakage a
     # complete .bin must not mask. An ignore-dropped format is skipped so the next read format is judged.
-    if "model.safetensors" in root_files and _format_kept("model.safetensors"):
+    if "model.safetensors" in root_files and _read_format_kept("model.safetensors", ignore_patterns):
         return True
-    if st_index is not None and _format_kept("model.safetensors"):
+    if st_index is not None and _read_format_kept("model.safetensors", ignore_patterns):
         return _weight_shard_index_complete(st_index)
-    if prefer_safetensors and _format_kept("model.safetensors"):
+    if prefer_safetensors and _read_format_kept("model.safetensors", ignore_patterns):
         # STRICT gate: safetensors is preferred but absent, and a bin-only cache cannot prove it absent
         # remotely, so a default load would fetch it over Xet -> defer to the child.
         return False
-    if "pytorch_model.bin" in root_files and _format_kept("pytorch_model.bin"):
+    if "pytorch_model.bin" in root_files and _read_format_kept("pytorch_model.bin", ignore_patterns):
         return True
-    if bin_index is not None and _format_kept("pytorch_model.bin"):
+    if bin_index is not None and _read_format_kept("pytorch_model.bin", ignore_patterns):
         return _weight_shard_index_complete(bin_index)
     return False
 
@@ -641,12 +660,8 @@ def _sentence_transformers_subfolder_incomplete(
             names = {entry.name for entry in sub.iterdir()} if _safe_is_dir(sub) else set()
         except OSError:
             names = set()
-        st_read = (not ignore_patterns) or bool(
-            _filter_paths([f"{path}/model.safetensors"], None, ignore_patterns)
-        )
-        bin_read = (not ignore_patterns) or bool(
-            _filter_paths([f"{path}/pytorch_model.bin"], None, ignore_patterns)
-        )
+        st_read = _read_format_kept(f"{path}/model.safetensors", ignore_patterns)
+        bin_read = _read_format_kept(f"{path}/pytorch_model.bin", ignore_patterns)
         st_present = "model.safetensors" in names and st_read
         bin_present = "pytorch_model.bin" in names and bin_read
         if prefer_safetensors and st_read:
@@ -706,12 +721,6 @@ def _has_incomplete_variant_root_shards(
     dash_infix = f".{variant}-"    # a sharded variant weight (model.<variant>-00001-of-00002.safetensors)
     ignore_patterns = _as_pattern_list(ignore_patterns)
 
-    def _format_kept(weight_name: str) -> bool:
-        # The read format must survive the ignore filter, else the file is a stale excluded-format artifact.
-        if not ignore_patterns:
-            return True
-        return bool(_filter_paths([weight_name], None, ignore_patterns))
-
     try:
         entries = list(snapshot_dir.iterdir())
     except OSError:
@@ -725,26 +734,23 @@ def _has_incomplete_variant_root_shards(
         # Restrict to the ROOT model index; an adapter_model / other non-model variant index the default
         # load does not read is skipped so its incompleteness cannot force-fail the model variant.
         if dot_infix in name and _ROOT_MODEL_SHARD_INDEX_RE.match(name):
-            is_safetensors = ".safetensors.index." in name
-            fmt_probe = (
-                f"model.{variant}.safetensors" if is_safetensors else f"pytorch_model.{variant}.bin"
-            )
-            if not _format_kept(fmt_probe):
+            probe = _index_weight_probe(name, variant)
+            if not _read_format_kept(probe, ignore_patterns):
                 continue  # this format is ignored -> the load does not read it
             incomplete = not (_safe_is_file(entry) and _weight_shard_index_complete(entry))
-            if is_safetensors:
+            if probe.endswith(".safetensors"):
                 st_index_incomplete = incomplete
             else:
                 bin_index_incomplete = incomplete
         elif dash_infix in name and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
-            if _safe_is_file(entry) and _format_kept(name):
+            if _safe_is_file(entry) and _read_format_kept(name, ignore_patterns):
                 if name.endswith(".safetensors"):
                     has_st_shard = True
                 else:
                     has_bin_shard = True
         elif dot_infix in name and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
             # a single-file ROOT model variant weight (model.<variant>.safetensors / .bin).
-            if _safe_is_file(entry) and _format_kept(name):
+            if _safe_is_file(entry) and _read_format_kept(name, ignore_patterns):
                 if name.endswith(".safetensors"):
                     has_single_st = True
                 else:
