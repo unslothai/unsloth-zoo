@@ -53,6 +53,7 @@ from unsloth_zoo.hf_cache_state import (
     _has_glob,
     _has_incomplete_canonical_root_shards,
     _has_incomplete_variant_root_shards,
+    _is_canonical_weight_shard_index,
     _is_loadable_weight_file,
     _selected_shard_index_incomplete,
     _sentence_transformers_subfolder_incomplete,
@@ -1200,6 +1201,8 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
         return _has_diffusers_component_weight(snapshot_dir, ignore_patterns = ignore_patterns)
     rels: list = []
     tf_flax_rels: list = []
+    has_st_index = False
+    has_bin_index = False
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
@@ -1210,11 +1213,27 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
                 continue
             if _CANONICAL_ROOT_MODEL_WEIGHT_RE.match(name):
                 rels.append(name)  # canonical model / pytorch_model (single or shard)
+            elif _is_canonical_weight_shard_index(name):
+                # a sharded model enumerated via its canonical root index (shard files may carry a
+                # non-standard name the regex above misses); track per-format for the ignore filter.
+                if ".safetensors.index." in name:
+                    has_st_index = True
+                else:
+                    has_bin_index = True
             elif _CANONICAL_ROOT_TF_FLAX_WEIGHT_RE.match(name):
                 tf_flax_rels.append(name)  # TF/Flax root weight (from_tf / from_flax)
     except OSError:
         return False
     if _filter_paths(rels, None, ignore_patterns):
+        return True
+    # A canonical ROOT shard INDEX of a kept format proves a readable weight even when the shard files
+    # carry a NON-standard name the canonical regex misses (e.g. model.safetensors-00001-of-00002
+    # .safetensors, referenced that way by the index's weight_map). transformers enumerates the sharded
+    # weight through the index, so its presence is the readable-weight signal; shard completeness stays
+    # Invariant B's job (_readable_shard_set_incomplete).
+    if has_st_index and _filter_paths(["model.safetensors"], None, ignore_patterns):
+        return True
+    if has_bin_index and _filter_paths(["pytorch_model.bin"], None, ignore_patterns):
         return True
     # from_tf / from_flax (both PyTorch formats ignored): count a SINGLE-FILE TF/Flax weight or a COMPLETE
     # sharded set (index + every listed shard present), so a complete h5/msgpack download is not
@@ -1241,7 +1260,13 @@ def _root_has_variant_weight(
     ``model.<variant>-00001-of-00002.safetensors`` (``.<variant>-`` shard infix), matched by
     ``_ROOT_MODEL_VARIANT_WEIGHT_RE`` plus the variant infix. A non-canonical base, PEFT adapter, or
     non-``model`` variant is excluded -> a cache holding only those is retried over HTTP. The ignore
-    filter is applied so an ignored-format partial does not count."""
+    filter is applied so an ignored-format partial does not count.
+
+    Unlike ``_root_model_has_weight``, this intentionally does NOT recognize a variant shard *index*
+    (``model.<variant>.safetensors.index.json``): a variant whose shard files carry a non-standard name
+    is a rare combination not yet needed (standard-named variant shards match the regex via the
+    ``.<variant>-`` infix). The variant completeness sibling ``_has_incomplete_variant_root_shards`` does
+    read the index, so revisit this if such a repo ever surfaces."""
     infix_dot = f".{variant}."
     infix_dash = f".{variant}-"
     rels: list = []

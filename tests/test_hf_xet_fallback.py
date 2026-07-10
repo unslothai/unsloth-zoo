@@ -2197,6 +2197,45 @@ def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
+def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
+    """Regression for issue #889: unsloth/Qwen3.5-4B shards its safetensors with a NON-standard name that
+    keeps the format suffix in the middle (model.safetensors-00001-of-00002.safetensors), referenced that
+    way by model.safetensors.index.json. transformers enumerates the weight through the index, so the
+    post-download gate must accept it rather than raise a spurious DownloadStallError. Shard completeness
+    is still enforced: a missing shard is rejected, and the standard sharded layout is unaffected."""
+    shards = ["model.safetensors-00001-of-00002.safetensors",
+              "model.safetensors-00002-of-00002.safetensors"]
+    # Complete cache with the non-standard shard names -> accepted (the #889 fix).
+    snap, blob = _mk_snapshot(tmp_path, "qwen35_nonstd")
+    (snap / "config.json").write_text("{}")
+    for s in shards:
+        (snap / s).symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+    # Same layout but one shard missing -> still rejected (Invariant B validates via the index).
+    snap2, blob2 = _mk_snapshot(tmp_path, "qwen35_nonstd_missing")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / shards[0]).symlink_to(blob2)
+    (snap2 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # Sanity: the standard sharded layout still passes.
+    snap3, blob3 = _mk_snapshot(tmp_path, "qwen35_standard")
+    (snap3 / "config.json").write_text("{}")
+    std = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for s in std:
+        (snap3 / s).symlink_to(blob3)
+    (snap3 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": std[0], "b": std[1]}}))
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
 def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_path):
     """A sentence-transformers model reads a weight-bearing subfolder module (2_Dense) the canonical root
     gate does not check, so a partial cache holding the root weight but missing the 2_Dense weight must
