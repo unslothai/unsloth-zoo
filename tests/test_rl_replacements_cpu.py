@@ -21,15 +21,17 @@ Covers:
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
   - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
     top_entropy_quantile, use_bias_correction_kl)
-  - `UnslothEfficientGRPO` at n_chunks=1 matches a naive grpo_compute_loss pass,
-    and n_chunks>1 (equal or ragged chunks) is loss- and gradient-identical to
-    n_chunks=1 for every loss type (global normalizers threaded per chunk)
+  - `_warn_deprecated_n_chunks` (warn-once that unsloth_num_chunks has no effect)
+  - `UnslothEfficientGRPO` on the single-chunk path (the only path
+    grpo_accumulated_loss uses) matches a naive grpo_compute_loss pass in loss
+    and gradient for every loss type
   - `RL_REPLACEMENTS` dict integrity (every value is callable; the
     well-known public-API keys are populated).
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from types import SimpleNamespace
@@ -292,15 +294,66 @@ def test_warn_unsupported_grpo_options_registered():
 
 
 # ---------------------------------------------------------------------------
-# UnslothEfficientGRPO batch chunking
+# _warn_deprecated_n_chunks  (unsloth_num_chunks is accepted but has no effect)
 # ---------------------------------------------------------------------------
-# UnslothEfficientGRPO threads full-batch (global) normalizers into every chunk's
-# grpo_compute_loss call, so chunk losses sum to the exact full-batch loss and each
-# chunk's gradient slice is already globally scaled (no division by n_chunks). These
-# tests pin (1) n_chunks=1 is numerically identical (loss and gradient) to a naive
-# grpo_compute_loss pass (the global kwargs default to None, keeping the single-chunk
-# path bit-identical), and (2) n_chunks>1, including chunk counts that do not divide
-# the batch evenly, matches n_chunks=1 for every loss type in loss AND gradient.
+# grpo_accumulated_loss keeps n_chunks in its signature because unsloth's generated
+# GRPO trainer passes unsloth_num_chunks, but loss chunking was removed: the
+# UnslothEfficientGRPO call always runs the whole batch as a single chunk. Any
+# non-default request (not None / -1 / 1) warns once per process.
+
+
+def test_warn_deprecated_n_chunks_silent_on_defaults(caplog, monkeypatch):
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_deprecated_n_chunks(None)
+        rr._warn_deprecated_n_chunks(-1)
+        rr._warn_deprecated_n_chunks(1)
+    assert caplog.records == []
+    # Defaults must not consume the warn-once flag.
+    assert rr._n_chunks_deprecation_warned is False
+
+
+@pytest.mark.parametrize("n_chunks", [-2, 0, 2, 4, 1000])
+def test_warn_deprecated_n_chunks_fires_for_non_default(n_chunks, caplog, monkeypatch):
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_deprecated_n_chunks(n_chunks)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "unsloth_num_chunks is deprecated" in msgs[0]
+
+
+def test_warn_deprecated_n_chunks_fires_once(caplog, monkeypatch):
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_deprecated_n_chunks(4)
+        rr._warn_deprecated_n_chunks(2)
+        rr._warn_deprecated_n_chunks(4)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+
+
+def test_warn_deprecated_n_chunks_registered():
+    assert rr.RL_REPLACEMENTS.get("_warn_deprecated_n_chunks") is rr._warn_deprecated_n_chunks
+
+
+def test_grpo_accumulated_loss_does_not_forward_n_chunks():
+    # The n_chunks request must not reach UnslothEfficientGRPO.apply: the whole batch
+    # runs as a single chunk regardless of the requested value, so a non-default
+    # request computes the same loss as the default (pinned against the naive pass in
+    # test_efficient_grpo_single_chunk_matches_naive below).
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert "UnslothEfficientGRPO.apply" in src
+    apply_args = src.split("UnslothEfficientGRPO.apply(", 1)[1].split(")", 1)[0]
+    assert "n_chunks" not in apply_args
+
+
+# ---------------------------------------------------------------------------
+# UnslothEfficientGRPO single-chunk path
+# ---------------------------------------------------------------------------
+# grpo_accumulated_loss always invokes UnslothEfficientGRPO with a single chunk
+# (the whole batch). Pin that this path is numerically identical (loss and
+# gradient) to a naive grpo_compute_loss pass for every loss type.
 
 
 @pytest.fixture
@@ -320,7 +373,7 @@ def _vespo_gamma_weights(advantages, log_ratio_per_token, mask, importance_sampl
                          k_pos=2.0, lambda_pos=3.0, k_neg=3.0, lambda_neg=2.0):
     # Faithful per-sequence VESPO gamma weights (mirrors TRL GRPOTrainer.get_gamma_weights):
     # phi(w) = e^lambda * w^k * e^{-lambda w} with w the sequence-level ratio. Each row depends
-    # only on its own tokens (seq_log_ratio sums over that row), so it is chunk-invariant.
+    # only on its own tokens (seq_log_ratio sums over that row).
     lower = math.log(1e-8)
     seq_log_ratio = (torch.clamp(log_ratio_per_token, -20.0, 20.0) * mask).sum(-1, keepdim=True)
     if importance_sampling_ratio is not None:
@@ -357,9 +410,9 @@ def _grpo_loss_fixture(loss_type, B=6, T=5, V=17):
 
 
 @pytest.mark.parametrize(
-    "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo"]
+    "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
 )
-def test_efficient_grpo_nchunks1_matches_naive(loss_type, disable_dynamo):
+def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     beta = 0.04
     lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
@@ -383,116 +436,3 @@ def test_efficient_grpo_nchunks1_matches_naive(loss_type, disable_dynamo):
     assert torch.allclose(
         new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
     ), f"{loss_type}: gradient mismatch"
-
-
-_ALL_LOSS_TYPES = ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
-
-
-def _run_efficient_grpo(new, old, ref, input_ids, mask, advantages, kwargs,
-                        n_chunks, beta=0.04):
-    lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
-    ne = new.clone().requires_grad_(True)
-    out = rr.UnslothEfficientGRPO.apply(
-        ne, old, ref, None, lm_head, input_ids, mask, advantages,
-        beta, None, n_chunks, kwargs,
-    )
-    out[0].backward()
-    # (loss, completion_length, mean_kl, grad)
-    return out[0].detach().double(), out[1].detach().double(), \
-        out[2].detach().double(), ne.grad.clone()
-
-
-@pytest.mark.parametrize("n_chunks", [2, 3, 4])
-@pytest.mark.parametrize("loss_type", _ALL_LOSS_TYPES)
-def test_efficient_grpo_nchunks_invariant(loss_type, n_chunks, disable_dynamo):
-    # Core correctness proof for batch chunking: n_chunks in {2,3,4} must give the
-    # same loss AND gradient (and folded metrics) as n_chunks=1 for every loss type.
-    # B=6 makes n_chunks=2,3 equal-sized splits; n_chunks=4 exercises a chunk count
-    # that does not divide the batch (torch.chunk(6, 4) -> 3 chunks of 2 rows).
-    fixture = _grpo_loss_fixture(loss_type, B=6)
-    new, old, ref, input_ids, mask, advantages, kwargs = fixture
-
-    loss_1, clen_1, kl_1, grad_1 = _run_efficient_grpo(*fixture, n_chunks=1)
-    loss_k, clen_k, kl_k, grad_k = _run_efficient_grpo(*fixture, n_chunks=n_chunks)
-
-    # The loss accumulator buffer in UnslothEfficientGRPO is float32, so summed
-    # chunk losses agree with the single-chunk loss at fp32 resolution; the fp64
-    # gradient below is the strict 1e-8 invariance proof.
-    assert torch.allclose(loss_k, loss_1, atol=1e-8, rtol=1e-6), \
-        f"{loss_type}: loss mismatch at n_chunks={n_chunks}"
-    assert torch.allclose(grad_k, grad_1, atol=1e-8, rtol=1e-8), \
-        f"{loss_type}: gradient mismatch at n_chunks={n_chunks}"
-    # Metrics accumulate in float32 buffers, so compare at fp32 resolution.
-    assert torch.allclose(clen_k, clen_1, atol=1e-6, rtol=1e-6), \
-        f"{loss_type}: completion_length mismatch at n_chunks={n_chunks}"
-    assert torch.allclose(kl_k, kl_1, atol=1e-6, rtol=1e-6), \
-        f"{loss_type}: mean_kl mismatch at n_chunks={n_chunks}"
-
-
-@pytest.mark.parametrize("loss_type", _ALL_LOSS_TYPES)
-def test_efficient_grpo_ragged_chunks_match(loss_type, disable_dynamo):
-    # Unequal chunk sizes must still be exact: B=7 with n_chunks=3 splits into
-    # (3, 3, 1)-row chunks. Global normalization makes ragged chunks correct too
-    # (the caller only snaps to divisors to avoid torch.compile recompiles).
-    fixture = _grpo_loss_fixture(loss_type, B=7)
-
-    loss_1, clen_1, kl_1, grad_1 = _run_efficient_grpo(*fixture, n_chunks=1)
-    loss_3, clen_3, kl_3, grad_3 = _run_efficient_grpo(*fixture, n_chunks=3)
-
-    # fp32 loss accumulator: see test_efficient_grpo_nchunks_invariant.
-    assert torch.allclose(loss_3, loss_1, atol=1e-8, rtol=1e-6), \
-        f"{loss_type}: loss mismatch on ragged chunks"
-    assert torch.allclose(grad_3, grad_1, atol=1e-8, rtol=1e-8), \
-        f"{loss_type}: gradient mismatch on ragged chunks"
-    # Metrics accumulate in float32 buffers, so compare at fp32 resolution.
-    assert torch.allclose(clen_3, clen_1, atol=1e-6, rtol=1e-6), \
-        f"{loss_type}: completion_length mismatch on ragged chunks"
-    assert torch.allclose(kl_3, kl_1, atol=1e-6, rtol=1e-6), \
-        f"{loss_type}: mean_kl mismatch on ragged chunks"
-
-
-# ---------------------------------------------------------------------------
-# _snap_n_chunks: any unsloth_num_chunks request -> a valid divisor in [1, n_rows]
-# ---------------------------------------------------------------------------
-#
-# unsloth_num_chunks accepts any int; the snap clamps it into range and rounds up to a
-# divisor of the batch row count so UnslothEfficientGRPO always splits into equal chunks.
-# -1/None -> n_rows (most chunks); < 1 -> 1; > n_rows -> n_rows; else next divisor up.
-
-
-@pytest.mark.parametrize("n_rows", [1, 2, 6, 7, 8, 12, 13])  # incl. primes 7, 13
-def test_snap_n_chunks_always_valid_divisor(n_rows):
-    candidates = [-100, -2, -1, 0, 1, 2, 3, 4, 5, n_rows - 1, n_rows, n_rows + 1, 1000, None]
-    for n in candidates:
-        r = rr._snap_n_chunks(n, n_rows)
-        assert 1 <= r <= n_rows, f"n={n} n_rows={n_rows} -> {r} out of range"
-        assert n_rows % r == 0, f"n={n} n_rows={n_rows} -> {r} not a divisor"
-
-
-def test_snap_n_chunks_sentinels_and_clamps():
-    assert rr._snap_n_chunks(-1, 6) == 6      # -1 = most chunks (one row per chunk)
-    assert rr._snap_n_chunks(None, 6) == 6    # None behaves like -1
-    assert rr._snap_n_chunks(0, 6) == 1       # below 1 clamps to whole batch
-    assert rr._snap_n_chunks(-5, 6) == 1      # any other negative clamps to 1
-    assert rr._snap_n_chunks(1000, 6) == 6    # above n_rows clamps to n_rows
-    assert rr._snap_n_chunks(1, 6) == 1       # whole batch
-    assert rr._snap_n_chunks(2, 6) == 2       # exact divisor kept
-    assert rr._snap_n_chunks(4, 6) == 6       # non-divisor rounds up (6 has no divisor 4 or 5)
-    assert rr._snap_n_chunks(4, 8) == 4       # exact divisor kept
-    assert rr._snap_n_chunks(3, 7) == 7       # prime: only 1 and 7
-
-
-def test_snap_n_chunks_matches_numpy_divisor_snap_for_positive_requests():
-    np = pytest.importorskip("numpy")
-
-    def numpy_snap(n_chunks, bsz):
-        factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
-        if n_chunks == -1:
-            n_chunks = bsz
-        return factors[min(np.searchsorted(factors, n_chunks), len(factors) - 1)]
-
-    for n_rows in [2, 6, 7, 8, 12, 13]:
-        for n in range(1, n_rows + 2):
-            assert rr._snap_n_chunks(n, n_rows) == numpy_snap(n, n_rows), (
-                f"n={n} n_rows={n_rows}"
-            )
