@@ -350,3 +350,13 @@ def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
     # CUDA machinery stays behind is_cuda; CPU-only platforms take the pageable path.
     assert "is_cuda" in fwd
     assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
+
+
+def test_offloaded_log_softmax_keep_on_gpu_budget_is_cumulative():
+    # The padded GRPO loop runs N forwards before any backward; a per-chunk
+    # 4x-free check alone compounds retained chunks toward all free memory.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    block = src[src.index("    def to_device"):src.index("    def efficient_log_softmax")]
+    assert "offload_retained_bytes = [0]" in block
+    assert "4 * (tensor_bytes + offload_retained_bytes[0]) <= free_bytes" in block
+    assert "offload_retained_bytes[0] += tensor_bytes" in block

@@ -1346,6 +1346,9 @@ def grpo_accumulated_loss(
         if tensor is None: return None
         return tensor.to(device, non_blocking=non_blocking)
 
+    # Bytes kept on GPU by this step's chunk loop; recreated per call, so no cross-step state.
+    offload_retained_bytes = [0]
+
     class Unsloth_Offloaded_Log_Softmax(torch.autograd.Function):
         """Manual gradient checkpointing / CPU offloading for log softmax."""
         @staticmethod
@@ -1364,9 +1367,12 @@ def grpo_accumulated_loss(
                     tensor_bytes = detached_hidden_states.numel() * detached_hidden_states.element_size()
                 except Exception:
                     free_bytes, tensor_bytes = 0, 1
-                if tensor_bytes * 4 <= free_bytes:
-                    # Enough headroom: keep the alias on GPU (mem_get_info failure defaults to offload).
+                if 4 * (tensor_bytes + offload_retained_bytes[0]) <= free_bytes:
+                    # Headroom must also cover chunks already kept this step: the padded loop
+                    # runs N forwards before any backward, and per-chunk 4x checks alone
+                    # compound toward all free memory (mem_get_info failure defaults to offload).
                     saved_hidden_states = detached_hidden_states
+                    offload_retained_bytes[0] += tensor_bytes
                 else:
                     # Async D2H via pinned buffer on a side stream; backward MUST wait on
                     # copy_event before the H2D reload or the copy races.
