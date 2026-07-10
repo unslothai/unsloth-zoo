@@ -499,11 +499,8 @@ def grpo_compute_loss(
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-        # Importance sampling correction for the KL divergence (TRL
-        # GRPOConfig.use_bias_correction_kl, DeepSeek-V3.2 paper). Matches TRL: applied
-        # before the loss_type dispatch with the pre-delta-clamp, non-detached coef_1
-        # ((B, T) token level, (B, 1) sequence level broadcast), and the corrected KL
-        # feeds both the beta * kl term and the mean_kl metric below.
+        # IS-corrected KL as in TRL (use_bias_correction_kl): pre-clamp non-detached
+        # coef_1, applied before the loss_type dispatch; also feeds the mean_kl metric.
         if use_bias_correction_kl:
             kl_i = kl_i * coef_1
     else:
@@ -768,7 +765,6 @@ def _warn_unsupported_grpo_options(trainer):
     args = getattr(trainer, "args", None)
 
     unsupported = []
-    # Older TRL may lack this attribute; fall back to the default so we never warn.
     top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
     if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
         unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
@@ -784,7 +780,6 @@ def _warn_unsupported_grpo_options(trainer):
         except Exception:
             import warnings as _warnings
             _warnings.warn(message)
-    # Flag set after first check so it runs at most once per trainer.
     trainer._unsloth_grpo_unsupported_warned = True
     return
 pass
@@ -834,8 +829,7 @@ def grpo_accumulated_loss(
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
-    # Warn once about **kwargs-passthrough GRPO options the fast path ignores. Imported
-    # here (not module scope) so the inlined copy in the generated trainer cache resolves.
+    # Body-local import so the copy inlined into the generated trainer cache resolves.
     try:
         from unsloth_zoo.rl_replacements import _warn_unsupported_grpo_options
         _warn_unsupported_grpo_options(trainer)
@@ -881,10 +875,8 @@ def grpo_accumulated_loss(
     # KL bias correction (TRL 0.27.0+); older TRL lacks the field -> off, the default.
     kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
-    # n_chunks (GRPOConfig.unsloth_num_chunks) stays in the signature because unsloth's
-    # generated trainer passes it, but loss chunking was removed: the UnslothEfficientGRPO
-    # call below always runs the whole batch as a single chunk. Body-local import so the
-    # copy of this function inlined into the generated trainer cache resolves the helper.
+    # n_chunks stays in the signature (generated trainers still pass unsloth_num_chunks)
+    # but chunking was removed; body-local import for the inlined trainer-cache copy.
     try:
         from unsloth_zoo.rl_replacements import _warn_deprecated_n_chunks
         _warn_deprecated_n_chunks(n_chunks)
