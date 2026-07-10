@@ -20,7 +20,10 @@ Covers:
   - `align_logprobs_with_mask` (insert per-batch left padding into logprobs)
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
   - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
-    top_entropy_quantile, use_bias_correction_kl)
+    top_entropy_quantile; use_bias_correction_kl is supported so it must not warn)
+  - `grpo_compute_loss` with `use_bias_correction_kl=True` (KL x importance-sampling
+    ratio, TRL GRPOConfig.use_bias_correction_kl) matches an inline TRL-mirror
+    reference in loss, gradient and mean_kl for token and sequence IS levels
   - `_warn_deprecated_n_chunks` (warn-once that unsloth_num_chunks has no effect)
   - `UnslothEfficientGRPO` on the single-chunk path (the only path
     grpo_accumulated_loss uses) matches a naive grpo_compute_loss pass in loss
@@ -223,9 +226,10 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
 # ---------------------------------------------------------------------------
 # _warn_unsupported_grpo_options  (Issue 1: silently-ignored GRPO config options)
 # ---------------------------------------------------------------------------
-# The fast GRPO path ignores top_entropy_quantile < 1.0 and use_bias_correction_kl
-# = True; the helper warns once per trainer on non-defaults only (TRL 1.7.1 defaults
-# are 1.0 and False, so defaults must NOT warn).
+# The fast GRPO path ignores top_entropy_quantile < 1.0; the helper warns once per
+# trainer on non-defaults only (the TRL 1.7.1 default is 1.0, so the default must NOT
+# warn). use_bias_correction_kl is implemented (grpo_compute_loss applies kl_i * coef_1)
+# so setting it must never warn.
 
 
 def _make_grpo_trainer(**args):
@@ -259,24 +263,25 @@ def test_warn_unsupported_grpo_options_fires_for_top_entropy_quantile(caplog):
     assert "use_bias_correction_kl" not in msgs[0]
 
 
-def test_warn_unsupported_grpo_options_fires_for_use_bias_correction_kl(caplog):
+def test_warn_unsupported_grpo_options_silent_for_use_bias_correction_kl(caplog):
+    # use_bias_correction_kl is supported (grpo_compute_loss applies kl_i * coef_1),
+    # so enabling it must NOT warn.
     trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=True)
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
-    msgs = [r.getMessage() for r in caplog.records]
-    assert len(msgs) == 1
-    assert "use_bias_correction_kl=True" in msgs[0]
-    assert "top_entropy_quantile" not in msgs[0]
+    assert caplog.records == []
 
 
-def test_warn_unsupported_grpo_options_lists_both(caplog):
+def test_warn_unsupported_grpo_options_never_mentions_use_bias_correction_kl(caplog):
+    # Even when another option warns, the supported use_bias_correction_kl must not
+    # appear in the message.
     trainer = _make_grpo_trainer(top_entropy_quantile=0.5, use_bias_correction_kl=True)
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
     msgs = [r.getMessage() for r in caplog.records]
     assert len(msgs) == 1
     assert "top_entropy_quantile=0.5" in msgs[0]
-    assert "use_bias_correction_kl=True" in msgs[0]
+    assert "use_bias_correction_kl" not in msgs[0]
 
 
 def test_warn_unsupported_grpo_options_fires_once(caplog):
@@ -436,3 +441,191 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     assert torch.allclose(
         new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
     ), f"{loss_type}: gradient mismatch"
+
+
+# ---------------------------------------------------------------------------
+# use_bias_correction_kl  (TRL GRPOConfig.use_bias_correction_kl, DeepSeek-V3.2)
+# ---------------------------------------------------------------------------
+# TRL grpo_trainer._compute_loss (main @ f782735, identical in 0.27.0):
+#
+#     coef_1 = torch.exp(log_importance_weights)
+#     if self.beta != 0.0:
+#         per_token_kl = (
+#             torch.exp(ref_per_token_logps - per_token_logps)
+#             - (ref_per_token_logps - per_token_logps) - 1
+#         )
+#         # Importance sampling correction for the KL divergence
+#         if self.args.use_bias_correction_kl:
+#             per_token_kl = per_token_kl * coef_1
+#
+# The correction runs before the loss_type dispatch (so all loss types), uses the
+# pre-delta-clamp NON-detached coef_1 ((B,T) token level, (B,1) sequence level
+# broadcast), and the corrected KL feeds both `beta * per_token_kl` in the loss and
+# the kl metric. grpo_compute_loss must reproduce that.
+
+
+def _trl_mirror_grpo_loss(
+    ref, new, old, mask, beta, advantages,
+    importance_sampling_level="token", use_bias_correction_kl=False,
+    epsilon_low=0.2, epsilon_high=0.2,
+):
+    # Line-by-line mirror of TRL _compute_loss for loss_type="grpo" (quoted above),
+    # kept independent of unsloth_zoo internals. mean_kl uses unsloth's per-row
+    # masked-mean convention so it is comparable with grpo_compute_loss's metric.
+    if advantages.dim() == 1:
+        advantages = advantages.unsqueeze(1)
+    log_ratio = new - old
+    if importance_sampling_level == "token":
+        log_importance_weights = log_ratio
+    else:
+        log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = log_importance_weights.unsqueeze(-1)
+    coef_1 = torch.exp(log_importance_weights)
+    per_token_kl = torch.exp(ref - new) - (ref - new) - 1
+    if use_bias_correction_kl:
+        per_token_kl = per_token_kl * coef_1
+    coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+    per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+    per_token_loss = per_token_loss + beta * per_token_kl
+    loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+    mean_kl = ((per_token_kl * mask).sum(-1) / mask.sum(-1)).mean()
+    return loss, mean_kl
+
+
+@pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
+@pytest.mark.parametrize("use_bias_correction_kl", [False, True])
+def test_grpo_compute_loss_bias_correction_kl_matches_trl_mirror(
+    importance_sampling_level, use_bias_correction_kl
+):
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    kwargs["importance_sampling_level"] = importance_sampling_level
+    kwargs["use_bias_correction_kl"] = use_bias_correction_kl
+
+    new_ours = new.clone().requires_grad_(True)
+    loss, _completion_length, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new_ours, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss.backward()
+
+    new_trl = new.clone().requires_grad_(True)
+    loss_trl, mean_kl_trl = _trl_mirror_grpo_loss(
+        ref, new_trl, old, mask, beta, advantages,
+        importance_sampling_level=importance_sampling_level,
+        use_bias_correction_kl=use_bias_correction_kl,
+    )
+    loss_trl.backward()
+
+    assert torch.allclose(loss.detach(), loss_trl.detach(), atol=1e-10, rtol=1e-8)
+    assert torch.allclose(mean_kl.detach(), mean_kl_trl.detach(), atol=1e-10, rtol=1e-8)
+    # Gradient must flow through the NON-detached coef_1 in the corrected KL term.
+    assert torch.allclose(new_ours.grad, new_trl.grad, atol=1e-10, rtol=1e-8)
+
+
+def test_grpo_compute_loss_bias_correction_kl_changes_loss_and_mean_kl():
+    # Guard against the kwarg being silently dropped: with beta != 0 and old != new,
+    # enabling the correction must change both the loss and the kl metric. Shift old
+    # by a constant so coef_1 ~= e^0.5 everywhere: with the fixture's symmetric noise
+    # alone, E[kl_i * (coef_1 - 1)] ~= 0 and the loss shift can fall inside allclose's
+    # default tolerance.
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    old = old - 0.5
+    loss_off, _, mean_kl_off, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss_on, _, mean_kl_on, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages,
+        use_bias_correction_kl=True, **kwargs
+    )
+    assert not torch.allclose(loss_on, loss_off)
+    assert not torch.allclose(mean_kl_on, mean_kl_off)
+
+
+def test_grpo_compute_loss_bias_correction_kl_defaults_off():
+    # Omitting the kwarg must behave exactly like use_bias_correction_kl=False
+    # (the TRL GRPOConfig default).
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    loss_default, _, kl_default, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss_off, _, kl_off, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages,
+        use_bias_correction_kl=False, **kwargs
+    )
+    assert torch.equal(loss_default, loss_off)
+    assert torch.equal(kl_default, kl_off)
+
+
+def test_grpo_compute_loss_bias_correction_kl_noop_when_beta_zero():
+    # TRL only computes (and corrects) the KL term when beta != 0; with beta == 0 the
+    # flag must have no effect on the loss.
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    loss_off, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, 0.0, advantages, **kwargs
+    )
+    loss_on, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, 0.0, advantages,
+        use_bias_correction_kl=True, **kwargs
+    )
+    assert torch.equal(loss_on, loss_off)
+
+
+@pytest.mark.parametrize(
+    "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
+)
+def test_efficient_grpo_forwards_use_bias_correction_kl(loss_type, disable_dynamo):
+    # UnslothEfficientGRPO passes extra_kwargs through to grpo_compute_loss, so the
+    # single-chunk path with the flag on must match the naive corrected pass (loss and
+    # gradient) for every loss type -- TRL applies the correction before the loss_type
+    # dispatch, so it is loss_type independent.
+    beta = 0.04
+    lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+    # Constant shift -> coef_1 ~= e^0.5 everywhere, so the corrected KL term moves the
+    # loss well past allclose tolerance (the fixture's symmetric noise alone averages
+    # the correction to ~0).
+    old = old - 0.5
+    kwargs["use_bias_correction_kl"] = True
+
+    new_ref = new.clone().requires_grad_(True)
+    loss_ref = rr.grpo_compute_loss(
+        ref, new_ref, old, None, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    loss_ref.backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages,
+        beta, None, 1, kwargs,
+    )
+    out[0].backward()
+
+    assert torch.allclose(
+        out[0].detach().double(), loss_ref.detach().double(), atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: loss mismatch"
+    assert torch.allclose(
+        new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: gradient mismatch"
+
+    # And the flag must actually bite: with beta != 0 and old != new, the same
+    # efficient path with the flag off must produce a different (uncorrected) loss.
+    kwargs_off = dict(kwargs)
+    kwargs_off["use_bias_correction_kl"] = False
+    out_off = rr.UnslothEfficientGRPO.apply(
+        new.clone().requires_grad_(True), old, ref, None, lm_head, input_ids, mask,
+        advantages, beta, None, 1, kwargs_off,
+    )
+    assert not torch.allclose(out[0].detach(), out_off[0].detach()), (
+        f"{loss_type}: use_bias_correction_kl had no effect"
+    )
+
+
+def test_grpo_accumulated_loss_forwards_use_bias_correction_kl():
+    # grpo_accumulated_loss must read the flag off trainer.args (same pattern as the
+    # other TRL config passthroughs) so it reaches grpo_compute_loss via extra_kwargs;
+    # getattr default False keeps older TRL (no such field) on the uncorrected path.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert 'kwargs["use_bias_correction_kl"]' in src
+    assert 'getattr(trainer.args, "use_bias_correction_kl", False)' in src

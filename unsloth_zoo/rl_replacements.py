@@ -406,6 +406,7 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -498,7 +499,13 @@ def grpo_compute_loss(
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-
+        # Importance sampling correction for the KL divergence (TRL
+        # GRPOConfig.use_bias_correction_kl, DeepSeek-V3.2 paper). Matches TRL: applied
+        # before the loss_type dispatch with the pre-delta-clamp, non-detached coef_1
+        # ((B, T) token level, (B, 1) sequence level broadcast), and the corrected KL
+        # feeds both the beta * kl term and the mean_kl metric below.
+        if use_bias_correction_kl:
+            kl_i = kl_i * coef_1
     else:
         # Zeros with the correct shape.
         if importance_sampling_level == "sequence":
@@ -752,20 +759,19 @@ def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options the optimized GRPO path
     ignores, so setting them is not silently dropped. UnslothGRPOConfig forwards every
     field via **kwargs, but the fast path does not implement top_entropy_quantile < 1.0
-    (entropy masking) or use_bias_correction_kl = True (KL x importance-sampling ratio).
-    TRL defaults (grpo_config, TRL 1.7.1) are 1.0 and False, so only non-defaults warn.
+    (entropy masking). The TRL default (grpo_config, TRL 1.7.1) is 1.0, so only
+    non-defaults warn. use_bias_correction_kl IS supported (grpo_compute_loss applies
+    kl_i * coef_1), so it must not be listed here.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
         return
     args = getattr(trainer, "args", None)
 
     unsupported = []
-    # Older TRL may lack these attributes; fall back to defaults so we never warn.
+    # Older TRL may lack this attribute; fall back to the default so we never warn.
     top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
     if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
         unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
-    if getattr(args, "use_bias_correction_kl", False):
-        unsupported.append("use_bias_correction_kl=True")
 
     if unsupported:
         message = (
@@ -872,6 +878,8 @@ def grpo_accumulated_loss(
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    # KL bias correction (TRL 0.27.0+); older TRL lacks the field -> off, the default.
+    kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
     # n_chunks (GRPOConfig.unsloth_num_chunks) stays in the signature because unsloth's
     # generated trainer passes it, but loss chunking was removed: the UnslothEfficientGRPO
