@@ -490,7 +490,11 @@ def _patch_is_available():
                 continue
             if not (name == "transformers" or name.startswith("transformers.")):
                 continue
-            if getattr(mod, "is_flash_linear_attention_available", None) is original:
+            try:
+                attr = getattr(mod, "is_flash_linear_attention_available", None)
+            except Exception:
+                continue
+            if attr is original:
                 try:
                     setattr(mod, "is_flash_linear_attention_available", _vendored_availability_probe)
                 except Exception:
