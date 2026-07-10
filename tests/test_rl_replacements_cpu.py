@@ -216,30 +216,20 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
 # ---------------------------------------------------------------------------
 # Unsloth_Offloaded_Log_Softmax backward returns LOCAL input gradients
 # ---------------------------------------------------------------------------
-#
-# The offloaded log-softmax Function recomputes its output in backward. It must return
-# each input's local gradient contribution. Using torch.autograd.backward (which writes
-# leaf .grad) and returning lm_head.grad double-counts: the outer engine's AccumulateGrad
-# adds it again (2x for a single use, more when lm_head is shared across chunks) and
-# corrupts any grad already accumulated on lm_head. torch.autograd.grad returns the local
-# grads without touching leaf .grad. Reachable on the offload path (long-completion /
-# large-batch GRPO) whenever lm_head / tied embeddings are trainable; frozen lm_head
-# (standard LoRA) returns None and is unaffected.
+# backward must return LOCAL grads via autograd.grad; backward + leaf .grad
+# double-counts through the outer AccumulateGrad when lm_head is trainable.
 
 
 def test_offloaded_log_softmax_uses_autograd_grad_not_backward():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "class Unsloth_Offloaded_Log_Softmax" in src
-    # The fix: local grads via torch.autograd.grad, not backward + leaf .grad return.
     assert "torch.autograd.grad(" in src
     assert "torch.autograd.backward(output, grad_output)" not in src
     assert "lm_head.grad if ctx.lm_head_requires_grad else None" not in src
 
 
 def _recompute_fn(use_backward):
-    # Mirrors the offloaded Function's recompute-in-backward over a plain inner op (x @ W).
-    # use_backward=True is the buggy variant (autograd.backward + return the leaf .grad),
-    # use_backward=False is the fix (autograd.grad returns the local contribution).
+    # Recompute-in-backward mirror; use_backward=True is the buggy variant, False the fix.
     class _Fn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, W):
@@ -265,8 +255,6 @@ def _recompute_fn(use_backward):
 
 
 def _weight_grad(op, shared, preexisting):
-    # Accumulate W.grad through `op` (either a custom Function.apply or plain matmul), for
-    # a single use and for two uses sharing W, optionally starting from a pre-existing grad.
     torch.manual_seed(0)
     x1 = torch.randn(6, 8)
     x2 = torch.randn(6, 8)
@@ -283,12 +271,10 @@ def _weight_grad(op, shared, preexisting):
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("preexisting", [False, True])
 def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting):
-    # Oracle: plain autograd through the same op, no custom Function.
     ref = _weight_grad(lambda x, W: x @ W, shared, preexisting)
-    # The fix (autograd.grad) matches the oracle exactly.
     fixed = _recompute_fn(use_backward=False)
     assert torch.allclose(_weight_grad(fixed.apply, shared, preexisting), ref, atol=1e-6)
-    # The buggy pattern (autograd.backward + return leaf .grad) diverges -- guards the test.
+    # Buggy variant must diverge, or this test proves nothing.
     buggy = _recompute_fn(use_backward=True)
     assert not torch.allclose(_weight_grad(buggy.apply, shared, preexisting), ref, atol=1e-4)
 
@@ -296,13 +282,8 @@ def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting)
 # ---------------------------------------------------------------------------
 # Unsloth_Offloaded_Log_Softmax offload paths (pinned / keep-on-GPU / CPU)
 # ---------------------------------------------------------------------------
-#
-# Forward offloads hidden_states to a pinned host buffer on a side stream (async
-# D2H) when the GPU is tight, keeps the alias on GPU when there is headroom, and
-# falls back to a plain pageable copy on CPU / no CUDA / pinned-alloc failure.
-# The event sync in backward is load-bearing: a pinned non_blocking copy without
-# it is a use-before-copy race. These tests pin the CPU fallback numerics and
-# the CUDA-path source invariants (all CUDA calls guarded by is_cuda).
+# Pins CPU-fallback numerics and CUDA-path source invariants; backward's event
+# wait is load-bearing (pinned non_blocking copy races without it).
 
 
 def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
@@ -326,8 +307,7 @@ def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
 
 
 def _extract_offloaded_log_softmax(inner_fn):
-    # Exec the nested to_device + Unsloth_Offloaded_Log_Softmax block from the
-    # real source against `inner_fn`, exactly like the generated trainer inlines it.
+    # Exec the real Unsloth_Offloaded_Log_Softmax block against `inner_fn`.
     import textwrap
     src = inspect.getsource(rr.grpo_accumulated_loss)
     block = textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
@@ -362,13 +342,11 @@ def test_offloaded_log_softmax_cpu_path_grads_bitwise_exact(lm_requires_grad):
 def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     fwd = src[src.index("class Unsloth_Offloaded_Log_Softmax"):src.index("def efficient_log_softmax")]
-    # The pinned non_blocking D2H must record an event on the copy stream, keep
-    # the source storage alive across streams, and backward must wait on it.
+    # Pinned D2H must record an event, keep the source alive, and backward must wait on it.
     assert "pin_memory = True" in fwd
     assert "copy_event.record(copy_stream)" in fwd
     assert "record_stream(copy_stream)" in fwd
     assert "ctx.copy_event.wait(" in fwd
-    # All CUDA-only machinery stays behind an is_cuda check so CPU / no-CUDA
-    # (Windows, Mac) still take the plain pageable path.
+    # CUDA machinery stays behind is_cuda; CPU-only platforms take the pageable path.
     assert "is_cuda" in fwd
     assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
