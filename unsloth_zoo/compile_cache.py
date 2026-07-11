@@ -192,13 +192,59 @@ pass
 def _bundle_paths(key):
     root = _cache_root()
     if root is None:
-        return None, None, None
+        return None, None
     directory = os.path.join(root, key)
-    return (
-        directory,
-        os.path.join(directory, _BUNDLE_NAME),
-        os.path.join(directory, _MANIFEST_NAME),
-    )
+    return directory, os.path.join(directory, _MANIFEST_NAME)
+pass
+
+
+def _read_disk_bundle(directory, manifest_path):
+    """Read the (manifest, bundle bytes) pair for a key, returning
+    ``(None, None)`` unless the manifest checksum matches the bundle file it
+    points at. The manifest names its bundle file (content-addressed by the
+    writer), so a manifest can never validate against a bundle written by a
+    different process: same name implies same bytes."""
+    try:
+        with open(manifest_path, "r") as file:
+            manifest = json.load(file)
+        bundle_name = os.path.basename(str(manifest.get("bundle", _BUNDLE_NAME)))
+        with open(os.path.join(directory, bundle_name), "rb") as file:
+            data = file.read()
+        if manifest.get("sha256") != hashlib.sha256(data).hexdigest():
+            return None, None
+        return manifest, data
+    except Exception:
+        return None, None
+pass
+
+
+def _merge_recorded_artifacts(data):
+    """Re-record an existing bundle's artifacts into torch's artifact manager
+    so the next ``save_cache_artifacts`` serializes the UNION of the on-disk
+    bundle and this process' artifacts. torch only records what this run
+    loaded-and-hit or compiled, so without this a run that exercises a subset
+    of a warm bundle (a different shape, one of several cached models) would
+    replace the bundle with that subset and silently drop the rest.
+    Best-effort: a failure just means this save may narrow the bundle."""
+    try:
+        from torch.compiler._cache import CacheArtifactManager
+        artifacts = CacheArtifactManager.deserialize(data)
+        if not artifacts:
+            return
+        merged = 0
+        for artifact_type, items in artifacts.items():
+            for artifact in items:
+                # Value-equality dedup: artifacts this run re-recorded on its
+                # own hits are already present and are skipped.
+                if artifact in CacheArtifactManager._seen_artifacts:
+                    continue
+                CacheArtifactManager._new_cache_artifacts[artifact_type].append(artifact)
+                CacheArtifactManager._seen_artifacts.add(artifact)
+                merged += 1
+        if merged:
+            _log(f"merged {merged} artifact(s) from the existing bundle")
+    except Exception as error:
+        _log(f"bundle merge skipped ({error})")
 pass
 
 
@@ -222,8 +268,8 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         _model_key(model_type, compile_kwargs or {}, torch_compile_options or {})
     )
     key = _bundle_key()
-    directory, bundle_path, manifest_path = _bundle_paths(key)
-    if bundle_path is None:
+    directory, manifest_path = _bundle_paths(key)
+    if manifest_path is None:
         _log("no writable cache root; skipping")
         return False
 
@@ -236,20 +282,12 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         atexit.register(megacache_save)
         _STATE["atexit_registered"] = True
 
-    if not (os.path.isfile(bundle_path) and os.path.isfile(manifest_path)):
+    manifest, data = _read_disk_bundle(directory, manifest_path)
+    if manifest is None:
         _log(f"no bundle for key {key} (will compile locally and save on exit)")
         return False
 
     try:
-        with open(manifest_path, "r") as file:
-            manifest = json.load(file)
-        with open(bundle_path, "rb") as file:
-            data = file.read()
-        # Defence in depth: torch validates internally as well, but a stale or
-        # corrupted bundle should be an explicit miss, not a surprise.
-        if manifest.get("sha256") != hashlib.sha256(data).hexdigest():
-            _log("bundle checksum mismatch; ignoring")
-            return False
         import torch
         info = torch.compiler.load_cache_artifacts(data)
         if info is None:
@@ -266,11 +304,12 @@ pass
 
 def megacache_save():
     """Persist this process' compile artifacts. Runs at exit (atexit) or on
-    demand. torch records artifacts on cache HITS as well as writes, so the
-    serialized bundle is a superset of anything loaded plus everything newly
-    compiled; save whenever those bytes differ from the bundle on disk. A
-    pure hit with no new compilation serializes back to the same content and
-    is skipped. Never raises.
+    demand. torch records artifacts on cache HITS as well as writes, but only
+    for the entries this run actually exercised - so the on-disk bundle is
+    first merged back into the recorder and the saved bundle is always the
+    UNION of the existing bundle and this process' artifacts. A run that
+    changes nothing serializes back to the same content and is skipped.
+    Never raises.
     """
     if not (_STATE["armed"] and megacache_is_enabled() and _mega_cache_supported()):
         return False
@@ -284,36 +323,45 @@ def megacache_save():
         return False
     try:
         import torch
+        directory, manifest_path = _bundle_paths(key)
+        if manifest_path is None:
+            return False
+        # Union semantics: fold the current on-disk bundle back into the
+        # manager before serializing, so a run that exercised only part of a
+        # warm bundle cannot narrow it (see _merge_recorded_artifacts).
+        _, existing = _read_disk_bundle(directory, manifest_path)
+        if existing is not None:
+            _merge_recorded_artifacts(existing)
         result = torch.compiler.save_cache_artifacts()
         if not result or not result[0]:
             _log("nothing to save (no compile artifacts recorded)")
             return False
         data = result[0]
-        directory, bundle_path, manifest_path = _bundle_paths(key)
-        if bundle_path is None:
-            return False
         new_sha = hashlib.sha256(data).hexdigest()
-        if not _refresh_enabled():
-            try:
-                with open(manifest_path, "r") as file:
-                    if json.load(file).get("sha256") == new_sha:
-                        _log("bundle unchanged; skipping save")
-                        return False
-            except Exception:
-                pass
+        if not _refresh_enabled() and existing is not None:
+            if hashlib.sha256(existing).hexdigest() == new_sha:
+                _log("bundle unchanged; skipping save")
+                return False
         os.makedirs(directory, exist_ok = True)
-        # PID-unique temp + atomic replace: concurrent processes cannot
-        # truncate or interleave each other's bytes.
-        temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
-        with open(temporary_path, "wb") as file:
-            file.write(data)
-        os.replace(temporary_path, bundle_path)
+        # The bundle file is content-addressed and the manifest names it, so
+        # the (bundle, manifest) pair is consistent without a cross-file lock:
+        # concurrent writers produce differently named bundles, the manifest
+        # replace is atomic, and whichever manifest lands last points at its
+        # own complete file. Same name always implies same bytes.
+        bundle_name = f"megacache-{new_sha[:16]}.bin"
+        bundle_path = os.path.join(directory, bundle_name)
+        if not os.path.isfile(bundle_path):
+            temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
+            with open(temporary_path, "wb") as file:
+                file.write(data)
+            os.replace(temporary_path, bundle_path)
         manifest = {
             "format": _FORMAT_VERSION,
             "key": key,
             "created": time.time(),
             "bytes": len(data),
             "sha256": new_sha,
+            "bundle": bundle_name,
             "env": _environment_fingerprint(),
             "models": _STATE["model_keys"],
         }
@@ -322,6 +370,21 @@ def megacache_save():
             json.dump(manifest, file, indent = 2, sort_keys = True, default = str)
         os.replace(temporary_manifest, manifest_path)
         _log(f"saved bundle for key {key} ({len(data)} bytes)")
+        # Best-effort GC of superseded bundle files (including the legacy
+        # fixed-name bundle). A concurrent reader that already opened one
+        # keeps its file handle; a reader that comes later re-reads the
+        # manifest and finds the new name.
+        try:
+            for name in os.listdir(directory):
+                is_stale_bundle = (
+                    name == _BUNDLE_NAME
+                    or (name.startswith("megacache-") and name.endswith(".bin"))
+                    or ".bin.tmp." in name
+                )
+                if is_stale_bundle and name != bundle_name:
+                    os.unlink(os.path.join(directory, name))
+        except Exception:
+            pass
         return True
     except Exception as error:
         _log(f"save failed ({error})")
