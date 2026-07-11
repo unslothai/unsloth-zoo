@@ -76,7 +76,10 @@ def test_idempotent_and_guard_shared(base_init):
     assert base_init.__init__ is wrapped
 
 
-def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
+def test_materialize_normalizes_list_extra_special_tokens_sidecar(
+    tmp_path, monkeypatch
+):
+    import transformers.models.auto.tokenization_auto as tokenization_auto
     from unsloth_zoo.mlx.loader import (
         _materialize_mlx_vlm_config_override,
         _normalize_tokenizer_config_extra_special_tokens,
@@ -84,10 +87,14 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     source_dir = tmp_path / "snapshot"
     source_dir.mkdir()
     original = {
+        "tokenizer_class": "TokenizersBackend",
         "extra_special_tokens": ["<|im_start|>", "<|im_end|>"],
         "additional_special_tokens": ["<existing>", "<|im_start|>"],
         "model_specific_special_tokens": {"image_token": "<|image_pad|>"},
     }
+    monkeypatch.setattr(
+        tokenization_auto, "tokenizer_class_from_name", lambda _name: None
+    )
     (source_dir / "tokenizer_config.json").write_text(
         json.dumps(original),
         encoding="utf-8",
@@ -111,6 +118,7 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     patched_config = json.loads(
         (Path(load_path) / "tokenizer_config.json").read_text(encoding="utf-8")
     )
+    assert patched_config["tokenizer_class"] == "PreTrainedTokenizerFast"
     assert patched_config["extra_special_tokens"] == {"image_token": "<|image_pad|>"}
     assert patched_config["additional_special_tokens"] == [
         "<existing>",
@@ -123,6 +131,9 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     ) == (
         original,
         False,
+    )
+    monkeypatch.setattr(
+        tokenization_auto, "tokenizer_class_from_name", lambda _name: object
     )
     assert _materialize_mlx_vlm_config_override(
         str(source_dir),
@@ -176,6 +187,33 @@ def test_materialize_probe_ignores_installed_coercion_patch(base_init, tmp_path)
     )
 
     assert load_path != str(source_dir)
+
+
+def test_normalizes_tokenizers_backend_only_when_unavailable(monkeypatch):
+    import transformers.models.auto.tokenization_auto as tokenization_auto
+    from unsloth_zoo.mlx.loader import _normalize_tokenizer_config_backend_class
+
+    config = {"tokenizer_class": "TokenizersBackend"}
+    assert _normalize_tokenizer_config_backend_class(
+        config, backend_class_available=False
+    ) == ({"tokenizer_class": "PreTrainedTokenizerFast"}, True)
+    assert _normalize_tokenizer_config_backend_class(
+        config, backend_class_available=True
+    ) == (config, False)
+    unrelated = {"tokenizer_class": "CustomTokenizer"}
+    assert _normalize_tokenizer_config_backend_class(
+        unrelated, backend_class_available=False
+    ) == (unrelated, False)
+
+    def unavailable(_name):
+        raise RuntimeError("resolver unavailable")
+
+    monkeypatch.setattr(
+        tokenization_auto,
+        "tokenizer_class_from_name",
+        unavailable,
+    )
+    assert _normalize_tokenizer_config_backend_class(config) == (config, False)
 
 
 def test_temporary_patch_exposes_original_init_for_probe(

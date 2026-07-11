@@ -425,6 +425,31 @@ def _normalize_tokenizer_config_extra_special_tokens(
     return patched_config, True
 
 
+def _normalize_tokenizer_config_backend_class(
+    tokenizer_config,
+    *,
+    backend_class_available=None,
+):
+    if tokenizer_config.get("tokenizer_class") != "TokenizersBackend":
+        return tokenizer_config, False
+    if backend_class_available is None:
+        try:
+            from transformers.models.auto.tokenization_auto import (
+                tokenizer_class_from_name,
+            )
+            backend_class_available = (
+                tokenizer_class_from_name("TokenizersBackend") is not None
+            )
+        except Exception:
+            return tokenizer_config, False
+    if backend_class_available:
+        return tokenizer_config, False
+
+    patched_config = dict(tokenizer_config)
+    patched_config["tokenizer_class"] = "PreTrainedTokenizerFast"
+    return patched_config, True
+
+
 def _materialize_mlx_vlm_config_data(local_path, config_data):
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
     for name in os.listdir(local_path):
@@ -501,13 +526,16 @@ def _materialize_mlx_vlm_config_override(
         tokenizer_config = _read_json_file(
             os.path.join(local_path, "tokenizer_config.json")
         )
+        patched_tokenizer_config, patched_backend = (
+            _normalize_tokenizer_config_backend_class(tokenizer_config)
+        )
         patched_tokenizer_config, patched_tokenizer = (
             _normalize_tokenizer_config_extra_special_tokens(
-                tokenizer_config,
+                patched_tokenizer_config,
                 supports_list_extra_special_tokens=supports_list_extra_special_tokens,
             )
         )
-        if patched_tokenizer:
+        if patched_backend or patched_tokenizer:
             patched_files["tokenizer_config.json"] = patched_tokenizer_config
 
     if not patched_files:
