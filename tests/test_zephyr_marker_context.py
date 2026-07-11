@@ -32,8 +32,11 @@ import pytest
 
 def _tokenizer():
     import json
-    from transformers import AutoTokenizer
-    from tokenizers import Tokenizer
+    try:
+        from transformers import AutoTokenizer
+        from tokenizers import Tokenizer
+    except ImportError:
+        return None  # dependency-light run: skip instead of erroring
     # SentencePiece tokenizer (Llama/Mistral) so "<" tokenizes context-dependently;
     # role tags must stay ordinary text, NOT added special tokens.
     try:
