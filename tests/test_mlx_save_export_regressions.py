@@ -1015,6 +1015,77 @@ def test_mlx_vlm_processor_loader_repair_is_signature_gated(monkeypatch, tmp_pat
     assert loader._recoverable_mlx_vlm_processor_error(missing_module.value)
 
 
+def test_mlx_vlm_pt_only_output_fallback_is_narrow(monkeypatch):
+    from collections import defaultdict
+    import mlx.core as mx
+    import mlx_vlm.utils as vlm_utils
+    import torch
+    from transformers import BatchEncoding
+    import unsloth_zoo.mlx.loader as loader
+
+    calls = []
+    dlpack_inputs = []
+    converted_marker = object()
+    passthrough = object()
+    error_message = [loader._MLX_VLM_PT_ONLY_ERROR]
+    monkeypatch.setattr(mx, "from_dlpack", lambda tensor: (
+        dlpack_inputs.append(tensor) or converted_marker
+    ), raising=False)
+
+    def pt_only_processor(*args, return_tensors="mlx", **kwargs):
+        calls.append((args, return_tensors, kwargs))
+        if error_message[0] is None:
+            return passthrough
+        if return_tensors != "pt":
+            raise ValueError(error_message[0])
+        return {
+            "input_ids": torch.arange(4.0, requires_grad=True).reshape(2, 2).T,
+            "nested": [torch.tensor([3]), "metadata"],
+        }
+
+    monkeypatch.setattr(
+        vlm_utils,
+        "process_inputs_with_fallback",
+        pt_only_processor,
+        raising=False,
+    )
+    loader._ensure_mlx_vlm_pt_output_fallback()
+    wrapped = vlm_utils.process_inputs_with_fallback
+    outputs = wrapped(object(), "prompt", ["image"], None, custom_option=7)
+    assert outputs["input_ids"] is converted_marker
+    assert outputs["nested"][0] is converted_marker
+    assert not dlpack_inputs[0].requires_grad
+    assert dlpack_inputs[0].device.type == "cpu"
+    assert dlpack_inputs[0].is_contiguous()
+    assert outputs["nested"][1] == "metadata"
+    assert [call[1] for call in calls] == ["mlx", "pt"]
+    assert calls[1][2]["custom_option"] == 7
+
+    loader._ensure_mlx_vlm_pt_output_fallback()
+    assert vlm_utils.process_inputs_with_fallback is wrapped
+    error_message[0] = "different failure"
+    with pytest.raises(ValueError, match="different failure"):
+        wrapped(object(), "prompt", None, None)
+    error_message[0] = None
+    calls.clear()
+    assert wrapped(object(), "prompt", None, None) is passthrough
+    assert len(calls) == 1
+
+    stateful = defaultdict(list, batch=BatchEncoding(
+        {"values": torch.ones(2, dtype=torch.bfloat16)}, n_sequences=2,
+    ))
+    converted = loader._convert_pt_vlm_output(stateful, "np")
+    assert converted.default_factory is list
+    assert isinstance(converted["batch"], BatchEncoding)
+    assert converted["batch"].n_sequences == 2
+    assert converted["batch"]["values"].dtype.name == "float32"
+    assert loader._convert_pt_vlm_output(torch._neg_view(torch.ones(1)), "np")[0] == -1
+    monkeypatch.setattr(mx, "from_dlpack", None)
+    assert loader._convert_pt_vlm_output(
+        torch.ones(1, dtype=torch.bfloat16), "mlx",
+    ).dtype is torch.float32
+
+
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 

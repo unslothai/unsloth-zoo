@@ -20,6 +20,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 (which pulls in CUDA kernels).
 """
 
+import copy
 import gc
 import json
 import importlib
@@ -1515,6 +1516,125 @@ def _ensure_mlx_vlm_processor_repair():
     repairing_load_processor._unsloth_processor_repair = True
     repairing_load_processor._unsloth_original = load_processor
     vlm_utils.load_processor = repairing_load_processor
+
+
+_MLX_VLM_PT_ONLY_ERROR = (
+    "Failed to process inputs with error: "
+    "Only returning PyTorch tensors is currently supported."
+)
+
+
+def _convert_pt_vlm_output(value, return_tensors):
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if tensor.is_conj():
+            tensor = tensor.resolve_conj()
+        if tensor.is_neg():
+            tensor = tensor.resolve_neg()
+        if return_tensors in {"mlx", "mx"}:
+            import mlx.core as mx
+            from_dlpack = getattr(mx, "from_dlpack", None)
+            if from_dlpack is not None:
+                return from_dlpack(tensor.contiguous())
+            if tensor.dtype is torch.bfloat16:
+                tensor = tensor.float()
+            return mx.array(tensor.numpy())
+        if tensor.dtype is torch.bfloat16:
+            tensor = tensor.float()
+        return tensor.numpy()
+    if isinstance(value, Mapping):
+        converted_items = {
+            key: _convert_pt_vlm_output(item, return_tensors)
+            for key, item in value.items()
+        }
+        try:
+            converted = copy.copy(value)
+            for key, item in converted_items.items():
+                converted[key] = item
+            return converted
+        except (AttributeError, TypeError):
+            try:
+                return type(value)(converted_items)
+            except TypeError:
+                return converted_items
+    if isinstance(value, tuple):
+        converted = tuple(
+            _convert_pt_vlm_output(item, return_tensors) for item in value
+        )
+        if hasattr(value, "_fields"):
+            return type(value)(*converted)
+        if type(value) is not tuple:
+            try:
+                return type(value)(converted)
+            except TypeError:
+                pass
+        return converted
+    if isinstance(value, list):
+        converted = [_convert_pt_vlm_output(item, return_tensors) for item in value]
+        if type(value) is list:
+            return converted
+        try:
+            copied = copy.copy(value)
+            copied[:] = converted
+            return copied
+        except (AttributeError, TypeError):
+            return converted
+    return value
+
+
+def _ensure_mlx_vlm_pt_output_fallback():
+    """Retry processors that only implement PyTorch tensor output."""
+    try:
+        import mlx_vlm.utils as vlm_utils
+    except ImportError:
+        return
+
+    process_inputs = getattr(vlm_utils, "process_inputs_with_fallback", None)
+    if process_inputs is None or getattr(process_inputs, "_unsloth_pt_fallback", False):
+        return
+
+    @wraps(process_inputs)
+    def process_inputs_with_pt_fallback(
+        processor,
+        prompts,
+        images,
+        audio,
+        add_special_tokens=False,
+        return_tensors="mlx",
+        **kwargs,
+    ):
+        try:
+            return process_inputs(
+                processor,
+                prompts,
+                images,
+                audio,
+                add_special_tokens=add_special_tokens,
+                return_tensors=return_tensors,
+                **kwargs,
+            )
+        except ValueError as error:
+            if (
+                return_tensors not in {"mlx", "mx", "np"}
+                or str(error) != _MLX_VLM_PT_ONLY_ERROR
+            ):
+                raise
+        outputs = process_inputs(
+            processor,
+            prompts,
+            images,
+            audio,
+            add_special_tokens=add_special_tokens,
+            return_tensors="pt",
+            **kwargs,
+        )
+        return _convert_pt_vlm_output(outputs, return_tensors)
+
+    process_inputs_with_pt_fallback._unsloth_pt_fallback = True
+    process_inputs_with_pt_fallback._unsloth_original = process_inputs
+    vlm_utils.process_inputs_with_fallback = process_inputs_with_pt_fallback
 
 
 def _build_vlm_image_processor_from_config(
@@ -6162,6 +6282,7 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
             _ensure_mlx_vlm_processor_repair()
+            _ensure_mlx_vlm_pt_output_fallback()
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
