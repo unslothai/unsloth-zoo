@@ -693,22 +693,32 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     tmp_path,
 ):
     import unsloth_zoo.mlx.loader as loader
+    from transformers.image_processing_utils import ImageProcessingMixin
 
     class FakeProcessor:
+        attributes = ["image_processor", "video_processor"]
+        video_processor_class = "AutoVideoProcessor"
+        fallback_video = None
+
         def __init__(self, image_processor, tokenizer, chat_template=None):
             self.image_processor = image_processor
+            self.video_processor = type(self).fallback_video
             self.tokenizer = tokenizer
             self.chat_template = chat_template
 
+    class FakeImageProcessor(ImageProcessingMixin):
+        pass
+
     fake_processing = types.ModuleType("mlx_vlm.models.glm_ocr.processing")
     fake_processing.FakeProcessor = FakeProcessor
+    fake_processing.FakeImageProcessor = FakeImageProcessor
     monkeypatch.setitem(
         sys.modules,
         "mlx_vlm.models.glm_ocr.processing",
         fake_processing,
     )
 
-    image_processor = object()
+    image_processor = FakeImageProcessor()
     monkeypatch.setattr(
         loader,
         "_build_vlm_image_processor_from_config",
@@ -739,6 +749,7 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
         degraded,
         tmp_path,
         "glm_ocr",
+        add_detokenizer=False,
     )
 
     assert isinstance(repaired, FakeProcessor)
@@ -746,6 +757,262 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     assert repaired.tokenizer is tokenizer
     assert repaired.chat_template == "{{ messages }}"
     assert tokenizer.chat_template == "{{ messages }}"
+    FakeProcessor.fallback_video = object()
+    assert loader._repair_degraded_vlm_processor(
+        degraded, tmp_path, "glm_ocr", add_detokenizer=False,
+    ) is degraded
+
+
+def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+    import mlx_vlm.utils as vlm_utils
+    from transformers.image_processing_utils import BaseImageProcessor
+    from transformers.image_processing_utils import ImageProcessingMixin
+    from transformers.processing_utils import ProcessorMixin
+    from transformers.video_processing_utils import BaseVideoProcessor
+
+    class CustomImageProcessor(BaseImageProcessor):
+        pass
+
+    class CustomVideoProcessor(BaseVideoProcessor):
+        pass
+
+    class CustomTokenizer:
+        chat_template = None
+        eos_token_id = 1
+    received_kwargs = {}
+
+    class CustomProcessor(ProcessorMixin):
+        attributes = ["image_processor", "tokenizer", "video_processor"]
+        image_processor_class = "AutoImageProcessor"
+        tokenizer_class = "CustomTokenizer"
+        video_processor_class = "CustomVideoProcessor"
+
+        @classmethod
+        def get_attributes(cls):
+            return [
+                name.removesuffix("_class")
+                for name, value in cls.__dict__.items()
+                if name.removesuffix("_class") in cls.attributes
+                and name.endswith("_class")
+                and value is not None
+            ]
+
+        def check_argument_for_proper_class(self, _name, argument):
+            return type(argument)
+
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            if cls.get_attributes() != [
+                "image_processor", "tokenizer", "video_processor",
+            ]:
+                raise ValueError("temporary processor attributes changed")
+            received_kwargs.update(_kwargs)
+            tokenizer = cls.get_possibly_dynamic_module("CustomTokenizer")()
+            return cls(
+                cls.get_possibly_dynamic_module("CustomImageProcessor")(),
+                tokenizer, cls.get_possibly_dynamic_module("CustomVideoProcessor")(),
+            )
+
+    for component_class in (CustomImageProcessor, CustomVideoProcessor, CustomTokenizer):
+        component_class.__module__ = "mlx_vlm.models.fake_vlm.processing"
+    classes = {
+        cls.__name__: cls
+        for cls in (
+            CustomProcessor,
+            CustomImageProcessor,
+            CustomVideoProcessor,
+            CustomTokenizer,
+        )
+    }
+    monkeypatch.setattr(
+        loader,
+        "_resolve_mlx_vlm_processor_class",
+        lambda _t, name, *_a: classes.get(name),
+    )
+    sidecars = {
+        "preprocessor_config.json": {
+            "processor_class": "CustomProcessor",
+            "image_processor_type": "CustomImageProcessor",
+        },
+        "video_preprocessor_config.json": {
+            "processor_class": "CustomProcessor",
+            "video_processor_type": "CustomVideoProcessor",
+        },
+    }
+    for filename, config in sidecars.items():
+        (tmp_path / filename).write_text(json.dumps(config))
+    monkeypatch.setattr(
+        vlm_utils,
+        "load_tokenizer",
+        lambda *_a, **_k: lambda tok: ("detok", tok),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        vlm_utils,
+        "StoppingCriteria",
+        lambda ids, tok: (ids, tok),
+        raising=False,
+    )
+    source = types.SimpleNamespace(
+        chat_template="{{ messages }}",
+        stopping_criteria=types.SimpleNamespace(eos_token_ids=[1, 2, 3]),
+    )
+
+    repaired = loader._repair_degraded_vlm_processor(
+        source,
+        tmp_path,
+        "fake_vlm",
+        trust_remote_code=True,
+        processor_kwargs={"use_fast": False, "custom_option": 7},
+    )
+
+    repaired_types = tuple(map(
+        type,
+        (repaired, repaired.image_processor, repaired.video_processor, repaired.tokenizer),
+    ))
+    assert repaired_types == (
+        CustomProcessor,
+        CustomImageProcessor,
+        CustomVideoProcessor,
+        CustomTokenizer,
+    )
+    assert repaired.detokenizer == ("detok", repaired.tokenizer)
+    assert repaired.tokenizer.stopping_criteria == ([1, 2, 3], repaired.tokenizer)
+    assert repaired.chat_template == "{{ messages }}"
+    assert received_kwargs == {
+        "use_fast": False, "custom_option": 7, "trust_remote_code": True,
+    }
+    assert loader._repair_degraded_vlm_processor(repaired, tmp_path, "fake_vlm") is repaired
+    assert loader._set_mlx_vlm_processor_runtime_state(repaired, tmp_path)
+    assert repaired.tokenizer.stopping_criteria == (1, repaired.tokenizer)
+
+    class NativeImageProcessor(ImageProcessingMixin):
+        pass
+
+    class NativeVideoProcessor(BaseVideoProcessor):
+        pass
+
+    assert loader._matches_vlm_component_kind(
+        "image_processor", NativeImageProcessor(),
+    )
+    assert not loader._matches_vlm_component_kind(
+        "image_processor", NativeVideoProcessor(),
+    )
+
+    assert loader._vlm_processor_attributes(CustomProcessor) == (
+        "image_processor", "tokenizer", "video_processor",
+    )
+
+    class LocalGenericProcessor(ProcessorMixin):
+        pass
+
+    LocalGenericProcessor.__module__ = "mlx_vlm.models.fake_vlm.processing"
+    assert not loader._is_native_mlx_vlm_factory(LocalGenericProcessor)
+
+    def native_factory(cls, *_args, **_kwargs):
+        return cls(
+            NativeImageProcessor(), repaired.tokenizer, repaired.video_processor,
+        )
+
+    native_factory.__module__ = "mlx_vlm.models.fake_vlm.processing"
+    monkeypatch.setattr(
+        CustomProcessor, "from_pretrained", classmethod(native_factory),
+    )
+    native_repaired = loader._repair_degraded_vlm_processor(
+        types.SimpleNamespace(chat_template=None),
+        tmp_path,
+        "fake_vlm",
+        add_detokenizer=False,
+    )
+    assert type(native_repaired.image_processor) is NativeImageProcessor
+
+    undeclared_image = type("UndeclaredImageProcessor", (BaseImageProcessor,), {})
+    undeclared_image.__name__ = CustomImageProcessor.__name__
+    undeclared_image.__module__ = CustomImageProcessor.__module__
+
+    def return_image(image_class):
+        return classmethod(lambda cls, *_a, **_k: cls(
+            image_class(), repaired.tokenizer, repaired.video_processor,
+        ))
+
+    monkeypatch.setattr(
+        CustomProcessor,
+        "from_pretrained",
+        return_image(undeclared_image),
+    )
+    degraded = types.SimpleNamespace(chat_template=None)
+    assert loader._repair_degraded_vlm_processor(
+        degraded, tmp_path, "fake_vlm", add_detokenizer=False,
+    ) is degraded
+
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps(
+        {
+            "processor_class": "CustomProcessor",
+            "image_processor_type": "MissingImageProcessor",
+        }
+    ))
+    assert loader._repair_degraded_vlm_processor(
+        degraded, tmp_path, "fake_vlm", add_detokenizer=False,
+    ) is degraded
+
+
+def test_mlx_vlm_processor_loader_repair_is_signature_gated(monkeypatch, tmp_path):
+    import mlx_vlm.utils as vlm_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    mismatch = TypeError(
+        "Received a Siglip2ImageProcessor for argument image_processor, "
+        "but a Lfm2VlImageProcessorFast was expected."
+    )
+    active_error = [mismatch]
+
+    def failing_load_processor(*_args, **_kwargs):
+        raise active_error[0]
+
+    monkeypatch.setattr(
+        vlm_utils, "load_processor", failing_load_processor, raising=False,
+    )
+    calls = []
+    sentinel = object()
+    monkeypatch.setattr(
+        loader,
+        "_repair_degraded_vlm_processor",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or sentinel,
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "lfm2_vl"}), encoding="utf-8"
+    )
+
+    loader._ensure_mlx_vlm_processor_repair()
+    repairing_load_processor = vlm_utils.load_processor
+    assert repairing_load_processor(
+        tmp_path, processor_option=7, eos_token_ids=(2,),
+    ) is sentinel
+    assert calls[0][1]["processor_kwargs"]["processor_option"] == 7
+    assert calls[0][1]["eos_token_ids"] == (2,)
+
+    active_error[0] = ValueError("invalid processor option")
+    with pytest.raises(ValueError) as exc_info:
+        repairing_load_processor(tmp_path)
+    assert exc_info.value is active_error[0]
+    assert len(calls) == 1
+
+    active_error[0] = mismatch
+    monkeypatch.setattr(
+        loader, "_repair_degraded_vlm_processor", lambda *_a, **_k: None,
+    )
+    with pytest.raises(TypeError) as exc_info:
+        repairing_load_processor(tmp_path)
+    assert exc_info.value is mismatch
+    loader._ensure_mlx_vlm_processor_repair()
+    assert vlm_utils.load_processor is repairing_load_processor
+
+    from transformers.processing_utils import ProcessorMixin
+
+    with pytest.raises(ValueError) as missing_module:
+        ProcessorMixin.get_possibly_dynamic_module("MissingCustomProcessor")
+    assert loader._recoverable_mlx_vlm_processor_error(missing_module.value)
 
 
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
