@@ -39,9 +39,10 @@ always best-effort and never raises.
 
 Environment knobs:
   UNSLOTH_MEGA_CACHE       = "auto" (default) | "0" | "1"
-      auto -> load a matching bundle if one exists AND save a bundle at
-              process exit when compilation happened with no bundle present.
-      1    -> same as auto, plus refresh the bundle even when one was loaded.
+      auto -> load a matching bundle if one exists AND save at process exit
+              whenever the recorded artifacts differ from the bundle on disk
+              (torch records hits too, so saves merge loaded + new artifacts).
+      1    -> same as auto, but always rewrite the bundle at exit.
       0    -> fully disabled (kill switch).
   UNSLOTH_MEGA_CACHE_DIR   = bundle root (default ~/.cache/unsloth/mega_cache).
 """
@@ -135,8 +136,11 @@ def _environment_fingerprint():
         fingerprint["torch"] = str(torch.__version__)
         fingerprint["cuda"] = str(torch.version.cuda)
         if torch.cuda.is_available():
-            fingerprint["gpu_name"] = torch.cuda.get_device_name(0)
-            capability = torch.cuda.get_device_capability(0)
+            # The bound device, not device 0: mixed-architecture hosts must
+            # not save one GPU's kernels under another's key.
+            device = torch.cuda.current_device()
+            fingerprint["gpu_name"] = torch.cuda.get_device_name(device)
+            capability = torch.cuda.get_device_capability(device)
             fingerprint["gpu_capability"] = f"sm_{capability[0]}{capability[1]}"
     except Exception:
         pass
@@ -262,17 +266,18 @@ pass
 
 def megacache_save():
     """Persist this process' compile artifacts. Runs at exit (atexit) or on
-    demand. Saves only when something new would be stored: a fresh bundle on
-    a miss, or a refresh when UNSLOTH_MEGA_CACHE=1. Never raises.
+    demand. torch records artifacts on cache HITS as well as writes, so the
+    serialized bundle is a superset of anything loaded plus everything newly
+    compiled; save whenever those bytes differ from the bundle on disk. A
+    pure hit with no new compilation serializes back to the same content and
+    is skipped. Never raises.
     """
     if not (_STATE["armed"] and megacache_is_enabled() and _mega_cache_supported()):
         return False
-    if _STATE["hit"] and not _refresh_enabled():
-        return False
-    # Distributed launches: every rank records the same artifacts; concurrent
-    # writers could leave the manifest checksum pointing at another rank's
-    # bytes, so only the main rank persists the bundle.
-    if os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0":
+    # Distributed launches: one writer per NODE (cache roots default to
+    # node-local disks), guarded against shared roots by the pid-unique
+    # temp + atomic replace below.
+    if os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")) != "0":
         return False
     key = _STATE["loaded_key"]
     if key is None:
@@ -287,6 +292,15 @@ def megacache_save():
         directory, bundle_path, manifest_path = _bundle_paths(key)
         if bundle_path is None:
             return False
+        new_sha = hashlib.sha256(data).hexdigest()
+        if not _refresh_enabled():
+            try:
+                with open(manifest_path, "r") as file:
+                    if json.load(file).get("sha256") == new_sha:
+                        _log("bundle unchanged; skipping save")
+                        return False
+            except Exception:
+                pass
         os.makedirs(directory, exist_ok = True)
         # PID-unique temp + atomic replace: concurrent processes cannot
         # truncate or interleave each other's bytes.
@@ -299,7 +313,7 @@ def megacache_save():
             "key": key,
             "created": time.time(),
             "bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "sha256": new_sha,
             "env": _environment_fingerprint(),
             "models": _STATE["model_keys"],
         }
