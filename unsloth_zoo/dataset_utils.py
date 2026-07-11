@@ -303,12 +303,24 @@ def get_chat_template_parts(tokenizer):
     # Each marker must tokenize to a core present in a tokenized probe, else masking would
     # silently train on nothing (role tags that are not atomic tokens, or whose ids shift by
     # context). Some SentencePiece tokenizers need a leading space, so try that variant too.
+    # Markers also tokenize differently at text start vs mid-text (context-dependent
+    # SentencePiece): Zephyr's "<|assistant|>" is "▁<" standalone but bare "<" after "</s>\n",
+    # so also probe a leading-newline variant.
+    # 3 turns per role means a reliable marker matches >=2 times; a lone hit can be the
+    # text-start tokenization only (Zephyr "<|user|>\n" at pos 0), which breaks multi-turn masking.
     probe_ids = tok(full, add_special_tokens = False).input_ids
+    def count_matches(cand):
+        core = _find_common_token_ids(cand, tok, True)[0]
+        if not core: return 0
+        return sum(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1))
     def validate(part, part_name):
-        for cand in (part, " " + part):
-            core = _find_common_token_ids(cand, tok, True)[0]
-            if core and any(probe_ids[i : i + len(core)] == core for i in range(len(probe_ids) - len(core) + 1)):
-                return cand
+        counts = [(cand, count_matches(cand)) for cand in (part, " " + part, "\n" + part)]
+        for cand, n in counts:
+            if n >= 2: return cand
+        # Fall back to a single-match original variant (marker unique to the probe layout),
+        # preserving prior behaviour when nothing matches twice.
+        for cand, n in counts[:2]:
+            if n >= 1: return cand
         raise ValueError(f"Unsloth: Could not reliably auto-detect {part_name} (detected {repr(part)}) - pass instruction_part and response_part.")
     return validate(instruction_part, "instruction_part"), validate(response_part, "response_part")
 pass
