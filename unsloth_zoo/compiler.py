@@ -3457,6 +3457,16 @@ def unsloth_compile_transformers(
     # Kill switch: UNSLOTH_MEGA_CACHE=0. See compile_cache.py.
     try:
         from .compile_cache import megacache_load
+        # Env vars override these arguments below (and the generated forwards
+        # branch on UNSLOTH_RETURN_HIDDEN_STATES), so key on the EFFECTIVE
+        # values or one mode's bundle would be a false hit for another.
+        _effective_fullgraph = os.environ.get(
+            "UNSLOTH_FULLGRAPH", "1" if fullgraph else "0"
+        ) == "1"
+        _effective_return_logits = os.environ.get(
+            "UNSLOTH_RETURN_LOGITS", "1" if return_logits else "0"
+        ) == "1"
+        _return_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
         megacache_load(
             model_type,
             compile_kwargs = {
@@ -3475,9 +3485,10 @@ def unsloth_compile_transformers(
                 "fast_lora_forwards"    : fast_lora_forwards,
                 "fast_residual_stream"  : fast_residual_stream,
                 "accurate_accumulation" : accurate_accumulation,
-                "fullgraph"             : fullgraph,
+                "fullgraph"             : _effective_fullgraph,
                 "disable"               : disable,
-                "return_logits"         : return_logits,
+                "return_logits"         : _effective_return_logits,
+                "return_hidden_states"  : _return_hidden_states,
             },
             torch_compile_options = torch_compile_options,
         )

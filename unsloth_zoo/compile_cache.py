@@ -94,9 +94,14 @@ pass
 
 
 def _cache_root():
-    root = os.environ.get("UNSLOTH_MEGA_CACHE_DIR", "")
+    root = os.path.expanduser(os.environ.get("UNSLOTH_MEGA_CACHE_DIR", ""))
     if root == "":
-        root = os.path.join(os.path.expanduser("~"), ".cache", "unsloth", "mega_cache")
+        home = os.path.expanduser("~")
+        # Restricted containers can have no resolvable home; disable rather
+        # than writing a literal "~" directory into the CWD.
+        if home == "~" or not os.path.isdir(home):
+            return None
+        root = os.path.join(home, ".cache", "unsloth", "mega_cache")
     return root
 pass
 
@@ -181,7 +186,10 @@ pass
 
 
 def _bundle_paths(key):
-    directory = os.path.join(_cache_root(), key)
+    root = _cache_root()
+    if root is None:
+        return None, None, None
+    directory = os.path.join(root, key)
     return (
         directory,
         os.path.join(directory, _BUNDLE_NAME),
@@ -211,9 +219,15 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
     )
     key = _bundle_key()
     directory, bundle_path, manifest_path = _bundle_paths(key)
+    if bundle_path is None:
+        _log("no writable cache root; skipping")
+        return False
 
     _STATE["armed"] = True
     _STATE["loaded_key"] = key
+    # A hit for an earlier cumulative key does not cover this one: reset so a
+    # miss here still saves the extended bundle at exit.
+    _STATE["hit"] = False
     if not _STATE["atexit_registered"]:
         atexit.register(megacache_save)
         _STATE["atexit_registered"] = True
@@ -255,6 +269,11 @@ def megacache_save():
         return False
     if _STATE["hit"] and not _refresh_enabled():
         return False
+    # Distributed launches: every rank records the same artifacts; concurrent
+    # writers could leave the manifest checksum pointing at another rank's
+    # bytes, so only the main rank persists the bundle.
+    if os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0":
+        return False
     key = _STATE["loaded_key"]
     if key is None:
         return False
@@ -266,8 +285,12 @@ def megacache_save():
             return False
         data = result[0]
         directory, bundle_path, manifest_path = _bundle_paths(key)
+        if bundle_path is None:
+            return False
         os.makedirs(directory, exist_ok = True)
-        temporary_path = bundle_path + ".tmp"
+        # PID-unique temp + atomic replace: concurrent processes cannot
+        # truncate or interleave each other's bytes.
+        temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
         with open(temporary_path, "wb") as file:
             file.write(data)
         os.replace(temporary_path, bundle_path)
@@ -280,8 +303,10 @@ def megacache_save():
             "env": _environment_fingerprint(),
             "models": _STATE["model_keys"],
         }
-        with open(manifest_path, "w") as file:
+        temporary_manifest = f"{manifest_path}.tmp.{os.getpid()}"
+        with open(temporary_manifest, "w") as file:
             json.dump(manifest, file, indent = 2, sort_keys = True, default = str)
+        os.replace(temporary_manifest, manifest_path)
         _log(f"saved bundle for key {key} ({len(data)} bytes)")
         return True
     except Exception as error:
