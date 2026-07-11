@@ -27,7 +27,7 @@ compile-ready only once explicitly verified.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from itertools import accumulate
 import importlib
@@ -2201,6 +2201,121 @@ def _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds):
     return hidden_states + gathered.reshape(hidden_shape)
 
 
+def _qwen3_vl_prefill_starts(cache, batch_size):
+    """Return one active-window start per Qwen3-VL batch row."""
+
+    if not cache or cache[0] is None:
+        return [0] * batch_size
+
+    first_cache = cache[0]
+    offset = getattr(first_cache, "offset", 0)
+    offset_size = int(np.prod(offset.shape)) if isinstance(offset, mx.array) else 1
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        if offset_size < batch_size:
+            raise ValueError(
+                "Qwen3-VL cache offsets must cover every batch row."
+            )
+        rotating_offset = getattr(first_cache, "_offset", None)
+        if rotating_offset is not None:
+            return [int(rotating_offset)] * batch_size
+        left_padding = getattr(first_cache, "left_padding", None)
+        if isinstance(left_padding, mx.array):
+            offset = offset + left_padding
+        return [int(offset[i].item()) for i in range(batch_size)]
+
+    if isinstance(offset, mx.array):
+        offset = offset.reshape((-1,))[0].item()
+    return [int(offset)] * batch_size
+
+
+def _align_qwen3_vl_prefill_window(
+    inputs,
+    cache,
+    visual_pos_masks,
+    deepstack_visual_embeds,
+):
+    """Align full-prompt Qwen3 visual state to the active model window."""
+
+    if (
+        visual_pos_masks is None
+        or visual_pos_masks.shape[-1] == inputs.shape[-1]
+    ):
+        return visual_pos_masks, deepstack_visual_embeds
+
+    batch_size, window = inputs.shape[:2]
+    starts = _qwen3_vl_prefill_starts(cache, batch_size)
+    mask_rows = []
+    embed_rows = (
+        [[] for _ in deepstack_visual_embeds]
+        if deepstack_visual_embeds is not None
+        else None
+    )
+    batch_visual_offset = 0
+
+    for batch_index, start in enumerate(starts):
+        full_row = visual_pos_masks[batch_index : batch_index + 1]
+        window_row = full_row[:, start : start + window]
+        mask_rows.append(window_row)
+
+        if embed_rows is not None:
+            before = batch_visual_offset + int(full_row[:, :start].sum().item())
+            count = int(window_row.sum().item())
+            for layer_index, embeds in enumerate(deepstack_visual_embeds):
+                embed_rows[layer_index].append(embeds[before : before + count])
+        batch_visual_offset += int(full_row.sum().item())
+
+    aligned_mask = mx.concatenate(mask_rows, axis=0)
+    if embed_rows is None:
+        return aligned_mask, deepstack_visual_embeds
+    aligned_embeds = [mx.concatenate(rows, axis=0) for rows in embed_rows]
+    return aligned_mask, aligned_embeds
+
+
+def _patch_qwen3_vl_prefill_window(language_module):
+    """Patch one Qwen3-VL language class without replacing its implementation."""
+
+    language_class = getattr(language_module, "LanguageModel", None)
+    if language_class is None:
+        return
+    original_call = language_class.__call__
+    if getattr(original_call, "_unsloth_prefill_window", False):
+        return
+
+    @wraps(original_call)
+    def aligned_call(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        **kwargs,
+    ):
+        visual_pos_masks, deepstack_visual_embeds = (
+            _align_qwen3_vl_prefill_window(
+                inputs,
+                cache,
+                visual_pos_masks,
+                deepstack_visual_embeds,
+            )
+        )
+        kwargs.pop("n_to_process", None)
+        return original_call(
+            self,
+            inputs,
+            inputs_embeds=inputs_embeds,
+            mask=mask,
+            cache=cache,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            **kwargs,
+        )
+
+    aligned_call._unsloth_prefill_window = True
+    _patch_method(language_class, "__call__", aligned_call)
+
+
 def _downsample_square_tokens(x, downsample_ratio):
     """Downsample square token grids without leaving MLX array ops."""
 
@@ -2601,6 +2716,7 @@ def _install_qwen3_family_compile_patches():
     try:
         module = importlib.import_module("mlx_vlm.models.qwen3_vl.qwen3_vl")
         vision_module = importlib.import_module("mlx_vlm.models.qwen3_vl.vision")
+        language_module = importlib.import_module("mlx_vlm.models.qwen3_vl.language")
         qwen35_module = importlib.import_module("mlx_vlm.models.qwen3_5.qwen3_5")
     except Exception:
         return
@@ -2967,7 +3083,8 @@ def _install_qwen3_family_compile_patches():
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
-    _patch_method(importlib.import_module("mlx_vlm.models.qwen3_vl.language").Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
+    _patch_method(language_module.Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
+    _patch_qwen3_vl_prefill_window(language_module)
     _patch_method(module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
     _patch_method(qwen35_module.Model, "get_input_embeddings", patched_qwen35_get_input_embeddings)
     if qwen3moe_module is not None:
@@ -2979,6 +3096,7 @@ def _install_qwen3_family_compile_patches():
         _patch_method(qwen3moe_vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
         _patch_method(qwen3moe_vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
         _patch_method(qwen3moe_language_module.Qwen3VLMoEModel, "_deepstack_process", patched_qwen3_deepstack)
+        _patch_qwen3_vl_prefill_window(qwen3moe_language_module)
         _patch_method(qwen3moe_module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
         _PATCHED_ARCHES.add("qwen3_vl_moe")
     _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})

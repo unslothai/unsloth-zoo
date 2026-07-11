@@ -1789,6 +1789,70 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_qwen3_vl_prefill_windows_align_masks_and_deepstack():
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    full_mask = mx.array([[0, 1, 1, 0, 1, 0, 0, 1],
+                          [1, 0, 1, 0, 0, 1, 1, 0]], dtype=mx.bool_)
+    embeds = [mx.arange(8).reshape(8, 1)]
+    cases = [
+        (0, 3, [[0, 1, 1], [1, 0, 1]], [0, 1, 4, 5]),
+        (mx.array([2, 4]), 3, [[1, 0, 1], [0, 1, 1]], [1, 2, 6, 7]),
+        (6, 2, [[0, 1], [1, 0]], [3, 7]),
+    ]
+    for offsets, window, expected_mask, expected_embeds in cases:
+        aligned_mask, aligned_embeds = mc._align_qwen3_vl_prefill_window(
+            mx.zeros((2, window)), [types.SimpleNamespace(offset=offsets)], full_mask, embeds,
+        )
+        assert aligned_mask.tolist() == expected_mask
+        assert aligned_embeds[0].reshape(-1).tolist() == expected_embeds
+
+    same_mask = mx.ones((2, 2))
+    aligned = mc._align_qwen3_vl_prefill_window(mx.zeros((2, 2)), None, same_mask, embeds)
+    assert aligned == (same_mask, embeds)
+
+    start_cases = [
+        (types.SimpleNamespace(offset=6, _idx=2), 1, [6]),
+        (types.SimpleNamespace(offset=mx.array([6, 4]), _offset=6), 2, [6, 6]),
+        (types.SimpleNamespace(offset=mx.array([-4]), left_padding=mx.array([4])), 1, [0]),
+        (types.SimpleNamespace(offset=mx.array([2]), _offset=6), 1, [6]),
+    ]
+    for cache_state, batch_size, expected in start_cases:
+        assert mc._qwen3_vl_prefill_starts([cache_state], batch_size) == expected
+    with pytest.raises(ValueError, match="cover every batch row"):
+        cache_state = types.SimpleNamespace(offset=mx.array([2]), _offset=6)
+        mc._qwen3_vl_prefill_starts([cache_state], 2)
+
+
+def test_qwen3_vl_prefill_wrapper_is_scoped_and_idempotent(monkeypatch):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+    class LanguageModel:
+        def __call__(self, inputs, **kwargs):
+            calls.append(kwargs)
+            return "delegated"
+
+    language_module = types.SimpleNamespace(LanguageModel=LanguageModel)
+    mc._patch_qwen3_vl_prefill_window(language_module)
+    patched = LanguageModel.__call__
+    mc._patch_qwen3_vl_prefill_window(language_module)
+    assert LanguageModel.__call__ is patched
+    assert LanguageModel()(mx.zeros((1, 2)), n_to_process=2, custom=7) == "delegated"
+    assert calls[0]["custom"] == 7 and "n_to_process" not in calls[0]
+
+    bindings = []
+    def patcher(module):
+        bindings.append(module.__name__)
+    monkeypatch.setattr(mc, "_patch_qwen3_vl_prefill_window", patcher)
+    monkeypatch.setattr(mc, "_patch_method", lambda *_args: None)
+    monkeypatch.setattr(mc, "_patch_staticmethod", lambda *_args: None)
+    mc._install_qwen3_family_compile_patches()
+    assert bindings == ["mlx_vlm.models.qwen3_vl.language", "mlx_vlm.models.qwen3_vl_moe.language"]
+
+
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
     import inspect
     import unsloth_zoo.mlx.utils as mlx_utils
