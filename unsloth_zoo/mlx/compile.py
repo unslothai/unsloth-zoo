@@ -1535,6 +1535,12 @@ def _arch_matches_prefixes(arch: str, prefixes: tuple[str, ...]) -> bool:
     return bool(prefixes) and arch.startswith(prefixes)
 
 
+_IDEFICS_SHARED_PATCH_ARCHES = frozenset({"idefics2", "idefics3"})
+_QWEN_LIKE_MERGE_ARCHES = frozenset(
+    {"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"}
+)
+
+
 def _adapter_matches(
     adapter: CompilePatchAdapter,
     arch: str,
@@ -3344,9 +3350,9 @@ def _install_qwen_like_image_merge_patches():
 
     for arch, module in _iter_trait_model_modules(
         "qwen_like_image_merge",
-        include_arches=("qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"),
+        include_arches=_QWEN_LIKE_MERGE_ARCHES,
     ):
-        if arch.startswith("qwen3"):
+        if arch not in _QWEN_LIKE_MERGE_ARCHES:
             continue
         model_cls = getattr(module, "Model", None)
         if (
@@ -4377,7 +4383,6 @@ def _install_idefics_family_compile_patches():
     """Patch Idefics-family image filtering and multimodal merges for compile.
 
     Shared issue: Python-side padded-image filtering and placeholder merging.
-    Architectures with the same trait and standard layout inherit this patch.
     """
 
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
@@ -4449,9 +4454,9 @@ def _install_idefics_family_compile_patches():
 
     for arch, module in _iter_trait_model_modules(
         "padded_image_filtering",
-        include_arches=("idefics2", "idefics3"),
+        include_arches=_IDEFICS_SHARED_PATCH_ARCHES,
     ):
-        if arch == "smolvlm":
+        if arch not in _IDEFICS_SHARED_PATCH_ARCHES:
             continue
         model_cls = getattr(module, "Model", None)
         if model_cls is None:

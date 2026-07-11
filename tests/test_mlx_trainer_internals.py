@@ -1824,6 +1824,84 @@ def test_compile_patch_primitives_exist():
     assert len(primitives) > 0
 
 
+def test_family_installers_patch_only_allowlisted_models(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    def native(*_args, **_kwargs):
+        return None
+
+    def model_module(arch):
+        attrs = {name: native for name in method_names}
+        attrs["merge_input_ids_with_image_features"] = staticmethod(native)
+        model = type(f"{arch}Model", (), attrs)
+        return types.SimpleNamespace(Model=model)
+
+    method_names = (
+        "merge_input_ids_with_image_features",
+        "_prepare_inputs_for_multimodal",
+        "get_input_embeddings",
+    )
+    assert mc._QWEN_LIKE_MERGE_ARCHES == frozenset(
+        {"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"}
+    )
+    assert mc._IDEFICS_SHARED_PATCH_ARCHES == frozenset({"idefics2", "idefics3"})
+    qwen_arches = tuple(mc._QWEN_LIKE_MERGE_ARCHES)
+    idefics_arches = tuple(mc._IDEFICS_SHARED_PATCH_ARCHES)
+    denied_arches = (
+        "lfm2_vl", "minicpmo", "phi4mm", "qwen3_vl_moe", "qwen3_5",
+    )
+    modules = {
+        arch: model_module(arch)
+        for arch in (*qwen_arches, *idefics_arches, *denied_arches, "qwen3_vl")
+    }
+    smol = types.SimpleNamespace(
+        Model=type(
+            "smolvlmModel",
+            (modules["idefics3"].Model,),
+            {"_prepare_inputs_for_multimodal": native},
+        )
+    )
+    imported = {
+        "mlx_vlm.models.qwen3_vl.qwen3_vl": modules["qwen3_vl"],
+        "mlx_vlm.models.smolvlm.smolvlm": smol,
+    }
+
+    def trait_modules(_trait, *, include_arches=()):
+        arches = (*denied_arches, "qwen3_vl", *include_arches)
+        return [(arch, modules[arch]) for arch in dict.fromkeys(arches)]
+
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(mc, "_iter_trait_model_modules", trait_modules)
+    monkeypatch.setattr(mc, "_try_import_module", imported.get)
+    mc._install_qwen_like_image_merge_patches()
+    mc._install_idefics_family_compile_patches()
+
+    assert all(
+        modules[arch].Model.merge_input_ids_with_image_features
+        is mc._merge_special_token_features_only
+        for arch in qwen_arches
+    )
+    assert all(
+        getattr(modules[arch].Model, name) is not native
+        for arch in idefics_arches
+        for name in ("_prepare_inputs_for_multimodal", "get_input_embeddings")
+    )
+    assert smol.Model._prepare_inputs_for_multimodal is not native
+    assert "get_input_embeddings" not in smol.Model.__dict__
+    assert smol.Model.get_input_embeddings is modules["idefics3"].Model.get_input_embeddings
+    assert modules["qwen3_vl"].Model.merge_input_ids_with_image_features is not native
+
+    expected_patched = set(
+        (*qwen_arches, *idefics_arches, "qwen3_vl", "smolvlm")
+    )
+    assert mc._PATCHED_ARCHES == expected_patched
+    assert all(
+        getattr(modules[arch].Model, name) is native
+        for arch in denied_arches for name in method_names
+    )
+
+
 def test_compile_protocol_requirements_exist():
     import unsloth_zoo.mlx.compile as mc
     reqs = mc.list_protocol_requirements()
