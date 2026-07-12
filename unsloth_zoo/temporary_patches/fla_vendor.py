@@ -490,11 +490,12 @@ def _patch_is_available():
                 continue
             if not (name == "transformers" or name.startswith("transformers.")):
                 continue
-            try:
-                attr = getattr(mod, "is_flash_linear_attention_available", None)
-            except Exception:
+            # Read the static binding via __dict__ so we never fire transformers'
+            # lazy __getattr__, which imports optional deps (e.g. torchvision) and crashes.
+            mod_dict = getattr(mod, "__dict__", None)
+            if not isinstance(mod_dict, dict):
                 continue
-            if attr is original:
+            if mod_dict.get("is_flash_linear_attention_available") is original:
                 try:
                     setattr(mod, "is_flash_linear_attention_available", _vendored_availability_probe)
                 except Exception:
