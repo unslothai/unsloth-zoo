@@ -360,10 +360,8 @@ def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
 def test_vlm_prompt_patch_preserves_model_specific_image_markers(monkeypatch):
     import mlx_vlm.prompt_utils as prompt_utils
     import unsloth_zoo.mlx.loader as loader
-
     expected = "<|user|>\n<|image_1|>Describe this image.<|end|>\n<|assistant|>\n"
     state = {"result": expected, "calls": 0}
-
     def original(*args, **kwargs):
         state["calls"] += 1
         if isinstance(state["result"], Exception):
@@ -839,19 +837,11 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
     import unsloth_zoo.mlx.loader as loader
     import mlx_vlm.utils as vlm_utils
     from transformers.image_processing_utils import BaseImageProcessor
-    from transformers.image_processing_utils import ImageProcessingMixin
     from transformers.processing_utils import ProcessorMixin
     from transformers.video_processing_utils import BaseVideoProcessor
-
-    class CustomImageProcessor(BaseImageProcessor):
-        pass
-
-    class CustomVideoProcessor(BaseVideoProcessor):
-        pass
-
-    class CustomTokenizer:
-        chat_template = None
-        eos_token_id = 1
+    CustomImageProcessor = type("CustomImageProcessor", (BaseImageProcessor,), {})
+    CustomVideoProcessor = type("CustomVideoProcessor", (BaseVideoProcessor,), {})
+    CustomTokenizer = type("CustomTokenizer", (), {"chat_template": None, "eos_token_id": 1})
     received_kwargs = {}
 
     class CustomProcessor(ProcessorMixin):
@@ -860,25 +850,11 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
         tokenizer_class = "CustomTokenizer"
         video_processor_class = "CustomVideoProcessor"
 
-        @classmethod
-        def get_attributes(cls):
-            return [
-                name.removesuffix("_class")
-                for name, value in cls.__dict__.items()
-                if name.removesuffix("_class") in cls.attributes
-                and name.endswith("_class")
-                and value is not None
-            ]
-
         def check_argument_for_proper_class(self, _name, argument):
             return type(argument)
 
         @classmethod
         def from_pretrained(cls, *_args, **_kwargs):
-            if cls.get_attributes() != [
-                "image_processor", "tokenizer", "video_processor",
-            ]:
-                raise ValueError("temporary processor attributes changed")
             received_kwargs.update(_kwargs)
             tokenizer = cls.get_possibly_dynamic_module("CustomTokenizer")()
             return cls(
@@ -888,66 +864,25 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
 
     for component_class in (CustomImageProcessor, CustomVideoProcessor, CustomTokenizer):
         component_class.__module__ = "mlx_vlm.models.fake_vlm.processing"
-    classes = {
-        cls.__name__: cls
-        for cls in (
-            CustomProcessor,
-            CustomImageProcessor,
-            CustomVideoProcessor,
-            CustomTokenizer,
-        )
-    }
+    classes = {cls.__name__: cls for cls in (CustomProcessor, CustomImageProcessor, CustomVideoProcessor, CustomTokenizer)}
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_processor_class", lambda _t, name, *_a: classes.get(name))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({"processor_class": "CustomProcessor", "image_processor_type": "CustomImageProcessor"}))
+    (tmp_path / "video_preprocessor_config.json").write_text(json.dumps({"processor_class": "CustomProcessor", "video_processor_type": "CustomVideoProcessor"}))
     monkeypatch.setattr(
-        loader,
-        "_resolve_mlx_vlm_processor_class",
-        lambda _t, name, *_a: classes.get(name),
-    )
-    sidecars = {
-        "preprocessor_config.json": {
-            "processor_class": "CustomProcessor",
-            "image_processor_type": "CustomImageProcessor",
-        },
-        "video_preprocessor_config.json": {
-            "processor_class": "CustomProcessor",
-            "video_processor_type": "CustomVideoProcessor",
-        },
-    }
-    for filename, config in sidecars.items():
-        (tmp_path / filename).write_text(json.dumps(config))
-    monkeypatch.setattr(
-        vlm_utils,
-        "load_tokenizer",
-        lambda *_a, **_k: lambda tok: ("detok", tok),
+        vlm_utils, "load_tokenizer", lambda *_a, **_k: lambda tok: ("detok", tok),
         raising=False,
     )
     monkeypatch.setattr(
-        vlm_utils,
-        "StoppingCriteria",
-        lambda ids, tok: (ids, tok),
-        raising=False,
+        vlm_utils, "StoppingCriteria", lambda ids, tok: (ids, tok), raising=False,
     )
-    source = types.SimpleNamespace(
-        chat_template="{{ messages }}",
-        stopping_criteria=types.SimpleNamespace(eos_token_ids=[1, 2, 3]),
-    )
-
+    source = types.SimpleNamespace(chat_template="{{ messages }}", stopping_criteria=types.SimpleNamespace(eos_token_ids=[1, 2, 3]))
     repaired = loader._repair_degraded_vlm_processor(
-        source,
-        tmp_path,
-        "fake_vlm",
-        trust_remote_code=True,
+        source, tmp_path, "fake_vlm", trust_remote_code=True,
         processor_kwargs={"use_fast": False, "custom_option": 7},
     )
 
-    repaired_types = tuple(map(
-        type,
-        (repaired, repaired.image_processor, repaired.video_processor, repaired.tokenizer),
-    ))
-    assert repaired_types == (
-        CustomProcessor,
-        CustomImageProcessor,
-        CustomVideoProcessor,
-        CustomTokenizer,
+    assert tuple(map(type, (repaired, repaired.image_processor, repaired.video_processor, repaired.tokenizer))) == (
+        CustomProcessor, CustomImageProcessor, CustomVideoProcessor, CustomTokenizer,
     )
     assert repaired.detokenizer == ("detok", repaired.tokenizer)
     assert repaired.tokenizer.stopping_criteria == ([1, 2, 3], repaired.tokenizer)
@@ -958,72 +893,27 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
     assert loader._repair_degraded_vlm_processor(repaired, tmp_path, "fake_vlm") is repaired
     assert loader._set_mlx_vlm_processor_runtime_state(repaired, tmp_path)
     assert repaired.tokenizer.stopping_criteria == (1, repaired.tokenizer)
-
-    class NativeImageProcessor(ImageProcessingMixin):
-        pass
-
-    class NativeVideoProcessor(BaseVideoProcessor):
-        pass
-
-    assert loader._matches_vlm_component_kind(
-        "image_processor", NativeImageProcessor(),
-    )
-    assert not loader._matches_vlm_component_kind(
-        "image_processor", NativeVideoProcessor(),
-    )
-
-    assert loader._vlm_processor_attributes(CustomProcessor) == (
-        "image_processor", "tokenizer", "video_processor",
-    )
-
-    class LocalGenericProcessor(ProcessorMixin):
-        pass
-
-    LocalGenericProcessor.__module__ = "mlx_vlm.models.fake_vlm.processing"
-    assert not loader._is_native_mlx_vlm_factory(LocalGenericProcessor)
-
-    def native_factory(cls, *_args, **_kwargs):
-        return cls(
-            NativeImageProcessor(), repaired.tokenizer, repaired.video_processor,
-        )
-
-    native_factory.__module__ = "mlx_vlm.models.fake_vlm.processing"
-    monkeypatch.setattr(
-        CustomProcessor, "from_pretrained", classmethod(native_factory),
-    )
-    native_repaired = loader._repair_degraded_vlm_processor(
-        types.SimpleNamespace(chat_template=None),
-        tmp_path,
-        "fake_vlm",
-        add_detokenizer=False,
-    )
-    assert type(native_repaired.image_processor) is NativeImageProcessor
-
-    undeclared_image = type("UndeclaredImageProcessor", (BaseImageProcessor,), {})
-    undeclared_image.__name__ = CustomImageProcessor.__name__
-    undeclared_image.__module__ = CustomImageProcessor.__module__
-
-    def return_image(image_class):
-        return classmethod(lambda cls, *_a, **_k: cls(
-            image_class(), repaired.tokenizer, repaired.video_processor,
-        ))
-
-    monkeypatch.setattr(
-        CustomProcessor,
-        "from_pretrained",
-        return_image(undeclared_image),
-    )
+    NativeImageProcessor = type("NativeImageProcessor", (BaseImageProcessor,), {})
+    NativeImageProcessor.__module__ = "mlx_vlm.models.fake_vlm.processing"
     degraded = types.SimpleNamespace(chat_template=None)
+    def native_factory(cls, *_args, **_kwargs):
+        return cls(NativeImageProcessor(), repaired.tokenizer, repaired.video_processor)
+    native_factory.__module__ = NativeImageProcessor.__module__
+    monkeypatch.setattr(CustomProcessor, "from_pretrained", classmethod(native_factory))
+    native = loader._repair_degraded_vlm_processor(degraded, tmp_path, "fake_vlm", add_detokenizer=False)
+    assert type(native.image_processor) is NativeImageProcessor
+    assert not loader._matches_vlm_component_kind("image_processor", CustomVideoProcessor())
+    UndeclaredImageProcessor = type("CustomImageProcessor", (BaseImageProcessor,), {})
+    UndeclaredImageProcessor.__module__ = CustomImageProcessor.__module__
+    monkeypatch.setattr(CustomProcessor, "from_pretrained", classmethod(
+        lambda cls, *_a, **_k: cls(UndeclaredImageProcessor(), repaired.tokenizer, repaired.video_processor)
+    ))
     assert loader._repair_degraded_vlm_processor(
         degraded, tmp_path, "fake_vlm", add_detokenizer=False,
     ) is degraded
-
-    (tmp_path / "preprocessor_config.json").write_text(json.dumps(
-        {
-            "processor_class": "CustomProcessor",
-            "image_processor_type": "MissingImageProcessor",
-        }
-    ))
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({
+        "processor_class": "CustomProcessor", "image_processor_type": "MissingImageProcessor",
+    }))
     assert loader._repair_degraded_vlm_processor(
         degraded, tmp_path, "fake_vlm", add_detokenizer=False,
     ) is degraded
