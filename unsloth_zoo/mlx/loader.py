@@ -1702,36 +1702,68 @@ def _ensure_mlx_vlm_pt_output_fallback():
     vlm_utils.process_inputs_with_fallback = process_inputs_with_pt_fallback
 
 
+def _mlx_vlm_bpe_flush_recovery(error, buffered, token, tokenmap, byte_decoder):
+    try:
+        value = tokenmap[token]
+        buffered_bytes = bytes(byte_decoder[char] for char in buffered)
+        buffered_bytes.decode("utf-8")
+    except UnicodeDecodeError as buffered_error:
+        if (
+            value
+            and byte_decoder.get(value[0]) == 32
+            and error.encoding == buffered_error.encoding == "utf-8"
+            and bytes(error.object) == buffered_bytes
+            and error.start == buffered_error.start
+            and error.end == buffered_error.end
+            and error.reason == buffered_error.reason
+        ):
+            return buffered_bytes, value
+    except Exception:
+        pass
+    return None
+
+
 def _mlx_vlm_bpe_needs_utf8_fallback(detokenizer_class):
     try:
         detokenizer_class.make_byte_decoder()
         byte_chars = {
             byte: char for char, byte in detokenizer_class._byte_decoder.items()
         }
-        probe = object.__new__(detokenizer_class)
-        probe.trim_space = False
-        probe.tokenmap = [byte_chars[0xC3], byte_chars[32] + "x"]
-        probe.reset()
-        probe.add_token(0)
-        if probe._unflushed != byte_chars[0xC3] or probe.text:
-            return False
     except Exception:
         return False
-    try:
-        probe.add_token(1)
-    except UnicodeDecodeError as error:
-        return (
-            error.reason == "unexpected end of data"
-            and probe._unflushed == byte_chars[0xC3]
-            and not probe.text
-        )
-    except Exception:
-        pass
-    return False
+
+    def fails_strict_flush(byte):
+        try:
+            probe = object.__new__(detokenizer_class)
+            probe.trim_space = False
+            probe.tokenmap = [byte_chars[byte], byte_chars[32] + "x"]
+            probe.reset()
+            probe.add_token(0)
+            if probe._unflushed != byte_chars[byte] or probe.text:
+                return False
+            buffered, text = probe._unflushed, probe.text
+        except Exception:
+            return False
+        try:
+            probe.add_token(1)
+        except UnicodeDecodeError as error:
+            return (
+                _mlx_vlm_bpe_flush_recovery(
+                    error, buffered, 1, probe.tokenmap, probe._byte_decoder
+                )
+                is not None
+                and probe._unflushed == buffered
+                and probe.text == text
+            )
+        except Exception:
+            pass
+        return False
+
+    return any(fails_strict_flush(byte) for byte in (0xC3, 0xBF))
 
 
 def _ensure_mlx_vlm_bpe_utf8_fallback():
-    """Replace only incomplete UTF-8 flush failures in release mlx-vlm."""
+    """Replace invalid UTF-8 flushes in release mlx-vlm."""
     try:
         import mlx_vlm.tokenizer_utils as tokenizer_utils
     except ImportError:
@@ -1747,16 +1779,18 @@ def _ensure_mlx_vlm_bpe_utf8_fallback():
 
     @wraps(add_token)
     def add_token_utf8_safe(self, *args, **kwargs):
+        buffered, text = self._unflushed, self.text
         try:
             return add_token(self, *args, **kwargs)
         except UnicodeDecodeError as error:
-            if error.reason != "unexpected end of data":
-                raise
             token = kwargs.get("token", args[0] if args else None)
-            value = self.tokenmap[token]
-            current_text = bytearray(
-                self._byte_decoder[char] for char in self._unflushed
-            ).decode("utf-8", errors="replace")
+            recovery = _mlx_vlm_bpe_flush_recovery(
+                error, buffered, token, self.tokenmap, self._byte_decoder
+            )
+            if recovery is None or self._unflushed != buffered or self.text != text:
+                raise
+            buffered_bytes, value = recovery
+            current_text = buffered_bytes.decode("utf-8", errors="replace")
             if self.text or not self.trim_space:
                 self.text += current_text
             else:
