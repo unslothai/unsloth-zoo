@@ -490,8 +490,8 @@ def _patch_is_available():
                 continue
             if not (name == "transformers" or name.startswith("transformers.")):
                 continue
-            # Read the static binding via __dict__ so we never fire transformers'
-            # lazy __getattr__, which imports optional deps (e.g. torchvision) and crashes.
+            # Read via __dict__, not getattr: getattr fires transformers' lazy
+            # __getattr__, which imports optional deps like torchvision and crashes.
             mod_dict = getattr(mod, "__dict__", None)
             if not isinstance(mod_dict, dict):
                 continue
