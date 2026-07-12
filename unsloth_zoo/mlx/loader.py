@@ -1702,6 +1702,72 @@ def _ensure_mlx_vlm_pt_output_fallback():
     vlm_utils.process_inputs_with_fallback = process_inputs_with_pt_fallback
 
 
+def _mlx_vlm_bpe_needs_utf8_fallback(detokenizer_class):
+    try:
+        detokenizer_class.make_byte_decoder()
+        byte_chars = {
+            byte: char for char, byte in detokenizer_class._byte_decoder.items()
+        }
+        probe = object.__new__(detokenizer_class)
+        probe.trim_space = False
+        probe.tokenmap = [byte_chars[0xC3], byte_chars[32] + "x"]
+        probe.reset()
+        probe.add_token(0)
+        if probe._unflushed != byte_chars[0xC3] or probe.text:
+            return False
+    except Exception:
+        return False
+    try:
+        probe.add_token(1)
+    except UnicodeDecodeError as error:
+        return (
+            error.reason == "unexpected end of data"
+            and probe._unflushed == byte_chars[0xC3]
+            and not probe.text
+        )
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_mlx_vlm_bpe_utf8_fallback():
+    """Replace only incomplete UTF-8 flush failures in release mlx-vlm."""
+    try:
+        import mlx_vlm.tokenizer_utils as tokenizer_utils
+    except ImportError:
+        return
+    detokenizer_class = getattr(tokenizer_utils, "BPEStreamingDetokenizer", None)
+    add_token = getattr(detokenizer_class, "add_token", None)
+    if (
+        add_token is None
+        or getattr(add_token, "_unsloth_utf8_fallback", False)
+        or not _mlx_vlm_bpe_needs_utf8_fallback(detokenizer_class)
+    ):
+        return
+
+    @wraps(add_token)
+    def add_token_utf8_safe(self, *args, **kwargs):
+        try:
+            return add_token(self, *args, **kwargs)
+        except UnicodeDecodeError as error:
+            if error.reason != "unexpected end of data":
+                raise
+            token = kwargs.get("token", args[0] if args else None)
+            value = self.tokenmap[token]
+            current_text = bytearray(
+                self._byte_decoder[char] for char in self._unflushed
+            ).decode("utf-8", errors="replace")
+            if self.text or not self.trim_space:
+                self.text += current_text
+            else:
+                self.text += tokenizer_utils._remove_space(current_text)
+            self._unflushed = value
+
+    add_token_utf8_safe._unsloth_utf8_fallback = True
+    add_token_utf8_safe._unsloth_original = add_token
+    detokenizer_class.add_token = add_token_utf8_safe
+
+
 def _build_vlm_image_processor_from_config(
     model_path, processor_config, preprocessor_config, model_type=None,
 ):
@@ -6387,6 +6453,7 @@ class FastMLXModel:
             _ensure_vlm_prompt_utils_patched()
             _ensure_mlx_vlm_processor_repair()
             _ensure_mlx_vlm_pt_output_fallback()
+            _ensure_mlx_vlm_bpe_utf8_fallback()
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
