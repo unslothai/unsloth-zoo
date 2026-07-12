@@ -3449,16 +3449,13 @@ def unsloth_compile_transformers(
     )
 
     # Pre-load persisted torch.compile artifacts (Mega-cache) for this exact
-    # environment + model + compile configuration. This runs during
-    # from_pretrained, strictly before any @torch.compile region executes, so
-    # a hit lets the first training step skip Inductor codegen and Triton
-    # autotuning. A miss is silent and falls back to a normal local compile;
-    # the artifacts are then saved at process exit for the next run.
-    # Kill switch: UNSLOTH_MEGA_CACHE=0. See compile_cache.py.
+    # environment + model + compile configuration. Runs during from_pretrained,
+    # before any @torch.compile region, so a hit skips Inductor codegen and
+    # Triton autotuning; a silent miss compiles locally and saves at process
+    # exit. Kill switch: UNSLOTH_MEGA_CACHE=0. See compile_cache.py.
     try:
         from .compile_cache import megacache_load
-        # Env vars override these arguments below (and the generated forwards
-        # branch on UNSLOTH_RETURN_HIDDEN_STATES), so key on the EFFECTIVE
+        # Env vars override these arguments below, so key on the EFFECTIVE
         # values or one mode's bundle would be a false hit for another.
         _effective_fullgraph = os.environ.get(
             "UNSLOTH_FULLGRAPH", "1" if fullgraph else "0"

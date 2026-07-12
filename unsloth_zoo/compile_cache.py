@@ -16,33 +16,25 @@
 
 """Persistent torch.compile artifact cache for Unsloth training (Mega-cache).
 
-``unsloth_compiled_cache/`` only caches the GENERATED SOURCE of the patched
-modules. The expensive part of a first training step - Dynamo tracing,
-AOTAutograd partitioning, Inductor codegen and Triton autotuning for the
-forward AND backward graphs - is redone by every new process unless torch's
-own on-disk caches (FX graph cache, AOTAutograd cache, autotune cache) are
-warm. Those caches live under ``TORCHINDUCTOR_CACHE_DIR`` (by default a
-``/tmp/torchinductor_<user>`` directory that rarely survives reboots or
-container restarts, and is never shipped to users).
+``unsloth_compiled_cache/`` only caches the GENERATED SOURCE; Dynamo tracing,
+AOTAutograd partitioning, Inductor codegen and Triton autotuning are redone by
+every new process unless torch's own on-disk caches (default
+``/tmp/torchinductor_<user>``, which rarely survives reboots or container
+restarts) are warm. This module persists those artifacts via the portable
+Mega-cache API (``torch.compiler.save/load_cache_artifacts``, torch >= 2.7) so
+a model family's compile cost is paid once per IDENTICAL environment.
 
-This module persists the same artifacts through the portable Mega-cache API
-(``torch.compiler.save_cache_artifacts`` / ``load_cache_artifacts``,
-torch >= 2.7) so the one-time compile cost of a model family can be paid once
-per environment and reused across processes, container restarts and machines
-with an IDENTICAL environment.
-
-A bundle is only valid for the exact same torch / Triton / CUDA build, GPU
-architecture, transformers version and generated-source configuration. The
-key is therefore an exact-match fingerprint over all of those dimensions; a
-mismatch simply means a cache miss and a normal local compile. Loading is
-always best-effort and never raises.
+A bundle is only valid for the exact torch / Triton / CUDA build, GPU
+architecture, transformers version and generated-source configuration, so the
+key is an exact-match fingerprint over all of them; a mismatch is just a cache
+miss. Loading is best-effort and never raises.
 
 Environment knobs:
   UNSLOTH_MEGA_CACHE       = "auto" (default) | "0" | "1"
-      auto -> load a matching bundle if one exists AND save at process exit
-              whenever the recorded artifacts differ from the bundle on disk
-              (torch records hits too, so saves merge loaded + new artifacts).
-      1    -> same as auto, but always rewrite the bundle at exit.
+      auto -> load a matching bundle AND save at exit when the recorded
+              artifacts differ from disk (torch records hits too, so saves
+              merge loaded + new artifacts).
+      1    -> like auto, but always rewrite the bundle at exit.
       0    -> fully disabled (kill switch).
   UNSLOTH_MEGA_CACHE_DIR   = bundle root (default ~/.cache/unsloth/mega_cache).
 """
@@ -66,8 +58,7 @@ _FORMAT_VERSION = 1
 _BUNDLE_NAME = "megacache.bin"
 _MANIFEST_NAME = "manifest.json"
 
-# Process-level state: one fingerprint accumulates all models loaded in this
-# process (multiple unsloth_compile_transformers calls extend the key).
+# Process-level state: each unsloth_compile_transformers call extends the key.
 _STATE = {
     "armed": False,
     "loaded_key": None,
@@ -98,8 +89,7 @@ def _cache_root():
     root = os.path.expanduser(os.environ.get("UNSLOTH_MEGA_CACHE_DIR", ""))
     if root == "":
         home = os.path.expanduser("~")
-        # Restricted containers can have no resolvable home; disable rather
-        # than writing a literal "~" directory into the CWD.
+        # No resolvable home: disable rather than write a literal "~" dir.
         if home == "~" or not os.path.isdir(home):
             return None
         root = os.path.join(home, ".cache", "unsloth", "mega_cache")
@@ -136,8 +126,8 @@ def _environment_fingerprint():
         fingerprint["torch"] = str(torch.__version__)
         fingerprint["cuda"] = str(torch.version.cuda)
         if torch.cuda.is_available():
-            # The bound device, not device 0: mixed-architecture hosts must
-            # not save one GPU's kernels under another's key.
+            # Bound device, not device 0: mixed-architecture hosts must not
+            # save one GPU's kernels under another's key.
             device = torch.cuda.current_device()
             fingerprint["gpu_name"] = torch.cuda.get_device_name(device)
             capability = torch.cuda.get_device_capability(device)
@@ -164,13 +154,9 @@ pass
 
 
 def _model_key(model_type, compile_kwargs, torch_compile_options):
-    """One model's contribution to the bundle key.
-
-    ``compile_kwargs`` are the unsloth_compile_transformers arguments that
-    change the GENERATED SOURCE (and therefore the traced graphs);
-    ``torch_compile_options`` is the Inductor options dict baked into the
-    generated ``@torch.compile`` decorators.
-    """
+    """One model's contribution to the bundle key: the arguments that change
+    the GENERATED SOURCE (hence the traced graphs) plus the Inductor options
+    baked into the generated ``@torch.compile`` decorators."""
     payload = {
         "model_type": str(model_type),
         "compile_kwargs": {k: compile_kwargs[k] for k in sorted(compile_kwargs)},
@@ -199,11 +185,10 @@ pass
 
 
 def _read_disk_bundle(directory, manifest_path):
-    """Read the (manifest, bundle bytes) pair for a key, returning
-    ``(None, None)`` unless the manifest checksum matches the bundle file it
-    points at. The manifest names its bundle file (content-addressed by the
-    writer), so a manifest can never validate against a bundle written by a
-    different process: same name implies same bytes."""
+    """Read (manifest, bundle bytes), or ``(None, None)`` unless the manifest
+    checksum matches the bundle file it names. Bundle files are
+    content-addressed (same name implies same bytes), so a manifest can never
+    validate a different writer's bundle."""
     try:
         with open(manifest_path, "r") as file:
             manifest = json.load(file)
@@ -219,13 +204,11 @@ pass
 
 
 def _merge_recorded_artifacts(data):
-    """Re-record an existing bundle's artifacts into torch's artifact manager
-    so the next ``save_cache_artifacts`` serializes the UNION of the on-disk
-    bundle and this process' artifacts. torch only records what this run
-    loaded-and-hit or compiled, so without this a run that exercises a subset
-    of a warm bundle (a different shape, one of several cached models) would
-    replace the bundle with that subset and silently drop the rest.
-    Best-effort: a failure just means this save may narrow the bundle."""
+    """Re-record the on-disk bundle's artifacts so the next
+    ``save_cache_artifacts`` serializes the UNION of bundle + this process.
+    torch only records what this run exercised, so without this a run hitting
+    a subset of a warm bundle would replace it with that subset. Best-effort:
+    a failure just means this save may narrow the bundle."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         artifacts = CacheArtifactManager.deserialize(data)
@@ -234,8 +217,7 @@ def _merge_recorded_artifacts(data):
         merged = 0
         for artifact_type, items in artifacts.items():
             for artifact in items:
-                # Value-equality dedup: artifacts this run re-recorded on its
-                # own hits are already present and are skipped.
+                # Value-equality dedup skips artifacts this run re-recorded.
                 if artifact in CacheArtifactManager._seen_artifacts:
                     continue
                 CacheArtifactManager._new_cache_artifacts[artifact_type].append(artifact)
@@ -249,15 +231,10 @@ pass
 
 
 def megacache_load(model_type, compile_kwargs = None, torch_compile_options = None):
-    """Try to pre-load compile artifacts for ``model_type`` before the first
-    compiled forward. Registers the exit-time save as a side effect.
-
-    Called from ``unsloth_compile_transformers`` which runs during
-    ``from_pretrained`` - i.e. strictly before any ``@torch.compile`` region
-    executes, which is when Dynamo consults the caches this pre-populates.
-
-    Never raises; a miss just means a normal local compile.
-    """
+    """Pre-load compile artifacts for ``model_type`` and register the
+    exit-time save. Runs during ``from_pretrained``, strictly before any
+    ``@torch.compile`` region consults the caches this pre-populates.
+    Never raises; a miss just means a normal local compile."""
     if not megacache_is_enabled():
         return False
     if not _mega_cache_supported():
@@ -275,8 +252,7 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
 
     _STATE["armed"] = True
     _STATE["loaded_key"] = key
-    # A hit for an earlier cumulative key does not cover this one: reset so a
-    # miss here still saves the extended bundle at exit.
+    # A hit for an earlier cumulative key does not cover this extended one.
     _STATE["hit"] = False
     if not _STATE["atexit_registered"]:
         atexit.register(megacache_save)
@@ -303,19 +279,14 @@ pass
 
 
 def megacache_save():
-    """Persist this process' compile artifacts. Runs at exit (atexit) or on
-    demand. torch records artifacts on cache HITS as well as writes, but only
-    for the entries this run actually exercised - so the on-disk bundle is
-    first merged back into the recorder and the saved bundle is always the
-    UNION of the existing bundle and this process' artifacts. A run that
-    changes nothing serializes back to the same content and is skipped.
-    Never raises.
-    """
+    """Persist this process' compile artifacts (atexit or on demand). torch
+    records hits as well as writes, but only what this run exercised - so the
+    on-disk bundle is merged back first and the save is always the UNION of
+    bundle + process. An unchanged bundle is skipped. Never raises."""
     if not (_STATE["armed"] and megacache_is_enabled() and _mega_cache_supported()):
         return False
-    # Distributed launches: one writer per NODE (cache roots default to
-    # node-local disks), guarded against shared roots by the pid-unique
-    # temp + atomic replace below.
+    # One writer per NODE (cache roots default to node-local disks); shared
+    # roots are guarded by the pid-unique temp + atomic replace below.
     if os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")) != "0":
         return False
     key = _STATE["loaded_key"]
@@ -326,9 +297,8 @@ def megacache_save():
         directory, manifest_path = _bundle_paths(key)
         if manifest_path is None:
             return False
-        # Union semantics: fold the current on-disk bundle back into the
-        # manager before serializing, so a run that exercised only part of a
-        # warm bundle cannot narrow it (see _merge_recorded_artifacts).
+        # Union semantics: fold the on-disk bundle back in first so a run
+        # that exercised only part of it cannot narrow it.
         _, existing = _read_disk_bundle(directory, manifest_path)
         if existing is not None:
             _merge_recorded_artifacts(existing)
@@ -343,11 +313,10 @@ def megacache_save():
                 _log("bundle unchanged; skipping save")
                 return False
         os.makedirs(directory, exist_ok = True)
-        # The bundle file is content-addressed and the manifest names it, so
-        # the (bundle, manifest) pair is consistent without a cross-file lock:
-        # concurrent writers produce differently named bundles, the manifest
-        # replace is atomic, and whichever manifest lands last points at its
-        # own complete file. Same name always implies same bytes.
+        # Content-addressed bundle + manifest naming it = consistency without
+        # a cross-file lock: concurrent writers produce differently named
+        # bundles, the manifest replace is atomic, and the last manifest
+        # points at its own complete file. Same name implies same bytes.
         bundle_name = f"megacache-{new_sha[:16]}.bin"
         bundle_path = os.path.join(directory, bundle_name)
         if not os.path.isfile(bundle_path):
@@ -370,10 +339,8 @@ def megacache_save():
             json.dump(manifest, file, indent = 2, sort_keys = True, default = str)
         os.replace(temporary_manifest, manifest_path)
         _log(f"saved bundle for key {key} ({len(data)} bytes)")
-        # Best-effort GC of superseded bundle files (including the legacy
-        # fixed-name bundle). A concurrent reader that already opened one
-        # keeps its file handle; a reader that comes later re-reads the
-        # manifest and finds the new name.
+        # Best-effort GC of superseded bundles (incl. legacy fixed name).
+        # Open readers keep their handle; later readers re-read the manifest.
         try:
             for name in os.listdir(directory):
                 is_stale_bundle = (

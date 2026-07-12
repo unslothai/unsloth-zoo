@@ -155,9 +155,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
     os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
-    # ENABLE_AOT_AUTOGRAD_CACHE is no longer read by torch >= 2.12; the
-    # AOTAutograd cache env override was renamed. Set the current name too so
-    # backward graphs are also cached on disk across process restarts.
+    # torch >= 2.12 renamed the AOTAutograd cache env override; set the new
+    # name too so backward graphs stay disk-cached across restarts.
     os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
 
     # Torch compile arguments
