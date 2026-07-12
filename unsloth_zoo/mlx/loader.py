@@ -452,16 +452,46 @@ def _normalize_tokenizer_config_backend_class(
     return patched_config, True
 
 
-def _materialize_mlx_vlm_config_data(local_path, config_data):
+def _normalize_vlm_processor_geometry(processor_config, model_config):
+    vision_config = model_config.get("vision_config")
+    if not isinstance(vision_config, dict):
+        vision_config = {}
+    patch_size = vision_config.get("patch_size")
+    strategy = model_config.get("vision_feature_select_strategy")
+    updates = {}
+    if (
+        processor_config.get("patch_size") is None
+        and isinstance(patch_size, int)
+        and not isinstance(patch_size, bool)
+        and patch_size > 0
+    ):
+        updates["patch_size"] = patch_size
+    if (
+        processor_config.get("vision_feature_select_strategy") is None
+        and isinstance(strategy, str)
+        and strategy.strip()
+    ):
+        updates["vision_feature_select_strategy"] = strategy
+    if not updates:
+        return processor_config, False
+    return {**processor_config, **updates}, True
+
+
+def _materialize_mlx_vlm_sidecar_overrides(local_path, patched_files):
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name == "config.json":
-            continue
-        _link_or_copy_path(src, dst)
-    with open(os.path.join(override_dir, "config.json"), "w") as f:
-        json.dump(config_data, f, indent=2)
+    try:
+        for name in os.listdir(local_path):
+            src = os.path.join(local_path, name)
+            dst = os.path.join(override_dir, name)
+            if name in patched_files:
+                continue
+            _link_or_copy_path(src, dst)
+        for name, data in patched_files.items():
+            with open(os.path.join(override_dir, name), "w") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        shutil.rmtree(override_dir, ignore_errors=True)
+        raise
     return override_dir
 
 
@@ -499,11 +529,25 @@ def _keep_mlx_vlm_config_view_alive(model, override_dir):
         pass
 
 
+def _load_mlx_vlm_with_config_views(load_fn, view_paths, *args, **kwargs):
+    try:
+        model, processor = load_fn(*args, **kwargs)
+    except Exception:
+        for path in reversed(view_paths):
+            shutil.rmtree(path, ignore_errors=True)
+        raise
+    for path in view_paths:
+        _keep_mlx_vlm_config_view_alive(model, path)
+    return model, processor
+
+
 def _materialize_mlx_vlm_config_override(
     local_path,
     config_data,
     *,
+    config_override_data=None,
     normalize_tokenizer_config=False,
+    normalize_processor_geometry=False,
     supports_list_extra_special_tokens=None,
 ):
     """Return a load path whose sidecars are compatible with mlx-vlm loaders."""
@@ -513,7 +557,10 @@ def _materialize_mlx_vlm_config_override(
 
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     patched_config = config_data
-    if (
+    if config_override_data is not None:
+        patched_config = dict(config_override_data)
+        patched_files["config.json"] = patched_config
+    elif (
         corrected_model_type is not None
         and config_data.get("model_type") != corrected_model_type
     ):
@@ -540,22 +587,37 @@ def _materialize_mlx_vlm_config_override(
         if patched_backend or patched_tokenizer:
             patched_files["tokenizer_config.json"] = patched_tokenizer_config
 
+    processor_config = (
+        _read_json_file(os.path.join(local_path, "processor_config.json"))
+        if normalize_processor_geometry else {}
+    )
+    if processor_config:
+        patched_processor_config, patched_geometry = (
+            _normalize_vlm_processor_geometry(processor_config, patched_config)
+        )
+        if patched_geometry:
+            patched_files["processor_config.json"] = patched_processor_config
+
     if not patched_files:
         return local_path, config_data
 
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name in patched_files:
-            continue
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            pass
-    for name, data in patched_files.items():
-        with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    try:
+        for name in os.listdir(local_path):
+            src = os.path.join(local_path, name)
+            dst = os.path.join(override_dir, name)
+            if name in patched_files:
+                continue
+            try:
+                os.symlink(src, dst)
+            except FileExistsError:
+                pass
+        for name, data in patched_files.items():
+            with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        shutil.rmtree(override_dir, ignore_errors=True)
+        raise
     if corrected_model_type is not None and "config.json" in patched_files:
         print(
             "Unsloth: Routing DeepSeek OCR checkpoint through "
@@ -951,6 +1013,7 @@ def _load_mlx_vlm_distributed(
     hf_token=None,
     revision=None,
     config_override_data=None,
+    sidecar_override_data=None,
 ):
     pipeline_group, tensor_group = _mlx_active_distributed_groups(
         pipeline_group,
@@ -972,10 +1035,12 @@ def _load_mlx_vlm_distributed(
     try:
         with _temporary_hf_token_env(hf_token):
             load_target = get_model_path(model_name, revision=revision)
+            patched_files = dict(sidecar_override_data or {})
             if config_override_data is not None:
-                load_target = _materialize_mlx_vlm_config_data(
-                    str(load_target),
-                    config_override_data,
+                patched_files["config.json"] = config_override_data
+            if patched_files:
+                load_target = _materialize_mlx_vlm_sidecar_overrides(
+                    str(load_target), patched_files,
                 )
                 try:
                     model, processor = sharded_load(
@@ -5725,6 +5790,8 @@ class FastMLXModel:
         local_path = None
         original_local_path = None
         vlm_config_override_data = None
+        vlm_sidecar_override_data = None
+        vlm_config_view_paths = []
         try:
             with _temporary_hf_token_env(token):
                 config_allow_patterns = None
@@ -5753,19 +5820,10 @@ class FastMLXModel:
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
             original_local_path = local_path
-            original_config_data = dict(config_data)
-            if distributed_requested:
-                patched_config_data = _mlx_vlm_config_override_data(config_data)
-                if patched_config_data is not None:
-                    config_data = patched_config_data
-                    vlm_config_override_data = dict(config_data)
-            else:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                )
-                if local_path != original_local_path or config_data != original_config_data:
-                    vlm_config_override_data = dict(config_data)
+            patched_config_data = _mlx_vlm_config_override_data(config_data)
+            if patched_config_data is not None:
+                config_data = patched_config_data
+                vlm_config_override_data = dict(config_data)
 
         # bitsandbytes-quantized repos store NF4 weights MLX cannot read. When
         # the real bitsandbytes wheel is importable, let bnb dequantize to fp16
@@ -6324,13 +6382,6 @@ class FastMLXModel:
                     stacklevel=2,
                 )
 
-            if local_path:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                    normalize_tokenizer_config=True,
-                )
-
             if patch_mode == "patched":
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
@@ -6359,13 +6410,41 @@ class FastMLXModel:
             if want_runtime_quant:
                 import mlx.core as mx
                 from mlx_vlm.utils import load_config as _vlm_load_config
+                _patch_deepseek_ocr_transformers_import_compat(model_type)
+
+            if local_path:
+                if distributed_requested:
+                    processor_config = _read_json_file(
+                        os.path.join(local_path, "processor_config.json")
+                    )
+                    patched_processor_config, patched_geometry = (
+                        _normalize_vlm_processor_geometry(processor_config, config_data)
+                    )
+                    if processor_config and patched_geometry:
+                        vlm_sidecar_override_data = {
+                            "processor_config.json": patched_processor_config,
+                        }
+                else:
+                    previous_local_path = local_path
+                    local_path, config_data = _materialize_mlx_vlm_config_override(
+                        local_path,
+                        config_data,
+                        config_override_data=vlm_config_override_data,
+                        normalize_tokenizer_config=True,
+                        normalize_processor_geometry=True,
+                    )
+                    if local_path != previous_local_path:
+                        vlm_config_view_paths.append(local_path)
+
+            if want_runtime_quant:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
-                _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
                     try:
-                        model, processor = vlm_load(
+                        model, processor = _load_mlx_vlm_with_config_views(
+                            vlm_load,
+                            vlm_config_view_paths,
                             vlm_load_target,
                             lazy=True,
                             revision=revision,
@@ -6404,6 +6483,7 @@ class FastMLXModel:
                     hf_token=token,
                     revision=revision,
                     config_override_data=vlm_config_override_data,
+                    sidecar_override_data=vlm_sidecar_override_data,
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
@@ -6412,17 +6492,20 @@ class FastMLXModel:
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
-                model, processor = _load_mlx_vlm_with_extra_weight_filter(
-                    local_path or model_name,
-                    model_type,
-                    vlm_load,
-                    vlm_kwargs,
+                model, processor = _load_mlx_vlm_with_config_views(
+                    _load_mlx_vlm_with_extra_weight_filter,
+                    vlm_config_view_paths,
+                    local_path or model_name, model_type, vlm_load, vlm_kwargs,
                     hf_token=token,
                 )
 
+            config_view_paths = getattr(model, "_unsloth_mlx_config_view_paths", ())
+            processor_source_path = (
+                config_view_paths[-1] if config_view_paths else local_path or model_name
+            )
             processor = _repair_degraded_vlm_processor(
                 processor,
-                local_path or model_name,
+                processor_source_path,
                 model_type,
                 token=token,
                 trust_remote_code=trust_remote_code,
@@ -6471,7 +6554,7 @@ class FastMLXModel:
             # saving needs the mlx-vlm patched dir when one was materialized
             # (e.g. DeepSeek OCR), else saved adapters copy the unpatched
             # model_type/auto_map the override drops.
-            model._config_src_path = local_path or original_local_path
+            model._config_src_path = processor_source_path
             model._unsloth_base_revision = revision
             model._unsloth_base_commit_hash = _infer_snapshot_commit(
                 original_local_path or local_path

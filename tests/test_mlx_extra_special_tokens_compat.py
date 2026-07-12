@@ -216,6 +216,41 @@ def test_normalizes_tokenizers_backend_only_when_unavailable(monkeypatch):
     assert _normalize_tokenizer_config_backend_class(config) == (config, False)
 
 
+def test_materializes_only_missing_vlm_processor_geometry(tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    original = {"processor_class": "LlavaProcessor", "patch_size": None}
+    (source / "processor_config.json").write_text(json.dumps(original), encoding="utf-8")
+    (source / "config.json").write_text(json.dumps({"model_type": "raw"}), encoding="utf-8")
+    model = {"model_type": "llava", "vision_config": {"patch_size": 14}, "vision_feature_select_strategy": "default"}
+    view, _ = loader._materialize_mlx_vlm_config_override(
+        str(source), model, config_override_data=model, normalize_processor_geometry=True,
+    )
+    assert json.loads((Path(view) / "config.json").read_text()) == model
+    patched = json.loads((Path(view) / "processor_config.json").read_text(encoding="utf-8"))
+    assert patched == {**original, "patch_size": 14, "vision_feature_select_strategy": "default"}
+    assert json.loads((source / "processor_config.json").read_text(encoding="utf-8")) == original
+    second_view = tmp_path / "second_view"
+    second_view.mkdir()
+    loaded, _ = loader._load_mlx_vlm_with_config_views(
+        lambda: (type("Model", (), {})(), object()), [view, second_view],
+    )
+    for finalizer in loaded._unsloth_mlx_config_view_finalizers:
+        finalizer()
+    assert not Path(view).exists() and not second_view.exists()
+    failed_view = tmp_path / "failed_view"
+    failed_view.mkdir()
+    with pytest.raises(RuntimeError):
+        loader._load_mlx_vlm_with_config_views(
+            lambda: (_ for _ in ()).throw(RuntimeError("load failed")), [failed_view],
+        )
+    assert not failed_view.exists()
+
+    existing = {"patch_size": 16, "vision_feature_select_strategy": "full"}
+    assert loader._normalize_vlm_processor_geometry(existing, model) == (existing, False)
+
+
 def test_temporary_patch_exposes_original_init_for_probe(
     base_init,
     monkeypatch,

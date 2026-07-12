@@ -210,6 +210,7 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
     calls = []
     model_dir = _write_config(tmp_path, {"model_type": "raw"})
+    (model_dir / "processor_config.json").write_text(json.dumps({"patch_size": None}))
     messages = ["The model does not support pipeline parallelism", "Model type kimi_k25 not supported", "Unsupported model type kimi_k25", "checkpoint exploded"]
 
     class _FakeVLM:
@@ -217,7 +218,8 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
 
     def sharded_load(repo, *, tensor_group=None, pipeline_group=None):
         patched_type = json.loads((Path(repo) / "config.json").read_text()).get("model_type")
-        calls.append((repo, tensor_group, pipeline_group, patched_type))
+        patch_size = json.loads((Path(repo) / "processor_config.json").read_text()).get("patch_size")
+        calls.append((repo, tensor_group, pipeline_group, patched_type, patch_size))
         if pipeline_group is not None:
             raise ValueError(messages.pop(0))
         return _FakeVLM(), types.SimpleNamespace(name="processor")
@@ -228,13 +230,14 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", vlm_utils)
     tensor_group, pipeline_group = _FakeGroup(name="tensor"), _FakeGroup(name="pipeline")
-    model, _processor = _load_mlx_vlm_distributed("fake/vlm", "qwen3_vl_moe", tensor_group=tensor_group, config_override_data={"model_type": "patched"})
+    model, _processor = _load_mlx_vlm_distributed("fake/vlm", "qwen3_vl_moe", tensor_group=tensor_group, config_override_data={"model_type": "patched"}, sidecar_override_data={"processor_config.json": {"patch_size": 14}})
     for _ in range(3):
         with pytest.raises(ValueError, match=r"Unsloth: 'fake/vlm'.*kimi_k25.*pipeline"):
             _load_mlx_vlm_distributed("fake/vlm", "kimi_k25", pipeline_group=pipeline_group)
     with pytest.raises(ValueError, match="checkpoint exploded") as exc_info:
         _load_mlx_vlm_distributed("fake/vlm", "kimi_k25", pipeline_group=pipeline_group)
     assert calls[0][3] == "patched"
+    assert calls[0][4] == 14
     assert Path(calls[0][0]).exists()
     assert model._unsloth_mlx_config_view_paths == [str(calls[0][0])]
     model._unsloth_mlx_config_view_finalizers[0]()
@@ -250,19 +253,22 @@ def test_from_pretrained_distributed_vlm_passes_override_without_temp_view(monke
     from unsloth_zoo.mlx.loader import FastMLXModel
 
     config = {"model_type": "raw", "vision_config": {}, "architectures": ["DeepSeekOCRForCausalLM"], "auto_map": {"x": "y"}}
-    model_path, calls = _write_config(tmp_path, config), []
+    model_path, calls, repair_paths = _write_config(tmp_path, config), [], []
+    loaded_model = types.SimpleNamespace(_unsloth_mlx_config_view_paths=["patched-view"])
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda *_a, **_k: model_path)
-    monkeypatch.setattr(loader, "_materialize_mlx_vlm_config_data", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("first temp view")))
-    monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", lambda *_a, config_override_data=None, **_k: (calls.append(config_override_data), (types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())))[1])
+    monkeypatch.setattr(loader, "_materialize_mlx_vlm_sidecar_overrides", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("first temp view")))
+    monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", lambda target, *_a, config_override_data=None, sidecar_override_data=None, **_k: (calls.append((target, config_override_data, sidecar_override_data)), (loaded_model, types.SimpleNamespace(tokenizer=object())))[1])
     for name in ("install_mlx_compile_patches", "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype", "_patch_mixed_precision_set_dtype", "_fix_gemma4_kv_sharing", "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa", "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32", "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation", "_fix_gemma3_multimodal_image_feature_scale"):
         monkeypatch.setattr(loader, name, lambda *_a, **_k: None)
-    monkeypatch.setattr(loader, "_repair_degraded_vlm_processor", lambda processor, *_a, **_k: processor)
+    monkeypatch.setattr(loader, "_repair_degraded_vlm_processor", lambda processor, path, *_a, **_k: (repair_paths.append(path), processor)[1])
     monkeypatch.setattr(loader, "_infer_snapshot_commit", lambda *_a, **_k: "commit")
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.SimpleNamespace(load=lambda *_a, **_k: None))
 
     FastMLXModel.from_pretrained("fake/vlm", text_only=False, tensor_group=_FakeGroup(), load_in_4bit=False)
 
-    assert calls == [{k: v for k, v in config.items() if k != "auto_map"} | {"model_type": "deepseekocr"}]
+    assert calls == [("fake/vlm", {k: v for k, v in config.items() if k != "auto_map"} | {"model_type": "deepseekocr"}, None)]
+    assert repair_paths == ["patched-view"]
+    assert loaded_model._config_src_path == "patched-view"
 
 
 def _patch_fast_mlx_text_load(monkeypatch, tmp_path, config):
