@@ -1225,11 +1225,9 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
         return False
     if _filter_paths(rels, None, ignore_patterns):
         return True
-    # A canonical ROOT shard INDEX of a kept format proves a readable weight even when the shard files
-    # carry a NON-standard name the canonical regex misses (e.g. model.safetensors-00001-of-00002
-    # .safetensors, referenced that way by the index's weight_map). transformers enumerates the sharded
-    # weight through the index, so its presence is the readable-weight signal; shard completeness stays
-    # Invariant B's job (_readable_shard_set_incomplete).
+    # A canonical ROOT shard INDEX of a kept format proves a readable weight even for non-standard shard
+    # names (e.g. model.safetensors-00001-of-00002.safetensors): transformers enumerates the weight
+    # through the index, so its presence is the readable-weight signal; completeness stays Invariant B's.
     if any(_read_format_kept(probe, ignore_patterns) for probe in index_probes):
         return True
     # from_tf / from_flax (both PyTorch formats ignored): count a SINGLE-FILE TF/Flax weight or a COMPLETE
@@ -1288,10 +1286,9 @@ def _root_has_variant_weight(
         return False
     if _filter_paths(rels, None, ignore_patterns):
         return True
-    # A ROOT variant shard INDEX of a kept format proves a readable weight even when the shard files carry
-    # a NON-standard name the variant-weight regex misses (mirrors _root_model_has_weight). The probe and
-    # format-kept test are shared with _has_incomplete_variant_root_shards so presence (Invariant A) and
-    # completeness (Invariant B) judge the ignore filter identically.
+    # A ROOT variant shard INDEX of a kept format proves a readable weight even for non-standard shard
+    # names (mirrors _root_model_has_weight). Probe + format-kept are shared with
+    # _has_incomplete_variant_root_shards so presence (Invariant A) and completeness (Invariant B) agree.
     return any(_read_format_kept(probe, ignore_patterns) for probe in index_probes)
 
 
