@@ -357,6 +357,78 @@ def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
     assert tokenizer("hi") == {"called": True}
 
 
+def test_vlm_prompt_patch_preserves_model_specific_image_markers(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    expected = "<|user|>\n<|image_1|>Describe this image.<|end|>\n<|assistant|>\n"
+    state = {"result": expected, "calls": 0}
+
+    def original(*args, **kwargs):
+        state["calls"] += 1
+        if isinstance(state["result"], Exception):
+            raise state["result"]
+        return state["result"]
+
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    role_content = lambda item: (item["role"], item["content"])
+    monkeypatch.setattr(prompt_utils, "_get_role_content", role_content, raising=False)
+    fallback = lambda *args, **kwargs: "custom fallback"
+    monkeypatch.setattr(prompt_utils, "get_chat_template", fallback, raising=False)
+    monkeypatch.setattr(prompt_utils, "MODEL_CONFIG", {"phi3_v": object()}, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    for module_name in (
+        "mlx_vlm.chat", "mlx_vlm.generate", "mlx_vlm.server", "mlx_vlm.evals.utils",
+    ):
+        monkeypatch.setattr(
+            sys.modules[module_name], "apply_chat_template", original, raising=False,
+        )
+    loader._ensure_vlm_prompt_utils_patched()
+
+    def render(messages, model_type="phi3_v", **kwargs):
+        return prompt_utils.apply_chat_template(
+            object(), {"model_type": model_type}, messages, **kwargs
+        )
+    image_content = [
+        {"type": "image"}, {"type": "text", "text": "Describe this image."},
+    ]
+    messages = [{"role": "user", "content": image_content}]
+    assert render(messages, num_images=1) == expected
+    assert render([{"role": "system", "content": "Be concise."}] + messages, num_images=1) == expected
+    assert render([{"role": "user", "content": [{"type": "audio"}]}], num_audios=1) == expected
+
+    unsafe_cases = [
+        (messages + [
+        {"role": "assistant", "content": "What would you like to know?"},
+        {"role": "user", "content": "Focus on its color."},
+        ], {"num_images": 1}, "custom fallback"),
+        (messages, {}, "custom fallback"),
+        ([{"role": "developer", "content": image_content}], {"num_images": 1}, "custom fallback"),
+        ([{"role": "User", "content": image_content}], {"num_images": 1}, "custom fallback"),
+        (messages + [{"role": "Assistant", "content": "Done."}], {"num_images": 1}, "custom fallback"),
+        ([{"role": "user", "content": [{"type": "video"}]}], {}, "custom fallback"),
+        (messages, {"num_images": 1, "video": "clip.mp4"}, "custom fallback"),
+        (messages, {"num_images": 1, "return_messages": True}, messages),
+    ]
+    for unsafe_messages, kwargs, result in unsafe_cases:
+        assert render(unsafe_messages, **kwargs) == result
+    assert render(messages, model_type="unknown", num_images=1) == "custom fallback"
+
+    text_messages = [{"role": "user", "content": "Hello."}]
+    calls_before_text = state["calls"]
+    assert render(text_messages) == expected
+    assert state["calls"] == calls_before_text + 1
+
+    for state["result"] in ("", ValueError("upstream renderer rejected the prompt")):
+        assert render(messages, num_images=1) == "custom fallback"
+
+    calls_before_text = state["calls"]
+    with pytest.raises(ValueError, match="upstream renderer rejected"):
+        render(text_messages)
+    assert state["calls"] == calls_before_text + 1
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
     import torch
     from transformers.tokenization_utils_base import to_py_obj

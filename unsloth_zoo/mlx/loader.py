@@ -2680,16 +2680,6 @@ def _patch_mixed_precision_set_dtype(model):
 _vlm_prompt_utils_patched = False
 _original_vlm_apply_chat_template = None
 
-_MULTIMODAL_ITEM_TYPES = frozenset(
-    {
-        "image",
-        "image_url",
-        "input_image",
-        "audio",
-        "input_audio",
-        "video",
-    }
-)
 _NON_USER_ROLES = frozenset({"system", "assistant"})
 _ROLE_PROMPT_NAMES = {
     "user": "Human",
@@ -4328,24 +4318,30 @@ def _apply_mlx_distributed_sharding(
     return mode
 
 
+def _structured_multimodal_counts(content):
+    """Count explicit image, audio, and video items in structured content."""
+    if isinstance(content, list):
+        counts = [_structured_multimodal_counts(item) for item in content]
+        return tuple(sum(values) for values in zip(*counts)) if counts else (0, 0, 0)
+    if not isinstance(content, dict):
+        return (0, 0, 0)
+
+    item_type = str(content.get("type", "")).lower()
+    if item_type in ("image", "image_url", "input_image"):
+        return (1, 0, 0)
+    if item_type in ("audio", "input_audio"):
+        return (0, 1, 0)
+    if item_type == "video":
+        return (0, 0, 1)
+    nested = content.get("content", None)
+    if nested is not None and nested is not content:
+        return _structured_multimodal_counts(nested)
+    return (0, 0, 0)
+
+
 def _content_has_structured_multimodal_markers(content):
     """Return True when content already contains explicit image/audio/video items."""
-    if isinstance(content, list):
-        for item in content:
-            if _content_has_structured_multimodal_markers(item):
-                return True
-        return False
-
-    if isinstance(content, dict):
-        item_type = str(content.get("type", "")).lower()
-        if item_type in _MULTIMODAL_ITEM_TYPES:
-            return True
-        nested = content.get("content", None)
-        if nested is not None and nested is not content:
-            return _content_has_structured_multimodal_markers(nested)
-        return False
-
-    return False
+    return any(_structured_multimodal_counts(content))
 
 
 def _normalize_prompt_messages(prompt_utils_module, prompt):
@@ -4371,6 +4367,29 @@ def _messages_have_structured_multimodal_content(messages):
     return any(
         _content_has_structured_multimodal_markers(message.get("content", ""))
         for message in messages
+    )
+
+
+def _structured_media_matches_count_renderer(messages, num_images, num_audios):
+    """Return whether upstream count-based rendering preserves media ownership."""
+    last_target_idx = -1
+    media_indices = set()
+    totals = [0, 0, 0]
+    for i, message in enumerate(messages):
+        role = str(message.get("role", "user"))
+        if role not in _NON_USER_ROLES:
+            last_target_idx = i
+        counts = _structured_multimodal_counts(message.get("content", ""))
+        if any(counts):
+            media_indices.add(i)
+            totals = [total + count for total, count in zip(totals, counts)]
+
+    return (
+        last_target_idx >= 0
+        and str(messages[last_target_idx].get("role", "user")) == "user"
+        and media_indices == {last_target_idx}
+        and any(totals)
+        and totals == [num_images, num_audios, 0]
     )
 
 
@@ -4596,6 +4615,15 @@ def _render_vlm_template_or_fallback(
     return rendered
 
 
+def _has_vlm_template_result(rendered):
+    """Return whether a chat renderer produced a usable prompt or message list."""
+    if isinstance(rendered, str):
+        return bool(rendered.strip())
+    if isinstance(rendered, (list, tuple, dict)):
+        return bool(rendered)
+    return rendered is not None
+
+
 def _ensure_vlm_prompt_utils_patched():
     """Patch mlx-vlm chat-template helper for stable multi-turn multimodal chat."""
     global _vlm_prompt_utils_patched, _original_vlm_apply_chat_template
@@ -4643,6 +4671,31 @@ def _ensure_vlm_prompt_utils_patched():
                 kwargs=kwargs,
             )
         )
+        if (
+            not return_messages
+            and not kwargs.get("video")
+            and model_type in getattr(prompt_utils, "MODEL_CONFIG", {})
+            and _structured_media_matches_count_renderer(
+                normalized_messages, num_images, num_audios
+            )
+        ):
+            try:
+                rendered = _original_vlm_apply_chat_template(
+                    processor,
+                    config,
+                    prompt,
+                    add_generation_prompt=add_generation_prompt,
+                    return_messages=return_messages,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
+            except Exception:
+                pass
+            else:
+                if _has_vlm_template_result(rendered):
+                    return rendered
+
         if needs_custom_render:
             if return_messages:
                 return template_messages
