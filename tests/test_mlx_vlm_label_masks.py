@@ -485,7 +485,7 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     assert processor.images_seen[0] == ["embedded"]
 
 
-def test_vlm_top_level_image_key_falls_back_after_real_bare_placeholder_error():
+def test_vlm_top_level_image_key_uses_bare_image_placeholder_fallback():
     from unsloth_zoo.mlx.utils import _extract_vlm_images
 
     messages = [{"role": "user", "content": [{"type": "image"}]}]

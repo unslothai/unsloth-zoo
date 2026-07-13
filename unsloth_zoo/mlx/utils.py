@@ -3536,10 +3536,6 @@ def _vlm_vision_part_state(messages):
     return bare_placeholder_types, has_media_payload
 
 
-def _vlm_bare_placeholder_error(exc):
-    return "image, image_url or video should in content" in str(exc)
-
-
 def _extract_vlm_images(
     item,
     messages,
@@ -3571,7 +3567,14 @@ def _extract_vlm_images(
                     if image is not None:
                         images.append(image)
 
-    process_error = None
+    if (
+        not images
+        and top_level_image
+        and has_only_bare_image_placeholders
+        and not has_media_payload
+    ):
+        images = top_level_image
+
     if not images and isinstance(messages, list):
         try:
             from ..vision_utils import process_vision_info
@@ -3581,21 +3584,9 @@ def _extract_vlm_images(
                 maybe_images = extracted[0]
                 if maybe_images is not None:
                     images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
-        except Exception as exc:
-            process_error = exc
-            can_fallback = (
-                top_level_image
-                and has_only_bare_image_placeholders
-                and not has_media_payload
-                and _vlm_bare_placeholder_error(exc)
-            )
-            if not can_fallback and not suppress_process_errors:
+        except Exception:
+            if not suppress_process_errors:
                 raise
-
-    if not images and top_level_image and has_only_bare_image_placeholders and not has_media_payload:
-        images = top_level_image
-    if not images and process_error is not None and not suppress_process_errors:
-        raise process_error
 
     return _resize_vlm_images(images, image_size)
 
