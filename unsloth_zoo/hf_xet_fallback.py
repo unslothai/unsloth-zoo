@@ -54,7 +54,9 @@ from unsloth_zoo.hf_cache_state import (
     _has_glob,
     _has_incomplete_canonical_root_shards,
     _has_incomplete_variant_root_shards,
+    _index_variant_token,
     _index_weight_probe,
+    _is_canonical_component_shard_index,
     _is_canonical_weight_shard_index,
     _is_loadable_weight_file,
     _read_format_kept,
@@ -1120,7 +1122,8 @@ def _diffusers_component_weights_complete(
     try:
         for entry in snapshot_dir.rglob("*"):
             name = entry.name
-            if not _is_default_load_weight_file(name):
+            is_index = _is_canonical_component_shard_index(name)
+            if not is_index and not _is_default_load_weight_file(name):
                 continue
             try:
                 if not entry.is_file():
@@ -1138,6 +1141,19 @@ def _diffusers_component_weights_complete(
                 continue  # an UNDECLARED subtree the load does not read
             if _CHECKPOINT_DIR_RE.match(comp):
                 continue  # a training-checkpoint subtree, not a component
+            if is_index:
+                # A component shard INDEX of a kept format proves a readable component weight even when the
+                # shard files carry a NON-standard name the weight regexes miss (mirrors
+                # _root_model_has_weight); the probe is the component-relative weight the index enumerates,
+                # so the ignore filter is judged on what the load reads. Completeness stays
+                # _diffusers_component_shards_incomplete's job.
+                tok = _index_variant_token(name)
+                probe = f"{comp}/{_index_weight_probe(name, tok)}"
+                if tok is None:
+                    per_comp_canon.setdefault(comp, []).append(probe)
+                elif tok == variant:
+                    per_comp_variant.setdefault(comp, []).append(probe)
+                continue
             if variant_weight_re is not None and variant_weight_re.match(name):
                 per_comp_variant.setdefault(comp, []).append(rel)
             elif _CANONICAL_COMPONENT_WEIGHT_RE.match(name):

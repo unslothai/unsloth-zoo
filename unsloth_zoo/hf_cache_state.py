@@ -243,6 +243,25 @@ def _is_canonical_weight_shard_index(name: str) -> bool:
     return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
+# Canonical diffusers COMPONENT weight bases a pipeline load reads (unet/, vae/, transformer/, ...).
+_CANONICAL_COMPONENT_WEIGHT_BASES = ("diffusion_pytorch_model", "model", "pytorch_model")
+
+
+def _is_canonical_component_shard_index(name: str) -> bool:
+    """True for a weight-shard index (canonical or variant) whose base is a canonical diffusers COMPONENT
+    weight (``diffusion_pytorch_model`` / ``model`` / ``pytorch_model``), e.g.
+    ``diffusion_pytorch_model.safetensors.index.json`` or ``...index.fp16.json``. Lets a component sharded
+    with NON-standard shard names be recognized via its index (the component analog of
+    ``_is_canonical_weight_shard_index``). Excludes an ``adapter_model`` / other non-component index the
+    pipeline does not read."""
+    if not _is_weight_shard_index(name):
+        return False
+    for marker in (".safetensors.index.", ".bin.index."):
+        if marker in name:
+            return name.split(marker, 1)[0] in _CANONICAL_COMPONENT_WEIGHT_BASES
+    return False
+
+
 def _is_unsafe_shard_ref(shard: str) -> bool:
     """True if a ``weight_map`` value is NOT a safe relative path inside the snapshot (absolute, Windows
     drive-letter, UNC, or ``..``-escaping). Judged under BOTH POSIX and Windows semantics so a crafted
