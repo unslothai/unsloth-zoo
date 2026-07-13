@@ -833,6 +833,25 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     ) is degraded
 
 
+def test_repair_collapses_flat_feature_alias_to_processor_contract(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+    class AudioProcessor:
+        attributes = ["audio_processor"]
+    class AudioFeature:
+        pass
+    AudioFeature.__module__ = "mlx_vlm.models.fake_audio.processing"
+    classes = {"AudioProcessor": AudioProcessor, "AudioFeature": AudioFeature}
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_processor_class", lambda _t, name, *_a: classes.get(name))
+    captured = {}
+    source = types.SimpleNamespace()
+    monkeypatch.setattr(loader, "_reconstruct_declared_vlm_processor", lambda _c, _p, components, *_a, **_k: captured.update(components) or source)
+    (tmp_path / "preprocessor_config.json").write_text(json.dumps({
+        "processor_class": "AudioProcessor", "feature_extractor_type": "AudioFeature",
+    }))
+    assert loader._repair_degraded_vlm_processor(source, tmp_path, "fake_audio", add_detokenizer=False) is source
+    assert set(captured) == {"audio_processor"}
+
+
 def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.loader as loader
     import mlx_vlm.utils as vlm_utils
@@ -846,6 +865,12 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
     assert loader._declared_vlm_processor_components(
         {}, {"feature_extractor_type": "WhisperFeatureExtractor"}
     )["audio_processor"] == "WhisperFeatureExtractor"
+    aliases = {"feature_extractor": "Audio", "audio_processor": "Audio"}
+    assert loader._shadowed_vlm_feature_alias("feature_extractor", {"audio_processor"}, aliases)
+    assert loader._shadowed_vlm_feature_alias("audio_processor", {"feature_extractor"}, aliases)
+    assert not loader._shadowed_vlm_feature_alias("feature_extractor", set(), aliases)
+    assert not loader._shadowed_vlm_feature_alias("feature_extractor", set(aliases), aliases)
+    assert not loader._shadowed_vlm_feature_alias("feature_extractor", {"audio_processor"}, {**aliases, "feature_extractor": "Feature"})
 
     class CustomProcessor(ProcessorMixin):
         attributes = ["image_processor", "tokenizer", "video_processor"]

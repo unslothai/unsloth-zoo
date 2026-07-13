@@ -1241,6 +1241,20 @@ def _declared_vlm_processor_components(
     return components
 
 
+def _shadowed_vlm_feature_alias(attribute_name, processor_attributes, components):
+    aliases = {
+        "feature_extractor": "audio_processor",
+        "audio_processor": "feature_extractor",
+    }
+    owner = aliases.get(attribute_name)
+    return (
+        attribute_name not in processor_attributes
+        and owner in processor_attributes
+        and owner in components
+        and components.get(attribute_name) == components.get(owner)
+    )
+
+
 def _matches_vlm_component_kind(attribute_name, argument):
     module_and_class = _VLM_PROCESSOR_COMPONENT_BASES.get(attribute_name)
     if module_and_class is None:
@@ -1905,6 +1919,10 @@ def _repair_degraded_vlm_processor(
     processor_attributes = set(_vlm_processor_attributes(processor_class))
     components = {}
     for attribute_name, class_name in declared_components.items():
+        if _shadowed_vlm_feature_alias(
+            attribute_name, processor_attributes, declared_components,
+        ):
+            continue
         component_class = _resolve_mlx_vlm_processor_class(
             model_type,
             class_name,
