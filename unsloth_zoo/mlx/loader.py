@@ -1161,7 +1161,7 @@ _VLM_PROCESSOR_COMPONENT_TYPES = {
     "feature_extractor": (("feature_extractor_type",), ("feature_extractor_type",)),
     "audio_processor": (
         ("audio_processor_type", "feature_extractor_type"),
-        ("audio_processor_type",),
+        ("audio_processor_type", "feature_extractor_type"),
     ),
 }
 _VLM_PROCESSOR_COMPONENT_BASES = {
@@ -1427,9 +1427,16 @@ def _reconstruct_declared_vlm_processor(
             lambda _cls: list(processor_attribute_order)
         )
     for attribute_name, (class_name, _component_class) in components.items():
+        declared_class = getattr(processor_class, f"{attribute_name}_class", None)
         if (
             attribute_name in processor_attributes
-            and getattr(processor_class, f"{attribute_name}_class", None) is None
+            and (
+                declared_class is None
+                or (
+                    isinstance(declared_class, str)
+                    and declared_class.startswith("Auto")
+                )
+            )
         ):
             subclass_attrs[f"{attribute_name}_class"] = class_name
     if callable(base_check):

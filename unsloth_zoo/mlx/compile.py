@@ -2216,7 +2216,12 @@ def _qwen3_vl_prefill_starts(cache, batch_size):
                 "Qwen3-VL cache offsets must cover every batch row."
             )
         rotating_offset = getattr(first_cache, "_offset", None)
-        if rotating_offset is not None:
+        max_size = getattr(first_cache, "max_size", None)
+        if (
+            rotating_offset is not None
+            and max_size is not None
+            and rotating_offset > max_size
+        ):
             return [int(rotating_offset)] * batch_size
         left_padding = getattr(first_cache, "left_padding", None)
         if isinstance(left_padding, mx.array):

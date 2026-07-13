@@ -1814,9 +1814,11 @@ def test_qwen3_vl_prefill_windows_align_masks_and_deepstack():
 
     start_cases = [
         (types.SimpleNamespace(offset=6, _idx=2), 1, [6]),
-        (types.SimpleNamespace(offset=mx.array([6, 4]), _offset=6), 2, [6, 6]),
+        (types.SimpleNamespace(offset=mx.array([6, 4]), _offset=6), 2, [6, 4]),
         (types.SimpleNamespace(offset=mx.array([-4]), left_padding=mx.array([4])), 1, [0]),
-        (types.SimpleNamespace(offset=mx.array([2]), _offset=6), 1, [6]),
+        (types.SimpleNamespace(offset=mx.array([2]), _offset=6), 1, [2]),
+        (types.SimpleNamespace(offset=mx.array([4, 2]), left_padding=mx.array([2, 1])), 2, [6, 3]),
+        (types.SimpleNamespace(offset=mx.array([5, 5]), left_padding=mx.array([-1, -1]), _offset=5, max_size=4), 2, [5, 5]),
     ]
     for cache_state, batch_size, expected in start_cases:
         assert mc._qwen3_vl_prefill_starts([cache_state], batch_size) == expected

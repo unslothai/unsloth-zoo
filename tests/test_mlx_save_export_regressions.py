@@ -843,6 +843,9 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
     CustomVideoProcessor = type("CustomVideoProcessor", (BaseVideoProcessor,), {})
     CustomTokenizer = type("CustomTokenizer", (), {"chat_template": None, "eos_token_id": 1})
     received_kwargs = {}
+    assert loader._declared_vlm_processor_components(
+        {}, {"feature_extractor_type": "WhisperFeatureExtractor"}
+    )["audio_processor"] == "WhisperFeatureExtractor"
 
     class CustomProcessor(ProcessorMixin):
         attributes = ["image_processor", "tokenizer", "video_processor"]
@@ -858,7 +861,7 @@ def test_repair_uses_declared_custom_components_and_runtime_state(monkeypatch, t
             received_kwargs.update(_kwargs)
             tokenizer = cls.get_possibly_dynamic_module("CustomTokenizer")()
             return cls(
-                cls.get_possibly_dynamic_module("CustomImageProcessor")(),
+                cls.get_possibly_dynamic_module(cls.image_processor_class)(),
                 tokenizer, cls.get_possibly_dynamic_module("CustomVideoProcessor")(),
             )
 
