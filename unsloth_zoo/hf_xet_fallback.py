@@ -48,6 +48,7 @@ from unsloth_zoo.hf_cache_state import (
     _ROOT_MODEL_SHARD_INDEX_RE,
     _ROOT_MODEL_VARIANT_WEIGHT_RE,
     _as_pattern_list,
+    _component_index_weight_probe,
     _diffusers_component_shards_incomplete,
     _diffusers_declared_component_specs,
     _filter_paths,
@@ -1144,12 +1145,19 @@ def _diffusers_component_weights_complete(
             if is_index:
                 # A component shard INDEX of a kept format proves a readable component weight even when the
                 # shard files carry a NON-standard name the weight regexes miss (mirrors
-                # _root_model_has_weight); the probe is the component-relative weight the index enumerates,
-                # so the ignore filter is judged on what the load reads. Completeness stays
-                # _diffusers_component_shards_incomplete's job.
+                # _root_model_has_weight); the probe is the component-relative weight the index enumerates
+                # (its OWN base), so the ignore filter is judged on what the load reads.
                 tok = _index_variant_token(name)
-                probe = f"{comp}/{_index_weight_probe(name, tok)}"
+                probe = _component_index_weight_probe(name, comp)
+                if probe is None:
+                    continue
                 if tok is None:
+                    # A canonical component index. Under a variant load it is the per-component FALLBACK,
+                    # which the variant completeness pass does not validate, so accept it as fallback
+                    # presence only when its shards are complete (else defer to the child). Under a plain
+                    # load the canonical completeness pass validates it, so record it unconditionally.
+                    if variant is not None and not _weight_shard_index_complete(entry):
+                        continue
                     per_comp_canon.setdefault(comp, []).append(probe)
                 elif tok == variant:
                     per_comp_variant.setdefault(comp, []).append(probe)

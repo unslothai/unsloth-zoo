@@ -243,23 +243,37 @@ def _is_canonical_weight_shard_index(name: str) -> bool:
     return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
-# Canonical diffusers COMPONENT weight bases a pipeline load reads (unet/, vae/, transformer/, ...).
-_CANONICAL_COMPONENT_WEIGHT_BASES = ("diffusion_pytorch_model", "model", "pytorch_model")
+# The EXACT canonical / single-variant diffusers COMPONENT shard index: a canonical component base
+# (diffusion_pytorch_model / model / pytorch_model) + safetensors/bin format + the .index.json /
+# .index.<variant>.json form (anchored, one optional variant token). So a stale sidecar such as
+# diffusion_pytorch_model.safetensors.index.fp16.extra.json is NOT accepted. The base is captured so the
+# ignore-filter probe can use the component's OWN weight name.
+_COMPONENT_SHARD_INDEX_RE = re.compile(
+    r"^(?P<base>diffusion_pytorch_model|model|pytorch_model)\.(?P<ext>safetensors|bin)"
+    r"\.index(?:\.(?P<variant>[^.]+))?\.json$"
+)
 
 
 def _is_canonical_component_shard_index(name: str) -> bool:
-    """True for a weight-shard index (canonical or variant) whose base is a canonical diffusers COMPONENT
-    weight (``diffusion_pytorch_model`` / ``model`` / ``pytorch_model``), e.g.
-    ``diffusion_pytorch_model.safetensors.index.json`` or ``...index.fp16.json``. Lets a component sharded
-    with NON-standard shard names be recognized via its index (the component analog of
-    ``_is_canonical_weight_shard_index``). Excludes an ``adapter_model`` / other non-component index the
-    pipeline does not read."""
-    if not _is_weight_shard_index(name):
-        return False
-    for marker in (".safetensors.index.", ".bin.index."):
-        if marker in name:
-            return name.split(marker, 1)[0] in _CANONICAL_COMPONENT_WEIGHT_BASES
-    return False
+    """True only for the EXACT canonical / single-variant diffusers COMPONENT shard index
+    (``diffusion_pytorch_model.safetensors.index.json`` / ``...index.fp16.json``, plus the ``model`` /
+    ``pytorch_model`` bases). The component analog of ``_is_canonical_weight_shard_index``: lets a component
+    sharded with NON-standard shard names be recognized via its index, while a stale malformed sidecar the
+    pipeline never probes is rejected."""
+    return _COMPONENT_SHARD_INDEX_RE.match(name) is not None
+
+
+def _component_index_weight_probe(index_name: str, dir_rel: str) -> "Optional[str]":
+    """The component-relative weight path a canonical component shard *index* enumerates, preserving the
+    component's OWN base (``diffusion_pytorch_model`` / ``model`` / ``pytorch_model``), format, and variant
+    token, so the ignore filter is judged on the real weight name -- a component-scoped ignore like
+    ``unet/diffusion_pytorch_model*`` matches. None when *index_name* is not such an index."""
+    m = _COMPONENT_SHARD_INDEX_RE.match(index_name)
+    if m is None:
+        return None
+    token = f".{m['variant']}" if m["variant"] else ""
+    prefix = f"{dir_rel}/" if dir_rel else ""
+    return f"{prefix}{m['base']}{token}.{m['ext']}"
 
 
 def _is_unsafe_shard_ref(shard: str) -> bool:
