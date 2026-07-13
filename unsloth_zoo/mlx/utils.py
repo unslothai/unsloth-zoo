@@ -3596,7 +3596,7 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
     messages = (prompt_messages or []) + (completion_messages or [])
     if messages:
         images = _extract_vlm_images(
-            {},
+            item if isinstance(item, dict) and item.get("images") is None else {},
             messages,
             image_size,
             suppress_process_errors=True,

@@ -485,11 +485,13 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     assert processor.images_seen[0] == ["embedded"]
 
 
-def test_vlm_top_level_image_key_uses_bare_image_placeholder_fallback():
-    from unsloth_zoo.mlx.utils import _extract_vlm_images
+def test_vlm_prompt_completion_uses_top_level_image_for_bare_placeholder():
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
 
     messages = [{"role": "user", "content": [{"type": "image"}]}]
-    assert _extract_vlm_images({"image": "top-level"}, messages, image_size=16) == ["top-level"]
+    assert _extract_vlm_pc_images(
+        {"image": "top-level"}, messages, [], image_size=16,
+    ) == ["top-level"]
 
 
 def test_vlm_collate_passes_studio_top_level_image_to_processor():
