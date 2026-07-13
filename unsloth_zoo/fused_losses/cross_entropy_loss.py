@@ -194,21 +194,24 @@ def compute_fused_dft_loss(
     flat_logits = logits.view(-1, vocab_size).float().contiguous()
     flat_labels = labels.contiguous().view(-1).to(device = device).contiguous()
     valid = flat_labels != ignore_index
-    safe_labels = flat_labels.masked_fill(~valid, 0)
-    # Ignored rows may contain non-finite logits; sanitize before log_softmax
-    # so both forward and backward remain hard-zeroed for ignored targets.
+    # Native CE can propagate non-finite ignored logits during backward on some
+    # backends, so sanitize them before CE to keep ignored gradients hard-zeroed.
     flat_logits = torch.where(
         valid.unsqueeze(1),
         flat_logits,
         torch.zeros((), dtype = flat_logits.dtype, device = flat_logits.device),
     )
-    logprobs = torch.nn.functional.log_softmax(flat_logits, dim = -1)
-    token_nll = -logprobs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
-    valid_float = valid.to(dtype = token_nll.dtype)
-    weights = torch.exp(-token_nll.detach()) * valid_float
+    token_nll = torch.nn.functional.cross_entropy(
+        input = flat_logits,
+        target = flat_labels,
+        reduction = "none",
+        ignore_index = ignore_index,
+        label_smoothing = 0.0,
+    )
+    weighted_nll = torch.exp(-token_nll.detach()) * token_nll
 
     if n_items is None:
-        divisor = valid_float.sum()
+        divisor = valid.to(dtype = token_nll.dtype).sum()
     elif torch.is_tensor(n_items):
         divisor = n_items.to(device = device, dtype = token_nll.dtype)
     else:
@@ -216,7 +219,7 @@ def compute_fused_dft_loss(
     if divisor.numel() != 1: divisor = divisor.ravel()[0]
     divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
 
-    loss = (token_nll * weights).sum() / divisor
+    loss = weighted_nll.sum() / divisor
     scaled_loss = loss * scaling if scaling is not None else loss
     return scaled_loss, (loss.detach(),)
 pass
