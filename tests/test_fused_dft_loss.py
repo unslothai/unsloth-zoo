@@ -68,12 +68,19 @@ def _lightweight_unsloth_zoo_import():
 @contextmanager
 def _compile_flag_guard(torch, cross_entropy_loss):
     previous = cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED
+    proven = getattr(cross_entropy_loss, "_FUSED_CE_COMPILE_FASTPATH_PROVEN", None)
+    previous_proven = None if proven is None else set(proven)
     torch._dynamo.reset()
     cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED = None
+    if proven is not None:
+        proven.clear()
     try:
         yield
     finally:
         cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED = previous
+        if proven is not None:
+            proven.clear()
+            proven.update(previous_proven)
         torch._dynamo.reset()
 
 
@@ -314,6 +321,46 @@ def _skip_if_compile_disabled():
         pytest.skip("UNSLOTH_FUSED_CE_COMPILE_DISABLE=1 disables fused-loss compile")
 
 
+def test_compute_dft_uses_unreduced_cross_entropy(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    with _lightweight_unsloth_zoo_import():
+        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
+
+        original_cross_entropy = torch.nn.functional.cross_entropy
+        calls = []
+
+        def cross_entropy_spy(input, target, *args, **kwargs):
+            calls.append(dict(input=input, target=target, **kwargs))
+            return original_cross_entropy(input, target, *args, **kwargs)
+
+        monkeypatch.setattr(torch.nn.functional, "cross_entropy", cross_entropy_spy)
+
+        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30]]], dtype=torch.float64)
+        weight = torch.tensor([[0.10, 0.40], [-0.30, 0.20], [0.50, -0.60]], dtype=torch.float64)
+        labels = torch.tensor([[1, 999]])
+
+        compute_fused_dft_loss(
+            hidden,
+            weight,
+            None,
+            labels,
+            shift_labels=False,
+            ignore_index=999,
+        )
+
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["input"].shape == (2, 3)
+        assert call["input"].dtype == torch.float32
+        assert call["input"].is_contiguous()
+        assert call["target"].shape == (2,)
+        assert call["target"].is_contiguous()
+        assert call["reduction"] == "none"
+        assert call["ignore_index"] == 999
+        assert call["label_smoothing"] == 0.0
+
+
 def test_compute_dft_single_token_closed_form_loss_and_gradient():
     torch = pytest.importorskip("torch")
 
@@ -465,7 +512,40 @@ def test_compute_dft_ignore_index_zeroes_loss_and_grad_rows():
         assert torch.allclose(bias.grad, expected_bias, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
 
 
-def test_compute_dft_ignored_rows_sanitize_nonfinite_logits_before_log_softmax():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_unreduced_ce_ignored_nonfinite_row_has_finite_zero_gradient(device):
+    torch = pytest.importorskip("torch")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    logits = torch.tensor(
+        [[0.20, -0.10, 0.30], [float("inf"), float("-inf"), float("nan")]],
+        dtype=torch.float32,
+        device=device,
+        requires_grad=True,
+    )
+    labels = torch.tensor([1, -100], device=device)
+    token_nll = torch.nn.functional.cross_entropy(
+        input=logits,
+        target=labels,
+        reduction="none",
+        ignore_index=-100,
+        label_smoothing=0.0,
+    )
+    token_nll.sum().backward()
+
+    native_ce_is_safe = bool(
+        torch.isfinite(token_nll).all()
+        and torch.isfinite(logits.grad).all()
+        and torch.count_nonzero(logits.grad[1]) == 0
+    )
+    if not native_ce_is_safe:
+        pytest.xfail("native unreduced CE requires DFT ignored-row sanitization on this backend")
+
+    assert token_nll[1] == 0
+
+
+def test_compute_dft_ignored_nonfinite_row_has_finite_zero_gradient():
     torch = pytest.importorskip("torch")
 
     with _lightweight_unsloth_zoo_import():
@@ -1178,7 +1258,7 @@ def test_unsloth_fused_dft_label_smoothing_raise_does_not_poison_compile_flag():
             assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is None
 
 
-def test_unsloth_fused_dft_compiles_when_flag_preset_true():
+def test_fused_ce_then_dft_compile_order():
     torch = pytest.importorskip("torch")
     _skip_if_compile_disabled()
 
@@ -1186,7 +1266,18 @@ def test_unsloth_fused_dft_compiles_when_flag_preset_true():
         import unsloth_zoo.fused_losses.cross_entropy_loss as cross_entropy_loss
 
         hidden, weight, bias, labels = _make_wrapper_inputs(torch, dtype=torch.float32)
-        eager = _run_wrapper(
+        eager_ce = _run_wrapper(
+            torch,
+            cross_entropy_loss.unsloth_fused_ce_loss,
+            hidden,
+            weight,
+            bias,
+            labels,
+            torch_compile=False,
+            n_chunks=2,
+            shift_labels=False,
+        )
+        eager_dft = _run_wrapper(
             torch,
             cross_entropy_loss.unsloth_fused_dft_loss,
             hidden,
@@ -1199,8 +1290,20 @@ def test_unsloth_fused_dft_compiles_when_flag_preset_true():
         )
 
         with _compile_flag_guard(torch, cross_entropy_loss):
-            cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED = True
-            compiled = _run_wrapper(
+            compiled_ce = _run_wrapper(
+                torch,
+                cross_entropy_loss.unsloth_fused_ce_loss,
+                hidden,
+                weight,
+                bias,
+                labels,
+                torch_compile=True,
+                n_chunks=2,
+                shift_labels=False,
+            )
+            assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is True
+
+            compiled_dft = _run_wrapper(
                 torch,
                 cross_entropy_loss.unsloth_fused_dft_loss,
                 hidden,
@@ -1213,7 +1316,8 @@ def test_unsloth_fused_dft_compiles_when_flag_preset_true():
             )
             assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is True
 
-        _assert_wrapper_results_close(torch, compiled, eager)
+        _assert_wrapper_results_close(torch, compiled_ce, eager_ce, message="CE")
+        _assert_wrapper_results_close(torch, compiled_dft, eager_dft, message="DFT")
 
 
 def test_unsloth_fused_dft_exports_public_symbol():
