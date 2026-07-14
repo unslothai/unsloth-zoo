@@ -243,11 +243,9 @@ def _is_canonical_weight_shard_index(name: str) -> bool:
     return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
-# The EXACT canonical / single-variant diffusers COMPONENT shard index: a canonical component base
-# (diffusion_pytorch_model / model / pytorch_model) + safetensors/bin format + the .index.json /
-# .index.<variant>.json form (anchored, one optional variant token). So a stale sidecar such as
-# diffusion_pytorch_model.safetensors.index.fp16.extra.json is NOT accepted. The base is captured so the
-# ignore-filter probe can use the component's OWN weight name.
+# The EXACT canonical / single-variant diffusers COMPONENT shard index (anchored, one optional variant
+# token), so a stale sidecar like diffusion_pytorch_model.safetensors.index.fp16.extra.json is rejected.
+# The base is captured so the ignore-filter probe uses the component's OWN weight name.
 _COMPONENT_SHARD_INDEX_RE = re.compile(
     r"^(?P<base>diffusion_pytorch_model|model|pytorch_model)\.(?P<ext>safetensors|bin)"
     r"\.index(?:\.(?P<variant>[^.]+))?\.json$"

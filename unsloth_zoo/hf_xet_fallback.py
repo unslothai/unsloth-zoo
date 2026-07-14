@@ -1143,19 +1143,17 @@ def _diffusers_component_weights_complete(
             if _CHECKPOINT_DIR_RE.match(comp):
                 continue  # a training-checkpoint subtree, not a component
             if is_index:
-                # A component shard INDEX of a kept format proves a readable component weight even when the
-                # shard files carry a NON-standard name the weight regexes miss (mirrors
-                # _root_model_has_weight); the probe is the component-relative weight the index enumerates
-                # (its OWN base), so the ignore filter is judged on what the load reads.
+                # A component shard INDEX of a kept format proves a readable component weight even for
+                # non-standard shard names the weight regexes miss (mirrors _root_model_has_weight); the
+                # probe is the component-relative weight (its OWN base), so the ignore filter matches.
                 tok = _index_variant_token(name)
                 probe = _component_index_weight_probe(name, comp)
                 if probe is None:
                     continue
                 if tok is None:
-                    # A canonical component index. Under a variant load it is the per-component FALLBACK,
-                    # which the variant completeness pass does not validate, so accept it as fallback
-                    # presence only when its shards are complete (else defer to the child). Under a plain
-                    # load the canonical completeness pass validates it, so record it unconditionally.
+                    # A canonical component index: under a variant load it is the per-component FALLBACK the
+                    # variant completeness pass skips, so accept it only when its shards are complete; a
+                    # plain load validates it via the canonical completeness pass, so record it always.
                     if variant is not None and not _weight_shard_index_complete(entry):
                         continue
                     per_comp_canon.setdefault(comp, []).append(probe)
