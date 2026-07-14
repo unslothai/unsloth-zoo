@@ -172,7 +172,7 @@ def compute_fused_dft_loss(
     pass
 
     vocab_size = lm_head_weight.shape[0]
-    flat_labels = labels.contiguous().view(-1).to(device = device).contiguous()
+    flat_labels = labels.reshape(-1).to(device = device)
     valid = flat_labels != ignore_index
     logits = torch.nn.functional.linear(
         hidden_states.to(dtype = lm_head_weight.dtype, device = device),
