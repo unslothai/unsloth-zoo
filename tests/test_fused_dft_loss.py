@@ -551,20 +551,30 @@ def test_compute_dft_ignored_nonfinite_row_has_finite_zero_gradient():
     with _lightweight_unsloth_zoo_import():
         from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
 
+        max_float = torch.finfo(torch.float32).max
         hidden = torch.tensor(
-            [[[0.20, -0.10], [1.0e40, -1.0e40]]],
-            dtype=torch.float64,
+            [[[0.20, -0.10], [max_float, max_float]]],
+            dtype=torch.float32,
             requires_grad=True,
         )
         weight = torch.tensor(
-            [[0.30, -0.10], [0.20, 0.50], [-0.40, 0.70]],
-            dtype=torch.float64,
+            [[0.30, -0.10], [2.0, -2.0], [-2.0, 2.0]],
+            dtype=torch.float32,
             requires_grad=True,
         )
-        bias = torch.tensor([0.10, -0.20, 0.30], dtype=torch.float64, requires_grad=True)
+        bias = torch.tensor([0.10, -0.20, 0.30], dtype=torch.float32, requires_grad=True)
         labels = torch.tensor([[1, -100]])
+        raw_logits = _linear_logits(torch, hidden, weight, bias)
+        assert torch.isnan(raw_logits[0, 1]).any()
 
-        loss, aux = compute_fused_dft_loss(hidden, weight, bias, labels, shift_labels=False)
+        loss, aux = compute_fused_dft_loss(
+            hidden,
+            weight,
+            bias,
+            labels,
+            shift_labels=False,
+            logit_softcapping=1.0,
+        )
         expected = _reference_dft_loss(
             torch,
             hidden[:, :1],
@@ -572,6 +582,7 @@ def test_compute_dft_ignored_nonfinite_row_has_finite_zero_gradient():
             bias,
             labels[:, :1],
             shift_labels=False,
+            logit_softcapping=1.0,
         )
 
         assert torch.isfinite(loss)

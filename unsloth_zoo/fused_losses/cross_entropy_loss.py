@@ -171,12 +171,15 @@ def compute_fused_dft_loss(
         labels = labels.to(device = device)
     pass
 
+    vocab_size = lm_head_weight.shape[0]
+    flat_labels = labels.contiguous().view(-1).to(device = device).contiguous()
+    valid = flat_labels != ignore_index
     logits = torch.nn.functional.linear(
         hidden_states.to(dtype = lm_head_weight.dtype, device = device),
         lm_head_weight,
         lm_head_bias,
     )
-    vocab_size = lm_head_weight.shape[0]
+    logits.view(-1, vocab_size).masked_fill_(~valid.unsqueeze(1), 0.0)
 
     # Apply the same logit transforms as fused CE before computing NLL.
     logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
@@ -192,15 +195,6 @@ def compute_fused_dft_loss(
         logits = logits * logit_softcapping
 
     flat_logits = logits.view(-1, vocab_size).float().contiguous()
-    flat_labels = labels.contiguous().view(-1).to(device = device).contiguous()
-    valid = flat_labels != ignore_index
-    # Native CE can propagate non-finite ignored logits during backward on some
-    # backends, so sanitize them before CE to keep ignored gradients hard-zeroed.
-    flat_logits = torch.where(
-        valid.unsqueeze(1),
-        flat_logits,
-        torch.zeros((), dtype = flat_logits.dtype, device = flat_logits.device),
-    )
     token_nll = torch.nn.functional.cross_entropy(
         input = flat_logits,
         target = flat_labels,
