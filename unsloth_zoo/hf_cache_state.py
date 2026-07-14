@@ -243,6 +243,37 @@ def _is_canonical_weight_shard_index(name: str) -> bool:
     return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
+# The EXACT canonical / single-variant diffusers COMPONENT shard index (anchored, one optional variant
+# token), so a stale sidecar like diffusion_pytorch_model.safetensors.index.fp16.extra.json is rejected.
+# The base is captured so the ignore-filter probe uses the component's OWN weight name.
+_COMPONENT_SHARD_INDEX_RE = re.compile(
+    r"^(?P<base>diffusion_pytorch_model|model|pytorch_model)\.(?P<ext>safetensors|bin)"
+    r"\.index(?:\.(?P<variant>[^.]+))?\.json$"
+)
+
+
+def _is_canonical_component_shard_index(name: str) -> bool:
+    """True only for the EXACT canonical / single-variant diffusers COMPONENT shard index
+    (``diffusion_pytorch_model.safetensors.index.json`` / ``...index.fp16.json``, plus the ``model`` /
+    ``pytorch_model`` bases). The component analog of ``_is_canonical_weight_shard_index``: lets a component
+    sharded with NON-standard shard names be recognized via its index, while a stale malformed sidecar the
+    pipeline never probes is rejected."""
+    return _COMPONENT_SHARD_INDEX_RE.match(name) is not None
+
+
+def _component_index_weight_probe(index_name: str, dir_rel: str) -> "Optional[str]":
+    """The component-relative weight path a canonical component shard *index* enumerates, preserving the
+    component's OWN base (``diffusion_pytorch_model`` / ``model`` / ``pytorch_model``), format, and variant
+    token, so the ignore filter is judged on the real weight name -- a component-scoped ignore like
+    ``unet/diffusion_pytorch_model*`` matches. None when *index_name* is not such an index."""
+    m = _COMPONENT_SHARD_INDEX_RE.match(index_name)
+    if m is None:
+        return None
+    token = f".{m['variant']}" if m["variant"] else ""
+    prefix = f"{dir_rel}/" if dir_rel else ""
+    return f"{prefix}{m['base']}{token}.{m['ext']}"
+
+
 def _is_unsafe_shard_ref(shard: str) -> bool:
     """True if a ``weight_map`` value is NOT a safe relative path inside the snapshot (absolute, Windows
     drive-letter, UNC, or ``..``-escaping). Judged under BOTH POSIX and Windows semantics so a crafted
