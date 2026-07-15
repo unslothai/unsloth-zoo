@@ -862,6 +862,141 @@ def test_text_completion_probe_keeps_one_shot_iterables_reusable():
     assert list(dataset) == [{"text": "1 2"}]
 
 
+def _streaming_text_tokenizer(pad_token_id=0):
+    return types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        pad_token_id=pad_token_id,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+
+
+def _streaming_text_batches(dataset, tokenizer=None, **kwargs):
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    options = dict(batch_size=1, max_seq_length=8, dataset_order="sequential")
+    return iterate_training_batches(
+        dataset, tokenizer or _streaming_text_tokenizer(), **(options | kwargs),
+    )
+
+
+def _streaming_batch_signature(batch):
+    tokens, lengths, labels = batch
+    return tokens.tolist(), lengths.tolist(), None if labels is None else labels.tolist()
+
+
+@pytest.mark.parametrize("use_hf", [False, True])
+def test_text_streaming_yields_without_sizing_indexing_or_preconsumption(use_hf):
+    from datasets import IterableDataset
+
+    class GuardedRows:
+        def __init__(self):
+            self.pulls = 0
+
+        def __len__(self):
+            raise AssertionError("streaming source length must not be requested")
+
+        def __getitem__(self, _index):
+            raise AssertionError("streaming source must not be indexed")
+
+        def __iter__(self):
+            while True:
+                if self.pulls >= 2:
+                    raise AssertionError("source was consumed past the first batch")
+                self.pulls += 1
+                yield {"text": f"{self.pulls} {self.pulls + 10}"}
+
+    guarded = GuardedRows()
+    source = IterableDataset.from_generator(lambda: iter(guarded)) if use_hf else guarded
+    batch = next(_streaming_text_batches(
+        source,
+        batch_size=2,
+        completion_only_loss=False,
+    ))
+
+    assert guarded.pulls == 2
+    assert [row[:2] for row in batch[0].tolist()] == [[1, 11], [2, 12]]
+    assert batch[2] is None
+
+
+def test_raw_text_streaming_matches_sized_sequential_order():
+    class ReplayableRows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    rows = [{"value": value} for value in range(1, 6)]
+    kwargs = {
+        "batch_size": 2,
+        "completion_only_loss": False,
+        "formatting_func": lambda row: {
+            "text": f"{row['value']} {row['value'] + 10}"
+        },
+    }
+    expected = _streaming_text_batches(rows, **kwargs)
+    actual = _streaming_text_batches(ReplayableRows(rows), **kwargs)
+    assert [_streaming_batch_signature(next(actual)) for _ in range(3)] == [
+        _streaming_batch_signature(next(expected)) for _ in range(3)
+    ]
+
+
+def test_streaming_prompt_completion_and_assistant_labels():
+    completion_batch = next(_streaming_text_batches(iter([
+        {"prompt": "1 2", "completion": " 3"},
+        {"prompt": "4", "completion": " 5 6"},
+    ]), batch_size=2))
+    assert completion_batch[0].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert completion_batch[2].tolist() == [
+        [-100, -100, 3],
+        [-100, 5, 6],
+    ]
+
+    assistant_batch = next(_streaming_text_batches(
+        iter([{
+            "messages": [
+                {"role": "user", "content": "1"},
+                {"role": "assistant", "content": "2 3"},
+            ],
+        }]),
+        tokenizer=_AssistantMaskTokenizer(),
+        completion_only_loss=False,
+        assistant_only_loss=True,
+    ))
+    assert assistant_batch[0].tolist() == [[10, 1, 20, 2, 3]]
+    assert assistant_batch[2].tolist() == [[-100, -100, -100, 2, 3]]
+
+
+def test_pretokenized_streaming_preserves_supported_label_fields():
+    explicit = next(_streaming_text_batches(
+        iter([{
+            "input_ids": [1, 2],
+            "labels": [-100, 2],
+            "attention_mask": [0, 0],
+        }]),
+        tokenizer=types.SimpleNamespace(pad_token_id=9),
+        completion_only_loss=False,
+        formatting_func=lambda _row: pytest.fail(
+            "pretokenized rows must bypass formatting"
+        ),
+    ))
+    assert explicit[0].tolist() == [[1, 2]]
+    assert explicit[2].tolist() == [[-100, 2]]
+
+    masked = next(_streaming_text_batches(
+        iter([{
+            "input_ids": [4, 5, 6],
+            "completion_mask": [1, 1, 1],
+            "assistant_masks": [0, 1, 1],
+        }]),
+        tokenizer=types.SimpleNamespace(pad_token_id=0),
+    ))
+    assert masked[2].tolist() == [[-100, 5, 6]]
+
+
 def test_text_pretokenized_create_batches_preserves_input_ids():
     from unsloth_zoo.mlx.utils import create_batches
 

@@ -36,7 +36,7 @@ import shutil
 import tempfile
 import threading
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 
@@ -3363,6 +3363,20 @@ def _ensure_reiterable_text_dataset(dataset):
     return list(dataset)
 
 
+def _is_mlx_lazy_text_source(dataset):
+    """Return whether streaming text must avoid map-style source operations."""
+    if isinstance(dataset, Sequence):
+        return False
+    if isinstance(dataset, Iterator):
+        return True
+    return any("__iter__" in cls.__dict__ for cls in type(dataset).__mro__)
+
+
+def _is_mlx_replayable_text_source(dataset):
+    """Return whether a source can create a fresh iterator for another pass."""
+    return not isinstance(dataset, Iterator)
+
+
 def _labeled_row_has_supervision(labels, max_seq_length):
     # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift,
     # length-capped); an all-masked batch aborts training. labels=None always kept.
@@ -5161,6 +5175,211 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
                 yield (ids, 0)
 
 
+def _iter_lazy_tokenized_text_rows(
+    dataset,
+    tokenizer,
+    *,
+    dataset_text_field="text",
+    formatting_func=None,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+    max_seq_length=None,
+    state=None,
+):
+    """Normalize an unsized source one row at a time and lock its schema."""
+    state = {} if state is None else state
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+
+    def _validate_state(kind, labels):
+        if state.get("schema") is None:
+            state["schema"] = kind
+        elif state["schema"] != kind:
+            raise ValueError(
+                "Unsloth MLX: pretokenized text rows with 'input_ids' cannot "
+                "be mixed with rows that need text formatting/tokenization."
+            )
+        has_labels = labels is not None
+        if state.get("label_state") is None:
+            state["label_state"] = has_labels
+        elif state["label_state"] != has_labels:
+            raise ValueError(
+                "Unsloth MLX: streaming text rows with labels or masks must "
+                "not be mixed with rows that do not provide labels."
+            )
+
+    for item in dataset:
+        source_rows = item if (
+            isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
+        ) else [item]
+        if not any(
+            isinstance(row, Mapping) and "input_ids" in row
+            for row in source_rows
+        ) and formatting_func is not None:
+            formatted = formatting_func(item)
+            source_rows = formatted if (
+                isinstance(formatted, list)
+                and not _looks_like_mlx_chat_messages(formatted)
+            ) else [formatted]
+
+        for row in source_rows:
+            tokenized = _tokenize_mlx_pretokenized_row(
+                row,
+                completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
+            )
+            if tokenized is not None:
+                ids, labels = tokenized
+                _validate_state("pretokenized", labels)
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                    labels = (
+                        labels[:max_seq_length] if labels is not None else None
+                    )
+                if len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                ):
+                    yield ids, labels
+                continue
+
+            labeled = None
+            if completion_only_loss is not False or assistant_only_loss:
+                labeled = _tokenize_mlx_prompt_completion_row(
+                    tokenizer,
+                    row,
+                    dataset_text_field=dataset_text_field,
+                    append_eos=append_eos,
+                    completion_only_loss=completion_only_loss,
+                    assistant_only_loss=assistant_only_loss,
+                )
+                if labeled is None and assistant_only_loss:
+                    labeled = _tokenize_mlx_assistant_messages_row(tokenizer, row)
+            if labeled is not None:
+                ids, labels = labeled
+                _validate_state("raw", labels)
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                    labels = labels[:max_seq_length]
+                if len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                ):
+                    yield ids, labels
+                continue
+            if assistant_only_loss:
+                raise ValueError(
+                    "You set `assistant_only_loss=True`, but the dataset is not "
+                    "conversational. This option is only supported for "
+                    "conversational datasets."
+                )
+            if completion_only_loss is True:
+                raise ValueError(
+                    "Unsloth MLX: text completion_only_loss=True requires "
+                    "prompt/completion rows for streaming text training."
+                )
+
+            for text in collect_mlx_texts(
+                tokenizer,
+                row,
+                dataset_text_field=dataset_text_field,
+                is_vlm=False,
+            ):
+                ids = list(encode_mlx_text(tokenizer, text))
+                if eos_id is not None and (not ids or ids[-1] != eos_id):
+                    ids.append(int(eos_id))
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                _validate_state("raw", None)
+                if len(ids) >= 2:
+                    yield ids, None
+
+
+def _iterate_lazy_text_training_batches(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    *,
+    dataset_text_field="text",
+    formatting_func=None,
+    dataset_order="default",
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+    comm_group=None,
+):
+    """Yield source-ordered text batches without probing an unsized source."""
+    if dataset_order == "torch_randperm":
+        raise ValueError(
+            "Unsloth MLX: dataset_order='torch_randperm' is not supported for "
+            "an unsized streaming text source."
+        )
+    if dataset_order not in (None, "default", "sequential"):
+        raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+    replayable = _is_mlx_replayable_text_source(dataset)
+    state = {}
+    epoch = 0
+    while True:
+        set_epoch = getattr(dataset, "set_epoch", None)
+        if replayable and callable(set_epoch):
+            set_epoch(epoch)
+
+        pending = []
+        yielded = False
+        for row in _iter_lazy_tokenized_text_rows(
+            dataset,
+            tokenizer,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+            max_seq_length=max_seq_length,
+            state=state,
+        ):
+            pending.append(row)
+            if len(pending) < global_batch_size:
+                continue
+            local_items = _rank_slice_distributed_batch(
+                pending,
+                batch_size,
+                comm_group=comm_group,
+                pad_source=pending,
+            )
+            yielded = True
+            yield _create_tokenized_text_batch(
+                local_items,
+                max_seq_length,
+                pad_id=_mlx_text_pad_id(tokenizer),
+            )
+            pending = []
+
+        if pending:
+            local_items = _rank_slice_distributed_batch(
+                pending,
+                batch_size,
+                comm_group=comm_group,
+                pad_source=pending,
+            )
+            yielded = True
+            yield _create_tokenized_text_batch(
+                local_items,
+                max_seq_length,
+                pad_id=_mlx_text_pad_id(tokenizer),
+            )
+        if not yielded:
+            raise ValueError(
+                "Unsloth MLX: streaming text source produced no trainable rows."
+            )
+        if not replayable:
+            raise RuntimeError(
+                "Unsloth MLX: one-shot streaming text source is exhausted and "
+                "cannot be replayed. Use a replayable iterable or reduce max_steps."
+            )
+        epoch += 1
+
+
 def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
                                            max_seq_length, seed=42,
                                            dataset_text_field="text",
@@ -5290,6 +5509,30 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
         ``labels`` is ``None`` unless text prompt/completion masking is active.
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    if _is_mlx_lazy_text_source(dataset):
+        tokenizer = normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        yield from _iterate_lazy_text_training_batches(
+            dataset,
+            tokenizer,
+            batch_size,
+            max_seq_length,
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            dataset_order=dataset_order,
+            append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+            comm_group=comm_group,
+        )
+        return
 
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
