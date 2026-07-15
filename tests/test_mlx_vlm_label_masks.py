@@ -490,6 +490,20 @@ def test_vlm_streaming_response_mask_skips_fully_masked_rows():
     assert batch["labels"].tolist() == [[-100, 12, 13, -100]]
 
 
+def test_vlm_assistant_only_loss_materialized_streaming_parity():
+    from unsloth_zoo.mlx.utils import create_vlm_batches, iterate_vlm_training_batches
+    dataset = [_assistant_vlm_row("same"), _assistant_vlm_row("policy")]
+    kwargs = dict(dataset=dataset, config={"image_token_id": _AssistantMaskProcessor.image_token_id},
+                  batch_size=2, max_seq_length=32, image_size=16,
+                  dataset_order="sequential", assistant_only_loss=True)
+    batches = [
+        create_vlm_batches(processor=_AssistantMaskProcessor(), **kwargs)[0],
+        next(iterate_vlm_training_batches(processor=_AssistantMaskProcessor(), **kwargs)),
+    ]
+    assert all(batches[0][key].tolist() == batches[1][key].tolist()
+               for key in ("input_ids", "attention_mask", "labels"))
+
+
 def test_vlm_response_mask_formats_each_filtered_row_once():
     from unsloth_zoo.mlx.utils import create_vlm_batches
 

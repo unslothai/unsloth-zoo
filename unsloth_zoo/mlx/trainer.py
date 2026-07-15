@@ -2614,6 +2614,7 @@ class MLXTrainer:
                             response_mask_fn=_vlm_mask_fn,
                             formatting_func=self.formatting_func,
                             completion_only_loss=text_completion_only_loss,
+                            assistant_only_loss=text_assistant_only_loss,
                             comm_group=self.distributed_world,
                             distributed_pad_mode="empty",
                         )
@@ -3278,12 +3279,6 @@ class MLXTrainer:
         comm_group = self.distributed_world
 
         if is_vlm:
-            if text_assistant_only_loss:
-                raise ValueError(
-                    "Unsloth MLX VLM: assistant_only_loss=True is not supported for "
-                    "vision-language models. Set assistant_only_loss=False, or use "
-                    "train_on_responses_only for response masking."
-                )
             _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
             vlm_dataset_order = (
                 "sequential"
@@ -3312,6 +3307,7 @@ class MLXTrainer:
                     formatting_func=self.formatting_func,
                     dataset_order=vlm_dataset_order,
                     completion_only_loss=text_completion_only_loss,
+                    assistant_only_loss=text_assistant_only_loss,
                     comm_group=comm_group,
                 )
             else:
@@ -3330,9 +3326,10 @@ class MLXTrainer:
                     dataset_order=vlm_dataset_order,
                     num_epochs=vlm_num_epochs,
                     completion_only_loss=text_completion_only_loss,
+                    assistant_only_loss=text_assistant_only_loss,
                     comm_group=comm_group,
                 )
-                if _vlm_mask_fn is not None and batches:
+                if (_vlm_mask_fn is not None or text_assistant_only_loss) and batches:
                     _check_vlm_all_masked(
                         batches,
                         comm_group=comm_group,
@@ -3831,8 +3828,8 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
             continue
         labels_list = labels.tolist()
         for row in labels_list:
-            unique = set(row)
-            if unique == {-100}:
+            # Causal losses consume labels[:, 1:], never the first position.
+            if not any(label != -100 for label in row[1:]):
                 seen_bad += 1
             else:
                 seen_good += 1
@@ -3859,16 +3856,15 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
     if ratio == 1.0:
         raise ZeroDivisionError(
             "Unsloth: All VLM labels in your dataset are -100. Training losses will be all 0.\n"
-            "Are you sure you used `train_on_responses_only` correctly?\n"
-            "Check that your instruction_part and response_part strings match "
-            "the chat template used by your processor."
+            "Check assistant_only_loss, train_on_responses_only, truncation, "
+            "and the chat template used by your processor."
         )
     elif ratio >= 0.9:
         import warnings
         warnings.warn(
             f"Unsloth: {seen_bad}/{seen_bad + seen_good} VLM samples have all -100 labels "
-            f"({ratio:.0%}). Your instruction_part / response_part may not match "
-            f"the chat template correctly.",
+            f"({ratio:.0%}). Check assistant/response masking, truncation, and "
+            f"the processor chat template.",
             UserWarning,
         )
 

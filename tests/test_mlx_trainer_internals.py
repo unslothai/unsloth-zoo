@@ -1120,7 +1120,10 @@ def test_vlm_eval_batches_define_completion_only_loss_before_use():
     text_eval_start = source.index("return create_batches(")
     text_eval_end = source.index("if isinstance(self.eval_dataset, dict)")
     text_eval_block = source[text_eval_start:text_eval_end]
+    vlm_eval_start = source.index("if is_vlm:")
+    vlm_eval_block = source[vlm_eval_start:text_eval_start]
     assert definition < eval_use
+    assert "assistant_only_loss=text_assistant_only_loss" in vlm_eval_block
     assert "completion_only_loss=text_completion_only_loss" in text_eval_block
 
 
@@ -1234,7 +1237,7 @@ def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
 
     monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
+    all_bad = [{"labels": mx.array([[7, -100]])}]
     _check_vlm_all_masked(all_bad, comm_group=object(), world_size=2)
 
 
@@ -1243,7 +1246,7 @@ def test_check_vlm_all_masked_single_process_still_raises():
 
     from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
+    all_bad = [{"labels": mx.array([[7, -100]])}]
     with pytest.raises(ZeroDivisionError):
         _check_vlm_all_masked(all_bad)
 

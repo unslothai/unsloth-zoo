@@ -4474,6 +4474,7 @@ def _filter_trainable_vlm_indices(
     formatting_func=None,
     ignore_token_ids=None,
     completion_only_loss=None,
+    assistant_only_loss=False,
 ):
     """Filter VLM rows before batching, matching CUDA dataset.filter order."""
     kept_indices = []
@@ -4493,6 +4494,7 @@ def _filter_trainable_vlm_indices(
             formatting_func=None,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
             return_prompt_completion=True,
         )
         if is_prompt_completion:
@@ -4515,7 +4517,8 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                        formatting_func=None, dataset_order="default",
                        num_epochs=None, completion_only_loss=None,
                        image_size=None, comm_group=None,
-                       distributed_pad_mode="cycle"):
+                       distributed_pad_mode="cycle",
+                       assistant_only_loss=False):
     """Pre-materialize VLM training batches using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator:
@@ -4547,6 +4550,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             formatting_func=formatting_func,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
         )
         if not base_indices and total_removed > 0:
             raise ValueError(
@@ -4621,6 +4625,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
         )
         if any(empty_rows):
             batch_dict = _mask_empty_vlm_padding_rows(
@@ -4652,7 +4657,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   formatting_func=None,
                                   dataset_order="default",
                                   completion_only_loss=None,
-                                  image_size=None, comm_group=None):
+                                  image_size=None, comm_group=None,
+                                  assistant_only_loss=False):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -4677,6 +4683,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
         )
 
     if hasattr(dataset, "__len__"):
@@ -4697,6 +4704,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 formatting_func=formatting_func,
                 ignore_token_ids=ignore_token_ids,
                 completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
             )
             if not base_indices and total_removed > 0:
                 raise ValueError(
@@ -4787,6 +4795,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 formatting_func=None,
                 ignore_token_ids=ignore_token_ids,
                 completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
                 return_prompt_completion=True,
             )
             if is_prompt_completion:
