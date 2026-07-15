@@ -45,15 +45,22 @@ from typing import Any, Callable, Optional
 
 from unsloth_zoo.hf_cache_state import (
     INCOMPLETE_SUFFIX,
+    _ROOT_MODEL_SHARD_INDEX_RE,
     _ROOT_MODEL_VARIANT_WEIGHT_RE,
     _as_pattern_list,
+    _component_index_weight_probe,
     _diffusers_component_shards_incomplete,
     _diffusers_declared_component_specs,
     _filter_paths,
     _has_glob,
     _has_incomplete_canonical_root_shards,
     _has_incomplete_variant_root_shards,
+    _index_variant_token,
+    _index_weight_probe,
+    _is_canonical_component_shard_index,
+    _is_canonical_weight_shard_index,
     _is_loadable_weight_file,
+    _read_format_kept,
     _selected_shard_index_incomplete,
     _sentence_transformers_subfolder_incomplete,
     _weight_shard_index_complete,
@@ -1116,7 +1123,8 @@ def _diffusers_component_weights_complete(
     try:
         for entry in snapshot_dir.rglob("*"):
             name = entry.name
-            if not _is_default_load_weight_file(name):
+            is_index = _is_canonical_component_shard_index(name)
+            if not is_index and not _is_default_load_weight_file(name):
                 continue
             try:
                 if not entry.is_file():
@@ -1134,6 +1142,24 @@ def _diffusers_component_weights_complete(
                 continue  # an UNDECLARED subtree the load does not read
             if _CHECKPOINT_DIR_RE.match(comp):
                 continue  # a training-checkpoint subtree, not a component
+            if is_index:
+                # A component shard INDEX of a kept format proves a readable component weight even for
+                # non-standard shard names the weight regexes miss (mirrors _root_model_has_weight); the
+                # probe is the component-relative weight (its OWN base), so the ignore filter matches.
+                tok = _index_variant_token(name)
+                probe = _component_index_weight_probe(name, comp)
+                if probe is None:
+                    continue
+                if tok is None:
+                    # A canonical component index: under a variant load it is the per-component FALLBACK the
+                    # variant completeness pass skips, so accept it only when its shards are complete; a
+                    # plain load validates it via the canonical completeness pass, so record it always.
+                    if variant is not None and not _weight_shard_index_complete(entry):
+                        continue
+                    per_comp_canon.setdefault(comp, []).append(probe)
+                elif tok == variant:
+                    per_comp_variant.setdefault(comp, []).append(probe)
+                continue
             if variant_weight_re is not None and variant_weight_re.match(name):
                 per_comp_variant.setdefault(comp, []).append(rel)
             elif _CANONICAL_COMPONENT_WEIGHT_RE.match(name):
@@ -1200,6 +1226,7 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
         return _has_diffusers_component_weight(snapshot_dir, ignore_patterns = ignore_patterns)
     rels: list = []
     tf_flax_rels: list = []
+    index_probes: set = set()
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
@@ -1210,11 +1237,20 @@ def _root_model_has_weight(snapshot_dir: Path, *, ignore_patterns: Any = None) -
                 continue
             if _CANONICAL_ROOT_MODEL_WEIGHT_RE.match(name):
                 rels.append(name)  # canonical model / pytorch_model (single or shard)
+            elif _is_canonical_weight_shard_index(name):
+                # a sharded model enumerated via its canonical root index (shard files may carry a
+                # non-standard name the regex above misses); record the weight it enumerates.
+                index_probes.add(_index_weight_probe(name))
             elif _CANONICAL_ROOT_TF_FLAX_WEIGHT_RE.match(name):
                 tf_flax_rels.append(name)  # TF/Flax root weight (from_tf / from_flax)
     except OSError:
         return False
     if _filter_paths(rels, None, ignore_patterns):
+        return True
+    # A canonical ROOT shard INDEX of a kept format proves a readable weight even for non-standard shard
+    # names (e.g. model.safetensors-00001-of-00002.safetensors): transformers enumerates the weight
+    # through the index, so its presence is the readable-weight signal; completeness stays Invariant B's.
+    if any(_read_format_kept(probe, ignore_patterns) for probe in index_probes):
         return True
     # from_tf / from_flax (both PyTorch formats ignored): count a SINGLE-FILE TF/Flax weight or a COMPLETE
     # sharded set (index + every listed shard present), so a complete h5/msgpack download is not
@@ -1241,25 +1277,41 @@ def _root_has_variant_weight(
     ``model.<variant>-00001-of-00002.safetensors`` (``.<variant>-`` shard infix), matched by
     ``_ROOT_MODEL_VARIANT_WEIGHT_RE`` plus the variant infix. A non-canonical base, PEFT adapter, or
     non-``model`` variant is excluded -> a cache holding only those is retried over HTTP. The ignore
-    filter is applied so an ignored-format partial does not count."""
+    filter is applied so an ignored-format partial does not count.
+
+    Mirrors ``_root_model_has_weight``: a ROOT variant shard INDEX
+    (``model.safetensors.index.<variant>.json`` / ``pytorch_model.bin.index.<variant>.json``) of a kept
+    format also proves a readable weight, so a variant sharded with NON-standard shard names the weight
+    regex misses is not false-rejected. Shard completeness stays ``_has_incomplete_variant_root_shards``'s
+    job, so an index whose shards are missing is still correctly rejected."""
     infix_dot = f".{variant}."
     infix_dash = f".{variant}-"
     rels: list = []
+    index_probes: set = set()
     try:
         for entry in snapshot_dir.iterdir():
             name = entry.name
             if infix_dot not in name and infix_dash not in name:
                 continue  # not the requested variant token
-            if not _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
-                continue  # only a canonical model / pytorch_model variant weight, not adapter / gguf
             try:
-                if entry.is_file():
-                    rels.append(name)
+                if not entry.is_file():
+                    continue
             except OSError:
                 continue
+            if _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
+                rels.append(name)  # canonical model / pytorch_model variant weight (single or shard)
+            elif _ROOT_MODEL_SHARD_INDEX_RE.match(name):
+                # a sharded variant enumerated via its root index (shard files may carry a non-standard
+                # name the regex above misses); record the variant weight it enumerates.
+                index_probes.add(_index_weight_probe(name, variant))
     except OSError:
         return False
-    return bool(_filter_paths(rels, None, ignore_patterns))
+    if _filter_paths(rels, None, ignore_patterns):
+        return True
+    # A ROOT variant shard INDEX of a kept format proves a readable weight even for non-standard shard
+    # names (mirrors _root_model_has_weight). Probe + format-kept are shared with
+    # _has_incomplete_variant_root_shards so presence (Invariant A) and completeness (Invariant B) agree.
+    return any(_read_format_kept(probe, ignore_patterns) for probe in index_probes)
 
 
 def _has_diffusers_component_variant_weight(
