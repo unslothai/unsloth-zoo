@@ -2715,14 +2715,25 @@ class MLXTrainer:
         # ordering the killed run would have produced.
         if _resume_step > 0 and batch_iter is not None:
             for _ in range(_resume_step * grad_accum):
+                fast_forward_error = None
                 try:
                     next(batch_iter)
                 except StopIteration:
-                    raise RuntimeError(
+                    fast_forward_error = RuntimeError(
                         f"Unsloth: streaming dataset exhausted while "
                         f"fast-forwarding to resume step {_resume_step}. "
                         f"Dataset may be shorter than the killed run consumed."
-                    ) from None
+                    )
+                except Exception as e:
+                    fast_forward_error = e
+                if distributed_world_size > 1:
+                    self._raise_distributed_failure(
+                        fast_forward_error is not None,
+                        "fast-forwarding training batch",
+                        fast_forward_error,
+                    )
+                elif fast_forward_error is not None:
+                    raise fast_forward_error
 
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""

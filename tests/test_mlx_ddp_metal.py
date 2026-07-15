@@ -87,6 +87,13 @@ class RankFailingStream:
             raise KeyError("rank0 stream failure")
         return ({"text": f"{i} {i + 20} {i + 30}"} for i in range(10, 15))
 
+class RankFailingResumeStream:
+    def __iter__(self):
+        for i in range(10, 15):
+            if int(world.rank()) == 0:
+                raise KeyError("rank0 resume stream failure")
+            yield {"text": f"{i} {i + 20} {i + 30}"}
+
 class ReplayableVLMStream:
     def __iter__(self): return ({"text": str(i)} for i in range(10, 15))
 
@@ -282,6 +289,17 @@ mx.eval(sync)
 resumed_trainer = make_parity_trainer("resume_resumed", seed=987)
 resumed_trainer.train(resume_from_checkpoint=str(Path(sys.argv[1], "resume_partial", "checkpoint-2")))
 resume_param_delta = max_trainable_delta(fresh_trainer, resumed_trainer)
+def asymmetric_resume_data_error_message():
+    mx.random.seed(795)
+    error_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=3, logging_steps=1, eval_steps=0, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "asymmetric_resume_data_error")), use_cce=False, compile=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
+    error_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), RankFailingResumeStream(), args=error_args)
+    error_trainer.save_model = mark("asymmetric_resume_data_error_final")
+    try:
+        error_trainer.train(resume_from_checkpoint=str(Path(sys.argv[1], "resume_partial", "checkpoint-2")))
+    except RuntimeError as exc:
+        return str(exc)
+    return ""
+asymmetric_resume_data_error = asymmetric_resume_data_error_message()
 trainer_mod.save_trainable_adapters = mark("vlm_ckpt_adapter")
 trainer_mod.save_optimizer_state = mark("vlm_ckpt_opt")
 trainer_mod.save_trainer_state = mark("vlm_ckpt_state")
@@ -361,6 +379,7 @@ payload = {
     "fresh_losses": [float(x) for x in fresh_trainer._train_loss_history],
     "resumed_losses": [float(x) for x in resumed_trainer._train_loss_history],
     "resume_param_delta": resume_param_delta,
+    "asymmetric_resume_data_error": asymmetric_resume_data_error,
     "vlm_events": vlm_events,
     "vlm_step": int(vlm_trainer._global_step),
     "vlm_compile_enabled": bool(vlm_result["compile_enabled"]),
@@ -386,14 +405,13 @@ payload = {
 Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
 """,
         encoding="utf-8")
-
     env = os.environ.copy()
     repo_root = Path(__file__).resolve().parents[1]
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [
         str(launcher), "-n", "2", "--backend", "ring",
-        "--python", sys.executable, "--cwd", str(repo_root),
-        str(script), str(tmp_path),
+        "--cwd", str(repo_root),
+        sys.executable, str(script), str(tmp_path),
     ]
     proc = subprocess.run(
         cmd, capture_output=True, env=env, text=True, timeout=120,
@@ -492,5 +510,8 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["vlm_empty_eval"][1]["ids"][0][1] == 20
     assert ranks[1]["vlm_empty_eval"][1]["mask"][0] == [1, 1, 1, 1]
     assert all(value == -100 for value in ranks[1]["vlm_empty_eval"][1]["labels"][0])
-    assert [rank["stream_text"] for rank in ranks] == expected_stream
+    assert [rank["stream_text"] for rank in ranks] == expected
     assert [rank["stream_vlm"] for rank in ranks] == expected_stream
+    assert all("fast-forwarding training batch" in rank["asymmetric_resume_data_error"] for rank in ranks)
+    assert "rank 0 failed" in ranks[0]["asymmetric_resume_data_error"]
+    assert "peer rank failed" in ranks[1]["asymmetric_resume_data_error"]
