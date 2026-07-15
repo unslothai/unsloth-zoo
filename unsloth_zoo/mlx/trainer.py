@@ -1817,10 +1817,24 @@ class MLXTrainer:
         self._neftune_emb = None
         self._neftune_base_cls = None
 
+    def _close_active_batch_iterator(self):
+        """Best-effort release of an iterator owned by the training run."""
+        batch_iter = getattr(self, "_active_batch_iter", None)
+        self._active_batch_iter = None
+        close = getattr(batch_iter, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # Cleanup must not mask the training error already in flight or
+                # make distributed ranks diverge after their final collective.
+                pass
+
 
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
+        self._close_active_batch_iterator()
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
@@ -1937,6 +1951,7 @@ class MLXTrainer:
                 self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
+            self._close_active_batch_iterator()
             _handles = getattr(self, "_report_to_handles", (None, None))
             _wb, _tb = _handles
             if _tb is not None:
@@ -2034,6 +2049,7 @@ class MLXTrainer:
         if self._batches is None:
             self._prepared_batches_include_epochs = False
         batches, batch_iter = self._prepare_data(is_vlm)
+        self._active_batch_iter = batch_iter
 
         if batches is not None and not batches:
             raise ValueError(

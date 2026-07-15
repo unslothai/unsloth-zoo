@@ -3379,7 +3379,15 @@ def _is_mlx_lazy_text_source(dataset):
         return False
     if isinstance(dataset, Iterator):
         return True
-    return any("__iter__" in cls.__dict__ for cls in type(dataset).__mro__)
+    source_mro = type(dataset).__mro__
+    if any("__iter__" in cls.__dict__ for cls in source_mro):
+        return True
+    # Python's sequence-iteration fallback accepts __getitem__ without
+    # __iter__. Keep custom objects that also declare __len__ on the existing
+    # sized/map path; the no-length protocol must be consumed incrementally.
+    has_getitem = any("__getitem__" in cls.__dict__ for cls in source_mro)
+    has_len = any("__len__" in cls.__dict__ for cls in source_mro)
+    return has_getitem and not has_len
 
 
 def _is_mlx_hf_iterable_text_source(dataset):
@@ -5240,6 +5248,7 @@ def _iter_lazy_tokenized_text_rows(
             and "prompt" in item
             and "completion" in item
         )
+        formatter_applied = False
         formatter_needs_completion_boundary = False
         source_rows = item if (
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
@@ -5249,6 +5258,7 @@ def _iter_lazy_tokenized_text_rows(
             for row in source_rows
         ) and formatting_func is not None:
             formatted = formatting_func(item)
+            formatter_applied = True
             formatter_needs_completion_boundary = (
                 completion_only_loss is None
                 and item_has_completion_boundary
@@ -5283,16 +5293,22 @@ def _iter_lazy_tokenized_text_rows(
             if tokenized is not None:
                 ids, labels = tokenized
                 if (
-                    formatter_needs_completion_boundary
+                    formatter_applied
                     and row_completion_only_loss is True
                     and labels is None
                 ):
+                    if formatter_needs_completion_boundary:
+                        raise ValueError(
+                            "Unsloth MLX: a formatting_func was provided for a "
+                            "prompt/completion dataset, which drops the completion "
+                            "boundary needed for the default completion-only loss. "
+                            "Apply your formatting before passing the dataset, or set "
+                            "completion_only_loss=False."
+                        )
                     raise ValueError(
-                        "Unsloth MLX: a formatting_func was provided for a "
-                        "prompt/completion dataset, which drops the completion "
-                        "boundary needed for the default completion-only loss. "
-                        "Apply your formatting before passing the dataset, or set "
-                        "completion_only_loss=False."
+                        "Unsloth MLX: formatting_func produced pretokenized "
+                        "input_ids without labels or completion_mask while "
+                        "completion-only loss is active."
                     )
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
@@ -5391,6 +5407,15 @@ def _iter_lazy_tokenized_text_rows(
                     yield ids, None
 
 
+def _close_mlx_owned_iterator(iterator):
+    """Close an iterator owned by the lazy text pipeline when supported."""
+    if iterator is None:
+        return
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
 def _iterate_lazy_text_training_batches(
     dataset,
     tokenizer,
@@ -5406,7 +5431,13 @@ def _iterate_lazy_text_training_batches(
     comm_group=None,
     require_replayable=False,
 ):
-    """Yield source-ordered text batches without probing an unsized source."""
+    """Yield source-ordered text batches without materializing an unsized source.
+
+    Custom replayable sources must return independent fresh traversals from
+    ``iter(source)``. Resume validation may create one non-consuming iterator
+    ahead of the serving iterator; epoch-aware validation iterators are closed
+    immediately and recreated only after ``set_epoch`` advances.
+    """
     if dataset_order == "torch_randperm":
         raise ValueError(
             "Unsloth MLX: dataset_order='torch_randperm' is not supported for "
@@ -5440,99 +5471,132 @@ def _iterate_lazy_text_training_batches(
     _set_epoch(0)
     current_iterator = iter(dataset)
     cached_next_iterator = None
-    if isinstance(dataset, Iterator):
-        replayable = False
-    elif _is_mlx_hf_iterable_text_source(dataset):
-        replayable = True
-    else:
-        replayable = None
+    try:
+        if isinstance(dataset, Iterator):
+            replayable = False
+        elif _is_mlx_hf_iterable_text_source(dataset):
+            replayable = True
+        else:
+            replayable = None
 
-    if require_replayable:
-        if replayable is False:
-            raise _resume_replay_error()
-        if replayable is None:
+        if require_replayable:
+            if replayable is False:
+                raise _resume_replay_error()
+            if replayable is None:
+                try:
+                    candidate = iter(dataset)
+                except Exception as exc:
+                    raise _resume_replay_error() from exc
+                if candidate is current_iterator:
+                    raise _resume_replay_error()
+                if not callable(set_epoch):
+                    cached_next_iterator = candidate
+                else:
+                    _close_mlx_owned_iterator(candidate)
+                    del candidate
+                replayable = True
+
+        def _make_batch(local_items):
+            if state.get("schema") == "raw" and state.get("label_state") is False:
+                return _make_text_batch_from_items(
+                    [ids for ids, _labels in local_items],
+                    tokenizer,
+                    max_seq_length,
+                )
+            return _create_tokenized_text_batch(
+                local_items,
+                max_seq_length,
+                pad_id=_mlx_text_pad_id(tokenizer),
+            )
+
+        while True:
+            pending = []
+            padding_source = []
+            yielded = False
+            for row in _iter_lazy_tokenized_text_rows(
+                current_iterator,
+                tokenizer,
+                dataset_text_field=dataset_text_field,
+                formatting_func=formatting_func,
+                append_eos=append_eos,
+                completion_only_loss=completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
+                max_seq_length=max_seq_length,
+                state=state,
+            ):
+                if len(padding_source) < global_batch_size:
+                    padding_source.append(row)
+                pending.append(row)
+                if len(pending) < global_batch_size:
+                    continue
+                local_items = _rank_slice_distributed_batch(
+                    pending,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=padding_source,
+                )
+                yielded = True
+                yield _make_batch(local_items)
+                pending = []
+
+            if pending:
+                local_items = _rank_slice_distributed_batch(
+                    pending,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=padding_source,
+                )
+                yielded = True
+                yield _make_batch(local_items)
+
+            exhausted_iterator = current_iterator
+            current_iterator = None
+            _close_mlx_owned_iterator(exhausted_iterator)
+            if not yielded:
+                raise ValueError(
+                    "Unsloth MLX: streaming text source produced no trainable rows."
+                )
+            if replayable is False:
+                raise _exhaustion_error()
+            epoch += 1
+            _set_epoch(epoch)
+            if cached_next_iterator is not None:
+                current_iterator = cached_next_iterator
+                cached_next_iterator = None
+                del exhausted_iterator
+                continue
             try:
                 candidate = iter(dataset)
             except Exception as exc:
-                raise _resume_replay_error() from exc
-            if candidate is current_iterator:
-                raise _resume_replay_error()
-            if not callable(set_epoch):
-                cached_next_iterator = candidate
+                if replayable is True:
+                    raise RuntimeError(
+                        "Unsloth MLX: replayable streaming text source failed to "
+                        f"create an iterator for epoch {epoch}: {exc}"
+                    ) from exc
+                raise _exhaustion_error() from exc
+            if candidate is exhausted_iterator:
+                raise _exhaustion_error()
+            current_iterator = candidate
             replayable = True
-
-    def _make_batch(local_items):
-        if state.get("schema") == "raw" and state.get("label_state") is False:
-            return _make_text_batch_from_items(
-                [ids for ids, _labels in local_items],
-                tokenizer,
-                max_seq_length,
-            )
-        return _create_tokenized_text_batch(
-            local_items,
-            max_seq_length,
-            pad_id=_mlx_text_pad_id(tokenizer),
+            del exhausted_iterator
+    finally:
+        active_iterator = current_iterator
+        current_iterator = None
+        replay_iterator = cached_next_iterator
+        cached_next_iterator = None
+        cleanup_iterators = (
+            (active_iterator,)
+            if replay_iterator is active_iterator
+            else (active_iterator, replay_iterator)
         )
-
-    while True:
-        pending = []
-        padding_source = []
-        yielded = False
-        for row in _iter_lazy_tokenized_text_rows(
-            current_iterator,
-            tokenizer,
-            dataset_text_field=dataset_text_field,
-            formatting_func=formatting_func,
-            append_eos=append_eos,
-            completion_only_loss=completion_only_loss,
-            assistant_only_loss=assistant_only_loss,
-            max_seq_length=max_seq_length,
-            state=state,
-        ):
-            if len(padding_source) < global_batch_size:
-                padding_source.append(row)
-            pending.append(row)
-            if len(pending) < global_batch_size:
-                continue
-            local_items = _rank_slice_distributed_batch(
-                pending,
-                batch_size,
-                comm_group=comm_group,
-                pad_source=padding_source,
-            )
-            yielded = True
-            yield _make_batch(local_items)
-            pending = []
-
-        if pending:
-            local_items = _rank_slice_distributed_batch(
-                pending,
-                batch_size,
-                comm_group=comm_group,
-                pad_source=padding_source,
-            )
-            yielded = True
-            yield _make_batch(local_items)
-        if not yielded:
-            raise ValueError(
-                "Unsloth MLX: streaming text source produced no trainable rows."
-            )
-        if replayable is False:
-            raise _exhaustion_error()
-        epoch += 1
-        _set_epoch(epoch)
-        if cached_next_iterator is not None:
-            current_iterator = cached_next_iterator
-            cached_next_iterator = None
-            continue
-        try:
-            candidate = iter(dataset)
-        except Exception as exc:
-            raise _exhaustion_error() from exc
-        if candidate is current_iterator:
-            raise _exhaustion_error()
-        current_iterator = candidate
-        replayable = True
+        # A schema/source error may already be unwinding. Cleanup must attempt
+        # every owned cursor without replacing that primary failure. The normal
+        # epoch-boundary close above remains strict and still surfaces errors.
+        for iterator in cleanup_iterators:
+            try:
+                _close_mlx_owned_iterator(iterator)
+            except Exception:
+                pass
 
 
 def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
