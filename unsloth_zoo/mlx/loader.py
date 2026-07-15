@@ -280,8 +280,8 @@ def _message_matches_known_fallback(message, rule):
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict mlx load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too
-    old (or regressed, e.g. 0.31.3 - mlx-lm #1242) for a QK-norm arch; dropping
-    those weights breaks the model, so raise a clear error instead."""
+    old or incompatible for a QK-norm arch; dropping those weights breaks the
+    model, so raise a clear error instead."""
     if "parameters not in model" not in message:
         return
     if not any(marker in message for marker in ("k_norm", "q_norm")):
@@ -309,9 +309,10 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
     raise ValueError(
         f"Unsloth: cannot load MLX {model_type or 'model'} - the installed "
         f"mlx-lm / mlx-vlm rejects its QK-norm (q_norm/k_norm) weights, so it is "
-        f"too old or regressed for this architecture (mlx-lm 0.31.3 broke "
-        f"gemma4 / qwen3_5). Reinstall an arch-complete build, e.g. "
-        f'`pip install -U "mlx-lm>=0.22.0,!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
+        f"too old or incompatible for this architecture. Upgrade unsloth-zoo, mlx, "
+        f"mlx-lm, mlx-vlm, and mlx-audio together through the supported installer "
+        f"or dependency policy for your environment; Studio users should rerun "
+        f"installer/repair. Do not bypass this error with strict=False.{installed}"
     ) from error
 
 
