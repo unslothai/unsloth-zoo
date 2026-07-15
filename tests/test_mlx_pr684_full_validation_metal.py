@@ -13,8 +13,8 @@ paths that only real Metal training can prove:
 3. Epoch-based unlabeled runs: num_train_epochs drives the step count when
    max_steps is disabled.
 4. SGD with gradient-coupled weight decay end to end.
-5. Real VLM LoRA training: tiny 4-bit SmolVLM through the VLM collation,
-   label masking, CCE loss, and adapter save pipeline.
+5. Real VLM LoRA training: 4-bit Qwen2-VL through assistant-only VLM
+   collation, CCE loss, and adapter save pipeline.
 """
 
 import gc
@@ -40,6 +40,23 @@ TEXT_MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 # transformers (the mlx-community SmolVLM-256M repo ships a preprocessor
 # config AutoImageProcessor cannot map).
 VLM_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+VLM_ASSISTANT_CHAT_TEMPLATE = (
+    "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}"
+    "{% macro render_content(message) %}{% if message['content'] is string %}{{ message['content'] }}"
+    "{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}"
+    "{% set image_count.value = image_count.value + 1 %}<|vision_start|><|image_pad|><|vision_end|>"
+    "{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}"
+    "<|vision_start|><|video_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}"
+    "{% endfor %}{% endif %}{% endmacro %}{% for message in messages %}"
+    "{% if loop.first and message['role'] != 'system' %}"
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}"
+    "<|im_start|>{{ message['role'] }}\n"
+    "{% if message['role'] == 'assistant' %}"
+    "{% generation %}{{ render_content(message) }}<|im_end|>\n{% endgeneration %}"
+    "{% else %}{{ render_content(message) }}<|im_end|>\n{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
 
 
 def _chat_dataset(n=12):
@@ -177,7 +194,7 @@ def test_sgd_coupled_weight_decay_e2e(tmp_path):
 
 @metal_only
 def test_vlm_lora_training_e2e(tmp_path):
-    """Real VLM LoRA fit: collation, label masking, CCE, save."""
+    """Real VLM LoRA fit: assistant-only labels, CCE, and adapter save."""
     from PIL import Image
 
     from unsloth_zoo.mlx.loader import FastMLXModel
@@ -220,9 +237,11 @@ def test_vlm_lora_training_e2e(tmp_path):
             output_dir=str(tmp_path),
             seed=3407,
             report_to="none",
+            assistant_only_loss=True,
+            vlm_chat_template=VLM_ASSISTANT_CHAT_TEMPLATE,
         ),
     )
-    assert trainer._is_vlm, "SmolVLM was not detected as a VLM"
+    assert trainer._is_vlm, "Qwen2-VL was not detected as a VLM"
     trainer.train()
     hist = trainer._train_loss_history
     assert len(hist) == 4
@@ -335,4 +354,3 @@ def test_vlm_resume_from_checkpoint_matches_fresh_run(tmp_path):
             f"step {i}: fresh={a!r} resumed={b!r}\n"
             f"fresh={fresh_hist}\nresumed={resumed_hist}"
         )
-
