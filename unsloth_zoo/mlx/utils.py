@@ -31,6 +31,7 @@ import importlib
 import json
 import numpy as np
 import os
+import re
 import sys
 import shutil
 import tempfile
@@ -3787,6 +3788,281 @@ def _processor_vlm_inputs(
     raise first_error
 
 
+def _as_vlm_token_rows(value, field_name, expected_rows):
+    """Normalize one batched chat-template field to Python token rows."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if expected_rows == 1 and value and not isinstance(value[0], (list, tuple)):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or len(value) != expected_rows:
+        raise ValueError(
+            f"Unsloth MLX VLM: chat-template {field_name} must contain "
+            f"{expected_rows} row(s)."
+        )
+    rows = []
+    for row in value:
+        if hasattr(row, "tolist"):
+            row = row.tolist()
+        if not isinstance(row, (list, tuple)):
+            raise ValueError(
+                f"Unsloth MLX VLM: chat-template {field_name} rows must be sequences."
+            )
+        rows.append([int(token) for token in row])
+    return rows
+
+
+def _tokenize_vlm_assistant_mask_rows(processor, messages_batch):
+    """Return unexpanded template token ids and generation masks per VLM row."""
+    template = getattr(processor, "chat_template", None)
+    if not isinstance(template, str) or re.search(
+        r"\{%-?\s*generation\s*-?%\}", template,
+    ) is None:
+        raise ValueError(
+            "Unsloth MLX VLM: assistant_only_loss=True requires the active "
+            "processor chat_template to mark assistant spans with "
+            "`{% generation %}...{% endgeneration %}`."
+        )
+
+    tokenizer = _get_processor_tokenizer(processor)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        raise ValueError(
+            "Unsloth MLX VLM: assistant_only_loss=True requires a tokenizer "
+            "that supports apply_chat_template(..., return_assistant_tokens_mask=True)."
+        )
+
+    render_batch = []
+    turn_probe_batch = []
+    turn_probes = []
+    accepts_list_content = _processor_accepts_assistant_list_content(processor)
+    for row_index, messages in enumerate(messages_batch):
+        rendered_messages = (
+            messages
+            if accepts_list_content
+            else _collapse_vlm_assistant_content(messages)
+        )
+        render_batch.append(rendered_messages)
+        assistant_positions = [
+            index for index, message in enumerate(rendered_messages)
+            if isinstance(message, Mapping) and message.get("role") == "assistant"
+        ]
+        if len(assistant_positions) > 1:
+            for position in assistant_positions:
+                before_index = None
+                if position > 0:
+                    before_index = len(turn_probe_batch)
+                    turn_probe_batch.append(rendered_messages[:position])
+                through_index = len(turn_probe_batch)
+                turn_probe_batch.append(rendered_messages[:position + 1])
+                turn_probes.append((row_index, before_index, through_index))
+
+    # Tokenize full rows and structured turn probes together so correctness does
+    # not add another chat-template processor pass.
+    template_batch = render_batch + turn_probe_batch
+    try:
+        processed = tokenizer.apply_chat_template(
+            template_batch,
+            chat_template=template,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+            padding=False,
+            truncation=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Unsloth MLX VLM: the processor tokenizer could not produce "
+            "trustworthy assistant token masks. Use a fast tokenizer and a "
+            "chat template with `{% generation %}` blocks."
+        ) from exc
+
+    if not isinstance(processed, Mapping) or "assistant_masks" not in processed:
+        raise RuntimeError(
+            "Unsloth MLX VLM: assistant_only_loss=True requested assistant "
+            "masks, but the processor tokenizer returned none. Ensure the "
+            "active chat template contains `{% generation %}` blocks."
+        )
+    input_rows = _as_vlm_token_rows(
+        processed["input_ids"], "input_ids", len(template_batch),
+    )
+    mask_rows = _as_vlm_token_rows(
+        processed["assistant_masks"], "assistant_masks", len(template_batch),
+    )
+    full_count = len(render_batch)
+    full_input_rows, probe_input_rows = input_rows[:full_count], input_rows[full_count:]
+    full_mask_rows, probe_mask_rows = mask_rows[:full_count], mask_rows[full_count:]
+    for input_ids, assistant_mask in zip(full_input_rows, full_mask_rows):
+        _validate_mlx_assistant_mask(
+            input_ids, assistant_mask, source="VLM chat-template",
+        )
+
+    def _matching_prefix_length(left, right):
+        length = 0
+        while length < min(len(left), len(right)) and left[length] == right[length]:
+            length += 1
+        return length
+
+    for row_index, before_index, through_index in turn_probes:
+        before_ids = [] if before_index is None else probe_input_rows[before_index]
+        through_ids = probe_input_rows[through_index]
+        through_mask = probe_mask_rows[through_index]
+        _validate_mlx_assistant_mask(
+            through_ids, through_mask, source="VLM assistant-turn probe",
+        )
+        turn_start = _matching_prefix_length(before_ids, through_ids)
+        turn_positions = [
+            index for index in range(turn_start, len(through_ids))
+            if through_mask[index] == 1
+        ]
+        full_prefix = _matching_prefix_length(
+            through_ids, full_input_rows[row_index],
+        )
+        if not turn_positions or any(
+            index >= full_prefix or full_mask_rows[row_index][index] != 1
+            for index in turn_positions
+        ):
+            raise RuntimeError(
+                "Unsloth MLX VLM: assistant_only_loss=True requires the active "
+                "chat template to mark every assistant turn with `{% generation %}`. "
+                "The template returned a partial or final-turn-only assistant mask."
+            )
+    return list(zip(full_input_rows, full_mask_rows))
+
+
+def _align_vlm_assistant_mask_row(
+    source_ids,
+    source_mask,
+    final_ids,
+    attention_mask,
+    *,
+    ignore_token_ids=None,
+    truncation_side="right",
+    max_seq_length=None,
+):
+    """Align a template mask to final processor ids without content searching."""
+    structural_ids = {int(token) for token in (ignore_token_ids or ())}
+    final_ids = [int(token) for token in final_ids]
+    if attention_mask is None:
+        valid_positions = list(range(len(final_ids)))
+    else:
+        valid_positions = [
+            idx for idx, keep in enumerate(attention_mask) if int(keep) != 0
+        ]
+    final_valid = [final_ids[idx] for idx in valid_positions]
+    source_ids = [int(token) for token in source_ids]
+    source_mask = [int(mask) for mask in source_mask]
+
+    reverse = truncation_side == "left"
+    if reverse:
+        source_ids.reverse()
+        source_mask.reverse()
+        final_valid.reverse()
+
+    aligned_valid = []
+    source_idx = 0
+    for final_token in final_valid:
+        while (
+            source_idx < len(source_ids)
+            and source_ids[source_idx] in structural_ids
+            and source_ids[source_idx] != final_token
+        ):
+            source_idx += 1
+        if source_idx < len(source_ids) and source_ids[source_idx] == final_token:
+            aligned_valid.append(source_mask[source_idx])
+            source_idx += 1
+        elif final_token in structural_ids:
+            # Processor-expanded image/video/audio tokens never train.
+            aligned_valid.append(0)
+        else:
+            source_token = (
+                source_ids[source_idx] if source_idx < len(source_ids) else None
+            )
+            raise ValueError(
+                "Unsloth MLX VLM: assistant mask could not be aligned with "
+                "final processor input_ids; the processor changed a "
+                f"non-multimodal token ({source_token!r} -> {final_token!r})."
+            )
+
+    while source_idx < len(source_ids) and source_ids[source_idx] in structural_ids:
+        source_idx += 1
+    was_truncated = (
+        max_seq_length is not None
+        and max_seq_length > 0
+        and len(final_valid) >= int(max_seq_length)
+    )
+    if source_idx < len(source_ids) and not was_truncated:
+        raise ValueError(
+            "Unsloth MLX VLM: assistant mask alignment ended before all "
+            "non-multimodal chat-template tokens were consumed."
+        )
+
+    if reverse:
+        aligned_valid.reverse()
+    aligned = [0] * len(final_ids)
+    for position, mask in zip(valid_positions, aligned_valid):
+        aligned[position] = int(mask != 0)
+    return aligned
+
+
+def _apply_vlm_assistant_label_masks(
+    batch_dict,
+    source_rows,
+    tokenizer,
+    *,
+    ignore_token_ids=None,
+    max_seq_length=None,
+):
+    """Intersect assistant masks with existing labels and VLM ignore masks."""
+    raw_input_ids = batch_dict.get(
+        _RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"],
+    )
+    final_rows = np.asarray(
+        raw_input_ids.tolist()
+        if hasattr(raw_input_ids, "tolist") else raw_input_ids
+    )
+    if final_rows.ndim == 1:
+        final_rows = final_rows.reshape(1, -1)
+    attention = batch_dict.get("attention_mask")
+    attention_rows = None if attention is None else np.asarray(
+        attention.tolist() if hasattr(attention, "tolist") else attention
+    )
+    if len(source_rows) != final_rows.shape[0]:
+        raise ValueError(
+            "Unsloth MLX VLM: assistant mask row count must match processor input_ids."
+        )
+
+    truncation_side = getattr(tokenizer, "truncation_side", "right")
+    assistant_masks = []
+    for row_idx, (source_ids, source_mask) in enumerate(source_rows):
+        assistant_masks.append(
+            _align_vlm_assistant_mask_row(
+                source_ids,
+                source_mask,
+                final_rows[row_idx],
+                None if attention_rows is None else attention_rows[row_idx],
+                ignore_token_ids=ignore_token_ids,
+                truncation_side=truncation_side,
+                max_seq_length=max_seq_length,
+            )
+        )
+
+    labels = batch_dict.get("labels", raw_input_ids)
+    labels = _normalize_cce_label_dtype(labels)
+    assistant_mask = mx.array(np.asarray(assistant_masks, dtype=np.int32))
+    if tuple(labels.shape) != tuple(assistant_mask.shape):
+        raise ValueError(
+            "Unsloth MLX VLM: existing labels must match final processor "
+            "input_ids before applying assistant_only_loss."
+        )
+    ignore = mx.array(-100, dtype=labels.dtype)
+    labels = mx.where(assistant_mask != 0, labels, ignore)
+    return _apply_vlm_label_masks(
+        batch_dict,
+        labels=labels,
+        ignore_token_ids=ignore_token_ids,
+    )
+
+
 def _as_numpy_vlm_field(inputs, key):
     """Return a processor output field as a 2-D numpy array."""
     value = inputs[key]
@@ -4007,6 +4283,7 @@ def _collate_vlm_prompt_completion_batch(
 def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                        formatting_func=None, ignore_token_ids=None,
                        completion_only_loss=None,
+                       assistant_only_loss=False,
                        return_prompt_completion=False):
     """Collate a batch of VLM samples using the processor directly.
 
@@ -4027,6 +4304,13 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         and "prompt" in formatted_items[0]
         and "completion" in formatted_items[0]
     ):
+        if assistant_only_loss:
+            raise ValueError(
+                "Unsloth MLX VLM: assistant_only_loss=True is not supported "
+                "for prompt/completion VLM rows because the CUDA-parity "
+                "collator tokenizes the two parts separately. Use a single "
+                "conversational messages column instead."
+            )
         batch = _collate_vlm_prompt_completion_batch(
             formatted_items, processor, max_seq_length, image_size,
             ignore_token_ids=ignore_token_ids,
@@ -4037,15 +4321,24 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     all_texts = []
     all_images = []
     all_suffixes = []
+    assistant_messages = []
 
     for item in formatted_items:
         raw = _select_vlm_messages_or_raw(item)
         if raw is item:
+            if assistant_only_loss:
+                raise ValueError(
+                    "Unsloth MLX VLM: assistant_only_loss=True requires "
+                    "conversational messages/conversations rows; pre-rendered "
+                    "text and pretokenized VLM rows do not preserve assistant boundaries."
+                )
             text = render_mlx_chat_example(processor, item, is_vlm=True)
             messages = []
         else:
             messages = _normalize_vlm_messages(raw)
             text = _render_vlm_messages(processor, messages)
+            if assistant_only_loss:
+                assistant_messages.append(messages)
         if not text:
             raise ValueError(
                 "Unsloth MLX VLM: no text could be rendered for this dataset row. "
@@ -4061,10 +4354,27 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         suffixes=all_suffixes,
     )
     batch = _to_mx_vlm_batch(inputs)
-    batch["labels"] = _apply_vlm_label_masks(
-        batch,
-        ignore_token_ids=ignore_token_ids,
-    )
+    if assistant_only_loss:
+        effective_ignore_ids = (
+            ignore_token_ids
+            if ignore_token_ids is not None
+            else _get_vlm_ignore_token_ids(processor=processor)
+        )
+        source_rows = _tokenize_vlm_assistant_mask_rows(
+            processor, assistant_messages,
+        )
+        batch["labels"] = _apply_vlm_assistant_label_masks(
+            batch,
+            source_rows,
+            _get_processor_tokenizer(processor),
+            ignore_token_ids=effective_ignore_ids,
+            max_seq_length=max_seq_length,
+        )
+    else:
+        batch["labels"] = _apply_vlm_label_masks(
+            batch,
+            ignore_token_ids=ignore_token_ids,
+        )
     return (batch, False) if return_prompt_completion else batch
 
 
@@ -4129,6 +4439,7 @@ def _build_response_masked_vlm_batch(
     formatting_func=None,
     ignore_token_ids=None,
     completion_only_loss=None,
+    assistant_only_loss=False,
     return_prompt_completion=False,
 ):
     """Collate VLM rows and apply the CUDA response-mask closure."""
@@ -4137,6 +4448,7 @@ def _build_response_masked_vlm_batch(
         formatting_func=formatting_func,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
         return_prompt_completion=True,
     )
     batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)

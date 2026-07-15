@@ -160,6 +160,45 @@ class _ConversationalPromptCompletionProcessor:
         }
 
 
+class _AssistantMaskProcessor:
+    image_processor = object()
+    image_token_id = 14
+    chat_template = (
+        "{% for m in messages %}{{ '<' + m.role + '>' }} {% if m.role == 'assistant' %}{% generation %}"
+        "{% for p in m.content %}{{ '<image> ' if p.type == 'image' else p.text + ' ' }}{% endfor %}"
+        "{{ '</' + m.role + '>' }}{% endgeneration %} {% else %}{% for p in m.content %}"
+        "{{ '<image> ' if p.type == 'image' else p.text + ' ' }}{% endfor %}"
+        "{{ '</' + m.role + '>' }} {% endif %}{% endfor %}"
+    )
+
+    def __init__(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import WhitespaceSplit
+        from transformers import PreTrainedTokenizerFast
+
+        tokens = ["[UNK]", "[PAD]", "<system>", "</system>", "<user>", "</user>",
+                  "<assistant>", "</assistant>", "<tool>",
+                  "</tool>", "same", "answer", "policy", "tool", "<image>"]
+        self.vocab = {token: idx for idx, token in enumerate(tokens)}
+        backend = Tokenizer(WordLevel(self.vocab, unk_token="[UNK]"))
+        backend.pre_tokenizer = WhitespaceSplit()
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend,
+            unk_token="[UNK]", pad_token="[PAD]", chat_template=self.chat_template)
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        return self.tokenizer.apply_chat_template(messages, chat_template=self.chat_template,
+            tokenize=tokenize, add_generation_prompt=add_generation_prompt)
+
+    def __call__(self, text, **kwargs):
+        rows = [[item for token in self.tokenizer(
+            value, add_special_tokens=False,
+        )["input_ids"] for item in [token] * (3 if token == self.image_token_id else 1)]
+                for value in text]
+        input_ids = np.asarray(rows, dtype=np.int32)
+        return {"input_ids": input_ids, "attention_mask": np.ones_like(input_ids)}
+
+
 def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
     from unsloth_zoo.mlx.utils import (
         _collate_vlm_batch,
@@ -177,6 +216,7 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         max_seq_length=8,
         image_size=16,
         ignore_token_ids=ignore_ids,
+        assistant_only_loss=False,
     )
 
     assert "labels" in batch
@@ -188,6 +228,78 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         [101, 10, -100, 11, -100],
         [101, 12, 13, -100, -100],
     ]
+
+
+def test_vlm_assistant_only_loss_uses_real_multiturn_generation_spans():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    processor = _AssistantMaskProcessor()
+    row = _assistant_vlm_row()
+    user, final = row["messages"]
+    row["messages"] = [
+        {"role": "system", "content": [{"type": "text", "text": "policy"}]}, user,
+        {"role": "assistant", "content": [{"type": "text", "text": "same"}]},
+        {"role": "tool", "content": [{"type": "text", "text": "tool"}]}, final,
+    ]
+    batch = _collate_vlm_batch([row], processor, max_seq_length=32, image_size=16,
+        ignore_token_ids=[processor.image_token_id], assistant_only_loss=True)
+
+    assert batch["input_ids"].tolist()[0].count(processor.image_token_id) == 3
+    assert batch["labels"].tolist() == [[-100] * 10 + [
+        processor.vocab["same"], processor.vocab["</assistant>"],
+    ] + [-100] * 4 + [processor.vocab["answer"], processor.vocab["</assistant>"]]]
+
+
+def test_vlm_assistant_only_loss_rejects_final_turn_only_generation_mask():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    processor = _AssistantMaskProcessor()
+    processor.chat_template = processor.chat_template.replace(
+        "m.role == 'assistant'", "m.role == 'assistant' and loop.last")
+    processor.tokenizer.chat_template = processor.chat_template
+    row = _assistant_vlm_row()
+    row["messages"] = [row["messages"][0],
+        {"role": "assistant", "content": [{"type": "text", "text": "same"}]},
+        {"role": "user", "content": [{"type": "text", "text": "policy"}]},
+        row["messages"][1]]
+    with pytest.raises(RuntimeError, match="every assistant turn"):
+        _collate_vlm_batch([row], processor, max_seq_length=32, image_size=16,
+            ignore_token_ids=[processor.image_token_id], assistant_only_loss=True)
+
+
+def test_vlm_assistant_only_loss_rejects_untrustworthy_inputs():
+    from unsloth_zoo.mlx.utils import (
+        _align_vlm_assistant_mask_row,
+        _collate_vlm_batch,
+        _tokenize_vlm_assistant_mask_rows,
+    )
+
+    messages = [_assistant_vlm_row()["messages"]]
+    with pytest.raises(ValueError, match="generation"):
+        _tokenize_vlm_assistant_mask_rows(_FakeProcessor(), messages)
+    processor = _AssistantMaskProcessor()
+    processor.tokenizer.apply_chat_template = lambda rows, **_kwargs: {
+        "input_ids": [[1]] * len(rows)}
+    with pytest.raises(RuntimeError, match="returned none"):
+        _tokenize_vlm_assistant_mask_rows(processor, messages)
+    with pytest.raises(ValueError, match="non-multimodal token"):
+        _align_vlm_assistant_mask_row([1], [0], [2], None)
+    with pytest.raises(ValueError, match="prompt/completion"):
+        _collate_vlm_batch(
+            [{"prompt": [], "completion": []}], _AssistantMaskProcessor(),
+            max_seq_length=16, image_size=16, assistant_only_loss=True,
+        )
+
+
+def _assistant_vlm_row(text="same"):
+    return {
+        "messages": [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": text},
+        ]}, {"role": "assistant", "content": [
+            {"type": "text", "text": "answer"},
+        ]}],
+        "images": [object()],
+    }
 
 
 def test_vlm_response_mask_reapplies_special_token_masks():
