@@ -30,8 +30,7 @@ def test_mlx_launch_ordered_text_batches_are_rank_sharded(tmp_path):
         pytest.skip("mlx.launch not found beside current Python executable")
 
     script = tmp_path / "ddp_batch_probe.py"
-    script.write_text("""#!/usr/bin/env python3
-import json, sys
+    script.write_text(f"#!{sys.executable}\n" + """import json, sys
 from pathlib import Path
 
 import mlx.core as mx

@@ -196,7 +196,6 @@ from .utils import (
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
     _distributed_global_batch_size,
-    _is_mlx_replayable_text_source,
     _rank_slice_distributed_batch,
 )
 from .compile import (
@@ -3354,15 +3353,6 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
-                if (
-                    getattr(self, "_resume_from_checkpoint", None)
-                    and not _is_mlx_replayable_text_source(train_dataset)
-                ):
-                    raise RuntimeError(
-                        "Unsloth MLX: checkpoint resume requires a replayable "
-                        "iterable text source; a one-shot iterator cannot be "
-                        "fast-forwarded deterministically."
-                    )
                 text_dataset_order = (
                     "sequential"
                     if getattr(args, "preserve_dataset_order", False)
@@ -3384,6 +3374,9 @@ class MLXTrainer:
                     assistant_only_loss=text_assistant_only_loss,
                     dataset_order=text_dataset_order,
                     comm_group=comm_group,
+                    require_replayable=bool(
+                        getattr(self, "_resume_from_checkpoint", None)
+                    ),
                 )
             else:
                 batch_kwargs = dict(

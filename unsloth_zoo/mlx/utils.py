@@ -3382,16 +3382,13 @@ def _is_mlx_lazy_text_source(dataset):
     return any("__iter__" in cls.__dict__ for cls in type(dataset).__mro__)
 
 
-def _is_mlx_replayable_text_source(dataset):
-    """Return whether a source can create a fresh iterator for another pass."""
-    if isinstance(dataset, Iterator):
-        return False
+def _is_mlx_hf_iterable_text_source(dataset):
+    """Return whether Hugging Face defines this source as replayable."""
     try:
-        first = iter(dataset)
-        second = iter(dataset)
-    except TypeError:
+        from datasets import IterableDataset as HFIterableDataset
+    except ImportError:
         return False
-    return first is not second
+    return isinstance(dataset, HFIterableDataset)
 
 
 def _labeled_row_has_supervision(labels, max_seq_length):
@@ -5243,11 +5240,7 @@ def _iter_lazy_tokenized_text_rows(
             and "prompt" in item
             and "completion" in item
         )
-        formatter_needs_completion_boundary = (
-            formatting_func is not None
-            and completion_only_loss is None
-            and item_has_completion_boundary
-        )
+        formatter_needs_completion_boundary = False
         source_rows = item if (
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
         ) else [item]
@@ -5256,6 +5249,10 @@ def _iter_lazy_tokenized_text_rows(
             for row in source_rows
         ) and formatting_func is not None:
             formatted = formatting_func(item)
+            formatter_needs_completion_boundary = (
+                completion_only_loss is None
+                and item_has_completion_boundary
+            )
             source_rows = formatted if (
                 isinstance(formatted, list)
                 and not _looks_like_mlx_chat_messages(formatted)
@@ -5267,13 +5264,17 @@ def _iter_lazy_tokenized_text_rows(
                 and "prompt" in row
                 and "completion" in row
             )
-            row_completion_only_loss = (
-                completion_only_loss
-                if completion_only_loss is not None
-                else True
-                if item_has_completion_boundary or row_has_completion_boundary
-                else state.get("pretokenized_completion_only_loss", False)
-            )
+            if completion_only_loss is not None:
+                row_completion_only_loss = completion_only_loss
+            elif "pretokenized_completion_only_loss" in state:
+                row_completion_only_loss = state[
+                    "pretokenized_completion_only_loss"
+                ]
+            elif item_has_completion_boundary or row_has_completion_boundary:
+                row_completion_only_loss = True
+                state["pretokenized_completion_only_loss"] = True
+            else:
+                row_completion_only_loss = False
             tokenized = _tokenize_mlx_pretokenized_row(
                 row,
                 completion_only_loss=row_completion_only_loss,
@@ -5281,7 +5282,11 @@ def _iter_lazy_tokenized_text_rows(
             )
             if tokenized is not None:
                 ids, labels = tokenized
-                if formatter_needs_completion_boundary and labels is None:
+                if (
+                    formatter_needs_completion_boundary
+                    and row_completion_only_loss is True
+                    and labels is None
+                ):
                     raise ValueError(
                         "Unsloth MLX: a formatting_func was provided for a "
                         "prompt/completion dataset, which drops the completion "
@@ -5314,13 +5319,13 @@ def _iter_lazy_tokenized_text_rows(
                     "conversational datasets."
                 )
             labeled = None
-            if completion_only_loss is not False or assistant_only_loss:
+            if row_completion_only_loss is not False or assistant_only_loss:
                 labeled = _tokenize_mlx_prompt_completion_row(
                     tokenizer,
                     row,
                     dataset_text_field=dataset_text_field,
                     append_eos=append_eos,
-                    completion_only_loss=completion_only_loss,
+                    completion_only_loss=row_completion_only_loss,
                     assistant_only_loss=assistant_only_loss,
                 )
                 if labeled is None and assistant_only_loss:
@@ -5348,18 +5353,21 @@ def _iter_lazy_tokenized_text_rows(
                     "conversational. This option is only supported for "
                     "conversational datasets."
                 )
-            if completion_only_loss is True:
-                raise ValueError(
-                    "Unsloth MLX: text completion_only_loss=True requires "
-                    "prompt/completion rows for streaming text training."
-                )
-            if formatter_needs_completion_boundary:
+            if (
+                formatter_needs_completion_boundary
+                and row_completion_only_loss is True
+            ):
                 raise ValueError(
                     "Unsloth MLX: a formatting_func was provided for a "
                     "prompt/completion dataset, which drops the completion "
                     "boundary needed for the default completion-only loss. "
                     "Apply your formatting before passing the dataset, or set "
                     "completion_only_loss=False."
+                )
+            if row_completion_only_loss is True:
+                raise ValueError(
+                    "Unsloth MLX: text completion_only_loss=True requires "
+                    "prompt/completion rows for streaming text training."
                 )
 
             for text in collect_mlx_texts(
@@ -5396,6 +5404,7 @@ def _iterate_lazy_text_training_batches(
     completion_only_loss=None,
     assistant_only_loss=False,
     comm_group=None,
+    require_replayable=False,
 ):
     """Yield source-ordered text batches without probing an unsized source."""
     if dataset_order == "torch_randperm":
@@ -5407,9 +5416,50 @@ def _iterate_lazy_text_training_batches(
         raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
 
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    replayable = _is_mlx_replayable_text_source(dataset)
     state = {}
     epoch = 0
+    set_epoch = getattr(dataset, "set_epoch", None)
+
+    def _set_epoch(value):
+        if callable(set_epoch):
+            set_epoch(value)
+
+    def _resume_replay_error():
+        return RuntimeError(
+            "Unsloth MLX: checkpoint resume requires a replayable iterable "
+            "text source; a one-shot iterator cannot be fast-forwarded "
+            "deterministically."
+        )
+
+    def _exhaustion_error():
+        return RuntimeError(
+            "Unsloth MLX: one-shot streaming text source is exhausted and "
+            "cannot be replayed. Use a replayable iterable or reduce max_steps."
+        )
+
+    _set_epoch(0)
+    current_iterator = iter(dataset)
+    cached_next_iterator = None
+    if isinstance(dataset, Iterator):
+        replayable = False
+    elif _is_mlx_hf_iterable_text_source(dataset):
+        replayable = True
+    else:
+        replayable = None
+
+    if require_replayable:
+        if replayable is False:
+            raise _resume_replay_error()
+        if replayable is None:
+            try:
+                candidate = iter(dataset)
+            except Exception as exc:
+                raise _resume_replay_error() from exc
+            if candidate is current_iterator:
+                raise _resume_replay_error()
+            if not callable(set_epoch):
+                cached_next_iterator = candidate
+            replayable = True
 
     def _make_batch(local_items):
         if state.get("schema") == "raw" and state.get("label_state") is False:
@@ -5425,15 +5475,11 @@ def _iterate_lazy_text_training_batches(
         )
 
     while True:
-        set_epoch = getattr(dataset, "set_epoch", None)
-        if replayable and callable(set_epoch):
-            set_epoch(epoch)
-
         pending = []
         padding_source = []
         yielded = False
         for row in _iter_lazy_tokenized_text_rows(
-            dataset,
+            current_iterator,
             tokenizer,
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
@@ -5471,12 +5517,22 @@ def _iterate_lazy_text_training_batches(
             raise ValueError(
                 "Unsloth MLX: streaming text source produced no trainable rows."
             )
-        if not replayable:
-            raise RuntimeError(
-                "Unsloth MLX: one-shot streaming text source is exhausted and "
-                "cannot be replayed. Use a replayable iterable or reduce max_steps."
-            )
+        if replayable is False:
+            raise _exhaustion_error()
         epoch += 1
+        _set_epoch(epoch)
+        if cached_next_iterator is not None:
+            current_iterator = cached_next_iterator
+            cached_next_iterator = None
+            continue
+        try:
+            candidate = iter(dataset)
+        except Exception as exc:
+            raise _exhaustion_error() from exc
+        if candidate is current_iterator:
+            raise _exhaustion_error()
+        current_iterator = candidate
+        replayable = True
 
 
 def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
@@ -5597,7 +5653,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              model_name=None, model_type=None,
                              append_eos=True, completion_only_loss=None,
                              assistant_only_loss=False, dataset_order="default",
-                             comm_group=None):
+                             comm_group=None, require_replayable=False):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -5631,6 +5687,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             completion_only_loss=completion_only_loss,
             assistant_only_loss=assistant_only_loss,
             comm_group=comm_group,
+            require_replayable=require_replayable,
         )
         return
 
