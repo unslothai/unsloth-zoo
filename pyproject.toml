@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==80.9.0", "setuptools-scm==9.2.0"]
+requires = ["setuptools==83.0.0", "setuptools-scm==10.2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,7 +28,7 @@ dependencies = [
     "triton>=3.0.0 ; ('linux' in sys_platform)",
     "tyro ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "accelerate>=0.34.1 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
-    "trl>=0.18.2,!=0.19.0,<=0.24.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "trl>=0.18.2,!=0.19.0,<=1.7.1 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "peft>=0.18.0,!=0.11.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "cut_cross_entropy ; python_version >= '3.10' and (sys_platform != 'darwin' or platform_machine != 'arm64')",
     # --- MLX-only deps (macOS arm64) ---
@@ -37,8 +37,8 @@ dependencies = [
     "mlx-vlm>=0.4.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
-    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.13.0",
+    "datasets>=4.0,<5.1",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
@@ -75,8 +75,8 @@ mlx = [
 core = [
     "packaging>=24.1",
     "tyro",
-    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.13.0",
+    "datasets>=4.0,<5.1",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
