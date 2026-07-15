@@ -1001,6 +1001,39 @@ def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeyp
     assert received["assistant_only_loss"] is True
 
 
+@pytest.mark.parametrize("streaming,failure", [(False, None), (True, None), (False, "local"), (False, "peer")])
+def test_vlm_prepare_data_routes_masks_and_syncs_failures(monkeypatch, streaming, failure):
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+    received, expected = {}, ["batch"]
+
+    def build(**kwargs):
+        received.update(kwargs)
+        if failure == "local":
+            raise RuntimeError("bad assistant mask")
+        return iter(expected) if streaming else expected
+
+    monkeypatch.setattr(mlx_trainer, "iterate_vlm_training_batches" if streaming else "create_vlm_batches", build)
+    monkeypatch.setattr(mlx_trainer, "_check_vlm_all_masked", lambda batches, **_kwargs: received.update(preflight=batches))
+    MLXTrainer, trainer = _make_mlx_text_trainer(max_steps=1, streaming=streaming, assistant_only_loss=True)
+    trainer.processor = object()
+    trainer._resolve_vlm_processor = lambda: trainer.processor
+    trainer._distributed_initialized, trainer._distributed_world = True, None
+    trainer._distributed_rank, trainer._distributed_world_size = 0, 2 if failure else 1
+    trainer._distributed_any_flag = lambda failed: bool(failure) or failed
+    trainer._vlm_response_mask_fn = None
+
+    if failure:
+        with pytest.raises(RuntimeError, match="VLM training batch materialization"):
+            MLXTrainer._prepare_data(trainer, is_vlm=True)
+        assert "preflight" not in received
+        return
+    batches, iterator = MLXTrainer._prepare_data(trainer, is_vlm=True)
+    assert received["assistant_only_loss"] is True
+    assert (list(iterator) if streaming else batches) == expected
+    if not streaming:
+        assert received["preflight"] == expected
+
+
 def test_text_prepare_data_ordered_batches_emit_completion_only_labels():
     MLXTrainer, trainer = _make_mlx_text_trainer(
         max_steps=1,
@@ -1124,6 +1157,7 @@ def test_vlm_eval_batches_define_completion_only_loss_before_use():
     vlm_eval_block = source[vlm_eval_start:text_eval_start]
     assert definition < eval_use
     assert "assistant_only_loss=text_assistant_only_loss" in vlm_eval_block
+    assert "evaluation batch materialization" in source
     assert "completion_only_loss=text_completion_only_loss" in text_eval_block
 
 

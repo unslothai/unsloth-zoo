@@ -1041,6 +1041,24 @@ class MLXTrainer:
             exc,
         )
 
+    def _run_distributed_setup(self, callback, context):
+        """Run rank-local setup and synchronize failures before collectives."""
+        result = None
+        local_error = None
+        try:
+            result = callback()
+        except Exception as exc:
+            local_error = exc
+        if self.distributed_world_size > 1:
+            self._raise_distributed_failure(
+                local_error is not None,
+                context,
+                local_error,
+            )
+        elif local_error is not None:
+            raise local_error
+        return result
+
     def _distributed_sum_gradient_tree(self, grad):
         """All-sum a gradient tree while preserving MLX's grouped all-reduce."""
         world = self._ensure_distributed()
@@ -2640,13 +2658,18 @@ class MLXTrainer:
                         distributed_pad_mode="empty",
                     )
 
-                if isinstance(self.eval_dataset, dict):
-                    eval_batches = {
-                        key: _create_eval_batches(value)
-                        for key, value in self.eval_dataset.items()
-                    }
-                else:
-                    eval_batches = _create_eval_batches(self.eval_dataset)
+                def _materialize_eval_batches():
+                    if isinstance(self.eval_dataset, dict):
+                        return {
+                            key: _create_eval_batches(value)
+                            for key, value in self.eval_dataset.items()
+                        }
+                    return _create_eval_batches(self.eval_dataset)
+
+                eval_batches = self._run_distributed_setup(
+                    _materialize_eval_batches,
+                    "evaluation batch materialization",
+                )
             if eval_batches:
                 eval_batch_count = (
                     sum(len(value) for value in eval_batches.values())
@@ -3323,22 +3346,25 @@ class MLXTrainer:
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
-                batches = create_vlm_batches(
-                    dataset=train_dataset,
-                    processor=processor,
-                    config=config,
-                    batch_size=args.per_device_train_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    image_size=getattr(args, "image_size", None),
-                    num_batches=total_batches_needed,
-                    seed=args.seed,
-                    response_mask_fn=_vlm_mask_fn,
-                    formatting_func=self.formatting_func,
-                    dataset_order=vlm_dataset_order,
-                    num_epochs=vlm_num_epochs,
-                    completion_only_loss=text_completion_only_loss,
-                    assistant_only_loss=text_assistant_only_loss,
-                    comm_group=comm_group,
+                batches = self._run_distributed_setup(
+                    lambda: create_vlm_batches(
+                        dataset=train_dataset,
+                        processor=processor,
+                        config=config,
+                        batch_size=args.per_device_train_batch_size,
+                        max_seq_length=args.max_seq_length,
+                        image_size=getattr(args, "image_size", None),
+                        num_batches=total_batches_needed,
+                        seed=args.seed,
+                        response_mask_fn=_vlm_mask_fn,
+                        formatting_func=self.formatting_func,
+                        dataset_order=vlm_dataset_order,
+                        num_epochs=vlm_num_epochs,
+                        completion_only_loss=text_completion_only_loss,
+                        assistant_only_loss=text_assistant_only_loss,
+                        comm_group=comm_group,
+                    ),
+                    "VLM training batch materialization",
                 )
                 if (_vlm_mask_fn is not None or text_assistant_only_loss) and batches:
                     _check_vlm_all_masked(
