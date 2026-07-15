@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import importlib.machinery
-import math
 import os
 from pathlib import Path
 import sys
@@ -11,21 +10,12 @@ import types
 import pytest
 
 
-DIRECT_RTOL = 1e-6
-DIRECT_ATOL = 1e-7
-WRAPPER_RTOL = 1e-5
-WRAPPER_ATOL = 1e-7
-CUDA_RTOL = 1e-4
-CUDA_ATOL = 1e-6
+torch = pytest.importorskip("torch")
 
 
 @contextmanager
 def _lightweight_unsloth_zoo_import():
-    """Import fused-loss modules without running unsloth_zoo.__init__.
-
-    These tests only need the local fused-loss modules, so install a temporary
-    package skeleton and restore any pre-existing modules afterwards.
-    """
+    """Import fused losses without running unsloth_zoo.__init__."""
     root = Path(__file__).resolve().parents[1]
     saved = {
         name: module
@@ -65,165 +55,32 @@ def _lightweight_unsloth_zoo_import():
         sys.modules.update(saved)
 
 
+@pytest.fixture(scope="module")
+def fused_losses():
+    with _lightweight_unsloth_zoo_import():
+        import unsloth_zoo.fused_losses.cross_entropy_loss as module
+
+        yield module
+
+
 @contextmanager
-def _compile_flag_guard(torch, cross_entropy_loss):
-    previous = cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED
-    proven = getattr(cross_entropy_loss, "_FUSED_CE_COMPILE_FASTPATH_PROVEN", None)
-    previous_proven = None if proven is None else set(proven)
+def _compile_flag_guard(fused_losses):
+    previous = fused_losses._FUSED_CE_COMPILE_SUPPORTED
+    proven = fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN
+    previous_proven = set(proven)
     torch._dynamo.reset()
-    cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED = None
-    if proven is not None:
-        proven.clear()
+    fused_losses._FUSED_CE_COMPILE_SUPPORTED = None
+    proven.clear()
     try:
         yield
     finally:
-        cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED = previous
-        if proven is not None:
-            proven.clear()
-            proven.update(previous_proven)
+        fused_losses._FUSED_CE_COMPILE_SUPPORTED = previous
+        proven.clear()
+        proven.update(previous_proven)
         torch._dynamo.reset()
 
 
-def _shift_labels(torch, labels, ignore_index=-100):
-    shifted = torch.empty_like(labels)
-    shifted[..., :-1] = labels[..., 1:]
-    shifted[..., -1] = ignore_index
-    return shifted
-
-
-def _linear_logits(torch, hidden, weight, bias):
-    return torch.nn.functional.linear(
-        hidden.to(dtype=weight.dtype, device=weight.device),
-        weight,
-        bias,
-    )
-
-
-def _apply_logit_transforms(
-    torch,
-    logits,
-    *,
-    logit_scale_multiply=None,
-    logit_scale_divide=None,
-    logit_softcapping=None,
-):
-    if logit_scale_multiply not in (None, 0):
-        logits = logits * logit_scale_multiply
-    if logit_scale_divide not in (None, 0):
-        logits = logits / logit_scale_divide
-    if logit_softcapping not in (None, 0):
-        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
-    return logits
-
-
-def _dft_loss_from_logits(
-    torch,
-    logits,
-    labels,
-    *,
-    n_items=None,
-    ignore_index=-100,
-):
-    flat_logits = logits.view(-1, logits.shape[-1]).float().contiguous()
-    flat_labels = labels.view(-1).to(device=flat_logits.device).contiguous()
-    valid = flat_labels != ignore_index
-    safe_labels = flat_labels.masked_fill(~valid, 0)
-    logprobs = torch.nn.functional.log_softmax(flat_logits, dim=-1)
-    token_nll = -logprobs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
-    valid_float = valid.to(dtype=token_nll.dtype)
-    weights = torch.exp(-token_nll.detach()) * valid_float
-
-    if n_items is None:
-        divisor = valid_float.sum()
-    elif torch.is_tensor(n_items):
-        divisor = n_items.to(device=flat_logits.device, dtype=token_nll.dtype)
-    else:
-        divisor = torch.tensor(n_items, device=flat_logits.device, dtype=token_nll.dtype)
-    if divisor.numel() != 1:
-        divisor = divisor.ravel()[0]
-    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
-    return (token_nll * weights).sum() / divisor
-
-
-def _reference_dft_loss(
-    torch,
-    hidden,
-    weight,
-    bias,
-    labels,
-    *,
-    n_items=None,
-    ignore_index=-100,
-    shift_labels=False,
-    logit_scale_multiply=None,
-    logit_scale_divide=None,
-    logit_softcapping=None,
-):
-    if shift_labels:
-        labels = _shift_labels(torch, labels, ignore_index)
-    logits = _linear_logits(torch, hidden, weight, bias)
-    logits = _apply_logit_transforms(
-        torch,
-        logits,
-        logit_scale_multiply=logit_scale_multiply,
-        logit_scale_divide=logit_scale_divide,
-        logit_softcapping=logit_softcapping,
-    )
-    return _dft_loss_from_logits(
-        torch,
-        logits,
-        labels,
-        n_items=n_items,
-        ignore_index=ignore_index,
-    )
-
-
-def _closed_form_dft(torch, transformed_logits, labels, *, n_items=None, ignore_index=-100):
-    with torch.no_grad():
-        flat_logits = transformed_logits.detach().view(-1, transformed_logits.shape[-1]).float()
-        flat_labels = labels.view(-1).to(device=flat_logits.device)
-        valid = flat_labels != ignore_index
-        safe_labels = flat_labels.masked_fill(~valid, 0)
-        logprobs = torch.nn.functional.log_softmax(flat_logits, dim=-1)
-        probs = logprobs.exp()
-        token_nll = -logprobs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
-        valid_float = valid.to(dtype=token_nll.dtype)
-        token_values = token_nll * torch.exp(-token_nll) * valid_float
-
-        if n_items is None:
-            divisor = valid_float.sum()
-        elif torch.is_tensor(n_items):
-            divisor = n_items.to(device=flat_logits.device, dtype=token_nll.dtype)
-        else:
-            divisor = torch.tensor(n_items, device=flat_logits.device, dtype=token_nll.dtype)
-        if divisor.numel() != 1:
-            divisor = divisor.ravel()[0]
-        divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
-
-        one_hot = torch.zeros_like(probs)
-        one_hot.scatter_(1, safe_labels.unsqueeze(1), 1.0)
-        weights = torch.exp(-token_nll) * valid_float
-        logit_grad = weights.unsqueeze(1) * (probs - one_hot) / divisor
-        return {
-            "loss": token_values.sum() / divisor,
-            "token_values": token_values,
-            "logit_grad": logit_grad,
-            "probs": probs,
-        }
-
-
-def _expected_linear_grads(torch, hidden, weight, bias, logit_grad):
-    grad = logit_grad.to(dtype=weight.dtype)
-    flat_hidden = hidden.detach().view(-1, hidden.shape[-1]).to(dtype=weight.dtype)
-    hidden_grad = grad.matmul(weight.detach()).view_as(hidden).to(dtype=hidden.dtype)
-    weight_grad = grad.transpose(0, 1).matmul(flat_hidden)
-    bias_grad = None if bias is None else grad.sum(dim=0).to(dtype=bias.dtype)
-    return hidden_grad, weight_grad, bias_grad
-
-
-def _make_wrapper_inputs(torch, *, dtype=None, device=None):
-    dtype = torch.float64 if dtype is None else dtype
-    device = torch.device("cpu") if device is None else device
+def _make_inputs(device, dtype):
     hidden = torch.tensor(
         [
             [[0.30, -0.70, 0.20], [1.10, 0.40, -0.30], [-0.50, 0.80, 0.60]],
@@ -243,1145 +100,345 @@ def _make_wrapper_inputs(torch, *, dtype=None, device=None):
         dtype=dtype,
         device=device,
     )
-    bias = torch.tensor([0.10, -0.20, 0.30, -0.10, 0.20], dtype=dtype, device=device)
-    labels = torch.tensor([[0, 1, 2], [3, -100, 4]], device=device)
+    bias = torch.tensor(
+        [0.10, -0.20, 0.30, -0.10, 0.20],
+        dtype=dtype,
+        device=device,
+    )
+    labels = torch.tensor(
+        [[0, 1, -100], [2, 3, 4]],
+        device=device,
+    )
     return hidden, weight, bias, labels
+
+
+def _shift_labels(labels, ignore_index=-100):
+    shifted = torch.empty_like(labels)
+    shifted[..., :-1] = labels[..., 1:]
+    shifted[..., -1] = ignore_index
+    return shifted
+
+
+def _reference_dft(
+    hidden,
+    weight,
+    bias,
+    labels,
+    *,
+    shift_labels=True,
+    ignore_index=-100,
+    logit_scale_multiply=None,
+    logit_scale_divide=None,
+    logit_softcapping=None,
+    detach_weight=True,
+):
+    """Materialized-logit oracle for finite inputs.
+
+    Non-finite ignored rows are compared with a valid-row-only oracle because
+    sanitizing those rows is the production behavior under test.
+    """
+    if shift_labels:
+        labels = _shift_labels(labels, ignore_index)
+    logits = torch.nn.functional.linear(
+        hidden.to(dtype=weight.dtype, device=weight.device),
+        weight,
+        bias,
+    )
+    if logit_scale_multiply not in (None, 0):
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide not in (None, 0):
+        logits = logits / logit_scale_divide
+    if logit_softcapping not in (None, 0):
+        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
+
+    flat_labels = labels.reshape(-1).to(device=weight.device)
+    token_nll = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float().contiguous(),
+        flat_labels,
+        reduction="none",
+        ignore_index=ignore_index,
+        label_smoothing=0.0,
+    )
+    divisor = (flat_labels != ignore_index).to(dtype=token_nll.dtype).sum()
+    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+    weight_nll = token_nll.detach() if detach_weight else token_nll
+    return (torch.exp(-weight_nll) * token_nll).sum() / divisor
 
 
 def _clone_leaf(tensor):
     return tensor.detach().clone().requires_grad_(True)
 
 
-def _run_wrapper(torch, loss_fn, hidden, weight, bias, labels, **kwargs):
-    hidden_leaf = _clone_leaf(hidden)
-    weight_leaf = _clone_leaf(weight)
-    bias_leaf = None if bias is None else _clone_leaf(bias)
-    loss = loss_fn(
-        trainer=None,
-        hidden_states=hidden_leaf,
-        lm_head_weight=weight_leaf,
-        lm_head_bias=bias_leaf,
-        labels=labels.detach().clone(),
-        **kwargs,
-    )
+def _collect_result(loss, hidden, weight, bias):
     loss.backward()
     return (
         loss.detach().clone(),
-        hidden_leaf.grad.detach().clone(),
-        weight_leaf.grad.detach().clone(),
-        None if bias_leaf is None else bias_leaf.grad.detach().clone(),
+        hidden.grad.detach().clone(),
+        weight.grad.detach().clone(),
+        bias.grad.detach().clone(),
     )
 
 
-def _run_direct(torch, compute_fused_dft_loss, hidden, weight, bias, labels, **kwargs):
-    hidden_leaf = _clone_leaf(hidden)
-    weight_leaf = _clone_leaf(weight)
-    bias_leaf = None if bias is None else _clone_leaf(bias)
-    loss, aux = compute_fused_dft_loss(
-        hidden_leaf,
-        weight_leaf,
-        bias_leaf,
+def _run_reference(hidden, weight, bias, labels, **kwargs):
+    hidden = _clone_leaf(hidden)
+    weight = _clone_leaf(weight)
+    bias = _clone_leaf(bias)
+    loss = _reference_dft(hidden, weight, bias, labels.detach().clone(), **kwargs)
+    return _collect_result(loss, hidden, weight, bias)
+
+
+def _run_direct(fused_losses, hidden, weight, bias, labels, **kwargs):
+    hidden = _clone_leaf(hidden)
+    weight = _clone_leaf(weight)
+    bias = _clone_leaf(bias)
+    loss, _ = fused_losses.compute_fused_dft_loss(
+        hidden,
+        weight,
+        bias,
         labels.detach().clone(),
         **kwargs,
     )
-    loss.backward()
-    return (
-        aux[0].detach().clone(),
-        hidden_leaf.grad.detach().clone(),
-        weight_leaf.grad.detach().clone(),
-        None if bias_leaf is None else bias_leaf.grad.detach().clone(),
+    return _collect_result(loss, hidden, weight, bias)
+
+
+def _run_wrapper(loss_fn, hidden, weight, bias, labels, **kwargs):
+    hidden = _clone_leaf(hidden)
+    weight = _clone_leaf(weight)
+    bias = _clone_leaf(bias)
+    loss = loss_fn(
+        trainer=None,
+        hidden_states=hidden,
+        lm_head_weight=weight,
+        lm_head_bias=bias,
+        labels=labels.detach().clone(),
+        **kwargs,
     )
+    return _collect_result(loss, hidden, weight, bias)
 
 
-def _assert_wrapper_results_close(torch, actual, expected, *, message=""):
-    for actual_tensor, expected_tensor, name in zip(
-        actual,
-        expected,
-        ("loss", "hidden grad", "weight grad", "bias grad"),
-    ):
-        if actual_tensor is None or expected_tensor is None:
-            assert actual_tensor is expected_tensor, f"{message} {name} None mismatch"
-            continue
-        assert torch.allclose(
+def _assert_result_close(actual, expected, *, rtol=1e-5, atol=1e-7):
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(
             actual_tensor,
             expected_tensor,
-            rtol=WRAPPER_RTOL,
-            atol=WRAPPER_ATOL,
-        ), f"{message} {name} mismatch"
-
-
-def _two_class_logits_for_probability(torch, probability, *, dtype=None):
-    dtype = torch.float64 if dtype is None else dtype
-    logit = math.log(probability / (1.0 - probability))
-    return torch.tensor([[[logit, 0.0]]], dtype=dtype)
-
-
-def _skip_if_compile_disabled():
-    if os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1":
-        pytest.skip("UNSLOTH_FUSED_CE_COMPILE_DISABLE=1 disables fused-loss compile")
-
-
-def test_compute_dft_uses_unreduced_cross_entropy(monkeypatch):
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        original_cross_entropy = torch.nn.functional.cross_entropy
-        calls = []
-
-        def cross_entropy_spy(input, target, *args, **kwargs):
-            calls.append(dict(input=input, target=target, **kwargs))
-            return original_cross_entropy(input, target, *args, **kwargs)
-
-        monkeypatch.setattr(torch.nn.functional, "cross_entropy", cross_entropy_spy)
-
-        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30]]], dtype=torch.float64)
-        weight = torch.tensor([[0.10, 0.40], [-0.30, 0.20], [0.50, -0.60]], dtype=torch.float64)
-        labels = torch.tensor([[1, 999]])
-
-        compute_fused_dft_loss(
-            hidden,
-            weight,
-            None,
-            labels,
-            shift_labels=False,
-            ignore_index=999,
+            rtol=rtol,
+            atol=atol,
         )
 
-        assert len(calls) == 1
-        call = calls[0]
-        assert call["input"].shape == (2, 3)
-        assert call["input"].dtype == torch.float32
-        assert call["input"].is_contiguous()
-        assert call["target"].shape == (2,)
-        assert call["target"].is_contiguous()
-        assert call["reduction"] == "none"
-        assert call["ignore_index"] == 999
-        assert call["label_smoothing"] == 0.0
+
+def _skip_if_compile_unavailable():
+    # Only skip a missing generic toolchain; fused-loss graph failures must fail.
+    try:
+        compiled = torch.compile(lambda value: value + 1, fullgraph=True)
+        compiled(torch.ones(1))
+    except Exception as error:
+        torch._dynamo.reset()
+        pytest.skip(f"torch.compile toolchain unavailable: {type(error).__name__}")
+    torch._dynamo.reset()
 
 
-def test_compute_dft_single_token_closed_form_loss_and_gradient():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = torch.tensor([[[0.25, -0.50]]], dtype=torch.float64, requires_grad=True)
-        weight = torch.tensor(
-            [[0.20, -0.30], [-0.70, 0.40], [0.50, 0.10]],
-            dtype=torch.float64,
-            requires_grad=True,
-        )
-        bias = torch.tensor([0.05, -0.10, 0.20], dtype=torch.float64, requires_grad=True)
-        labels = torch.tensor([[2]])
-
-        loss, aux = compute_fused_dft_loss(
-            hidden,
-            weight,
-            bias,
-            labels,
-            shift_labels=False,
-        )
-        logits = _linear_logits(torch, hidden, weight, bias)
-        expected = _closed_form_dft(torch, logits, labels)
-        expected_hidden, expected_weight, expected_bias = _expected_linear_grads(
-            torch,
-            hidden,
-            weight,
-            bias,
-            expected["logit_grad"],
-        )
-
-        assert torch.allclose(loss, expected["loss"], rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(aux[0], expected["loss"], rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-        loss.backward()
-        assert torch.allclose(hidden.grad, expected_hidden, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(weight.grad, expected_weight, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(bias.grad, expected_bias, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-
-def test_compute_dft_gradient_uses_detached_probability_weight():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = _two_class_logits_for_probability(torch, 0.10).requires_grad_(True)
-        weight = torch.eye(2, dtype=torch.float64)
-        labels = torch.tensor([[0]])
-        loss, _ = compute_fused_dft_loss(hidden, weight, None, labels, shift_labels=False)
-        loss.backward()
-
-        expected = _closed_form_dft(torch, hidden, labels)
-        probability = expected["probs"][0, 0]
-        nll = -torch.log(probability)
-        one_hot = torch.tensor([[1.0, 0.0]], dtype=expected["probs"].dtype)
-        # In the (q - one_hot) convention, differentiating -p log(p) adds
-        # the factor (1 - NLL); DFT intentionally omits it via detach().
-        nondetached_grad = probability * (1.0 - nll) * (expected["probs"] - one_hot)
-
-        assert torch.allclose(
-            hidden.grad,
-            expected["logit_grad"].view_as(hidden).to(dtype=hidden.dtype),
-            rtol=DIRECT_RTOL,
-            atol=DIRECT_ATOL,
-        )
-        assert torch.max(torch.abs(hidden.grad.float().view(1, 2) - nondetached_grad)) > 1e-3
-
-
-def test_compute_dft_minus_p_log_p_shape():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        weight = torch.eye(2, dtype=torch.float64)
-        labels = torch.tensor([[0]])
-        probabilities = [0.99, math.exp(-1.0), 1e-4]
-        observed = []
-        expected_values = []
-
-        for probability in probabilities:
-            hidden = _two_class_logits_for_probability(torch, probability).requires_grad_(True)
-            loss, aux = compute_fused_dft_loss(hidden, weight, None, labels, shift_labels=False)
-            expected = _closed_form_dft(torch, hidden, labels)
-            observed.append(loss.detach())
-            expected_values.append(expected["loss"])
-            assert torch.allclose(loss, expected["loss"], rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-            assert torch.allclose(aux[0], expected["loss"], rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-        assert observed[1] > observed[0]
-        assert observed[1] > observed[2]
-        assert expected_values[2] < torch.tensor(1e-3, dtype=expected_values[2].dtype)
-
-
-def test_compute_dft_low_probability_gradient_vanishes():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        weight = torch.eye(2, dtype=torch.float64)
-        labels = torch.tensor([[0]])
-
-        low_hidden = _two_class_logits_for_probability(torch, 1e-5).requires_grad_(True)
-        low_loss, _ = compute_fused_dft_loss(low_hidden, weight, None, labels, shift_labels=False)
-        low_loss.backward()
-
-        peak_hidden = _two_class_logits_for_probability(torch, math.exp(-1.0)).requires_grad_(True)
-        peak_loss, _ = compute_fused_dft_loss(peak_hidden, weight, None, labels, shift_labels=False)
-        peak_loss.backward()
-
-        assert torch.linalg.vector_norm(low_hidden.grad) < torch.linalg.vector_norm(peak_hidden.grad) * 1e-3
-
-
-def test_compute_dft_ignore_index_zeroes_loss_and_grad_rows():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = torch.tensor([[[0.40, -0.20], [9.0, -7.0]]], dtype=torch.float64, requires_grad=True)
-        weight = torch.tensor(
-            [[0.30, -0.10], [0.20, 0.50], [-0.40, 0.70]],
-            dtype=torch.float64,
-            requires_grad=True,
-        )
-        bias = torch.tensor([0.10, -0.20, 0.30], dtype=torch.float64, requires_grad=True)
-        labels = torch.tensor([[1, -100]])
-
-        loss, _ = compute_fused_dft_loss(hidden, weight, bias, labels, shift_labels=False)
-        logits = _linear_logits(torch, hidden, weight, bias)
-        expected = _closed_form_dft(torch, logits, labels)
-        expected_hidden, expected_weight, expected_bias = _expected_linear_grads(
-            torch,
-            hidden,
-            weight,
-            bias,
-            expected["logit_grad"],
-        )
-
-        assert expected["token_values"][1] == 0
-        assert torch.allclose(loss, expected["loss"], rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        loss.backward()
-        assert torch.count_nonzero(hidden.grad[0, 1]) == 0
-        assert torch.allclose(hidden.grad, expected_hidden, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(weight.grad, expected_weight, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(bias.grad, expected_bias, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_unreduced_ce_ignored_nonfinite_row_has_finite_zero_gradient(device):
-    torch = pytest.importorskip("torch")
-    if device == "cuda" and not torch.cuda.is_available():
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_fused_dft_matches_reference(fused_losses, device_name):
+    if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
-    logits = torch.tensor(
-        [[0.20, -0.10, 0.30], [float("inf"), float("-inf"), float("nan")]],
+    device = torch.device(device_name)
+    dtype = torch.float64 if device_name == "cpu" else torch.float32
+    wrapper_rtol, direct_rtol, atol = (
+        (1e-5, 1e-6, 1e-7)
+        if device_name == "cpu"
+        else (1e-4, 1e-4, 1e-6)
+    )
+    hidden, weight, bias, labels = _make_inputs(device, dtype)
+    shifted_labels = _shift_labels(labels)
+    valid_per_chunk = [
+        int((chunk != -100).sum())
+        for chunk in torch.chunk(shifted_labels.reshape(-1), 2)
+    ]
+    assert valid_per_chunk == [1, 2]
+
+    transforms = {
+        "logit_scale_multiply": 1.7,
+        "logit_scale_divide": 0.8,
+        "logit_softcapping": 2.25,
+    }
+    expected = _run_reference(hidden, weight, bias, labels, **transforms)
+    nondetached = _run_reference(
+        hidden,
+        weight,
+        bias,
+        labels,
+        detach_weight=False,
+        **transforms,
+    )
+    assert torch.max(torch.abs(expected[1] - nondetached[1])) > 1e-3
+    direct = _run_direct(
+        fused_losses,
+        hidden,
+        weight,
+        bias,
+        shifted_labels,
+        shift_labels=False,
+        **transforms,
+    )
+    chunked = _run_wrapper(
+        fused_losses.unsloth_fused_dft_loss,
+        hidden,
+        weight,
+        bias,
+        labels,
+        torch_compile=False,
+        n_chunks=2,
+        scaling=7.0,
+        **transforms,
+    )
+
+    _assert_result_close(direct, expected, rtol=direct_rtol, atol=atol)
+    _assert_result_close(chunked, expected, rtol=wrapper_rtol, atol=atol)
+
+
+def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses):
+    max_float = torch.finfo(torch.float32).max
+    hidden = torch.tensor(
+        [[[0.20, -0.10], [max_float, max_float]]],
         dtype=torch.float32,
-        device=device,
-        requires_grad=True,
     )
-    labels = torch.tensor([1, -100], device=device)
-    token_nll = torch.nn.functional.cross_entropy(
-        input=logits,
-        target=labels,
-        reduction="none",
-        ignore_index=-100,
-        label_smoothing=0.0,
+    weight = torch.tensor(
+        [[0.30, -0.10], [2.0, -2.0], [-2.0, 2.0]],
+        dtype=torch.float32,
     )
-    token_nll.sum().backward()
+    bias = torch.tensor([0.10, -0.20, 0.30], dtype=torch.float32)
+    labels = torch.tensor([[1, -100]])
+    assert torch.isnan(torch.nn.functional.linear(hidden, weight, bias)[0, 1]).any()
 
-    native_ce_is_safe = bool(
-        torch.isfinite(token_nll).all()
-        and torch.isfinite(logits.grad).all()
-        and torch.count_nonzero(logits.grad[1]) == 0
+    actual = _run_direct(
+        fused_losses,
+        hidden,
+        weight,
+        bias,
+        labels,
+        shift_labels=False,
+        logit_softcapping=1.0,
     )
-    if not native_ce_is_safe:
-        pytest.xfail("native unreduced CE requires DFT ignored-row sanitization on this backend")
+    expected = _run_reference(
+        hidden[:, :1],
+        weight,
+        bias,
+        labels[:, :1],
+        shift_labels=False,
+        logit_softcapping=1.0,
+    )
 
-    assert token_nll[1] == 0
-
-
-def test_compute_dft_ignored_nonfinite_row_has_finite_zero_gradient():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        max_float = torch.finfo(torch.float32).max
-        hidden = torch.tensor(
-            [[[0.20, -0.10], [max_float, max_float]]],
-            dtype=torch.float32,
-            requires_grad=True,
-        )
-        weight = torch.tensor(
-            [[0.30, -0.10], [2.0, -2.0], [-2.0, 2.0]],
-            dtype=torch.float32,
-            requires_grad=True,
-        )
-        bias = torch.tensor([0.10, -0.20, 0.30], dtype=torch.float32, requires_grad=True)
-        labels = torch.tensor([[1, -100]])
-        raw_logits = _linear_logits(torch, hidden, weight, bias)
-        assert torch.isnan(raw_logits[0, 1]).any()
-
-        loss, aux = compute_fused_dft_loss(
-            hidden,
-            weight,
-            bias,
-            labels,
-            shift_labels=False,
-            logit_softcapping=1.0,
-        )
-        expected = _reference_dft_loss(
-            torch,
-            hidden[:, :1],
-            weight,
-            bias,
-            labels[:, :1],
-            shift_labels=False,
-            logit_softcapping=1.0,
-        )
-
-        assert torch.isfinite(loss)
-        assert torch.allclose(loss, expected, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(aux[0], expected, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        loss.backward()
-        assert torch.isfinite(hidden.grad).all()
-        assert torch.isfinite(weight.grad).all()
-        assert torch.isfinite(bias.grad).all()
-        assert torch.count_nonzero(hidden.grad[0, 1]) == 0
+    torch.testing.assert_close(actual[0], expected[0], rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(actual[1][:, :1], expected[1], rtol=1e-5, atol=1e-7)
+    assert torch.count_nonzero(actual[1][:, 1:]) == 0
+    torch.testing.assert_close(actual[2], expected[2], rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(actual[3], expected[3], rtol=1e-5, atol=1e-7)
+    assert all(torch.isfinite(tensor).all() for tensor in actual)
 
 
-def test_compute_dft_custom_ignore_index_is_safe_for_out_of_vocab_label():
-    torch = pytest.importorskip("torch")
+def test_fused_dft_all_ignored_returns_connected_zero(fused_losses):
+    torch.manual_seed(0)
+    hidden = torch.randn(1, 4, 3, dtype=torch.float64)
+    weight = torch.randn(6, 3, dtype=torch.float64)
+    bias = torch.randn(6, dtype=torch.float64)
+    labels = torch.full((1, 4), -100)
 
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
+    result = _run_wrapper(
+        fused_losses.unsloth_fused_dft_loss,
+        hidden,
+        weight,
+        bias,
+        labels,
+        torch_compile=False,
+        n_chunks=2,
+    )
 
-        hidden = torch.tensor([[[0.20, -0.10]]], dtype=torch.float64, requires_grad=True)
-        weight = torch.tensor([[0.30, 0.40], [-0.20, 0.10]], dtype=torch.float64, requires_grad=True)
-        bias = torch.tensor([0.05, -0.15], dtype=torch.float64, requires_grad=True)
-        labels = torch.tensor([[999]])
-
-        loss, aux = compute_fused_dft_loss(
-            hidden,
-            weight,
-            bias,
-            labels,
-            shift_labels=False,
-            ignore_index=999,
-        )
-        assert torch.isfinite(loss)
-        assert float(loss.detach()) == 0.0
-        assert float(aux[0].detach()) == 0.0
-        loss.backward()
-        assert torch.count_nonzero(hidden.grad) == 0
-        assert torch.count_nonzero(weight.grad) == 0
-        assert torch.count_nonzero(bias.grad) == 0
+    assert torch.isfinite(result[0])
+    assert float(result[0]) == 0.0
+    assert all(torch.count_nonzero(gradient) == 0 for gradient in result[1:])
 
 
-def test_compute_dft_shift_labels_false_accepts_noncontiguous_labels():
-    torch = pytest.importorskip("torch")
+@pytest.mark.parametrize("ce_first", [False, True], ids=["fresh-dft", "ce-first"])
+def test_fused_dft_compiled_matches_eager(fused_losses, ce_first):
+    if os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1":
+        pytest.skip("UNSLOTH_FUSED_CE_COMPILE_DISABLE=1 disables fused-loss compile")
+    _skip_if_compile_unavailable()
 
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float32)
+    eager = _run_wrapper(
+        fused_losses.unsloth_fused_dft_loss,
+        hidden,
+        weight,
+        bias,
+        labels,
+        torch_compile=False,
+        n_chunks=2,
+        shift_labels=False,
+    )
 
-        hidden = torch.tensor(
-            [
-                [[0.20, -0.10], [0.50, 0.30]],
-                [[-0.70, 0.40], [0.90, -0.20]],
-                [[0.10, 0.80], [-0.30, 0.60]],
-            ],
-            dtype=torch.float64,
-        )
-        weight = torch.tensor([[0.40, -0.30], [-0.20, 0.60], [0.70, 0.10]], dtype=torch.float64)
-        labels = torch.tensor([[0, 1, 2], [2, 1, 0]]).t()
-        assert not labels.is_contiguous()
-
-        loss, aux = compute_fused_dft_loss(hidden, weight, None, labels, shift_labels=False)
-        expected, expected_aux = compute_fused_dft_loss(
-            hidden,
-            weight,
-            None,
-            labels.contiguous(),
-            shift_labels=False,
-        )
-
-        assert torch.allclose(loss, expected, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(aux[0], expected_aux[0], rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-
-def test_compute_dft_n_items_int_and_tensor_override_valid_count_divisor():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = torch.tensor([[[0.10, 0.30], [-0.40, 0.20]]], dtype=torch.float64)
-        weight = torch.tensor([[0.20, -0.50], [0.60, 0.10], [-0.30, 0.40]], dtype=torch.float64)
-        labels = torch.tensor([[0, 2]])
-
-        default_loss, _ = compute_fused_dft_loss(hidden, weight, None, labels, shift_labels=False)
-        int_loss, _ = compute_fused_dft_loss(hidden, weight, None, labels, n_items=4, shift_labels=False)
-        tensor_loss, _ = compute_fused_dft_loss(
-            hidden,
-            weight,
-            None,
-            labels,
-            n_items=torch.tensor(4),
-            shift_labels=False,
-        )
-
-        assert torch.allclose(int_loss, default_loss / 2, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(tensor_loss, int_loss, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-
-def test_compute_dft_zero_n_items_uses_one_as_divisor():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30]]], dtype=torch.float64)
-        weight = torch.tensor([[0.10, 0.40], [-0.30, 0.20], [0.50, -0.60]], dtype=torch.float64)
-        labels = torch.tensor([[1, 2]])
-
-        default_loss, _ = compute_fused_dft_loss(hidden, weight, None, labels, shift_labels=False)
-        zero_divisor_loss, _ = compute_fused_dft_loss(
-            hidden,
-            weight,
-            None,
-            labels,
-            n_items=0,
-            shift_labels=False,
-        )
-
-        assert torch.isfinite(zero_divisor_loss)
-        assert torch.allclose(zero_divisor_loss, default_loss * 2, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-
-def test_compute_dft_logit_transforms_apply_in_implemented_order():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = torch.tensor([[[3.25, -1.75], [0.50, 2.20]]], dtype=torch.float64, requires_grad=True)
-        weight = torch.tensor(
-            [[1.20, -0.70], [-1.50, 0.90], [0.30, 1.10]],
-            dtype=torch.float64,
-            requires_grad=True,
-        )
-        bias = torch.tensor([0.20, -0.30, 0.40], dtype=torch.float64, requires_grad=True)
-        labels = torch.tensor([[0, 2]])
-        kwargs = dict(
-            logit_scale_multiply=1.7,
-            logit_scale_divide=0.8,
-            logit_softcapping=2.25,
-        )
-
-        ref_hidden = _clone_leaf(hidden)
-        ref_weight = _clone_leaf(weight)
-        ref_bias = _clone_leaf(bias)
-        reference_loss = _reference_dft_loss(
-            torch,
-            ref_hidden,
-            ref_weight,
-            ref_bias,
-            labels,
-            **kwargs,
-        )
-        actual_loss, _ = compute_fused_dft_loss(hidden, weight, bias, labels, shift_labels=False, **kwargs)
-
-        assert torch.allclose(actual_loss, reference_loss, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        actual_loss.backward()
-        reference_loss.backward()
-        assert torch.allclose(hidden.grad, ref_hidden.grad, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(weight.grad, ref_weight.grad, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-        assert torch.allclose(bias.grad, ref_bias.grad, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-        no_transform_loss, _ = compute_fused_dft_loss(
-            hidden.detach(),
-            weight.detach(),
-            bias.detach(),
-            labels,
-            shift_labels=False,
-        )
-        zero_transform_loss, _ = compute_fused_dft_loss(
-            hidden.detach(),
-            weight.detach(),
-            bias.detach(),
-            labels,
-            shift_labels=False,
-            logit_scale_multiply=0,
-            logit_scale_divide=0,
-            logit_softcapping=0,
-        )
-        assert torch.allclose(zero_transform_loss, no_transform_loss, rtol=DIRECT_RTOL, atol=DIRECT_ATOL)
-
-
-def test_compute_dft_rejects_label_smoothing():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-
-        hidden = torch.randn(1, 1, 2, dtype=torch.float64)
-        weight = torch.randn(3, 2, dtype=torch.float64)
-        labels = torch.tensor([[0]])
-
-        with pytest.raises(ValueError, match="label_smoothing"):
-            compute_fused_dft_loss(
+    with _compile_flag_guard(fused_losses):
+        if ce_first:
+            _run_wrapper(
+                fused_losses.unsloth_fused_ce_loss,
                 hidden,
                 weight,
-                None,
+                bias,
                 labels,
+                torch_compile=True,
+                n_chunks=2,
+                shift_labels=False,
+            )
+            assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is True
+            assert (
+                fused_losses.compute_fused_ce_loss
+                in fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN
+            )
+
+        compiled = _run_wrapper(
+            fused_losses.unsloth_fused_dft_loss,
+            hidden,
+            weight,
+            bias,
+            labels,
+            torch_compile=True,
+            n_chunks=2,
+            shift_labels=False,
+        )
+        assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is True
+        assert (
+            fused_losses.compute_fused_dft_loss
+            in fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN
+        )
+
+    _assert_result_close(compiled, eager)
+
+
+def test_fused_dft_rejects_label_smoothing_without_poisoning_compile(fused_losses):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float32)
+
+    with pytest.raises(ValueError, match="label_smoothing"):
+        fused_losses.compute_fused_dft_loss(
+            hidden,
+            weight,
+            bias,
+            labels,
+            shift_labels=False,
+            label_smoothing=0.1,
+        )
+
+    with _compile_flag_guard(fused_losses):
+        with pytest.raises(ValueError, match="label_smoothing"):
+            fused_losses.unsloth_fused_dft_loss(
+                trainer=None,
+                hidden_states=hidden,
+                lm_head_weight=weight,
+                lm_head_bias=bias,
+                labels=labels,
+                torch_compile=True,
+                n_chunks=2,
                 shift_labels=False,
                 label_smoothing=0.1,
             )
-
-
-def test_unsloth_fused_dft_matches_compute_for_preshifted_one_chunk():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch)
-        wrapper = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=1,
-            shift_labels=False,
-        )
-        direct = _run_direct(
-            torch,
-            compute_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            shift_labels=False,
-        )
-
-        _assert_wrapper_results_close(torch, wrapper, direct)
-
-
-def test_unsloth_fused_dft_chunking_invariant_value_and_gradients():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch)
-        baseline = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=1,
-            shift_labels=False,
-        )
-
-        for n_chunks in (2, 20):
-            chunked = _run_wrapper(
-                torch,
-                unsloth_fused_dft_loss,
-                hidden,
-                weight,
-                bias,
-                labels,
-                torch_compile=False,
-                n_chunks=n_chunks,
-                shift_labels=False,
-            )
-            _assert_wrapper_results_close(torch, chunked, baseline, message=f"n_chunks={n_chunks}")
-
-
-def test_unsloth_fused_dft_uses_shared_automatic_chunk_sizer(monkeypatch):
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        import unsloth_zoo.fused_losses.cross_entropy_loss as cross_entropy_loss
-
-        calls = []
-
-        def get_chunk_size(bsz, qlen, vocab_size, target_gb=None):
-            calls.append((bsz, qlen, vocab_size, target_gb))
-            return 2
-
-        monkeypatch.setattr(cross_entropy_loss, "get_chunk_size", get_chunk_size)
-        monkeypatch.setattr(cross_entropy_loss, "TARGET_GB", None)
-        monkeypatch.setattr(cross_entropy_loss, "N_CHUNKS", None)
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch)
-        automatic = _run_wrapper(
-            torch,
-            cross_entropy_loss.unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            shift_labels=False,
-        )
-        assert calls == [(2, 3, 5, None)]
-
-        calls.clear()
-        explicit = _run_wrapper(
-            torch,
-            cross_entropy_loss.unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-        assert calls == []
-        _assert_wrapper_results_close(torch, automatic, explicit)
-
-
-def test_unsloth_fused_dft_wrapper_uses_global_divisor_not_per_chunk():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30], [-0.70, 0.40], [0.90, -0.20]]], dtype=torch.float64)
-        weight = torch.tensor([[0.40, -0.30], [-0.20, 0.60], [0.70, 0.10]], dtype=torch.float64)
-        bias = torch.tensor([0.05, -0.10, 0.20], dtype=torch.float64)
-        labels = torch.tensor([[0, -100, 2, -100]])
-
-        loss, _, _, _ = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-
-        logits = _linear_logits(torch, hidden, weight, bias)
-        closed_form = _closed_form_dft(torch, logits, labels)
-        token_values = closed_form["token_values"]
-        global_loss = (token_values[0] + token_values[2]) / 2
-        per_chunk_bug_loss = token_values[0] + token_values[2]
-
-        assert torch.allclose(loss, global_loss, rtol=WRAPPER_RTOL, atol=WRAPPER_ATOL)
-        assert torch.abs(loss - per_chunk_bug_loss) > 1e-3
-
-
-def test_unsloth_fused_dft_overwrite_true_value_and_no_corruption():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch)
-        expected = _run_direct(
-            torch,
-            compute_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            shift_labels=False,
-        )
-        overwritten = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-            overwrite=True,
-        )
-
-        _assert_wrapper_results_close(torch, overwritten, expected)
-
-
-def test_unsloth_fused_dft_default_shift_masks_final_position():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30], [-0.70, 0.40], [0.90, -0.20]]], dtype=torch.float64)
-        weight = torch.tensor(
-            [[0.40, -0.30], [-0.20, 0.60], [0.70, 0.10], [-0.50, 0.20], [0.30, 0.80]],
-            dtype=torch.float64,
-        )
-        bias = torch.tensor([0.05, -0.10, 0.20, -0.15, 0.25], dtype=torch.float64)
-        labels = torch.tensor([[0, 1, 2, 3]])
-        labels_with_different_first_source = torch.tensor([[4, 1, 2, 3]])
-
-        baseline = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=1,
-        )
-        changed_first_label = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels_with_different_first_source,
-            torch_compile=False,
-            n_chunks=1,
-        )
-
-        _assert_wrapper_results_close(torch, changed_first_label, baseline)
-        assert torch.count_nonzero(baseline[1][0, -1]) == 0
-
-
-def test_unsloth_fused_dft_mask_applies_to_shifted_targets():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30], [-0.70, 0.40], [0.90, -0.20]]], dtype=torch.float64)
-        weight = torch.tensor([[0.40, -0.30], [-0.20, 0.60], [0.70, 0.10], [-0.50, 0.20]], dtype=torch.float64)
-        bias = torch.tensor([0.05, -0.10, 0.20, -0.15], dtype=torch.float64)
-        labels = torch.tensor([[0, 1, 2, 3]])
-        mask = torch.tensor([[1, 1, 0, 1]])
-        expected_preshifted_labels = torch.tensor([[1, -100, 3, -100]])
-
-        masked = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            mask=mask,
-            torch_compile=False,
-            n_chunks=1,
-        )
-        explicit = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            expected_preshifted_labels,
-            torch_compile=False,
-            n_chunks=1,
-            shift_labels=False,
-        )
-
-        _assert_wrapper_results_close(torch, masked, explicit)
-        assert torch.count_nonzero(masked[1][0, 1]) == 0
-
-
-def test_unsloth_fused_dft_shift_labels_false_uses_labels_as_targets():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import compute_fused_dft_loss
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden = torch.tensor([[[0.10, -0.20], [0.30, 0.40], [-0.50, 0.60]]], dtype=torch.float64)
-        weight = torch.tensor([[0.20, -0.10], [-0.40, 0.30], [0.50, 0.70]], dtype=torch.float64)
-        bias = torch.tensor([0.05, -0.15, 0.25], dtype=torch.float64)
-        labels = torch.tensor([[0, 1, 2]])
-
-        wrapper = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=1,
-            shift_labels=False,
-        )
-        direct = _run_direct(
-            torch,
-            compute_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            shift_labels=False,
-        )
-
-        _assert_wrapper_results_close(torch, wrapper, direct)
-        assert torch.count_nonzero(wrapper[1][0, -1]) > 0
-
-
-def test_unsloth_fused_dft_shift_labels_false_ignores_mask_by_contract():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch)
-        mask = torch.zeros_like(labels)
-
-        without_mask = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-        with_mask = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            mask=mask,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-
-        _assert_wrapper_results_close(torch, with_mask, without_mask)
-
-
-def test_unsloth_fused_dft_custom_ignore_index_through_wrapper():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden = torch.tensor([[[0.20, -0.10], [0.50, 0.30], [-0.70, 0.40]]], dtype=torch.float64)
-        weight = torch.tensor([[0.40, -0.30], [-0.20, 0.60], [0.70, 0.10]], dtype=torch.float64)
-        bias = torch.tensor([0.05, -0.10, 0.20], dtype=torch.float64)
-        labels = torch.tensor([[0, 999, 2]])
-
-        loss, hidden_grad, weight_grad, bias_grad = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=1,
-            ignore_index=999,
-        )
-
-        assert torch.isfinite(loss)
-        assert torch.count_nonzero(hidden_grad[0, 0]) == 0
-        assert torch.count_nonzero(hidden_grad[0, 1]) > 0
-        assert torch.isfinite(weight_grad).all()
-        assert torch.isfinite(bias_grad).all()
-
-
-def test_unsloth_fused_dft_scaling_nonzero_preserves_public_loss_and_gradients():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch)
-        unscaled = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-            scaling=None,
-        )
-        scaled = _run_wrapper(
-            torch,
-            unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-            scaling=7.0,
-        )
-
-        _assert_wrapper_results_close(torch, scaled, unscaled)
-
-
-def test_unsloth_fused_dft_all_ignored_returns_connected_zero():
-    torch = pytest.importorskip("torch")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        hidden = torch.randn(1, 4, 3, dtype=torch.float64, requires_grad=True)
-        weight = torch.randn(6, 3, dtype=torch.float64, requires_grad=True)
-        bias = torch.randn(6, dtype=torch.float64, requires_grad=True)
-        labels = torch.full((1, 4), -100)
-
-        loss = unsloth_fused_dft_loss(
-            trainer=None,
-            hidden_states=hidden,
-            lm_head_weight=weight,
-            lm_head_bias=bias,
-            labels=labels,
-            torch_compile=False,
-            n_chunks=2,
-        )
-        assert torch.isfinite(loss)
-        assert float(loss.detach()) == 0.0
-        loss.backward()
-        assert torch.count_nonzero(hidden.grad) == 0
-        assert torch.count_nonzero(weight.grad) == 0
-        assert torch.count_nonzero(bias.grad) == 0
-
-
-def test_unsloth_fused_dft_compiled_parity_and_probe_success():
-    torch = pytest.importorskip("torch")
-    _skip_if_compile_disabled()
-
-    with _lightweight_unsloth_zoo_import():
-        import unsloth_zoo.fused_losses.cross_entropy_loss as cross_entropy_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch, dtype=torch.float32)
-        eager = _run_wrapper(
-            torch,
-            cross_entropy_loss.unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-
-        with _compile_flag_guard(torch, cross_entropy_loss):
-            compiled = _run_wrapper(
-                torch,
-                cross_entropy_loss.unsloth_fused_dft_loss,
-                hidden,
-                weight,
-                bias,
-                labels,
-                torch_compile=True,
-                n_chunks=2,
-                shift_labels=False,
-            )
-            assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is True
-
-        _assert_wrapper_results_close(torch, compiled, eager)
-
-
-def test_unsloth_fused_dft_label_smoothing_raise_does_not_poison_compile_flag():
-    torch = pytest.importorskip("torch")
-    _skip_if_compile_disabled()
-
-    with _lightweight_unsloth_zoo_import():
-        import unsloth_zoo.fused_losses.cross_entropy_loss as cross_entropy_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch, dtype=torch.float32)
-
-        with _compile_flag_guard(torch, cross_entropy_loss):
-            with pytest.raises(ValueError, match="label_smoothing"):
-                cross_entropy_loss.unsloth_fused_dft_loss(
-                    trainer=None,
-                    hidden_states=hidden.detach().clone().requires_grad_(True),
-                    lm_head_weight=weight.detach().clone().requires_grad_(True),
-                    lm_head_bias=bias.detach().clone().requires_grad_(True),
-                    labels=labels.detach().clone(),
-                    torch_compile=True,
-                    n_chunks=2,
-                    shift_labels=False,
-                    label_smoothing=0.1,
-                )
-            assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is None
-
-
-def test_fused_ce_then_dft_compile_order():
-    torch = pytest.importorskip("torch")
-    _skip_if_compile_disabled()
-
-    with _lightweight_unsloth_zoo_import():
-        import unsloth_zoo.fused_losses.cross_entropy_loss as cross_entropy_loss
-
-        hidden, weight, bias, labels = _make_wrapper_inputs(torch, dtype=torch.float32)
-        eager_ce = _run_wrapper(
-            torch,
-            cross_entropy_loss.unsloth_fused_ce_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-        eager_dft = _run_wrapper(
-            torch,
-            cross_entropy_loss.unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=False,
-            n_chunks=2,
-            shift_labels=False,
-        )
-
-        with _compile_flag_guard(torch, cross_entropy_loss):
-            compiled_ce = _run_wrapper(
-                torch,
-                cross_entropy_loss.unsloth_fused_ce_loss,
-                hidden,
-                weight,
-                bias,
-                labels,
-                torch_compile=True,
-                n_chunks=2,
-                shift_labels=False,
-            )
-            assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is True
-
-            compiled_dft = _run_wrapper(
-                torch,
-                cross_entropy_loss.unsloth_fused_dft_loss,
-                hidden,
-                weight,
-                bias,
-                labels,
-                torch_compile=True,
-                n_chunks=2,
-                shift_labels=False,
-            )
-            assert cross_entropy_loss._FUSED_CE_COMPILE_SUPPORTED is True
-
-        _assert_wrapper_results_close(torch, compiled_ce, eager_ce, message="CE")
-        _assert_wrapper_results_close(torch, compiled_dft, eager_dft, message="DFT")
-
-
-def test_unsloth_fused_dft_exports_public_symbol():
-    pytest.importorskip("torch")
-    pytest.importorskip("triton")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses import unsloth_fused_dft_loss
-        from unsloth_zoo.loss_utils import unsloth_fused_dft_loss as exported
-
-        assert exported is unsloth_fused_dft_loss
-
-
-def test_unsloth_fused_dft_cuda_smoke():
-    torch = pytest.importorskip("torch")
-    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
-        pytest.skip("requires CUDA")
-
-    with _lightweight_unsloth_zoo_import():
-        from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_dft_loss
-
-        torch.manual_seed(1)
-        device = torch.device("cuda")
-        hidden = torch.randn(1, 6, 8, device=device, dtype=torch.float32, requires_grad=True)
-        weight = torch.randn(11, 8, device=device, dtype=torch.float32, requires_grad=True)
-        bias = torch.randn(11, device=device, dtype=torch.float32, requires_grad=True)
-        labels = torch.randint(0, 11, (1, 6), device=device)
-        labels[0, 3] = -100
-
-        ref_hidden = _clone_leaf(hidden)
-        ref_weight = _clone_leaf(weight)
-        ref_bias = _clone_leaf(bias)
-        loss = unsloth_fused_dft_loss(
-            trainer=None,
-            hidden_states=hidden,
-            lm_head_weight=weight,
-            lm_head_bias=bias,
-            labels=labels,
-            torch_compile=False,
-            n_chunks=2,
-        )
-        ref_loss = _reference_dft_loss(
-            torch,
-            ref_hidden,
-            ref_weight,
-            ref_bias,
-            labels,
-            shift_labels=True,
-        )
-
-        assert torch.allclose(loss, ref_loss, rtol=CUDA_RTOL, atol=CUDA_ATOL)
-        loss.backward()
-        ref_loss.backward()
-        assert torch.allclose(hidden.grad, ref_hidden.grad, rtol=CUDA_RTOL, atol=CUDA_ATOL)
-        assert torch.allclose(weight.grad, ref_weight.grad, rtol=CUDA_RTOL, atol=CUDA_ATOL)
-        assert torch.allclose(bias.grad, ref_bias.grad, rtol=CUDA_RTOL, atol=CUDA_ATOL)
+        assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is None
+        assert fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN == set()
