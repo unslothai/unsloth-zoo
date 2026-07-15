@@ -238,7 +238,8 @@ def _skip_if_compile_unavailable():
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-def test_fused_dft_matches_reference(fused_losses, device_name):
+@pytest.mark.parametrize("n_chunks", [1, 2, 20])
+def test_fused_dft_matches_reference(fused_losses, device_name, n_chunks):
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
@@ -253,9 +254,13 @@ def test_fused_dft_matches_reference(fused_losses, device_name):
     shifted_labels = _shift_labels(labels)
     valid_per_chunk = [
         int((chunk != -100).sum())
-        for chunk in torch.chunk(shifted_labels.reshape(-1), 2)
+        for chunk in torch.chunk(shifted_labels.reshape(-1), n_chunks)
     ]
-    assert valid_per_chunk == [1, 2]
+    assert valid_per_chunk == {
+        1: [3],
+        2: [1, 2],
+        20: [1, 0, 0, 1, 1, 0],
+    }[n_chunks]
 
     transforms = {
         "logit_scale_multiply": 1.7,
@@ -288,7 +293,7 @@ def test_fused_dft_matches_reference(fused_losses, device_name):
         bias,
         labels,
         torch_compile=False,
-        n_chunks=2,
+        n_chunks=n_chunks,
         scaling=7.0,
         **transforms,
     )
@@ -297,7 +302,8 @@ def test_fused_dft_matches_reference(fused_losses, device_name):
     _assert_result_close(chunked, expected, rtol=wrapper_rtol, atol=atol)
 
 
-def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses):
+@pytest.mark.parametrize("ignore_index", [-100, 999])
+def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses, ignore_index):
     max_float = torch.finfo(torch.float32).max
     hidden = torch.tensor(
         [[[0.20, -0.10], [max_float, max_float]]],
@@ -308,7 +314,7 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses):
         dtype=torch.float32,
     )
     bias = torch.tensor([0.10, -0.20, 0.30], dtype=torch.float32)
-    labels = torch.tensor([[1, -100]])
+    labels = torch.tensor([[1, ignore_index]])
     assert torch.isnan(torch.nn.functional.linear(hidden, weight, bias)[0, 1]).any()
 
     actual = _run_direct(
@@ -318,6 +324,7 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses):
         bias,
         labels,
         shift_labels=False,
+        ignore_index=ignore_index,
         logit_softcapping=1.0,
     )
     expected = _run_reference(
@@ -326,6 +333,7 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses):
         bias,
         labels[:, :1],
         shift_labels=False,
+        ignore_index=ignore_index,
         logit_softcapping=1.0,
     )
 
@@ -335,6 +343,33 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses):
     torch.testing.assert_close(actual[2], expected[2], rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(actual[3], expected[3], rtol=1e-5, atol=1e-7)
     assert all(torch.isfinite(tensor).all() for tensor in actual)
+
+
+@pytest.mark.parametrize(
+    "loss_name", ["unsloth_fused_ce_loss", "unsloth_fused_dft_loss"]
+)
+def test_fused_loss_mask_applies_to_shifted_targets(fused_losses, loss_name):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float64)
+    labels = labels.masked_fill(labels == -100, 2)
+    mask = torch.tensor([[1, 1, 0], [1, 0, 1]])
+    expected_labels = torch.tensor([[1, -100, -100], [-100, 4, -100]])
+    loss_fn = getattr(fused_losses, loss_name)
+
+    masked = _run_wrapper(
+        loss_fn, hidden, weight, bias, labels, mask=mask, torch_compile=False, n_chunks=2
+    )
+    explicit = _run_wrapper(
+        loss_fn,
+        hidden,
+        weight,
+        bias,
+        expected_labels,
+        shift_labels=False,
+        torch_compile=False,
+        n_chunks=2,
+    )
+
+    _assert_result_close(masked, explicit)
 
 
 def test_fused_dft_all_ignored_returns_connected_zero(fused_losses):
