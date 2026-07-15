@@ -3365,6 +3365,16 @@ def _ensure_reiterable_text_dataset(dataset):
 
 def _is_mlx_lazy_text_source(dataset):
     """Return whether streaming text must avoid map-style source operations."""
+    try:
+        from datasets import Dataset as HFDataset
+        from datasets import IterableDataset as HFIterableDataset
+    except ImportError:
+        pass
+    else:
+        if isinstance(dataset, HFIterableDataset):
+            return True
+        if isinstance(dataset, HFDataset):
+            return False
     if isinstance(dataset, Sequence):
         return False
     if isinstance(dataset, Iterator):
@@ -3374,7 +3384,14 @@ def _is_mlx_lazy_text_source(dataset):
 
 def _is_mlx_replayable_text_source(dataset):
     """Return whether a source can create a fresh iterator for another pass."""
-    return not isinstance(dataset, Iterator)
+    if isinstance(dataset, Iterator):
+        return False
+    try:
+        first = iter(dataset)
+        second = iter(dataset)
+    except TypeError:
+        return False
+    return first is not second
 
 
 def _labeled_row_has_supervision(labels, max_seq_length):
@@ -5191,7 +5208,15 @@ def _iter_lazy_tokenized_text_rows(
     state = {} if state is None else state
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
 
-    def _validate_state(kind, labels):
+    if completion_only_loss is not None:
+        state.setdefault(
+            "pretokenized_completion_only_loss",
+            completion_only_loss,
+        )
+
+    def _validate_state(kind, labels, *, usable=True, completion_mode=False):
+        if not usable:
+            return
         if state.get("schema") is None:
             state["schema"] = kind
         elif state["schema"] != kind:
@@ -5199,6 +5224,10 @@ def _iter_lazy_tokenized_text_rows(
                 "Unsloth MLX: pretokenized text rows with 'input_ids' cannot "
                 "be mixed with rows that need text formatting/tokenization."
             )
+        state.setdefault(
+            "pretokenized_completion_only_loss",
+            completion_mode,
+        )
         has_labels = labels is not None
         if state.get("label_state") is None:
             state["label_state"] = has_labels
@@ -5209,6 +5238,16 @@ def _iter_lazy_tokenized_text_rows(
             )
 
     for item in dataset:
+        item_has_completion_boundary = (
+            isinstance(item, Mapping)
+            and "prompt" in item
+            and "completion" in item
+        )
+        formatter_needs_completion_boundary = (
+            formatting_func is not None
+            and completion_only_loss is None
+            and item_has_completion_boundary
+        )
         source_rows = item if (
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
         ) else [item]
@@ -5223,25 +5262,57 @@ def _iter_lazy_tokenized_text_rows(
             ) else [formatted]
 
         for row in source_rows:
+            row_has_completion_boundary = (
+                isinstance(row, Mapping)
+                and "prompt" in row
+                and "completion" in row
+            )
+            row_completion_only_loss = (
+                completion_only_loss
+                if completion_only_loss is not None
+                else True
+                if item_has_completion_boundary or row_has_completion_boundary
+                else state.get("pretokenized_completion_only_loss", False)
+            )
             tokenized = _tokenize_mlx_pretokenized_row(
                 row,
-                completion_only_loss=completion_only_loss,
+                completion_only_loss=row_completion_only_loss,
                 assistant_only_loss=assistant_only_loss,
             )
             if tokenized is not None:
                 ids, labels = tokenized
-                _validate_state("pretokenized", labels)
+                if formatter_needs_completion_boundary and labels is None:
+                    raise ValueError(
+                        "Unsloth MLX: a formatting_func was provided for a "
+                        "prompt/completion dataset, which drops the completion "
+                        "boundary needed for the default completion-only loss. "
+                        "Apply your formatting before passing the dataset, or set "
+                        "completion_only_loss=False."
+                    )
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
                     labels = (
                         labels[:max_seq_length] if labels is not None else None
                     )
-                if len(ids) >= 2 and _labeled_row_has_supervision(
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
-                ):
+                )
+                _validate_state(
+                    "pretokenized",
+                    labels,
+                    usable=usable,
+                    completion_mode=row_completion_only_loss,
+                )
+                if usable:
                     yield ids, labels
                 continue
 
+            if assistant_only_loss and not _is_mlx_sft_conversational_row(row):
+                raise ValueError(
+                    "You set `assistant_only_loss=True`, but the dataset is not "
+                    "conversational. This option is only supported for "
+                    "conversational datasets."
+                )
             labeled = None
             if completion_only_loss is not False or assistant_only_loss:
                 labeled = _tokenize_mlx_prompt_completion_row(
@@ -5256,13 +5327,19 @@ def _iter_lazy_tokenized_text_rows(
                     labeled = _tokenize_mlx_assistant_messages_row(tokenizer, row)
             if labeled is not None:
                 ids, labels = labeled
-                _validate_state("raw", labels)
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
                     labels = labels[:max_seq_length]
-                if len(ids) >= 2 and _labeled_row_has_supervision(
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
-                ):
+                )
+                _validate_state(
+                    "raw",
+                    labels,
+                    usable=usable,
+                    completion_mode=row_completion_only_loss,
+                )
+                if usable:
                     yield ids, labels
                 continue
             if assistant_only_loss:
@@ -5276,6 +5353,14 @@ def _iter_lazy_tokenized_text_rows(
                     "Unsloth MLX: text completion_only_loss=True requires "
                     "prompt/completion rows for streaming text training."
                 )
+            if formatter_needs_completion_boundary:
+                raise ValueError(
+                    "Unsloth MLX: a formatting_func was provided for a "
+                    "prompt/completion dataset, which drops the completion "
+                    "boundary needed for the default completion-only loss. "
+                    "Apply your formatting before passing the dataset, or set "
+                    "completion_only_loss=False."
+                )
 
             for text in collect_mlx_texts(
                 tokenizer,
@@ -5288,7 +5373,12 @@ def _iter_lazy_tokenized_text_rows(
                     ids.append(int(eos_id))
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
-                _validate_state("raw", None)
+                _validate_state(
+                    "raw",
+                    None,
+                    usable=len(ids) >= 2,
+                    completion_mode=row_completion_only_loss,
+                )
                 if len(ids) >= 2:
                     yield ids, None
 
@@ -5320,12 +5410,27 @@ def _iterate_lazy_text_training_batches(
     replayable = _is_mlx_replayable_text_source(dataset)
     state = {}
     epoch = 0
+
+    def _make_batch(local_items):
+        if state.get("schema") == "raw" and state.get("label_state") is False:
+            return _make_text_batch_from_items(
+                [ids for ids, _labels in local_items],
+                tokenizer,
+                max_seq_length,
+            )
+        return _create_tokenized_text_batch(
+            local_items,
+            max_seq_length,
+            pad_id=_mlx_text_pad_id(tokenizer),
+        )
+
     while True:
         set_epoch = getattr(dataset, "set_epoch", None)
         if replayable and callable(set_epoch):
             set_epoch(epoch)
 
         pending = []
+        padding_source = []
         yielded = False
         for row in _iter_lazy_tokenized_text_rows(
             dataset,
@@ -5338,6 +5443,8 @@ def _iterate_lazy_text_training_batches(
             max_seq_length=max_seq_length,
             state=state,
         ):
+            if len(padding_source) < global_batch_size:
+                padding_source.append(row)
             pending.append(row)
             if len(pending) < global_batch_size:
                 continue
@@ -5345,14 +5452,10 @@ def _iterate_lazy_text_training_batches(
                 pending,
                 batch_size,
                 comm_group=comm_group,
-                pad_source=pending,
+                pad_source=padding_source,
             )
             yielded = True
-            yield _create_tokenized_text_batch(
-                local_items,
-                max_seq_length,
-                pad_id=_mlx_text_pad_id(tokenizer),
-            )
+            yield _make_batch(local_items)
             pending = []
 
         if pending:
@@ -5360,14 +5463,10 @@ def _iterate_lazy_text_training_batches(
                 pending,
                 batch_size,
                 comm_group=comm_group,
-                pad_source=pending,
+                pad_source=padding_source,
             )
             yielded = True
-            yield _create_tokenized_text_batch(
-                local_items,
-                max_seq_length,
-                pad_id=_mlx_text_pad_id(tokenizer),
-            )
+            yield _make_batch(local_items)
         if not yielded:
             raise ValueError(
                 "Unsloth MLX: streaming text source produced no trainable rows."
@@ -5501,8 +5600,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              comm_group=None):
     """Streaming batch generator for MLX training.
 
-    Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
-    materializing all batches in memory at once. Useful for large datasets.
+    Map-style datasets retain the existing mlx-lm batching behavior. Unsized
+    text sources are normalized and tokenized incrementally in source order,
+    with only one distributed micro-batch retained at a time.
 
     Yields:
         (batch, lengths, labels) tuples — same format as create_batches.

@@ -196,6 +196,7 @@ from .utils import (
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
     _distributed_global_batch_size,
+    _is_mlx_replayable_text_source,
     _rank_slice_distributed_batch,
 )
 from .compile import (
@@ -600,7 +601,7 @@ class MLXTrainingConfig:
     compile_auto_tune: bool = True
     compile_trace: bool = True
     gradient_checkpointing: bool = True
-    streaming: bool = False  # Use streaming iterator instead of materializing batches
+    streaming: bool = False  # Lazily consume unsized text/VLM sources
     dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
     preserve_dataset_order: bool = False  # Match Unsloth CUDA SequentialSampler order
     memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
@@ -2714,14 +2715,25 @@ class MLXTrainer:
         # ordering the killed run would have produced.
         if _resume_step > 0 and batch_iter is not None:
             for _ in range(_resume_step * grad_accum):
+                fast_forward_error = None
                 try:
                     next(batch_iter)
                 except StopIteration:
-                    raise RuntimeError(
+                    fast_forward_error = RuntimeError(
                         f"Unsloth: streaming dataset exhausted while "
                         f"fast-forwarding to resume step {_resume_step}. "
                         f"Dataset may be shorter than the killed run consumed."
-                    ) from None
+                    )
+                except Exception as e:
+                    fast_forward_error = e
+                if distributed_world_size > 1:
+                    self._raise_distributed_failure(
+                        fast_forward_error is not None,
+                        "fast-forwarding training batch",
+                        fast_forward_error,
+                    )
+                elif fast_forward_error is not None:
+                    raise fast_forward_error
 
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""
@@ -3342,6 +3354,15 @@ class MLXTrainer:
         else:
             chat_tmpl = getattr(args, "chat_template", None)
             if args.streaming:
+                if (
+                    getattr(self, "_resume_from_checkpoint", None)
+                    and not _is_mlx_replayable_text_source(train_dataset)
+                ):
+                    raise RuntimeError(
+                        "Unsloth MLX: checkpoint resume requires a replayable "
+                        "iterable text source; a one-shot iterator cannot be "
+                        "fast-forwarded deterministically."
+                    )
                 text_dataset_order = (
                     "sequential"
                     if getattr(args, "preserve_dataset_order", False)

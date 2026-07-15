@@ -997,6 +997,121 @@ def test_pretokenized_streaming_preserves_supported_label_fields():
     assert masked[2].tolist() == [[-100, 5, 6]]
 
 
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        ([{"text": "1 2"}, {"input_ids": [3, 4]}], "cannot be mixed"),
+        (
+            [
+                {"input_ids": [1, 2], "labels": [-100, 2]},
+                {"input_ids": [3, 4]},
+            ],
+            "must not be mixed",
+        ),
+    ],
+)
+def test_text_streaming_rejects_incremental_schema_drift(rows, match):
+    batches = _streaming_text_batches(
+        iter(rows),
+        completion_only_loss=False,
+    )
+
+    next(batches)
+    with pytest.raises(ValueError, match=match):
+        next(batches)
+
+
+def test_hf_stream_replays_in_source_order_and_sets_epoch():
+    from datasets import IterableDataset
+
+    source = IterableDataset.from_generator(
+        lambda: iter([{"text": "1"}, {"prompt": "2", "completion": " 3"}])
+    )
+    epochs = []
+    original_set_epoch = source.set_epoch
+
+    def record_epoch(epoch):
+        epochs.append(epoch)
+        original_set_epoch(epoch)
+
+    source.set_epoch = record_epoch
+    batches = _streaming_text_batches(source)
+    first = _streaming_batch_signature(next(batches))
+
+    assert first == ([[2, 3]], [[0, 2]], [[-100, 3]])
+    assert _streaming_batch_signature(next(batches)) == first
+    assert epochs == [0, 1]
+
+
+def test_one_shot_stream_exhaustion_and_resume_are_actionable():
+    batches = _streaming_text_batches(
+        iter([{"text": "1 2"}, {"text": "3 4"}]),
+        batch_size=2,
+        completion_only_loss=False,
+    )
+    next(batches)
+    with pytest.raises(RuntimeError, match="one-shot.*exhausted"):
+        next(batches)
+
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=2,
+        streaming=True,
+        dataset_order="sequential",
+    )
+    trainer.train_dataset = iter([{"text": "1 2"}, {"text": "3 4"}])
+    trainer._resume_from_checkpoint = "checkpoint-1"
+    _, resumed = MLXTrainer._prepare_data(trainer, is_vlm=False)
+    with pytest.raises(RuntimeError, match="replayable iterable"):
+        next(resumed)
+
+
+def test_hf_stream_resume_fast_forward_matches_uninterrupted_order():
+    from datasets import IterableDataset
+
+    def make_trainer(resume=False):
+        MLXTrainer, trainer = _make_mlx_text_trainer(
+            max_steps=3,
+            streaming=True,
+            dataset_order="sequential",
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=2,
+        )
+        trainer.tokenizer = _streaming_text_tokenizer()
+        trainer.train_dataset = IterableDataset.from_generator(
+            lambda: (
+                {"text": f"{value} {value + 10}"}
+                for value in range(1, 6)
+            )
+        ).shuffle(seed=17, buffer_size=3)
+        trainer._resume_from_checkpoint = "checkpoint-2" if resume else None
+        return MLXTrainer, trainer
+
+    MLXTrainer, uninterrupted = make_trainer()
+    _, batches = MLXTrainer._prepare_data(uninterrupted, is_vlm=False)
+    expected = [next(batches) for _ in range(5)][-1]
+
+    MLXTrainer, resumed = make_trainer(resume=True)
+    _, batches = MLXTrainer._prepare_data(resumed, is_vlm=False)
+    for _ in range(4):
+        next(batches)
+    actual = next(batches)
+
+    assert _streaming_batch_signature(actual) == _streaming_batch_signature(expected)
+
+
+def test_unsized_stream_rejects_randperm_before_consumption():
+    pulls = 0
+
+    def rows():
+        nonlocal pulls
+        pulls += 1
+        yield {"text": "1 2"}
+
+    with pytest.raises(ValueError, match="torch_randperm.*unsized"):
+        next(_streaming_text_batches(rows(), dataset_order="torch_randperm"))
+    assert pulls == 0
+
+
 def test_text_pretokenized_create_batches_preserves_input_ids():
     from unsloth_zoo.mlx.utils import create_batches
 

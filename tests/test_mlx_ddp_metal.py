@@ -30,7 +30,8 @@ def test_mlx_launch_ordered_text_batches_are_rank_sharded(tmp_path):
         pytest.skip("mlx.launch not found beside current Python executable")
 
     script = tmp_path / "ddp_batch_probe.py"
-    script.write_text("""import json, sys
+    script.write_text("""#!/usr/bin/env python3
+import json, sys
 from pathlib import Path
 
 import mlx.core as mx
@@ -386,13 +387,14 @@ payload = {
 Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
 """,
         encoding="utf-8")
+    script.chmod(script.stat().st_mode | 0o111)
 
     env = os.environ.copy()
     repo_root = Path(__file__).resolve().parents[1]
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [
         str(launcher), "-n", "2", "--backend", "ring",
-        "--python", sys.executable, "--cwd", str(repo_root),
+        "--cwd", str(repo_root),
         str(script), str(tmp_path),
     ]
     proc = subprocess.run(
@@ -492,5 +494,5 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["vlm_empty_eval"][1]["ids"][0][1] == 20
     assert ranks[1]["vlm_empty_eval"][1]["mask"][0] == [1, 1, 1, 1]
     assert all(value == -100 for value in ranks[1]["vlm_empty_eval"][1]["labels"][0])
-    assert [rank["stream_text"] for rank in ranks] == expected_stream
+    assert [rank["stream_text"] for rank in ranks] == expected
     assert [rank["stream_vlm"] for rank in ranks] == expected_stream
