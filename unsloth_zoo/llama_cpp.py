@@ -2244,6 +2244,34 @@ def _reinstall_converter_deps(python_exe, print_output = False):
     return result
 
 
+def _has_mtp_weight_tensors(input_folder, num_layers):
+    """True if the checkpoint actually carries MTP / nextn weights: the raw
+    `mtp.*` / `model.mtp.*` layout, or a decoder layer at index >= num_layers
+    (the layout a transformers merge writes). Reads only weight-map / header
+    names, never tensor data."""
+    _layer_re = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
+
+    def _is_mtp(name):
+        if name.startswith(("mtp.", "model.mtp.")):
+            return True
+        m = _layer_re.match(name)
+        return m is not None and int(m.group(1)) >= num_layers
+
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(input_folder, index_name)
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding = "utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            return any(_is_mtp(n) for n in weight_map)
+
+    single = os.path.join(input_folder, "model.safetensors")
+    if os.path.exists(single):
+        from safetensors import safe_open
+        with safe_open(single, framework = "pt") as f:
+            return any(_is_mtp(n) for n in f.keys())
+    return False
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2276,15 +2304,31 @@ def convert_to_gguf(
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
 
-    # Strip MTP / nextn config keys so the downstream convert_hf_to_gguf.py
-    # doesn't inflate block_count / inject nextn_predict_layers.
+    # Reconcile the Qwen3.5/3.6 MTP config to the actual weights. `unsloth_fixed_mtp`
+    # is an internal marker and always goes. `mtp_num_hidden_layers` we keep only
+    # when the merged weights still carry the MTP layer, so the converter's nextn
+    # path maps them (block_count += mtp, emits blk.N.nextn.*). We strip it when the
+    # weights lack the layer (an MLX merge, or a transformers build that drops the
+    # head), otherwise the converter is sized for a layer that isn't there and
+    # crashes on "Can not map tensor 'model.layers.N.eh_proj.weight'" (or errors on
+    # a missing tensor). Only Qwen3.5/3.6 set this key; GLM and other nextn arches
+    # use their own and are untouched.
+    _tc = config_file.get("text_config") or {}
+    _mtp_declared = "mtp_num_hidden_layers" in config_file or "mtp_num_hidden_layers" in _tc
+    _num_layers = _tc.get("num_hidden_layers", config_file.get("num_hidden_layers"))
+    _keep_mtp = (
+        _mtp_declared
+        and _num_layers is not None
+        and _has_mtp_weight_tensors(input_folder, int(_num_layers))
+    )
+    _strip_keys = ("unsloth_fixed_mtp",) if _keep_mtp else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
     _changed = False
-    for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
-        if config_file.pop(_key, None) is not None:
-            _changed = True
-        _tc = config_file.get("text_config")
-        if _tc and _tc.pop(_key, None) is not None:
-            _changed = True
+    for _cfg in (config_file, config_file.get("text_config")):
+        if not _cfg:
+            continue
+        for _key in _strip_keys:
+            if _cfg.pop(_key, None) is not None:
+                _changed = True
     if _changed:
         with open(config_path, "w", encoding = "utf-8") as f:
             json.dump(config_file, f, indent = 2)
