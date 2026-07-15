@@ -172,28 +172,21 @@ class _AssistantMaskProcessor:
     )
 
     def __init__(self):
-        from tokenizers import Tokenizer
-        from tokenizers.models import WordLevel
-        from tokenizers.pre_tokenizers import WhitespaceSplit
+        from tokenizers import Tokenizer, models, pre_tokenizers
         from transformers import PreTrainedTokenizerFast
 
-        tokens = ["[UNK]", "[PAD]", "<system>", "</system>", "<user>", "</user>",
-                  "<assistant>", "</assistant>", "<tool>",
-                  "</tool>", "same", "answer", "policy", "tool", "<image>"]
+        tokens = ["[UNK]", "[PAD]", "<system>", "</system>", "<user>", "</user>", "<assistant>",
+                  "</assistant>", "<tool>", "</tool>", "same", "answer", "policy", "tool", "<image>"]
         self.vocab = {token: idx for idx, token in enumerate(tokens)}
-        backend = Tokenizer(WordLevel(self.vocab, unk_token="[UNK]"))
-        backend.pre_tokenizer = WhitespaceSplit()
+        backend = Tokenizer(models.WordLevel(self.vocab, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend,
             unk_token="[UNK]", pad_token="[PAD]", chat_template=self.chat_template)
-
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        return self.tokenizer.apply_chat_template(messages, chat_template=self.chat_template,
-            tokenize=tokenize, add_generation_prompt=add_generation_prompt)
+        self.apply_chat_template = self.tokenizer.apply_chat_template
 
     def __call__(self, text, **kwargs):
-        rows = [[item for token in self.tokenizer(
-            value, add_special_tokens=False,
-        )["input_ids"] for item in [token] * (3 if token == self.image_token_id else 1)]
+        rows = [[item for token in self.tokenizer(value, add_special_tokens=False)["input_ids"]
+                 for item in [token] * (3 if token == self.image_token_id else 1)]
                 for value in text]
         input_ids = np.asarray(rows, dtype=np.int32)
         return {"input_ids": input_ids, "attention_mask": np.ones_like(input_ids)}
@@ -268,11 +261,8 @@ def test_vlm_assistant_only_loss_rejects_final_turn_only_generation_mask():
 
 
 def test_vlm_assistant_only_loss_rejects_untrustworthy_inputs():
-    from unsloth_zoo.mlx.utils import (
-        _align_vlm_assistant_mask_row,
-        _collate_vlm_batch,
-        _tokenize_vlm_assistant_mask_rows,
-    )
+    from unsloth_zoo.mlx.utils import (_align_vlm_assistant_mask_row, _collate_vlm_batch,
+                                       _tokenize_vlm_assistant_mask_rows)
 
     messages = [_assistant_vlm_row()["messages"]]
     with pytest.raises(ValueError, match="generation"):
@@ -293,11 +283,10 @@ def test_vlm_assistant_only_loss_rejects_untrustworthy_inputs():
 
 def _assistant_vlm_row(text="same"):
     return {
-        "messages": [{"role": "user", "content": [
-            {"type": "image"}, {"type": "text", "text": text},
-        ]}, {"role": "assistant", "content": [
-            {"type": "text", "text": "answer"},
-        ]}],
+        "messages": [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+        ],
         "images": [object()],
     }
 
@@ -339,6 +328,50 @@ def test_vlm_response_mask_preserves_existing_labels_like_cuda():
     out = _apply_response_mask_to_vlm_batch(batch, mask_fn, ignore_token_ids=[0])
 
     assert out["labels"].tolist() == [[-100, 777, -100, -100]]
+
+
+@pytest.mark.parametrize(("source", "mask", "final", "attention", "side", "expected"), [
+        ([1, 2, 3], [0, 1, 1], [1, 2, 3, 0], [1, 1, 1, 0], "right", [0, 1, 1, 0]),
+        ([1, 2, 3], [0, 1, 1], [0, 1, 2, 3], [0, 1, 1, 1], "right", [0, 0, 1, 1]),
+        ([1, 2, 3, 4], [0, 0, 1, 1], [1, 2, 3], None, "right", [0, 0, 1]),
+        ([1, 2, 3, 4], [0, 0, 1, 1], [2, 3, 4], None, "left", [0, 1, 1]),
+        ([1, 200, 2], [0, 0, 1], [1, 200, 200, 2], None, "right", [0, 0, 0, 1]),
+])
+def test_vlm_assistant_mask_alignment_matrix(source, mask, final, attention, side, expected):
+    from unsloth_zoo.mlx.utils import _align_vlm_assistant_mask_row
+
+    assert _align_vlm_assistant_mask_row(
+        source, mask, final, attention, ignore_token_ids=[200],
+        truncation_side=side, max_seq_length=len(final)) == expected
+
+
+def test_vlm_assistant_labels_intersect_and_match_baseline_cce(monkeypatch):
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    batch = {"input_ids": mx.array([[1, 2, 3]]),
+             "attention_mask": mx.array([[1, 1, 1]]),
+             "labels": mx.array([[777, 888, -100]])}
+    batch["labels"] = mlx_utils._apply_vlm_assistant_label_masks(
+        batch, [([1, 2, 3], [0, 1, 1])], _FakeTokenizer(),
+    )
+
+    class Model:
+        def __call__(self, input_ids, **_kwargs): return mx.zeros((*input_ids.shape, 1000))
+        def get_input_embeddings(self, input_ids, *_args, **_kwargs): return mx.zeros((*input_ids.shape, 4))
+
+    seen = []
+    def cross_entropy(_logits, targets):
+        seen.append(targets)
+        return mx.zeros(targets.shape)
+
+    monkeypatch.setattr(mlx_utils.nn.losses, "cross_entropy", cross_entropy)
+    _, baseline_ntoks = mlx_utils.make_vlm_baseline_loss_fn(ignore_token_ids=[])(Model(), batch)
+    monkeypatch.setattr(mlx_utils, "_forward_text_hidden_states",
+                        lambda _model, inputs, **_kwargs: mx.zeros((*inputs.shape, 4)))
+    _, cce_targets, cce_ntoks = mlx_utils._vlm_cce_forward(Model(), batch, image_token_ids=[])
+    assert batch["labels"].tolist() == [[-100, 888, -100]]
+    assert seen[0].tolist() == mx.where(cce_targets == -100, 0, cce_targets).tolist()
+    assert int(baseline_ntoks.item()) == int(cce_ntoks.item())
 
 
 def test_vlm_response_mask_drops_fully_masked_rows():
