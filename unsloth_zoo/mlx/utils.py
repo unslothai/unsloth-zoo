@@ -6392,6 +6392,16 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
+    for namespace in (
+        "audio_tower.",
+        "vision_tower.",
+        "embed_audio.",
+        "embed_vision.",
+    ):
+        if name.startswith(namespace):
+            add(f"model.{name}")
+            break
+
     if name.startswith("thinker.vision_tower."):
         suffix = name[len("thinker.vision_tower."):]
         add(f"thinker.visual.{suffix}")
@@ -6418,6 +6428,8 @@ def _vlm_gguf_tensor_candidates(tensor):
         candidates.append(mx.transpose(tensor, (0, 4, 1, 2, 3)))
     elif len(shape) == 4:
         candidates.append(mx.transpose(tensor, (0, 3, 1, 2)))
+    elif len(shape) == 3:
+        candidates.append(mx.transpose(tensor, (0, 2, 1)))
 
     if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
         candidates.append(tensor - 1)
@@ -6429,7 +6441,7 @@ def _vlm_gguf_tensor_candidates(tensor):
 def _has_vlm_gguf_tensor_candidate(tensor):
     """Return whether a tensor shape can require HF-layout recovery."""
     shape = getattr(tensor, "shape", ())
-    if len(shape) in (4, 5):
+    if len(shape) in (3, 4, 5):
         return True
     if len(shape) == 1:
         dtype = getattr(tensor, "dtype", None)

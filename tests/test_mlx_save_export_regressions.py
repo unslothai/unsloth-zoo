@@ -563,6 +563,64 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
     monkeypatch.setattr(mutils.mx, "all", torch.all)
 
 
+@pytest.mark.parametrize(
+    ("mlx_name", "hf_name"),
+    [
+        (
+            "audio_tower.layers.0.feed_forward1.ffw_layer_1.input_max",
+            "model.audio_tower.layers.0.feed_forward1.ffw_layer_1.input_max",
+        ),
+        (
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
+        ),
+        ("embed_audio.weight", "model.embed_audio.weight"),
+        ("embed_vision.weight", "model.embed_vision.weight"),
+    ],
+)
+def test_vlm_gguf_candidates_prefer_canonical_model_namespace(mlx_name, hf_name):
+    import unsloth_zoo.mlx.utils as mutils
+
+    candidates = mutils._vlm_gguf_name_candidates(mlx_name)
+
+    assert candidates[0] == hf_name
+    assert candidates.index(hf_name) < candidates.index(mlx_name)
+
+
+def test_vlm_rewrite_restores_namespace_with_conv1d_layout(monkeypatch):
+    import torch
+    import unsloth_zoo.mlx.utils as mutils
+
+    _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils)
+
+    class StripNamespaceAndTransposeConv1d:
+        @staticmethod
+        def sanitize(weights):
+            sanitized = {}
+            for name, tensor in weights.items():
+                if name.startswith("model."):
+                    name = name[len("model."):]
+                if "depthwise_conv1d.weight" in name:
+                    tensor = mutils.mx.transpose(tensor, (0, 2, 1))
+                sanitized[name] = tensor
+            return sanitized
+
+    mlx_layout = torch.arange(2 * 3 * 4).reshape(2, 3, 4)
+    new_name, hf_layout, changed = mutils._rewrite_mlx_vlm_tensor_for_gguf(
+        "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight",
+        mlx_layout,
+        [(StripNamespaceAndTransposeConv1d, None)],
+    )
+
+    assert changed is True
+    assert new_name == "model.audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+    assert tuple(hf_layout.shape) == (2, 4, 3)
+    assert mutils._mlx_arrays_match(
+        mutils.mx.transpose(hf_layout, (0, 2, 1)),
+        mlx_layout,
+    )
+
+
 def test_vlm_rewrite_prefers_hf_alias_before_current_name(monkeypatch):
     import torch
     import unsloth_zoo.mlx.utils as mutils
