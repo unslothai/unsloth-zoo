@@ -260,8 +260,74 @@ def test_vlm_assistant_only_loss_rejects_final_turn_only_generation_mask():
             ignore_token_ids=[processor.image_token_id], assistant_only_loss=True)
 
 
+def test_vlm_assistant_only_loss_rejects_non_assistant_generation_mask():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    processor = _AssistantMaskProcessor()
+    processor.chat_template = processor.chat_template.replace("m.role == 'assistant'", "true")
+    processor.tokenizer.chat_template = processor.chat_template
+    with pytest.raises(RuntimeError, match="only assistant"):
+        _collate_vlm_batch([_assistant_vlm_row()], processor, max_seq_length=32,
+            image_size=16, ignore_token_ids=[processor.image_token_id], assistant_only_loss=True)
+
+
+def test_vlm_assistant_only_loss_rejects_unsupported_assistant_fields():
+    from unsloth_zoo.mlx.utils import _tokenize_vlm_assistant_mask_rows
+
+    messages = _assistant_vlm_row()["messages"]
+    messages[1]["reasoning_content"] = "think"
+
+    with pytest.raises(ValueError, match="unsupported assistant message fields"):
+        _tokenize_vlm_assistant_mask_rows(_AssistantMaskProcessor(), [messages])
+
+    messages = _assistant_vlm_row()["messages"]
+    messages[1]["content"] = [{"type": "image", "caption": "same"}]
+    with pytest.raises(ValueError, match="unsupported assistant content"):
+        _tokenize_vlm_assistant_mask_rows(_AssistantMaskProcessor(), [messages])
+    processor = _AssistantMaskProcessor()
+    processor._unsloth_assistant_single_content = True
+    with pytest.raises(ValueError, match="unsupported assistant content"):
+        _tokenize_vlm_assistant_mask_rows(processor, [messages])
+
+
+def test_vlm_assistant_only_loss_rejects_partial_assistant_content_mask():
+    from unsloth_zoo.mlx.utils import _tokenize_vlm_assistant_mask_rows
+
+    processor = _AssistantMaskProcessor()
+    processor.chat_template = processor.chat_template.replace(
+        "{% generation %}{% for p in m.content %}", "{% for p in m.content %}",
+    ).replace(
+        "{{ '</' + m.role + '>' }}{% endgeneration %}",
+        "{% generation %}{{ '</' + m.role + '>' }}{% endgeneration %}",
+    )
+    processor.tokenizer.chat_template = processor.chat_template
+    with pytest.raises(RuntimeError, match="content span"):
+        _tokenize_vlm_assistant_mask_rows(
+            processor, [_assistant_vlm_row()["messages"]],
+        )
+
+
+def test_vlm_assistant_only_loss_rejects_adjacent_role_templates():
+    from unsloth_zoo.mlx.utils import _tokenize_vlm_assistant_mask_rows
+
+    row = _assistant_vlm_row()
+    processor = _AssistantMaskProcessor()
+    processor.chat_template = processor.chat_template.replace(
+        "{% endgeneration %}",
+        "{% if loop.nextitem is defined and loop.nextitem.role == 'tool' %}"
+        "{{ '<tool_response> ' }}{% endif %}{% endgeneration %}")
+    processor.tokenizer.chat_template = processor.chat_template
+    row["messages"] = [row["messages"][0], row["messages"][1],
+        {"role": "tool", "content": [{"type": "text", "text": "tool"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}]
+    with pytest.raises(RuntimeError, match="prefix-stable"):
+        _tokenize_vlm_assistant_mask_rows(processor, [row["messages"]])
+
+
 def test_vlm_assistant_only_loss_rejects_untrustworthy_inputs():
-    from unsloth_zoo.mlx.utils import (_align_vlm_assistant_mask_row, _collate_vlm_batch,
+    from unsloth_zoo.mlx.utils import (_align_vlm_assistant_mask_row, _as_vlm_token_rows,
+                                       _collate_vlm_batch,
+                                       _validate_mlx_assistant_mask,
                                        _tokenize_vlm_assistant_mask_rows)
 
     messages = [_assistant_vlm_row()["messages"]]
@@ -272,6 +338,15 @@ def test_vlm_assistant_only_loss_rejects_untrustworthy_inputs():
         "input_ids": [[1]] * len(rows)}
     with pytest.raises(RuntimeError, match="returned none"):
         _tokenize_vlm_assistant_mask_rows(processor, messages)
+    with pytest.raises(ValueError, match="0 or 1"):
+        _validate_mlx_assistant_mask([1], [2], source="test")
+    with pytest.raises(ValueError, match="0 or 1"):
+        _validate_mlx_assistant_mask(
+            [1], _as_vlm_token_rows(
+                [1.5], "assistant_masks", 1, coerce_int=False,
+            )[0],
+            source="test",
+        )
     with pytest.raises(ValueError, match="non-multimodal token"):
         _align_vlm_assistant_mask_row([1], [0], [2], None)
     with pytest.raises(ValueError, match="prompt/completion"):

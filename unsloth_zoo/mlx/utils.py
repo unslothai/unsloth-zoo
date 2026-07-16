@@ -31,7 +31,6 @@ import importlib
 import json
 import numpy as np
 import os
-import re
 import sys
 import shutil
 import tempfile
@@ -2924,7 +2923,11 @@ def _validate_mlx_assistant_mask(input_ids, assistant_mask, *, source):
         raise ValueError(
             f"Unsloth MLX: {source} assistant_masks must match input_ids length."
         )
-    if not any(int(mask) == 1 for mask in assistant_mask):
+    if any(mask not in (0, 1) for mask in assistant_mask):
+        raise ValueError(
+            f"Unsloth MLX: {source} assistant_masks must contain only 0 or 1."
+        )
+    if not any(mask == 1 for mask in assistant_mask):
         raise RuntimeError(
             "You're using `assistant_only_loss=True`, but at least one example has "
             "no assistant tokens. This usually means the tokenizer's chat template "
@@ -3788,7 +3791,7 @@ def _processor_vlm_inputs(
     raise first_error
 
 
-def _as_vlm_token_rows(value, field_name, expected_rows):
+def _as_vlm_token_rows(value, field_name, expected_rows, *, coerce_int=True):
     """Normalize one batched chat-template field to Python token rows."""
     if hasattr(value, "tolist"):
         value = value.tolist()
@@ -3807,16 +3810,224 @@ def _as_vlm_token_rows(value, field_name, expected_rows):
             raise ValueError(
                 f"Unsloth MLX VLM: chat-template {field_name} rows must be sequences."
             )
-        rows.append([int(token) for token in row])
+        rows.append([int(token) for token in row] if coerce_int else list(row))
     return rows
+
+
+def _as_vlm_offset_rows(value, expected_rows):
+    """Normalize fast-tokenizer offset mappings to batched Python rows."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    try:
+        if expected_rows == 1 and (
+            not value
+            or (value[0] and not isinstance(value[0][0], (list, tuple)))
+        ):
+            value = [value]
+        rows = [
+            [(int(start), int(end)) for start, end in row]
+            for row in value
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Unsloth MLX VLM: invalid fast-tokenizer offsets.") from exc
+    if len(rows) != expected_rows:
+        raise ValueError("Unsloth MLX VLM: offset row count must match input_ids.")
+    return rows
+
+
+def _annotate_vlm_content(messages, marker_root, row_index):
+    """Mark supported assistant content while preserving media by reference."""
+    annotated = []
+    spans = []
+    part_index = 0
+
+    def mark_text(value, message_index):
+        nonlocal part_index
+        text = str(value)
+        if not text.strip():
+            return text
+        key = f"{row_index}_{message_index}_{part_index}"
+        part_index += 1
+        start_marker = f"{marker_root}1_{key}__"
+        end_marker = f"{marker_root}2_{key}__"
+        spans.append((start_marker, end_marker))
+        return start_marker + text + end_marker
+
+    def unsupported_part():
+        return ValueError(
+            "Unsloth MLX VLM: unsupported assistant content; use one `text` field."
+        )
+
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise ValueError("Unsloth MLX VLM: messages must be mappings.")
+        if message.get("role") != "assistant":
+            annotated.append(message)
+            continue
+        extra_fields = set(message).difference(("role", "content"))
+        if extra_fields:
+            raise ValueError(
+                "Unsloth MLX VLM: unsupported assistant message fields outside "
+                "`role` and `content`."
+            )
+
+        cloned = dict(message)
+        content = message.get("content")
+        if isinstance(content, str):
+            cloned["content"] = mark_text(content, message_index)
+        elif isinstance(content, (list, tuple)):
+            cloned_parts = []
+            for part in content:
+                if isinstance(part, str):
+                    cloned_parts.append(mark_text(part, message_index))
+                    continue
+                if not isinstance(part, Mapping):
+                    raise ValueError(
+                        "Unsloth MLX VLM: VLM content parts must be strings or mappings."
+                    )
+                media_field = {
+                    "image": "image",
+                    "video": "video",
+                    "audio": "audio",
+                }.get(part.get("type"))
+                if media_field is not None:
+                    if set(part).difference(("type", media_field)):
+                        raise unsupported_part()
+                    cloned_parts.append(part)
+                    continue
+                text = part.get("text")
+                if (
+                    not isinstance(text, str)
+                    or set(part).difference(("type", "text"))
+                ):
+                    raise unsupported_part()
+                cloned_part = dict(part)
+                cloned_part["text"] = mark_text(text, message_index)
+                cloned_parts.append(cloned_part)
+            cloned["content"] = cloned_parts
+        else:
+            raise ValueError(
+                "Unsloth MLX VLM: unsupported message content; expected text or parts."
+            )
+        annotated.append(cloned)
+    return annotated, spans
+
+
+def _strip_vlm_content_markers(value, specs):
+    """Remove supported-content markers and return their character spans."""
+    occurrences = []
+    raw_spans = []
+    for start_marker, end_marker in specs:
+        start_count = value.count(start_marker)
+        end_count = value.count(end_marker)
+        if start_count == end_count == 0:
+            raise RuntimeError(
+                "Unsloth MLX VLM: could not prove every assistant content span."
+            )
+        if start_count != 1 or end_count != 1:
+            raise RuntimeError("Unsloth MLX VLM: content markers must render once.")
+        start_at = value.index(start_marker)
+        end_at = value.index(end_marker)
+        content_at = start_at + len(start_marker)
+        if end_at < content_at:
+            raise RuntimeError("Unsloth MLX VLM: content markers were reordered.")
+        occurrences.extend(((start_at, start_marker), (end_at, end_marker)))
+        raw_spans.append((content_at, end_at))
+
+    stripped = value
+    for position, marker in sorted(occurrences, reverse=True):
+        stripped = stripped[:position] + stripped[position + len(marker):]
+
+    def removed_before(position):
+        return sum(
+            len(marker) for marker_at, marker in occurrences
+            if marker_at < position
+        )
+
+    spans = [
+        (
+            start_at - removed_before(start_at),
+            end_at - removed_before(end_at),
+        )
+        for start_at, end_at in raw_spans
+    ]
+    return stripped, spans
+
+
+def _validate_vlm_prefix_assistant_mask(
+    rendered, annotated, content_specs, message_spans, offsets, assistant_mask,
+):
+    """Validate one full mask against prefix-stable message and content spans."""
+    annotated, content_spans = _strip_vlm_content_markers(
+        annotated, content_specs,
+    )
+    if annotated != rendered:
+        raise RuntimeError(
+            "Unsloth MLX VLM: assistant_only_loss=True could not map supported "
+            "content onto the tokenizer's full chat-template render."
+        )
+
+    valid_offsets = [
+        (token_index, token_start, token_end)
+        for token_index, (token_start, token_end) in enumerate(offsets)
+        if token_end > token_start
+    ]
+
+    def span_tokens(start_at, end_at):
+        return {
+            token_index
+            for token_index, token_start, token_end in valid_offsets
+            if token_start < end_at and token_end > start_at
+        }
+
+    assistant_message_tokens = []
+    allowed_mask_tokens = set()
+    non_assistant_tokens = set()
+    for role, start_at, end_at in message_spans:
+        token_positions = span_tokens(start_at, end_at)
+        if role == "assistant":
+            allowed_mask_tokens.update(token_positions)
+            assistant_message_tokens.append(token_positions)
+        else:
+            non_assistant_tokens.update(token_positions)
+
+    masked_tokens = {
+        index for index, value in enumerate(assistant_mask) if int(value) == 1
+    }
+    if (
+        not masked_tokens.issubset(allowed_mask_tokens)
+        or masked_tokens.intersection(non_assistant_tokens)
+    ):
+        raise RuntimeError(
+            "Unsloth MLX VLM: assistant_only_loss=True requires the active "
+            "chat template to mark only assistant-authored spans with "
+            "`{% generation %}` blocks."
+        )
+    if any(
+        not masked_tokens.intersection(token_positions)
+        for token_positions in assistant_message_tokens
+    ):
+        raise RuntimeError(
+            "Unsloth MLX VLM: assistant_only_loss=True requires the active "
+            "chat template to mark every assistant turn with `{% generation %}`."
+        )
+
+    for start_at, end_at in content_spans:
+        token_positions = span_tokens(start_at, end_at)
+        if (
+            not token_positions or not token_positions.issubset(masked_tokens)
+        ):
+            raise RuntimeError(
+                "Unsloth MLX VLM: assistant_only_loss=True requires the active "
+                "chat template to mark every rendered assistant content span "
+                "with `{% generation %}`."
+            )
 
 
 def _tokenize_vlm_assistant_mask_rows(processor, messages_batch):
     """Return unexpanded template token ids and generation masks per VLM row."""
     template = getattr(processor, "chat_template", None)
-    if not isinstance(template, str) or re.search(
-        r"\{%-?\s*generation\s*-?%\}", template,
-    ) is None:
+    if not isinstance(template, str):
         raise ValueError(
             "Unsloth MLX VLM: assistant_only_loss=True requires the active "
             "processor chat_template to mark assistant spans with "
@@ -3827,40 +4038,40 @@ def _tokenize_vlm_assistant_mask_rows(processor, messages_batch):
     if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
         raise ValueError(
             "Unsloth MLX VLM: assistant_only_loss=True requires a tokenizer "
-            "that supports apply_chat_template(..., return_assistant_tokens_mask=True)."
+            "that supports generation blocks through "
+            "apply_chat_template(..., return_assistant_tokens_mask=True)."
         )
 
     render_batch = []
-    turn_probe_batch = []
-    turn_probes = []
     accepts_list_content = _processor_accepts_assistant_list_content(processor)
+    marker_root = f"__3141592653589793238462643383279_{id(render_batch)}_"
+    while marker_root in repr(messages_batch) or marker_root in template:
+        marker_root += "_"
+    annotated_batch = []
+    content_spec_rows = []
     for row_index, messages in enumerate(messages_batch):
-        rendered_messages = (
-            messages
-            if accepts_list_content
-            else _collapse_vlm_assistant_content(messages)
+        annotated, specs = _annotate_vlm_content(
+            messages, marker_root, row_index,
         )
-        render_batch.append(rendered_messages)
-        assistant_positions = [
-            index for index, message in enumerate(rendered_messages)
-            if isinstance(message, Mapping) and message.get("role") == "assistant"
-        ]
-        if len(assistant_positions) > 1:
-            for position in assistant_positions:
-                before_index = None
-                if position > 0:
-                    before_index = len(turn_probe_batch)
-                    turn_probe_batch.append(rendered_messages[:position])
-                through_index = len(turn_probe_batch)
-                turn_probe_batch.append(rendered_messages[:position + 1])
-                turn_probes.append((row_index, before_index, through_index))
+        if not accepts_list_content:
+            messages = _collapse_vlm_assistant_content(messages)
+            annotated = _collapse_vlm_assistant_content(annotated)
+        render_batch.append(messages)
+        annotated_batch.append(annotated)
+        content_spec_rows.append(specs)
 
-    # Tokenize full rows and structured turn probes together so correctness does
-    # not add another chat-template processor pass.
-    template_batch = render_batch + turn_probe_batch
+    prefix_batch = []
+    prefix_ranges = []
+    for messages in render_batch:
+        start = len(prefix_batch)
+        prefix_batch.extend(
+            messages[:end] for end in range(1, len(messages))
+        )
+        prefix_ranges.append((start, len(prefix_batch)))
+
     try:
         processed = tokenizer.apply_chat_template(
-            template_batch,
+            render_batch,
             chat_template=template,
             tokenize=True,
             add_generation_prompt=False,
@@ -3868,6 +4079,7 @@ def _tokenize_vlm_assistant_mask_rows(processor, messages_batch):
             return_assistant_tokens_mask=True,
             padding=False,
             truncation=False,
+            tokenizer_kwargs={"return_offsets_mapping": True},
         )
     except Exception as exc:
         raise RuntimeError(
@@ -3882,51 +4094,86 @@ def _tokenize_vlm_assistant_mask_rows(processor, messages_batch):
             "masks, but the processor tokenizer returned none. Ensure the "
             "active chat template contains `{% generation %}` blocks."
         )
+    if "offset_mapping" not in processed:
+        raise RuntimeError(
+            "Unsloth MLX VLM: assistant_only_loss=True requires a fast "
+            "processor tokenizer that returns token offset mappings."
+        )
     input_rows = _as_vlm_token_rows(
-        processed["input_ids"], "input_ids", len(template_batch),
+        processed["input_ids"], "input_ids", len(render_batch),
     )
     mask_rows = _as_vlm_token_rows(
-        processed["assistant_masks"], "assistant_masks", len(template_batch),
+        processed["assistant_masks"], "assistant_masks", len(render_batch),
+        coerce_int=False,
     )
-    full_count = len(render_batch)
-    full_input_rows, probe_input_rows = input_rows[:full_count], input_rows[full_count:]
-    full_mask_rows, probe_mask_rows = mask_rows[:full_count], mask_rows[full_count:]
-    for input_ids, assistant_mask in zip(full_input_rows, full_mask_rows):
+    offset_rows = _as_vlm_offset_rows(
+        processed["offset_mapping"], len(render_batch),
+    )
+    for input_ids, assistant_mask, offsets in zip(input_rows, mask_rows, offset_rows):
         _validate_mlx_assistant_mask(
             input_ids, assistant_mask, source="VLM chat-template",
         )
-
-    def _matching_prefix_length(left, right):
-        length = 0
-        while length < min(len(left), len(right)) and left[length] == right[length]:
-            length += 1
-        return length
-
-    for row_index, before_index, through_index in turn_probes:
-        before_ids = [] if before_index is None else probe_input_rows[before_index]
-        through_ids = probe_input_rows[through_index]
-        through_mask = probe_mask_rows[through_index]
-        _validate_mlx_assistant_mask(
-            through_ids, through_mask, source="VLM assistant-turn probe",
-        )
-        turn_start = _matching_prefix_length(before_ids, through_ids)
-        turn_positions = [
-            index for index in range(turn_start, len(through_ids))
-            if through_mask[index] == 1
-        ]
-        full_prefix = _matching_prefix_length(
-            through_ids, full_input_rows[row_index],
-        )
-        if not turn_positions or any(
-            index >= full_prefix or full_mask_rows[row_index][index] != 1
-            for index in turn_positions
-        ):
-            raise RuntimeError(
-                "Unsloth MLX VLM: assistant_only_loss=True requires the active "
-                "chat template to mark every assistant turn with `{% generation %}`. "
-                "The template returned a partial or final-turn-only assistant mask."
+        if len(offsets) != len(input_ids):
+            raise ValueError(
+                "Unsloth MLX VLM: offset_mapping must match chat-template input_ids."
             )
-    return list(zip(full_input_rows, full_mask_rows))
+    mask_rows = [[int(mask) for mask in row] for row in mask_rows]
+
+    try:
+        render_values = tokenizer.apply_chat_template(
+            render_batch + annotated_batch + prefix_batch,
+            chat_template=template,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Unsloth MLX VLM: the processor tokenizer could not validate "
+            "assistant boundaries in prefix-stable chat-template renders."
+        ) from exc
+    if isinstance(render_values, str):
+        render_values = [render_values]
+    expected_renders = 2 * len(render_batch) + len(prefix_batch)
+    if (
+        not isinstance(render_values, (list, tuple))
+        or len(render_values) != expected_renders
+        or not all(isinstance(value, str) for value in render_values)
+    ):
+        raise RuntimeError(
+            "Unsloth MLX VLM: the processor tokenizer returned an unexpected "
+            "number of renders while validating assistant roles."
+        )
+
+    full_count = len(render_batch)
+    rendered_rows = render_values[:full_count]
+    annotated_rows = render_values[full_count:2 * full_count]
+    prefix_rows = render_values[2 * full_count:]
+    for row_index in range(len(render_batch)):
+        messages = render_batch[row_index]
+        start, end = prefix_ranges[row_index]
+        prefixes = list(prefix_rows[start:end]) + [rendered_rows[row_index]]
+        previous = ""
+        message_spans = []
+        for message_index, prefix in enumerate(prefixes):
+            if not prefix.startswith(previous):
+                raise RuntimeError(
+                    "Unsloth MLX VLM: assistant_only_loss=True requires a "
+                    "prefix-stable chat template; the rendered history changed "
+                    "when a later message was added."
+                )
+            role = str(messages[message_index].get("role", ""))
+            message_spans.append((role, len(previous), len(prefix)))
+            previous = prefix
+
+        _validate_vlm_prefix_assistant_mask(
+            rendered_rows[row_index],
+            annotated_rows[row_index],
+            content_spec_rows[row_index],
+            message_spans,
+            offset_rows[row_index],
+            mask_rows[row_index],
+        )
+    return list(zip(input_rows, mask_rows))
 
 
 def _align_vlm_assistant_mask_row(
