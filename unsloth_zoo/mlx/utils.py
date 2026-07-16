@@ -6392,15 +6392,10 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
-    for namespace in (
-        "audio_tower.",
-        "vision_tower.",
-        "embed_audio.",
-        "embed_vision.",
+    if name.startswith(
+        ("audio_tower.", "vision_tower.", "embed_audio.", "embed_vision.")
     ):
-        if name.startswith(namespace):
-            add(f"model.{name}")
-            break
+        add(f"model.{name}")
 
     if name.startswith("thinker.vision_tower."):
         suffix = name[len("thinker.vision_tower."):]
