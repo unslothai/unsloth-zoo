@@ -2245,29 +2245,74 @@ def _reinstall_converter_deps(python_exe, print_output = False):
 
 
 def _has_mtp_weight_tensors(input_folder, num_layers):
-    """True if the checkpoint carries MTP / nextn weights: the `mtp.*` /
-    `model.mtp.*` layout, or a decoder layer at index >= num_layers. Reads
-    only tensor names."""
+    """Return whether the checkpoint's tensor names include an MTP layer."""
+    input_folder = Path(input_folder)
     _layer_re = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
 
     def _is_mtp(name):
+        # Match the converter's TextModel.filter_tensors normalization.
+        name = name.replace("language_model.", "")
         if name.startswith(("mtp.", "model.mtp.")):
             return True
         m = _layer_re.match(name)
         return m is not None and int(m.group(1)) >= num_layers
 
-    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        index_path = os.path.join(input_folder, index_name)
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding = "utf-8") as f:
-                weight_map = json.load(f).get("weight_map", {})
-            return any(_is_mtp(n) for n in weight_map)
+    def _inspection_error(path):
+        return RuntimeError(
+            f"Unsloth: Could not inspect `{path.name}` for MTP tensors; "
+            "`config.json` was not changed."
+        )
 
-    single = os.path.join(input_folder, "model.safetensors")
-    if os.path.exists(single):
+    def _names_from_index(index_path):
+        try:
+            with index_path.open("r", encoding = "utf-8") as f:
+                index = json.load(f)
+        except Exception as error:
+            raise _inspection_error(index_path) from error
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            raise _inspection_error(index_path)
+        return weight_map.keys()
+
+    parts = sorted(input_folder.glob("model*.safetensors"))
+    if parts:
+        index_path = input_folder / "model.safetensors.index.json"
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
         from safetensors import safe_open
-        with safe_open(single, framework = "pt") as f:
-            return any(_is_mtp(n) for n in f.keys())
+
+        for part in parts:
+            try:
+                with safe_open(part, framework = "pt", device = "cpu") as f:
+                    if any(_is_mtp(name) for name in f.keys()):
+                        return True
+            except Exception as error:
+                raise _inspection_error(part) from error
+        return False
+
+    parts = sorted(input_folder.glob("pytorch_model*.bin"))
+    if parts:
+        index_path = input_folder / "pytorch_model.bin.index.json"
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        if torch is None:
+            raise RuntimeError("Unsloth: PyTorch is required to inspect `.bin` model weights.")
+        for part in parts:
+            try:
+                state_dict = torch.load(
+                    part,
+                    map_location = "cpu",
+                    mmap = True,
+                    weights_only = True,
+                )
+            except Exception as error:
+                raise _inspection_error(part) from error
+            if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+                state_dict = state_dict["state_dict"]
+            if not isinstance(state_dict, dict):
+                raise _inspection_error(part)
+            if any(_is_mtp(name) for name in state_dict):
+                return True
     return False
 
 
@@ -2308,21 +2353,33 @@ def convert_to_gguf(
     # tensor), and strip it when they don't (else it errors on the missing one).
     # `unsloth_fixed_mtp` is an internal marker, always dropped. Only Qwen3.5/3.6 set
     # these keys, so other arches are untouched.
-    _tc = config_file.get("text_config") or {}
+    _tc = config_file.get("text_config")
+    if not isinstance(_tc, dict):
+        _tc = {}
     _mtp_declared = "mtp_num_hidden_layers" in config_file or "mtp_num_hidden_layers" in _tc
     _num_layers = _tc.get("num_hidden_layers", config_file.get("num_hidden_layers"))
-    _keep_mtp = (
-        _mtp_declared
-        and _num_layers is not None
-        and _has_mtp_weight_tensors(input_folder, int(_num_layers))
+    if _mtp_declared and (
+        not isinstance(_num_layers, int)
+        or isinstance(_num_layers, bool)
+        or _num_layers <= 0
+    ):
+        raise ValueError(
+            "Unsloth: `num_hidden_layers` must be a positive integer to reconcile MTP tensors; "
+            "`config.json` was not changed."
+        )
+    _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
+    _strip_keys = (
+        ("unsloth_fixed_mtp",)
+        if _keep_mtp
+        else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
     )
-    _strip_keys = ("unsloth_fixed_mtp",) if _keep_mtp else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
     _changed = False
-    for _cfg in (config_file, config_file.get("text_config")):
+    for _cfg in (config_file, _tc):
         if not _cfg:
             continue
         for _key in _strip_keys:
-            if _cfg.pop(_key, None) is not None:
+            if _key in _cfg:
+                _cfg.pop(_key)
                 _changed = True
     if _changed:
         with open(config_path, "w", encoding = "utf-8") as f:

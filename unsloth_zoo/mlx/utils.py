@@ -7246,20 +7246,13 @@ def save_pretrained_gguf(
                     f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
                 )
 
-        # Strip MTP/nextn config keys so llama.cpp converter
-        # doesn't inflate block_count / inject nextn_predict_layers.
-        # Also restore architectures from the original HF config since
-        # mlx-vlm's save_config strips that key.
+        # Restore architectures from the original HF config since mlx-vlm's
+        # save_config strips that key. convert_to_gguf reconciles MTP metadata
+        # with the exported tensor names for every save path.
         _config_path = tmp_path / "config.json"
         if _config_path.exists():
             _cfg = json.loads(_config_path.read_text())
             _changed = False
-            for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
-                if _cfg.pop(_key, None) is not None:
-                    _changed = True
-                _tc = _cfg.get("text_config")
-                if _tc and _tc.pop(_key, None) is not None:
-                    _changed = True
             # Restore architectures from the original HF config
             if "architectures" not in _cfg:
                 _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
