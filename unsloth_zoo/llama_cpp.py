@@ -2479,6 +2479,16 @@ def convert_to_gguf(
 
     # Execute conversions
     for args, output_file, description in runs_to_do:
+        # Anchor the output to an absolute, writable directory. The --outfile above
+        # is a bare relative name, so the converter would otherwise write the GGUF
+        # into the process CWD. On Windows that CWD is frequently not writable (e.g.
+        # an app launched from a protected/install dir), so the final write failed
+        # with PermissionError [Errno 13] even though conversion fully succeeded.
+        # input_folder is always present and writable, so resolve relative outputs
+        # against it; callers already relocate the produced files to their final home.
+        if not os.path.isabs(output_file):
+            output_file = os.path.join(os.path.abspath(input_folder), output_file)
+            args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
         for key, value in args.items():
