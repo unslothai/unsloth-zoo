@@ -2245,10 +2245,9 @@ def _reinstall_converter_deps(python_exe, print_output = False):
 
 
 def _has_mtp_weight_tensors(input_folder, num_layers):
-    """True if the checkpoint actually carries MTP / nextn weights: the raw
-    `mtp.*` / `model.mtp.*` layout, or a decoder layer at index >= num_layers
-    (the layout a transformers merge writes). Reads only weight-map / header
-    names, never tensor data."""
+    """True if the checkpoint carries MTP / nextn weights: the `mtp.*` /
+    `model.mtp.*` layout, or a decoder layer at index >= num_layers. Reads
+    only tensor names."""
     _layer_re = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
 
     def _is_mtp(name):
@@ -2304,15 +2303,11 @@ def convert_to_gguf(
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
 
-    # Reconcile the Qwen3.5/3.6 MTP config to the actual weights. `unsloth_fixed_mtp`
-    # is an internal marker and always goes. `mtp_num_hidden_layers` we keep only
-    # when the merged weights still carry the MTP layer, so the converter's nextn
-    # path maps them (block_count += mtp, emits blk.N.nextn.*). We strip it when the
-    # weights lack the layer (an MLX merge, or a transformers build that drops the
-    # head), otherwise the converter is sized for a layer that isn't there and
-    # crashes on "Can not map tensor 'model.layers.N.eh_proj.weight'" (or errors on
-    # a missing tensor). Only Qwen3.5/3.6 set this key; GLM and other nextn arches
-    # use their own and are untouched.
+    # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
+    # only when the weights still carry the MTP layer (else it crashes on the extra
+    # tensor), and strip it when they don't (else it errors on the missing one).
+    # `unsloth_fixed_mtp` is an internal marker, always dropped. Only Qwen3.5/3.6 set
+    # these keys, so other arches are untouched.
     _tc = config_file.get("text_config") or {}
     _mtp_declared = "mtp_num_hidden_layers" in config_file or "mtp_num_hidden_layers" in _tc
     _num_layers = _tc.get("num_hidden_layers", config_file.get("num_hidden_layers"))
