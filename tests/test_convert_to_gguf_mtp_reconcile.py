@@ -81,6 +81,18 @@ def test_has_mtp_weight_tensors_reads_each_unindexed_safetensors_part(llama_cpp,
     assert llama_cpp._has_mtp_weight_tensors(tmp_path, 24) is True
 
 
+def test_has_mtp_weight_tensors_matches_converter_index_precedence(llama_cpp, tmp_path):
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    safetensors_torch.save_file(
+        {"model.layers.0.self_attn.q_proj.weight": torch.ones(1)},
+        tmp_path / "model.safetensors",
+    )
+    _write_index(tmp_path, "model.layers.24.eh_proj.weight")
+
+    assert llama_cpp._has_mtp_weight_tensors(tmp_path, 24) is True
+
+
 def _write_converter(path: Path) -> Path:
     converter = path / "fake_convert.py"
     converter.write_text(

@@ -2277,6 +2277,8 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     parts = sorted(input_folder.glob("model*.safetensors"))
     if parts:
         index_path = input_folder / "model.safetensors.index.json"
+        # llama.cpp gives the canonical index precedence whenever any
+        # safetensors part exists, including alongside model.safetensors.
         if index_path.is_file():
             return any(_is_mtp(name) for name in _names_from_index(index_path))
         from safetensors import safe_open
