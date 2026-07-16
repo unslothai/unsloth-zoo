@@ -112,7 +112,7 @@ def _cache_root():
 pass
 
 
-def _is_trusted_directory(path):
+def _is_trusted_directory(path, *, allow_missing = True):
     """Return whether an existing cache directory is safe to load from.
 
     A checksum stored next to a bundle only detects corruption; it cannot
@@ -128,16 +128,41 @@ def _is_trusted_directory(path):
     if path is None:
         return True
     try:
-        directory_stat = os.lstat(path)
-        if not stat.S_ISDIR(directory_stat.st_mode):
-            return False
         if os.name != "posix":
-            return True
-        if directory_stat.st_uid != os.geteuid():
-            return False
-        return (directory_stat.st_mode & 0o022) == 0
-    except FileNotFoundError:
-        return True
+            try:
+                directory_stat = os.lstat(path)
+            except FileNotFoundError:
+                return allow_missing
+            return stat.S_ISDIR(directory_stat.st_mode)
+
+        # Validate the full path, not only its leaf. A 0700 cache below a
+        # non-sticky group/world-writable parent can be renamed and replaced
+        # between this check and open(), defeating the leaf permission check.
+        target = os.path.abspath(os.fspath(path))
+        current = target
+        target_exists = False
+        while True:
+            try:
+                directory_stat = os.lstat(current)
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    return False
+                if current == target:
+                    target_exists = True
+                    if directory_stat.st_uid != os.geteuid():
+                        return False
+                writable_by_others = directory_stat.st_mode & 0o022
+                sticky_directory = directory_stat.st_mode & stat.S_ISVTX
+                if writable_by_others and not sticky_directory:
+                    return False
+            except FileNotFoundError:
+                pass
+
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+        return target_exists or allow_missing
     except Exception:
         return False
 pass
@@ -335,6 +360,18 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         atexit.register(megacache_save)
         _STATE["atexit_registered"] = True
 
+    # Missing paths are safe to create later, but never safe to read from.
+    # Revalidate both directories as existing immediately before opening the
+    # manifest so an attacker cannot win a create-after-check race under a
+    # sticky shared parent such as /tmp.
+    root = os.path.dirname(directory)
+    if not (
+        _is_trusted_directory(root, allow_missing = False)
+        and _is_trusted_directory(directory, allow_missing = False)
+    ):
+        _log(f"no trusted bundle for key {key} (will compile locally and save on exit)")
+        return False
+
     manifest, data = _read_disk_bundle(directory, manifest_path)
     if manifest is None:
         _log(f"no bundle for key {key} (will compile locally and save on exit)")
@@ -379,6 +416,15 @@ def megacache_save():
         directory, manifest_path = _bundle_paths(key)
         if manifest_path is None:
             return False
+        root = os.path.dirname(directory)
+        # Establish owned private directories before reading or deserializing
+        # any prior bundle. This closes the analogous race on the save path.
+        if not (
+            _ensure_private_directory(root)
+            and _ensure_private_directory(directory)
+        ):
+            _log("cache directory is not trusted; skipping save")
+            return False
         # Union semantics: fold the current on-disk bundle back into the
         # manager before serializing, so a run that exercised only part of a
         # warm bundle cannot narrow it (see _merge_recorded_artifacts).
@@ -395,13 +441,6 @@ def megacache_save():
             if hashlib.sha256(existing).hexdigest() == new_sha:
                 _log("bundle unchanged; skipping save")
                 return False
-        root = os.path.dirname(directory)
-        if not (
-            _ensure_private_directory(root)
-            and _ensure_private_directory(directory)
-        ):
-            _log("cache directory is not trusted; skipping save")
-            return False
         # The bundle file is content-addressed and the manifest names it, so
         # the (bundle, manifest) pair is consistent without a cross-file lock:
         # concurrent writers produce differently named bundles, the manifest

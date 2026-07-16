@@ -131,3 +131,152 @@ def test_megacache_creates_owner_only_cache_directories(monkeypatch, tmp_path):
     assert module.megacache_save() is True
     assert (root.stat().st_mode & 0o777) == 0o700
     assert (key_dir.stat().st_mode & 0o777) == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX symlink semantics")
+@pytest.mark.parametrize("unsafe_component", ("root", "key"))
+def test_megacache_does_not_load_through_directory_symlinks(
+    monkeypatch, tmp_path, unsafe_component
+):
+    module = _load_module()
+    real_root = tmp_path / "real-cache"
+    key_dir, _ = _seed_bundle(real_root)
+    real_root.chmod(0o700)
+    key_dir.chmod(0o700)
+
+    if unsafe_component == "root":
+        configured_root = tmp_path / "cache-link"
+        configured_root.symlink_to(real_root, target_is_directory = True)
+    else:
+        configured_root = tmp_path / "cache"
+        configured_root.mkdir(mode = 0o700)
+        (configured_root / "deadbeef").symlink_to(key_dir, target_is_directory = True)
+
+    loaded = []
+    _configure_load(monkeypatch, module, configured_root, loaded)
+
+    assert module.megacache_load("victim-model") is False
+    assert loaded == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX ownership")
+def test_megacache_rejects_directory_owned_by_another_user(monkeypatch, tmp_path):
+    module = _load_module()
+    directory = tmp_path / "cache"
+    directory.mkdir(mode = 0o700)
+    real_lstat = module.os.lstat
+    real_stat = real_lstat(directory)
+
+    monkeypatch.setattr(
+        module.os,
+        "lstat",
+        lambda path: types.SimpleNamespace(
+            st_mode = real_stat.st_mode,
+            st_uid = module.os.geteuid() + 1,
+        )
+        if Path(path) == directory
+        else real_lstat(path),
+    )
+
+    assert module._is_trusted_directory(directory) is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+@pytest.mark.parametrize("mode", (0o700, 0o750, 0o755))
+def test_megacache_accepts_owned_nonwritable_directory_modes(monkeypatch, tmp_path, mode):
+    module = _load_module()
+    directory = tmp_path / "cache"
+    directory.mkdir(mode = mode)
+    directory.chmod(mode)
+
+    assert module._is_trusted_directory(directory) is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+def test_megacache_rejects_nonsticky_writable_ancestor(monkeypatch, tmp_path):
+    module = _load_module()
+    shared = tmp_path / "shared"
+    directory = shared / "private-cache"
+    directory.mkdir(parents = True, mode = 0o700)
+    directory.chmod(0o700)
+    shared.chmod(0o770)
+
+    assert module._is_trusted_directory(directory) is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX sticky-directory semantics")
+def test_megacache_accepts_private_cache_below_sticky_temp_parent(monkeypatch, tmp_path):
+    module = _load_module()
+    sticky = tmp_path / "sticky"
+    directory = sticky / "private-cache"
+    directory.mkdir(parents = True, mode = 0o700)
+    directory.chmod(0o700)
+    sticky.chmod(0o1777)
+
+    assert module._is_trusted_directory(directory) is True
+
+
+def test_non_posix_load_still_requires_explicit_opt_in(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "mega_cache"
+    _seed_bundle(root)
+    loaded = []
+    _configure_load(monkeypatch, module, root, loaded)
+    monkeypatch.setattr(module.os, "name", "nt")
+
+    monkeypatch.delenv("UNSLOTH_MEGA_CACHE")
+    assert module.megacache_load("disabled-model") is False
+    assert loaded == []
+
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    assert module.megacache_load("trusted-model") is True
+    assert loaded != []
+
+
+def test_megacache_never_reads_a_missing_bundle_path(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "missing-cache"
+    loaded = []
+    _configure_load(monkeypatch, module, root, loaded)
+
+    def _unexpected_read(*_args, **_kwargs):
+        pytest.fail("missing cache path reached the artifact reader")
+
+    monkeypatch.setattr(module, "_read_disk_bundle", _unexpected_read)
+
+    assert module.megacache_load("cache-miss") is False
+    assert module._STATE["armed"] is True
+    assert loaded == []
+
+
+def test_megacache_save_secures_directories_before_existing_read(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "new-cache"
+    key_dir = root / "deadbeef"
+    data = b"locally generated artifact bundle"
+    read_observations = []
+
+    fake_torch = types.SimpleNamespace(
+        compiler = types.SimpleNamespace(
+            load_cache_artifacts = lambda bundle: {},
+            save_cache_artifacts = lambda: (data, {}),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE_DIR", str(root))
+    module._STATE["armed"] = True
+    module._STATE["loaded_key"] = "deadbeef"
+
+    def _observe_read(directory, manifest_path):
+        read_observations.append((Path(directory).is_dir(), Path(manifest_path).parent.is_dir()))
+        if os.name == "posix":
+            assert Path(directory).stat().st_mode & 0o777 == 0o700
+            assert Path(manifest_path).parent.stat().st_mode & 0o777 == 0o700
+        return None, None
+
+    monkeypatch.setattr(module, "_read_disk_bundle", _observe_read)
+
+    assert module.megacache_save() is True
+    assert read_observations == [(True, True)]
+    assert key_dir.is_dir()
