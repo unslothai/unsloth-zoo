@@ -9,9 +9,12 @@ lowercased, but callers may also provide canonical mixed-case IDs. Both the mode
 name and configured entries must therefore be normalized before comparison.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
+
+os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
 
 from unsloth_zoo.tokenizer_utils import fix_untrained_tokens
 
