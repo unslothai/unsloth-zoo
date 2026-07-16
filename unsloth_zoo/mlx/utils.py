@@ -6414,7 +6414,7 @@ def _vlm_gguf_name_candidates(name):
     return candidates
 
 
-def _vlm_gguf_tensor_candidates(tensor):
+def _vlm_gguf_tensor_candidates(name, tensor):
     """Yield HF-layout tensor candidates for an MLX VLM tensor."""
     candidates = []
     shape = getattr(tensor, "shape", ())
@@ -6423,7 +6423,7 @@ def _vlm_gguf_tensor_candidates(tensor):
         candidates.append(mx.transpose(tensor, (0, 4, 1, 2, 3)))
     elif len(shape) == 4:
         candidates.append(mx.transpose(tensor, (0, 3, 1, 2)))
-    elif len(shape) == 3:
+    elif len(shape) == 3 and "depthwise_conv1d.weight" in name:
         candidates.append(mx.transpose(tensor, (0, 2, 1)))
 
     if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
@@ -6433,10 +6433,12 @@ def _vlm_gguf_tensor_candidates(tensor):
     return candidates
 
 
-def _has_vlm_gguf_tensor_candidate(tensor):
+def _has_vlm_gguf_tensor_candidate(name, tensor):
     """Return whether a tensor shape can require HF-layout recovery."""
     shape = getattr(tensor, "shape", ())
-    if len(shape) in (3, 4, 5):
+    if len(shape) in (4, 5) or (
+        len(shape) == 3 and "depthwise_conv1d.weight" in name
+    ):
         return True
     if len(shape) == 1:
         dtype = getattr(tensor, "dtype", None)
@@ -6448,7 +6450,7 @@ def _has_vlm_gguf_rewrite_candidate(name, tensor):
     """Return whether a tensor can differ between mlx-vlm and GGUF layouts."""
     if any(candidate_name != name for candidate_name in _vlm_gguf_name_candidates(name)):
         return True
-    return _has_vlm_gguf_tensor_candidate(tensor)
+    return _has_vlm_gguf_tensor_candidate(name, tensor)
 
 
 def _mlx_arrays_match(actual, expected):
@@ -6488,7 +6490,7 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
         return name, tensor, False
 
     for candidate_name in _vlm_gguf_name_candidates(name):
-        for candidate_tensor in _vlm_gguf_tensor_candidates(tensor):
+        for candidate_tensor in _vlm_gguf_tensor_candidates(name, tensor):
             for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
                 sanitized = _apply_mlx_vlm_sanitizers(
                     pipeline,
