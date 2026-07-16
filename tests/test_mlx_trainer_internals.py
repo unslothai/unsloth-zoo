@@ -80,6 +80,7 @@ def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
 
 
 def test_finite_text_batch_plan_preserves_label_padding():
+    import mlx.core as mx
     from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
 
     plan = FiniteTextBatchPlan(
@@ -96,6 +97,95 @@ def test_finite_text_batch_plan_preserves_label_padding():
     assert batch.tolist() == [[1, 2, 3], [4, 5, 7]]
     assert lengths.tolist() == [[0, 3], [0, 2]]
     assert labels.tolist() == [[-100, 2, 3], [-100, 5, -100]]
+    assert labels.dtype == mx.int64
+
+
+def test_finite_text_training_plan_keeps_long_schedule_cpu_only():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (
+        FiniteTextBatchPlan,
+        _create_text_batch_plan,
+        create_batches,
+    )
+
+    dataset = [
+        {"input_ids": [1, 2]},
+        {"input_ids": [3, 4, 5]},
+        {"input_ids": [6, 7, 8, 9]},
+        {"input_ids": [10, 11, 12, 13, 14]},
+    ]
+    tokenizer = types.SimpleNamespace(pad_token_id=7)
+    plan = _create_text_batch_plan(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=16,
+        num_batches=120,
+        seed=11,
+        completion_only_loss=False,
+    )
+
+    assert isinstance(plan, FiniteTextBatchPlan)
+    assert len(plan) == 120
+    assert all(not isinstance(row.input_ids, mx.array) for row in plan.rows)
+    assert all(
+        isinstance(row_index, int)
+        for batch_indices in plan.schedule
+        for row_index in batch_indices
+    )
+
+    expected = create_batches(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=16,
+        num_batches=1,
+        seed=11,
+        completion_only_loss=False,
+    )[0]
+    actual = plan[0]
+    assert [value.tolist() if value is not None else None for value in actual] == [
+        value.tolist() if value is not None else None for value in expected
+    ]
+
+
+def test_response_masked_text_batches_can_remain_a_lazy_plan():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _create_labeled_batches
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan
+
+    tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        pad_token_id=7,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+
+    def mask_fn(batch):
+        ids = batch["input_ids"][0]
+        return {"labels": [[-100] + ids[1:]]}
+
+    kwargs = dict(
+        dataset=[{"text": "1 2"}, {"text": "3 4 5"}],
+        tokenizer=tokenizer,
+        mask_fn=mask_fn,
+        batch_size=2,
+        max_seq_length=64,
+        dataset_order="sequential",
+    )
+    plan = _create_labeled_batches(**kwargs, return_plan=True)
+    eager = _create_labeled_batches(**kwargs)[0]
+
+    assert isinstance(plan, FiniteTextBatchPlan)
+    assert plan.widths == (33,)
+    actual = plan[0]
+    assert [value.tolist() for value in actual] == [
+        value.tolist() for value in eager
+    ]
+    assert actual[2].dtype == mx.int32
+    assert eager[2].dtype == mx.int32
 
 
 # ---------------------------------------------------------------------------
@@ -1019,16 +1109,16 @@ def test_text_pretokenized_ordered_and_streaming_batches_emit_labels():
         assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
 
 
-def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeypatch):
+def test_text_prepare_data_passes_completion_only_loss_to_batch_plan(monkeypatch):
     from unsloth_zoo.mlx import trainer as mlx_trainer
 
     received = {}
 
-    def fake_create_batches(**kwargs):
+    def fake_create_plan(**kwargs):
         received.update(kwargs)
         return [("batch", "lengths", "labels")]
 
-    monkeypatch.setattr(mlx_trainer, "create_batches", fake_create_batches)
+    monkeypatch.setattr(mlx_trainer, "_create_text_batch_plan", fake_create_plan)
 
     MLXTrainer, trainer = _make_mlx_text_trainer(
         max_steps=1,

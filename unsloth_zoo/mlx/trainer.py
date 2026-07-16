@@ -168,6 +168,10 @@ from .utils import (
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
+    FiniteTextBatchPlan,
+    _FiniteTextRow,
+    _create_text_batch_plan,
+    _create_ordered_text_plan,
     create_batches,
     create_ordered_batches,
     iterate_training_batches,
@@ -3399,10 +3403,10 @@ class MLXTrainer:
                         batch_kwargs["num_epochs"] = args.num_train_epochs
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
-                    batches = create_ordered_batches(**batch_kwargs)
+                    batches = _create_ordered_text_plan(**batch_kwargs)
                 else:
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
-                    batches = create_batches(**batch_kwargs)
+                    batches = _create_text_batch_plan(**batch_kwargs)
                 return batches, None
 
     def save_model(self, output_dir=None):
@@ -3552,7 +3556,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             append_eos=True, dataset_order="default",
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
-                            comm_group=None, distributed_pad_mode="cycle"):
+                            comm_group=None, distributed_pad_mode="cycle",
+                            return_plan=False):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -3662,84 +3667,81 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             "'torch_randperm'."
         )
 
-    def _order_samples_for_epoch(items, epoch_idx):
+    def _order_indices_for_epoch(epoch_idx):
         if preserve_dataset_order or dataset_order == "sequential":
-            return list(items)
+            return list(range(len(all_items)))
         if dataset_order == "torch_randperm":
             from .utils import _torch_randperm_order, _normalize_seed
             # Reseed per epoch (matches `create_ordered_batches`). Normalize a
             # None seed first so seed=None does not raise on the int add.
             order = _torch_randperm_order(
-                len(items), _normalize_seed(seed) + epoch_idx
+                len(all_items), _normalize_seed(seed) + epoch_idx
             )
-            return [items[i] for i in order]
+            return order
         # legacy default: length-sort once
-        return sorted(items, key=lambda x: len(x[0]))
+        return sorted(range(len(all_items)), key=lambda i: len(all_items[i][0]))
 
     # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
         max(1, int(num_epochs)) if num_epochs is not None else 1
     )
     rng = random.Random(seed)
-    batches = []
+    schedule = []
+    widths = []
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     for epoch_idx in range(_n_epochs_materialize):
-        epoch_items = _order_samples_for_epoch(all_items, epoch_idx)
-        epoch_batches = []
-        for start in range(0, len(epoch_items), global_batch_size):
-            batch_items = epoch_items[start:start + global_batch_size]
-            batch_items = _rank_slice_distributed_batch(
-                batch_items,
+        epoch_order = _order_indices_for_epoch(epoch_idx)
+        epoch_schedule = []
+        for start in range(0, len(epoch_order), global_batch_size):
+            batch_indices = epoch_order[start:start + global_batch_size]
+            batch_indices = _rank_slice_distributed_batch(
+                batch_indices,
                 batch_size,
                 comm_group=comm_group,
-                pad_source=epoch_items,
+                pad_source=epoch_order,
                 pad_mode=distributed_pad_mode,
             )
-            if not batch_items:
+            if not batch_indices:
                 continue
-            valid_items = [item for item in batch_items if item is not None]
-            max_len = max((len(ids) for ids, _ in valid_items), default=2)
+            valid_indices = [i for i in batch_indices if i is not None]
+            max_len = max(
+                (len(all_items[i][0]) for i in valid_indices),
+                default=2,
+            )
             # +1 for autoregressive shift (mlx-lm iterate_batches parity).
             padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
             padded_len = min(padded_len, max_seq_length)
-
-            batch_ids = []
-            batch_labels = []
-            batch_lengths = []
-            for item in batch_items:
-                if item is None:
-                    batch_ids.append([pad_id] * padded_len)
-                    batch_labels.append([-100] * padded_len)
-                    batch_lengths.append([0, 0])
-                    continue
-                ids, lbls = item
-                L = min(len(ids), padded_len)
-                pad_len = padded_len - L
-                batch_ids.append(ids[:L] + [pad_id] * pad_len)
-                batch_labels.append(lbls[:L] + [-100] * pad_len)
-                # [start, end) matches loss masks in utils.py:360/:393/:429/:439.
-                batch_lengths.append([1, L])
-
-            epoch_batches.append((
-                mx.array(batch_ids),
-                mx.array(batch_lengths),
-                mx.array(batch_labels),
-            ))
+            epoch_schedule.append((tuple(batch_indices), padded_len))
 
         # 4. Legacy length-sort: shuffle batches so adjacent steps differ.
         if not _order_requested:
-            rng.shuffle(epoch_batches)
-        batches.extend(epoch_batches)
+            rng.shuffle(epoch_schedule)
+        for batch_indices, padded_len in epoch_schedule:
+            schedule.append(batch_indices)
+            widths.append(padded_len)
 
     # Limit if needed
-    if num_batches is not None and len(batches) > num_batches:
-        batches = batches[:num_batches]
+    if num_batches is not None and len(schedule) > num_batches:
+        schedule = schedule[:num_batches]
+        widths = widths[:num_batches]
 
-    # Evaluate all tensors
-    all_tensors = []
-    for batch_arr, lengths_arr, labels_arr in batches:
-        all_tensors.extend([batch_arr, lengths_arr, labels_arr])
-    mx.eval(all_tensors)
+    plan = FiniteTextBatchPlan(
+        tuple(
+            _FiniteTextRow(
+                tuple(int(token) for token in input_ids),
+                offset=1,
+                labels=tuple(int(label) for label in labels),
+            )
+            for input_ids, labels in all_items
+        ),
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=pad_id,
+        minimum_width=2,
+        widths=widths,
+        label_dtype="int32",
+    )
+    batches = plan if return_plan else plan.materialize_all()
 
     if return_dataset:
         return batches, _create_response_masked_dataset(all_items)
@@ -3770,10 +3772,24 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
     seen_bad = 0
     seen_good = 0
     checked = 0
-    for batch_ids, batch_lengths, batch_labels in batches:
-        labels_list = batch_labels.tolist()
+    if isinstance(batches, FiniteTextBatchPlan):
+        label_batches = (
+            (
+                (-100,)
+                if row_index is None
+                else batches.rows[int(row_index)].labels
+                for row_index in batch_indices
+            )
+            for batch_indices in batches.schedule
+        )
+    else:
+        label_batches = (
+            batch_labels.tolist()
+            for _batch_ids, _batch_lengths, batch_labels in batches
+        )
+    for labels_list in label_batches:
         for row in labels_list:
-            unique = set(row)
+            unique = set(row or ())
             if unique == {-100}:
                 seen_bad += 1
             else:
@@ -3993,6 +4009,7 @@ def train_on_responses_only(
             num_epochs=labeled_num_epochs,
             return_dataset=True,
             comm_group=comm_group,
+            return_plan=True,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
