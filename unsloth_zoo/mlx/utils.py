@@ -3380,11 +3380,14 @@ def _is_mlx_lazy_text_source(dataset):
     if isinstance(dataset, Iterator):
         return True
     source_mro = type(dataset).__mro__
+    # Explicit iteration wins over custom size/index methods: guarded streams
+    # may expose advisory or deliberately unusable map-style operations that
+    # must not be probed merely to decide whether streaming is safe.
     if any("__iter__" in cls.__dict__ for cls in source_mro):
         return True
     # Python's sequence-iteration fallback accepts __getitem__ without
-    # __iter__. Keep custom objects that also declare __len__ on the existing
-    # sized/map path; the no-length protocol must be consumed incrementally.
+    # __iter__. Preserve classes declaring both map-style protocols without
+    # probing either operation; getitem-only fallback iterables remain lazy.
     has_getitem = any("__getitem__" in cls.__dict__ for cls in source_mro)
     has_len = any("__len__" in cls.__dict__ for cls in source_mro)
     return has_getitem and not has_len
@@ -5212,6 +5215,8 @@ def _iter_lazy_tokenized_text_rows(
     """Normalize an unsized source one row at a time and lock its schema."""
     state = {} if state is None else state
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    saw_usable_this_pass = False
+    completion_labels_seen_this_pass = False
 
     if completion_only_loss is not None:
         state.setdefault(
@@ -5219,28 +5224,74 @@ def _iter_lazy_tokenized_text_rows(
             completion_only_loss,
         )
 
+    def _require_assistant_conversation(row):
+        if assistant_only_loss and not _is_mlx_sft_conversational_row(row):
+            raise ValueError(
+                "You set `assistant_only_loss=True`, but the dataset is not "
+                "conversational. This option is only supported for "
+                "conversational datasets."
+            )
+
     def _validate_state(kind, labels, *, usable=True, completion_mode=False):
-        if not usable:
-            return
-        if state.get("schema") is None:
-            state["schema"] = kind
-        elif state["schema"] != kind:
+        nonlocal saw_usable_this_pass, completion_labels_seen_this_pass
+        schema = state.get("schema")
+        has_labels = labels is not None
+        label_state = state.get("label_state")
+        validate_locked_state = usable or saw_usable_this_pass
+        if validate_locked_state and schema is not None and schema != kind:
             raise ValueError(
                 "Unsloth MLX: pretokenized text rows with 'input_ids' cannot "
                 "be mixed with rows that need text formatting/tokenization."
             )
-        state.setdefault(
-            "pretokenized_completion_only_loss",
-            completion_mode,
-        )
-        has_labels = labels is not None
-        if state.get("label_state") is None:
-            state["label_state"] = has_labels
-        elif state["label_state"] != has_labels:
+        if (
+            validate_locked_state
+            and label_state is not None
+            and label_state != has_labels
+        ):
             raise ValueError(
                 "Unsloth MLX: streaming text rows with labels or masks must "
                 "not be mixed with rows that do not provide labels."
             )
+        if completion_mode is True:
+            if has_labels:
+                completion_labels_seen_this_pass = True
+            elif completion_labels_seen_this_pass:
+                raise ValueError(
+                    "Unsloth MLX: streaming text rows with labels or masks must "
+                    "not be mixed with rows that do not provide labels."
+                )
+        if not usable:
+            return
+        if schema is None:
+            state["schema"] = kind
+        state.setdefault(
+            "pretokenized_completion_only_loss",
+            completion_mode,
+        )
+        if label_state is None:
+            state["label_state"] = has_labels
+        saw_usable_this_pass = True
+
+    def _resolve_completion_mode(item_has_boundary, row_has_boundary=False):
+        if completion_only_loss is not None:
+            return completion_only_loss
+        if "pretokenized_completion_only_loss" in state:
+            return state["pretokenized_completion_only_loss"]
+        if item_has_boundary or row_has_boundary:
+            state["pretokenized_completion_only_loss"] = True
+            return True
+        return False
+
+    def _filtered_label_observation(
+        completion_mode,
+        has_completion_boundary=False,
+    ):
+        # Empty label-owned rows have no token labels, but they also are not an
+        # unlabeled schema transition. A non-None sentinel preserves that fact.
+        label_owned = assistant_only_loss or (
+            completion_mode is True and has_completion_boundary
+        )
+        return () if label_owned else None
 
     for item in dataset:
         item_has_completion_boundary = (
@@ -5253,10 +5304,26 @@ def _iter_lazy_tokenized_text_rows(
         source_rows = item if (
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
         ) else [item]
-        if not any(
+        if not source_rows:
+            # Assistant-only validation applies to the original logical row
+            # before a formatter can replace it or produce side effects.
+            source_rows = [None]
+        source_has_input_ids = any(
             isinstance(row, Mapping) and "input_ids" in row
             for row in source_rows
-        ) and formatting_func is not None:
+        )
+        if (
+            assistant_only_loss
+            and formatting_func is not None
+            and "assistant_source_checked" not in state
+        ):
+            # Match the eager/SFT contract: validate the first original sample
+            # once, then validate every formatter result below. Pretokenized
+            # rows bypass the formatter and carry their own assistant metadata.
+            if not source_has_input_ids:
+                _require_assistant_conversation(item)
+            state["assistant_source_checked"] = True
+        if formatting_func is not None and not source_has_input_ids:
             formatted = formatting_func(item)
             formatter_applied = True
             formatter_needs_completion_boundary = (
@@ -5267,6 +5334,22 @@ def _iter_lazy_tokenized_text_rows(
                 isinstance(formatted, list)
                 and not _looks_like_mlx_chat_messages(formatted)
             ) else [formatted]
+        if not source_rows:
+            # An empty formatter list expands to zero rows, not one invalid
+            # row. Preserve only its schema/label observation, then continue.
+            row_completion_only_loss = _resolve_completion_mode(
+                item_has_completion_boundary
+            )
+            _validate_state(
+                "raw",
+                _filtered_label_observation(
+                    row_completion_only_loss,
+                    item_has_completion_boundary,
+                ),
+                usable=False,
+                completion_mode=row_completion_only_loss,
+            )
+            continue
 
         for row in source_rows:
             row_has_completion_boundary = (
@@ -5274,17 +5357,10 @@ def _iter_lazy_tokenized_text_rows(
                 and "prompt" in row
                 and "completion" in row
             )
-            if completion_only_loss is not None:
-                row_completion_only_loss = completion_only_loss
-            elif "pretokenized_completion_only_loss" in state:
-                row_completion_only_loss = state[
-                    "pretokenized_completion_only_loss"
-                ]
-            elif item_has_completion_boundary or row_has_completion_boundary:
-                row_completion_only_loss = True
-                state["pretokenized_completion_only_loss"] = True
-            else:
-                row_completion_only_loss = False
+            row_completion_only_loss = _resolve_completion_mode(
+                item_has_completion_boundary,
+                row_has_completion_boundary,
+            )
             tokenized = _tokenize_mlx_pretokenized_row(
                 row,
                 completion_only_loss=row_completion_only_loss,
@@ -5292,10 +5368,19 @@ def _iter_lazy_tokenized_text_rows(
             )
             if tokenized is not None:
                 ids, labels = tokenized
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                    labels = (
+                        labels[:max_seq_length] if labels is not None else None
+                    )
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                )
                 if (
                     formatter_applied
                     and row_completion_only_loss is True
                     and labels is None
+                    and usable
                 ):
                     if formatter_needs_completion_boundary:
                         raise ValueError(
@@ -5310,14 +5395,6 @@ def _iter_lazy_tokenized_text_rows(
                         "input_ids without labels or completion_mask while "
                         "completion-only loss is active."
                     )
-                if max_seq_length is not None:
-                    ids = ids[:max_seq_length]
-                    labels = (
-                        labels[:max_seq_length] if labels is not None else None
-                    )
-                usable = len(ids) >= 2 and _labeled_row_has_supervision(
-                    labels, len(ids)
-                )
                 _validate_state(
                     "pretokenized",
                     labels,
@@ -5328,12 +5405,7 @@ def _iter_lazy_tokenized_text_rows(
                     yield ids, labels
                 continue
 
-            if assistant_only_loss and not _is_mlx_sft_conversational_row(row):
-                raise ValueError(
-                    "You set `assistant_only_loss=True`, but the dataset is not "
-                    "conversational. This option is only supported for "
-                    "conversational datasets."
-                )
+            _require_assistant_conversation(row)
             labeled = None
             if row_completion_only_loss is not False or assistant_only_loss:
                 labeled = _tokenize_mlx_prompt_completion_row(
@@ -5369,41 +5441,73 @@ def _iter_lazy_tokenized_text_rows(
                     "conversational. This option is only supported for "
                     "conversational datasets."
                 )
-            if (
-                formatter_needs_completion_boundary
-                and row_completion_only_loss is True
-            ):
-                raise ValueError(
-                    "Unsloth MLX: a formatting_func was provided for a "
-                    "prompt/completion dataset, which drops the completion "
-                    "boundary needed for the default completion-only loss. "
-                    "Apply your formatting before passing the dataset, or set "
-                    "completion_only_loss=False."
+            texts = None
+            if formatter_applied:
+                texts = collect_mlx_texts(
+                    tokenizer,
+                    row,
+                    dataset_text_field=dataset_text_field,
+                    is_vlm=False,
                 )
-            if row_completion_only_loss is True:
-                raise ValueError(
-                    "Unsloth MLX: text completion_only_loss=True requires "
-                    "prompt/completion rows for streaming text training."
-                )
+                if not texts:
+                    _validate_state(
+                        "raw",
+                        _filtered_label_observation(
+                            row_completion_only_loss,
+                            item_has_completion_boundary
+                            or row_has_completion_boundary,
+                        ),
+                        usable=False,
+                        completion_mode=row_completion_only_loss,
+                    )
+                    continue
 
-            for text in collect_mlx_texts(
-                tokenizer,
-                row,
-                dataset_text_field=dataset_text_field,
-                is_vlm=False,
-            ):
+            if texts is None:
+                texts = collect_mlx_texts(
+                    tokenizer,
+                    row,
+                    dataset_text_field=dataset_text_field,
+                    is_vlm=False,
+                )
+            if not texts:
+                _validate_state(
+                    "raw",
+                    None,
+                    usable=False,
+                    completion_mode=row_completion_only_loss,
+                )
+                continue
+            for text in texts:
                 ids = list(encode_mlx_text(tokenizer, text))
                 if eos_id is not None and (not ids or ids[-1] != eos_id):
                     ids.append(int(eos_id))
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
+                usable = len(ids) >= 2
+                if (
+                    usable
+                    and formatter_needs_completion_boundary
+                    and row_completion_only_loss is True
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: a formatting_func was provided for a "
+                        "prompt/completion dataset, which drops the completion "
+                        "boundary needed for the default completion-only loss. "
+                        "Apply your formatting before passing the dataset, or set "
+                        "completion_only_loss=False."
+                    )
+                if usable and row_completion_only_loss is True:
+                    raise ValueError(
+                        "Unsloth MLX: text completion_only_loss=True requires "
+                        "prompt/completion rows for streaming text training."
+                    )
                 _validate_state(
                     "raw",
                     None,
-                    usable=len(ids) >= 2,
+                    usable=usable,
                     completion_mode=row_completion_only_loss,
                 )
-                if len(ids) >= 2:
+                if usable:
                     yield ids, None
 
 

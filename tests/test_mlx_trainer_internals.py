@@ -918,7 +918,6 @@ def test_text_streaming_yields_without_sizing_indexing_or_preconsumption(use_hf)
 
     assert guarded.pulls == 2
     assert [row[:2] for row in batch[0].tolist()] == [[1, 11], [2, 12]]
-    assert batch[2] is None
 
 
 def test_raw_text_streaming_matches_sized_sequential_order():
@@ -950,10 +949,7 @@ def test_streaming_prompt_completion_and_assistant_labels():
         {"prompt": "4", "completion": " 5 6"},
     ]), batch_size=2))
     assert completion_batch[0].tolist() == [[1, 2, 3], [4, 5, 6]]
-    assert completion_batch[2].tolist() == [
-        [-100, -100, 3],
-        [-100, 5, 6],
-    ]
+    assert completion_batch[2].tolist() == [[-100, -100, 3], [-100, 5, 6]]
 
     assistant_batch = next(_streaming_text_batches(
         iter([{
@@ -1110,6 +1106,15 @@ def test_unsized_stream_rejects_randperm_before_consumption():
     with pytest.raises(ValueError, match="torch_randperm.*unsized"):
         next(_streaming_text_batches(rows(), dataset_order="torch_randperm"))
     assert pulls == 0
+
+    class SizedRows(torch.utils.data.Dataset):
+        rows = [{"text": "1 2"}, {"text": "3 4"}]
+        def __len__(self): return len(self.rows)
+        def __getitem__(self, index): return self.rows[index]
+
+    batch = next(_streaming_text_batches(SizedRows(), batch_size=2,
+        completion_only_loss=False, dataset_order="torch_randperm"))
+    assert sorted(row[0] for row in batch[0].tolist()) == [1, 3]
 
 
 def test_text_pretokenized_create_batches_preserves_input_ids():
