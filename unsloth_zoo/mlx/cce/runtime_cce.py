@@ -18,6 +18,7 @@
 
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
+from collections import OrderedDict
 from typing import Callable
 
 import mlx.core as mx
@@ -62,6 +63,7 @@ def _get_memory_budget() -> int:
 
 
 _CHUNK_BUDGET: int | None = None
+_CHUNK_PLAN_CACHE_MAX_ENTRIES = 16
 
 
 def _resolve_chunk_size(
@@ -722,22 +724,24 @@ def make_runtime_cce_loss_fused_finalize(
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
-    chunk_plan_cache: dict[
+    chunk_plan_cache: OrderedDict[
         tuple,
-        tuple[int, list[int], list[mx.array], list[mx.array]],
-    ] = {}
+        tuple[int, tuple[int, ...], tuple[mx.array, ...], tuple[mx.array, ...]],
+    ] = OrderedDict()
+    cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
+    quantized_layout = (
+        bool(quantized),
+        group_size if quantized else None,
+        bits if quantized else None,
+        mode if quantized else None,
+    )
 
     def get_chunk_plan(
         hidden: mx.array,
         weight: mx.array,
-    ) -> tuple[int, list[int], list[mx.array], list[mx.array]]:
+    ) -> tuple[int, tuple[int, ...], tuple[mx.array, ...], tuple[mx.array, ...]]:
         n_tokens = hidden.shape[0]
         vocab_size = weight.shape[0]
-        # dtype drives compute_bytes; key must include it or a bf16 plan is reused for fp32 and OOMs.
-        key = (n_tokens, vocab_size, hidden.dtype)
-        if key in chunk_plan_cache:
-            return chunk_plan_cache[key]
-
         compute_bytes = 2 if hidden.dtype in (mx.float16, mx.bfloat16) else 4
         resolved_chunk_size = _resolve_chunk_size(
             chunk_size,
@@ -745,11 +749,49 @@ def make_runtime_cce_loss_fused_finalize(
             vocab_size,
             bytes_per_element=compute_bytes,
         )
-        starts = list(range(0, vocab_size, resolved_chunk_size))
-        start_arrays = [mx.array([v_start], dtype=mx.int32) for v_start in starts]
-        weight_start_arrays = [mx.array([v_start, 0], dtype=mx.int32) for v_start in starts]
-        chunk_plan_cache[key] = (resolved_chunk_size, starts, start_arrays, weight_start_arrays)
+        key = (
+            vocab_size,
+            resolved_chunk_size,
+            hidden.dtype,
+            quantized_layout,
+        )
+        if key in chunk_plan_cache:
+            cache_stats["hits"] += 1
+            chunk_plan_cache.move_to_end(key)
+            return chunk_plan_cache[key]
+
+        cache_stats["misses"] += 1
+        starts = tuple(range(0, vocab_size, resolved_chunk_size))
+        start_arrays = tuple(
+            mx.array([v_start], dtype=mx.int32) for v_start in starts
+        )
+        weight_start_arrays = (
+            ()
+            if quantized
+            else tuple(
+                mx.array([v_start, 0], dtype=mx.int32)
+                for v_start in starts
+            )
+        )
+        chunk_plan_cache[key] = (
+            resolved_chunk_size,
+            starts,
+            start_arrays,
+            weight_start_arrays,
+        )
+        if len(chunk_plan_cache) > _CHUNK_PLAN_CACHE_MAX_ENTRIES:
+            chunk_plan_cache.popitem(last=False)
+            cache_stats["evictions"] += 1
         return chunk_plan_cache[key]
+
+    def get_chunk_plan_cache_info():
+        return {
+            "entries": len(chunk_plan_cache),
+            "max_entries": _CHUNK_PLAN_CACHE_MAX_ENTRIES,
+            "hits": cache_stats["hits"],
+            "misses": cache_stats["misses"],
+            "evictions": cache_stats["evictions"],
+        }
 
     if quantized:
         @mx.custom_function
@@ -887,6 +929,7 @@ def make_runtime_cce_loss_fused_finalize(
             # during backward); zero-weight add preserves losses.
             return losses + lse * mx.array(0.0, dtype=mx.float32)
 
+        runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
         return runtime_cce_loss, use_metal_kernel
 
     @mx.custom_function
@@ -993,6 +1036,7 @@ def make_runtime_cce_loss_fused_finalize(
         # (it reads lse from custom-function outputs during backward).
         return losses + lse * mx.array(0.0, dtype=mx.float32)
 
+    runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
     return runtime_cce_loss, use_metal_kernel
 
 
