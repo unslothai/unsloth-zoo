@@ -3454,7 +3454,7 @@ def unsloth_compile_transformers(
     # a hit lets the first training step skip Inductor codegen and Triton
     # autotuning. A miss is silent and falls back to a normal local compile;
     # the artifacts are then saved at process exit for the next run.
-    # Kill switch: UNSLOTH_MEGA_CACHE=0. See compile_cache.py.
+    # Opt-in: UNSLOTH_MEGA_CACHE=1. See compile_cache.py.
     try:
         from .compile_cache import megacache_load
         # Env vars override these arguments below (and the generated forwards

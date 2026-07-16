@@ -38,12 +38,13 @@ mismatch simply means a cache miss and a normal local compile. Loading is
 always best-effort and never raises.
 
 Environment knobs:
-  UNSLOTH_MEGA_CACHE       = "auto" (default) | "0" | "1"
-      auto -> load a matching bundle if one exists AND save at process exit
-              whenever the recorded artifacts differ from the bundle on disk
-              (torch records hits too, so saves merge loaded + new artifacts).
-      1    -> same as auto, but always rewrite the bundle at exit.
-      0    -> fully disabled (kill switch).
+  UNSLOTH_MEGA_CACHE       = "0" (default) | "1"
+      1    -> opt in to loading and saving artifacts from a trusted cache
+              directory. Existing POSIX cache directories must be owned by
+              the current user and not writable by group or other users.
+      0    -> disabled. This is the default because torch.compile artifacts
+              are executable/deserialized data and must not be loaded from
+              an implicitly trusted persistent cache.
   UNSLOTH_MEGA_CACHE_DIR   = bundle root (default ~/.cache/unsloth/mega_cache).
 """
 
@@ -58,6 +59,7 @@ import atexit
 import hashlib
 import json
 import os
+import stat
 import time
 
 _UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
@@ -84,13 +86,16 @@ pass
 
 
 def megacache_is_enabled():
-    return (os.environ.get("UNSLOTH_MEGA_CACHE", "auto").strip().lower()
-            not in ("0", "off", "false", "no"))
+    # Mega-cache bundles are executable/deserialized torch.compile artifacts,
+    # not passive data. Require an explicit opt-in before loading them.
+    return os.environ.get("UNSLOTH_MEGA_CACHE", "0").strip().lower() in (
+        "1", "on", "true", "yes",
+    )
 pass
 
 
 def _refresh_enabled():
-    return os.environ.get("UNSLOTH_MEGA_CACHE", "auto").strip().lower() in ("1", "on", "true", "yes")
+    return megacache_is_enabled()
 pass
 
 
@@ -104,6 +109,51 @@ def _cache_root():
             return None
         root = os.path.join(home, ".cache", "unsloth", "mega_cache")
     return root
+pass
+
+
+def _is_trusted_directory(path):
+    """Return whether an existing cache directory is safe to load from.
+
+    A checksum stored next to a bundle only detects corruption; it cannot
+    authenticate files to an attacker who can write the same directory. On
+    POSIX, reject symlinks, directories owned by another user, and directories
+    writable by group or other users. The explicit feature opt-in remains the
+    trust boundary on platforms where POSIX ownership and mode bits do not
+    describe filesystem access controls.
+
+    Missing directories are allowed so a cache miss can be created safely by
+    ``_ensure_private_directory`` during the save path.
+    """
+    if path is None:
+        return True
+    try:
+        directory_stat = os.lstat(path)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            return False
+        if os.name != "posix":
+            return True
+        if directory_stat.st_uid != os.geteuid():
+            return False
+        return (directory_stat.st_mode & 0o022) == 0
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+pass
+
+
+def _ensure_private_directory(path):
+    """Create or clamp an owned, trusted cache directory to mode 0700."""
+    try:
+        os.makedirs(path, mode = 0o700, exist_ok = True)
+        if not _is_trusted_directory(path):
+            return False
+        if os.name == "posix":
+            os.chmod(path, 0o700)
+        return _is_trusted_directory(path)
+    except Exception:
+        return False
 pass
 
 
@@ -194,6 +244,9 @@ def _bundle_paths(key):
     if root is None:
         return None, None
     directory = os.path.join(root, key)
+    if not (_is_trusted_directory(root) and _is_trusted_directory(directory)):
+        _log("cache directory is not trusted; skipping")
+        return None, None
     return directory, os.path.join(directory, _MANIFEST_NAME)
 pass
 
@@ -201,9 +254,9 @@ pass
 def _read_disk_bundle(directory, manifest_path):
     """Read the (manifest, bundle bytes) pair for a key, returning
     ``(None, None)`` unless the manifest checksum matches the bundle file it
-    points at. The manifest names its bundle file (content-addressed by the
-    writer), so a manifest can never validate against a bundle written by a
-    different process: same name implies same bytes."""
+    points at. The caller must establish directory trust first: this checksum
+    detects corruption but does not authenticate a bundle against a writer who
+    can also replace the manifest."""
     try:
         with open(manifest_path, "r") as file:
             manifest = json.load(file)
@@ -270,7 +323,7 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
     key = _bundle_key()
     directory, manifest_path = _bundle_paths(key)
     if manifest_path is None:
-        _log("no writable cache root; skipping")
+        _log("no trusted cache root; skipping")
         return False
 
     _STATE["armed"] = True
@@ -342,7 +395,13 @@ def megacache_save():
             if hashlib.sha256(existing).hexdigest() == new_sha:
                 _log("bundle unchanged; skipping save")
                 return False
-        os.makedirs(directory, exist_ok = True)
+        root = os.path.dirname(directory)
+        if not (
+            _ensure_private_directory(root)
+            and _ensure_private_directory(directory)
+        ):
+            _log("cache directory is not trusted; skipping save")
+            return False
         # The bundle file is content-addressed and the manifest names it, so
         # the (bundle, manifest) pair is consistent without a cross-file lock:
         # concurrent writers produce differently named bundles, the manifest
