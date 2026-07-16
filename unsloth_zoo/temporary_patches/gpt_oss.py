@@ -28,6 +28,7 @@ from .common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
     UNSLOTH_COMPILE_DISABLE,
+    logger,
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -848,13 +849,184 @@ class GptOssExpertsBnb4bit(nn.Module):
             "down_proj_bias", torch.empty(0, dtype=self.dtype), persistent=False
         )
 
+    def _grouped_bnb4bit_ready(self):
+        """True when every expert is a plain (LoRA-free) bnb Linear4bit with a
+        populated quant_state, so the grouped torch._grouped_mm path is exact.
+
+        Self-contained (local imports, no module globals): the compiler can copy
+        this class's source into the standalone compiled cache, whose module
+        namespace lacks this file's globals."""
+        import os
+        if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
+            return False
+        # The grouped path materializes torch._grouped_mm stacks meant to run under the
+        # compiled cache; when the user disables compilation they have opted into the plain
+        # eager per-expert loop, so honor that and fall back.
+        if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+            return False
+        def _fail(reason):
+            if (
+                os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+                and not getattr(self, "_unsloth_grouped_logged", False)
+            ):
+                self._unsloth_grouped_logged = True
+                import logging
+                logging.getLogger("unsloth_zoo.temporary_patches").info(
+                    f"Unsloth: gpt-oss grouped path disabled: {reason}"
+                )
+            return False
+        try:
+            import bitsandbytes as bnb
+            from bitsandbytes.nn import Params4bit
+            from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
+            if not _check_torch_grouped_mm_supported():
+                return _fail("torch._grouped_mm unsupported")
+            blocksize = None
+            for lin in list(self.gate_up_projs) + list(self.down_projs):
+                if hasattr(lin, "lora_A") or hasattr(lin, "base_layer"):
+                    return _fail(f"LoRA-wrapped expert {type(lin).__name__}")
+                w = getattr(lin, "weight", None)
+                if not (isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None):
+                    return _fail(f"expert weight {type(w).__name__} without quant_state")
+                if w.requires_grad:
+                    return _fail("expert weight requires_grad")
+                qs = w.quant_state
+                # The grouped dequant concatenates packed bytes + absmax across
+                # experts, which is exact only when every expert tiles into whole
+                # blocks of one shared blocksize; a trailing partial block would
+                # shift scaling onto the next expert.
+                numel = 1
+                for s in qs.shape:
+                    numel *= int(s)
+                if not qs.blocksize or numel % int(qs.blocksize) != 0:
+                    return _fail(f"expert numel {numel} not a multiple of blocksize {qs.blocksize}")
+                if blocksize is None:
+                    blocksize = int(qs.blocksize)
+                elif int(qs.blocksize) != blocksize:
+                    return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
+                b = getattr(lin, "bias", None)
+                # Grouped path stacks per-expert biases, so a missing bias would
+                # break torch.stack; require all present and fall back otherwise.
+                if b is None:
+                    return _fail("expert bias is None")
+                if b.requires_grad:
+                    return _fail("expert bias requires_grad")
+        except Exception as e:
+            return _fail(f"{type(e).__name__}: {e}")
+        return True
+
+    def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
+                                 batch_size, num_tokens, num_experts, top_k):
+        """Grouped equivalent of the per-expert loop: one gather, two grouped_mm
+        calls over dequantized stacks (pinned or rebuilt in backward per the adaptive
+        _moe_recompute_default policy), grouped bias adds, fp32 index_add combine.
+
+        Self-contained (local imports, no module globals) for the standalone
+        compiled cache; see _grouped_bnb4bit_ready."""
+        import bitsandbytes as bnb
+        from unsloth_zoo.temporary_patches.moe_utils import _base_grouped_mm, _moe_recompute_default
+        from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
+
+        device = hidden_states.device
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()
+            token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            sorted_experts = flat_experts[sorted_idx]
+            counts = torch.bincount(flat_experts, minlength=num_experts)
+            offsets = counts.cumsum(0, dtype=torch.int32)
+            expert_ids = torch.repeat_interleave(
+                torch.arange(num_experts, device=device), counts
+            )
+
+        recompute = _moe_recompute_default()
+
+        cached = getattr(self, "_unsloth_grouped_qs", None)
+        if cached is None:
+            # One QuantState spanning all experts (packed NF4 is elementwise row-major,
+            # so per-expert byte + fp32 absmax concat is exact): one dequant launch per stack.
+            from bitsandbytes.functional import QuantState
+
+            def _absmax_fp32(qs):
+                # Materialize a QuantState's absmax as flat fp32 (denesting double-quant).
+                if getattr(qs, "nested", False):
+                    absmax = bnb.functional.dequantize_blockwise(qs.absmax, qs.state2)
+                    return (absmax + qs.offset).float()
+                return qs.absmax.float()
+
+            def build_qs(projs):
+                states = [l.weight.quant_state for l in projs]
+                absmax = torch.cat([_absmax_fp32(qs) for qs in states])
+                q0 = states[0]
+                return QuantState(
+                    absmax=absmax,
+                    shape=torch.Size((len(projs),) + tuple(q0.shape)),
+                    code=q0.code,
+                    blocksize=q0.blocksize,
+                    quant_type=q0.quant_type,
+                    dtype=q0.dtype,
+                )
+
+            cached = (
+                build_qs(self.gate_up_projs),
+                build_qs(self.down_projs),
+                torch.stack([l.bias for l in self.gate_up_projs]),  # (E, 2I)
+                torch.stack([l.bias for l in self.down_projs]),     # (E, H)
+            )
+            self._unsloth_grouped_qs = cached
+        gate_up_qs, down_qs, gate_up_bias, down_bias = cached
+
+        def _stack(projs, quant_state):
+            # One fused dequant gives (E, out, in); grouped_mm takes the transposed
+            # view. Cast to the input dtype (a no-op for the usual bf16-on-bf16
+            # case): torch._grouped_mm rejects mismatched dtypes, e.g. fp32 hidden
+            # states under the forced-float32 path against a bf16 quant state.
+            data = torch.cat([l.weight.data.reshape(-1, 1) for l in projs])
+            deq = bnb.functional.dequantize_4bit(data, quant_state)
+            return deq.to(hidden_states.dtype).transpose(1, 2)
+
+        xg = hidden_states[sorted_tokens]
+        gate_up = _base_grouped_mm(
+            xg, offsets, lambda: _stack(self.gate_up_projs, gate_up_qs), recompute)
+        gate_up = gate_up + gate_up_bias[expert_ids]
+        gated = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+        out = _base_grouped_mm(
+            gated, offsets, lambda: _stack(self.down_projs, down_qs), recompute)
+        out = out + down_bias[expert_ids]
+
+        weighted = out.to(torch.float32) * routing_weights[sorted_tokens, sorted_experts, None].to(torch.float32)
+        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=device)
+        next_states.index_add_(0, sorted_tokens, weighted)
+        # Grouped path only runs in training; mirror torch_native_forward's
+        # training branch, which returns fp32 (fp16 NaN protection).
+        return next_states.view(batch_size, -1, self.hidden_size).to(torch.float32)
+
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_tokens = hidden_states.shape[0]
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
-        
+
+        # fp16 keeps the loop path, whose fp32 swiglu + autocast-disabled down
+        # projection protect against fp16 overflow; grouped runs in model dtype.
+        if (
+            self.training
+            and hidden_states.dtype is not torch.float16
+            and self._grouped_bnb4bit_ready()
+        ):
+            try:
+                return self._forward_grouped_bnb4bit(
+                    hidden_states, router_indices, routing_weights,
+                    batch_size, num_tokens, num_experts, top_k,
+                )
+            except Exception:
+                import os as _os
+                if _os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                    import traceback; traceback.print_exc()
+                # fall through to the per-expert loop
+
         if self.training:
             with torch.no_grad():
                 flat_experts = router_indices.flatten()  # [tokens * topk]
@@ -1768,7 +1940,27 @@ def torch_native_forward(
     num_tokens = hidden_states.shape[0]
     num_experts = routing_weights.shape[1]
     top_k = router_indices.shape[1]
-    
+
+    # Grouped bnb-4bit fast path. The class dispatches this module-level
+    # function (forward is rebound below), so the gate must live here too.
+    # fp16 keeps the loop path below, whose fp32 swiglu + autocast-disabled
+    # down projection protect against fp16 overflow.
+    if (
+        self.training
+        and hidden_states.dtype is not torch.float16
+        and hasattr(self, "_grouped_bnb4bit_ready")
+        and self._grouped_bnb4bit_ready()
+    ):
+        try:
+            return self._forward_grouped_bnb4bit(
+                hidden_states, router_indices, routing_weights,
+                batch_size, num_tokens, num_experts, top_k,
+            )
+        except Exception:
+            if UNSLOTH_ENABLE_LOGGING:
+                import traceback; traceback.print_exc()
+            # fall through to the per-expert loop
+
     if self.training:
         with torch.no_grad():
             flat_experts = router_indices.flatten()  # [tokens * topk]
@@ -2268,12 +2460,49 @@ def patch_GptOssModel():
     pass
 
     # transformers 4.x uses `input_embeds` and accepts `cache_position`;
-    # transformers 5.x renamed to `inputs_embeds` and dropped `cache_position`.
-    # Inspect the mask factory signatures once and pass only the kwargs they
-    # actually accept so this patch works on both 4.x and 5.x.
+    # transformers 5.x renamed it to `inputs_embeds` and later dropped
+    # `cache_position` (deprecated then removed by 5.13). Inspect the mask factory
+    # signatures once and pass only the kwargs they actually accept so this patch
+    # works across 4.x and the whole 5.x line.
     import inspect as _inspect
-    _ccm_params = set(_inspect.signature(create_causal_mask).parameters)
-    _cswc_params = set(_inspect.signature(create_sliding_window_causal_mask).parameters)
+    def _mask_factory_params(fn, name):
+        # The factory may be wrapped (see misc.py) or torch-compiled, which
+        # collapses inspect.signature() to (*args, **kwargs) and would make the
+        # kwargs filter below drop every mask argument -> create_causal_mask()
+        # called with no args -> "missing required positional arguments". Recover
+        # the true parameter names from the pristine reference misc.py saves, then
+        # __wrapped__, then the object itself, then a version-aware fallback.
+        for cand in (
+            getattr(transformers.masking_utils, "_unsloth_original_" + name, None),
+            getattr(fn, "__wrapped__", None),
+            fn,
+        ):
+            if cand is None: continue
+            try:
+                params = set(_inspect.signature(cand).parameters)
+            except (TypeError, ValueError):
+                continue
+            if not params <= {"args", "kwargs", "self"}:
+                return params
+        # Introspection failed on every candidate (should not happen: misc.py saves
+        # the pristine factory and torch.compile exposes __wrapped__). Fall back to
+        # the parameter set for the running transformers, choosing the kwargs by
+        # major version so a reached fallback never passes an unexpected keyword to
+        # the real factory: 4.x uses `input_embeds` and accepts `cache_position`,
+        # while 5.x uses `inputs_embeds` and dropped `cache_position` (optional and
+        # defaulting to None on early 5.x, removed entirely by 5.13), so omitting it
+        # on 5.x is safe across the whole line.
+        try:
+            _tf_major = int(str(transformers.__version__).split(".", 1)[0])
+        except (ValueError, AttributeError, IndexError):
+            _tf_major = 5
+        if _tf_major < 5:
+            return {"config", "input_embeds", "attention_mask",
+                    "cache_position", "past_key_values", "position_ids"}
+        return {"config", "inputs_embeds", "attention_mask",
+                "past_key_values", "position_ids"}
+    _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
+    _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
     _mask_params = _ccm_params | _cswc_params
 
     def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):

@@ -3274,6 +3274,10 @@ DISABLE_COMPILE_MODULES = [
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
+    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
+    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    "DeepseekV4HyperConnection",
+    "DeepseekV4HyperHead",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -3443,6 +3447,55 @@ def unsloth_compile_transformers(
         multi_kernel=False,  # Sometimes fails
         use_block_ptr=False,  # Sometimes fails
     )
+
+    # Pre-load persisted torch.compile artifacts (Mega-cache) for this exact
+    # environment + model + compile configuration. This runs during
+    # from_pretrained, strictly before any @torch.compile region executes, so
+    # a hit lets the first training step skip Inductor codegen and Triton
+    # autotuning. A miss is silent and falls back to a normal local compile;
+    # the artifacts are then saved at process exit for the next run.
+    # Kill switch: UNSLOTH_MEGA_CACHE=0. See compile_cache.py.
+    try:
+        from .compile_cache import megacache_load
+        # Env vars override these arguments below (and the generated forwards
+        # branch on UNSLOTH_RETURN_HIDDEN_STATES), so key on the EFFECTIVE
+        # values or one mode's bundle would be a false hit for another.
+        _effective_fullgraph = os.environ.get(
+            "UNSLOTH_FULLGRAPH", "1" if fullgraph else "0"
+        ) == "1"
+        _effective_return_logits = os.environ.get(
+            "UNSLOTH_RETURN_LOGITS", "1" if return_logits else "0"
+        ) == "1"
+        _return_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+        megacache_load(
+            model_type,
+            compile_kwargs = {
+                "sdpa_dynamic_mask"     : sdpa_dynamic_mask,
+                "sdpa_bool_masks"       : sdpa_bool_masks,
+                "sdpa_gqa_replace"      : sdpa_gqa_replace,
+                "sdpa_dynamic_compile"  : sdpa_dynamic_compile,
+                "compile_attention"     : compile_attention,
+                "disable_causal_masks"  : disable_causal_masks,
+                "compile_torch_modules" : compile_torch_modules,
+                "compile_custom_modules": compile_custom_modules,
+                "compile_function_calls": compile_function_calls,
+                "fuse_lm_head"          : fuse_lm_head,
+                "gradient_checkpointing": gradient_checkpointing,
+                "manual_replacements"   : manual_replacements,
+                "fast_lora_forwards"    : fast_lora_forwards,
+                "fast_residual_stream"  : fast_residual_stream,
+                "accurate_accumulation" : accurate_accumulation,
+                "fullgraph"             : _effective_fullgraph,
+                "disable"               : disable,
+                "return_logits"         : _effective_return_logits,
+                "return_hidden_states"  : _return_hidden_states,
+            },
+            torch_compile_options = torch_compile_options,
+        )
+    except Exception as _megacache_error:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Mega-cache skipped ({_megacache_error})")
+    pass
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
