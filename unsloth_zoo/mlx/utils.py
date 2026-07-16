@@ -3391,6 +3391,7 @@ class FiniteTextBatchPlan:
         "minimum_width",
         "pad_to_multiple",
         "label_dtype",
+        "_shape_plan",
     )
 
     def __init__(
@@ -3413,6 +3414,7 @@ class FiniteTextBatchPlan:
         self.minimum_width = int(minimum_width)
         self.pad_to_multiple = int(pad_to_multiple)
         self.label_dtype = np.dtype(label_dtype)
+        self._shape_plan = None
         if self.max_seq_length < 1:
             raise ValueError("max_seq_length must be positive")
         if self.minimum_width < 0:
@@ -3437,7 +3439,58 @@ class FiniteTextBatchPlan:
     def __len__(self):
         return len(self._schedule)
 
-    def __getitem__(self, index):
+    def batch_width(self, index):
+        batch_indices = self._schedule[index]
+        lengths = [
+            0
+            if row_index is None
+            else min(
+                len(self._rows[int(row_index)].input_ids),
+                self.max_seq_length,
+            )
+            for row_index in batch_indices
+        ]
+        if self._widths is not None:
+            return self._widths[int(index)]
+        width = max(lengths, default=0)
+        if self.pad_to_multiple:
+            width = 1 + self.pad_to_multiple * (
+                (width + self.pad_to_multiple - 1) // self.pad_to_multiple
+            )
+        return min(self.max_seq_length, max(self.minimum_width, width))
+
+    def batch_family(self, index):
+        batch_indices = self._schedule[index]
+        real_rows = [
+            self._rows[int(row_index)]
+            for row_index in batch_indices
+            if row_index is not None
+        ]
+        has_labels = bool(
+            (real_rows and real_rows[0].labels is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].labels is not None
+            )
+        )
+        batch_size = len(batch_indices)
+        return (
+            "text_tuple_3",
+            ((batch_size, "sequence"), "int32"),
+            ((batch_size, 2), "int32"),
+            (
+                ((batch_size, "sequence"), self.label_dtype.name)
+                if has_labels else None
+            ),
+        )
+
+    def set_shape_plan(self, shape_plan):
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        self._shape_plan = shape_plan
+
+    def materialize(self, index, *, phase=None):
         batch_indices = self._schedule[index]
         selected = [
             None if row_index is None else self._rows[int(row_index)]
@@ -3461,15 +3514,18 @@ class FiniteTextBatchPlan:
             0 if row is None else min(len(row.input_ids), self.max_seq_length)
             for row in selected
         ]
-        if self._widths is None:
-            width = max(lengths, default=0)
-            if self.pad_to_multiple:
-                width = 1 + self.pad_to_multiple * (
-                    (width + self.pad_to_multiple - 1) // self.pad_to_multiple
+        raw_width = self.batch_width(index)
+        width = raw_width
+        if self._shape_plan is not None and phase is not None:
+            family = self.batch_family(index)
+            width = self._shape_plan.endpoint_for(family, raw_width)
+            if not self._shape_plan.allows(
+                family, raw_width, phase,
+            ):
+                raise RuntimeError(
+                    "Unsloth MLX: compiled text batch signature was not "
+                    "admitted by the finite shape plan."
                 )
-            width = min(self.max_seq_length, max(self.minimum_width, width))
-        else:
-            width = self._widths[int(index)]
         batch_ids = np.full(
             (len(selected), width), self.pad_id, dtype=np.int32,
         )
@@ -3492,6 +3548,9 @@ class FiniteTextBatchPlan:
             mx.array(lengths_info),
             mx.array(batch_labels) if batch_labels is not None else None,
         )
+
+    def __getitem__(self, index):
+        return self.materialize(index)
 
     def materialize_all(self):
         batches = [self[index] for index in range(len(self))]

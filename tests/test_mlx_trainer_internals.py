@@ -149,6 +149,316 @@ def test_finite_text_training_plan_keeps_long_schedule_cpu_only():
     ]
 
 
+def _make_shape_guard_text_plan(widths, *, schedules=None, labeled=True):
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    rows = tuple(
+        _FiniteTextRow(
+            tuple(range(1, width + 1)),
+            offset=1,
+            labels=(tuple(range(1, width + 1)) if labeled else None),
+        )
+        for width in widths
+    )
+    return FiniteTextBatchPlan(
+        rows,
+        schedules or tuple((index,) for index in range(len(rows))),
+        max_seq_length=64,
+        pad_id=99,
+    )
+
+
+def test_single_process_text_shape_guard_buckets_and_validates_before_materializing():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    batches = _make_shape_guard_text_plan((10, 11, 30))
+    args = MLXTrainingConfig(
+        max_steps=6,
+        gradient_accumulation_steps=1,
+        compile_max_variants=2,
+    )
+    shape_plan, report, compile_allowed = _plan_single_process_text_shapes(
+        batches,
+        None,
+        args=args,
+        total_steps=6,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+
+    assert compile_allowed is True
+    assert report.action == "bucket"
+    assert report.raw_signatures == 3
+    assert report.planned_signatures == 2
+    assert len(shape_plan.planned_catalog) == 2
+    batch, lengths, labels = batches.materialize(0, phase="single")
+    assert batch.shape == (1, 11)
+    assert batch[0, -1].item() == 99
+    assert labels[0, -1].item() == -100
+    assert lengths.tolist() == [[1, 10]]
+    assert batches[0][0].shape == (1, 10)
+    with pytest.raises(RuntimeError, match="was not admitted"):
+        batches.materialize(0, phase="unknown")
+
+
+def test_text_shape_guard_exact_and_compile_disabled_paths_add_no_padding():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    exact_batches = _make_shape_guard_text_plan((10, 11, 30), labeled=False)
+    exact_args = MLXTrainingConfig(
+        max_steps=3,
+        gradient_accumulation_steps=1,
+        compile_max_variants=3,
+    )
+    _, exact_report, exact_allowed = _plan_single_process_text_shapes(
+        exact_batches,
+        None,
+        args=exact_args,
+        total_steps=3,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=exact_args),
+    )
+    assert exact_allowed is True
+    assert exact_report.action == "exact"
+    assert exact_batches.materialize(0, phase="single")[0].shape == (1, 10)
+
+    eager_batches = _make_shape_guard_text_plan((10, 11, 30), labeled=False)
+    eager_args = MLXTrainingConfig(compile=False, compile_max_variants=1)
+    shape_plan, report, allowed = _plan_single_process_text_shapes(
+        eager_batches,
+        None,
+        args=eager_args,
+        total_steps=3,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=eager_args),
+    )
+    assert shape_plan is None and allowed is True
+    assert (report.action, report.reason) == ("not_applicable", "compile_disabled")
+    assert eager_batches[0][0].shape == (1, 10)
+
+
+def test_text_shape_guard_failure_obeys_best_effort_and_strict_modes():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    schedules = ((0,), (1, 0))
+    best_effort = MLXTrainingConfig(
+        max_steps=2,
+        gradient_accumulation_steps=1,
+        compile_max_variants=1,
+    )
+    _, report, allowed = _plan_single_process_text_shapes(
+        _make_shape_guard_text_plan((10, 11), schedules=schedules),
+        None,
+        args=best_effort,
+        total_steps=2,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=best_effort),
+    )
+    assert allowed is False
+    assert (report.action, report.reason) == ("eager", "irreducible_signatures")
+
+    strict = MLXTrainingConfig(
+        max_steps=2,
+        gradient_accumulation_steps=1,
+        compile_mode="strict",
+        compile_max_variants=1,
+    )
+    with pytest.raises(RuntimeError, match="shape planning failed"):
+        _plan_single_process_text_shapes(
+            _make_shape_guard_text_plan((10, 11), schedules=schedules),
+            None,
+            args=strict,
+            total_steps=2,
+            is_vlm=False,
+            distributed_world_size=1,
+            compile_policy=build_compile_policy(args=strict),
+        )
+
+
+def test_strict_text_shape_rejection_precedes_model_setup():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        _config = {}
+
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer(
+        Model(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=MLXTrainingConfig(
+            max_steps=1,
+            gradient_accumulation_steps=2,
+            compile_mode="strict",
+            compile_max_variants=1,
+        ),
+    )
+    trainer._batches = _make_shape_guard_text_plan((10, 11), labeled=False)
+    setup_calls = []
+    trainer._install_neftune = lambda: setup_calls.append("neftune")
+
+    with pytest.raises(RuntimeError, match="shape planning failed"):
+        trainer.train()
+
+    assert setup_calls == []
+
+
+def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    cases = (
+        (True, None, MLXTrainingConfig(), "vlm", True),
+        (False, iter(()), MLXTrainingConfig(), "streaming", True),
+        (
+            False,
+            None,
+            MLXTrainingConfig(
+                gradient_accumulation_steps=2,
+                max_grad_norm=1.0,
+                compile_max_variants=1,
+            ),
+            "compile_ineligible_global_norm",
+            False,
+        ),
+    )
+    for is_vlm, batch_iter, args, reason, allowed in cases:
+        batches = _make_shape_guard_text_plan((10, 30), labeled=False)
+        shape_plan, report, compile_allowed = _plan_single_process_text_shapes(
+            batches,
+            batch_iter,
+            args=args,
+            total_steps=2,
+            is_vlm=is_vlm,
+            distributed_world_size=1,
+            compile_policy=build_compile_policy(args=args),
+        )
+        assert shape_plan is None
+        assert (report.action, report.reason) == ("not_applicable", reason)
+        assert compile_allowed is allowed
+        assert batches[0][0].shape == (1, 10)
+
+
+@pytest.mark.parametrize("compile_failure", [None, "setup", "runtime"])
+def test_text_trainer_bounds_compiled_signatures_and_unpads_fallback(
+    monkeypatch, tmp_path, compile_failure,
+):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(128, 4)
+            self.proj = nn.Linear(4, 128, bias=False)
+            self._config = {"model_type": "tiny"}
+
+        def __call__(self, input_ids):
+            return self.proj(self.embed(input_ids))
+
+        def train(self):
+            return self
+
+        @property
+        def state(self):
+            return []
+
+    seen = set()
+    executed_widths = set()
+    failed_runtime = False
+
+    def compile_spy(fn, **_kwargs):
+        if compile_failure == "setup":
+            raise RuntimeError("compile setup failure")
+
+        def compiled(*args):
+            nonlocal failed_runtime
+            batch, prev_state, do_update = args
+            seen.add((int(batch[0].shape[-1]), prev_state is None, bool(do_update)))
+            if compile_failure == "runtime" and not failed_runtime:
+                failed_runtime = True
+                raise RuntimeError("compile runtime failure")
+            return fn(*args)
+        return compiled
+
+    def value_and_grad_with_aux(model, fn):
+        from mlx.utils import tree_map
+
+        def wrapped(*args):
+            executed_widths.add(int(args[1].shape[-1]))
+            return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
+
+        return wrapped
+
+    monkeypatch.setattr(mx, "compile", compile_spy)
+    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
+    args = MLXTrainingConfig(
+        max_steps=6,
+        gradient_accumulation_steps=1,
+        compile=True,
+        compile_max_variants=2,
+        use_cce=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        logging_steps=6,
+        output_dir=str(tmp_path),
+    )
+    trainer = MLXTrainer(
+        TinyLM(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+    )
+    trainer._batches = _make_shape_guard_text_plan(
+        (10, 11, 30), labeled=False,
+    )
+    trainer._build_optimizer = lambda _total_steps: types.SimpleNamespace(
+        learning_rate=mx.array(1e-5),
+        state={},
+        update=lambda _model, _grad: None,
+    )
+    trainer.save_model = lambda *_args, **_kwargs: None
+
+    result = trainer.train()
+
+    assert result["compile_shape_guard"]["action"] == "bucket"
+    assert result["compile_shape_guard"]["planned_signatures"] == 2
+    if compile_failure is None:
+        assert result["compile_enabled"] is True
+        assert {signature[0] for signature in seen} == {11, 30}
+        assert executed_widths == {11, 30}
+        assert len(seen) == 2
+    else:
+        assert result["compile_enabled"] is False
+        assert result["compile_scope"] == "fallback_eager"
+        assert executed_widths == {10, 11, 30}
+
+
 def test_response_masked_text_batches_can_remain_a_lazy_plan():
     import mlx.core as mx
     from unsloth_zoo.mlx.trainer import _create_labeled_batches
@@ -250,6 +560,14 @@ def test_mlx_training_config_exposes_completion_only_loss():
         MLXTrainingConfig(assistant_only_loss=True)
     ) is True
     assert _text_assistant_only_loss_arg(MLXTrainingConfig()) is False
+
+
+@pytest.mark.parametrize("value", [True, False, 0, 257, 1.5, "32"])
+def test_mlx_training_config_validates_compile_max_variants(value):
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    with pytest.raises(ValueError, match="compile_max_variants"):
+        MLXTrainingConfig(compile_max_variants=value)
 
 
 def test_mlx_trainer_distributed_defaults_world_size_one():
