@@ -1027,6 +1027,16 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
     def fake_save_merged_model(model, tokenizer, path, dequantize=False):
         calls["dequantize"] = dequantize
         Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "config.json").write_text(
+            json.dumps(
+                {
+                    "mtp_num_hidden_layers": 1,
+                    "unsloth_fixed_mtp": True,
+                    "num_hidden_layers": 24,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def fake_download_convert_hf_to_gguf():
         calls["scripts_dir"] = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
@@ -1036,6 +1046,9 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
 
     def fake_convert_to_gguf(**kwargs):
         calls["convert_kwargs"] = kwargs
+        calls["convert_config"] = json.loads(
+            (Path(kwargs["input_folder"]) / "config.json").read_text(encoding="utf-8")
+        )
         output = Path(
             f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf"
         )
@@ -1083,6 +1096,8 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
         llama_root / "unsloth_convert_hf_to_gguf.py"
     )
     assert calls["convert_kwargs"]["supported_text_archs"] == {"Qwen3ForCausalLM"}
+    assert calls["convert_config"]["mtp_num_hidden_layers"] == 1
+    assert calls["convert_config"]["unsloth_fixed_mtp"] is True
     assert (out / "TestModel.F16.gguf").read_bytes() == b"GGUF"
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == old_scripts_dir
 
