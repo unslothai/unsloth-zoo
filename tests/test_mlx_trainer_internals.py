@@ -292,7 +292,11 @@ def test_text_shape_guard_failure_obeys_best_effort_and_strict_modes():
 
 
 def test_strict_text_shape_rejection_precedes_model_setup():
-    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _shape_guard_report,
+    )
 
     class Model:
         _config = {}
@@ -319,6 +323,45 @@ def test_strict_text_shape_rejection_precedes_model_setup():
         trainer.train()
 
     assert setup_calls == []
+
+
+def test_ddp_text_shape_preparation_failure_is_coordinated_before_setup():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        _config = {}
+
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer(
+        Model(),
+        types.SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        [],
+        args=MLXTrainingConfig(max_steps=1),
+    )
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_rank = 0
+    trainer._distributed_is_main_process = True
+    trainer._prepare_data = lambda _is_vlm: (_ for _ in ()).throw(
+        KeyError("rank-local preparation failure")
+    )
+    calls = []
+
+    def coordinated_abort(failed, context, exc):
+        calls.append((failed, context, type(exc)))
+        raise RuntimeError("coordinated preparation failure")
+
+    trainer._raise_distributed_failure = coordinated_abort
+    trainer._install_neftune = lambda: calls.append("model setup")
+
+    with pytest.raises(RuntimeError, match="coordinated preparation failure"):
+        trainer.train()
+
+    assert calls == [
+        (True, "preparing finite text shape guard", KeyError),
+    ]
 
 
 def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged():
@@ -358,6 +401,76 @@ def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged(
         assert (report.action, report.reason) == ("not_applicable", reason)
         assert compile_allowed is allowed
         assert batches[0][0].shape == (1, 10)
+
+
+def test_ddp_text_shape_guard_uses_local_phases_and_rank_local_endpoints():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.shape_guard import DDP_LOCAL_GRAD_SCOPE
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    args = MLXTrainingConfig(
+        max_steps=3,
+        gradient_accumulation_steps=2,
+        compile_max_variants=2,
+    )
+    endpoints = []
+    for widths in ((10, 11, 30), (10, 11)):
+        schedules = (
+            ((0,), (1,), (1,), (0,)) if len(widths) == 2 else None
+        )
+        batches = _make_shape_guard_text_plan(
+            widths, schedules=schedules, labeled=False,
+        )
+        shape_plan, report, allowed = _plan_single_process_text_shapes(
+            batches,
+            None,
+            args=args,
+            total_steps=3 if len(widths) == 3 else 2,
+            is_vlm=False,
+            distributed_world_size=2,
+            compile_policy=build_compile_policy(args=args),
+        )
+        assert allowed is True
+        assert report.compile_scope == DDP_LOCAL_GRAD_SCOPE
+        assert (report.raw_signatures, report.planned_signatures) == (
+            2 * len(widths), 2,
+        )
+        endpoints.append(shape_plan.endpoint_for(batches.batch_family(0), 10))
+
+    assert endpoints == [30, 11]
+
+
+def test_ddp_text_shape_guard_coordinates_peer_failure_and_strict_mode():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _shape_guard_report,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: True
+    local_report = _shape_guard_report(
+        "exact", "schedule_within_cap", 32, "ddp_local_grad",
+    )
+    policy = build_compile_policy(args=MLXTrainingConfig())
+    report, allowed = trainer._coordinate_text_shape_guard(
+        local_report, True, policy,
+    )
+    assert allowed is False
+    assert (report.action, report.reason) == ("eager", "peer_planner_failure")
+    assert report.planned_signatures is None
+
+    strict_policy = build_compile_policy(
+        args=MLXTrainingConfig(compile_mode="strict"),
+    )
+    with pytest.raises(RuntimeError, match="at least one DDP rank"):
+        trainer._coordinate_text_shape_guard(local_report, True, strict_policy)
 
 
 @pytest.mark.parametrize("compile_failure", [None, "setup", "runtime"])

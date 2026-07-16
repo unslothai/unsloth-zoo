@@ -36,7 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass, replace
 import concurrent.futures
 import hashlib
 import math
@@ -720,29 +720,29 @@ def _plan_single_process_text_shapes(
         return None, _shape_guard_report(
             "not_applicable", "streaming", cap, lazy_batches=False,
         ), True
-    if distributed_world_size > 1:
-        return (
-            None,
-            _shape_guard_report(
-                "not_applicable", "ddp_pending", cap, DDP_LOCAL_GRAD_SCOPE,
-            ),
-            True,
-        )
+    compile_scope = (
+        DDP_LOCAL_GRAD_SCOPE
+        if distributed_world_size > 1 else FULL_STEP_SCOPE
+    )
     if compile_policy.mode == "eager":
         return None, _shape_guard_report(
             "not_applicable", "compile_disabled", cap,
         ), True
     max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
-    if max_grad_norm > 0 and args.gradient_accumulation_steps > 1:
+    if (
+        distributed_world_size <= 1
+        and max_grad_norm > 0
+        and args.gradient_accumulation_steps > 1
+    ):
         return None, _shape_guard_report(
             "not_applicable", "compile_ineligible_global_norm", cap,
         ), False
     if not isinstance(batches, FiniteTextBatchPlan):
         report = _shape_guard_report(
-            "eager", "unsupported_batch_plan", cap, FULL_STEP_SCOPE,
+            "eager", "unsupported_batch_plan", cap, compile_scope,
             lazy_batches=False,
         )
-        if compile_policy.mode == "strict":
+        if compile_policy.mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile requires a finite CPU text batch plan."
             )
@@ -755,7 +755,7 @@ def _plan_single_process_text_shapes(
         family = batches.batch_family(batch_index)
         width = batches.batch_width(batch_index)
         phase = phase_for_microstep(
-            FULL_STEP_SCOPE,
+            compile_scope,
             args.gradient_accumulation_steps,
             microstep,
         )
@@ -774,10 +774,10 @@ def _plan_single_process_text_shapes(
     shape_plan = plan_text_shape_buckets(
         events,
         cap=cap,
-        compile_scope=FULL_STEP_SCOPE,
+        compile_scope=compile_scope,
     )
     if shape_plan.report.action == "eager":
-        if compile_policy.mode == "strict":
+        if compile_policy.mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile finite text shape planning failed "
                 f"({shape_plan.report.reason})."
@@ -1156,6 +1156,37 @@ class MLXTrainer:
     def _distributed_any_flag(self, flag):
         """Return whether any rank reported ``flag``."""
         return self._distributed_status_mask(int(bool(flag))) > 0
+
+    def _coordinate_text_shape_guard(
+        self, report, compile_allowed, compile_policy, *, local_error=None,
+    ):
+        """Require every DDP rank to admit its local finite shape plan."""
+        if self.distributed_world_size <= 1:
+            if local_error is not None:
+                raise local_error
+            return report, compile_allowed
+        failed_any = self._distributed_any_flag(
+            local_error is not None or not compile_allowed
+        )
+        if not failed_any:
+            return report, compile_allowed
+        if compile_policy.mode == "strict":
+            error = RuntimeError(
+                "Unsloth: strict mx.compile finite text shape planning "
+                "failed on at least one DDP rank."
+            )
+            if local_error is not None:
+                raise error from local_error
+            raise error
+        reason = report.reason if not compile_allowed else "peer_planner_failure"
+        return replace(
+            report,
+            action="eager",
+            reason=reason,
+            planned_signatures=None,
+            planned_endpoints=(),
+            padding_tokens=0,
+        ), False
 
     def _distributed_status_mask(self, mask):
         """All-sum a small integer status code across ranks."""
@@ -1976,27 +2007,60 @@ class MLXTrainer:
         if (
             hasattr(self, "_batches")
             and not getattr(self, "_is_vlm", False)
-            and self.distributed_world_size <= 1
         ):
-            if self._batches is None:
-                self._prepared_batches_include_epochs = False
-            batches, batch_iter = self._prepare_data(False)
-            total_steps = _resolve_training_steps(
-                args,
-                batches,
-                batch_iter,
-                includes_epochs=getattr(
-                    self, "_prepared_batches_include_epochs", False,
-                ),
-            )
-            _, report, compile_allowed = _plan_single_process_text_shapes(
-                batches,
-                batch_iter,
-                args=args,
-                total_steps=total_steps,
-                is_vlm=False,
-                distributed_world_size=1,
-                compile_policy=build_compile_policy(args=args),
+            preflight_error = None
+            try:
+                if self._batches is None:
+                    self._prepared_batches_include_epochs = False
+                batches, batch_iter = self._prepare_data(False)
+                total_steps = _resolve_training_steps(
+                    args,
+                    batches,
+                    batch_iter,
+                    includes_epochs=getattr(
+                        self, "_prepared_batches_include_epochs", False,
+                    ),
+                )
+                compile_policy = build_compile_policy(args=args)
+            except Exception as exc:
+                preflight_error = exc
+            if self.distributed_world_size > 1:
+                self._raise_distributed_failure(
+                    preflight_error is not None,
+                    "preparing finite text shape guard",
+                    preflight_error,
+                )
+            elif preflight_error is not None:
+                raise preflight_error
+            local_plan_error = None
+            try:
+                _, report, compile_allowed = _plan_single_process_text_shapes(
+                    batches,
+                    batch_iter,
+                    args=args,
+                    total_steps=total_steps,
+                    is_vlm=False,
+                    distributed_world_size=self.distributed_world_size,
+                    compile_policy=compile_policy,
+                )
+            except Exception as exc:
+                local_plan_error = exc
+                report = _shape_guard_report(
+                    "eager",
+                    "planner_error",
+                    resolve_compile_max_variants(args.compile_max_variants),
+                    (
+                        DDP_LOCAL_GRAD_SCOPE
+                        if self.distributed_world_size > 1
+                        else FULL_STEP_SCOPE
+                    ),
+                )
+                compile_allowed = False
+            report, compile_allowed = self._coordinate_text_shape_guard(
+                report,
+                compile_allowed,
+                compile_policy,
+                local_error=local_plan_error,
             )
             self._text_shape_guard_preflight = (
                 batches, batch_iter, total_steps, report, compile_allowed,
@@ -2969,6 +3033,8 @@ class MLXTrainer:
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
+                if isinstance(batches, FiniteTextBatchPlan):
+                    batch_data = batches[scheduled_index]
                 state = [model.state, optimizer.state, mx.random.state]
                 local_error = None
                 try:
@@ -3002,13 +3068,15 @@ class MLXTrainer:
                     scheduled_index = batch_idx % len(batches)
                     if (
                         _use_compile
-                        and _compile_scope == FULL_STEP_SCOPE
+                        and _compile_scope in (
+                            FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE,
+                        )
                         and isinstance(batches, FiniteTextBatchPlan)
                     ):
                         batch_data = batches.materialize(
                             scheduled_index,
                             phase=phase_for_microstep(
-                                FULL_STEP_SCOPE,
+                                _compile_scope,
                                 grad_accum,
                                 it - 1,
                             ),
