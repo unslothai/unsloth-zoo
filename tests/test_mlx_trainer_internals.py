@@ -58,6 +58,46 @@ def _install_shim():
     sys.modules.update(real_mlx_modules)
 
 
+def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    plan = FiniteTextBatchPlan(
+        (
+            _FiniteTextRow((1, 2, 3), offset=1),
+            _FiniteTextRow((4, 5), offset=0),
+        ),
+        ((0, 1),),
+        max_seq_length=8,
+        pad_id=9,
+    )
+
+    assert all(not isinstance(value, mx.array) for value in plan.rows)
+    batch, lengths, labels = plan[0]
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 9]]
+    assert lengths.tolist() == [[1, 3], [0, 2]]
+    assert labels is None
+
+
+def test_finite_text_batch_plan_preserves_label_padding():
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    plan = FiniteTextBatchPlan(
+        (
+            _FiniteTextRow((1, 2, 3), labels=(-100, 2, 3)),
+            _FiniteTextRow((4, 5), labels=(-100, 5)),
+        ),
+        ((0, 1),),
+        max_seq_length=8,
+        pad_id=7,
+    )
+
+    batch, lengths, labels = plan[0]
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 7]]
+    assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert labels.tolist() == [[-100, 2, 3], [-100, 5, -100]]
+
+
 # ---------------------------------------------------------------------------
 # 1. MLXTrainingConfig: full surface check.
 # ---------------------------------------------------------------------------
@@ -218,13 +258,14 @@ def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
     batches = _create_distributed_text_batches(
         dataset,
         batch_size=2,
-        max_seq_length=8,
+        max_seq_length=64,
         seed=7,
         comm_group=FakeWorld(),
         tokenizer=Tokenizer(),
     )
 
     assert np.random.random(3) == pytest.approx(expected)
+    assert batches[0][0].shape == (2, 33)
     rows = batches[0][0].tolist()
     assert rows[0][:2] == [5, 6]
     assert rows[0][2:] == [99] * (len(rows[0]) - 2)
