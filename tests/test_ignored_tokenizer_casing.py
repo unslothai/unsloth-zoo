@@ -4,10 +4,9 @@
 """Regression test: fix_untrained_tokens' IGNORED_TOKENIZER_NAMES guard must match
 case-insensitively.
 
-The list is exported (via UNSLOTH_IGNORED_TOKENIZER_NAMES) fully lowercased, but
-fix_untrained_tokens compared model.config._name_or_path (the canonical mixed-case
-id, e.g. unsloth/Qwen2.5-Coder-7B-Instruct) against it. The guard never matched, so
-fix_untrained_tokens ran on the very models the list exists to leave alone.
+The production list is exported (via UNSLOTH_IGNORED_TOKENIZER_NAMES) fully
+lowercased, but callers may also provide canonical mixed-case IDs. Both the model
+name and configured entries must therefore be normalized before comparison.
 """
 
 from types import SimpleNamespace
@@ -39,16 +38,26 @@ def _model(name):
     )
 
 
-# IGNORED_TOKENIZER_NAMES is stored and exported lowercased.
-_IGNORED = ["unsloth/qwen2.5-coder-7b-instruct"]
+_MODEL_NAME = "unsloth/Qwen2.5-Coder-7B-Instruct"
+_IGNORED_LOWERCASE = ["unsloth/qwen2.5-coder-7b-instruct"]
+_IGNORED_CANONICAL = [_MODEL_NAME]
 _TOK = SimpleNamespace(chat_template = None)
 
 
 def test_ignored_name_matched_case_insensitively():
-    # The canonical mixed-case id must be recognized and skipped (returns early).
+    # The lowercased production entry must match the canonical mixed-case ID.
     result = fix_untrained_tokens(
-        _model("unsloth/Qwen2.5-Coder-7B-Instruct"), _TOK, None,
-        IGNORED_TOKENIZER_NAMES = _IGNORED,
+        _model(_MODEL_NAME), _TOK, None,
+        IGNORED_TOKENIZER_NAMES = _IGNORED_LOWERCASE,
+    )
+    assert result is None
+
+
+def test_canonical_ignored_entry_still_matched():
+    # Preserve callers that pass the canonical ID instead of a lowercased entry.
+    result = fix_untrained_tokens(
+        _model(_MODEL_NAME), _TOK, None,
+        IGNORED_TOKENIZER_NAMES = _IGNORED_CANONICAL,
     )
     assert result is None
 
@@ -58,11 +67,12 @@ def test_non_ignored_name_still_processed():
     with pytest.raises(_GuardPassed):
         fix_untrained_tokens(
             _model("unsloth/Llama-3.1-8B-Instruct"), _TOK, None,
-            IGNORED_TOKENIZER_NAMES = _IGNORED,
+            IGNORED_TOKENIZER_NAMES = _IGNORED_LOWERCASE,
         )
 
 
 if __name__ == "__main__":
     test_ignored_name_matched_case_insensitively()
+    test_canonical_ignored_entry_still_matched()
     test_non_ignored_name_still_processed()
     print("ok")

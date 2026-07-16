@@ -230,10 +230,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
-    # Ignore some model checks for now. IGNORED_TOKENIZER_NAMES is stored fully
-    # lowercased, so lowercase the name before the membership check. Guard against
-    # a None _name_or_path (the raw `in` check tolerated it; .lower() would not).
-    if (model.config._name_or_path or "").lower() in IGNORED_TOKENIZER_NAMES:
+    # Ignore some model checks for now. Normalize both the model name and caller-
+    # provided entries so the comparison is case-insensitive in either direction.
+    model_name = model.config._name_or_path
+    ignored_tokenizer_names = {
+        name.lower() for name in IGNORED_TOKENIZER_NAMES
+    }
+    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
         return
     pass
 
