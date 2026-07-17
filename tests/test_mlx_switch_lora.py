@@ -4,6 +4,7 @@
 
 """MLX LoRA coverage for routed SwitchLinear expert projections."""
 
+import json
 import sys
 import types
 
@@ -280,3 +281,132 @@ def test_independent_vlm_switch_uses_matching_wrapper(monkeypatch, quantized):
     wrapped = model.language_model.model.layers[0].proj
     assert isinstance(wrapped, wrapper_type)
     assert bool(mx.allclose(wrapped(x, indices), before))
+
+
+@pytest.mark.parametrize(
+    "backend,quantized,corrupt",
+    [
+        ("mlx_lm", False, None),
+        ("mlx_lm", True, None),
+        ("mlx_vlm", False, None),
+        ("mlx_vlm", True, None),
+        ("mlx_vlm", False, "fp32"),
+        ("mlx_lm", False, "bf16"),
+        ("mlx_lm", False, "missing_b"),
+        ("mlx_lm", False, "legacy_flattened"),
+        ("mlx_lm", False, "pathless"),
+    ],
+)
+def test_switch_adapter_public_lifecycle(
+    monkeypatch, tmp_path, backend, quantized, corrupt,
+):
+    import mlx.core as mx
+    import mlx_lm.utils as mlx_lm_utils
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from mlx_lm.tuner.lora import LoRASwitchLinear
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.utils import save_lora_adapters, save_merged_model
+
+    switch, quantized_switch, wrapper = (
+        _install_vlm_types(monkeypatch)
+        if backend == "mlx_vlm"
+        else (SwitchLinear, QuantizedSwitchLinear, LoRASwitchLinear)
+    )
+    projection_type = quantized_switch if quantized else switch
+
+    def make_model():
+        mx.random.seed(17)
+        projection = (
+            projection_type()
+            if backend == "mlx_vlm"
+            else projection_type(64, 16, 2, bias=False)
+        )
+        model = _direct_layer_model([_Block(projection)])
+        return model
+
+    trained, base = make_model(), make_model()
+    loader.FastMLXModel.get_peft_model(
+        trained, r=2, lora_alpha=2, target_modules=["proj"],
+        use_gradient_checkpointing=False,
+    )
+    trained.layers[0].proj.lora_b = mx.ones_like(
+        trained.layers[0].proj.lora_b,
+    ) * 0.125
+    trained._hf_repo = "test/switch-base"
+    x = mx.random.normal((1, 2, 1, 1, 64))
+    indices = mx.array([[[0], [1]]])
+    expected = trained.layers[0].proj(x, indices)
+    adapter = tmp_path / f"{backend}-{'q' if quantized else 'dense'}-{corrupt}"
+    save_lora_adapters(trained, adapter)
+    config = json.loads((adapter / "adapter_config.json").read_text())
+    path = "backbone.blocks.0.proj"
+    assert config["unsloth_mlx_lora_module_paths"] == [path]
+    if quantized:
+        assert config["base_resolved_quantization_map"] == {
+            path: {"bits": 4, "group_size": 64, "mode": "affine"},
+        }
+    weights_path = adapter / "adapters.safetensors"
+    weights = mx.load(str(weights_path))
+    assert {value.ndim for value in weights.values()} == {3}
+    if corrupt == "pathless":
+        config.pop("unsloth_mlx_lora_module_paths")
+        (adapter / "adapter_config.json").write_text(json.dumps(config))
+    elif corrupt:
+        if corrupt == "missing_b":
+            weights.pop(f"{path}.lora_b")
+        elif corrupt == "legacy_flattened":
+            lora_a = weights[f"{path}.lora_a"]
+            weights[f"{path}.lora_a"] = lora_a.reshape((-1, lora_a.shape[-1]))
+            config.pop("unsloth_mlx_lora_module_paths")
+            (adapter / "adapter_config.json").write_text(json.dumps(config))
+        else:
+            weights[f"{path}.lora_b"] = weights[f"{path}.lora_b"][..., :1]
+        if corrupt == "bf16":
+            weights = {key: value.astype(mx.bfloat16) for key, value in weights.items()}
+        mx.save_safetensors(str(weights_path), weights)
+
+    original = loader.FastMLXModel.from_pretrained
+    tokenizer = types.SimpleNamespace()
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *args, **kwargs: adapter)
+
+    def load_base(*args, **kwargs):
+        if quantized:
+            assert kwargs["mlx_quantization_config"]["quantize_modules"] == [path]
+        return base, tokenizer
+
+    monkeypatch.setattr(
+        loader.FastMLXModel, "from_pretrained", staticmethod(load_base),
+    )
+    if corrupt not in (None, "pathless"):
+        with pytest.raises(RuntimeError, match="partial adapter"):
+            original(str(adapter), load_in_4bit=False)
+        return
+
+    loaded, tokenizer = original(str(adapter), load_in_4bit=False)
+    assert isinstance(loaded.layers[0].proj, wrapper)
+    assert bool(mx.allclose(loaded.layers[0].proj(x, indices), expected))
+    if not quantized:
+        monkeypatch.setattr(mlx_lm_utils, "save_model", lambda *args, **kwargs: None)
+        monkeypatch.setattr(mlx_lm_utils, "create_model_card", lambda *args, **kwargs: None)
+        tokenizer.save_pretrained = lambda *args, **kwargs: None
+        save_merged_model(loaded, tokenizer, tmp_path / f"merged-{backend}")
+        assert not hasattr(loaded.layers[0].proj, "lora_a")
+        assert bool(mx.allclose(loaded.layers[0].proj(x, indices), expected, atol=1e-5))
+
+
+def test_legacy_switch_rank_layout(tmp_path):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mlx_utils
+
+    module = types.SimpleNamespace(
+        lora_a=mx.zeros((4, 64)), lora_b=mx.zeros((2, 16, 2)),
+    )
+    assert mlx_utils._infer_mlx_lora_rank(module) == 2
+
+    weights = tmp_path / "legacy.safetensors"
+    mx.save_safetensors(str(weights), {
+        "proj.lora_a": module.lora_a.astype(mx.bfloat16),
+        "proj.lora_b": module.lora_b.astype(mx.bfloat16),
+    })
+    assert loader._infer_rank_from_saved_adapter(str(weights), "proj") == 2

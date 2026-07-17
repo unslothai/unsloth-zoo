@@ -5660,6 +5660,18 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    quantized_types = [
+        nn.QuantizedLinear,
+        nn.QuantizedEmbedding,
+        QuantizedSwitchLinear,
+    ]
+    vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
+    if vlm_switch_module is not None:
+        quantized_types.append(vlm_switch_module.QuantizedSwitchLinear)
+    quantized_types = tuple(quantized_types)
+
     quantized = {}
     config = getattr(model, "_config", None)
     if isinstance(config, dict):
@@ -5675,7 +5687,7 @@ def _effective_mlx_quantization_map(model):
         # isinstance, not an exact class-name match: a training-time subclass of
         # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
         # recognised, else embed_tokens is silently dropped from the map.
-        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+        if not isinstance(module, quantized_types):
             continue
         name = _canonical_mlx_quantization_path(name)
         entry = {}
@@ -5831,6 +5843,11 @@ def _infer_mlx_lora_rank(module):
         if lora_a_shape[:-2] != lora_b_shape[:-2]:
             return None
         return int(rank)
+
+    # mlx-lm < 0.28.3 flattened experts into lora_a's leading dimension.
+    if len(lora_a_shape) == 2 and len(lora_b_shape) == 3:
+        experts, _, rank = lora_b_shape
+        return int(rank) if lora_a_shape[0] == experts * rank else None
 
     if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
         return None
