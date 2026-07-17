@@ -399,6 +399,79 @@ def test_padding_budget_scales_to_dense_975_width_schedule():
     assert shared.endpoint_maps == plan.endpoint_maps
 
 
+def test_automatic_work_preflight_uses_deterministic_bounded_fallback(monkeypatch):
+    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    events = [_event(("text",), width) for width in range(10, 50)]
+
+    forward = plan_text_shape_padding_budget(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+    reverse = plan_text_shape_padding_budget(
+        reversed(events), compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert forward.report.action == "bucket"
+    assert forward.report.cap_selection == "fallback"
+    assert forward.report.planned_signatures <= 128
+    assert forward.report.to_dict() == reverse.report.to_dict()
+    assert forward.endpoint_maps == reverse.endpoint_maps
+
+
+def test_large_workload_preflight_skips_exact_dp(monkeypatch):
+    def unexpected_exact(*_args, **_kwargs):
+        raise AssertionError("oversized workloads must skip exact DP")
+
+    monkeypatch.setattr(
+        shape_guard, "_build_padding_budget_frontier", unexpected_exact,
+    )
+    events = [_event(("text",), width) for width in range(1, 2_501)]
+
+    plan = plan_text_shape_padding_budget(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert plan.report.action == "bucket"
+    assert plan.report.cap_selection == "fallback"
+    assert plan.report.planned_signatures <= 128
+    assert plan.report.budget_satisfied is True
+
+
+def test_fallback_reports_unsatisfied_budget_and_structural_impossibility(monkeypatch):
+    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    over_stretch = plan_text_shape_padding_budget(
+        [_event(("text",), 2**index) for index in range(129)],
+        compile_scope=FULL_STEP_SCOPE,
+    )
+    assert over_stretch.report.cap_selection == "fallback"
+    assert over_stretch.report.planned_signatures <= 128
+    assert over_stretch.report.budget_satisfied is False
+    assert over_stretch.report.max_width_stretch > 1.5
+
+    impossible = plan_text_shape_padding_budget(
+        [_event(("family", index), 10) for index in range(129)],
+        compile_scope=FULL_STEP_SCOPE,
+    )
+    assert (impossible.report.action, impossible.report.reason) == (
+        "eager", "irreducible_signatures",
+    )
+
+
+def test_fallback_preserves_phase_aware_catalog_admission(monkeypatch):
+    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    events = [
+        _event(("text",), width, "a" if width % 2 else "b")
+        for width in range(10, 140)
+    ]
+
+    plan = plan_text_shape_padding_budget(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert plan.report.cap_selection == "fallback"
+    assert len(plan.planned_catalog) == plan.report.planned_signatures <= 128
+    assert all(plan.allows(event.family, event.width, event.phase) for event in events)
+
+
 def test_randomized_small_padding_frontiers_match_exhaustive_optima():
     rng = random.Random(8192)
     singleton_events = [

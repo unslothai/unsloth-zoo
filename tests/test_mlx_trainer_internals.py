@@ -331,7 +331,7 @@ def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
     assert coordinated == report
 
 
-def test_automatic_shape_planner_failure_reports_bounded_fallback(monkeypatch):
+def test_automatic_shape_planner_work_limit_uses_bounded_fallback(monkeypatch):
     from unsloth_zoo.mlx import shape_guard
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (
@@ -352,10 +352,51 @@ def test_automatic_shape_planner_failure_reports_bounded_fallback(monkeypatch):
     )
 
     assert plan is not None and frontier is not None
-    assert allowed is False
+    assert allowed is True
+    assert report.action == "bucket"
     assert report.cap_selection == "fallback"
-    assert report.effective_cap == report.cap == 128
-    assert report.budget_satisfied is False
+    assert report.effective_cap == report.cap <= 128
+    assert report.budget_satisfied is True
+
+
+def test_ddp_synchronizes_bounded_fallback_cap(monkeypatch):
+    from unsloth_zoo.mlx import shape_guard
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    args = MLXTrainingConfig(max_steps=40)
+    policy = build_compile_policy(args=args)
+    local_plan, report, allowed, frontier = _plan_single_process_text_shapes(
+        _make_shape_guard_text_plan(tuple(range(10, 50))),
+        None,
+        args=args,
+        total_steps=40,
+        is_vlm=False,
+        distributed_world_size=2,
+        compile_policy=policy,
+        install_plan=False,
+    )
+    shared_cap = min(128, report.effective_cap + 3)
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = lambda _cap: shared_cap
+
+    final_plan, final_report, final_allowed = trainer._coordinate_text_shape_guard(
+        local_plan, frontier, report, allowed, policy, automatic=True,
+    )
+
+    assert final_allowed is True
+    assert final_report.cap_selection == "fallback"
+    assert final_report.effective_cap == shared_cap
+    assert final_report.planned_signatures <= shared_cap
+    assert final_plan.report == final_report
 
 
 def test_text_shape_guard_exact_and_compile_disabled_paths_add_no_padding():
