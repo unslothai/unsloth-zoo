@@ -63,6 +63,39 @@ def _mlx_distributed_backend_from_env():
     return None
 
 
+def _mlx_rank0_resolve_int(comm_group, resolver, context):
+    """Resolve source metadata on rank 0 and synchronize its value or failure."""
+    rank, world_size = _distributed_rank_size(comm_group)
+    if world_size <= 1:
+        return int(resolver())
+
+    status = 0
+    value = 0
+    owner_error = None
+    if rank == 0:
+        try:
+            value = int(resolver())
+            status = 1
+        except Exception as exc:
+            owner_error = exc
+            status = -1
+    metadata = mx.array(
+        [status, value] if rank == 0 else [0, 0], dtype=mx.int64,
+    )
+    metadata = mx.distributed.all_sum(metadata, group=comm_group)
+    mx.eval(metadata)
+    status, value = (int(item) for item in metadata.tolist())
+    if status < 0:
+        if owner_error is not None:
+            raise owner_error
+        raise RuntimeError(f"Unsloth MLX: rank 0 failed while {context}.")
+    if status != 1:
+        raise RuntimeError(
+            f"Unsloth MLX: invalid rank-0 metadata status while {context}."
+        )
+    return value
+
+
 class MLXTrainOutput(dict):
     """Dict-compatible train() result with HF Trainer-style attributes."""
 
@@ -218,13 +251,21 @@ def _mlx_stream_declares_infinite(dataset):
 class _MLXLazyEvalBatchView:
     """Restartable eval batch surface that constructs one lazy pass per use."""
 
-    def __init__(self, dataset, factory, max_batches=None):
+    def __init__(self, dataset, factory, max_batches=None, comm_group=None):
         self._dataset = dataset
         self._factory = factory
         self._max_batches = max_batches
+        self._comm_group = comm_group
 
     def __iter__(self):
-        if self._max_batches is None and _mlx_stream_declares_infinite(self._dataset):
+        declared_infinite = False
+        if self._max_batches is None:
+            declared_infinite = bool(_mlx_rank0_resolve_int(
+                self._comm_group,
+                lambda: _mlx_stream_declares_infinite(self._dataset),
+                "checking whether the streaming eval source is infinite",
+            ))
+        if declared_infinite:
             raise ValueError(
                 "Unsloth MLX: an infinite streaming eval_dataset must set "
                 "max_eval_batches to a positive value (or apply dataset.take) "
@@ -293,6 +334,7 @@ from .utils import (
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
+    _distributed_rank_size,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
 )
@@ -1709,6 +1751,7 @@ class MLXTrainer:
                 eval_dataset,
                 _factory,
                 max_batches=max_batches,
+                comm_group=self.distributed_world,
             )
         return create_batches(
             **common,
@@ -3604,8 +3647,16 @@ class MLXTrainer:
                             "steps for a streaming iterable whose rows may be "
                             "filtered by label masking. Use max_steps instead."
                         )
-                    source_length = _mlx_declared_iterable_length(train_dataset)
-                    if source_length is None:
+                    def _resolve_source_length():
+                        length = _mlx_declared_iterable_length(train_dataset)
+                        return -1 if length is None else length
+
+                    source_length = _mlx_rank0_resolve_int(
+                        comm_group,
+                        _resolve_source_length,
+                        "resolving the streaming text source length",
+                    )
+                    if source_length < 0:
                         raise ValueError(
                             "Unsloth MLX: num_train_epochs requires a streaming "
                             "text iterable with an explicit reliable __len__. Use "

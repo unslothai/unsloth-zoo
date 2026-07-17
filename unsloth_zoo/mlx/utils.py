@@ -5682,6 +5682,7 @@ def _iterate_lazy_text_training_batches(
     repeat=True,
     distributed_pad_mode="cycle",
     expected_rows_per_pass=None,
+    include_epoch=False,
 ):
     """Yield source-ordered text batches without materializing an unsized source.
 
@@ -5773,6 +5774,10 @@ def _iterate_lazy_text_training_batches(
                 labels_expected=state.get("label_state"),
             )
 
+        def _yield_value(local_items):
+            batch = _make_batch(local_items)
+            return (batch, epoch) if include_epoch else batch
+
         while True:
             pending = []
             deferred_final = None
@@ -5849,7 +5854,7 @@ def _iterate_lazy_text_training_batches(
                     pad_mode=distributed_pad_mode,
                 )
                 yielded = True
-                yield _make_batch(local_items)
+                yield _yield_value(local_items)
                 pending = []
 
             if expected_rows_per_pass is not None and (
@@ -5871,7 +5876,7 @@ def _iterate_lazy_text_training_batches(
                     pad_mode=distributed_pad_mode,
                 )
                 yielded = True
-                yield _make_batch(local_items)
+                yield _yield_value(local_items)
 
             if pending:
                 local_items = _rank_slice_distributed_batch(
@@ -5882,7 +5887,7 @@ def _iterate_lazy_text_training_batches(
                     pad_mode=distributed_pad_mode,
                 )
                 yielded = True
-                yield _make_batch(local_items)
+                yield _yield_value(local_items)
 
             exhausted_iterator = current_iterator
             current_iterator = None
@@ -5934,6 +5939,223 @@ def _iterate_lazy_text_training_batches(
                 _close_mlx_owned_iterator(iterator)
             except Exception:
                 pass
+
+
+def _pad_dispatched_text_batch(
+    batch,
+    target_size,
+    *,
+    pad_id,
+    pad_mode,
+    cycle_source=None,
+):
+    """Pad one owner-built global text batch before rank dispatch."""
+    input_ids, lengths, labels = batch
+    row_count = int(input_ids.shape[0])
+    if row_count >= target_size:
+        return input_ids[:target_size], lengths[:target_size], (
+            None if labels is None else labels[:target_size]
+        )
+    if row_count == 0:
+        raise ValueError("Unsloth MLX: cannot dispatch an empty text batch.")
+    if pad_mode not in ("cycle", "empty"):
+        raise ValueError(f"Unsupported distributed pad mode: {pad_mode!r}.")
+
+    missing = target_size - row_count
+    if pad_mode == "empty":
+        padded_ids = mx.full(
+            (missing, int(input_ids.shape[1])), int(pad_id), dtype=input_ids.dtype,
+        )
+        padded_lengths = mx.zeros(
+            (missing, int(lengths.shape[1])), dtype=lengths.dtype,
+        )
+        padded_labels = (
+            None
+            if labels is None
+            else mx.full(
+                (missing, int(labels.shape[1])), -100, dtype=labels.dtype,
+            )
+        )
+    else:
+        source_ids, source_lengths, source_labels = cycle_source or batch
+        if (labels is None) != (source_labels is None):
+            raise ValueError(
+                "Unsloth MLX: streaming text labels changed within one pass."
+            )
+        source_rows = int(source_ids.shape[0])
+        indices = mx.array(
+            [index % source_rows for index in range(missing)], dtype=mx.int32,
+        )
+        padded_ids = mx.take(source_ids, indices, axis=0)
+        padded_lengths = mx.take(source_lengths, indices, axis=0)
+        padded_labels = (
+            None
+            if source_labels is None
+            else mx.take(source_labels, indices, axis=0)
+        )
+
+    width = max(int(input_ids.shape[1]), int(padded_ids.shape[1]))
+
+    def _pad_width(value, fill):
+        missing_width = width - int(value.shape[1])
+        if missing_width <= 0:
+            return value
+        padding = mx.full(
+            (int(value.shape[0]), missing_width), fill, dtype=value.dtype,
+        )
+        return mx.concatenate((value, padding), axis=1)
+
+    input_ids = _pad_width(input_ids, int(pad_id))
+    padded_ids = _pad_width(padded_ids, int(pad_id))
+    if labels is not None:
+        labels = _pad_width(labels, -100)
+        padded_labels = _pad_width(padded_labels, -100)
+    return (
+        mx.concatenate((input_ids, padded_ids), axis=0),
+        mx.concatenate((lengths, padded_lengths), axis=0),
+        None
+        if labels is None
+        else mx.concatenate((labels, padded_labels), axis=0),
+    )
+
+
+def _iterate_dispatched_lazy_text_training_batches(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    *,
+    comm_group,
+    distributed_pad_mode="cycle",
+    **kwargs,
+):
+    """Dispatch rank-0-owned lazy text batches to all data-parallel ranks.
+
+    The owner retains the first global batch of the current pass only to keep
+    legacy cycle-padding deterministic. Non-owner ranks never touch the source.
+    The supplied source is therefore interpreted as the global, unsharded stream.
+    """
+    rank, world_size = _distributed_rank_size(comm_group)
+    target_size = int(batch_size) * world_size
+    if target_size <= 0:
+        raise ValueError("batch_size must be positive for distributed batching.")
+    if distributed_pad_mode not in ("cycle", "empty"):
+        raise ValueError(
+            f"Unsupported distributed pad mode: {distributed_pad_mode!r}."
+        )
+
+    owner_iterator = None
+    owner_contract_error = None
+    owner_tokenizer = tokenizer
+    if rank == 0:
+        try:
+            if isinstance(dataset, _MLXIterableTokenizedDatasetView):
+                owner_tokenizer = dataset._tokenizer
+            source_distribution = getattr(
+                _mlx_lazy_text_source(dataset), "_distributed", None,
+            )
+            if int(getattr(source_distribution, "world_size", 1)) > 1:
+                owner_contract_error = ValueError(
+                    "Unsloth MLX: distributed lazy text dispatch requires the "
+                    "global unsharded Hugging Face iterable. Pass the source "
+                    "before split_dataset_by_node(); MLX owns rank partitioning."
+                )
+        except Exception as exc:
+            owner_contract_error = exc
+        owner_iterator = _iterate_lazy_text_training_batches(
+            dataset,
+            owner_tokenizer,
+            target_size,
+            max_seq_length,
+            comm_group=None,
+            distributed_pad_mode=distributed_pad_mode,
+            include_epoch=True,
+            **kwargs,
+        )
+    cycle_source = None
+    cycle_epoch = None
+    try:
+        while True:
+            owner_error = None
+            epoch = 0
+            rows = 0
+            width = 0
+            has_labels = 0
+            status = 0
+            if rank == 0:
+                try:
+                    if owner_contract_error is not None:
+                        raise owner_contract_error
+                    owner_batch, epoch = next(owner_iterator)
+                    if cycle_epoch != epoch:
+                        cycle_epoch = epoch
+                        cycle_source = owner_batch
+                    owner_batch = _pad_dispatched_text_batch(
+                        owner_batch,
+                        target_size,
+                        pad_id=_mlx_text_pad_id(owner_tokenizer),
+                        pad_mode=distributed_pad_mode,
+                        cycle_source=cycle_source,
+                    )
+                    input_ids, lengths, labels = owner_batch
+                    rows = int(input_ids.shape[0])
+                    width = int(input_ids.shape[1])
+                    has_labels = int(labels is not None)
+                    status = 1
+                except StopIteration:
+                    pass
+                except Exception as exc:
+                    owner_error = exc
+                    status = -1
+
+            metadata = mx.array(
+                [status, rows, width, has_labels]
+                if rank == 0 else [0, 0, 0, 0],
+                dtype=mx.int32,
+            )
+            metadata = mx.distributed.all_sum(metadata, group=comm_group)
+            mx.eval(metadata)
+            status, rows, width, has_labels = (
+                int(value) for value in metadata.tolist()
+            )
+            if status < 0:
+                if owner_error is not None:
+                    raise owner_error
+                raise RuntimeError(
+                    "Unsloth MLX: rank 0 failed while reading the global "
+                    "streaming text source before batch dispatch."
+                )
+            if status == 0:
+                return
+            if rows != target_size or width <= 0:
+                raise RuntimeError(
+                    "Unsloth MLX: rank-0 streaming text dispatch produced "
+                    f"invalid global batch shape ({rows}, {width})."
+                )
+
+            if rank != 0:
+                input_ids = mx.zeros((rows, width), dtype=mx.int32)
+                lengths = mx.zeros((rows, 2), dtype=mx.int32)
+                labels = (
+                    mx.zeros((rows, width), dtype=mx.int64)
+                    if has_labels else None
+                )
+            input_ids = mx.distributed.all_sum(input_ids, group=comm_group)
+            lengths = mx.distributed.all_sum(lengths, group=comm_group)
+            if has_labels:
+                labels = mx.distributed.all_sum(labels, group=comm_group)
+                mx.eval(input_ids, lengths, labels)
+            else:
+                mx.eval(input_ids, lengths)
+            yield (
+                input_ids[rank:target_size:world_size],
+                lengths[rank:target_size:world_size],
+                None
+                if labels is None
+                else labels[rank:target_size:world_size],
+            )
+    finally:
+        _close_mlx_owned_iterator(owner_iterator)
 
 
 def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
@@ -6079,11 +6301,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             is_vlm=False,
             strict=False,
         )
-        yield from _iterate_lazy_text_training_batches(
-            dataset,
-            tokenizer,
-            batch_size,
-            max_seq_length,
+        lazy_batch_kwargs = dict(
             dataset_text_field=dataset_text_field,
             formatting_func=formatting_func,
             dataset_order=dataset_order,
@@ -6091,12 +6309,30 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             completion_only_loss=completion_only_loss,
             assistant_only_loss=assistant_only_loss,
             response_mask_fn=response_mask_fn,
-            comm_group=comm_group,
             require_replayable=require_replayable,
             repeat=repeat,
-            distributed_pad_mode=distributed_pad_mode,
             expected_rows_per_pass=expected_rows_per_pass,
         )
+        if _distributed_rank_size(comm_group)[1] > 1:
+            yield from _iterate_dispatched_lazy_text_training_batches(
+                dataset,
+                tokenizer,
+                batch_size,
+                max_seq_length,
+                comm_group=comm_group,
+                distributed_pad_mode=distributed_pad_mode,
+                **lazy_batch_kwargs,
+            )
+        else:
+            yield from _iterate_lazy_text_training_batches(
+                dataset,
+                tokenizer,
+                batch_size,
+                max_seq_length,
+                comm_group=comm_group,
+                distributed_pad_mode=distributed_pad_mode,
+                **lazy_batch_kwargs,
+            )
         return
 
     dataset = _ensure_reiterable_text_dataset(dataset)

@@ -1105,12 +1105,6 @@ def test_lazy_text_eval_restarts_masks_splits_and_bounds_infinite_sources():
     assert _mlx_stream_declares_infinite(interleave_datasets(
         [base.take(1)] * 2, probabilities=[1.0, 0.0], stopping_strategy="all_exhausted"))
 
-    trainer._distributed_world = types.SimpleNamespace(rank=lambda: 1, size=lambda: 2)
-    padded = list(trainer._create_text_eval_batches(
-        _CountingTextRows([{"text": "7 8"}]), 1, False, False))[0]
-    assert (padded[1].tolist(), padded[2].tolist()) == ([[0, 0]], [[-100, -100]])
-
-
 def test_sized_response_training_defers_lazy_eval_with_override_tokenizer():
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer, MLXTrainingConfig, train_on_responses_only,

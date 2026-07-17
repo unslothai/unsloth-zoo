@@ -39,7 +39,7 @@ from mlx.utils import tree_flatten
 from unsloth_zoo import dataset_utils
 import unsloth_zoo.mlx.trainer as trainer_mod
 from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig, _create_labeled_batches, train_on_responses_only
-from unsloth_zoo.mlx.utils import create_batches, create_ordered_batches, create_vlm_batches, iterate_training_batches, iterate_vlm_training_batches, make_baseline_loss_fn
+from unsloth_zoo.mlx.utils import _MLXIterableTokenizedDatasetView, create_batches, create_ordered_batches, create_vlm_batches, iterate_training_batches, iterate_vlm_training_batches, make_baseline_loss_fn
 
 class TinyTokenizer:
     pad_token_id = eos_token_id = 2
@@ -79,7 +79,36 @@ def eval_loss_for_batches(model, batches):
     return float((all_losses / ntokens).item())
 
 class ReplayableStream:
-    def __iter__(self): return ({"text": f"{i} {i + 20} {i + 30}"} for i in range(10, 15))
+    @property
+    def _ex_iterable(self):
+        if int(world.rank()) != 0: raise AssertionError("non-owner inspected eval stream")
+        return None
+    def __iter__(self):
+        if int(world.rank()) != 0: raise AssertionError("non-owner consumed text stream")
+        return ({"text": f"{i} {i + 20} {i + 30}"} for i in range(10, 15))
+
+class ReplayableLabeledStream:
+    def __iter__(self):
+        if int(world.rank()) != 0: raise AssertionError("non-owner consumed labeled stream")
+        return ({"input_ids": [i, i + 20], "labels": [-100, i + 20]} for i in range(10, 13))
+
+class ReplayableVariableStream:
+    def __iter__(self):
+        if int(world.rank()) != 0: raise AssertionError("non-owner consumed variable stream")
+        return iter(({"input_ids": [10, 30]}, {"input_ids": [11, 31, 41, 51]}, {"input_ids": [12, 32]}))
+
+class RaisingMetadataStream:
+    @property
+    def _distributed(self): raise RuntimeError("owner metadata failure")
+    def __iter__(self): raise AssertionError("metadata failure must precede consumption")
+
+class RankOwnedLengthStream:
+    def __len__(self):
+        if int(world.rank()) != 0: raise AssertionError("non-owner inspected stream length")
+        return 4
+    def __iter__(self):
+        if int(world.rank()) != 0: raise AssertionError("non-owner consumed length stream")
+        return ({"text": f"{i} {i + 20}"} for i in range(10, 14))
 
 class RankFailingStream:
     def __iter__(self):
@@ -101,6 +130,35 @@ trainer.stop_requested = world.rank() == 0
 synced_stop = trainer._distributed_should_stop()
 trainer.stop_requested = False
 
+def stream_replay_probe():
+    full = take_stream_rows(iterate_training_batches(ReplayableStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world), 3)
+    resumed = iterate_training_batches(ReplayableStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world)
+    next(resumed); next(resumed)
+    return [full[2], take_stream_rows(resumed, 1)[0]]
+
+def presharded_stream_error():
+    from datasets import IterableDataset
+    from datasets.distributed import split_dataset_by_node
+    source = IterableDataset.from_generator(lambda: ({"text": f"{i} {i + 20}"} for i in range(4)))
+    source = split_dataset_by_node(source, rank=int(world.rank()), world_size=int(world.size()))
+    try:
+        next(iterate_training_batches(source, TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world))
+    except (RuntimeError, ValueError) as exc:
+        return str(exc)
+    return ""
+
+def owner_metadata_error():
+    try:
+        next(iterate_training_batches(RaisingMetadataStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world))
+    except RuntimeError as exc:
+        return str(exc)
+    return ""
+
+def prepared_override_batches():
+    override = TinyTokenizer(); override.pad_token_id = 9
+    view = _MLXIterableTokenizedDatasetView(ReplayableVariableStream(), override, max_seq_length=8)
+    return [batch.tolist() for batch, _lengths, _labels in iterate_training_batches(view, TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world, repeat=False)]
+
 class TinyLM(nn.Module):
     def __init__(self):
         super().__init__(); self.embed = nn.Embedding(64, 8)
@@ -116,6 +174,12 @@ class TinyLM(nn.Module):
         if self._record_eval_rows:
             self.eval_first_tokens.extend([int(row[0]) for row in x.tolist()])
         return self.proj(self.embed(x))
+
+def epoch_owned_probe():
+    epoch_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=-1, num_train_epochs=1, max_seq_length=8, output_dir=str(Path(sys.argv[1], "epoch_owned")), use_cce=False, gradient_checkpointing=False, completion_only_loss=False, dataset_order="sequential", streaming=True)
+    epoch_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), RankOwnedLengthStream(), args=epoch_args)
+    _batches, batch_iter = epoch_trainer._prepare_data(False)
+    return [int(epoch_trainer._streaming_epoch_batch_count), take_stream_rows(batch_iter, 1)[0]]
 
 class BrokenTinyLM(TinyLM):
     def __call__(self, x):
@@ -154,14 +218,15 @@ param_sum = mx.sum(loop_trainer.model.embed.weight) + mx.sum(loop_trainer.model.
 loop_eval_reference_loss = eval_loss_for_batches(loop_trainer.model, _create_labeled_batches(train_data[:3], TinyTokenizer(), keep_all_labels, batch_size=1, max_seq_length=8, seed=args.seed, dataset_order="sequential"))
 mx.random.seed(1)
 stream_args = MLXTrainingConfig(per_device_train_batch_size=1, gradient_accumulation_steps=1, max_steps=1, logging_steps=1, eval_steps=1, save_steps=0, learning_rate=1e-3, max_seq_length=8, output_dir=str(Path(sys.argv[1], "stream_train_out")), use_cce=False, gradient_checkpointing=False, cast_norm_output_to_input_dtype=False, dataset_order="sequential", streaming=True)
-stream_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), ReplayableStream(), eval_dataset=train_data[:3], args=stream_args)
+stream_eval_data = [{"text": f"{i} {i + 20} {i + 30}"} for i in range(10, 15)]
+stream_trainer = MLXTrainer(TinyLM(), TinyTokenizer(), ReplayableStream(), eval_dataset=ReplayableStream(), args=stream_args)
 stream_events = []
 stream_trainer.save_model = mark("stream_final")
 stream_trainer.add_step_callback(lambda step, *_args: stream_events.append(["step", int(step)]))
 stream_trainer.add_eval_callback(lambda step, loss, _ppl: stream_events.append(["eval", int(step), float(loss)]))
 stream_result = stream_trainer.train()
 stream_param_sum = mx.sum(stream_trainer.model.embed.weight) + mx.sum(stream_trainer.model.proj.weight)
-stream_eval_reference_loss = eval_loss_for_batches(stream_trainer.model, create_batches(train_data[:3], TinyTokenizer(), batch_size=1, max_seq_length=8, seed=stream_args.seed))
+stream_eval_reference_loss = eval_loss_for_batches(stream_trainer.model, create_batches(stream_eval_data, TinyTokenizer(), batch_size=1, max_seq_length=8, seed=stream_args.seed))
 trainer_mod.save_trainable_adapters, trainer_mod.save_optimizer_state, trainer_mod.save_trainer_state = real_save_trainable_adapters, real_save_optimizer_state, real_save_trainer_state
 parity_data = [{"text": f"{i} {i + 1} {i + 2}"} for i in range(10, 18)]
 def make_parity_trainer(output_name, seed=123):
@@ -379,6 +444,12 @@ payload = {
     "ordered": first_token_rows(create_ordered_batches(data, TinyTokenizer(), dataset_order="sequential", **common)),
     "labeled": first_token_rows(_create_labeled_batches(data, TinyTokenizer(), keep_all_labels, dataset_order="sequential", **common)),
     "stream_text": take_stream_rows(iterate_training_batches(ReplayableStream(), TinyTokenizer(), batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world), 2),
+    "stream_replay": stream_replay_probe(),
+    "presharded_stream_error": presharded_stream_error(),
+    "owner_metadata_error": owner_metadata_error(),
+    "prepared_override_batches": prepared_override_batches(),
+    "epoch_owned": epoch_owned_probe(),
+    "stream_labeled_empty": [{"ids": batch.tolist(), "lengths": lengths.tolist(), "labels": labels.tolist()} for batch, lengths, labels in list(iterate_training_batches(ReplayableLabeledStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world, repeat=False, distributed_pad_mode="empty"))],
     "vlm": [[int(row[0]) for row in batch["input_ids"].tolist()] for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 15)], TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world)],
     "vlm_empty_eval": [{"ids": batch["input_ids"].tolist(), "mask": batch["attention_mask"].tolist(), "labels": batch["labels"].tolist()} for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 13)], TinyProcessor(), {"image_token_id": 20}, batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world, distributed_pad_mode="empty")],
     "stream_vlm": take_stream_rows(iterate_vlm_training_batches(ReplayableVLMStream(), TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world), 2),
@@ -429,7 +500,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert [rank["stream_step"] for rank in ranks] == [1, 1]
     assert [rank["stream_compile_enabled"] for rank in ranks] == [True, True]
     assert [rank["stream_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
-    assert [rank["stream_text_eval_rows"] for rank in ranks] == [[10, 12], [11, 2]]
+    assert [rank["stream_text_eval_rows"] for rank in ranks] == [[10, 12, 14], [11, 13, 2]]
     assert ranks[0]["stream_eval_loss"] == pytest.approx(ranks[1]["stream_eval_loss"], abs=1e-6)
     assert ranks[0]["stream_eval_loss"] == pytest.approx(ranks[0]["stream_eval_reference_loss"], abs=1e-6)
     assert ranks[1]["stream_eval_loss"] == pytest.approx(ranks[1]["stream_eval_reference_loss"], abs=1e-6)
@@ -454,7 +525,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert all("runtime fallback is disabled" not in rank["non_compile_error"] for rank in ranks)
     assert all("fetching training batch" in rank["asymmetric_data_error"] for rank in ranks)
     assert "rank 0 failed" in ranks[0]["asymmetric_data_error"]
-    assert "peer rank failed" in ranks[1]["asymmetric_data_error"]
+    assert "rank 0 failed while reading" in ranks[1]["asymmetric_data_error"]
     assert all("zero supervised tokens" in rank["zero_token_error"] for rank in ranks)
     assert ranks[0]["fresh_losses"] == pytest.approx(ranks[0]["resumed_losses"], abs=1e-6)
     assert ranks[0]["resume_param_delta"] < 1e-5
@@ -494,4 +565,16 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["vlm_empty_eval"][1]["mask"][0] == [1, 1, 1, 1]
     assert all(value == -100 for value in ranks[1]["vlm_empty_eval"][1]["labels"][0])
     assert [rank["stream_text"] for rank in ranks] == expected
+    assert all(rank["stream_replay"][0] == rank["stream_replay"][1] for rank in ranks)
+    assert "global unsharded" in ranks[0]["presharded_stream_error"]
+    assert "rank 0 failed" in ranks[1]["presharded_stream_error"]
+    assert "owner metadata failure" in ranks[0]["owner_metadata_error"]
+    assert "rank 0 failed" in ranks[1]["owner_metadata_error"]
+    assert ranks[0]["prepared_override_batches"][1][0] == [12, 32, 9, 9]
+    assert ranks[1]["prepared_override_batches"][1][0] == [10, 30, 9, 9]
+    assert [rank["epoch_owned"] for rank in ranks] == [[2, [10]], [2, [11]]]
+    assert [rank["stream_labeled_empty"][1]["ids"][0][0] for rank in ranks] == [12, 2]
+    assert ranks[0]["stream_labeled_empty"][1]["labels"][0] == [-100, 32]
+    assert ranks[1]["stream_labeled_empty"][1]["lengths"][0] == [0, 0]
+    assert ranks[1]["stream_labeled_empty"][1]["labels"][0] == [-100, -100]
     assert [rank["stream_vlm"] for rank in ranks] == expected_stream
