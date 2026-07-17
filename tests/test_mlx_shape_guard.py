@@ -163,7 +163,7 @@ def test_irreducible_families_and_planner_limits_select_eager(monkeypatch):
 def test_variant_cap_rejects_non_integer_or_out_of_range_values(value):
     with pytest.raises(ValueError, match="compile_max_variants"):
         resolve_compile_max_variants(value)
-    assert resolve_compile_max_variants(None) == 32
+    assert resolve_compile_max_variants(None) == 128
 
 
 def test_report_is_bounded_and_deterministic_across_event_order():
