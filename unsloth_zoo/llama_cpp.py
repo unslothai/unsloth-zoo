@@ -2490,8 +2490,10 @@ def convert_to_gguf(
         ok = _writable_dir_cache.get(d)
         if ok is not None: return ok
         try:
-            probe = os.path.join(d, f".unsloth_gguf_write_test_{os.getpid()}")
-            with open(probe, "wb"): pass
+            # Exclusive, unique temp file (never truncates an existing path or follows
+            # a planted symlink); its existence proves the dir is writable.
+            fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
+            os.close(fd)
             os.remove(probe)
             ok = True
         except Exception:
