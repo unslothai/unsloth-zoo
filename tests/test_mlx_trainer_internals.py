@@ -920,6 +920,127 @@ def test_text_streaming_yields_without_sizing_indexing_or_preconsumption(use_hf)
     assert [row[:2] for row in batch[0].tolist()] == [[1, 11], [2, 12]]
 
 
+def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    class Model:
+        _config = {}
+        def trainable_parameters(self): return {}
+
+    class Rows:
+        def __init__(self): self.pulls = 0
+        def __len__(self): raise AssertionError("must stay unsized")
+        def __getitem__(self, _index): raise AssertionError("must stay unindexed")
+        def take(self, _count): return [{"value": "raw"}]
+        def __iter__(self):
+            self.pulls += 1
+            yield {"value": 1}
+
+    rows = Rows()
+    trainer = MLXTrainer(
+        Model(), _streaming_text_tokenizer(), rows,
+        formatting_func=lambda row: {"text": f"{row['value']} 2"},
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, completion_only_loss=False,
+            max_seq_length=8,
+        ),
+    )
+
+    assert rows.pulls == 0
+    assert not hasattr(trainer.train_dataset, "__len__")
+    assert not hasattr(trainer.train_dataset, "__getitem__")
+    assert not hasattr(trainer.train_dataset, "take")
+    assert next(iter(trainer.train_dataset)) == {"input_ids": [1, 2]}
+    assert rows.pulls == 1
+    parameters = list(inspect.signature(iterate_training_batches).parameters)
+    assert parameters.index("response_mask_fn") > parameters.index("require_replayable")
+
+
+def test_train_on_responses_only_masks_unsized_text_lazily():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, train_on_responses_only,
+    )
+
+    class Model:
+        _config = {}
+        def trainable_parameters(self): return {}
+
+    class Encoding:
+        def __init__(self, input_ids): self.input_ids = input_ids
+
+    class Tokenizer:
+        eos_token_id = None
+        pad_token_id = 0
+        def __init__(self, offset=0):
+            self.offset = offset
+            self.chat_template = None
+        def encode(self, text, add_special_tokens=True):
+            return [int(part) + self.offset for part in str(text).split()]
+        def __call__(self, text, **_kwargs):
+            return Encoding(self.encode(text, add_special_tokens=False))
+        def apply_chat_template(self, messages, tokenize=False, **_kwargs):
+            ids = []
+            for message in messages:
+                ids.append(20 if message["role"] == "assistant" else 10)
+                ids.extend(int(part) for part in message["content"].split())
+            return ids if tokenize else " ".join(str(token) for token in ids)
+
+    class Rows:
+        def __init__(self): self.pulls = 0
+        def __iter__(self):
+            values = (
+                "10 1",
+                "10 1 20 2 3",
+                "",
+                {"messages": [
+                    {"role": "user", "content": "4"},
+                    {"role": "assistant", "content": "5"},
+                ]},
+            )
+            for value in values:
+                self.pulls += 1
+                yield value if isinstance(value, dict) else {"text": value}
+
+    rows = Rows()
+    lazy_eval = Rows()
+    trainer = MLXTrainer(
+        Model(), Tokenizer(offset=100), rows,
+        eval_dataset={
+            "sized": [{"text": "10 6 20 7"}],
+            "lazy": lazy_eval,
+        },
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, per_device_train_batch_size=1,
+            completion_only_loss=False, dataset_order="sequential",
+            max_seq_length=8, chat_template="{{ messages }}",
+        ),
+    )
+    train_on_responses_only(
+        trainer, instruction_part="10", response_part="20", force_match=True,
+        tokenizer=Tokenizer(),
+    )
+
+    assert rows.pulls == 0
+    prepared_rows = iter(trainer.train_dataset)
+    public_row = next(prepared_rows)
+    assert public_row == {
+        "input_ids": [10, 1, 20, 2, 3],
+        "labels": [-100, -100, -100, 2, 3],
+    }
+    assert rows.pulls == 2  # the fully masked first row is legitimately filtered
+    assert next(prepared_rows) == {
+        "input_ids": [10, 4, 20, 5],
+        "labels": [-100, -100, -100, 5],
+    }
+    assert rows.pulls == 4  # an empty labeled row is filtered, not schema drift
+    assert trainer._eval_batches_labeled is None
+    assert trainer.eval_dataset["sized"][0]["labels"] == [-100, -100, -100, 7]
+    assert lazy_eval.pulls == 0
+
+
 def test_raw_text_streaming_matches_sized_sequential_order():
     class ReplayableRows:
         def __init__(self, rows):
@@ -1014,6 +1135,55 @@ def test_text_streaming_rejects_incremental_schema_drift(rows, match):
 
     next(batches)
     with pytest.raises(ValueError, match=match):
+        next(batches)
+
+
+def test_response_masking_preserves_pretokenized_label_state_validation():
+    rows = iter([
+        {"input_ids": [1, 2], "labels": [-100, 2]},
+        {"input_ids": [3, 4]},
+    ])
+
+    def response_mask(batch):
+        return {
+            "labels": [[-100, input_ids[-1]] for input_ids in batch["input_ids"]]
+        }
+
+    batches = _streaming_text_batches(
+        rows,
+        completion_only_loss=False,
+        response_mask_fn=response_mask,
+    )
+    next(batches)
+    with pytest.raises(ValueError, match="must not be mixed"):
+        next(batches)
+
+
+def test_response_masking_does_not_replace_formatter_completion_boundary():
+    def response_mask(batch):
+        return {
+            "labels": [[-100, input_ids[-1]] for input_ids in batch["input_ids"]]
+        }
+
+    batches = _streaming_text_batches(
+        iter([{"prompt": "1", "completion": " 2"}]),
+        formatting_func=lambda _row: {"input_ids": [1, 2]},
+        response_mask_fn=response_mask,
+    )
+    with pytest.raises(ValueError, match="drops the completion boundary"):
+        next(batches)
+
+
+@pytest.mark.parametrize("formatted", [{"input_ids": [1, 2]}, {"text": "1 2"}])
+def test_fully_masked_response_still_validates_completion_boundary(formatted):
+    batches = _streaming_text_batches(
+        iter([{"prompt": "1", "completion": " 2"}]),
+        formatting_func=lambda _row: formatted,
+        response_mask_fn=lambda batch: {
+            "labels": [[-100] * len(ids) for ids in batch["input_ids"]]
+        },
+    )
+    with pytest.raises(ValueError, match="drops the completion boundary"):
         next(batches)
 
 
@@ -1348,6 +1518,43 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     )
 
     assert received["last_response_only"] is True
+
+
+def test_response_mask_closure_does_not_normalize_explicit_tokenizer(monkeypatch):
+    import unsloth_zoo.dataset_utils as dataset_utils
+    from unsloth_zoo.mlx.trainer import train_on_responses_only
+
+    class CallableTokenizer:
+        chat_template = None
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+    tokenizer = CallableTokenizer()
+    trainer = types.SimpleNamespace(
+        _is_vlm=False,
+        args=types.SimpleNamespace(
+            streaming=True,
+            chat_template="{{ messages }}",
+        ),
+        model=types.SimpleNamespace(_config={}),
+        tokenizer=tokenizer,
+        _train_dataset_for_batches=lambda: iter([{"text": "1 2"}]),
+    )
+    monkeypatch.setattr(
+        dataset_utils,
+        "train_on_responses_only",
+        lambda *args, **kwargs: (lambda batch: batch),
+    )
+
+    train_on_responses_only(
+        trainer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        tokenizer=tokenizer,
+        return_function=True,
+    )
+
+    assert tokenizer.chat_template is None
 
 
 def test_response_mask_tokenizer_rejects_encode_only_tokenizer():

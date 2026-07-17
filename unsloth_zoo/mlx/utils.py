@@ -3402,6 +3402,76 @@ def _is_mlx_hf_iterable_text_source(dataset):
     return isinstance(dataset, HFIterableDataset)
 
 
+def _mlx_lazy_text_source(dataset):
+    """Return the raw source beneath an MLX prepared iterable view."""
+    return getattr(dataset, "_mlx_source_dataset", dataset)
+
+
+class _MLXIterableTokenizedDatasetView:
+    """Iterable-only public view over MLX's lazy text normalization pipeline.
+
+    The view deliberately has no ``__len__`` or ``__getitem__``. It preserves
+    the source's replay/one-shot behavior and forwards epoch changes without
+    consuming a row during construction.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        *,
+        dataset_text_field="text",
+        formatting_func=None,
+        append_eos=True,
+        completion_only_loss=None,
+        assistant_only_loss=False,
+        max_seq_length=None,
+        response_mask_fn=None,
+    ):
+        self._mlx_source_dataset = dataset
+        self._tokenizer = tokenizer
+        self._dataset_text_field = dataset_text_field
+        self._formatting_func = formatting_func
+        self._append_eos = append_eos
+        self._completion_only_loss = completion_only_loss
+        self._assistant_only_loss = assistant_only_loss
+        self._max_seq_length = max_seq_length
+        self._response_mask_fn = response_mask_fn
+
+    def set_epoch(self, epoch):
+        set_epoch = getattr(self._mlx_source_dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
+    def set_response_mask(self, mask_fn):
+        self._response_mask_fn = mask_fn
+
+    def set_tokenizer(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def _iter_tokenized_rows(self, dataset=None, *, state=None):
+        source = self._mlx_source_dataset if dataset is None else dataset
+        return _iter_lazy_tokenized_text_rows(
+            source,
+            self._tokenizer,
+            dataset_text_field=self._dataset_text_field,
+            formatting_func=self._formatting_func,
+            append_eos=self._append_eos,
+            completion_only_loss=self._completion_only_loss,
+            assistant_only_loss=self._assistant_only_loss,
+            max_seq_length=self._max_seq_length,
+            response_mask_fn=self._response_mask_fn,
+            state=state,
+        )
+
+    def __iter__(self):
+        for input_ids, labels in self._iter_tokenized_rows():
+            row = {"input_ids": list(input_ids)}
+            if labels is not None:
+                row["labels"] = list(labels)
+            yield row
+
+
 def _labeled_row_has_supervision(labels, max_seq_length):
     # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift,
     # length-capped); an all-masked batch aborts training. labels=None always kept.
@@ -5200,6 +5270,30 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
                 yield (ids, 0)
 
 
+def _apply_mlx_response_mask_to_text_row(input_ids, labels, mask_fn):
+    """Apply the CUDA response-marker closure to one tokenized text row."""
+    mask_batch = {"input_ids": [list(input_ids)]}
+    if labels is not None:
+        # The shared CUDA closure accepts tensor-like labels with ``tolist``.
+        mask_batch["labels"] = np.asarray([labels], dtype=np.int64)
+    result = mask_fn(mask_batch)
+    masked = result.get("labels") if isinstance(result, Mapping) else None
+    if hasattr(masked, "tolist"):
+        masked = masked.tolist()
+    if not isinstance(masked, (list, tuple)) or len(masked) != 1:
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only masking must return one "
+            "labels row for each input_ids row."
+        )
+    masked = _coerce_mlx_token_list(masked[0], "labels")
+    if len(masked) != len(input_ids):
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only labels must match "
+            "input_ids length."
+        )
+    return list(input_ids), masked
+
+
 def _iter_lazy_tokenized_text_rows(
     dataset,
     tokenizer,
@@ -5210,6 +5304,7 @@ def _iter_lazy_tokenized_text_rows(
     completion_only_loss=None,
     assistant_only_loss=False,
     max_seq_length=None,
+    response_mask_fn=None,
     state=None,
 ):
     """Normalize an unsized source one row at a time and lock its schema."""
@@ -5288,7 +5383,7 @@ def _iter_lazy_tokenized_text_rows(
     ):
         # Empty label-owned rows have no token labels, but they also are not an
         # unlabeled schema transition. A non-None sentinel preserves that fact.
-        label_owned = assistant_only_loss or (
+        label_owned = response_mask_fn is not None or assistant_only_loss or (
             completion_mode is True and has_completion_boundary
         )
         return () if label_owned else None
@@ -5368,10 +5463,23 @@ def _iter_lazy_tokenized_text_rows(
             )
             if tokenized is not None:
                 ids, labels = tokenized
+                source_labels = labels
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
                     labels = (
                         labels[:max_seq_length] if labels is not None else None
+                    )
+                    source_labels = (
+                        source_labels[:max_seq_length]
+                        if source_labels is not None else None
+                    )
+                source_usable = (
+                    len(ids) >= 2
+                    and _labeled_row_has_supervision(source_labels, len(ids))
+                )
+                if response_mask_fn is not None:
+                    ids, labels = _apply_mlx_response_mask_to_text_row(
+                        ids, labels, response_mask_fn,
                     )
                 usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
@@ -5379,8 +5487,8 @@ def _iter_lazy_tokenized_text_rows(
                 if (
                     formatter_applied
                     and row_completion_only_loss is True
-                    and labels is None
-                    and usable
+                    and source_labels is None
+                    and source_usable
                 ):
                     if formatter_needs_completion_boundary:
                         raise ValueError(
@@ -5397,7 +5505,7 @@ def _iter_lazy_tokenized_text_rows(
                     )
                 _validate_state(
                     "pretokenized",
-                    labels,
+                    source_labels,
                     usable=usable,
                     completion_mode=row_completion_only_loss,
                 )
@@ -5423,6 +5531,10 @@ def _iter_lazy_tokenized_text_rows(
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
                     labels = labels[:max_seq_length]
+                if response_mask_fn is not None:
+                    ids, labels = _apply_mlx_response_mask_to_text_row(
+                        ids, labels, response_mask_fn,
+                    )
                 usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
                 )
@@ -5472,7 +5584,11 @@ def _iter_lazy_tokenized_text_rows(
             if not texts:
                 _validate_state(
                     "raw",
-                    None,
+                    _filtered_label_observation(
+                        row_completion_only_loss,
+                        item_has_completion_boundary
+                        or row_has_completion_boundary,
+                    ),
                     usable=False,
                     completion_mode=row_completion_only_loss,
                 )
@@ -5483,9 +5599,17 @@ def _iter_lazy_tokenized_text_rows(
                     ids.append(int(eos_id))
                 if max_seq_length is not None:
                     ids = ids[:max_seq_length]
-                usable = len(ids) >= 2
+                source_usable = len(ids) >= 2
+                labels = None
+                if response_mask_fn is not None:
+                    ids, labels = _apply_mlx_response_mask_to_text_row(
+                        ids, None, response_mask_fn,
+                    )
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                )
                 if (
-                    usable
+                    source_usable
                     and formatter_needs_completion_boundary
                     and row_completion_only_loss is True
                 ):
@@ -5496,19 +5620,19 @@ def _iter_lazy_tokenized_text_rows(
                         "Apply your formatting before passing the dataset, or set "
                         "completion_only_loss=False."
                     )
-                if usable and row_completion_only_loss is True:
+                if source_usable and row_completion_only_loss is True:
                     raise ValueError(
                         "Unsloth MLX: text completion_only_loss=True requires "
                         "prompt/completion rows for streaming text training."
                     )
                 _validate_state(
                     "raw",
-                    None,
+                    labels,
                     usable=usable,
                     completion_mode=row_completion_only_loss,
                 )
                 if usable:
-                    yield ids, None
+                    yield ids, labels
 
 
 def _close_mlx_owned_iterator(iterator):
@@ -5532,6 +5656,7 @@ def _iterate_lazy_text_training_batches(
     append_eos=True,
     completion_only_loss=None,
     assistant_only_loss=False,
+    response_mask_fn=None,
     comm_group=None,
     require_replayable=False,
 ):
@@ -5550,10 +5675,16 @@ def _iterate_lazy_text_training_batches(
     if dataset_order not in (None, "default", "sequential"):
         raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
 
+    prepared_view = (
+        dataset if isinstance(dataset, _MLXIterableTokenizedDatasetView) else None
+    )
+    if prepared_view is not None:
+        tokenizer = prepared_view._tokenizer
+    source_dataset = _mlx_lazy_text_source(dataset)
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     state = {}
     epoch = 0
-    set_epoch = getattr(dataset, "set_epoch", None)
+    set_epoch = getattr(source_dataset, "set_epoch", None)
 
     def _set_epoch(value):
         if callable(set_epoch):
@@ -5573,12 +5704,12 @@ def _iterate_lazy_text_training_batches(
         )
 
     _set_epoch(0)
-    current_iterator = iter(dataset)
+    current_iterator = iter(source_dataset)
     cached_next_iterator = None
     try:
-        if isinstance(dataset, Iterator):
+        if isinstance(source_dataset, Iterator):
             replayable = False
-        elif _is_mlx_hf_iterable_text_source(dataset):
+        elif _is_mlx_hf_iterable_text_source(source_dataset):
             replayable = True
         else:
             replayable = None
@@ -5588,7 +5719,7 @@ def _iterate_lazy_text_training_batches(
                 raise _resume_replay_error()
             if replayable is None:
                 try:
-                    candidate = iter(dataset)
+                    candidate = iter(source_dataset)
                 except Exception as exc:
                     raise _resume_replay_error() from exc
                 if candidate is current_iterator:
@@ -5617,17 +5748,25 @@ def _iterate_lazy_text_training_batches(
             pending = []
             padding_source = []
             yielded = False
-            for row in _iter_lazy_tokenized_text_rows(
-                current_iterator,
-                tokenizer,
-                dataset_text_field=dataset_text_field,
-                formatting_func=formatting_func,
-                append_eos=append_eos,
-                completion_only_loss=completion_only_loss,
-                assistant_only_loss=assistant_only_loss,
-                max_seq_length=max_seq_length,
-                state=state,
-            ):
+            row_iterator = (
+                prepared_view._iter_tokenized_rows(
+                    current_iterator, state=state,
+                )
+                if prepared_view is not None
+                else _iter_lazy_tokenized_text_rows(
+                    current_iterator,
+                    tokenizer,
+                    dataset_text_field=dataset_text_field,
+                    formatting_func=formatting_func,
+                    append_eos=append_eos,
+                    completion_only_loss=completion_only_loss,
+                    assistant_only_loss=assistant_only_loss,
+                    max_seq_length=max_seq_length,
+                    response_mask_fn=response_mask_fn,
+                    state=state,
+                )
+            )
+            for row in row_iterator:
                 if len(padding_source) < global_batch_size:
                     padding_source.append(row)
                 pending.append(row)
@@ -5670,7 +5809,7 @@ def _iterate_lazy_text_training_batches(
                 del exhausted_iterator
                 continue
             try:
-                candidate = iter(dataset)
+                candidate = iter(source_dataset)
             except Exception as exc:
                 if replayable is True:
                     raise RuntimeError(
@@ -5821,7 +5960,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              model_name=None, model_type=None,
                              append_eos=True, completion_only_loss=None,
                              assistant_only_loss=False, dataset_order="default",
-                             comm_group=None, require_replayable=False):
+                             comm_group=None, require_replayable=False,
+                             response_mask_fn=None):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -5854,6 +5994,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             append_eos=append_eos,
             completion_only_loss=completion_only_loss,
             assistant_only_loss=assistant_only_loss,
+            response_mask_fn=response_mask_fn,
             comm_group=comm_group,
             require_replayable=require_replayable,
         )

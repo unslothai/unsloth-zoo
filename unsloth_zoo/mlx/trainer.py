@@ -171,6 +171,8 @@ from .utils import (
     create_batches,
     create_ordered_batches,
     iterate_training_batches,
+    _is_mlx_lazy_text_source,
+    _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
@@ -712,6 +714,34 @@ class MLXTrainer:
             self.args.packing = False
 
         if (
+            not self._is_vlm
+            and self.train_dataset is not None
+            and self.tokenizer is not None
+            and self.args.streaming
+            and _is_mlx_lazy_text_source(self.train_dataset)
+        ):
+            config = getattr(self.model, "_config", {})
+            model_type = config.get("model_type") if isinstance(config, dict) else None
+            self.tokenizer = normalize_mlx_chat_template(
+                self.tokenizer,
+                chat_template=getattr(self.args, "chat_template", None),
+                model_name=getattr(self.model, "_hf_repo", None),
+                model_type=model_type,
+                is_vlm=False,
+                strict=False,
+            )
+            self.train_dataset = _MLXIterableTokenizedDatasetView(
+                self.train_dataset,
+                self.tokenizer,
+                dataset_text_field=self.args.dataset_text_field,
+                formatting_func=self.formatting_func,
+                append_eos=bool(getattr(self.args, "append_eos", True)),
+                completion_only_loss=_text_completion_only_loss_arg(self.args),
+                assistant_only_loss=_text_assistant_only_loss_arg(self.args),
+                max_seq_length=self.args.max_seq_length,
+            )
+            self._mlx_train_dataset_for_batches = self.train_dataset
+        elif (
             not self._is_vlm
             and self.train_dataset is not None
             and self.tokenizer is not None
@@ -3903,6 +3933,81 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
         )
 
 
+def _prepare_response_labeled_eval_batches(
+    trainer,
+    tokenizer,
+    mask_fn,
+    *,
+    sized_only=False,
+):
+    """Prepare response-masked text eval batches, optionally only when sized."""
+    if trainer.eval_dataset is None:
+        return False
+    eval_datasets = (
+        list(trainer.eval_dataset.values())
+        if isinstance(trainer.eval_dataset, dict)
+        else [trainer.eval_dataset]
+    )
+    lazy_splits = [
+        _is_mlx_lazy_text_source(dataset) for dataset in eval_datasets
+    ]
+    if sized_only and all(lazy_splits):
+        return False
+
+    args = trainer.args
+    eval_batch_size = (
+        getattr(args, "per_device_eval_batch_size", None)
+        or args.per_device_train_batch_size
+    )
+    comm_group = getattr(trainer, "distributed_world", None)
+
+    def _create(eval_dataset):
+        batches, response_masked_dataset = _create_labeled_batches(
+            dataset=eval_dataset,
+            tokenizer=tokenizer,
+            mask_fn=mask_fn,
+            batch_size=eval_batch_size,
+            max_seq_length=args.max_seq_length,
+            formatting_func=trainer.formatting_func,
+            dataset_text_field=args.dataset_text_field,
+            seed=args.seed,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(trainer.model, "_hf_repo", None),
+            model_type=(
+                getattr(trainer.model, "_config", {}).get("model_type")
+                if isinstance(getattr(trainer.model, "_config", {}), dict)
+                else None
+            ),
+            append_eos=bool(getattr(args, "append_eos", True)),
+            dataset_order=getattr(args, "dataset_order", "default"),
+            preserve_dataset_order=bool(
+                getattr(args, "preserve_dataset_order", False)
+            ),
+            return_dataset=True,
+            comm_group=comm_group,
+            distributed_pad_mode="empty",
+        )
+        return batches, response_masked_dataset
+
+    if isinstance(trainer.eval_dataset, dict):
+        if sized_only and any(lazy_splits):
+            for key, value in trainer.eval_dataset.items():
+                if _is_mlx_lazy_text_source(value):
+                    continue
+                _unused_batches, split_dataset = _create(value)
+                trainer.eval_dataset[key] = split_dataset
+            return False
+        eval_batches = {}
+        for key, value in trainer.eval_dataset.items():
+            split_batches, split_dataset = _create(value)
+            eval_batches[key] = split_batches
+            trainer.eval_dataset[key] = split_dataset
+    else:
+        eval_batches, trainer.eval_dataset = _create(trainer.eval_dataset)
+    trainer._eval_batches_labeled = eval_batches
+    return True
+
+
 def train_on_responses_only(
     trainer,
     instruction_part=None,
@@ -3949,6 +4054,23 @@ def train_on_responses_only(
 
     # Callable HF tokenizer for token matching and text batch encoding.
     _tokenizer = _resolve_response_mask_tokenizer(_source)
+    if (
+        not return_function
+        and trainer is not None
+        and not trainer._is_vlm
+        and trainer.args.streaming
+        and _is_mlx_lazy_text_source(trainer._train_dataset_for_batches())
+    ):
+        config = getattr(trainer.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        _tokenizer = normalize_mlx_chat_template(
+            _tokenizer,
+            chat_template=getattr(trainer.args, "chat_template", None),
+            model_name=getattr(trainer.model, "_hf_repo", None),
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
 
     # Omitted markers -> auto-detect from the right chat template (see helper).
     if instruction_part is None and response_part is None:
@@ -3984,8 +4106,38 @@ def train_on_responses_only(
         trainer._vlm_response_mask_fn = mask_fn
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
-        # Text path: tokenize, mask, and create batches now
         args = trainer.args
+        train_dataset = trainer._train_dataset_for_batches()
+        if args.streaming and _is_mlx_lazy_text_source(train_dataset):
+            if not isinstance(train_dataset, _MLXIterableTokenizedDatasetView):
+                train_dataset = _MLXIterableTokenizedDatasetView(
+                    train_dataset,
+                    _tokenizer,
+                    dataset_text_field=args.dataset_text_field,
+                    formatting_func=trainer.formatting_func,
+                    append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=_text_completion_only_loss_arg(args),
+                    assistant_only_loss=_text_assistant_only_loss_arg(args),
+                    max_seq_length=args.max_seq_length,
+                )
+                trainer.train_dataset = train_dataset
+                trainer._mlx_train_dataset_for_batches = train_dataset
+            else:
+                train_dataset.set_tokenizer(_tokenizer)
+            train_dataset.set_response_mask(mask_fn)
+            trainer._mlx_response_mask_fn = mask_fn
+            trainer._batches = None
+            trainer._eval_batches_labeled = None
+            _prepare_response_labeled_eval_batches(
+                trainer,
+                _tokenizer,
+                mask_fn,
+                sized_only=True,
+            )
+            print("Unsloth: train_on_responses_only enabled (lazy text mode).")
+            return trainer
+
+        # Eager/sized text path: tokenize, mask, and create batches now.
         total_batches_needed = (
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
@@ -3998,7 +4150,6 @@ def train_on_responses_only(
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
-        train_dataset = trainer._train_dataset_for_batches()
         comm_group = getattr(trainer, "distributed_world", None)
         batches, response_masked_dataset = _create_labeled_batches(
             dataset=train_dataset,
@@ -4039,53 +4190,11 @@ def train_on_responses_only(
         )
         trainer._batches = batches
 
-        # Process eval dataset too
-        if trainer.eval_dataset is not None:
-            eval_batch_size = (
-                getattr(args, "per_device_eval_batch_size", None)
-                or args.per_device_train_batch_size
-            )
-
-            def _create_labeled_eval_batches(eval_dataset):
-                """Build response-masked eval batches for one dataset split."""
-                batches, response_masked_dataset = _create_labeled_batches(
-                    dataset=eval_dataset,
-                    tokenizer=_tokenizer,
-                    mask_fn=mask_fn,
-                    batch_size=eval_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    formatting_func=trainer.formatting_func,
-                    dataset_text_field=args.dataset_text_field,
-                    seed=args.seed,
-                    chat_template=getattr(args, "chat_template", None),
-                    model_name=getattr(trainer.model, "_hf_repo", None),
-                    model_type=(
-                        getattr(trainer.model, "_config", {}).get("model_type")
-                        if isinstance(getattr(trainer.model, "_config", {}), dict)
-                        else None
-                    ),
-                    append_eos=bool(getattr(args, "append_eos", True)),
-                    dataset_order=getattr(args, "dataset_order", "default"),
-                    preserve_dataset_order=bool(
-                        getattr(args, "preserve_dataset_order", False)
-                    ),
-                    return_dataset=True,
-                    comm_group=comm_group,
-                    distributed_pad_mode="empty",
-                )
-                return batches, response_masked_dataset
-
-            if isinstance(trainer.eval_dataset, dict):
-                eval_batches = {}
-                for key, value in trainer.eval_dataset.items():
-                    split_batches, split_dataset = _create_labeled_eval_batches(value)
-                    eval_batches[key] = split_batches
-                    trainer.eval_dataset[key] = split_dataset
-            else:
-                eval_batches, trainer.eval_dataset = _create_labeled_eval_batches(
-                    trainer.eval_dataset
-                )
-            trainer._eval_batches_labeled = eval_batches
+        _prepare_response_labeled_eval_batches(
+            trainer,
+            _tokenizer,
+            mask_fn,
+        )
 
         print(f"Unsloth: train_on_responses_only enabled "
               f"({len(batches)} batches prepared).")
