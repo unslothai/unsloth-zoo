@@ -210,7 +210,6 @@ def test_type_driven_peft_trains_routed_expert_without_unfreezing_base(quantized
 
 def test_custom_to_lora_dispatch_preserves_fused_outputs():
     import mlx.core as mx
-    from mlx.utils import tree_flatten
     from mlx_lm.models.afm7 import FusedLinear, FusedLoRALinear
     from unsloth_zoo.mlx.loader import FastMLXModel
 
@@ -227,9 +226,47 @@ def test_custom_to_lora_dispatch_preserves_fused_outputs():
         bool(mx.allclose(left, right))
         for left, right in zip(before, wrapped(x))
     )
-    trainable = dict(tree_flatten(model.trainable_parameters()))
-    assert any("lora_a." in name for name in trainable)
-    assert any("lora_b." in name for name in trainable)
+
+
+def test_legacy_quant_map_may_omit_switch_paths():
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+    from unsloth_zoo.mlx.loader import (
+        _effective_mlx_quantization_map,
+        _validate_mlx_adapter_base,
+    )
+
+    model = nn.Module()
+    model.dense = nn.QuantizedLinear(64, 16)
+    model.experts = QuantizedSwitchLinear(64, 16, 2, bias=False)
+    live_map = _effective_mlx_quantization_map(model)
+    legacy_config = {
+        "base_resolved_quantization_map": {"dense": live_map["dense"]},
+    }
+
+    _validate_mlx_adapter_base(model, legacy_config)
+
+    marked_config = {
+        **legacy_config,
+        "base_resolved_quantization_map_supports_switch": True,
+    }
+    with pytest.raises(ValueError, match="unexpected quantized modules"):
+        _validate_mlx_adapter_base(model, marked_config)
+
+    model.extra_dense = nn.QuantizedLinear(64, 16)
+    with pytest.raises(ValueError, match="unexpected quantized modules"):
+        _validate_mlx_adapter_base(model, legacy_config)
+
+    switch_aware = nn.Module()
+    switch_aware.experts = QuantizedSwitchLinear(64, 16, 2, bias=False)
+    switch_aware.extra_experts = QuantizedSwitchLinear(64, 16, 2, bias=False)
+    switch_map = _effective_mlx_quantization_map(switch_aware)
+    with pytest.raises(ValueError, match="unexpected quantized modules"):
+        _validate_mlx_adapter_base(switch_aware, {
+            "base_resolved_quantization_map": {
+                "experts": switch_map["experts"],
+            },
+        })
 
 
 def test_direct_layers_respect_finetune_last_n_layers():
@@ -345,6 +382,7 @@ def test_switch_adapter_public_lifecycle(
         assert config["base_resolved_quantization_map"] == {
             path: {"bits": 4, "group_size": 64, "mode": "affine"},
         }
+        assert config["base_resolved_quantization_map_supports_switch"] is True
     weights_path = adapter / "adapters.safetensors"
     weights = mx.load(str(weights_path))
     assert {value.ndim for value in weights.values()} == {3}

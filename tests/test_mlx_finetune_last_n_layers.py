@@ -87,7 +87,6 @@ def test_get_peft_model_passes_finetune_last_n_layers_through(monkeypatch):
         "model.layers.1.mlp.gate_proj",
     ])
     monkeypatch.setattr(L, "_apply_mlx_lora_initialization", lambda m, init: None)
-    monkeypatch.setattr(L, "_unfreeze_mlx_lora_parameters", lambda m: None)
     monkeypatch.setattr(L, "linear_to_lora_layers", fake_linear_to_lora_layers)
 
     # Case 1: default (None) -> all 8 layers

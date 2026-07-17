@@ -5928,9 +5928,11 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     resolved_map = _effective_mlx_quantization_map(model)
     if resolved_map:
         adapter_config["base_resolved_quantization_map"] = resolved_map
+        adapter_config["base_resolved_quantization_map_supports_switch"] = True
         adapter_config.pop("base_quantization_map", None)
     else:
         adapter_config.pop("base_resolved_quantization_map", None)
+        adapter_config.pop("base_resolved_quantization_map_supports_switch", None)
         adapter_config.pop("base_quantization_map", None)
 
     requires_runtime = False

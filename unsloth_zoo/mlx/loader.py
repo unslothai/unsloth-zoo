@@ -233,15 +233,24 @@ def _mlx_lora_base_types():
     )
 
 
-def _mlx_quantized_module_types():
-    import mlx.nn as nn
+def _mlx_quantized_switch_module_types():
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
-    types = [nn.QuantizedLinear, nn.QuantizedEmbedding, QuantizedSwitchLinear]
+    types = [QuantizedSwitchLinear]
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
         types.append(vlm_switch_module.QuantizedSwitchLinear)
     return tuple(types)
+
+
+def _mlx_quantized_module_types():
+    import mlx.nn as nn
+
+    return (
+        nn.QuantizedLinear,
+        nn.QuantizedEmbedding,
+        *_mlx_quantized_switch_module_types(),
+    )
 
 
 def _mlx_lora_spec_for_module(module, specs):
@@ -276,23 +285,6 @@ def _mlx_language_layers(model):
     if hasattr(model, "layers"):
         return model.layers
     return model.model.layers
-
-
-def _unfreeze_mlx_lora_parameters(model):
-    """Unfreeze scalar, array, and list-valued LoRA parameter containers."""
-    from mlx.utils import tree_flatten
-
-    for _, module in model.named_modules():
-        if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
-            continue
-        keys = [
-            key
-            for key, _ in tree_flatten({
-                "lora_a": module.lora_a,
-                "lora_b": module.lora_b,
-            })
-        ]
-        module.unfreeze(recurse=False, keys=keys, strict=False)
 
 
 def linear_to_lora_layers(model, num_layers, config):
@@ -2434,13 +2426,31 @@ def _validate_mlx_adapter_base(model, adapter_cfg):
     )
     if expected_map:
         live_map = _normalize_quantization_map(_effective_mlx_quantization_map(model))
-        if live_map != expected_map:
-            missing = sorted(set(expected_map) - set(live_map))
-            extra = sorted(set(live_map) - set(expected_map))
-            changed = sorted(
-                path for path in set(expected_map) & set(live_map)
-                if expected_map[path] != live_map[path]
-            )
+        expected_paths = set(expected_map)
+        live_paths = set(live_map)
+        missing = sorted(expected_paths - live_paths)
+        extra = live_paths - expected_paths
+        changed = sorted(
+            path for path in expected_paths & live_paths
+            if expected_map[path] != live_map[path]
+        )
+
+        # Older Unsloth saves could not discover quantized Switch modules.
+        # New saves mark that capability even when no Switch layer is quantized;
+        # only an unmarked, Switch-free map receives the legacy allowance.
+        switch_types = _mlx_quantized_switch_module_types()
+        legacy_switch_paths = {
+            _canonical_mlx_quantization_path(path)
+            for path, module in model.named_modules()
+            if path and isinstance(module, switch_types)
+        }
+        switch_aware_map = bool(
+            adapter_cfg.get("base_resolved_quantization_map_supports_switch")
+        ) or not expected_paths.isdisjoint(legacy_switch_paths)
+        if not switch_aware_map:
+            extra -= legacy_switch_paths
+        extra = sorted(extra)
+        if missing or extra or changed:
             details = []
             if missing:
                 details.append(f"missing quantized modules: {missing[:5]!r}")
@@ -6204,7 +6214,7 @@ class FastMLXModel:
                 _raise_no_lora_targets(target_modules)
 
             # Unfreeze all LoRA params across the tree.
-            _unfreeze_mlx_lora_parameters(model)
+            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
         else:
             # Text-only path. _fix_missing_no_grad handles modules using
             # __new__ without __init__ (e.g. Gemma4 AudioRelativePosition...).
@@ -6240,7 +6250,7 @@ class FastMLXModel:
                     _raise_no_lora_targets(target_modules)
 
             model.freeze()
-            _unfreeze_mlx_lora_parameters(model)
+            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
 
