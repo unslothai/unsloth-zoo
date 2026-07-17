@@ -163,6 +163,102 @@ class _MLXTokenizedDatasetView:
         return item
 
 
+def _mlx_stream_declares_infinite(dataset):
+    """Recognize explicit/common infinite iterable declarations without probing."""
+    dataset = getattr(dataset, "_mlx_source_dataset", dataset)
+    if bool(getattr(dataset, "_unsloth_mlx_infinite", False)):
+        return True
+
+    def _is_infinite(ex_iterable, seen):
+        if ex_iterable is None or id(ex_iterable) in seen:
+            return False
+        seen = seen | {id(ex_iterable)}
+        kind = type(ex_iterable).__name__
+        if kind == "TakeExamplesIterable":
+            return False
+        if (
+            kind == "RepeatExamplesIterable"
+            and getattr(ex_iterable, "num_times", 0) is None
+        ):
+            return True
+        if kind in (
+            "VerticallyConcatenatedMultiSourcesExamplesIterable",
+            "HorizontallyConcatenatedMultiSourcesExamplesIterable",
+        ):
+            return any(_is_infinite(child, seen) for child in ex_iterable.ex_iterables)
+        if kind in (
+            "CyclingMultiSourcesExamplesIterable",
+            "RandomlyCyclingMultiSourcesExamplesIterable",
+        ):
+            children = ex_iterable.ex_iterables
+            probabilities = getattr(ex_iterable, "probabilities", None)
+            if probabilities is not None:
+                if (
+                    ex_iterable.stopping_strategy.startswith("all_exhausted")
+                    and any(probability <= 0 for probability in probabilities)
+                ):
+                    return True
+                children = [
+                    child for child, probability in zip(children, probabilities)
+                    if probability > 0
+                ]
+            infinite = [_is_infinite(child, seen) for child in children]
+            return (
+                any(infinite)
+                if ex_iterable.stopping_strategy.startswith("all_exhausted")
+                else bool(infinite) and all(infinite)
+            )
+        return _is_infinite(getattr(ex_iterable, "ex_iterable", None), seen)
+
+    ex_iterable = getattr(dataset, "_ex_iterable", None)
+    seen = set()
+    return _is_infinite(ex_iterable, seen)
+
+
+class _MLXLazyEvalBatchView:
+    """Restartable eval batch surface that constructs one lazy pass per use."""
+
+    def __init__(self, dataset, factory, max_batches=None):
+        self._dataset = dataset
+        self._factory = factory
+        self._max_batches = max_batches
+
+    def __iter__(self):
+        if self._max_batches is None and _mlx_stream_declares_infinite(self._dataset):
+            raise ValueError(
+                "Unsloth MLX: an infinite streaming eval_dataset must set "
+                "max_eval_batches to a positive value (or apply dataset.take) "
+                "so evaluation has an explicit boundary."
+            )
+        iterator = iter(self._factory())
+        if self._max_batches is None:
+            yield from iterator
+            return
+        for _ in range(self._max_batches):
+            try:
+                yield next(iterator)
+            except StopIteration:
+                return
+
+
+def _mlx_declared_iterable_length(dataset):
+    """Return a declared source length without probing a truly unsized source."""
+    source = getattr(dataset, "_mlx_source_dataset", dataset)
+    if not any("__len__" in cls.__dict__ for cls in type(source).__mro__):
+        return None
+    try:
+        length = len(source)
+    except (TypeError, AttributeError) as exc:
+        raise ValueError(
+            "Unsloth MLX: num_train_epochs requires a streaming text source "
+            "whose declared __len__ returns the exact source row count. Use "
+            "max_steps for a truly unsized iterable."
+        ) from exc
+    if length < 0:
+        raise ValueError("Unsloth MLX: iterable dataset length cannot be negative.")
+    return int(length)
+
+
 from .utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
@@ -620,6 +716,7 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
+    max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -657,7 +754,14 @@ class MLXTrainingConfig:
 
         warmup_steps_default = type(self).warmup_steps
         warmup_ratio_default = type(self).warmup_ratio
-        copied_all_fields = len(provided) == len(config_fields)
+        copied_all_fields = len(provided) == len(config_fields) or (
+            "max_eval_batches" not in provided
+            and all(
+                field.name in provided
+                for field in config_fields
+                if field.name != "max_eval_batches"
+            )
+        )
         copied_default_warmup_with_ratio = (
             copied_all_fields
             and getattr(self, "warmup_steps", None) == warmup_steps_default
@@ -1551,6 +1655,67 @@ class MLXTrainer:
 
         return all_losses, ntokens
 
+    def _create_text_eval_batches(
+        self,
+        eval_dataset,
+        eval_batch_size,
+        completion_only_loss,
+        assistant_only_loss,
+    ):
+        """Build eager or one-pass lazy text evaluation batches."""
+        args = self.args
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        eval_tokenizer = getattr(
+            self, "_mlx_response_mask_tokenizer", self.tokenizer,
+        )
+        common = dict(
+            dataset=eval_dataset,
+            tokenizer=eval_tokenizer,
+            batch_size=eval_batch_size,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            dataset_text_field=args.dataset_text_field,
+            formatting_func=self.formatting_func,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(self.model, "_hf_repo", None),
+            model_type=model_type,
+            append_eos=bool(getattr(args, "append_eos", True)),
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+        )
+        if args.streaming and _is_mlx_lazy_text_source(eval_dataset):
+            max_batches = getattr(args, "max_eval_batches", None)
+            if max_batches is not None:
+                max_batches = int(max_batches)
+                if max_batches <= 0:
+                    raise ValueError(
+                        "Unsloth MLX: max_eval_batches must be a positive "
+                        "integer when provided."
+                    )
+
+            def _factory():
+                return iterate_training_batches(
+                    **common,
+                    response_mask_fn=getattr(self, "_mlx_response_mask_fn", None),
+                    dataset_order="sequential",
+                    comm_group=self.distributed_world,
+                    require_replayable=True,
+                    repeat=False,
+                    distributed_pad_mode="empty",
+                )
+
+            return _MLXLazyEvalBatchView(
+                eval_dataset,
+                _factory,
+                max_batches=max_batches,
+            )
+        return create_batches(
+            **common,
+            comm_group=self.distributed_world,
+            distributed_pad_mode="empty",
+        )
+
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
 
@@ -2099,6 +2264,11 @@ class MLXTrainer:
             else:
                 total_steps = n_batches // grad_accum
             total_steps = max(1, total_steps)
+        elif getattr(self, "_streaming_epoch_batch_count", None) is not None:
+            total_steps = (
+                self._streaming_epoch_batch_count * args.num_train_epochs
+            ) // grad_accum
+            total_steps = max(1, total_steps)
         else:
             # Streaming mode — must have max_steps
             if args.num_train_epochs > 0:
@@ -2644,7 +2814,7 @@ class MLXTrainer:
                 eval_batches = _labeled_eval
             else:
                 def _create_eval_batches(eval_dataset):
-                    """Materialize eval batches for one dataset split."""
+                    """Build evaluation batches for one dataset split."""
                     if is_vlm:
                         processor = self._resolve_vlm_processor()
                         config = getattr(self.model, "_config", {})
@@ -2663,26 +2833,11 @@ class MLXTrainer:
                             comm_group=self.distributed_world,
                             distributed_pad_mode="empty",
                         )
-                    return create_batches(
-                        dataset=eval_dataset,
-                        tokenizer=self.tokenizer,
-                        batch_size=eval_batch_size,
-                        max_seq_length=args.max_seq_length,
-                        seed=args.seed,
-                        dataset_text_field=args.dataset_text_field,
-                        formatting_func=self.formatting_func,
-                        chat_template=getattr(args, "chat_template", None),
-                        model_name=getattr(self.model, "_hf_repo", None),
-                        model_type=(
-                            getattr(self.model, "_config", {}).get("model_type")
-                            if isinstance(getattr(self.model, "_config", {}), dict)
-                            else None
-                        ),
-                        append_eos=bool(getattr(args, "append_eos", True)),
-                        completion_only_loss=text_completion_only_loss,
-                        assistant_only_loss=text_assistant_only_loss,
-                        comm_group=self.distributed_world,
-                        distributed_pad_mode="empty",
+                    return self._create_text_eval_batches(
+                        eval_dataset,
+                        eval_batch_size,
+                        text_completion_only_loss,
+                        text_assistant_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -2693,14 +2848,27 @@ class MLXTrainer:
                 else:
                     eval_batches = _create_eval_batches(self.eval_dataset)
             if eval_batches:
-                eval_batch_count = (
-                    sum(len(value) for value in eval_batches.values())
-                    if isinstance(eval_batches, dict) else len(eval_batches)
+                lazy_eval = isinstance(eval_batches, _MLXLazyEvalBatchView) or (
+                    isinstance(eval_batches, dict)
+                    and any(
+                        isinstance(value, _MLXLazyEvalBatchView)
+                        for value in eval_batches.values()
+                    )
                 )
-                _main_print(
-                    f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                    f"({eval_batch_count} eval batches)."
-                )
+                if lazy_eval:
+                    _main_print(
+                        f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                        "(lazy text batches)."
+                    )
+                else:
+                    eval_batch_count = (
+                        sum(len(value) for value in eval_batches.values())
+                        if isinstance(eval_batches, dict) else len(eval_batches)
+                    )
+                    _main_print(
+                        f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                        f"({eval_batch_count} eval batches)."
+                    )
 
         features = []
         if is_vlm:
@@ -3306,6 +3474,7 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        self._streaming_epoch_batch_count = None
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3404,6 +3573,67 @@ class MLXTrainer:
                     if getattr(args, "preserve_dataset_order", False)
                     else getattr(args, "dataset_order", "default")
                 )
+                expected_rows_per_pass = None
+                require_replayable = bool(
+                    getattr(self, "_resume_from_checkpoint", None)
+                )
+                if (
+                    _is_mlx_lazy_text_source(train_dataset)
+                    and args.max_steps <= 0
+                    and args.num_train_epochs > 0
+                ):
+                    response_mask_fn = getattr(
+                        train_dataset, "_response_mask_fn", None,
+                    ) or getattr(self, "_mlx_response_mask_fn", None)
+                    if self.formatting_func is not None:
+                        raise ValueError(
+                            "Unsloth MLX: num_train_epochs with a streaming text "
+                            "iterable cannot use formatting_func because prepared "
+                            "row cardinality may change. Use max_steps instead."
+                        )
+                    if text_completion_only_loss is not False:
+                        raise ValueError(
+                            "Unsloth MLX: num_train_epochs with a streaming text "
+                            "iterable requires completion_only_loss=False so the "
+                            "declared length remains exact. Use max_steps for "
+                            "completion-masked streams."
+                        )
+                    if text_assistant_only_loss or response_mask_fn is not None:
+                        raise ValueError(
+                            "Unsloth MLX: num_train_epochs cannot guarantee exact "
+                            "steps for a streaming iterable whose rows may be "
+                            "filtered by label masking. Use max_steps instead."
+                        )
+                    source_length = _mlx_declared_iterable_length(train_dataset)
+                    if source_length is None:
+                        raise ValueError(
+                            "Unsloth MLX: num_train_epochs requires a streaming "
+                            "text iterable with an explicit reliable __len__. Use "
+                            "max_steps for an unsized source."
+                        )
+                    if source_length == 0:
+                        raise ValueError(
+                            "Unsloth MLX: streaming text iterable declares zero rows."
+                        )
+                    global_batch_size = (
+                        args.per_device_train_batch_size
+                        * self.distributed_world_size
+                    )
+                    self._streaming_epoch_batch_count = math.ceil(
+                        source_length / global_batch_size
+                    )
+                    if (
+                        self._streaming_epoch_batch_count
+                        % args.gradient_accumulation_steps
+                    ):
+                        raise ValueError(
+                            "Unsloth MLX: streaming num_train_epochs requires "
+                            "the total epoch micro-batches to be divisible by "
+                            "gradient_accumulation_steps. Use max_steps or "
+                            "adjust the accumulation factor."
+                        )
+                    expected_rows_per_pass = source_length
+                    require_replayable = True
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -3420,9 +3650,8 @@ class MLXTrainer:
                     assistant_only_loss=text_assistant_only_loss,
                     dataset_order=text_dataset_order,
                     comm_group=comm_group,
-                    require_replayable=bool(
-                        getattr(self, "_resume_from_checkpoint", None)
-                    ),
+                    require_replayable=require_replayable,
+                    expected_rows_per_pass=expected_rows_per_pass,
                 )
             else:
                 batch_kwargs = dict(
@@ -4054,12 +4283,26 @@ def train_on_responses_only(
 
     # Callable HF tokenizer for token matching and text batch encoding.
     _tokenizer = _resolve_response_mask_tokenizer(_source)
+    _lazy_text_eval = False
+    eval_dataset = getattr(trainer, "eval_dataset", None)
+    if eval_dataset is not None:
+        eval_datasets = (
+            eval_dataset.values()
+            if isinstance(eval_dataset, dict)
+            else (eval_dataset,)
+        )
+        _lazy_text_eval = any(
+            _is_mlx_lazy_text_source(dataset) for dataset in eval_datasets
+        )
     if (
         not return_function
         and trainer is not None
         and not trainer._is_vlm
         and trainer.args.streaming
-        and _is_mlx_lazy_text_source(trainer._train_dataset_for_batches())
+        and (
+            _is_mlx_lazy_text_source(trainer._train_dataset_for_batches())
+            or _lazy_text_eval
+        )
     ):
         config = getattr(trainer.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -4108,6 +4351,9 @@ def train_on_responses_only(
     else:
         args = trainer.args
         train_dataset = trainer._train_dataset_for_batches()
+        if args.streaming:
+            trainer._mlx_response_mask_fn = mask_fn
+            trainer._mlx_response_mask_tokenizer = _tokenizer
         if args.streaming and _is_mlx_lazy_text_source(train_dataset):
             if not isinstance(train_dataset, _MLXIterableTokenizedDatasetView):
                 train_dataset = _MLXIterableTokenizedDatasetView(
@@ -4125,7 +4371,6 @@ def train_on_responses_only(
             else:
                 train_dataset.set_tokenizer(_tokenizer)
             train_dataset.set_response_mask(mask_fn)
-            trainer._mlx_response_mask_fn = mask_fn
             trainer._batches = None
             trainer._eval_batches_labeled = None
             _prepare_response_labeled_eval_batches(
@@ -4194,6 +4439,7 @@ def train_on_responses_only(
             trainer,
             _tokenizer,
             mask_fn,
+            sized_only=bool(args.streaming),
         )
 
         print(f"Unsloth: train_on_responses_only enabled "

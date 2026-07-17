@@ -3480,13 +3480,30 @@ def _labeled_row_has_supervision(labels, max_seq_length):
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
-def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
+def _create_tokenized_text_batch(
+    batch_items,
+    max_seq_length,
+    pad_id=0,
+    labels_expected=None,
+):
     """Pad pretokenized ids plus optional labels for one MLX text batch."""
-    lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
+    valid_items = [item for item in batch_items if item is not None]
+    lengths = [
+        0 if item is None else min(len(item[0]), max_seq_length)
+        for item in batch_items
+    ]
     max_length = max(lengths)
+    if max_length == 0:
+        max_length = min(2, max_seq_length)
     batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
-    has_labels = batch_items[0][1] is not None
-    if any((labels is not None) != has_labels for _ids, labels in batch_items):
+    has_labels = (
+        valid_items[0][1] is not None
+        if valid_items else bool(labels_expected)
+    )
+    if any(
+        (labels is not None) != has_labels
+        for ids, labels in valid_items
+    ):
         raise ValueError(
             "Unsloth MLX: pretokenized rows with labels/completion_mask must "
             "not be batched with rows that do not provide labels."
@@ -3495,7 +3512,10 @@ def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
         np.full((len(batch_items), max_length), -100, dtype=np.int64)
         if has_labels else None
     )
-    for row_idx, (ids, labels) in enumerate(batch_items):
+    for row_idx, item in enumerate(batch_items):
+        if item is None:
+            continue
+        ids, labels = item
         length = lengths[row_idx]
         batch_ids[row_idx, :length] = ids[:length]
         if batch_labels is not None:
@@ -5659,6 +5679,9 @@ def _iterate_lazy_text_training_batches(
     response_mask_fn=None,
     comm_group=None,
     require_replayable=False,
+    repeat=True,
+    distributed_pad_mode="cycle",
+    expected_rows_per_pass=None,
 ):
     """Yield source-ordered text batches without materializing an unsized source.
 
@@ -5692,9 +5715,8 @@ def _iterate_lazy_text_training_batches(
 
     def _resume_replay_error():
         return RuntimeError(
-            "Unsloth MLX: checkpoint resume requires a replayable iterable "
-            "text source; a one-shot iterator cannot be fast-forwarded "
-            "deterministically."
+            "Unsloth MLX: this operation requires a replayable iterable text "
+            "source; a one-shot iterator cannot be replayed deterministically."
         )
 
     def _exhaustion_error():
@@ -5702,6 +5724,9 @@ def _iterate_lazy_text_training_batches(
             "Unsloth MLX: one-shot streaming text source is exhausted and "
             "cannot be replayed. Use a replayable iterable or reduce max_steps."
         )
+
+    if require_replayable and isinstance(source_dataset, Iterator):
+        raise _resume_replay_error()
 
     _set_epoch(0)
     current_iterator = iter(source_dataset)
@@ -5734,7 +5759,10 @@ def _iterate_lazy_text_training_batches(
         def _make_batch(local_items):
             if state.get("schema") == "raw" and state.get("label_state") is False:
                 return _make_text_batch_from_items(
-                    [ids for ids, _labels in local_items],
+                    [
+                        None if item is None else item[0]
+                        for item in local_items
+                    ],
                     tokenizer,
                     max_seq_length,
                 )
@@ -5742,19 +5770,40 @@ def _iterate_lazy_text_training_batches(
                 local_items,
                 max_seq_length,
                 pad_id=_mlx_text_pad_id(tokenizer),
+                labels_expected=state.get("label_state"),
             )
 
         while True:
             pending = []
+            deferred_final = None
             padding_source = []
             yielded = False
+            source_rows_seen = 0
+            prepared_rows_seen = 0
+
+            def _counted_source_rows():
+                nonlocal source_rows_seen
+                for item in current_iterator:
+                    source_rows_seen += 1
+                    if source_rows_seen > expected_rows_per_pass:
+                        raise ValueError(
+                            "Unsloth MLX: epoch training requires exactly one "
+                            "trainable text row per declared source row. Use "
+                            "max_steps when the source exceeds its declared length."
+                        )
+                    yield item
+
+            row_source = (
+                _counted_source_rows()
+                if expected_rows_per_pass is not None else current_iterator
+            )
             row_iterator = (
                 prepared_view._iter_tokenized_rows(
-                    current_iterator, state=state,
+                    row_source, state=state,
                 )
                 if prepared_view is not None
                 else _iter_lazy_tokenized_text_rows(
-                    current_iterator,
+                    row_source,
                     tokenizer,
                     dataset_text_field=dataset_text_field,
                     formatting_func=formatting_func,
@@ -5767,20 +5816,62 @@ def _iterate_lazy_text_training_batches(
                 )
             )
             for row in row_iterator:
+                prepared_rows_seen += 1
+                if (
+                    expected_rows_per_pass is not None
+                    and (
+                        source_rows_seen != prepared_rows_seen
+                        or source_rows_seen > expected_rows_per_pass
+                    )
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: epoch training requires exactly one "
+                        "trainable text row per declared source row. Use "
+                        "max_steps when rows expand or are filtered."
+                    )
                 if len(padding_source) < global_batch_size:
                     padding_source.append(row)
                 pending.append(row)
                 if len(pending) < global_batch_size:
+                    continue
+                if (
+                    expected_rows_per_pass is not None
+                    and prepared_rows_seen == expected_rows_per_pass
+                ):
+                    deferred_final = pending
+                    pending = []
                     continue
                 local_items = _rank_slice_distributed_batch(
                     pending,
                     batch_size,
                     comm_group=comm_group,
                     pad_source=padding_source,
+                    pad_mode=distributed_pad_mode,
                 )
                 yielded = True
                 yield _make_batch(local_items)
                 pending = []
+
+            if expected_rows_per_pass is not None and (
+                source_rows_seen != expected_rows_per_pass
+                or prepared_rows_seen != expected_rows_per_pass
+            ):
+                raise ValueError(
+                    "Unsloth MLX: the streaming text source's declared length "
+                    "does not match one trainable row per source row. Use "
+                    "max_steps for filtered or expanding streams."
+                )
+
+            if deferred_final is not None:
+                local_items = _rank_slice_distributed_batch(
+                    deferred_final,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=padding_source,
+                    pad_mode=distributed_pad_mode,
+                )
+                yielded = True
+                yield _make_batch(local_items)
 
             if pending:
                 local_items = _rank_slice_distributed_batch(
@@ -5788,6 +5879,7 @@ def _iterate_lazy_text_training_batches(
                     batch_size,
                     comm_group=comm_group,
                     pad_source=padding_source,
+                    pad_mode=distributed_pad_mode,
                 )
                 yielded = True
                 yield _make_batch(local_items)
@@ -5799,6 +5891,8 @@ def _iterate_lazy_text_training_batches(
                 raise ValueError(
                     "Unsloth MLX: streaming text source produced no trainable rows."
                 )
+            if not repeat:
+                return
             if replayable is False:
                 raise _exhaustion_error()
             epoch += 1
@@ -5961,7 +6055,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              append_eos=True, completion_only_loss=None,
                              assistant_only_loss=False, dataset_order="default",
                              comm_group=None, require_replayable=False,
-                             response_mask_fn=None):
+                             response_mask_fn=None, repeat=True,
+                             distributed_pad_mode="cycle",
+                             expected_rows_per_pass=None):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -5997,6 +6093,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             response_mask_fn=response_mask_fn,
             comm_group=comm_group,
             require_replayable=require_replayable,
+            repeat=repeat,
+            distributed_pad_mode=distributed_pad_mode,
+            expected_rows_per_pass=expected_rows_per_pass,
         )
         return
 
