@@ -28,8 +28,8 @@ MAX_PADDING_WORK_PERCENT = 5
 MAX_WIDTH_STRETCH_NUMERATOR = 3
 MAX_WIDTH_STRETCH_DENOMINATOR = 2
 MAX_COMPILE_VARIANTS = 256
-MAX_WIDTHS_PER_FAMILY = 2_048
-MAX_PLANNER_WORK = 16_000_000
+_MAX_EXACT_WIDTHS_PER_FAMILY = 2_048
+_MAX_EXACT_PLANNER_WORK = 16_000_000
 
 FULL_STEP_SCOPE = "full_step"
 DDP_LOCAL_GRAD_SCOPE = "ddp_local_grad"
@@ -175,7 +175,7 @@ class _FamilyBudgetPlanner:
     def __init__(self, width_data, max_padding_cost, work):
         self.width_data = width_data
         self.widths = tuple(sorted(width_data))
-        if len(self.widths) > MAX_WIDTHS_PER_FAMILY:
+        if len(self.widths) > _MAX_EXACT_WIDTHS_PER_FAMILY:
             raise _PlannerLimit("too_many_widths")
         self.max_padding_cost = max_padding_cost
         self.work = work
@@ -205,7 +205,7 @@ class _FamilyBudgetPlanner:
                 segment_squares = 0
                 for start in range(end - 1, -1, -1):
                     self.work[0] += 1
-                    if self.work[0] > MAX_PLANNER_WORK:
+                    if self.work[0] > _MAX_EXACT_PLANNER_WORK:
                         raise _PlannerLimit("planner_work_limit")
                     width = self.widths[start]
                     if (
@@ -386,7 +386,7 @@ def _family_options(width_data, cap, work, *, include_stretch=False):
     """Return unrestricted and optionally stretch-feasible exact options."""
 
     widths = tuple(sorted(width_data))
-    if len(widths) > MAX_WIDTHS_PER_FAMILY:
+    if len(widths) > _MAX_EXACT_WIDTHS_PER_FAMILY:
         raise _PlannerLimit("too_many_widths")
     states = [dict() for _ in range(len(widths) + 1)]
     states[0][0] = (0, ())
@@ -408,7 +408,7 @@ def _family_options(width_data, cap, work, *, include_stretch=False):
             segment_cost = endpoint * endpoint * segment_weight - segment_squares
             for previous_slots, (previous_cost, previous_endpoints) in states[start].items():
                 work[0] += 1
-                if work[0] > MAX_PLANNER_WORK:
+                if work[0] > _MAX_EXACT_PLANNER_WORK:
                     raise _PlannerLimit("planner_work_limit")
                 slots = previous_slots + segment_slots
                 if slots > cap:
@@ -429,7 +429,7 @@ def _family_options(width_data, cap, work, *, include_stretch=False):
                     previous_cost, previous_endpoints,
                 ) in stretch_states[start].items():
                     work[0] += 1
-                    if work[0] > MAX_PLANNER_WORK:
+                    if work[0] > _MAX_EXACT_PLANNER_WORK:
                         raise _PlannerLimit("planner_work_limit")
                     slots = previous_slots + segment_slots
                     if slots > cap:
@@ -482,7 +482,7 @@ def _build_global_frontier(problem, cap, *, include_stretch=False):
         for used, (cost, choices) in states.items():
             for slots, (family_cost, endpoints) in options.items():
                 work[0] += 1
-                if work[0] > MAX_PLANNER_WORK:
+                if work[0] > _MAX_EXACT_PLANNER_WORK:
                     raise _PlannerLimit("planner_work_limit")
                 total = used + slots
                 if total > cap:
@@ -497,7 +497,7 @@ def _build_global_frontier(problem, cap, *, include_stretch=False):
             for used, (cost, choices) in stretch_states.items():
                 for slots, (family_cost, endpoints) in stretch_options.items():
                     work[0] += 1
-                    if work[0] > MAX_PLANNER_WORK:
+                    if work[0] > _MAX_EXACT_PLANNER_WORK:
                         raise _PlannerLimit("planner_work_limit")
                     total = used + slots
                     if total > cap:
@@ -544,7 +544,7 @@ def _build_padding_budget_frontier(problem, cap, *, stop_at_first):
                     if total > total_slots:
                         continue
                     work[0] += 1
-                    if work[0] > MAX_PLANNER_WORK:
+                    if work[0] > _MAX_EXACT_PLANNER_WORK:
                         raise _PlannerLimit("planner_work_limit")
                     candidate_cost = cost + family_cost
                     if candidate_cost > max_padding_cost:
@@ -600,8 +600,8 @@ def _padding_budget_work_bound(problem, cap):
     for family in problem.sorted_families:
         width_data = problem.family_data[family]
         widths = tuple(sorted(width_data))
-        if len(widths) > MAX_WIDTHS_PER_FAMILY:
-            return MAX_PLANNER_WORK + 1
+        if len(widths) > _MAX_EXACT_WIDTHS_PER_FAMILY:
+            return _MAX_EXACT_PLANNER_WORK + 1
         family_minimum = len({
             phase for phases in width_data.values() for phase in phases
         })
@@ -614,7 +614,7 @@ def _padding_budget_work_bound(problem, cap):
             if first:
                 scans += 1
         work += max(0, layers) * scans
-        if work > MAX_PLANNER_WORK:
+        if work > _MAX_EXACT_PLANNER_WORK:
             return work
     return work
 
@@ -626,13 +626,13 @@ def _unrestricted_work_bound(problem, cap):
     for family in problem.sorted_families:
         width_data = problem.family_data[family]
         width_count = len(width_data)
-        if width_count > MAX_WIDTHS_PER_FAMILY:
-            return MAX_PLANNER_WORK + 1
+        if width_count > _MAX_EXACT_WIDTHS_PER_FAMILY:
+            return _MAX_EXACT_PLANNER_WORK + 1
         maximum = min(
             cap, sum(len(phases) for phases in width_data.values()),
         )
         work += width_count * (width_count + 1) // 2 * maximum
-        if work > MAX_PLANNER_WORK:
+        if work > _MAX_EXACT_PLANNER_WORK:
             return work
     return work
 
@@ -969,7 +969,10 @@ def build_text_shape_frontier(events, *, compile_scope):
         if _point_within_budgets(problem, fallback_point)
         else AUTOMATIC_TEXT_COMPILE_CEILING
     )
-    if _padding_budget_work_bound(problem, exact_target) > MAX_PLANNER_WORK:
+    if (
+        _padding_budget_work_bound(problem, exact_target)
+        > _MAX_EXACT_PLANNER_WORK
+    ):
         return fallback_frontier
     try:
         stretch_points = _build_padding_budget_frontier(
@@ -986,7 +989,7 @@ def build_text_shape_frontier(events, *, compile_scope):
             _unrestricted_work_bound(
                 problem, AUTOMATIC_TEXT_COMPILE_CEILING,
             )
-            > MAX_PLANNER_WORK
+            > _MAX_EXACT_PLANNER_WORK
         ):
             return fallback_frontier
         states, _ = _build_global_frontier(
@@ -1062,7 +1065,10 @@ def materialize_text_shape_frontier(
     if frontier._stretch_points:
         budget_points = frontier._stretch_points
         if budget_points[-1][0] < cap:
-            if _padding_budget_work_bound(problem, cap) <= MAX_PLANNER_WORK:
+            if (
+                _padding_budget_work_bound(problem, cap)
+                <= _MAX_EXACT_PLANNER_WORK
+            ):
                 try:
                     budget_points = _build_padding_budget_frontier(
                         problem, cap, stop_at_first=False,
@@ -1230,8 +1236,6 @@ __all__ = (
     "MAX_WIDTH_STRETCH_NUMERATOR",
     "MAX_WIDTH_STRETCH_DENOMINATOR",
     "MAX_COMPILE_VARIANTS",
-    "MAX_WIDTHS_PER_FAMILY",
-    "MAX_PLANNER_WORK",
     "FULL_STEP_SCOPE",
     "DDP_LOCAL_GRAD_SCOPE",
     "TextShapeEvent",

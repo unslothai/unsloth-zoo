@@ -339,7 +339,7 @@ def test_automatic_shape_planner_work_limit_uses_bounded_fallback(monkeypatch):
         _plan_single_process_text_shapes,
     )
 
-    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     args = MLXTrainingConfig(max_steps=40)
     plan, report, allowed, frontier = _plan_single_process_text_shapes(
         _make_shape_guard_text_plan(tuple(range(10, 50))),
@@ -368,7 +368,7 @@ def test_ddp_synchronizes_bounded_fallback_cap(monkeypatch):
         _plan_single_process_text_shapes,
     )
 
-    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     args = MLXTrainingConfig(max_steps=40)
     policy = build_compile_policy(args=args)
     local_plan, report, allowed, frontier = _plan_single_process_text_shapes(

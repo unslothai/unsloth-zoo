@@ -163,7 +163,7 @@ def test_irreducible_families_and_planner_limits_select_eager(monkeypatch):
         "eager", "irreducible_signatures",
     )
 
-    monkeypatch.setattr(shape_guard, "MAX_WIDTHS_PER_FAMILY", 2)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_WIDTHS_PER_FAMILY", 2)
     too_many = plan_text_shape_buckets(
         [_event(("a",), width) for width in (2, 3, 4)],
         cap=1,
@@ -173,8 +173,8 @@ def test_irreducible_families_and_planner_limits_select_eager(monkeypatch):
         "eager", "too_many_widths",
     )
 
-    monkeypatch.setattr(shape_guard, "MAX_WIDTHS_PER_FAMILY", 2_048)
-    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_WIDTHS_PER_FAMILY", 2_048)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     over_work = plan_text_shape_buckets(
         [_event(("a",), width) for width in (2, 3, 4)],
         cap=1,
@@ -400,7 +400,7 @@ def test_padding_budget_scales_to_dense_975_width_schedule():
 
 
 def test_automatic_work_preflight_uses_deterministic_bounded_fallback(monkeypatch):
-    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     events = [_event(("text",), width) for width in range(10, 50)]
 
     forward = plan_text_shape_padding_budget(
@@ -437,7 +437,7 @@ def test_large_workload_preflight_skips_exact_dp(monkeypatch):
 
 
 def test_fallback_reports_unsatisfied_budget_and_structural_impossibility(monkeypatch):
-    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     over_stretch = plan_text_shape_padding_budget(
         [_event(("text",), 2**index) for index in range(129)],
         compile_scope=FULL_STEP_SCOPE,
@@ -457,7 +457,7 @@ def test_fallback_reports_unsatisfied_budget_and_structural_impossibility(monkey
 
 
 def test_fallback_preserves_phase_aware_catalog_admission(monkeypatch):
-    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     events = [
         _event(("text",), width, "a" if width % 2 else "b")
         for width in range(10, 140)
