@@ -181,7 +181,7 @@ def test_single_process_text_shape_guard_buckets_and_validates_before_materializ
         gradient_accumulation_steps=1,
         compile_max_variants=2,
     )
-    shape_plan, report, compile_allowed = _plan_single_process_text_shapes(
+    shape_plan, report, compile_allowed, _ = _plan_single_process_text_shapes(
         batches,
         None,
         args=args,
@@ -206,6 +206,158 @@ def test_single_process_text_shape_guard_buckets_and_validates_before_materializ
         batches.materialize(0, phase="unknown")
 
 
+def test_automatic_text_shape_guard_installs_deterministic_budgeted_plan():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    args = MLXTrainingConfig(max_steps=40, gradient_accumulation_steps=1)
+    batches = _make_shape_guard_text_plan(tuple(range(10, 50)))
+    shape_plan, report, allowed, frontier = _plan_single_process_text_shapes(
+        batches,
+        None,
+        args=args,
+        total_steps=40,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+
+    assert allowed is True and frontier is not None
+    assert report.cap_selection == "padding_budget"
+    assert report.configured_cap == 128
+    assert report.effective_cap == report.cap == 15
+    assert report.planned_signatures == 15
+    assert report.padding_work_fraction <= 0.05
+    assert report.max_width_stretch <= 1.5
+    assert report.budget_satisfied is True
+    batch, lengths, labels = batches.materialize(0, phase="single")
+    assert batch.shape == labels.shape == (1, 13)
+    assert batch[0, :10].tolist() == list(range(1, 11))
+    assert labels[0, 10:].tolist() == [-100, -100, -100]
+    assert lengths.tolist() == [[1, 10]]
+    assert shape_plan.report == report
+
+
+def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.shape_guard import (
+        DDP_LOCAL_GRAD_SCOPE,
+        TextShapeEvent,
+        build_text_shape_frontier,
+        select_text_shape_padding_budget,
+    )
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    events = [
+        TextShapeEvent(("text",), width, "none")
+        for width in range(10, 50)
+    ]
+    frontier = build_text_shape_frontier(
+        events, compile_scope=DDP_LOCAL_GRAD_SCOPE,
+    )
+    local_plan = select_text_shape_padding_budget(frontier)
+    shared_cap = local_plan.report.effective_cap + 4
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = lambda cap: shared_cap
+
+    plan, report, allowed = trainer._coordinate_text_shape_guard(
+        local_plan,
+        frontier,
+        local_plan.report,
+        True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True,
+    )
+
+    assert allowed is True
+    assert report.effective_cap == report.cap == shared_cap <= 128
+    assert report.planned_signatures <= shared_cap
+    assert report.budget_satisfied is True
+    assert plan.report == report
+
+    trainer._distributed_max_int = lambda _cap: 129
+    failure_consensus = iter((False, True))
+    trainer._distributed_any_flag = lambda _failed: next(failure_consensus)
+    plan, fallback, allowed = trainer._coordinate_text_shape_guard(
+        local_plan,
+        frontier,
+        local_plan.report,
+        True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True,
+    )
+
+    assert plan is None and allowed is False
+    assert fallback.action == "eager"
+    assert fallback.cap_selection == "fallback"
+    assert fallback.effective_cap == fallback.cap == 128
+
+
+def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _shape_guard_report,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = lambda _cap: (_ for _ in ()).throw(
+        AssertionError("not-applicable paths must not synchronize a cap")
+    )
+    report = _shape_guard_report(
+        "not_applicable", "streaming", 128, lazy_batches=False,
+    )
+
+    plan, coordinated, allowed = trainer._coordinate_text_shape_guard(
+        None,
+        None,
+        report,
+        True,
+        build_compile_policy(args=MLXTrainingConfig(streaming=True)),
+        automatic=True,
+    )
+
+    assert plan is None and allowed is True
+    assert coordinated == report
+
+
+def test_automatic_shape_planner_failure_reports_bounded_fallback(monkeypatch):
+    from unsloth_zoo.mlx import shape_guard
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    monkeypatch.setattr(shape_guard, "MAX_PLANNER_WORK", 1)
+    args = MLXTrainingConfig(max_steps=40)
+    plan, report, allowed, frontier = _plan_single_process_text_shapes(
+        _make_shape_guard_text_plan(tuple(range(10, 50))),
+        None,
+        args=args,
+        total_steps=40,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+
+    assert plan is not None and frontier is not None
+    assert allowed is False
+    assert report.cap_selection == "fallback"
+    assert report.effective_cap == report.cap == 128
+    assert report.budget_satisfied is False
+
+
 def test_text_shape_guard_exact_and_compile_disabled_paths_add_no_padding():
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (
@@ -219,7 +371,7 @@ def test_text_shape_guard_exact_and_compile_disabled_paths_add_no_padding():
         gradient_accumulation_steps=1,
         compile_max_variants=3,
     )
-    _, exact_report, exact_allowed = _plan_single_process_text_shapes(
+    _, exact_report, exact_allowed, _ = _plan_single_process_text_shapes(
         exact_batches,
         None,
         args=exact_args,
@@ -234,7 +386,7 @@ def test_text_shape_guard_exact_and_compile_disabled_paths_add_no_padding():
 
     eager_batches = _make_shape_guard_text_plan((10, 11, 30), labeled=False)
     eager_args = MLXTrainingConfig(compile=False, compile_max_variants=1)
-    shape_plan, report, allowed = _plan_single_process_text_shapes(
+    shape_plan, report, allowed, _ = _plan_single_process_text_shapes(
         eager_batches,
         None,
         args=eager_args,
@@ -261,7 +413,7 @@ def test_text_shape_guard_failure_obeys_best_effort_and_strict_modes():
         gradient_accumulation_steps=1,
         compile_max_variants=1,
     )
-    _, report, allowed = _plan_single_process_text_shapes(
+    _, report, allowed, _ = _plan_single_process_text_shapes(
         _make_shape_guard_text_plan((10, 11), schedules=schedules),
         None,
         args=best_effort,
@@ -388,7 +540,7 @@ def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged(
     )
     for is_vlm, batch_iter, args, reason, allowed in cases:
         batches = _make_shape_guard_text_plan((10, 30), labeled=False)
-        shape_plan, report, compile_allowed = _plan_single_process_text_shapes(
+        shape_plan, report, compile_allowed, _ = _plan_single_process_text_shapes(
             batches,
             batch_iter,
             args=args,
@@ -424,7 +576,7 @@ def test_ddp_text_shape_guard_uses_local_phases_and_rank_local_endpoints():
         batches = _make_shape_guard_text_plan(
             widths, schedules=schedules, labeled=False,
         )
-        shape_plan, report, allowed = _plan_single_process_text_shapes(
+        shape_plan, report, allowed, _ = _plan_single_process_text_shapes(
             batches,
             None,
             args=args,
@@ -459,8 +611,8 @@ def test_ddp_text_shape_guard_coordinates_peer_failure_and_strict_mode():
         "exact", "schedule_within_cap", 32, "ddp_local_grad",
     )
     policy = build_compile_policy(args=MLXTrainingConfig())
-    report, allowed = trainer._coordinate_text_shape_guard(
-        local_report, True, policy,
+    _, report, allowed = trainer._coordinate_text_shape_guard(
+        None, None, local_report, True, policy,
     )
     assert allowed is False
     assert (report.action, report.reason) == ("eager", "peer_planner_failure")
@@ -470,7 +622,9 @@ def test_ddp_text_shape_guard_coordinates_peer_failure_and_strict_mode():
         args=MLXTrainingConfig(compile_mode="strict"),
     )
     with pytest.raises(RuntimeError, match="at least one DDP rank"):
-        trainer._coordinate_text_shape_guard(local_report, True, strict_policy)
+        trainer._coordinate_text_shape_guard(
+            None, None, local_report, True, strict_policy,
+        )
 
 
 @pytest.mark.parametrize("compile_failure", [None, "setup", "runtime"])

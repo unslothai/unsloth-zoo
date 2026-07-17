@@ -212,13 +212,17 @@ from .compile import (
     trace_compile_application,
 )
 from .shape_guard import (
+    AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
     FULL_STEP_SCOPE,
     TextShapeEvent,
     TextShapeGuardReport,
+    build_text_shape_frontier,
+    materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
     resolve_compile_max_variants,
+    select_text_shape_padding_budget,
 )
 
 
@@ -683,7 +687,13 @@ class MLXTrainingConfig:
 
 
 def _shape_guard_report(
-    action, reason, cap, compile_scope="none", *, lazy_batches=True,
+    action,
+    reason,
+    cap,
+    compile_scope="none",
+    *,
+    lazy_batches=True,
+    cap_selection="not_applicable",
 ):
     return TextShapeGuardReport(
         action=action,
@@ -694,6 +704,10 @@ def _shape_guard_report(
         planned_signatures=None,
         raw_widths=0,
         lazy_batches=lazy_batches,
+        configured_cap=cap,
+        effective_cap=cap,
+        cap_selection=cap_selection,
+        budget_satisfied=False,
     )
 
 
@@ -706,20 +720,21 @@ def _plan_single_process_text_shapes(
     is_vlm,
     distributed_world_size,
     compile_policy,
+    install_plan=True,
 ):
     """Plan finite text shapes before optimizer or compiled-callable setup."""
 
-    cap = resolve_compile_max_variants(
-        getattr(args, "compile_max_variants", None)
-    )
+    configured_cap = getattr(args, "compile_max_variants", None)
+    automatic = configured_cap is None
+    cap = resolve_compile_max_variants(configured_cap)
     if is_vlm:
         return None, _shape_guard_report(
             "not_applicable", "vlm", cap, lazy_batches=False,
-        ), True
+        ), True, None
     if batch_iter is not None:
         return None, _shape_guard_report(
             "not_applicable", "streaming", cap, lazy_batches=False,
-        ), True
+        ), True, None
     compile_scope = (
         DDP_LOCAL_GRAD_SCOPE
         if distributed_world_size > 1 else FULL_STEP_SCOPE
@@ -727,7 +742,7 @@ def _plan_single_process_text_shapes(
     if compile_policy.mode == "eager":
         return None, _shape_guard_report(
             "not_applicable", "compile_disabled", cap,
-        ), True
+        ), True, None
     max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
     if (
         distributed_world_size <= 1
@@ -736,17 +751,18 @@ def _plan_single_process_text_shapes(
     ):
         return None, _shape_guard_report(
             "not_applicable", "compile_ineligible_global_norm", cap,
-        ), False
+        ), False, None
     if not isinstance(batches, FiniteTextBatchPlan):
         report = _shape_guard_report(
             "eager", "unsupported_batch_plan", cap, compile_scope,
             lazy_batches=False,
+            cap_selection="fallback",
         )
         if compile_policy.mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile requires a finite CPU text batch plan."
             )
-        return None, report, False
+        return None, report, False, None
 
     total_microsteps = total_steps * args.gradient_accumulation_steps
     event_counts = {}
@@ -761,7 +777,7 @@ def _plan_single_process_text_shapes(
         )
         key = (family, width, phase, len(batches.schedule[batch_index]))
         event_counts[key] = event_counts.get(key, 0) + 1
-    events = (
+    events = tuple(
         TextShapeEvent(
             family=family,
             width=width,
@@ -771,20 +787,28 @@ def _plan_single_process_text_shapes(
         )
         for (family, width, phase, batch_size), frequency in event_counts.items()
     )
-    shape_plan = plan_text_shape_buckets(
-        events,
-        cap=cap,
-        compile_scope=compile_scope,
-    )
+    frontier = None
+    if automatic:
+        frontier = build_text_shape_frontier(
+            events, compile_scope=compile_scope,
+        )
+        shape_plan = select_text_shape_padding_budget(frontier)
+    else:
+        shape_plan = plan_text_shape_buckets(
+            events,
+            cap=cap,
+            compile_scope=compile_scope,
+        )
     if shape_plan.report.action == "eager":
         if compile_policy.mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile finite text shape planning failed "
                 f"({shape_plan.report.reason})."
             )
-        return shape_plan, shape_plan.report, False
-    batches.set_shape_plan(shape_plan)
-    return shape_plan, shape_plan.report, True
+        return shape_plan, shape_plan.report, False, frontier
+    if install_plan:
+        batches.set_shape_plan(shape_plan)
+    return shape_plan, shape_plan.report, True, frontier
 
 
 def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False):
@@ -1153,39 +1177,114 @@ class MLXTrainer:
             return value
         return mx.distributed.all_sum(value, group=world, stream=stream)
 
+    def _distributed_all_max(self, value, stream=None):
+        """All-max a scalar/array on the trainer's distributed group."""
+        world = self._ensure_distributed()
+        if world is None or self._distributed_world_size <= 1:
+            return value
+        return mx.distributed.all_max(value, group=world, stream=stream)
+
     def _distributed_any_flag(self, flag):
         """Return whether any rank reported ``flag``."""
         return self._distributed_status_mask(int(bool(flag))) > 0
 
     def _coordinate_text_shape_guard(
-        self, report, compile_allowed, compile_policy, *, local_error=None,
+        self,
+        shape_plan,
+        frontier,
+        report,
+        compile_allowed,
+        compile_policy,
+        *,
+        automatic=False,
+        local_error=None,
     ):
         """Require every DDP rank to admit its local finite shape plan."""
         if self.distributed_world_size <= 1:
             if local_error is not None:
                 raise local_error
-            return report, compile_allowed
+            return shape_plan, report, compile_allowed
         failed_any = self._distributed_any_flag(
             local_error is not None or not compile_allowed
         )
-        if not failed_any:
-            return report, compile_allowed
+        if failed_any:
+            if compile_policy.mode == "strict":
+                error = RuntimeError(
+                    "Unsloth: strict mx.compile finite text shape planning "
+                    "failed on at least one DDP rank."
+                )
+                if local_error is not None:
+                    raise error from local_error
+                raise error
+            reason = (
+                report.reason if not compile_allowed
+                else "peer_planner_failure"
+            )
+            return None, replace(
+                report,
+                action="eager",
+                reason=reason,
+                planned_signatures=None,
+                planned_endpoints=(),
+                padding_tokens=0,
+                cap_selection="fallback",
+                padding_work_fraction=0.0,
+                max_width_stretch=1.0,
+                budget_satisfied=False,
+            ), False
+        if not automatic or frontier is None:
+            return shape_plan, report, compile_allowed
+
+        shared_cap = self._distributed_max_int(report.effective_cap)
+        final_plan = None
+        final_error = None
+        try:
+            if not 1 <= shared_cap <= AUTOMATIC_TEXT_COMPILE_CEILING:
+                raise RuntimeError(
+                    "automatic finite text cap synchronization exceeded "
+                    f"{AUTOMATIC_TEXT_COMPILE_CEILING}"
+                )
+            final_plan = materialize_text_shape_frontier(
+                frontier,
+                cap=shared_cap,
+                cap_selection=report.cap_selection,
+            )
+            if final_plan.report.action == "eager":
+                raise RuntimeError(final_plan.report.reason)
+        except Exception as exc:
+            final_error = exc
+        final_failed_any = self._distributed_any_flag(final_error is not None)
+        if not final_failed_any:
+            return final_plan, final_plan.report, True
         if compile_policy.mode == "strict":
             error = RuntimeError(
-                "Unsloth: strict mx.compile finite text shape planning "
-                "failed on at least one DDP rank."
+                "Unsloth: strict mx.compile finite text shared-cap "
+                "materialization failed on at least one DDP rank."
             )
-            if local_error is not None:
-                raise error from local_error
+            if final_error is not None:
+                raise error from final_error
             raise error
-        reason = report.reason if not compile_allowed else "peer_planner_failure"
-        return replace(
+        fallback_cap = (
+            shared_cap
+            if 1 <= shared_cap <= AUTOMATIC_TEXT_COMPILE_CEILING
+            else AUTOMATIC_TEXT_COMPILE_CEILING
+        )
+        return None, replace(
             report,
             action="eager",
-            reason=reason,
+            reason=(
+                "shared_cap_materialization_failed"
+                if final_error is not None else "peer_planner_failure"
+            ),
+            cap=fallback_cap,
+            effective_cap=fallback_cap,
             planned_signatures=None,
             planned_endpoints=(),
             padding_tokens=0,
+            cap_selection="fallback",
+            padding_work_fraction=0.0,
+            max_width_stretch=1.0,
+            budget_satisfied=False,
         ), False
 
     def _distributed_status_mask(self, mask):
@@ -1194,6 +1293,13 @@ class MLXTrainer:
         total = self._distributed_all_sum(local, stream=mx.cpu)
         mx.eval(total)
         return int(total.item())
+
+    def _distributed_max_int(self, value):
+        """All-max a bounded integer preflight value across ranks."""
+        local = mx.array(int(value), dtype=mx.int32)
+        maximum = self._distributed_all_max(local, stream=mx.cpu)
+        mx.eval(maximum)
+        return int(maximum.item())
 
     def _raise_distributed_failure_from_any(self, failed_any, context, exc=None):
         """Abort this rank after a rank-wide failure consensus."""
@@ -2033,8 +2139,15 @@ class MLXTrainer:
             elif preflight_error is not None:
                 raise preflight_error
             local_plan_error = None
+            shape_plan = None
+            frontier = None
             try:
-                _, report, compile_allowed = _plan_single_process_text_shapes(
+                (
+                    shape_plan,
+                    report,
+                    compile_allowed,
+                    frontier,
+                ) = _plan_single_process_text_shapes(
                     batches,
                     batch_iter,
                     args=args,
@@ -2042,6 +2155,7 @@ class MLXTrainer:
                     is_vlm=False,
                     distributed_world_size=self.distributed_world_size,
                     compile_policy=compile_policy,
+                    install_plan=False,
                 )
             except Exception as exc:
                 local_plan_error = exc
@@ -2054,14 +2168,24 @@ class MLXTrainer:
                         if self.distributed_world_size > 1
                         else FULL_STEP_SCOPE
                     ),
+                    cap_selection="fallback",
                 )
                 compile_allowed = False
-            report, compile_allowed = self._coordinate_text_shape_guard(
+            (
+                shape_plan,
+                report,
+                compile_allowed,
+            ) = self._coordinate_text_shape_guard(
+                shape_plan,
+                frontier,
                 report,
                 compile_allowed,
                 compile_policy,
+                automatic=args.compile_max_variants is None,
                 local_error=local_plan_error,
             )
+            if compile_allowed and shape_plan is not None:
+                batches.set_shape_plan(shape_plan)
             self._text_shape_guard_preflight = (
                 batches, batch_iter, total_steps, report, compile_allowed,
             )
@@ -2296,6 +2420,7 @@ class MLXTrainer:
                 _,
                 _compile_shape_guard_report,
                 _shape_guard_compile_allowed,
+                _,
             ) = _plan_single_process_text_shapes(
                 batches,
                 batch_iter,
