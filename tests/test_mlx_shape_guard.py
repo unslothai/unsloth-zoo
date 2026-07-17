@@ -332,6 +332,28 @@ def test_padding_budget_ceiling_is_bounded_when_no_point_meets_stretch():
     assert plan.report.max_width_stretch > 1.5
 
 
+def test_padding_budget_keeps_stretch_feasible_long_tail_frontier():
+    widths = (8, 13, 21, 34, 55) + tuple(
+        random.Random(6994).sample(range(96, 513), 139)
+    )
+    events = [_event(("text",), width, "single") for width in widths]
+
+    plan = plan_text_shape_padding_budget(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert plan.report.effective_cap == plan.report.planned_signatures == 21
+    assert plan.report.padding_work_fraction == pytest.approx(
+        0.04942145401598708,
+    )
+    assert plan.report.max_width_stretch == pytest.approx(1.34375)
+    assert plan.report.budget_satisfied is True
+    assert all(
+        plan.endpoint_for(event.family, event.width) >= event.width
+        for event in events
+    )
+
+
 def test_padding_budget_is_independent_of_event_order():
     events = [
         _event(("a",), 10 + index * index, "a", frequency=1 + index % 3)
