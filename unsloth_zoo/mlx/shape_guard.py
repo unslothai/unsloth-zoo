@@ -18,7 +18,12 @@ from dataclasses import asdict, dataclass
 import hashlib
 
 
-DEFAULT_TEXT_COMPILE_MAX_VARIANTS = 128
+AUTOMATIC_TEXT_COMPILE_CEILING = 128
+DEFAULT_TEXT_COMPILE_MAX_VARIANTS = AUTOMATIC_TEXT_COMPILE_CEILING
+SMALL_EXACT_SIGNATURE_THRESHOLD = 32
+MAX_PADDING_WORK_PERCENT = 5
+MAX_WIDTH_STRETCH_NUMERATOR = 3
+MAX_WIDTH_STRETCH_DENOMINATOR = 2
 MAX_COMPILE_VARIANTS = 256
 MAX_WIDTHS_PER_FAMILY = 2_048
 MAX_PLANNER_WORK = 16_000_000
@@ -71,6 +76,18 @@ class TextShapeGuardReport:
     padding_tokens: int = 0
     original_tokens: int = 0
     lazy_batches: bool = True
+    configured_cap: int | None = None
+    effective_cap: int | None = None
+    cap_selection: str = "fixed"
+    padding_work_fraction: float = 0.0
+    max_width_stretch: float = 1.0
+    budget_satisfied: bool = True
+
+    def __post_init__(self):
+        if self.configured_cap is None:
+            object.__setattr__(self, "configured_cap", self.cap)
+        if self.effective_cap is None:
+            object.__setattr__(self, "effective_cap", self.cap)
 
     @property
     def padding_fraction(self):
@@ -122,6 +139,29 @@ class TextShapePlan:
 
 class _PlannerLimit(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _TextShapeProblem:
+    compile_scope: str
+    family_data: dict
+    raw_catalog: frozenset[tuple]
+    sorted_families: tuple[tuple, ...]
+    original_tokens: int
+    raw_work: int
+
+
+@dataclass(frozen=True)
+class TextShapeFrontier:
+    """One exact global padding frontier for a finite text schedule."""
+
+    _problem: _TextShapeProblem
+    _points: tuple[tuple[int, int, tuple], ...] = ()
+    failure_reason: str | None = None
+
+    @property
+    def raw_signatures(self):
+        return len(self._problem.raw_catalog)
 
 
 def resolve_compile_max_variants(value=None):
@@ -188,6 +228,12 @@ def _report(
     endpoints=(),
     padding_tokens=0,
     original_tokens=0,
+    configured_cap=None,
+    cap_selection="fixed",
+    padding_work=0,
+    raw_work=0,
+    max_width_stretch=1.0,
+    budget_satisfied=True,
 ):
     labels = _family_labels(family_data)
     planned_endpoints = tuple(
@@ -207,6 +253,39 @@ def _report(
         planned_endpoints=planned_endpoints,
         padding_tokens=padding_tokens,
         original_tokens=original_tokens,
+        configured_cap=cap if configured_cap is None else configured_cap,
+        effective_cap=cap,
+        cap_selection=cap_selection,
+        padding_work_fraction=(padding_work / raw_work if raw_work else 0.0),
+        max_width_stretch=max_width_stretch,
+        budget_satisfied=budget_satisfied,
+    )
+
+
+def _collect_problem(events, compile_scope):
+    if compile_scope not in (FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE):
+        raise ValueError(f"unsupported compile scope: {compile_scope!r}")
+    family_data = {}
+    raw_catalog = set()
+    original_tokens = 0
+    raw_work = 0
+    for event in tuple(events):
+        if not isinstance(event, TextShapeEvent):
+            raise TypeError("events must contain TextShapeEvent values")
+        phase_weights = family_data.setdefault(event.family, {}).setdefault(
+            event.width, {}
+        )
+        phase_weights[event.phase] = phase_weights.get(event.phase, 0) + event.weight
+        raw_catalog.add((compile_scope, event.phase, event.family, event.width))
+        original_tokens += event.weight * event.width
+        raw_work += event.weight * event.width * event.width
+    return _TextShapeProblem(
+        compile_scope=compile_scope,
+        family_data=family_data,
+        raw_catalog=frozenset(raw_catalog),
+        sorted_families=tuple(sorted(family_data, key=_family_key)),
+        original_tokens=original_tokens,
+        raw_work=raw_work,
     )
 
 
@@ -248,145 +327,163 @@ def _family_options(width_data, cap, work):
     return states[-1]
 
 
-def _eager_plan(reason, cap, compile_scope, raw_catalog, family_data, original_tokens):
+def _build_global_frontier(problem, cap):
+    """Build the exact minimum-padding point for every feasible slot count."""
+
+    irreducible = sum(
+        len({
+            phase
+            for phases in problem.family_data[family].values()
+            for phase in phases
+        })
+        for family in problem.sorted_families
+    )
+    if irreducible > cap:
+        raise _PlannerLimit("irreducible_signatures")
+
+    work = [0]
+    family_options = []
+    for family in problem.sorted_families:
+        options = _family_options(problem.family_data[family], cap, work)
+        if not options:
+            raise _PlannerLimit("irreducible_signatures")
+        family_options.append(options)
+
+    states = {0: (0, ())}
+    for options in family_options:
+        next_states = {}
+        for used, (cost, choices) in states.items():
+            for slots, (family_cost, endpoints) in options.items():
+                work[0] += 1
+                if work[0] > MAX_PLANNER_WORK:
+                    raise _PlannerLimit("planner_work_limit")
+                total = used + slots
+                if total > cap:
+                    continue
+                candidate = (cost + family_cost, choices + (endpoints,))
+                current = next_states.get(total)
+                if current is None or candidate < current:
+                    next_states[total] = candidate
+        states = next_states
+    if not states:
+        raise _PlannerLimit("irreducible_signatures")
+    return states
+
+
+def _eager_plan(
+    problem, reason, cap, *, configured_cap=None, cap_selection="fixed",
+):
     report = _report(
         action="eager",
         reason=reason,
         cap=cap,
-        compile_scope=compile_scope,
-        raw_catalog=raw_catalog,
-        family_data=family_data,
-        original_tokens=original_tokens,
+        compile_scope=problem.compile_scope,
+        raw_catalog=problem.raw_catalog,
+        family_data=problem.family_data,
+        original_tokens=problem.original_tokens,
+        configured_cap=configured_cap,
+        cap_selection=cap_selection,
+        raw_work=problem.raw_work,
+        budget_satisfied=False,
     )
-    return TextShapePlan(report, frozenset(raw_catalog), frozenset())
+    return TextShapePlan(report, problem.raw_catalog, frozenset())
 
 
-def plan_text_shape_buckets(events, *, cap, compile_scope):
-    """Choose the minimum-cost upward endpoint map under a signature cap."""
-
-    cap = resolve_compile_max_variants(cap)
-    if compile_scope not in (FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE):
-        raise ValueError(f"unsupported compile scope: {compile_scope!r}")
-    events = tuple(events)
-    if not events:
-        return _eager_plan("empty_schedule", cap, compile_scope, (), {}, 0)
-
-    family_data = {}
-    raw_catalog = set()
-    original_tokens = 0
-    for event in events:
-        if not isinstance(event, TextShapeEvent):
-            raise TypeError("events must contain TextShapeEvent values")
-        phase_weights = family_data.setdefault(event.family, {}).setdefault(
-            event.width, {}
-        )
-        phase_weights[event.phase] = phase_weights.get(event.phase, 0) + event.weight
-        raw_catalog.add((compile_scope, event.phase, event.family, event.width))
-        original_tokens += event.weight * event.width
-
-    sorted_families = tuple(sorted(family_data, key=_family_key))
-    if len(raw_catalog) <= cap:
-        raw_endpoints = tuple(
-            (family, tuple(sorted(family_data[family])))
-            for family in sorted_families
-        )
-        report = _report(
-            action="exact",
-            reason="schedule_within_cap",
-            cap=cap,
-            compile_scope=compile_scope,
-            raw_catalog=raw_catalog,
-            family_data=family_data,
-            planned_catalog=raw_catalog,
-            endpoints=raw_endpoints,
-            original_tokens=original_tokens,
-        )
-        return TextShapePlan(
-            report,
-            frozenset(raw_catalog),
-            frozenset(raw_catalog),
-        )
-
-    irreducible = sum(
-        len({phase for phases in family_data[family].values() for phase in phases})
-        for family in sorted_families
-    )
-    if irreducible > cap:
-        return _eager_plan(
-            "irreducible_signatures", cap, compile_scope,
-            raw_catalog, family_data, original_tokens,
-        )
-
-    work = [0]
-    family_options = []
-    try:
-        for family in sorted_families:
-            options = _family_options(family_data[family], cap, work)
-            if not options:
-                return _eager_plan(
-                    "irreducible_signatures", cap, compile_scope,
-                    raw_catalog, family_data, original_tokens,
-                )
-            family_options.append((family, options))
-
-        states = {0: (0, ())}
-        for _family, options in family_options:
-            next_states = {}
-            for used, (cost, choices) in states.items():
-                for slots, (family_cost, endpoints) in options.items():
-                    work[0] += 1
-                    if work[0] > MAX_PLANNER_WORK:
-                        raise _PlannerLimit("planner_work_limit")
-                    total = used + slots
-                    if total > cap:
-                        continue
-                    candidate = (cost + family_cost, choices + (endpoints,))
-                    current = next_states.get(total)
-                    if current is None or candidate < current:
-                        next_states[total] = candidate
-            states = next_states
-    except _PlannerLimit as exc:
-        return _eager_plan(
-            str(exc), cap, compile_scope,
-            raw_catalog, family_data, original_tokens,
-        )
-
-    if not states:
-        return _eager_plan(
-            "irreducible_signatures", cap, compile_scope,
-            raw_catalog, family_data, original_tokens,
-        )
-    slots, (padding_cost, choices) = min(
-        states.items(),
-        key=lambda item: (item[1][0], item[0], item[1][1]),
-    )
+def _exact_plan(problem, cap, *, configured_cap=None, cap_selection="fixed"):
     endpoints = tuple(
-        (family, choices[index])
-        for index, family in enumerate(sorted_families)
+        (family, tuple(sorted(problem.family_data[family])))
+        for family in problem.sorted_families
     )
-    endpoint_maps = []
+    report = _report(
+        action="exact",
+        reason="schedule_within_cap",
+        cap=cap,
+        compile_scope=problem.compile_scope,
+        raw_catalog=problem.raw_catalog,
+        family_data=problem.family_data,
+        planned_catalog=problem.raw_catalog,
+        endpoints=endpoints,
+        original_tokens=problem.original_tokens,
+        configured_cap=configured_cap,
+        cap_selection=cap_selection,
+        raw_work=problem.raw_work,
+    )
+    return TextShapePlan(report, problem.raw_catalog, problem.raw_catalog)
+
+
+def _choice_metrics(problem, choices):
     endpoint_lookup = {}
-    for family, family_endpoints in endpoints:
-        mapping = []
-        for width in sorted(family_data[family]):
+    max_numerator = 1
+    max_denominator = 1
+    stretch_within_budget = True
+    for index, family in enumerate(problem.sorted_families):
+        family_endpoints = choices[index]
+        for width in sorted(problem.family_data[family]):
             endpoint = next(value for value in family_endpoints if width <= value)
             if endpoint < width:
                 raise AssertionError("endpoint mapping truncated a sequence")
-            mapping.append((width, endpoint))
             endpoint_lookup[(family, width)] = endpoint
-        endpoint_maps.append((family, tuple(mapping)))
+            if endpoint * max_denominator > max_numerator * width:
+                max_numerator, max_denominator = endpoint, width
+            if (
+                endpoint * MAX_WIDTH_STRETCH_DENOMINATOR
+                > width * MAX_WIDTH_STRETCH_NUMERATOR
+            ):
+                stretch_within_budget = False
+    return (
+        endpoint_lookup,
+        max_numerator / max_denominator,
+        stretch_within_budget,
+    )
 
-    planned_catalog = {
+
+def _point_within_budgets(problem, point):
+    _slots, padding_cost, choices = point
+    return (
+        padding_cost * 100
+        <= problem.raw_work * MAX_PADDING_WORK_PERCENT
+        and _choice_metrics(problem, choices)[2]
+    )
+
+
+def _materialize_choice(
+    problem,
+    slots,
+    padding_cost,
+    choices,
+    *,
+    cap,
+    configured_cap=None,
+    cap_selection="fixed",
+):
+    endpoints = tuple(
+        (family, choices[index])
+        for index, family in enumerate(problem.sorted_families)
+    )
+    endpoint_lookup, max_width_stretch, stretch_within_budget = (
+        _choice_metrics(problem, choices)
+    )
+    endpoint_maps = tuple(
+        (
+            family,
+            tuple(
+                (width, endpoint_lookup[(family, width)])
+                for width in sorted(problem.family_data[family])
+            ),
+        )
+        for family in problem.sorted_families
+    )
+    planned_catalog = frozenset({
         (scope, phase, family, endpoint_lookup[(family, width)])
-        for scope, phase, family, width in raw_catalog
-    }
+        for scope, phase, family, width in problem.raw_catalog
+    })
     if len(planned_catalog) != slots or len(planned_catalog) > cap:
         raise AssertionError("planned signature catalog exceeds its cap")
 
     padding_tokens = 0
     reconstructed_cost = 0
-    for family in sorted_families:
-        for width, phase_weights in family_data[family].items():
+    for family in problem.sorted_families:
+        for width, phase_weights in problem.family_data[family].items():
             endpoint = endpoint_lookup[(family, width)]
             weight = sum(phase_weights.values())
             padding_tokens += (endpoint - width) * weight
@@ -394,38 +491,224 @@ def plan_text_shape_buckets(events, *, cap, compile_scope):
     if reconstructed_cost != padding_cost:
         raise AssertionError("planner padding cost reconstruction failed")
 
+    work_within_budget = (
+        padding_cost * 100
+        <= problem.raw_work * MAX_PADDING_WORK_PERCENT
+    )
+    budget_satisfied = work_within_budget and stretch_within_budget
+    is_exact = planned_catalog == problem.raw_catalog and padding_cost == 0
     report = _report(
-        action="bucket",
-        reason="schedule_exceeds_cap",
+        action="exact" if is_exact else "bucket",
+        reason="schedule_within_cap" if is_exact else "schedule_exceeds_cap",
         cap=cap,
-        compile_scope=compile_scope,
-        raw_catalog=raw_catalog,
-        family_data=family_data,
+        compile_scope=problem.compile_scope,
+        raw_catalog=problem.raw_catalog,
+        family_data=problem.family_data,
         planned_catalog=planned_catalog,
         endpoints=endpoints,
         padding_tokens=padding_tokens,
-        original_tokens=original_tokens,
+        original_tokens=problem.original_tokens,
+        configured_cap=configured_cap,
+        cap_selection=cap_selection,
+        padding_work=padding_cost,
+        raw_work=problem.raw_work,
+        max_width_stretch=max_width_stretch,
+        budget_satisfied=budget_satisfied,
     )
     return TextShapePlan(
         report=report,
-        raw_catalog=frozenset(raw_catalog),
-        planned_catalog=frozenset(planned_catalog),
-        endpoint_maps=tuple(endpoint_maps),
+        raw_catalog=problem.raw_catalog,
+        planned_catalog=planned_catalog,
+        endpoint_maps=() if is_exact else endpoint_maps,
         padding_cost=padding_cost,
     )
 
 
+def build_text_shape_frontier(events, *, compile_scope):
+    """Build at most one exact automatic frontier for ``events``."""
+
+    problem = _collect_problem(events, compile_scope)
+    if not problem.raw_catalog:
+        return TextShapeFrontier(problem, failure_reason="empty_schedule")
+    if len(problem.raw_catalog) <= SMALL_EXACT_SIGNATURE_THRESHOLD:
+        return TextShapeFrontier(problem)
+    try:
+        states = _build_global_frontier(
+            problem, AUTOMATIC_TEXT_COMPILE_CEILING,
+        )
+    except _PlannerLimit as exc:
+        return TextShapeFrontier(problem, failure_reason=str(exc))
+    points = tuple(
+        (slots, cost, choices)
+        for slots, (cost, choices) in sorted(states.items())
+    )
+    return TextShapeFrontier(problem, points)
+
+
+def materialize_text_shape_frontier(
+    frontier,
+    *,
+    cap,
+    cap_selection="padding_budget",
+):
+    """Materialize the minimum-padding local plan under a shared auto cap."""
+
+    if not isinstance(frontier, TextShapeFrontier):
+        raise TypeError("frontier must be a TextShapeFrontier")
+    if type(cap) is not int or not 1 <= cap <= AUTOMATIC_TEXT_COMPILE_CEILING:
+        raise ValueError(
+            "automatic effective cap must be an integer from 1 through "
+            f"{AUTOMATIC_TEXT_COMPILE_CEILING}"
+        )
+    problem = frontier._problem
+    if frontier.failure_reason is not None:
+        return _eager_plan(
+            problem,
+            frontier.failure_reason,
+            cap,
+            configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+            cap_selection="fallback",
+        )
+    if len(problem.raw_catalog) <= cap:
+        return _exact_plan(
+            problem,
+            cap,
+            configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+            cap_selection=cap_selection,
+        )
+    candidates = [point for point in frontier._points if point[0] <= cap]
+    if not candidates:
+        return _eager_plan(
+            problem,
+            "irreducible_signatures",
+            cap,
+            configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+            cap_selection="fallback",
+        )
+    budget_candidates = [
+        point for point in candidates if _point_within_budgets(problem, point)
+    ]
+    slots, padding_cost, choices = min(
+        budget_candidates or candidates,
+        key=lambda point: (point[1], point[0], point[2]),
+    )
+    return _materialize_choice(
+        problem,
+        slots,
+        padding_cost,
+        choices,
+        cap=cap,
+        configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+        cap_selection=cap_selection,
+    )
+
+
+def select_text_shape_padding_budget(frontier):
+    """Select the smallest exact-frontier point within both policy budgets."""
+
+    if not isinstance(frontier, TextShapeFrontier):
+        raise TypeError("frontier must be a TextShapeFrontier")
+    problem = frontier._problem
+    if frontier.failure_reason is not None:
+        return _eager_plan(
+            problem,
+            frontier.failure_reason,
+            AUTOMATIC_TEXT_COMPILE_CEILING,
+            configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+            cap_selection="fallback",
+        )
+    if len(problem.raw_catalog) <= SMALL_EXACT_SIGNATURE_THRESHOLD:
+        return _exact_plan(
+            problem,
+            len(problem.raw_catalog),
+            configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+            cap_selection="exact",
+        )
+
+    selected = None
+    for point in frontier._points:
+        slots, padding_cost, choices = point
+        if _point_within_budgets(problem, point):
+            selected = point
+            break
+    if selected is not None:
+        slots, padding_cost, choices = selected
+        return _materialize_choice(
+            problem,
+            slots,
+            padding_cost,
+            choices,
+            cap=slots,
+            configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+            cap_selection="padding_budget",
+        )
+
+    slots, padding_cost, choices = min(
+        frontier._points,
+        key=lambda point: (point[1], point[0], point[2]),
+    )
+    return _materialize_choice(
+        problem,
+        slots,
+        padding_cost,
+        choices,
+        cap=slots,
+        configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+        cap_selection="ceiling",
+    )
+
+
+def plan_text_shape_padding_budget(events, *, compile_scope):
+    """Build one frontier and select the deterministic automatic text cap."""
+
+    return select_text_shape_padding_budget(
+        build_text_shape_frontier(events, compile_scope=compile_scope)
+    )
+
+
+def plan_text_shape_buckets(events, *, cap, compile_scope):
+    """Choose the minimum-cost upward endpoint map under a signature cap."""
+
+    cap = resolve_compile_max_variants(cap)
+    problem = _collect_problem(events, compile_scope)
+    if not problem.raw_catalog:
+        return _eager_plan(problem, "empty_schedule", cap)
+    if len(problem.raw_catalog) <= cap:
+        return _exact_plan(problem, cap)
+    try:
+        states = _build_global_frontier(problem, cap)
+    except _PlannerLimit as exc:
+        return _eager_plan(problem, str(exc), cap)
+    slots, (padding_cost, choices) = min(
+        states.items(),
+        key=lambda item: (item[1][0], item[0], item[1][1]),
+    )
+    return _materialize_choice(
+        problem, slots, padding_cost, choices, cap=cap,
+    )
+
+
 __all__ = (
+    "AUTOMATIC_TEXT_COMPILE_CEILING",
     "DEFAULT_TEXT_COMPILE_MAX_VARIANTS",
+    "SMALL_EXACT_SIGNATURE_THRESHOLD",
+    "MAX_PADDING_WORK_PERCENT",
+    "MAX_WIDTH_STRETCH_NUMERATOR",
+    "MAX_WIDTH_STRETCH_DENOMINATOR",
     "MAX_COMPILE_VARIANTS",
     "MAX_WIDTHS_PER_FAMILY",
     "MAX_PLANNER_WORK",
     "FULL_STEP_SCOPE",
     "DDP_LOCAL_GRAD_SCOPE",
     "TextShapeEvent",
+    "TextShapeFrontier",
     "TextShapeGuardReport",
     "TextShapePlan",
     "resolve_compile_max_variants",
     "phase_for_microstep",
+    "build_text_shape_frontier",
+    "materialize_text_shape_frontier",
+    "select_text_shape_padding_budget",
     "plan_text_shape_buckets",
+    "plan_text_shape_padding_budget",
 )

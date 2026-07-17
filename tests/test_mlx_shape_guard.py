@@ -7,12 +7,17 @@ import pytest
 
 from unsloth_zoo.mlx import shape_guard
 from unsloth_zoo.mlx.shape_guard import (
+    AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
     FULL_STEP_SCOPE,
     TextShapeEvent,
+    build_text_shape_frontier,
+    materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
+    plan_text_shape_padding_budget,
     resolve_compile_max_variants,
+    select_text_shape_padding_budget,
 )
 
 
@@ -187,6 +192,8 @@ def test_report_is_bounded_and_deterministic_across_event_order():
         "action", "reason", "cap", "compile_scope", "raw_signatures",
         "planned_signatures", "raw_widths", "planned_endpoints",
         "padding_tokens", "original_tokens", "lazy_batches",
+        "configured_cap", "effective_cap", "cap_selection",
+        "padding_work_fraction", "max_width_stretch", "budget_satisfied",
         "padding_fraction",
     }
     assert len(report["planned_endpoints"]) <= report["cap"]
@@ -233,3 +240,141 @@ def test_randomized_small_plans_match_exhaustive_optima():
         assert len(actual.planned_catalog) <= cap
         for event in events:
             assert actual.endpoint_for(event.family, event.width) >= event.width
+
+
+def test_padding_budget_keeps_small_schedules_exact_without_frontier(monkeypatch):
+    def unexpected_frontier(*_args, **_kwargs):
+        raise AssertionError("small exact schedules must bypass frontier work")
+
+    monkeypatch.setattr(shape_guard, "_build_global_frontier", unexpected_frontier)
+    events = [_event(("text",), width) for width in range(10, 42)]
+
+    plan = plan_text_shape_padding_budget(events, compile_scope=FULL_STEP_SCOPE)
+
+    assert plan.report.cap_selection == "exact"
+    assert plan.report.configured_cap == AUTOMATIC_TEXT_COMPILE_CEILING
+    assert plan.report.effective_cap == plan.report.cap == 32
+    assert plan.report.action == "exact"
+    assert plan.report.padding_work_fraction == 0.0
+    assert plan.report.max_width_stretch == 1.0
+    assert plan.report.budget_satisfied is True
+
+
+def test_padding_budget_uses_one_frontier_and_adapts_to_width_distribution(monkeypatch):
+    original = shape_guard._build_global_frontier
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(shape_guard, "_build_global_frontier", counted)
+    clustered = [_event(("text",), width) for width in range(100, 164)]
+    irregular = [_event(("text",), 10 + width * width) for width in range(64)]
+
+    clustered_plan = plan_text_shape_padding_budget(
+        clustered, compile_scope=FULL_STEP_SCOPE,
+    )
+    irregular_plan = plan_text_shape_padding_budget(
+        irregular, compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert calls == [1, 1]
+    assert 1 <= clustered_plan.report.effective_cap < AUTOMATIC_TEXT_COMPILE_CEILING
+    assert clustered_plan.report.budget_satisfied is True
+    assert irregular_plan.report.effective_cap > clustered_plan.report.effective_cap
+    assert irregular_plan.report.budget_satisfied is True
+
+
+def test_padding_budget_exact_boundaries_and_explicit_caps_remain_deterministic():
+    boundary = [_event(("text",), 100, "p0", frequency=3)]
+    boundary.extend(
+        _event(("text",), 150, f"p{phase}") for phase in range(32)
+    )
+    over_stretch = [_event(("text",), 100, "p0", frequency=3)]
+    over_stretch.extend(
+        _event(("text",), 151, f"p{phase}") for phase in range(32)
+    )
+
+    accepted = plan_text_shape_padding_budget(
+        boundary, compile_scope=FULL_STEP_SCOPE,
+    )
+    rejected = plan_text_shape_padding_budget(
+        over_stretch, compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert accepted.report.effective_cap == 32
+    assert accepted.padding_cost * 100 == sum(
+        event.weight * event.width * event.width for event in boundary
+    ) * 5
+    assert accepted.report.max_width_stretch == 1.5
+    assert rejected.report.effective_cap == 33
+    for cap in (1, 256):
+        fixed = plan_text_shape_buckets(
+            [_event(("fixed",), 10), _event(("fixed",), 20)],
+            cap=cap,
+            compile_scope=FULL_STEP_SCOPE,
+        )
+        assert fixed.report.cap_selection == "fixed"
+        assert fixed.report.configured_cap == fixed.report.effective_cap == cap
+
+
+def test_padding_budget_ceiling_is_bounded_when_no_point_meets_stretch():
+    events = [_event(("text",), 2**index) for index in range(129)]
+
+    plan = plan_text_shape_padding_budget(events, compile_scope=FULL_STEP_SCOPE)
+
+    assert plan.report.action == "bucket"
+    assert plan.report.cap_selection == "ceiling"
+    assert plan.report.effective_cap == plan.report.cap == 128
+    assert plan.report.planned_signatures == 128
+    assert plan.report.budget_satisfied is False
+    assert plan.report.max_width_stretch > 1.5
+
+
+def test_padding_budget_is_independent_of_event_order():
+    events = [
+        _event(("a",), 10 + index * index, "a", frequency=1 + index % 3)
+        for index in range(40)
+    ] + [
+        _event(("b",), 20 + index * 3, "b", frequency=2)
+        for index in range(20)
+    ]
+
+    forward = plan_text_shape_padding_budget(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+    reverse = plan_text_shape_padding_budget(
+        reversed(events), compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert forward.report.to_dict() == reverse.report.to_dict()
+    assert forward.endpoint_maps == reverse.endpoint_maps
+
+
+def test_shared_cap_materialization_preserves_both_padding_budgets():
+    events = [
+        _event(("core",), width, frequency=frequency)
+        for width, frequency in ((26, 13), (30, 1), (53, 11), (70, 15))
+    ]
+    events.extend(
+        _event(("singleton", index), 150) for index in range(29)
+    )
+    frontier = build_text_shape_frontier(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+    local = select_text_shape_padding_budget(frontier)
+
+    assert local.report.effective_cap == 31
+    assert local.report.budget_satisfied is True
+    shared = materialize_text_shape_frontier(
+        frontier,
+        cap=32,
+        cap_selection=local.report.cap_selection,
+    )
+
+    assert shared.report.effective_cap == shared.report.cap == 32
+    assert shared.report.planned_signatures <= 32
+    assert shared.report.padding_work_fraction <= 0.05
+    assert shared.report.max_width_stretch <= 1.5
+    assert shared.report.budget_satisfied is True
