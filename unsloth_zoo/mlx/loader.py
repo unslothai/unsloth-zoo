@@ -190,18 +190,23 @@ def _seed_mlx_random_state(random_state):
     mx.random.seed(seed)
 
 
+def _mlx_lora_base_types():
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+
+    return (nn.Linear, nn.QuantizedLinear, SwitchLinear, QuantizedSwitchLinear)
+
+
 def _collect_all_linear_target_names(model):
-    """Leaf-suffix names of every Linear / QuantizedLinear in `model`.
+    """Leaf-suffix names of every dense or routed linear in ``model``.
 
     Mirrors PEFT's ``target_modules="all-linear"``: walk the live tree and
     return each leaf's semantic name (``w1``, ``q_proj``, ``lm_head``, ...),
-    skipping numeric list indices. mlx-lm's ``linear_to_lora_layers`` matches
-    on these, so LoRA covers fused-QKV, MoE, projector, and untied heads.
+    skipping numeric list indices.
     """
-    import mlx.nn as nn
-    linear_types = (nn.Linear, nn.QuantizedLinear)
     names = set()
     try:
+        linear_types = _mlx_lora_base_types()
         for path, mod in model.named_modules():
             if not isinstance(mod, linear_types):
                 continue
@@ -4638,12 +4643,11 @@ def _lora_walk_module(
 
 def _resolve_lora_keys(model, target_modules):
     """Resolve user-facing target module names to mlx-lm layer-local keys."""
-    import mlx.nn as nn
-
     target_modules = set(target_modules or ())
     if not target_modules:
         return None
 
+    linear_types = _mlx_lora_base_types()
     keys = set()
     roots = []
     if hasattr(model, "model") and hasattr(model.model, "layers"):
@@ -4655,7 +4659,7 @@ def _resolve_lora_keys(model, target_modules):
 
     for root in roots:
         for name, module in root.named_modules():
-            if not isinstance(module, (nn.Linear, nn.QuantizedLinear)):
+            if not isinstance(module, linear_types):
                 continue
             if _lora_name_matches_target(name, target_modules):
                 keys.add(name)
