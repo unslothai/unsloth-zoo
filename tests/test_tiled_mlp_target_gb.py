@@ -48,8 +48,10 @@ def test_target_gb_xpu_uses_free_memory_not_constant():
         assert tiled_mlp._default_target_gb() == 1.0  # half of 2 GB free, not 4.0
 
 
-def test_target_gb_xpu_unsupported_falls_back_to_host():
-    # Some Intel GPUs (Arc B580, Lunar Lake) raise on mem_get_info; must not crash.
+def test_target_gb_xpu_unsupported_uses_bounded_default_not_host():
+    # Some Intel GPUs (Arc B580, Lunar Lake) raise on mem_get_info; must not crash,
+    # and must NOT size from host RAM (activations live on the XPU, not the host,
+    # so a big-RAM/small-VRAM box would still OOM). Use a bounded GPU-safe default.
     fake_cuda = mock.MagicMock()
     fake_cuda.is_available.return_value = False
     fake_xpu = mock.MagicMock()
@@ -57,12 +59,12 @@ def test_target_gb_xpu_unsupported_falls_back_to_host():
     fake_xpu.mem_get_info.side_effect = RuntimeError(
         "The device doesn't support querying the available free memory."
     )
-    fake_vm = mock.MagicMock(available=6 * 1024 ** 3)
     with mock.patch.object(tiled_mlp, "DEVICE_TYPE", "xpu"), \
          mock.patch.object(torch, "cuda", fake_cuda), \
          mock.patch.object(torch, "xpu", fake_xpu, create=True), \
-         mock.patch("psutil.virtual_memory", return_value=fake_vm):
-        assert tiled_mlp._default_target_gb() == 3.0  # half of 6 GB host RAM
+         mock.patch("psutil.virtual_memory") as host_ram:
+        assert tiled_mlp._default_target_gb() == 4.0  # bounded default, not host RAM
+        host_ram.assert_not_called()  # host RAM must not drive an accelerator budget
 
 
 def test_target_gb_cpu_uses_host_memory():

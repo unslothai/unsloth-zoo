@@ -2018,6 +2018,24 @@ def _install_vllm_decompose_size_nodes_fix():
     return True
 
 
+def _clear_flashinfer_env_on_hip():
+    # AMD ROCm: FlashInfer requires the CUDA nvcc compiler and never applies here.
+    # Remove any forced FlashInfer selection unconditionally, even when the package
+    # is not installed but the env var was inherited, so vLLM does not try to use
+    # FlashInfer and falls back to the ROCm/default attention backend. Returns True
+    # on HIP so the caller skips the CUDA FlashInfer setup.
+    if not is_hip():
+        return False
+    _fi_forced = False
+    for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
+        if os.environ.get(_fi_env, "") in ("1", "FLASHINFER"):
+            del os.environ[_fi_env]
+            _fi_forced = True
+    if _fi_forced or importlib.util.find_spec("flashinfer"):
+        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
+    return True
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -2238,13 +2256,9 @@ def load_vllm(
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
     # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
     # On AMD, vLLM uses its built-in paged attention instead.
-    if is_hip() and importlib.util.find_spec("flashinfer"):
-        for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
-            if os.environ.get(_fi_env, "") in ("1", "FLASHINFER"):
-                del os.environ[_fi_env]
-        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
-    elif not is_hip() and \
-         importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+    if _clear_flashinfer_env_on_hip():
+        pass
+    elif importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
         # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
         # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
         _has_nvcc = (

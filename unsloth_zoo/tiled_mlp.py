@@ -67,27 +67,24 @@ pass
 def _default_target_gb():
     # Size the tile memory budget from the free memory actually available on the
     # current backend, so a device with little memory left does not pick chunks
-    # that immediately OOM. Mirrors the CUDA path everywhere: query free memory
-    # and keep half of it.
-    free_gb = None
+    # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
     if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
         # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
-        free_gb = torch.cuda.mem_get_info(0)[0] / 1024 / 1024 / 1024
-    elif DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.cuda.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+    if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
         # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
-        # Lunar Lake); fall back to host RAM when the device cannot report it.
+        # Lunar Lake). When the accelerator cannot report free memory, use a small
+        # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
         try:
-            free_gb = torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024
+            return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
         except Exception:
-            free_gb = None
-    if free_gb is None:
-        # CPU / MPS and any backend without a free-memory query: use host RAM.
-        try:
-            import psutil
-            free_gb = psutil.virtual_memory().available / 1024 / 1024 / 1024
-        except Exception:
-            free_gb = 8.0  # ~4 GB budget after the 0.5 factor, matching the old default
-    return free_gb * 0.5
+            return 4.0
+    # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1024 / 1024 / 1024 * 0.5
+    except Exception:
+        return 4.0
 pass
 
 class TiledMLP(torch.autograd.Function):
