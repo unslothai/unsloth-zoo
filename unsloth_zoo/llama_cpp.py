@@ -2477,18 +2477,42 @@ def convert_to_gguf(
             }
         runs_to_do.append((args, final_output, "model"))
 
+    # A bare --outfile (just a filename, no directory) is created by llama.cpp in the
+    # process CWD. On Windows that CWD is frequently not writable (e.g. an app launched
+    # from a protected/install dir), so the final write died with PermissionError
+    # [Errno 13] even though conversion fully succeeded. Resolve such bare names against
+    # a directory we have actually confirmed is writable. CWD is preferred so the
+    # historical behavior (callers relocate the file from CWD) is unchanged wherever the
+    # CWD is writable; input_folder / a temp dir are only fallbacks, and input_folder is
+    # never assumed writable (it may be a read-only/mounted model source).
+    _writable_dir_cache = {}
+    def _dir_is_writable(d):
+        ok = _writable_dir_cache.get(d)
+        if ok is not None: return ok
+        try:
+            probe = os.path.join(d, f".unsloth_gguf_write_test_{os.getpid()}")
+            with open(probe, "wb"): pass
+            os.remove(probe)
+            ok = True
+        except Exception:
+            ok = False
+        _writable_dir_cache[d] = ok
+        return ok
+    def _resolve_bare_outfile(name):
+        for d in (os.getcwd(), os.path.abspath(input_folder), tempfile.gettempdir()):
+            if _dir_is_writable(d):
+                return os.path.join(d, name)
+        return name  # nothing writable found; leave as-is and let the error surface
+
     # Execute conversions
     for args, output_file, description in runs_to_do:
-        # Anchor the output to an absolute, writable directory. The --outfile above
-        # is a bare relative name, so the converter would otherwise write the GGUF
-        # into the process CWD. On Windows that CWD is frequently not writable (e.g.
-        # an app launched from a protected/install dir), so the final write failed
-        # with PermissionError [Errno 13] even though conversion fully succeeded.
-        # input_folder is always present and writable, so resolve relative outputs
-        # against it; callers already relocate the produced files to their final home.
-        if not os.path.isabs(output_file):
-            output_file = os.path.join(os.path.abspath(input_folder), output_file)
-            args = {**args, "--outfile": output_file}
+        # Only touch bare filenames. A caller that passed a relative path with a
+        # directory (e.g. "exports/model") or an absolute path chose its destination
+        # on purpose, so leave those exactly as they were.
+        if not os.path.isabs(output_file) and os.path.dirname(output_file) == "":
+            output_file = _resolve_bare_outfile(output_file)
+            if os.path.isabs(output_file):
+                args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
         for key, value in args.items():
