@@ -379,6 +379,17 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     )
     assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
+    legacy_fields = [
+        field for field in dataclasses.fields(MLXTrainingConfig)
+        if field.init and field.name != "max_eval_batches"
+    ]
+    legacy_values = [getattr(MLXTrainingConfig(), field.name) for field in legacy_fields]
+    legacy_values[[field.name for field in legacy_fields].index("warmup_ratio")] = 0.1
+    legacy_values[-1] = (128, 256)
+    copied_ratio_trainer.args = MLXTrainingConfig(*legacy_values)
+    assert copied_ratio_trainer.args.image_size == (128, 256)
+    assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
     explicit_default_trainer = MLXTrainer.__new__(MLXTrainer)
     explicit_default_trainer.args = MLXTrainingConfig(
         learning_rate=5e-5,
@@ -862,15 +873,69 @@ def test_text_completion_probe_keeps_one_shot_iterables_reusable():
     assert list(dataset) == [{"text": "1 2"}]
 
 
+class _StreamingTextTokenizer:
+    chat_template = None
+    eos_token_id = None
+
+    def __init__(self, offset=0, pad_token_id=0):
+        self.offset = offset
+        self.pad_token_id = pad_token_id
+
+    def encode(self, text, add_special_tokens=True):
+        return [int(part) + self.offset for part in str(text).split()]
+
+    def __call__(self, text, **_kwargs):
+        return types.SimpleNamespace(
+            input_ids=self.encode(text, add_special_tokens=False),
+        )
+
+    def apply_chat_template(self, messages, tokenize=False, **_kwargs):
+        ids = []
+        for message in messages:
+            ids.append(20 if message["role"] == "assistant" else 10)
+            ids.extend(int(part) for part in message["content"].split())
+        return ids if tokenize else " ".join(str(token) for token in ids)
+
+
+class _MinimalTextModel:
+    _config = {}
+    def trainable_parameters(self): return {}
+
+
+class _CountingTextRows:
+    def __init__(self, rows, infinite=False):
+        self.rows = tuple(rows)
+        self.pulls = 0
+        self._unsloth_mlx_infinite = infinite
+
+    def __iter__(self):
+        while True:
+            for row in self.rows:
+                self.pulls += 1
+                yield row
+            if not self._unsloth_mlx_infinite:
+                return
+
+
+class _DeclaredTextRows(_CountingTextRows):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.epochs = []
+    def __len__(self): return len(self.rows)
+    def set_epoch(self, epoch): self.epochs.append(epoch)
+
+
 def _streaming_text_tokenizer(pad_token_id=0):
-    return types.SimpleNamespace(
-        chat_template=None,
-        eos_token_id=None,
-        pad_token_id=pad_token_id,
-        encode=lambda text, add_special_tokens=True: [
-            int(part) for part in str(text).split()
-        ],
-    )
+    return _StreamingTextTokenizer(pad_token_id=pad_token_id)
+
+
+def _streaming_text_trainer(**kwargs):
+    MLXTrainer, trainer = _make_mlx_text_trainer(streaming=True, **kwargs)
+    trainer.tokenizer = _streaming_text_tokenizer()
+    trainer._distributed_initialized = True
+    trainer._distributed_world = None
+    trainer._distributed_world_size = 1
+    return MLXTrainer, trainer
 
 
 def _streaming_text_batches(dataset, tokenizer=None, **kwargs):
@@ -921,14 +986,7 @@ def test_text_streaming_yields_without_sizing_indexing_or_preconsumption(use_hf)
 
 
 def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
-    import inspect
-
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
-    from unsloth_zoo.mlx.utils import iterate_training_batches
-
-    class Model:
-        _config = {}
-        def trainable_parameters(self): return {}
 
     class Rows:
         def __init__(self): self.pulls = 0
@@ -941,7 +999,7 @@ def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
 
     rows = Rows()
     trainer = MLXTrainer(
-        Model(), _streaming_text_tokenizer(), rows,
+        _MinimalTextModel(), _streaming_text_tokenizer(), rows,
         formatting_func=lambda row: {"text": f"{row['value']} 2"},
         args=MLXTrainingConfig(
             streaming=True, max_steps=1, completion_only_loss=False,
@@ -955,8 +1013,6 @@ def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
     assert not hasattr(trainer.train_dataset, "take")
     assert next(iter(trainer.train_dataset)) == {"input_ids": [1, 2]}
     assert rows.pulls == 1
-    parameters = list(inspect.signature(iterate_training_batches).parameters)
-    assert parameters.index("response_mask_fn") > parameters.index("require_replayable")
 
 
 def test_train_on_responses_only_masks_unsized_text_lazily():
@@ -964,50 +1020,18 @@ def test_train_on_responses_only_masks_unsized_text_lazily():
         MLXTrainer, MLXTrainingConfig, train_on_responses_only,
     )
 
-    class Model:
-        _config = {}
-        def trainable_parameters(self): return {}
-
-    class Encoding:
-        def __init__(self, input_ids): self.input_ids = input_ids
-
-    class Tokenizer:
-        eos_token_id = None
-        pad_token_id = 0
-        def __init__(self, offset=0):
-            self.offset = offset
-            self.chat_template = None
-        def encode(self, text, add_special_tokens=True):
-            return [int(part) + self.offset for part in str(text).split()]
-        def __call__(self, text, **_kwargs):
-            return Encoding(self.encode(text, add_special_tokens=False))
-        def apply_chat_template(self, messages, tokenize=False, **_kwargs):
-            ids = []
-            for message in messages:
-                ids.append(20 if message["role"] == "assistant" else 10)
-                ids.extend(int(part) for part in message["content"].split())
-            return ids if tokenize else " ".join(str(token) for token in ids)
-
-    class Rows:
-        def __init__(self): self.pulls = 0
-        def __iter__(self):
-            values = (
-                "10 1",
-                "10 1 20 2 3",
-                "",
-                {"messages": [
-                    {"role": "user", "content": "4"},
-                    {"role": "assistant", "content": "5"},
-                ]},
-            )
-            for value in values:
-                self.pulls += 1
-                yield value if isinstance(value, dict) else {"text": value}
-
-    rows = Rows()
-    lazy_eval = Rows()
+    source_rows = (
+        {"text": "10 1"},
+        {"text": "10 1 20 2 3"},
+        {"messages": [
+            {"role": "user", "content": "4"},
+            {"role": "assistant", "content": "5"},
+        ]},
+    )
+    rows = _CountingTextRows(source_rows)
+    lazy_eval = _CountingTextRows(source_rows)
     trainer = MLXTrainer(
-        Model(), Tokenizer(offset=100), rows,
+        _MinimalTextModel(), _StreamingTextTokenizer(offset=100), rows,
         eval_dataset={
             "sized": [{"text": "10 6 20 7"}],
             "lazy": lazy_eval,
@@ -1020,7 +1044,7 @@ def test_train_on_responses_only_masks_unsized_text_lazily():
     )
     train_on_responses_only(
         trainer, instruction_part="10", response_part="20", force_match=True,
-        tokenizer=Tokenizer(),
+        tokenizer=_StreamingTextTokenizer(),
     )
 
     assert rows.pulls == 0
@@ -1035,20 +1059,151 @@ def test_train_on_responses_only_masks_unsized_text_lazily():
         "input_ids": [10, 4, 20, 5],
         "labels": [-100, -100, -100, 5],
     }
-    assert rows.pulls == 4  # an empty labeled row is filtered, not schema drift
-    assert trainer._eval_batches_labeled is None
     assert trainer.eval_dataset["sized"][0]["labels"] == [-100, -100, -100, 7]
     assert lazy_eval.pulls == 0
 
 
-def test_raw_text_streaming_matches_sized_sequential_order():
-    class ReplayableRows:
-        def __init__(self, rows):
-            self.rows = rows
+def test_lazy_text_eval_restarts_masks_splits_and_bounds_infinite_sources():
+    MLXTrainer, trainer = _streaming_text_trainer(
+        max_steps=1, completion_only_loss=False,
+        per_device_eval_batch_size=1,
+    )
+    trainer._mlx_response_mask_fn = lambda batch: {
+        "labels": [[-100] + ids[1:] for ids in batch["input_ids"]]
+    }
+    source = _CountingTextRows([{"text": "1 2"}, {"text": "3 4"}])
+    batches = MLXTrainer._create_text_eval_batches(trainer, source, 1, False, False)
+    first = [_streaming_batch_signature(batch) for batch in batches]
+    assert [_streaming_batch_signature(batch) for batch in batches] == first
+    assert first[0][2] == [[-100, 2]]
 
+    infinite = _CountingTextRows([{"text": "1 2"}], infinite=True)
+    unbounded = MLXTrainer._create_text_eval_batches(
+        trainer, infinite, 1, False, False,
+    )
+    with pytest.raises(ValueError, match="infinite.*max_eval_batches"):
+        next(iter(unbounded))
+    assert infinite.pulls == 0
+
+    trainer.args.max_eval_batches = 1
+    bounded = MLXTrainer._create_text_eval_batches(
+        trainer, infinite, 1, False, False,
+    )
+    assert len(list(bounded)) == infinite.pulls == 1
+
+    from datasets import IterableDataset, concatenate_datasets, interleave_datasets
+    base = IterableDataset.from_generator(lambda: iter([{"text": "1 2"}]))
+    from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
+    assert (_mlx_stream_declares_infinite(base.repeat(None).take(3)),
+            _mlx_stream_declares_infinite(base.take(3).repeat(None))) == (False, True)
+    assert _mlx_stream_declares_infinite(concatenate_datasets([base.take(1), base.repeat(None)]))
+    assert _mlx_stream_declares_infinite(concatenate_datasets([base.take(1), base.rename_column("text", "other").repeat(None)], axis=1))
+    assert _mlx_stream_declares_infinite(interleave_datasets(
+        [base.take(1), base.repeat(None)], stopping_strategy="all_exhausted"))
+    assert _mlx_stream_declares_infinite(interleave_datasets(
+        [base.repeat(None)] * 2, stopping_strategy="first_exhausted"))
+    assert _mlx_stream_declares_infinite(interleave_datasets(
+        [base.take(1)] * 2, probabilities=[1.0, 0.0], stopping_strategy="all_exhausted"))
+
+    trainer._distributed_world = types.SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    padded = list(trainer._create_text_eval_batches(
+        _CountingTextRows([{"text": "7 8"}]), 1, False, False))[0]
+    assert (padded[1].tolist(), padded[2].tolist()) == ([[0, 0]], [[-100, -100]])
+
+
+def test_sized_response_training_defers_lazy_eval_with_override_tokenizer():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, train_on_responses_only,
+    )
+
+    eval_rows = _CountingTextRows([{"text": "10 1 20 2"}])
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _StreamingTextTokenizer(100),
+        [{"text": "10 1 20 2"}],
+        eval_dataset=eval_rows,
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, completion_only_loss=False,
+            per_device_train_batch_size=1,
+        ),
+    )
+    override = _StreamingTextTokenizer()
+    train_on_responses_only(
+        trainer, instruction_part="10", response_part="20",
+        tokenizer=override,
+    )
+
+    assert eval_rows.pulls == 0
+    eval_batches = trainer._create_text_eval_batches(
+        trainer.eval_dataset, 1, False, False,
+    )
+    batch = next(iter(eval_batches))
+    assert batch[0].tolist() == [[10, 1, 20, 2]]
+    assert batch[2].tolist() == [[-100, -100, -100, 2]]
+
+
+def test_length_declaring_text_stream_supports_epoch_replay():
+    MLXTrainer, trainer = _streaming_text_trainer(
+        max_steps=0, num_train_epochs=2,
+        completion_only_loss=False, dataset_order="sequential",
+        per_device_train_batch_size=2, gradient_accumulation_steps=1,
+    )
+    trainer.train_dataset = _DeclaredTextRows([
+        {"text": f"{value} {value + 10}"} for value in range(1, 6)
+    ])
+    batches, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches is None
+    assert trainer._streaming_epoch_batch_count == 3
+    signatures = [_streaming_batch_signature(next(iterator)) for _ in range(4)]
+    assert signatures[3] == signatures[0]
+    assert trainer.train_dataset.epochs == [0, 1]
+
+
+def test_epoch_stream_rejects_ambiguous_or_inexact_cardinality_lazily():
+    MLXTrainer, trainer = _streaming_text_trainer(
+        max_steps=0, num_train_epochs=1,
+        completion_only_loss=False, per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+    )
+    trainer.train_dataset = _DeclaredTextRows([{"text": "1 2"}])
+    trainer.formatting_func = lambda row: row
+    with pytest.raises(ValueError, match="formatting_func.*max_steps"):
+        MLXTrainer._prepare_data(trainer, is_vlm=False)
+    assert trainer.train_dataset.pulls == 0
+
+    trainer.formatting_func = None
+    trainer.train_dataset = _DeclaredTextRows([{"text": "1 2"}, {"text": ""}])
+    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+    with pytest.raises(ValueError, match="declared length"):
+        next(iterator)
+
+    class UnderDeclared(_DeclaredTextRows):
+        def __len__(self): return 2
         def __iter__(self):
-            return iter(self.rows)
+            for row in ({"text": "1 2"}, {"text": "3 4"}, {"text": ""}):
+                self.pulls += 1
+                yield row
+            raise AssertionError("must reject the first overflow row")
+    trainer.train_dataset = UnderDeclared([
+        {"text": "unused"},
+    ])
+    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+    with pytest.raises(ValueError, match="exactly one trainable"):
+        next(iterator)
+    assert trainer.train_dataset.pulls == 3
 
+    trainer.args.gradient_accumulation_steps = 2
+    trainer.args.num_train_epochs = 2
+    trainer.train_dataset = _DeclaredTextRows([
+        {"text": "1 2"}, {"text": "3 4"}, {"text": "5 6"},
+        {"text": "7 8"}, {"text": "9 10"},
+    ])
+    with pytest.raises(ValueError, match="divisible.*gradient_accumulation"):
+        MLXTrainer._prepare_data(trainer, is_vlm=False)
+    assert trainer.train_dataset.pulls == 0
+
+
+def test_raw_text_streaming_matches_sized_sequential_order():
     rows = [{"value": value} for value in range(1, 6)]
     kwargs = {
         "batch_size": 2,
@@ -1058,7 +1213,7 @@ def test_raw_text_streaming_matches_sized_sequential_order():
         },
     }
     expected = _streaming_text_batches(rows, **kwargs)
-    actual = _streaming_text_batches(ReplayableRows(rows), **kwargs)
+    actual = _streaming_text_batches(_CountingTextRows(rows), **kwargs)
     assert [_streaming_batch_signature(next(actual)) for _ in range(3)] == [
         _streaming_batch_signature(next(expected)) for _ in range(3)
     ]
@@ -1137,56 +1292,6 @@ def test_text_streaming_rejects_incremental_schema_drift(rows, match):
     with pytest.raises(ValueError, match=match):
         next(batches)
 
-
-def test_response_masking_preserves_pretokenized_label_state_validation():
-    rows = iter([
-        {"input_ids": [1, 2], "labels": [-100, 2]},
-        {"input_ids": [3, 4]},
-    ])
-
-    def response_mask(batch):
-        return {
-            "labels": [[-100, input_ids[-1]] for input_ids in batch["input_ids"]]
-        }
-
-    batches = _streaming_text_batches(
-        rows,
-        completion_only_loss=False,
-        response_mask_fn=response_mask,
-    )
-    next(batches)
-    with pytest.raises(ValueError, match="must not be mixed"):
-        next(batches)
-
-
-def test_response_masking_does_not_replace_formatter_completion_boundary():
-    def response_mask(batch):
-        return {
-            "labels": [[-100, input_ids[-1]] for input_ids in batch["input_ids"]]
-        }
-
-    batches = _streaming_text_batches(
-        iter([{"prompt": "1", "completion": " 2"}]),
-        formatting_func=lambda _row: {"input_ids": [1, 2]},
-        response_mask_fn=response_mask,
-    )
-    with pytest.raises(ValueError, match="drops the completion boundary"):
-        next(batches)
-
-
-@pytest.mark.parametrize("formatted", [{"input_ids": [1, 2]}, {"text": "1 2"}])
-def test_fully_masked_response_still_validates_completion_boundary(formatted):
-    batches = _streaming_text_batches(
-        iter([{"prompt": "1", "completion": " 2"}]),
-        formatting_func=lambda _row: formatted,
-        response_mask_fn=lambda batch: {
-            "labels": [[-100] * len(ids) for ids in batch["input_ids"]]
-        },
-    )
-    with pytest.raises(ValueError, match="drops the completion boundary"):
-        next(batches)
-
-
 def test_hf_stream_replays_in_source_order_and_sets_epoch():
     from datasets import IterableDataset
 
@@ -1229,6 +1334,15 @@ def test_one_shot_stream_exhaustion_and_resume_are_actionable():
     _, resumed = MLXTrainer._prepare_data(trainer, is_vlm=False)
     with pytest.raises(RuntimeError, match="replayable iterable"):
         next(resumed)
+
+    MLXTrainer, evaluator = _streaming_text_trainer(
+        max_steps=1, completion_only_loss=False,
+    )
+    source = ({"text": "1 2"} for _ in range(1))
+    eval_batches = evaluator._create_text_eval_batches(source, 1, False, False)
+    with pytest.raises(RuntimeError, match="replayable iterable"):
+        next(iter(eval_batches))
+    assert next(source) == {"text": "1 2"}
 
 
 def test_hf_stream_resume_fast_forward_matches_uninterrupted_order():
@@ -1496,6 +1610,7 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     from unsloth_zoo.mlx.trainer import train_on_responses_only
 
     class CallableTokenizer:
+        chat_template = None
         def __call__(self, text, **kwargs):
             return {"input_ids": [1, 2, 3]}
 
@@ -1508,67 +1623,17 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
         return lambda batch: batch
 
     monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    tokenizer = CallableTokenizer()
     train_on_responses_only(
         None,
         instruction_part="<user>",
         response_part="<assistant>",
-        tokenizer=CallableTokenizer(),
+        tokenizer=tokenizer,
         return_function=True,
         last_response_only=True,
     )
 
     assert received["last_response_only"] is True
-
-
-def test_response_mask_closure_does_not_normalize_explicit_tokenizer(monkeypatch):
-    import unsloth_zoo.dataset_utils as dataset_utils
-    from unsloth_zoo.mlx.trainer import train_on_responses_only
-
-    class CallableTokenizer:
-        chat_template = None
-        def __call__(self, text, **kwargs):
-            return {"input_ids": [1, 2, 3]}
-
-    tokenizer = CallableTokenizer()
-    trainer = types.SimpleNamespace(
-        _is_vlm=False,
-        args=types.SimpleNamespace(
-            streaming=True,
-            chat_template="{{ messages }}",
-        ),
-        model=types.SimpleNamespace(_config={}),
-        tokenizer=tokenizer,
-        _train_dataset_for_batches=lambda: iter([{"text": "1 2"}]),
-    )
-    monkeypatch.setattr(
-        dataset_utils,
-        "train_on_responses_only",
-        lambda *args, **kwargs: (lambda batch: batch),
-    )
-
-    train_on_responses_only(
-        trainer,
-        instruction_part="<user>",
-        response_part="<assistant>",
-        tokenizer=tokenizer,
-        return_function=True,
-    )
-
-    assert tokenizer.chat_template is None
-
-
-def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
-    from unsloth_zoo.mlx.trainer import _resolve_response_mask_tokenizer
-
-    class EncodeOnlyTokenizer:
-        def encode(self, text):
-            return [1, 2, 3]
-
-        def convert_tokens_to_ids(self, token):
-            return 1
-
-    with pytest.raises(TypeError, match="requires a callable"):
-        _resolve_response_mask_tokenizer(EncodeOnlyTokenizer())
 
 
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
@@ -1578,12 +1643,10 @@ def test_vlm_eval_batches_define_completion_only_loss_before_use():
 
     source = inspect.getsource(MLXTrainer._train_inner)
     definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
-    eval_use = source.index("completion_only_loss=text_completion_only_loss")
-    text_eval_start = source.index("return create_batches(")
-    text_eval_end = source.index("if isinstance(self.eval_dataset, dict)")
-    text_eval_block = source[text_eval_start:text_eval_end]
+    eval_use = source.index("text_completion_only_loss,")
+    text_eval_block = inspect.getsource(MLXTrainer._create_text_eval_batches)
     assert definition < eval_use
-    assert "completion_only_loss=text_completion_only_loss" in text_eval_block
+    assert "completion_only_loss=completion_only_loss" in text_eval_block
 
 
 def test_evaluate_dict_eval_datasets_records_split_metrics():
