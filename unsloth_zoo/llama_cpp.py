@@ -2480,40 +2480,35 @@ def convert_to_gguf(
     # A bare --outfile (just a filename, no directory) is created by llama.cpp in the
     # process CWD. On Windows that CWD is frequently not writable (e.g. an app launched
     # from a protected/install dir), so the final write died with PermissionError
-    # [Errno 13] even though conversion fully succeeded. Resolve such bare names against
-    # a directory we have actually confirmed is writable. CWD is preferred so the
-    # historical behavior (callers relocate the file from CWD) is unchanged wherever the
-    # CWD is writable; input_folder / a temp dir are only fallbacks, and input_folder is
-    # never assumed writable (it may be a read-only/mounted model source).
-    _writable_dir_cache = {}
+    # [Errno 13] even though conversion fully succeeded. Only in that case do we redirect
+    # the bare name into input_folder. When the CWD is writable we change nothing, so
+    # behavior on Linux/Colab/Mac (and Windows-with-writable-CWD) is byte-for-byte as
+    # before: the file is written to CWD and callers relocate it from there.
     def _dir_is_writable(d):
-        ok = _writable_dir_cache.get(d)
-        if ok is not None: return ok
         try:
             # Exclusive, unique temp file (never truncates an existing path or follows
             # a planted symlink); its existence proves the dir is writable.
             fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
             os.close(fd)
             os.remove(probe)
-            ok = True
+            return True
         except Exception:
-            ok = False
-        _writable_dir_cache[d] = ok
-        return ok
-    def _resolve_bare_outfile(name):
-        for d in (os.getcwd(), os.path.abspath(input_folder), tempfile.gettempdir()):
-            if _dir_is_writable(d):
-                return os.path.join(d, name)
-        return name  # nothing writable found; leave as-is and let the error surface
+            return False
+    # Probe the CWD once; input_folder is only probed if we actually need to redirect.
+    _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
     for args, output_file, description in runs_to_do:
-        # Only touch bare filenames. A caller that passed a relative path with a
-        # directory (e.g. "exports/model") or an absolute path chose its destination
-        # on purpose, so leave those exactly as they were.
-        if not os.path.isabs(output_file) and os.path.dirname(output_file) == "":
-            output_file = _resolve_bare_outfile(output_file)
-            if os.path.isabs(output_file):
+        # Redirect only a bare filename, and only when the CWD (where llama.cpp would
+        # otherwise write it) is not writable. Relative paths that include a directory
+        # and absolute paths are the caller's chosen destination and are left untouched;
+        # input_folder is never assumed writable (it may be a read-only model source).
+        if (not _cwd_writable
+                and not os.path.isabs(output_file)
+                and os.path.dirname(output_file) == ""):
+            _dst = os.path.abspath(input_folder)
+            if _dir_is_writable(_dst):
+                output_file = os.path.join(_dst, output_file)
                 args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
