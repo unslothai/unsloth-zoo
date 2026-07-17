@@ -3620,33 +3620,14 @@ class MLXTrainer:
                 require_replayable = bool(
                     getattr(self, "_resume_from_checkpoint", None)
                 )
+                response_mask_fn = getattr(
+                    train_dataset, "_response_mask_fn", None,
+                ) or getattr(self, "_mlx_response_mask_fn", None)
                 if (
                     _is_mlx_lazy_text_source(train_dataset)
                     and args.max_steps <= 0
                     and args.num_train_epochs > 0
                 ):
-                    response_mask_fn = getattr(
-                        train_dataset, "_response_mask_fn", None,
-                    ) or getattr(self, "_mlx_response_mask_fn", None)
-                    if self.formatting_func is not None:
-                        raise ValueError(
-                            "Unsloth MLX: num_train_epochs with a streaming text "
-                            "iterable cannot use formatting_func because prepared "
-                            "row cardinality may change. Use max_steps instead."
-                        )
-                    if text_completion_only_loss is not False:
-                        raise ValueError(
-                            "Unsloth MLX: num_train_epochs with a streaming text "
-                            "iterable requires completion_only_loss=False so the "
-                            "declared length remains exact. Use max_steps for "
-                            "completion-masked streams."
-                        )
-                    if text_assistant_only_loss or response_mask_fn is not None:
-                        raise ValueError(
-                            "Unsloth MLX: num_train_epochs cannot guarantee exact "
-                            "steps for a streaming iterable whose rows may be "
-                            "filtered by label masking. Use max_steps instead."
-                        )
                     def _resolve_source_length():
                         length = _mlx_declared_iterable_length(train_dataset)
                         return -1 if length is None else length
@@ -3699,6 +3680,7 @@ class MLXTrainer:
                     append_eos=bool(getattr(args, "append_eos", True)),
                     completion_only_loss=text_completion_only_loss,
                     assistant_only_loss=text_assistant_only_loss,
+                    response_mask_fn=response_mask_fn,
                     dataset_order=text_dataset_order,
                     comm_group=comm_group,
                     require_replayable=require_replayable,

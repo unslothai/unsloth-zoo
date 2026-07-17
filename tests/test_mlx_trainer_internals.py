@@ -989,10 +989,13 @@ def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class Rows:
-        def __init__(self): self.pulls = 0
+        def __init__(self):
+            self.pulls = 0; self.features = {"value": "int64"}; self.column_names = ["value"]; self.split = "train"; self.restored = []
         def __len__(self): raise AssertionError("must stay unsized")
         def __getitem__(self, _index): raise AssertionError("must stay unindexed")
         def take(self, _count): return [{"value": "raw"}]
+        def state_dict(self): return {"pulls": self.pulls}
+        def load_state_dict(self, state): self.restored.append(state)
         def __iter__(self):
             self.pulls += 1
             yield {"value": 1}
@@ -1011,7 +1014,13 @@ def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
     assert not hasattr(trainer.train_dataset, "__len__")
     assert not hasattr(trainer.train_dataset, "__getitem__")
     assert not hasattr(trainer.train_dataset, "take")
-    assert next(iter(trainer.train_dataset)) == {"input_ids": [1, 2]}
+    assert not hasattr(trainer.train_dataset, "state_dict")
+    assert not hasattr(trainer.train_dataset, "load_state_dict")
+    assert not hasattr(trainer.train_dataset, "features")
+    assert not hasattr(trainer.train_dataset, "column_names")
+    assert trainer.train_dataset.split == "train"
+    assert rows.restored == []
+    assert next(iter(trainer.train_dataset)) == {"value": 1, "input_ids": [1, 2]}
     assert rows.pulls == 1
 
 
@@ -1050,15 +1059,9 @@ def test_train_on_responses_only_masks_unsized_text_lazily():
     assert rows.pulls == 0
     prepared_rows = iter(trainer.train_dataset)
     public_row = next(prepared_rows)
-    assert public_row == {
-        "input_ids": [10, 1, 20, 2, 3],
-        "labels": [-100, -100, -100, 2, 3],
-    }
+    assert public_row == source_rows[1] | {"input_ids": [10, 1, 20, 2, 3], "labels": [-100, -100, -100, 2, 3]}
     assert rows.pulls == 2  # the fully masked first row is legitimately filtered
-    assert next(prepared_rows) == {
-        "input_ids": [10, 4, 20, 5],
-        "labels": [-100, -100, -100, 5],
-    }
+    assert next(prepared_rows) == source_rows[2] | {"input_ids": [10, 4, 20, 5], "labels": [-100, -100, -100, 5]}
     assert trainer.eval_dataset["sized"][0]["labels"] == [-100, -100, -100, 7]
     assert lazy_eval.pulls == 0
 
@@ -1161,14 +1164,23 @@ def test_epoch_stream_rejects_ambiguous_or_inexact_cardinality_lazily():
     )
     trainer.train_dataset = _DeclaredTextRows([{"text": "1 2"}])
     trainer.formatting_func = lambda row: row
-    with pytest.raises(ValueError, match="formatting_func.*max_steps"):
-        MLXTrainer._prepare_data(trainer, is_vlm=False)
-    assert trainer.train_dataset.pulls == 0
+    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+    assert _streaming_batch_signature(next(iterator))[0][0][:2] == [1, 2]
 
+    trainer.args.per_device_train_batch_size = 1
+    trainer.train_dataset = _DeclaredTextRows([
+        {"text": "1 2"}, {"text": "3 4"},
+    ])
+    trainer.formatting_func = lambda row: [row, row]
+    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+    with pytest.raises(ValueError, match="exactly one trainable"):
+        next(iterator)
+
+    trainer.args.per_device_train_batch_size = 2
     trainer.formatting_func = None
     trainer.train_dataset = _DeclaredTextRows([{"text": "1 2"}, {"text": ""}])
     _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
-    with pytest.raises(ValueError, match="declared length"):
+    with pytest.raises(ValueError, match="exactly one trainable"):
         next(iterator)
 
     class UnderDeclared(_DeclaredTextRows):
@@ -1195,6 +1207,42 @@ def test_epoch_stream_rejects_ambiguous_or_inexact_cardinality_lazily():
     with pytest.raises(ValueError, match="divisible.*gradient_accumulation"):
         MLXTrainer._prepare_data(trainer, is_vlm=False)
     assert trainer.train_dataset.pulls == 0
+
+
+def test_epoch_stream_allows_one_to_one_labeled_preparation():
+    def prepare(rows, *, tokenizer=None, response_mask_fn=None, **kwargs):
+        MLXTrainer, trainer = _streaming_text_trainer(
+            max_steps=0, num_train_epochs=1,
+            per_device_train_batch_size=1, gradient_accumulation_steps=1,
+            **kwargs,
+        )
+        trainer.train_dataset = _DeclaredTextRows(rows)
+        if tokenizer is not None:
+            trainer.tokenizer = tokenizer
+        trainer._mlx_response_mask_fn = response_mask_fn
+        _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+        return next(iterator)
+
+    completion = prepare(
+        [{"prompt": "1 2", "completion": " 3"}],
+        completion_only_loss=True,
+    )
+    assistant_rows = [{"messages": [{"role": "user", "content": "4"}, {"role": "assistant", "content": "5"}]}]
+    assistant = prepare(
+        assistant_rows,
+        tokenizer=_AssistantMaskTokenizer(), completion_only_loss=False,
+        assistant_only_loss=True,
+    )
+    response = prepare(
+        [{"text": "6 7"}], completion_only_loss=False,
+        response_mask_fn=lambda batch: {
+            "labels": [[-100] + ids[1:] for ids in batch["input_ids"]]
+        },
+    )
+
+    assert completion[2].tolist() == [[-100, -100, 3]]
+    assert assistant[2].tolist() == [[-100, -100, -100, 5]]
+    assert response[2].tolist() == [[-100, 7]]
 
 
 def test_raw_text_streaming_matches_sized_sequential_order():
@@ -1237,6 +1285,8 @@ def test_streaming_prompt_completion_and_assistant_labels():
 
 
 def test_pretokenized_streaming_preserves_supported_label_fields():
+    from unsloth_zoo.mlx.utils import _MLXIterableTokenizedDatasetView
+
     explicit = next(_streaming_text_batches(
         iter([{
             "input_ids": [1, 2],
@@ -1252,15 +1302,16 @@ def test_pretokenized_streaming_preserves_supported_label_fields():
     assert explicit[0].tolist() == [[1, 2]]
     assert explicit[2].tolist() == [[-100, 2]]
 
+    masked_row = next(iter(_MLXIterableTokenizedDatasetView(iter([{
+        "input_ids": [4, 5, 6], "completion_mask": [1, 1, 1],
+        "assistant_masks": [0, 1, 1],
+    }]), types.SimpleNamespace(), max_seq_length=2)))
+    assert masked_row["completion_mask"] == [1, 1] and masked_row["assistant_masks"] == [0, 1]
     masked = next(_streaming_text_batches(
-        iter([{
-            "input_ids": [4, 5, 6],
-            "completion_mask": [1, 1, 1],
-            "assistant_masks": [0, 1, 1],
-        }]),
+        iter([masked_row]),
         tokenizer=types.SimpleNamespace(pad_token_id=0),
     ))
-    assert masked[2].tolist() == [[-100, 5, 6]]
+    assert masked[2].tolist() == [[-100, 5]]
 
 
 @pytest.mark.parametrize(

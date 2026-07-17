@@ -3415,6 +3415,10 @@ class _MLXIterableTokenizedDatasetView:
     consuming a row during construction.
     """
 
+    _INVALIDATED_SOURCE_METADATA = frozenset((
+        "column_names", "features", "info", "num_columns", "supervised_keys",
+    ))
+
     def __init__(
         self,
         dataset,
@@ -3438,6 +3442,15 @@ class _MLXIterableTokenizedDatasetView:
         self._max_seq_length = max_seq_length
         self._response_mask_fn = response_mask_fn
 
+    def __getattr__(self, name):
+        """Lazily expose public metadata and cursor state, not raw transforms."""
+        if name.startswith("_") or name in self._INVALIDATED_SOURCE_METADATA:
+            raise AttributeError(name)
+        value = getattr(self._mlx_source_dataset, name)
+        if callable(value):
+            raise AttributeError(name)
+        return value
+
     def set_epoch(self, epoch):
         set_epoch = getattr(self._mlx_source_dataset, "set_epoch", None)
         if callable(set_epoch):
@@ -3449,7 +3462,9 @@ class _MLXIterableTokenizedDatasetView:
     def set_tokenizer(self, tokenizer):
         self._tokenizer = tokenizer
 
-    def _iter_tokenized_rows(self, dataset=None, *, state=None):
+    def _iter_tokenized_rows(
+        self, dataset=None, *, state=None, include_source=False,
+    ):
         source = self._mlx_source_dataset if dataset is None else dataset
         return _iter_lazy_tokenized_text_rows(
             source,
@@ -3462,13 +3477,27 @@ class _MLXIterableTokenizedDatasetView:
             max_seq_length=self._max_seq_length,
             response_mask_fn=self._response_mask_fn,
             state=state,
+            include_source=include_source,
         )
 
     def __iter__(self):
-        for input_ids, labels in self._iter_tokenized_rows():
-            row = {"input_ids": list(input_ids)}
+        for source, input_ids, labels in self._iter_tokenized_rows(
+            include_source=True,
+        ):
+            row = dict(source) if isinstance(source, Mapping) else {}
+            row["input_ids"] = list(input_ids)
+            row.pop("labels", None)
             if labels is not None:
                 row["labels"] = list(labels)
+            if isinstance(source, Mapping) and "input_ids" in source:
+                for field in ("completion_mask", "assistant_masks"):
+                    mask = row.get(field)
+                    if hasattr(mask, "tolist"):
+                        mask = mask.tolist()
+                    if isinstance(mask, (list, tuple)) and (
+                        not mask or not isinstance(mask[0], (list, tuple))
+                    ):
+                        row[field] = list(mask)[:len(input_ids)]
             yield row
 
 
@@ -5326,12 +5355,18 @@ def _iter_lazy_tokenized_text_rows(
     max_seq_length=None,
     response_mask_fn=None,
     state=None,
+    include_source=False,
 ):
     """Normalize an unsized source one row at a time and lock its schema."""
     state = {} if state is None else state
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
     saw_usable_this_pass = False
     completion_labels_seen_this_pass = False
+
+    def _output(source, input_ids, labels):
+        if include_source:
+            return source, input_ids, labels
+        return input_ids, labels
 
     if completion_only_loss is not None:
         state.setdefault(
@@ -5467,6 +5502,7 @@ def _iter_lazy_tokenized_text_rows(
             continue
 
         for row in source_rows:
+            prepared_source = item if isinstance(item, Mapping) else row
             row_has_completion_boundary = (
                 isinstance(row, Mapping)
                 and "prompt" in row
@@ -5530,7 +5566,7 @@ def _iter_lazy_tokenized_text_rows(
                     completion_mode=row_completion_only_loss,
                 )
                 if usable:
-                    yield ids, labels
+                    yield _output(prepared_source, ids, labels)
                 continue
 
             _require_assistant_conversation(row)
@@ -5565,7 +5601,7 @@ def _iter_lazy_tokenized_text_rows(
                     completion_mode=row_completion_only_loss,
                 )
                 if usable:
-                    yield ids, labels
+                    yield _output(prepared_source, ids, labels)
                 continue
             if assistant_only_loss:
                 raise ValueError(
@@ -5652,7 +5688,7 @@ def _iter_lazy_tokenized_text_rows(
                     completion_mode=row_completion_only_loss,
                 )
                 if usable:
-                    yield ids, labels
+                    yield _output(prepared_source, ids, labels)
 
 
 def _close_mlx_owned_iterator(iterator):
@@ -5786,29 +5822,13 @@ def _iterate_lazy_text_training_batches(
             source_rows_seen = 0
             prepared_rows_seen = 0
 
-            def _counted_source_rows():
-                nonlocal source_rows_seen
-                for item in current_iterator:
-                    source_rows_seen += 1
-                    if source_rows_seen > expected_rows_per_pass:
-                        raise ValueError(
-                            "Unsloth MLX: epoch training requires exactly one "
-                            "trainable text row per declared source row. Use "
-                            "max_steps when the source exceeds its declared length."
-                        )
-                    yield item
-
-            row_source = (
-                _counted_source_rows()
-                if expected_rows_per_pass is not None else current_iterator
-            )
-            row_iterator = (
-                prepared_view._iter_tokenized_rows(
-                    row_source, state=state,
-                )
-                if prepared_view is not None
-                else _iter_lazy_tokenized_text_rows(
-                    row_source,
+            def _tokenized_rows(source):
+                if prepared_view is not None:
+                    return prepared_view._iter_tokenized_rows(
+                        source, state=state,
+                    )
+                return _iter_lazy_tokenized_text_rows(
+                    source,
                     tokenizer,
                     dataset_text_field=dataset_text_field,
                     formatting_func=formatting_func,
@@ -5819,6 +5839,34 @@ def _iterate_lazy_text_training_batches(
                     response_mask_fn=response_mask_fn,
                     state=state,
                 )
+
+            def _exactly_one_prepared_row_per_source():
+                nonlocal source_rows_seen
+                for item in current_iterator:
+                    source_rows_seen += 1
+                    if source_rows_seen > expected_rows_per_pass:
+                        raise ValueError(
+                            "Unsloth MLX: epoch training requires exactly one "
+                            "trainable text row per declared source row. Use "
+                            "max_steps when the source exceeds its declared length."
+                        )
+                    prepared = _tokenized_rows((item,))
+                    missing = object()
+                    first = next(prepared, missing)
+                    extra = next(prepared, missing)
+                    _close_mlx_owned_iterator(prepared)
+                    if first is missing or extra is not missing:
+                        raise ValueError(
+                            "Unsloth MLX: epoch training requires exactly one "
+                            "trainable text row per declared source row. Use "
+                            "max_steps when rows expand or are filtered."
+                        )
+                    yield first
+
+            row_iterator = (
+                _exactly_one_prepared_row_per_source()
+                if expected_rows_per_pass is not None
+                else _tokenized_rows(current_iterator)
             )
             for row in row_iterator:
                 prepared_rows_seen += 1
