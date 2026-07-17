@@ -190,11 +190,128 @@ def _seed_mlx_random_state(random_state):
     mx.random.seed(seed)
 
 
-def _mlx_lora_base_types():
+@dataclass(frozen=True)
+class _MLXLoRATypeSpec:
+    base_types: tuple[type, ...]
+    wrapper_type: type
+
+
+def _mlx_lora_type_specs():
     import mlx.nn as nn
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
 
-    return (nn.Linear, nn.QuantizedLinear, SwitchLinear, QuantizedSwitchLinear)
+    specs = [
+        _MLXLoRATypeSpec(
+            (nn.Linear, nn.QuantizedLinear), LoRALinear,
+        ),
+        _MLXLoRATypeSpec(
+            (SwitchLinear, QuantizedSwitchLinear),
+            LoRASwitchLinear,
+        ),
+    ]
+    vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
+    if vlm_switch_module is not None:
+        vlm_lora_module = importlib.import_module("mlx_vlm.trainer.lora_layers")
+        specs.append(
+            _MLXLoRATypeSpec(
+                (
+                    vlm_switch_module.SwitchLinear,
+                    vlm_switch_module.QuantizedSwitchLinear,
+                ),
+                vlm_lora_module.LoRASwitchLinear,
+            )
+        )
+    return tuple(specs)
+
+
+def _mlx_lora_base_types():
+    return tuple(
+        base_type
+        for spec in _mlx_lora_type_specs()
+        for base_type in spec.base_types
+    )
+
+
+def _mlx_lora_spec_for_module(module, specs):
+    for spec in specs:
+        if isinstance(module, spec.base_types):
+            return spec
+    return None
+
+
+def _mlx_lora_from_base(module, config, *, specs):
+    if callable(getattr(module, "to_lora", None)):
+        return module.to_lora(
+            r=config["rank"],
+            scale=config["scale"],
+            dropout=config["dropout"],
+        )
+    spec = _mlx_lora_spec_for_module(module, specs)
+    if spec is None:
+        raise ValueError(
+            "Unsloth MLX: cannot convert unsupported module type "
+            f"{type(module).__module__}.{type(module).__name__} to LoRA."
+        )
+    return spec.wrapper_type.from_base(
+        module,
+        r=config["rank"],
+        scale=config["scale"],
+        dropout=config["dropout"],
+    )
+
+
+def _mlx_language_layers(model):
+    if hasattr(model, "layers"):
+        return model.layers
+    return model.model.layers
+
+
+def _unfreeze_mlx_lora_parameters(model):
+    """Unfreeze scalar, array, and list-valued LoRA parameter containers."""
+    from mlx.utils import tree_flatten
+
+    for _, module in model.named_modules():
+        if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
+            continue
+        keys = [
+            key
+            for key, _ in tree_flatten({
+                "lora_a": module.lora_a,
+                "lora_b": module.lora_b,
+            })
+        ]
+        module.unfreeze(recurse=False, keys=keys, strict=False)
+
+
+def linear_to_lora_layers(model, num_layers, config):
+    """Attach namespace-compatible LoRA wrappers to selected language layers."""
+    from mlx.utils import tree_unflatten
+
+    layers = _mlx_language_layers(model)
+    type_specs = _mlx_lora_type_specs()
+    keys = set(config.get("keys") or ())
+
+    limit = max(int(num_layers), 0)
+    attached = 0
+    for layer in layers[max(len(layers) - limit, 0):]:
+        replacements = []
+        for name, module in layer.named_modules():
+            if name not in keys:
+                continue
+            replacements.append((
+                name,
+                _mlx_lora_from_base(
+                    module,
+                    config,
+                    specs=type_specs,
+                ),
+            ))
+        if replacements:
+            layer.update_modules(tree_unflatten(replacements))
+            attached += len(replacements)
+
+    return attached
 
 
 def _collect_all_linear_target_names(model):
@@ -202,7 +319,8 @@ def _collect_all_linear_target_names(model):
 
     Mirrors PEFT's ``target_modules="all-linear"``: walk the live tree and
     return each leaf's semantic name (``w1``, ``q_proj``, ``lm_head``, ...),
-    skipping numeric list indices.
+    skipping numeric list indices. Both mlx-lm and independent mlx-vlm switch
+    types participate when their defining modules are loaded.
     """
     names = set()
     try:
@@ -4649,15 +4767,7 @@ def _resolve_lora_keys(model, target_modules):
 
     linear_types = _mlx_lora_base_types()
     keys = set()
-    roots = []
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        roots.extend(model.model.layers)
-    elif hasattr(model, "layers"):
-        roots.extend(model.layers)
-    else:
-        roots.append(model)
-
-    for root in roots:
+    for root in _mlx_language_layers(model):
         for name, module in root.named_modules():
             if not isinstance(module, linear_types):
                 continue
@@ -5949,7 +6059,7 @@ class FastMLXModel:
             )
             return model
         try:
-            from mlx_lm.tuner.utils import linear_to_lora_layers
+            importlib.import_module("mlx_lm.tuner.lora")
         except ImportError:
             raise ImportError(
                 "Unsloth: mlx-lm is required for LoRA on Apple Silicon. "
@@ -6022,9 +6132,7 @@ class FastMLXModel:
                 target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
             ):
                 lm = model.language_model
-                num_layers = 0
-                if hasattr(lm, "model") and hasattr(lm.model, "layers"):
-                    num_layers = len(lm.model.layers)
+                num_layers = len(_mlx_language_layers(lm))
                 if finetune_last_n_layers is not None and num_layers > 0:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(lm, target_modules)
@@ -6037,13 +6145,11 @@ class FastMLXModel:
                     # mlx_lm/tuner/lora.py train); otherwise lazy state
                     # advances leak into lora_a sampling.
                     _seed_mlx_random_state(random_state)
-                    linear_to_lora_layers(
+                    language_lora_count = linear_to_lora_layers(
                         lm,
                         num_layers=num_layers,
                         config={**lora_config, "keys": language_lora_keys},
-                        use_dora=False,
                     )
-                    language_lora_count = len(language_lora_keys) if language_lora_keys is not None else num_layers
 
             # Optionally LoRA the vision tower.
             vision_lora_count = 0
@@ -6097,7 +6203,7 @@ class FastMLXModel:
                 _raise_no_lora_targets(target_modules)
 
             # Unfreeze all LoRA params across the tree.
-            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            _unfreeze_mlx_lora_parameters(model)
         else:
             # Text-only path. _fix_missing_no_grad handles modules using
             # __new__ without __init__ (e.g. Gemma4 AudioRelativePosition...).
@@ -6110,9 +6216,7 @@ class FastMLXModel:
                     stacklevel=2,
                 )
             else:
-                num_layers = 0
-                if hasattr(model, "model") and hasattr(model.model, "layers"):
-                    num_layers = len(model.model.layers)
+                num_layers = len(_mlx_language_layers(model))
                 if finetune_last_n_layers is not None and num_layers > 0:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = _resolve_lora_keys(model, target_modules)
@@ -6126,15 +6230,16 @@ class FastMLXModel:
                 # mlx_lm/tuner/lora.py train); otherwise lazy state advances
                 # leak into lora_a sampling.
                 _seed_mlx_random_state(random_state)
-                linear_to_lora_layers(
+                language_lora_count = linear_to_lora_layers(
                     model,
                     num_layers=num_layers,
                     config={**lora_config, "keys": language_lora_keys},
-                    use_dora=False,
                 )
+                if language_lora_count == 0:
+                    _raise_no_lora_targets(target_modules)
 
             model.freeze()
-            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            _unfreeze_mlx_lora_parameters(model)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
 
