@@ -221,10 +221,15 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             intermediate_size = hd * 4
 
         if target_gb is None:
-            free, total = torch.cuda.mem_get_info(0)
-            free_gb = free / 1024 / 1024 / 1024
-            free_gb = free_gb * 0.5
-            target_gb = free_gb
+            # torch.cuda.mem_get_info works on ROCm (PyTorch aliases cuda API),
+            # but guard for non-CUDA/HIP devices (XPU, CPU fallback).
+            if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(0)
+                free_gb = free / 1024 / 1024 / 1024
+                free_gb = free_gb * 0.5
+                target_gb = free_gb
+            else:
+                target_gb = 4.0  # Conservative default for non-CUDA/HIP devices
 
         max_flat_qlen = get_max_flat_qlen(
             hd = hd,

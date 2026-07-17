@@ -65,7 +65,7 @@ from .temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
-from .device_type import DEVICE_TYPE
+from .device_type import DEVICE_TYPE, is_hip
 global LORA_REQUEST_ID
 
 # Align FlashInfer workspace with Unsloth compiled cache to avoid stale JIT paths.
@@ -943,8 +943,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    capability = torch.cuda.get_device_capability()
-    sm_cap = capability[0] * 10 + capability[1]
+    # AMD ROCm: SM architecture (SM80/SM90) concepts don't apply to gfx9xx.
+    # CUTLASS block FP8 and DeepGEMM are NVIDIA Hopper (SM90) only.
+    if not is_hip():
+        capability = torch.cuda.get_device_capability()
+        sm_cap = capability[0] * 10 + capability[1]
+    else:
+        sm_cap = 0  # Not applicable on AMD; gates all SM90-specific paths
 
 
     try:
@@ -2231,7 +2236,15 @@ def load_vllm(
     # Use Flashinfer if possible (not faster for BnB, and seems lower throughput;
     # FP8 Flashinfer may be better).
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
-    if importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+    # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
+    # On AMD, vLLM uses its built-in paged attention instead.
+    if is_hip() and importlib.util.find_spec("flashinfer"):
+        for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
+            if os.environ.get(_fi_env, "") in ("1", "FLASHINFER"):
+                del os.environ[_fi_env]
+        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
+    elif not is_hip() and \
+         importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
         # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
         # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
         _has_nvcc = (
