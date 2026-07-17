@@ -78,6 +78,27 @@ def _brute_force(events, cap):
     return best
 
 
+def _brute_force_padding_budget(events):
+    by_family = {}
+    raw_work = 0
+    for event in events:
+        by_family.setdefault(event.family, set()).add(event.width)
+        raw_work += event.weight * event.width * event.width
+    families = sorted(by_family, key=shape_guard._family_key)
+    candidates = []
+    for family_choices in itertools.product(*_partition_options(events)):
+        cost = sum(choice[1] for choice in family_choices)
+        choices = tuple(choice[2] for choice in family_choices)
+        within_stretch = all(
+            next(value for value in endpoints if width <= value) * 2 <= width * 3
+            for family, endpoints in zip(families, choices)
+            for width in by_family[family]
+        )
+        if cost * 100 <= raw_work * 5 and within_stretch:
+            candidates.append((sum(choice[0] for choice in family_choices), cost))
+    return min(candidates)
+
+
 def _planned_endpoints(plan):
     return tuple(
         tuple(dict.fromkeys(endpoint for _width, endpoint in mapping))
@@ -261,14 +282,20 @@ def test_padding_budget_keeps_small_schedules_exact_without_frontier(monkeypatch
 
 
 def test_padding_budget_uses_one_frontier_and_adapts_to_width_distribution(monkeypatch):
-    original = shape_guard._build_global_frontier
+    original = shape_guard._build_padding_budget_frontier
     calls = []
 
     def counted(*args, **kwargs):
         calls.append(1)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(shape_guard, "_build_global_frontier", counted)
+    def unexpected_unrestricted(*_args, **_kwargs):
+        raise AssertionError("budget success must skip unrestricted planning")
+
+    monkeypatch.setattr(shape_guard, "_build_padding_budget_frontier", counted)
+    monkeypatch.setattr(
+        shape_guard, "_build_global_frontier", unexpected_unrestricted,
+    )
     clustered = [_event(("text",), width) for width in range(100, 164)]
     irregular = [_event(("text",), 10 + width * width) for width in range(64)]
 
@@ -354,6 +381,48 @@ def test_padding_budget_keeps_stretch_feasible_long_tail_frontier():
     )
 
 
+def test_padding_budget_scales_to_dense_975_width_schedule():
+    events = [_event(("text",), width) for width in range(50, 1_025)]
+    frontier = build_text_shape_frontier(
+        events, compile_scope=FULL_STEP_SCOPE,
+    )
+    plan = select_text_shape_padding_budget(frontier)
+
+    assert plan.report.effective_cap == plan.report.planned_signatures == 27
+    assert plan.report.padding_work_fraction <= 0.05
+    assert plan.report.budget_satisfied is True
+    shared = materialize_text_shape_frontier(
+        frontier, cap=128, cap_selection=plan.report.cap_selection,
+    )
+    assert shared.report.effective_cap == 128
+    assert shared.report.planned_signatures == 27
+    assert shared.endpoint_maps == plan.endpoint_maps
+
+
+def test_randomized_small_padding_frontiers_match_exhaustive_optima():
+    rng = random.Random(8192)
+    singleton_events = [
+        _event(("singleton", index), 150) for index in range(29)
+    ]
+    for _ in range(60):
+        core_events = [
+            _event(
+                ("core",), width, frequency=rng.randint(1, 8),
+            )
+            for width in sorted(rng.sample(range(10, 140), 4))
+        ]
+        events = core_events + singleton_events
+        expected_slots, expected_cost = _brute_force_padding_budget(events)
+
+        plan = plan_text_shape_padding_budget(
+            events, compile_scope=FULL_STEP_SCOPE,
+        )
+
+        assert plan.report.cap_selection == "padding_budget"
+        assert plan.report.effective_cap == expected_slots
+        assert plan.padding_cost == expected_cost
+
+
 def test_padding_budget_is_independent_of_event_order():
     events = [
         _event(("a",), 10 + index * index, "a", frequency=1 + index % 3)
@@ -389,6 +458,12 @@ def test_shared_cap_materialization_preserves_both_padding_budgets():
 
     assert local.report.effective_cap == 31
     assert local.report.budget_satisfied is True
+    lower = materialize_text_shape_frontier(
+        frontier, cap=30, cap_selection=local.report.cap_selection,
+    )
+    assert lower.report.action == "bucket"
+    assert lower.report.planned_signatures <= 30
+
     shared = materialize_text_shape_frontier(
         frontier,
         cap=32,

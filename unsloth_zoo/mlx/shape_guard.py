@@ -165,6 +165,79 @@ class TextShapeFrontier:
         return len(self._problem.raw_catalog)
 
 
+class _FamilyBudgetPlanner:
+    """Incremental exact stretch-feasible DP for one shape family."""
+
+    def __init__(self, width_data, max_padding_cost, work):
+        self.width_data = width_data
+        self.widths = tuple(sorted(width_data))
+        if len(self.widths) > MAX_WIDTHS_PER_FAMILY:
+            raise _PlannerLimit("too_many_widths")
+        self.max_padding_cost = max_padding_cost
+        self.work = work
+        self.width_weights = {
+            width: sum(width_data[width].values()) for width in self.widths
+        }
+        self.max_slots = sum(
+            len(width_data[width]) for width in self.widths
+        )
+        self.irreducible_slots = len({
+            phase
+            for phases in width_data.values()
+            for phase in phases
+        })
+        self.layers = [[(0, ())] + [None] * len(self.widths)]
+        self.options = {}
+
+    def extend(self, target_slots):
+        target_slots = min(target_slots, self.max_slots)
+        while len(self.layers) <= target_slots:
+            slots = len(self.layers)
+            layer = [None] * (len(self.widths) + 1)
+            for end in range(1, len(self.widths) + 1):
+                endpoint = self.widths[end - 1]
+                segment_phases = set()
+                segment_weight = 0
+                segment_squares = 0
+                for start in range(end - 1, -1, -1):
+                    self.work[0] += 1
+                    if self.work[0] > MAX_PLANNER_WORK:
+                        raise _PlannerLimit("planner_work_limit")
+                    width = self.widths[start]
+                    if (
+                        endpoint * MAX_WIDTH_STRETCH_DENOMINATOR
+                        > width * MAX_WIDTH_STRETCH_NUMERATOR
+                    ):
+                        break
+                    phase_weights = self.width_data[width]
+                    segment_phases.update(phase_weights)
+                    width_weight = self.width_weights[width]
+                    segment_weight += width_weight
+                    segment_squares += width_weight * width * width
+                    segment_slots = len(segment_phases)
+                    if segment_slots > slots:
+                        break
+                    previous = self.layers[slots - segment_slots][start]
+                    if previous is None:
+                        continue
+                    segment_cost = (
+                        endpoint * endpoint * segment_weight - segment_squares
+                    )
+                    candidate_cost = previous[0] + segment_cost
+                    if candidate_cost > self.max_padding_cost:
+                        continue
+                    candidate = (
+                        candidate_cost,
+                        previous[1] + (endpoint,),
+                    )
+                    current = layer[end]
+                    if current is None or candidate < current:
+                        layer[end] = candidate
+            self.layers.append(layer)
+            if layer[-1] is not None:
+                self.options[slots] = layer[-1]
+
+
 def resolve_compile_max_variants(value=None):
     if value is None:
         return DEFAULT_TEXT_COMPILE_MAX_VARIANTS
@@ -416,6 +489,60 @@ def _build_global_frontier(problem, cap, *, include_stretch=False):
     return states, stretch_states
 
 
+def _build_padding_budget_frontier(problem, cap, *, stop_at_first):
+    """Build exact stretch-feasible points in increasing signature count."""
+
+    max_padding_cost = (
+        problem.raw_work * MAX_PADDING_WORK_PERCENT // 100
+    )
+    work = [0]
+    planners = [
+        _FamilyBudgetPlanner(
+            problem.family_data[family], max_padding_cost, work,
+        )
+        for family in problem.sorted_families
+    ]
+    irreducible = sum(planner.irreducible_slots for planner in planners)
+    if irreducible > cap:
+        raise _PlannerLimit("irreducible_signatures")
+
+    points = []
+    for total_slots in range(irreducible, cap + 1):
+        for planner in planners:
+            other_minimum = irreducible - planner.irreducible_slots
+            planner.extend(total_slots - other_minimum)
+
+        states = {0: (0, ())}
+        for planner in planners:
+            next_states = {}
+            for used, (cost, choices) in states.items():
+                for slots, (family_cost, endpoints) in planner.options.items():
+                    total = used + slots
+                    if total > total_slots:
+                        continue
+                    work[0] += 1
+                    if work[0] > MAX_PLANNER_WORK:
+                        raise _PlannerLimit("planner_work_limit")
+                    candidate_cost = cost + family_cost
+                    if candidate_cost > max_padding_cost:
+                        continue
+                    candidate = (
+                        candidate_cost,
+                        choices + (endpoints,),
+                    )
+                    current = next_states.get(total)
+                    if current is None or candidate < current:
+                        next_states[total] = candidate
+            states = next_states
+        if total_slots not in states:
+            continue
+        cost, choices = states[total_slots]
+        points.append((total_slots, cost, choices))
+        if stop_at_first:
+            break
+    return tuple(points)
+
+
 def _eager_plan(
     problem, reason, cap, *, configured_cap=None, cap_selection="fixed",
 ):
@@ -579,10 +706,18 @@ def build_text_shape_frontier(events, *, compile_scope):
     if len(problem.raw_catalog) <= SMALL_EXACT_SIGNATURE_THRESHOLD:
         return TextShapeFrontier(problem)
     try:
-        states, stretch_states = _build_global_frontier(
+        stretch_points = _build_padding_budget_frontier(
             problem,
             AUTOMATIC_TEXT_COMPILE_CEILING,
-            include_stretch=True,
+            stop_at_first=True,
+        )
+        if stretch_points:
+            return TextShapeFrontier(
+                problem,
+                _stretch_points=stretch_points,
+            )
+        states, _ = _build_global_frontier(
+            problem, AUTOMATIC_TEXT_COMPILE_CEILING,
         )
     except _PlannerLimit as exc:
         return TextShapeFrontier(problem, failure_reason=str(exc))
@@ -590,15 +725,7 @@ def build_text_shape_frontier(events, *, compile_scope):
         (slots, cost, choices)
         for slots, (cost, choices) in sorted(states.items())
     )
-    stretch_points = tuple(
-        (slots, cost, choices)
-        for slots, (cost, choices) in sorted(stretch_states.items())
-    )
-    return TextShapeFrontier(
-        problem,
-        points,
-        _stretch_points=stretch_points,
-    )
+    return TextShapeFrontier(problem, points)
 
 
 def materialize_text_shape_frontier(
@@ -632,7 +759,47 @@ def materialize_text_shape_frontier(
             configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
             cap_selection=cap_selection,
         )
-    candidates = [point for point in frontier._points if point[0] <= cap]
+    if frontier._stretch_points:
+        budget_points = frontier._stretch_points
+        if budget_points[-1][0] < cap:
+            try:
+                budget_points = _build_padding_budget_frontier(
+                    problem, cap, stop_at_first=False,
+                )
+            except _PlannerLimit:
+                budget_points = frontier._stretch_points
+        candidates = [point for point in budget_points if point[0] <= cap]
+        if candidates:
+            slots, padding_cost, choices = min(
+                candidates,
+                key=lambda point: (point[1], point[0], point[2]),
+            )
+            return _materialize_choice(
+                problem,
+                slots,
+                padding_cost,
+                choices,
+                cap=cap,
+                configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+                cap_selection=cap_selection,
+            )
+    points = frontier._points
+    if not points:
+        try:
+            states, _ = _build_global_frontier(problem, cap)
+        except _PlannerLimit as exc:
+            return _eager_plan(
+                problem,
+                str(exc),
+                cap,
+                configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
+                cap_selection="fallback",
+            )
+        points = tuple(
+            (slots, cost, choices)
+            for slots, (cost, choices) in sorted(states.items())
+        )
+    candidates = [point for point in points if point[0] <= cap]
     if not candidates:
         return _eager_plan(
             problem,
@@ -641,13 +808,8 @@ def materialize_text_shape_frontier(
             configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
             cap_selection="fallback",
         )
-    budget_candidates = [
-        point
-        for point in frontier._stretch_points
-        if point[0] <= cap and _point_within_budgets(problem, point)
-    ]
     slots, padding_cost, choices = min(
-        budget_candidates or candidates,
+        candidates,
         key=lambda point: (point[1], point[0], point[2]),
     )
     return _materialize_choice(
