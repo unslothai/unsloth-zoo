@@ -35,7 +35,10 @@ from unsloth_zoo.temporary_patches.olmoe import (
     patch_olmoe_moe,
     _olmoe_weight_preprocessor,
 )
-from unsloth_zoo.temporary_patches.moe_utils import get_weight_preprocessor
+from unsloth_zoo.temporary_patches.moe_utils import (
+    get_weight_preprocessor,
+    select_moe_backend,
+)
 
 try:
     from transformers.models.olmoe.modeling_olmoe import OlmoeExperts
@@ -84,35 +87,43 @@ def test_patch_installs_backend_and_registry():
 @requires_fused_olmoe
 def test_patched_forward_matches_stock_math_cpu(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_BACKEND", "native_torch")
-    patch_olmoe_moe()
+    # select_moe_backend is @lru_cache(maxsize=1): drop any choice cached by an
+    # earlier test so the env pin above actually takes effect, and drop ours on
+    # the way out so it can't leak into later tests (e.g. on a GPU host whose
+    # uncached choice would be grouped_mm).
+    select_moe_backend.cache_clear()
+    try:
+        patch_olmoe_moe()
 
-    E, H, I, T, K = 8, 64, 32, 16, 2  # 2I == H -> the #849-ambiguous shape
-    cfg = OlmoeConfig(
-        hidden_size=H, intermediate_size=I, num_local_experts=E,
-        num_experts_per_tok=K, hidden_act="silu",
-    )
-    torch.manual_seed(0)
-    experts = OlmoeExperts(cfg).float().eval()
-    with torch.no_grad():
-        experts.gate_up_proj.normal_(0.0, 0.2)
-        experts.down_proj.normal_(0.0, 0.2)
+        E, H, I, T, K = 8, 64, 32, 16, 2  # 2I == H -> the #849-ambiguous shape
+        cfg = OlmoeConfig(
+            hidden_size=H, intermediate_size=I, num_local_experts=E,
+            num_experts_per_tok=K, hidden_act="silu",
+        )
+        torch.manual_seed(0)
+        experts = OlmoeExperts(cfg).float().eval()
+        with torch.no_grad():
+            experts.gate_up_proj.normal_(0.0, 0.2)
+            experts.down_proj.normal_(0.0, 0.2)
 
-    hs = torch.randn(T, H)
-    idx = torch.randint(0, E, (T, K))
-    w = torch.softmax(torch.rand(T, K), dim=-1)
+        hs = torch.randn(T, H)
+        idx = torch.randint(0, E, (T, K))
+        w = torch.softmax(torch.rand(T, K), dim=-1)
 
-    with torch.no_grad():
-        out = experts(hs, idx, w)
+        with torch.no_grad():
+            out = experts(hs, idx, w)
 
-        # Stock OlmoeExperts math: F.linear over the (E, 2I, H)/(E, H, I) weights.
-        ref = torch.zeros(T, H)
-        for t in range(T):
-            for k in range(K):
-                e = idx[t, k].item()
-                gate, up = torch.nn.functional.linear(hs[t], experts.gate_up_proj[e]).chunk(2, dim=-1)
-                ref[t] += w[t, k] * torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, experts.down_proj[e])
+            # Stock OlmoeExperts math: F.linear over the (E, 2I, H)/(E, H, I) weights.
+            ref = torch.zeros(T, H)
+            for t in range(T):
+                for k in range(K):
+                    e = idx[t, k].item()
+                    gate, up = torch.nn.functional.linear(hs[t], experts.gate_up_proj[e]).chunk(2, dim=-1)
+                    ref[t] += w[t, k] * torch.nn.functional.linear(torch.nn.functional.silu(gate) * up, experts.down_proj[e])
 
-    assert out.shape == ref.shape
-    assert torch.allclose(out, ref, rtol=1e-5, atol=1e-5), (
-        f"max abs diff {(out - ref).abs().max().item()}"
-    )
+        assert out.shape == ref.shape
+        assert torch.allclose(out, ref, rtol=1e-5, atol=1e-5), (
+            f"max abs diff {(out - ref).abs().max().item()}"
+        )
+    finally:
+        select_moe_backend.cache_clear()
