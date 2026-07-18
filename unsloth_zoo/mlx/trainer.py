@@ -756,7 +756,7 @@ def _plan_single_process_text_shapes(
         report = _shape_guard_report(
             "eager", "unsupported_batch_plan", cap, compile_scope,
             lazy_batches=False,
-            cap_selection="fallback",
+            cap_selection="not_applicable",
         )
         if compile_policy.mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
@@ -1227,7 +1227,7 @@ class MLXTrainer:
                 planned_signatures=None,
                 planned_endpoints=(),
                 padding_tokens=0,
-                cap_selection="fallback",
+                cap_selection="not_applicable",
                 padding_work_fraction=0.0,
                 max_width_stretch=1.0,
                 budget_satisfied=False,
@@ -1264,7 +1264,7 @@ class MLXTrainer:
             if final_error is not None:
                 raise error from final_error
             raise error
-        fallback_cap = (
+        failure_cap = (
             shared_cap
             if 1 <= shared_cap <= AUTOMATIC_TEXT_COMPILE_CEILING
             else AUTOMATIC_TEXT_COMPILE_CEILING
@@ -1276,12 +1276,12 @@ class MLXTrainer:
                 "shared_cap_materialization_failed"
                 if final_error is not None else "peer_planner_failure"
             ),
-            cap=fallback_cap,
-            effective_cap=fallback_cap,
+            cap=failure_cap,
+            effective_cap=failure_cap,
             planned_signatures=None,
             planned_endpoints=(),
             padding_tokens=0,
-            cap_selection="fallback",
+            cap_selection="not_applicable",
             padding_work_fraction=0.0,
             max_width_stretch=1.0,
             budget_satisfied=False,
@@ -2168,7 +2168,7 @@ class MLXTrainer:
                         if self.distributed_world_size > 1
                         else FULL_STEP_SCOPE
                     ),
-                    cap_selection="fallback",
+                    cap_selection="not_applicable",
                 )
                 compile_allowed = False
             (

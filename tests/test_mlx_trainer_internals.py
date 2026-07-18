@@ -284,7 +284,7 @@ def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
     trainer._distributed_max_int = lambda _cap: 129
     failure_consensus = iter((False, True))
     trainer._distributed_any_flag = lambda _failed: next(failure_consensus)
-    plan, fallback, allowed = trainer._coordinate_text_shape_guard(
+    plan, failed_report, allowed = trainer._coordinate_text_shape_guard(
         local_plan,
         frontier,
         local_plan.report,
@@ -294,9 +294,9 @@ def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
     )
 
     assert plan is None and allowed is False
-    assert fallback.action == "eager"
-    assert fallback.cap_selection == "fallback"
-    assert fallback.effective_cap == fallback.cap == 128
+    assert failed_report.action == "eager"
+    assert failed_report.cap_selection == "not_applicable"
+    assert failed_report.effective_cap == failed_report.cap == 128
 
 
 def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
@@ -331,36 +331,7 @@ def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
     assert coordinated == report
 
 
-def test_automatic_shape_planner_work_limit_uses_bounded_fallback(monkeypatch):
-    from unsloth_zoo.mlx import shape_guard
-    from unsloth_zoo.mlx.compile import build_compile_policy
-    from unsloth_zoo.mlx.trainer import (
-        MLXTrainingConfig,
-        _plan_single_process_text_shapes,
-    )
-
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
-    args = MLXTrainingConfig(max_steps=40)
-    plan, report, allowed, frontier = _plan_single_process_text_shapes(
-        _make_shape_guard_text_plan(tuple(range(10, 50))),
-        None,
-        args=args,
-        total_steps=40,
-        is_vlm=False,
-        distributed_world_size=1,
-        compile_policy=build_compile_policy(args=args),
-    )
-
-    assert plan is not None and frontier is not None
-    assert allowed is True
-    assert report.action == "bucket"
-    assert report.cap_selection == "fallback"
-    assert report.effective_cap == report.cap <= 128
-    assert report.budget_satisfied is True
-
-
-def test_ddp_synchronizes_bounded_fallback_cap(monkeypatch):
-    from unsloth_zoo.mlx import shape_guard
+def test_ddp_synchronizes_bounded_padding_budget_cap():
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer,
@@ -368,7 +339,6 @@ def test_ddp_synchronizes_bounded_fallback_cap(monkeypatch):
         _plan_single_process_text_shapes,
     )
 
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
     args = MLXTrainingConfig(max_steps=40)
     policy = build_compile_policy(args=args)
     local_plan, report, allowed, frontier = _plan_single_process_text_shapes(
@@ -393,7 +363,7 @@ def test_ddp_synchronizes_bounded_fallback_cap(monkeypatch):
     )
 
     assert final_allowed is True
-    assert final_report.cap_selection == "fallback"
+    assert final_report.cap_selection == "padding_budget"
     assert final_report.effective_cap == shared_cap
     assert final_report.planned_signatures <= shared_cap
     assert final_plan.report == final_report

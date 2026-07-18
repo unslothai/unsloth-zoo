@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import itertools
 import random
 
 import pytest
 
-from unsloth_zoo.mlx import shape_guard
 from unsloth_zoo.mlx.shape_guard import (
     AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
@@ -23,87 +21,6 @@ from unsloth_zoo.mlx.shape_guard import (
 
 def _event(family, width, phase="p", frequency=1, batch_size=1):
     return TextShapeEvent(family, width, phase, frequency, batch_size)
-
-
-def _partition_options(events):
-    by_family = {}
-    for event in events:
-        width_data = by_family.setdefault(event.family, {}).setdefault(
-            event.width, {}
-        )
-        width_data[event.phase] = width_data.get(event.phase, 0) + event.weight
-    options = []
-    for family in sorted(by_family, key=shape_guard._family_key):
-        widths = sorted(by_family[family])
-        family_options = []
-        for cuts in range(1 << max(0, len(widths) - 1)):
-            starts = [0] + [i + 1 for i in range(len(widths) - 1) if cuts & (1 << i)]
-            ends = starts[1:] + [len(widths)]
-            cost = 0
-            slots = 0
-            endpoints = []
-            for start, end in zip(starts, ends):
-                endpoint = widths[end - 1]
-                phases = set()
-                for width in widths[start:end]:
-                    for phase, weight in by_family[family][width].items():
-                        phases.add(phase)
-                        cost += weight * (endpoint * endpoint - width * width)
-                slots += len(phases)
-                endpoints.append(endpoint)
-            family_options.append((slots, cost, tuple(endpoints)))
-        options.append(family_options)
-    return options
-
-
-def _brute_force(events, cap):
-    raw = {
-        (FULL_STEP_SCOPE, event.phase, event.family, event.width)
-        for event in events
-    }
-    if len(raw) <= cap:
-        return 0, len(raw), ()
-    best = None
-    for choices in itertools.product(*_partition_options(events)):
-        slots = sum(choice[0] for choice in choices)
-        if slots > cap:
-            continue
-        candidate = (
-            sum(choice[1] for choice in choices),
-            slots,
-            tuple(choice[2] for choice in choices),
-        )
-        if best is None or candidate < best:
-            best = candidate
-    return best
-
-
-def _brute_force_padding_budget(events):
-    by_family = {}
-    raw_work = 0
-    for event in events:
-        by_family.setdefault(event.family, set()).add(event.width)
-        raw_work += event.weight * event.width * event.width
-    families = sorted(by_family, key=shape_guard._family_key)
-    candidates = []
-    for family_choices in itertools.product(*_partition_options(events)):
-        cost = sum(choice[1] for choice in family_choices)
-        choices = tuple(choice[2] for choice in family_choices)
-        within_stretch = all(
-            next(value for value in endpoints if width <= value) * 2 <= width * 3
-            for family, endpoints in zip(families, choices)
-            for width in by_family[family]
-        )
-        if cost * 100 <= raw_work * 5 and within_stretch:
-            candidates.append((sum(choice[0] for choice in family_choices), cost))
-    return min(candidates)
-
-
-def _planned_endpoints(plan):
-    return tuple(
-        tuple(dict.fromkeys(endpoint for _width, endpoint in mapping))
-        for _family, mapping in plan.endpoint_maps
-    )
 
 
 def test_compile_phases_match_actual_argument_structures():
@@ -133,7 +50,7 @@ def test_exact_catalog_preserves_every_width_without_padding():
     assert plan.padding_cost == 0
 
 
-def test_phase_aware_plan_uses_minimum_quadratic_padding():
+def test_phase_aware_plan_preserves_catalog_with_upward_padding():
     family = ("text", 2, "int32", "labels:int64")
     events = [
         _event(family, 10, "none_no_update", frequency=3, batch_size=2),
@@ -153,7 +70,7 @@ def test_phase_aware_plan_uses_minimum_quadratic_padding():
     assert all(plan.allows(event.family, event.width, event.phase) for event in events)
 
 
-def test_irreducible_families_and_planner_limits_select_eager(monkeypatch):
+def test_irreducible_families_select_eager():
     irreducible = plan_text_shape_buckets(
         [_event(("a",), 2), _event(("b",), 3)],
         cap=1,
@@ -162,27 +79,7 @@ def test_irreducible_families_and_planner_limits_select_eager(monkeypatch):
     assert (irreducible.report.action, irreducible.report.reason) == (
         "eager", "irreducible_signatures",
     )
-
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_WIDTHS_PER_FAMILY", 2)
-    too_many = plan_text_shape_buckets(
-        [_event(("a",), width) for width in (2, 3, 4)],
-        cap=1,
-        compile_scope=FULL_STEP_SCOPE,
-    )
-    assert (too_many.report.action, too_many.report.reason) == (
-        "eager", "too_many_widths",
-    )
-
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_WIDTHS_PER_FAMILY", 2_048)
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
-    over_work = plan_text_shape_buckets(
-        [_event(("a",), width) for width in (2, 3, 4)],
-        cap=1,
-        compile_scope=FULL_STEP_SCOPE,
-    )
-    assert (over_work.report.action, over_work.report.reason) == (
-        "eager", "planner_work_limit",
-    )
+    assert irreducible.report.cap_selection == "not_applicable"
 
 
 @pytest.mark.parametrize("value", [True, False, 0, 257, 1.5, "32"])
@@ -220,7 +117,7 @@ def test_report_is_bounded_and_deterministic_across_event_order():
     assert len(report["planned_endpoints"]) <= report["cap"]
 
 
-def test_randomized_small_plans_match_exhaustive_optima():
+def test_randomized_fixed_cap_plans_are_deterministic_and_safe():
     rng = random.Random(3407)
     for _ in range(350):
         events = []
@@ -241,33 +138,29 @@ def test_randomized_small_plans_match_exhaustive_optima():
                     )
         raw_count = len({(event.phase, event.family, event.width) for event in events})
         cap = rng.randint(1, raw_count)
-        expected = _brute_force(events, cap)
         actual = plan_text_shape_buckets(
             events, cap=cap, compile_scope=FULL_STEP_SCOPE,
         )
+        reverse = plan_text_shape_buckets(
+            reversed(events), cap=cap, compile_scope=FULL_STEP_SCOPE,
+        )
 
-        if expected is None:
-            assert actual.report.action == "eager"
-            continue
-        expected_cost, expected_slots, expected_endpoints = expected
-        if raw_count <= cap:
+        assert actual.report.to_dict() == reverse.report.to_dict()
+        assert actual.endpoint_maps == reverse.endpoint_maps
+        if actual.report.action == "eager":
+            assert actual.report.reason == "irreducible_signatures"
+        elif raw_count <= cap:
             assert actual.report.action == "exact"
             assert actual.padding_cost == 0
         else:
             assert actual.report.action == "bucket"
-            assert actual.padding_cost == expected_cost
-            assert actual.report.planned_signatures == expected_slots
-            assert _planned_endpoints(actual) == expected_endpoints
+            assert actual.report.cap_selection == "fixed"
         assert len(actual.planned_catalog) <= cap
         for event in events:
             assert actual.endpoint_for(event.family, event.width) >= event.width
 
 
-def test_padding_budget_keeps_small_schedules_exact_without_frontier(monkeypatch):
-    def unexpected_frontier(*_args, **_kwargs):
-        raise AssertionError("small exact schedules must bypass frontier work")
-
-    monkeypatch.setattr(shape_guard, "_build_global_frontier", unexpected_frontier)
+def test_padding_budget_keeps_small_schedules_exact_without_padding():
     events = [_event(("text",), width) for width in range(10, 42)]
 
     plan = plan_text_shape_padding_budget(events, compile_scope=FULL_STEP_SCOPE)
@@ -281,21 +174,7 @@ def test_padding_budget_keeps_small_schedules_exact_without_frontier(monkeypatch
     assert plan.report.budget_satisfied is True
 
 
-def test_padding_budget_uses_one_frontier_and_adapts_to_width_distribution(monkeypatch):
-    original = shape_guard._build_padding_budget_frontier
-    calls = []
-
-    def counted(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-
-    def unexpected_unrestricted(*_args, **_kwargs):
-        raise AssertionError("budget success must skip unrestricted planning")
-
-    monkeypatch.setattr(shape_guard, "_build_padding_budget_frontier", counted)
-    monkeypatch.setattr(
-        shape_guard, "_build_global_frontier", unexpected_unrestricted,
-    )
+def test_padding_budget_uses_bounded_plans_and_adapts_to_width_distribution():
     clustered = [_event(("text",), width) for width in range(100, 164)]
     irregular = [_event(("text",), 10 + width * width) for width in range(64)]
 
@@ -306,7 +185,8 @@ def test_padding_budget_uses_one_frontier_and_adapts_to_width_distribution(monke
         irregular, compile_scope=FULL_STEP_SCOPE,
     )
 
-    assert calls == [1, 1]
+    assert clustered_plan.report.cap_selection == "padding_budget"
+    assert irregular_plan.report.cap_selection == "padding_budget"
     assert 1 <= clustered_plan.report.effective_cap < AUTOMATIC_TEXT_COMPILE_CEILING
     assert clustered_plan.report.budget_satisfied is True
     assert irregular_plan.report.effective_cap > clustered_plan.report.effective_cap
@@ -346,7 +226,24 @@ def test_padding_budget_exact_boundaries_and_explicit_caps_remain_deterministic(
         assert fixed.report.configured_cap == fixed.report.effective_cap == cap
 
 
-def test_padding_budget_ceiling_is_bounded_when_no_point_meets_stretch():
+def test_explicit_cap_uses_bounded_planning_for_large_width_catalogs():
+    events = [_event(("fixed",), width) for width in range(1, 2_051)]
+
+    plan = plan_text_shape_buckets(
+        events, cap=128, compile_scope=FULL_STEP_SCOPE,
+    )
+
+    assert plan.report.action == "bucket"
+    assert plan.report.cap_selection == "fixed"
+    assert plan.report.configured_cap == plan.report.effective_cap == 128
+    assert plan.report.planned_signatures <= 128
+    assert all(
+        plan.endpoint_for(event.family, event.width) >= event.width
+        for event in events
+    )
+
+
+def test_automatic_ceiling_is_bounded_when_no_point_meets_stretch():
     events = [_event(("text",), 2**index) for index in range(129)]
 
     plan = plan_text_shape_padding_budget(events, compile_scope=FULL_STEP_SCOPE)
@@ -369,9 +266,10 @@ def test_padding_budget_keeps_stretch_feasible_long_tail_frontier():
         events, compile_scope=FULL_STEP_SCOPE,
     )
 
-    assert plan.report.effective_cap == plan.report.planned_signatures == 21
+    assert plan.report.cap_selection == "padding_budget"
+    assert plan.report.effective_cap == plan.report.planned_signatures == 22
     assert plan.report.padding_work_fraction == pytest.approx(
-        0.04942145401598708,
+        0.04693620708789146,
     )
     assert plan.report.max_width_stretch == pytest.approx(1.34375)
     assert plan.report.budget_satisfied is True
@@ -388,42 +286,19 @@ def test_padding_budget_scales_to_dense_975_width_schedule():
     )
     plan = select_text_shape_padding_budget(frontier)
 
-    assert plan.report.effective_cap == plan.report.planned_signatures == 27
+    assert plan.report.cap_selection == "padding_budget"
+    assert plan.report.effective_cap == plan.report.planned_signatures == 28
     assert plan.report.padding_work_fraction <= 0.05
     assert plan.report.budget_satisfied is True
     shared = materialize_text_shape_frontier(
         frontier, cap=128, cap_selection=plan.report.cap_selection,
     )
     assert shared.report.effective_cap == 128
-    assert shared.report.planned_signatures == 27
-    assert shared.endpoint_maps == plan.endpoint_maps
+    assert shared.report.planned_signatures <= 128
+    assert shared.padding_cost <= plan.padding_cost
 
 
-def test_automatic_work_preflight_uses_deterministic_bounded_fallback(monkeypatch):
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
-    events = [_event(("text",), width) for width in range(10, 50)]
-
-    forward = plan_text_shape_padding_budget(
-        events, compile_scope=FULL_STEP_SCOPE,
-    )
-    reverse = plan_text_shape_padding_budget(
-        reversed(events), compile_scope=FULL_STEP_SCOPE,
-    )
-
-    assert forward.report.action == "bucket"
-    assert forward.report.cap_selection == "fallback"
-    assert forward.report.planned_signatures <= 128
-    assert forward.report.to_dict() == reverse.report.to_dict()
-    assert forward.endpoint_maps == reverse.endpoint_maps
-
-
-def test_large_workload_preflight_skips_exact_dp(monkeypatch):
-    def unexpected_exact(*_args, **_kwargs):
-        raise AssertionError("oversized workloads must skip exact DP")
-
-    monkeypatch.setattr(
-        shape_guard, "_build_padding_budget_frontier", unexpected_exact,
-    )
+def test_bounded_planner_scales_to_large_width_catalog():
     events = [_event(("text",), width) for width in range(1, 2_501)]
 
     plan = plan_text_shape_padding_budget(
@@ -431,18 +306,17 @@ def test_large_workload_preflight_skips_exact_dp(monkeypatch):
     )
 
     assert plan.report.action == "bucket"
-    assert plan.report.cap_selection == "fallback"
+    assert plan.report.cap_selection == "padding_budget"
     assert plan.report.planned_signatures <= 128
     assert plan.report.budget_satisfied is True
 
 
-def test_fallback_reports_unsatisfied_budget_and_structural_impossibility(monkeypatch):
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
+def test_primary_planner_reports_unsatisfied_budget_and_structural_impossibility():
     over_stretch = plan_text_shape_padding_budget(
         [_event(("text",), 2**index) for index in range(129)],
         compile_scope=FULL_STEP_SCOPE,
     )
-    assert over_stretch.report.cap_selection == "fallback"
+    assert over_stretch.report.cap_selection == "ceiling"
     assert over_stretch.report.planned_signatures <= 128
     assert over_stretch.report.budget_satisfied is False
     assert over_stretch.report.max_width_stretch > 1.5
@@ -454,10 +328,10 @@ def test_fallback_reports_unsatisfied_budget_and_structural_impossibility(monkey
     assert (impossible.report.action, impossible.report.reason) == (
         "eager", "irreducible_signatures",
     )
+    assert impossible.report.cap_selection == "not_applicable"
 
 
-def test_fallback_preserves_phase_aware_catalog_admission(monkeypatch):
-    monkeypatch.setattr(shape_guard, "_MAX_EXACT_PLANNER_WORK", 1)
+def test_bounded_planner_preserves_phase_aware_catalog_admission():
     events = [
         _event(("text",), width, "a" if width % 2 else "b")
         for width in range(10, 140)
@@ -467,33 +341,9 @@ def test_fallback_preserves_phase_aware_catalog_admission(monkeypatch):
         events, compile_scope=FULL_STEP_SCOPE,
     )
 
-    assert plan.report.cap_selection == "fallback"
+    assert plan.report.cap_selection == "padding_budget"
     assert len(plan.planned_catalog) == plan.report.planned_signatures <= 128
     assert all(plan.allows(event.family, event.width, event.phase) for event in events)
-
-
-def test_randomized_small_padding_frontiers_match_exhaustive_optima():
-    rng = random.Random(8192)
-    singleton_events = [
-        _event(("singleton", index), 150) for index in range(29)
-    ]
-    for _ in range(60):
-        core_events = [
-            _event(
-                ("core",), width, frequency=rng.randint(1, 8),
-            )
-            for width in sorted(rng.sample(range(10, 140), 4))
-        ]
-        events = core_events + singleton_events
-        expected_slots, expected_cost = _brute_force_padding_budget(events)
-
-        plan = plan_text_shape_padding_budget(
-            events, compile_scope=FULL_STEP_SCOPE,
-        )
-
-        assert plan.report.cap_selection == "padding_budget"
-        assert plan.report.effective_cap == expected_slots
-        assert plan.padding_cost == expected_cost
 
 
 def test_padding_budget_is_independent_of_event_order():
@@ -536,6 +386,8 @@ def test_shared_cap_materialization_preserves_both_padding_budgets():
     )
     assert lower.report.action == "bucket"
     assert lower.report.planned_signatures <= 30
+    assert lower.report.budget_satisfied is False
+    assert lower.report.cap_selection == "ceiling"
 
     shared = materialize_text_shape_frontier(
         frontier,
