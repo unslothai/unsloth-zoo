@@ -602,13 +602,13 @@ class MLXTrainingConfig:
     gradient_checkpointing: bool = True
     streaming: bool = False  # Use streaming iterator instead of materializing batches
     dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
-    preserve_dataset_order: bool = False  # Match Studio CUDA SequentialSampler order
+    preserve_dataset_order: bool = False  # Match Unsloth CUDA SequentialSampler order
     memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
     cache_limit_gb: float | None = None  # Optional MLX Metal cache cap in GB; <= 0 disables override
     wired_limit_gb: float | None = None  # None = min(recommended working set, memory limit); <= 0 disables
     disable_memory_limits: bool = False
     cast_norm_output_to_input_dtype: bool = True  # fp32 norm storage/math, bf16/fp16 downstream activations
-    append_eos: bool = True  # True = mlx-lm parity; Studio sets False (template owns EOS)
+    append_eos: bool = True  # True = mlx-lm parity; Unsloth sets False (template owns EOS)
 
     # VLM / completion masking
     train_on_completions: bool = False  # Mask prompt tokens in loss
@@ -1659,7 +1659,7 @@ class MLXTrainer:
 
     def _setup_report_to_callbacks(self):
         """Auto-register W&B / TensorBoard callbacks from report_to, mirroring
-        Studio worker.py log keys so notebook and Studio runs chart identically."""
+        Unsloth worker.py log keys so notebook and Unsloth runs chart identically."""
         raw = getattr(self.args, "report_to", "none")
         if not raw or raw == "none":
             return
@@ -2069,7 +2069,7 @@ class MLXTrainer:
 
         # Resume from checkpoint: load adapter weights, optimizer state,
         # and trainer state (step counter + loss history). Adapters were
-        # already loaded by the Studio worker into the model before train()
+        # already loaded by the Unsloth worker into the model before train()
         # was called, so we only handle optimizer and trainer state here.
         # The step offset is applied below at loop start so the LR scheduler
         # and dataloader fast-forward to the right position.
@@ -2084,7 +2084,7 @@ class MLXTrainer:
         if _resume_from:
             try:
                 # 1. Load trained adapter weights into the model. The model
-                #    already has LoRA wrappers applied (Studio pipeline does
+                #    already has LoRA wrappers applied (Unsloth pipeline does
                 #    get_peft_model before training); strict=False ensures
                 #    only the LoRA params match and base weights are untouched.
                 model.load_weights(
@@ -3485,7 +3485,7 @@ class MLXTrainer:
 
             # Keep intentionally-trained non-LoRA tensors OUTSIDE any LoRA
             # module; drop wrapped base weights INSIDE one (else q_proj.weight
-            # under a LoRA-wrapped q_proj re-leaks the Studio reload bug). Uses
+            # under a LoRA-wrapped q_proj re-leaks the Unsloth reload bug). Uses
             # the shared filter to match save_trainable_adapters / _merged.
             trainable = dict(tree_flatten(self.model.trainable_parameters()))
             adapter_keys = set(adapter_tensors)

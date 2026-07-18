@@ -21,7 +21,7 @@ Xet (``hf_xet``) is fast but can hang with no progress, no exception, and an un-
 thread) that sets the env before importing ``huggingface_hub``. Cached files short-circuit with no
 child; deterministic errors (401/403/404/disk-full) and cancellation propagate without a fallback.
 ``snapshot_download_with_xet_fallback`` warms a whole repo in a killable child before Unsloth's
-in-process load; ``hf_hub_download_with_xet_fallback`` does a single file. Studio cache / secret /
+in-process load; ``hf_hub_download_with_xet_fallback`` does a single file. Unsloth cache / secret /
 process helpers are used best-effort (imported only if present) or injected. The child sets
 ``UNSLOTH_ZOO_DISABLE_GPU_INIT=1`` for unsloth_zoo's lightweight import path (no torch / transformers).
 """
@@ -76,7 +76,7 @@ from unsloth_zoo.hf_cache_state import (
 
 logger = logging.getLogger(__name__)
 
-# Explicit list keeps stdlib imports out of Studio's `import *` re-export shim.
+# Explicit list keeps stdlib imports out of Unsloth's `import *` re-export shim.
 __all__ = [
     "DownloadStallError",
     "hf_hub_download_with_xet_fallback",
@@ -90,7 +90,7 @@ __all__ = [
 
 _CTX = mp.get_context("spawn")
 
-# Defaults match the existing Studio inference watchdog and hub shutdown deadline.
+# Defaults match the existing Unsloth inference watchdog and hub shutdown deadline.
 DEFAULT_HEARTBEAT_INTERVAL = 30.0
 DEFAULT_STALL_TIMEOUT = 180.0
 DEFAULT_GRACE_PERIOD = 10.0
@@ -123,7 +123,7 @@ def _safe_status(callback: Optional[Callable[[str], None]], message: str) -> Non
 
 
 class DownloadStallError(RuntimeError):
-    """Raised when no download progress is observed for too long. Studio re-imports this canonical type."""
+    """Raised when no download progress is observed for too long. Unsloth re-imports this canonical type."""
 
 
 def is_hf_xet_available() -> bool:
@@ -218,7 +218,7 @@ def _default_prepare_for_http(
     HTTP resume over a sparse Xet / hf_transfer partial silently corrupts the blob) and the broken
     snapshot symlinks the detector counts as active (else the retry inherits stale state and re-trips).
     ``iter_active_repo_cache_dirs`` is case-collision safe, so this destructive purge only touches an
-    unambiguous repo cache dir. Studio injects its marker-aware version instead.
+    unambiguous repo cache dir. Unsloth injects its marker-aware version instead.
 
     *owned_incomplete_blobs* (basenames the stalled child held open, captured before the kill) SCOPES the
     purge so a same-repo sibling writing a DIFFERENT blob is spared even if aged past *active_grace*;
@@ -464,7 +464,7 @@ def start_watchdog(
 
 
 def _scrub_in_child(text: str, token: Optional[str]) -> str:
-    """Redact secrets from a child error string, preferring Studio's patterns if present."""
+    """Redact secrets from a child error string, preferring Unsloth's patterns if present."""
     try:
         from hub.utils.download_registry import scrub_secrets  # type: ignore
 
@@ -669,7 +669,7 @@ def _download_child_entry(
     """Spawn-child entrypoint (top-level + picklable): set the Xet env BEFORE importing huggingface_hub,
     form its own process group so the parent can kill the whole transfer, never log token / signed
     URLs."""
-    # Die with the parent on Linux under Studio (best-effort; module absent standalone).
+    # Die with the parent on Linux under Unsloth (best-effort; module absent standalone).
     try:
         from utils.process_lifetime import bind_current_process_to_parent_lifetime  # type: ignore
 
@@ -870,7 +870,7 @@ def _run_download_attempt(
                 else:
                     main_module.__spec__ = saved_main_spec
 
-    # Bind the child to the parent lifetime when running under Studio (best-effort).
+    # Bind the child to the parent lifetime when running under Unsloth (best-effort).
     try:
         from utils.process_lifetime import adopt_pid  # type: ignore
 
@@ -1734,7 +1734,7 @@ def _download_with_xet_fallback(
         if disable_xet:
             # Purge a non-HTTP partial first (an HTTP resume over a sparse Xet/hf_transfer partial
             # silently corrupts the blob), scoped to the stalled child's own partials so a same-repo
-            # sibling is spared. An injected (Studio) hook keeps the plain (repo_type, repo_id) signature.
+            # sibling is spared. An injected (Unsloth) hook keeps the plain (repo_type, repo_id) signature.
             owned_incomplete = params.pop("_owned_incomplete_blobs", None)
             try:
                 if prepare_for_http_fn is None:
