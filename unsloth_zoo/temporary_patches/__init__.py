@@ -36,6 +36,7 @@ from .gemma4_moe import *
 from .lfm2_moe import *
 from .mixtral_moe import *
 from .ernie4_5_moe import *
+from .olmoe import *
 from .pixtral import *
 from .ministral import *
 from .mxfp4 import *
