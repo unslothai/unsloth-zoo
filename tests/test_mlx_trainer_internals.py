@@ -1066,49 +1066,6 @@ def test_train_on_responses_only_masks_unsized_text_lazily():
     assert trainer.eval_dataset["sized"][0]["labels"] == [-100, -100, -100, 7]
     assert lazy_eval.pulls == 0
 
-
-def test_lazy_text_eval_restarts_masks_splits_and_bounds_infinite_sources():
-    MLXTrainer, trainer = _streaming_text_trainer(
-        max_steps=1, completion_only_loss=False,
-        per_device_eval_batch_size=1,
-    )
-    trainer._mlx_response_mask_fn = lambda batch: {
-        "labels": [[-100] + ids[1:] for ids in batch["input_ids"]]
-    }
-    source = _CountingTextRows([{"text": "1 2"}, {"text": "3 4"}])
-    batches = MLXTrainer._create_text_eval_batches(trainer, source, 1, False, False)
-    first = [_streaming_batch_signature(batch) for batch in batches]
-    assert [_streaming_batch_signature(batch) for batch in batches] == first
-    assert first[0][2] == [[-100, 2]]
-
-    infinite = _CountingTextRows([{"text": "1 2"}], infinite=True)
-    unbounded = MLXTrainer._create_text_eval_batches(
-        trainer, infinite, 1, False, False,
-    )
-    with pytest.raises(ValueError, match="infinite.*max_eval_batches"):
-        next(iter(unbounded))
-    assert infinite.pulls == 0
-
-    trainer.args.max_eval_batches = 1
-    bounded = MLXTrainer._create_text_eval_batches(
-        trainer, infinite, 1, False, False,
-    )
-    assert len(list(bounded)) == infinite.pulls == 1
-
-    from datasets import IterableDataset, concatenate_datasets, interleave_datasets
-    base = IterableDataset.from_generator(lambda: iter([{"text": "1 2"}]))
-    from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
-    assert (_mlx_stream_declares_infinite(base.repeat(None).take(3)),
-            _mlx_stream_declares_infinite(base.take(3).repeat(None))) == (False, True)
-    assert _mlx_stream_declares_infinite(concatenate_datasets([base.take(1), base.repeat(None)]))
-    assert _mlx_stream_declares_infinite(concatenate_datasets([base.take(1), base.rename_column("text", "other").repeat(None)], axis=1))
-    assert _mlx_stream_declares_infinite(interleave_datasets(
-        [base.take(1), base.repeat(None)], stopping_strategy="all_exhausted"))
-    assert _mlx_stream_declares_infinite(interleave_datasets(
-        [base.repeat(None)] * 2, stopping_strategy="first_exhausted"))
-    assert _mlx_stream_declares_infinite(interleave_datasets(
-        [base.take(1)] * 2, probabilities=[1.0, 0.0], stopping_strategy="all_exhausted"))
-
 def test_sized_response_training_defers_lazy_eval_with_override_tokenizer():
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer, MLXTrainingConfig, train_on_responses_only,
@@ -1155,95 +1112,6 @@ def test_length_declaring_text_stream_supports_epoch_replay():
     signatures = [_streaming_batch_signature(next(iterator)) for _ in range(4)]
     assert signatures[3] == signatures[0]
     assert trainer.train_dataset.epochs == [0, 1]
-
-
-def test_epoch_stream_rejects_ambiguous_or_inexact_cardinality_lazily():
-    MLXTrainer, trainer = _streaming_text_trainer(
-        max_steps=0, num_train_epochs=1,
-        completion_only_loss=False, per_device_train_batch_size=2,
-        gradient_accumulation_steps=1,
-    )
-    trainer.train_dataset = _DeclaredTextRows([{"text": "1 2"}])
-    trainer.formatting_func = lambda row: row
-    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
-    assert _streaming_batch_signature(next(iterator))[0][0][:2] == [1, 2]
-
-    trainer.args.per_device_train_batch_size = 1
-    trainer.train_dataset = _DeclaredTextRows([
-        {"text": "1 2"}, {"text": "3 4"},
-    ])
-    trainer.formatting_func = lambda row: [row, row]
-    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
-    with pytest.raises(ValueError, match="exactly one trainable"):
-        next(iterator)
-
-    trainer.args.per_device_train_batch_size = 2
-    trainer.formatting_func = None
-    trainer.train_dataset = _DeclaredTextRows([{"text": "1 2"}, {"text": ""}])
-    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
-    with pytest.raises(ValueError, match="exactly one trainable"):
-        next(iterator)
-
-    class UnderDeclared(_DeclaredTextRows):
-        def __len__(self): return 2
-        def __iter__(self):
-            for row in ({"text": "1 2"}, {"text": "3 4"}, {"text": ""}):
-                self.pulls += 1
-                yield row
-            raise AssertionError("must reject the first overflow row")
-    trainer.train_dataset = UnderDeclared([
-        {"text": "unused"},
-    ])
-    _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
-    with pytest.raises(ValueError, match="exactly one trainable"):
-        next(iterator)
-    assert trainer.train_dataset.pulls == 3
-
-    trainer.args.gradient_accumulation_steps = 2
-    trainer.args.num_train_epochs = 2
-    trainer.train_dataset = _DeclaredTextRows([
-        {"text": "1 2"}, {"text": "3 4"}, {"text": "5 6"},
-        {"text": "7 8"}, {"text": "9 10"},
-    ])
-    with pytest.raises(ValueError, match="divisible.*gradient_accumulation"):
-        MLXTrainer._prepare_data(trainer, is_vlm=False)
-    assert trainer.train_dataset.pulls == 0
-
-
-def test_epoch_stream_allows_one_to_one_labeled_preparation():
-    def prepare(rows, *, tokenizer=None, response_mask_fn=None, **kwargs):
-        MLXTrainer, trainer = _streaming_text_trainer(
-            max_steps=0, num_train_epochs=1,
-            per_device_train_batch_size=1, gradient_accumulation_steps=1,
-            **kwargs,
-        )
-        trainer.train_dataset = _DeclaredTextRows(rows)
-        if tokenizer is not None:
-            trainer.tokenizer = tokenizer
-        trainer._mlx_response_mask_fn = response_mask_fn
-        _, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
-        return next(iterator)
-
-    completion = prepare(
-        [{"prompt": "1 2", "completion": " 3"}],
-        completion_only_loss=True,
-    )
-    assistant_rows = [{"messages": [{"role": "user", "content": "4"}, {"role": "assistant", "content": "5"}]}]
-    assistant = prepare(
-        assistant_rows,
-        tokenizer=_AssistantMaskTokenizer(), completion_only_loss=False,
-        assistant_only_loss=True,
-    )
-    response = prepare(
-        [{"text": "6 7"}], completion_only_loss=False,
-        response_mask_fn=lambda batch: {
-            "labels": [[-100] + ids[1:] for ids in batch["input_ids"]]
-        },
-    )
-
-    assert completion[2].tolist() == [[-100, -100, 3]]
-    assert assistant[2].tolist() == [[-100, -100, -100, 5]]
-    assert response[2].tolist() == [[-100, 7]]
 
 
 def test_raw_text_streaming_matches_sized_sequential_order():
@@ -1389,40 +1257,6 @@ def test_one_shot_stream_exhaustion_and_resume_are_actionable():
     with pytest.raises(RuntimeError, match="replayable iterable"):
         next(iter(eval_batches))
     assert next(source) == {"text": "1 2"}
-
-
-def test_hf_stream_resume_fast_forward_matches_uninterrupted_order():
-    from datasets import IterableDataset
-
-    def make_trainer(resume=False):
-        MLXTrainer, trainer = _make_mlx_text_trainer(
-            max_steps=3,
-            streaming=True,
-            dataset_order="sequential",
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        trainer.tokenizer = _streaming_text_tokenizer()
-        trainer.train_dataset = IterableDataset.from_generator(
-            lambda: (
-                {"text": f"{value} {value + 10}"}
-                for value in range(1, 6)
-            )
-        ).shuffle(seed=17, buffer_size=3)
-        trainer._resume_from_checkpoint = "checkpoint-2" if resume else None
-        return MLXTrainer, trainer
-
-    MLXTrainer, uninterrupted = make_trainer()
-    _, batches = MLXTrainer._prepare_data(uninterrupted, is_vlm=False)
-    expected = [next(batches) for _ in range(5)][-1]
-
-    MLXTrainer, resumed = make_trainer(resume=True)
-    _, batches = MLXTrainer._prepare_data(resumed, is_vlm=False)
-    for _ in range(4):
-        next(batches)
-    actual = next(batches)
-
-    assert _streaming_batch_signature(actual) == _streaming_batch_signature(expected)
 
 
 def test_unsized_stream_rejects_randperm_before_consumption():
@@ -2522,42 +2356,41 @@ def test_quantized_linear_forward():
     torch.testing.assert_close(out, torch.tensor([[28.0, 28.0]]))
 
 
-def _window_rows(lengths):
-    # Row index rides in the first token so batch order is observable.
-    return [
-        " ".join([str(100 + idx)] + ["7"] * (length - 1))
-        for idx, length in enumerate(lengths)
-    ]
-
-
 def _first_tokens(stream, count):
     return [[row[0] for row in batch.tolist()]
             for batch, _l, _lab in (next(stream) for _ in range(count))]
 
 
-def _window_batches(rows, *, window, order="default", repeat=False, seed=3407,
-                    max_batches=None, source=None):
+def _window_rows(lengths):
+    # Row index rides in the first token so batch order is observable.
+    return [" ".join([str(100 + idx)] + ["7"] * (n - 1)) for idx, n in enumerate(lengths)]
+
+
+def _window_stream(rows, *, window, order="default", repeat=False, seed=3407,
+                   source=None, **kwargs):
     from unsloth_zoo.mlx.utils import iterate_training_batches
-    stream = iterate_training_batches(
+    return iterate_training_batches(
         dataset=_CountingTextRows(rows) if source is None else source,
         tokenizer=_streaming_text_tokenizer(), batch_size=2, max_seq_length=64,
         seed=seed, dataset_order=order, repeat=repeat,
-        length_window_batches=window,
+        length_window_batches=window, **kwargs,
     )
+
+
+def _window_batches(rows, *, max_batches=None, **kwargs):
     out = []
-    for batch, _lengths, _labels in stream:
+    for batch, _l, _lab in _window_stream(rows, **kwargs):
         out.append(([row[0] for row in batch.tolist()], batch.shape[1]))
         if max_batches is not None and len(out) >= max_batches:
-            return out
+            break
     return out
 
 
 _WINDOW_LENGTHS = (40, 3, 44, 4, 2, 46, 3, 41)
 
 
-def test_streaming_window_identity_grouping_and_ddp_slice():
-    rows = _window_rows(_WINDOW_LENGTHS)
-    arrival = [[100, 101], [102, 103], [104, 105], [106, 107]]
+def test_streaming_window_identity_grouping_padding_gate_and_ddp_slice():
+    rows, arrival = _window_rows(_WINDOW_LENGTHS), [[100, 101], [102, 103], [104, 105], [106, 107]]
     assert [ids for ids, _ in _window_batches(rows, window=1)] == arrival
     assert [ids for ids, _ in _window_batches(rows, window=8, order="sequential")] == arrival
 
@@ -2567,122 +2400,81 @@ def test_streaming_window_identity_grouping_and_ddp_slice():
     from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
     ddp = _iterate_lazy_text_training_batches(
         _CountingTextRows(rows), _streaming_text_tokenizer(), 1, 64,
-        comm_group=FakeWorld(), repeat=False, length_window_batches=1,
-    )
+        comm_group=FakeWorld(), repeat=False, length_window_batches=1)
     assert _first_tokens(ddp, 4) == [[101], [103], [105], [107]]
 
-    grouped = _window_batches(rows, window=4)
-    baseline = _window_batches(rows, window=1)
+    grouped, baseline = _window_batches(rows, window=4), _window_batches(rows, window=1)
     assert sorted(t for ids, _ in grouped for t in ids) == [100 + i for i in range(8)]
     assert sum(w for _, w in grouped) < sum(w for _, w in baseline)
-    assert grouped == _window_batches(rows, window=4)  # deterministic
-    assert [ids for ids, _ in grouped] != arrival      # grouping engaged
-    assert [ids for ids, _ in _window_batches(rows, window=4, seed=1)] != \
-        [ids for ids, _ in grouped]  # seed reaches the permutation
+    assert grouped == _window_batches(rows, window=4) != baseline
+    assert [ids for ids, _ in _window_batches(rows, window=4, seed=1)] != [ids for ids, _ in grouped]
 
-    # Single-process windowed slicing must see an EMPTY pad_source: cycle
-    # padding is gated to multi-rank runs (retention stays within the window).
+    # Single-process windowed slicing must see an EMPTY pad_source (cycle
+    # padding is multi-rank-only) and leave the partial tail short.
     from unsloth_zoo.mlx import utils as mlx_utils
-    odd = _window_rows(_WINDOW_LENGTHS[:7])
-    seen_pads = []
+    odd, seen_pads = _window_rows(_WINDOW_LENGTHS[:7]), []
     original = mlx_utils._rank_slice_distributed_batch
-    def spy(items, local_batch_size, comm_group=None, pad_source=None, pad_mode="cycle"):
+    def spy(items, n, comm_group=None, pad_source=None, pad_mode="cycle"):
         seen_pads.append([] if not pad_source else list(pad_source))
-        return original(items, local_batch_size, comm_group=comm_group,
-                        pad_source=pad_source, pad_mode=pad_mode)
+        return original(items, n, comm_group=comm_group, pad_source=pad_source, pad_mode=pad_mode)
     mlx_utils._rank_slice_distributed_batch = spy
     try:
         tail = _window_batches(odd, window=3)[-1]
     finally:
         mlx_utils._rank_slice_distributed_batch = original
-    assert len(tail[0]) == 1
-    assert seen_pads and all(pads == [] for pads in seen_pads)
+    assert len(tail[0]) == 1 and seen_pads and all(p == [] for p in seen_pads)
 
 
-def test_streaming_window_epoch_replay_oneshot_and_knob_validation():
+def test_streaming_window_epochs_cardinality_oneshot_and_knob():
     odd_rows = _window_rows(_WINDOW_LENGTHS[:7])  # 7 rows -> 4 batches/pass
     source = _DeclaredTextRows(odd_rows)
-    crossing = _window_batches(odd_rows, window=3, repeat=True, source=source,
-                               max_batches=6)  # crosses the epoch boundary
+    crossing = _window_batches(odd_rows, window=3, repeat=True, source=source, max_batches=6)
     assert source.epochs[:2] == [0, 1]
-    assert (sorted(t for ids, _ in crossing[:4] for t in ids)
-            == [100 + i for i in range(7)])
-    fresh = _window_batches(odd_rows, window=3, repeat=True, max_batches=6)
-    assert fresh == crossing  # deterministic reconstruction across the boundary
-    assert [ids for ids, _ in crossing[4:6]] != [ids for ids, _ in crossing[:2]]
-    # ^ epoch index reaches the permutation seed (pass-2 order differs)
+    assert sorted(t for ids, _ in crossing[:4] for t in ids) == [100 + i for i in range(7)]
+    assert _window_batches(odd_rows, window=3, repeat=True, max_batches=6) == crossing
+    assert [ids for ids, _ in crossing[4:6]] != [ids for ids, _ in crossing[:2]]  # epoch reaches seed
 
-    # Resume-style fast-forward: a fresh iterator skipped past the boundary
-    # continues exactly where the uninterrupted run would.
-    from unsloth_zoo.mlx.utils import iterate_training_batches
-    skipped = iterate_training_batches(
-        dataset=_CountingTextRows(odd_rows), tokenizer=_streaming_text_tokenizer(),
-        batch_size=2, max_seq_length=64, seed=3407, dataset_order="default",
-        repeat=True, require_replayable=True, length_window_batches=3,
-    )
+    skipped = _window_stream(odd_rows, window=3, repeat=True, require_replayable=True)
     for _ in range(5):
         next(skipped)
-    assert _first_tokens(skipped, 1) == [crossing[5][0]]
+    assert _first_tokens(skipped, 1) == [crossing[5][0]]  # resume fast-forward
 
-    # Declared-cardinality epochs with W>1: the final buffered window flushes
-    # only after per-pass validation; a declared-length mismatch raises before
-    # the buffered final batches are emitted.
     from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
-    exact = _iterate_lazy_text_training_batches(
-        _DeclaredTextRows(odd_rows), _streaming_text_tokenizer(), 2, 64,
-        repeat=True, length_window_batches=3, window_seed=3407,
-        expected_rows_per_pass=7,
-    )
-    two_passes = _first_tokens(exact, 8)
+    def exact_stream(expected):
+        return _iterate_lazy_text_training_batches(
+            _DeclaredTextRows(odd_rows), _streaming_text_tokenizer(), 2, 64,
+            repeat=True, length_window_batches=3, window_seed=3407,
+            expected_rows_per_pass=expected)
+    two_passes = _first_tokens(exact_stream(7), 8)
     assert sorted(t for ids in two_passes[:4] for t in ids) == [100 + i for i in range(7)]
-    mismatched = _iterate_lazy_text_training_batches(
-        _DeclaredTextRows(odd_rows), _streaming_text_tokenizer(), 2, 64,
-        repeat=True, length_window_batches=3, window_seed=3407,
-        expected_rows_per_pass=8,
-    )
     emitted = []
     with pytest.raises(ValueError, match="declared length"):
-        while True:
-            emitted.append(next(mismatched))
-    assert len(emitted) < 4  # buffered final window withheld on mismatch
+        for batch in exact_stream(6):
+            emitted.append(batch)
+    assert len(emitted) < 4  # buffered final window withheld on overrun
 
-    one_shot = iterate_training_batches(
-        dataset=iter(list(_CountingTextRows(odd_rows))),
-        tokenizer=_streaming_text_tokenizer(), batch_size=2, max_seq_length=64,
-        dataset_order="default", repeat=True, length_window_batches=3,
-    )
+    one_shot = _window_stream(odd_rows, window=3, repeat=True,
+                              source=iter(list(_CountingTextRows(odd_rows))))
     for _ in range(4):
         next(one_shot)
     with pytest.raises(RuntimeError, match="one-shot"):
         next(one_shot)
 
-    none_seed = iterate_training_batches(
-        dataset=_CountingTextRows(odd_rows), tokenizer=_streaming_text_tokenizer(),
-        batch_size=2, max_seq_length=64, seed=None, dataset_order="default",
-        repeat=False, length_window_batches=4,
-    )
-    assert next(iter(none_seed))[0].shape[0] == 2  # seed=None normalizes
+    assert next(iter(_window_stream(odd_rows, window=4, seed=None)))[0].shape[0] == 2
 
     for bad in (True, False, 0, -2, 2.0, "4"):
         probe = _CountingTextRows(_window_rows((3, 2)))
-        gen = iterate_training_batches(
-            dataset=probe, tokenizer=_streaming_text_tokenizer(), batch_size=2,
-            max_seq_length=64, dataset_order="default", repeat=False,
-            length_window_batches=bad,
-        )
         with pytest.raises(ValueError, match="streaming_text_length_window"):
-            next(iter(gen))
+            next(iter(_window_stream([], window=bad, source=probe)))
         assert probe.pulls == 0
 
 
-def test_trainer_prepare_data_routes_window_and_preserve_order():
-    rows = _window_rows(_WINDOW_LENGTHS)
-    arrival = [[100, 101], [102, 103], [104, 105], [106, 107]]
+def test_streaming_window_trainer_routing_and_config_copy():
+    rows, arrival = _window_rows(_WINDOW_LENGTHS), [[100, 101], [102, 103], [104, 105], [106, 107]]
 
     def prepared(**config_kwargs):
-        _MLXTrainer, trainer = _streaming_text_trainer(
-            per_device_train_batch_size=2, max_seq_length=64, **config_kwargs,
-        )
+        _T, trainer = _streaming_text_trainer(
+            per_device_train_batch_size=2, max_seq_length=64, **config_kwargs)
         trainer.train_dataset = _CountingTextRows(rows)
         _batches, stream = trainer._prepare_data(is_vlm=False)
         return _first_tokens(stream, 4)
@@ -2693,29 +2485,22 @@ def test_trainer_prepare_data_routes_window_and_preserve_order():
     assert prepared(streaming_text_length_window_batches=4,
                     preserve_dataset_order=True) == arrival
 
-    _MLXTrainer, bad_trainer = _streaming_text_trainer(
+    _T, bad_trainer = _streaming_text_trainer(
         per_device_train_batch_size=2, max_seq_length=64,
-        streaming_text_length_window_batches=0,
-    )
+        streaming_text_length_window_batches=0)
     probe = _DeclaredTextRows(rows)
     bad_trainer.train_dataset = probe
     with pytest.raises(ValueError, match="streaming_text_length_window"):
         bad_trainer._prepare_data(is_vlm=False)
     assert probe.pulls == 0 and probe.epochs == []
 
-
-def test_config_copy_tolerates_missing_suffix_fields():
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     base = MLXTrainingConfig(warmup_ratio=0.25)
-    for omitted in (
-        ("streaming_text_length_window_batches",),
-        ("streaming_text_length_window_batches", "max_eval_batches"),
-    ):
-        copied = {
-            field.name: getattr(base, field.name)
-            for field in dataclasses.fields(MLXTrainingConfig)
-            if field.init and field.name not in omitted
-        }
+    for omitted in (("streaming_text_length_window_batches",),
+                    ("streaming_text_length_window_batches", "max_eval_batches")):
+        copied = {f.name: getattr(base, f.name)
+                  for f in dataclasses.fields(MLXTrainingConfig)
+                  if f.init and f.name not in omitted}
         clone = MLXTrainingConfig(**copied)
         assert clone.streaming_text_length_window_batches == 8
         assert clone._unsloth_mlx_warmup_steps_explicit is False

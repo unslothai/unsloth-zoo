@@ -310,6 +310,7 @@ from .utils import (
     iterate_training_batches,
     _validate_streaming_length_window,
     _is_mlx_lazy_text_source,
+    _vlm_has_sized_index_space,
     _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
     iterate_vlm_training_batches,
@@ -2873,6 +2874,13 @@ class MLXTrainer:
                 def _create_eval_batches(eval_dataset):
                     """Build evaluation batches for one dataset split."""
                     if is_vlm:
+                        if not _vlm_has_sized_index_space(eval_dataset):
+                            raise ValueError(
+                                "Unsloth MLX VLM: unsized streaming eval "
+                                "datasets are not supported yet. Provide a "
+                                "sized (__len__ + __getitem__) eval dataset; "
+                                "lazy VLM evaluation is a planned follow-up."
+                            )
                         processor = self._resolve_vlm_processor()
                         config = getattr(self.model, "_config", {})
                         _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -3583,6 +3591,46 @@ class MLXTrainer:
                 else None
             )
             if args.streaming:
+                vlm_lazy = not _vlm_has_sized_index_space(train_dataset)
+                if vlm_lazy and self.distributed_world_size > 1:
+                    raise ValueError(
+                        "Unsloth MLX VLM: DDP training with an unsized "
+                        "streaming VLM source is not supported (every rank "
+                        "would re-consume the global stream). Use a sized "
+                        "dataset or single-process training; rank-owned lazy "
+                        "VLM dispatch is a planned follow-up."
+                    )
+                vlm_require_replayable = bool(
+                    getattr(self, "_resume_from_checkpoint", None)
+                )
+                vlm_expected_rows = None
+                if vlm_lazy and args.max_steps <= 0 and args.num_train_epochs > 0:
+                    declared = _mlx_declared_iterable_length(train_dataset)
+                    if declared is None:
+                        raise ValueError(
+                            "Unsloth MLX VLM: num_train_epochs requires a "
+                            "streaming iterable with an explicit reliable "
+                            "__len__. Use max_steps for an unsized source."
+                        )
+                    if declared == 0:
+                        raise ValueError(
+                            "Unsloth MLX VLM: streaming iterable declares zero rows."
+                        )
+                    self._streaming_epoch_batch_count = math.ceil(
+                        declared / args.per_device_train_batch_size
+                    )
+                    if (
+                        self._streaming_epoch_batch_count
+                        % args.gradient_accumulation_steps
+                    ):
+                        raise ValueError(
+                            "Unsloth MLX: streaming num_train_epochs requires "
+                            "the total epoch micro-batches to be divisible by "
+                            "gradient_accumulation_steps. Use max_steps or "
+                            "adjust the accumulation factor."
+                        )
+                    vlm_expected_rows = declared
+                    vlm_require_replayable = True
                 return None, iterate_vlm_training_batches(
                     dataset=train_dataset,
                     processor=processor,
@@ -3596,6 +3644,8 @@ class MLXTrainer:
                     dataset_order=vlm_dataset_order,
                     completion_only_loss=text_completion_only_loss,
                     comm_group=comm_group,
+                    require_replayable=vlm_require_replayable,
+                    expected_rows_per_pass=vlm_expected_rows,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None

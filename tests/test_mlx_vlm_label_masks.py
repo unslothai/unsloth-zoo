@@ -915,3 +915,195 @@ def test_gemma3_vlm_hidden_stack_uses_image_mask_and_embed_scale():
     assert mx.allclose(out, mx.full((1, 4, 4), 2.0))
     assert mx.allclose(layer.seen_h, mx.full((1, 4, 4), 2.0))
     assert layer.seen_mask[0, 0].tolist()[1] == [True, True, True, False]
+
+
+class _LifecycleVLMRows:
+    """Unsized replayable VLM source with consumption/epoch instrumentation."""
+
+    def __init__(self, count=6):
+        self.count, self.pulls, self.epochs = count, 0, []
+
+    def set_epoch(self, epoch):
+        self.epochs.append(epoch)
+
+    def __iter__(self):
+        def _gen():
+            for i in range(self.count):
+                self.pulls += 1
+                yield {"text": str(101 + i)}
+        return _gen()
+
+
+def _lazy_vlm(dataset, **kwargs):
+    from unsloth_zoo.mlx.utils import iterate_vlm_training_batches
+    options = dict(processor=_FakeProcessor(), config={}, batch_size=2, max_seq_length=8)
+    return iterate_vlm_training_batches(dataset=dataset, **(options | kwargs))
+
+
+def test_vlm_lazy_lifecycle_replay_oneshot_and_fast_forward():
+    source = _LifecycleVLMRows(6)
+    stream = _lazy_vlm(source)
+    assert source.pulls == 0 and source.epochs == []      # construction-lazy
+    first = next(stream)["input_ids"].tolist()
+    assert source.pulls == 2 and source.epochs == [0]     # bounded first yield
+    for _ in range(2):
+        next(stream)
+    assert next(stream)["input_ids"].tolist() == first    # replay restart
+    assert source.epochs == [0, 1]
+
+    rows = [{"text": str(101 + i)} for i in range(4)]
+    one_shot = _lazy_vlm(iter(list(rows)))
+    for _ in range(2):
+        next(one_shot)
+    with pytest.raises(RuntimeError, match="one-shot"):
+        next(one_shot)
+
+    consumed = []
+    def counting():
+        for row in rows:
+            consumed.append(row)
+            yield row
+    with pytest.raises(RuntimeError, match="replayable"):
+        next(_lazy_vlm(counting(), require_replayable=True))
+    assert consumed == []                                  # rejected pre-consumption
+
+    steady = _lazy_vlm(_LifecycleVLMRows(6))
+    uninterrupted = [next(steady)["input_ids"].tolist() for _ in range(5)]
+    resumed = _lazy_vlm(_LifecycleVLMRows(6), require_replayable=True)
+    for _ in range(4):
+        next(resumed)
+    assert next(resumed)["input_ids"].tolist() == uninterrupted[4]
+
+
+def test_vlm_lazy_declared_epochs_and_pre_consumption_rejections():
+    exact = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=4)
+    seen = [next(exact)["input_ids"].tolist() for _ in range(4)]
+    assert seen[0] == seen[2]                              # deferred final + replay
+
+    overrun, emitted = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=3), []
+    with pytest.raises(ValueError, match="declared length"):
+        while True:
+            emitted.append(next(overrun))
+    assert len(emitted) == 1                               # deferred final withheld
+
+    underrun = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=5)
+    for _ in range(2):
+        next(underrun)
+    with pytest.raises(ValueError, match="declared length"):
+        next(underrun)
+
+    def mask_fn(batch):
+        return {"labels": [[-100] * len(r) if r[0] == 101 else list(r)
+                           for r in batch["input_ids"]]}
+    filtered = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=4,
+                         processor=_ResponseMaskFilteringProcessor(),
+                         response_mask_fn=mask_fn)
+    with pytest.raises(ValueError, match="exactly one trainable"):
+        for _ in range(4):
+            next(filtered)
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+    ddp_probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="DDP training"):
+        next(_lazy_vlm(ddp_probe, comm_group=FakeWorld()))
+    assert ddp_probe.pulls == 0 and ddp_probe.epochs == []
+    with pytest.raises(ValueError, match="torch_randperm"):
+        next(_lazy_vlm(_LifecycleVLMRows(4), dataset_order="torch_randperm"))
+
+
+def test_vlm_sized_index_routing_guard_and_cleanup():
+    from unsloth_zoo.mlx.utils import create_vlm_batches, iterate_vlm_training_batches
+
+    class SizedIterableMap:
+        """Map-style dataset that ALSO iterates (must stay on the sized path)."""
+        def __init__(self):
+            self.rows = [{"text": str(101 + i)} for i in range(4)]
+        def __len__(self): return len(self.rows)
+        def __getitem__(self, idx): return self.rows[idx]
+        def __iter__(self): return iter(self.rows)
+
+    def _vlm_trainer_shell(world_size, dataset):
+        import types as _types
+        from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = MLXTrainingConfig(
+            per_device_train_batch_size=1, max_seq_length=8, streaming=True,
+        )
+        trainer.model = _types.SimpleNamespace(_config={})
+        trainer.tokenizer = _FakeProcessor()
+        trainer.processor = trainer.tokenizer
+        trainer.train_dataset = dataset
+        trainer._batches = None
+        trainer.formatting_func = None
+        trainer._distributed_initialized = True
+        trainer._distributed_world = None
+        trainer._distributed_world_size = world_size
+        return trainer
+
+    # Trainer seam: a sized iterable-map hybrid must pass the DDP gate and
+    # batch via the sized path...
+    sized_trainer = _vlm_trainer_shell(2, SizedIterableMap())
+    _batches, sized_stream = sized_trainer._prepare_data(is_vlm=True)
+    assert next(sized_stream)["input_ids"].shape[0] == 1
+    # ...while a genuinely unsized source is rejected before consumption.
+    lazy_probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="DDP training"):
+        _vlm_trainer_shell(2, lazy_probe)._prepare_data(is_vlm=True)
+    assert lazy_probe.pulls == 0 and lazy_probe.epochs == []
+
+    with pytest.raises(ValueError, match="__len__ and __getitem__"):
+        create_vlm_batches(dataset=_LifecycleVLMRows(4), processor=_FakeProcessor(),
+                           config={}, batch_size=2, max_seq_length=8)
+
+    class LenOnlyRows(_LifecycleVLMRows):
+        def __len__(self): return self.count
+    assert next(_lazy_vlm(LenOnlyRows(4)))["input_ids"].shape[0] == 2
+
+    import torch.utils.data as tud
+    class TorchStyleRows(_LifecycleVLMRows, tud.IterableDataset):
+        def __init__(self): _LifecycleVLMRows.__init__(self, 4)
+        def __len__(self): return self.count
+    assert next(_lazy_vlm(TorchStyleRows()))["input_ids"].shape[0] == 2
+
+    class GetattrProxyRows(_LifecycleVLMRows):
+        """Instance __getattr__ proxies must not classify as sized."""
+        def __len__(self): return self.count
+        def __getattr__(self, name):
+            if name == "__getitem__":
+                return lambda idx: {"text": "999"}
+            raise AttributeError(name)
+    proxied = GetattrProxyRows(4)
+    assert next(_lazy_vlm(proxied))["input_ids"].shape[0] == 2
+    assert proxied.pulls == 2                              # iterated, not indexed
+
+    closed = []
+    class RecordingCursor:
+        def __init__(self, name, rows, explode_on_close=False):
+            self._name, self._rows, self._explode = name, iter(rows), explode_on_close
+        def __iter__(self): return self
+        def __next__(self): return next(self._rows)
+        def close(self):
+            closed.append(self._name)
+            if self._explode:
+                raise RuntimeError("close exploded")
+    class ClosingRows:
+        def __init__(self): self.handed = 0
+        def __iter__(self):
+            self.handed += 1
+            name = "serving" if self.handed == 1 else "cached"
+            return RecordingCursor(name, [{"text": "101"}, {"text": "boom"}],
+                                   explode_on_close=(name == "serving"))
+    class ExplodingProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            if any("boom" in str(item) for item in text):
+                raise RuntimeError("processor exploded")
+            return super().__call__(text, **kwargs)
+    stream = _lazy_vlm(ClosingRows(), processor=ExplodingProcessor(), batch_size=1,
+                       require_replayable=True)
+    next(stream)
+    with pytest.raises(RuntimeError, match="processor exploded"):
+        next(stream)
+    stream.close()
+    assert sorted(closed) == ["cached", "serving"]         # both closed, error kept

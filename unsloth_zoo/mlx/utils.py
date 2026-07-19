@@ -3394,12 +3394,14 @@ def _is_mlx_lazy_text_source(dataset):
 
 
 def _is_mlx_hf_iterable_text_source(dataset):
-    """Return whether Hugging Face defines this source as replayable."""
-    try:
-        from datasets import IterableDataset as HFIterableDataset
-    except ImportError:
-        return False
-    return isinstance(dataset, HFIterableDataset)
+    """Return whether Hugging Face defines this source as replayable.
+
+    Detected through ``sys.modules`` so classification never imports
+    ``datasets``: if the package was never imported, no instance can exist.
+    """
+    hf_datasets = sys.modules.get("datasets")
+    hf_iterable = getattr(hf_datasets, "IterableDataset", None)
+    return hf_iterable is not None and isinstance(dataset, hf_iterable)
 
 
 def _mlx_lazy_text_source(dataset):
@@ -4369,6 +4371,14 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     """
     import numpy as np
 
+    if not _vlm_has_sized_index_space(dataset):
+        raise ValueError(
+            "Unsloth MLX VLM: this path requires a sized dataset exposing "
+            "__len__ and __getitem__. Unsized/streaming VLM sources are only "
+            "supported for training with streaming=True; unsized VLM "
+            "evaluation is a planned follow-up."
+        )
+
     image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
@@ -4492,13 +4502,239 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     return batch_list
 
 
+
+def _vlm_has_sized_index_space(dataset):
+    """True when the VLM batcher can index the dataset (`__len__` + `__getitem__`).
+
+    Both protocols must be declared on the TYPE (instance `__getattr__` proxies
+    do not make an object subscriptable), and known iterable-only bases are
+    excluded even when they inherit a raising `__getitem__` (torch
+    `IterableDataset`) or declare stream topology (HF iterables). Everything
+    else streams lazily; the sized path's permutations and response-mask
+    pre-scan require real indexing.
+    """
+    cls = type(dataset)
+    if not callable(getattr(cls, "__len__", None)):
+        return False
+    if not callable(getattr(cls, "__getitem__", None)):
+        return False
+    if _is_mlx_hf_iterable_text_source(dataset):
+        return False
+    torch_data = sys.modules.get("torch.utils.data")
+    torch_iterable = getattr(torch_data, "IterableDataset", None)
+    if torch_iterable is not None and isinstance(dataset, torch_iterable):
+        return False
+    return True
+
+
+def _iterate_lazy_vlm_training_batches(
+    dataset, processor, config, batch_size, max_seq_length, *,
+    response_mask_fn=None, formatting_func=None, dataset_order="default",
+    completion_only_loss=None, image_size=None, comm_group=None,
+    require_replayable=False, expected_rows_per_pass=None,
+    ignore_token_ids=None,
+):
+    """Unsized VLM batches under the lazy text-stream lifecycle contracts.
+
+    Single-process only: the previous every-rank consumption of the global
+    stream is intentionally removed, and rank-owned dispatch of ragged VLM
+    tensors is a planned follow-up. Per-row trainability filtering, label
+    masking, and collation reuse the sized-path helpers unchanged.
+    """
+    if _distributed_rank_size(comm_group)[1] > 1:
+        raise ValueError(
+            "Unsloth MLX VLM: DDP training with an unsized streaming VLM "
+            "source is not supported (every rank would re-consume the global "
+            "stream). Use a sized dataset or single-process training; "
+            "rank-owned lazy VLM dispatch is a planned follow-up."
+        )
+    if dataset_order == "torch_randperm":
+        raise ValueError(
+            "Unsloth MLX VLM: preserve_dataset_order / "
+            "dataset_order='torch_randperm' requires a sized "
+            "(`__len__`) dataset."
+        )
+    if dataset_order not in (None, "default", "sequential"):
+        raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+
+    def _build_batch(items, batch_formatting_func):
+        return _build_response_masked_vlm_batch(
+            items, processor, config, max_seq_length, image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=batch_formatting_func,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+        )
+
+    def _filter_stream_item(item):
+        """Return a formatted trainable streaming row, or None to skip it."""
+        if response_mask_fn is None:
+            return item
+        if formatting_func is not None:
+            item = formatting_func(item)
+        batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+            [item], processor, config, max_seq_length, image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=None,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+            return_prompt_completion=True,
+        )
+        if is_prompt_completion:
+            return item
+        valid_rows = _vlm_trainable_label_rows(batch_dict)
+        if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+            return None
+        return item
+
+    batch_formatting_func = None if response_mask_fn is not None else formatting_func
+    source_dataset = _mlx_lazy_text_source(dataset)
+    set_epoch = getattr(source_dataset, "set_epoch", None)
+
+    def _set_epoch(value):
+        if callable(set_epoch):
+            set_epoch(value)
+
+    def _resume_replay_error():
+        return RuntimeError(
+            "Unsloth MLX VLM: this operation requires a replayable iterable "
+            "source; a one-shot iterator cannot be replayed deterministically."
+        )
+
+    def _exhaustion_error():
+        return RuntimeError(
+            "Unsloth MLX VLM: one-shot streaming source is exhausted and "
+            "cannot be replayed. Use a replayable iterable or reduce max_steps."
+        )
+
+    if require_replayable and isinstance(source_dataset, Iterator):
+        raise _resume_replay_error()
+
+    _set_epoch(0)
+    current_iterator = iter(source_dataset)
+    cached_next_iterator = None
+    epoch = 0
+    try:
+        replayable, cached_next_iterator = _probe_lazy_replayability(
+            source_dataset, current_iterator, set_epoch,
+            require_replayable, _resume_replay_error,
+        )
+        while True:
+            pending = []
+            deferred_final = None
+            yielded = False
+            source_rows_seen = 0
+            prepared_rows_seen = 0
+            for item in current_iterator:
+                source_rows_seen += 1
+                item = _filter_stream_item(item)
+                if item is None:
+                    if expected_rows_per_pass is not None:
+                        raise ValueError(
+                            "Unsloth MLX VLM: epoch training requires exactly "
+                            "one trainable row per declared source row. Use "
+                            "max_steps when rows are filtered."
+                        )
+                    continue
+                prepared_rows_seen += 1
+                if (
+                    expected_rows_per_pass is not None
+                    and source_rows_seen > expected_rows_per_pass
+                ):
+                    raise ValueError(
+                        "Unsloth MLX VLM: the streaming source's declared "
+                        "length does not match one trainable row per source "
+                        "row. Use max_steps for filtered or expanding streams."
+                    )
+                pending.append(item)
+                if len(pending) < batch_size:
+                    continue
+                if (
+                    expected_rows_per_pass is not None
+                    and prepared_rows_seen == expected_rows_per_pass
+                ):
+                    deferred_final = pending
+                    pending = []
+                    continue
+                yielded = True
+                yield _build_batch(pending, batch_formatting_func)
+                pending = []
+
+            if expected_rows_per_pass is not None and (
+                source_rows_seen != expected_rows_per_pass
+                or prepared_rows_seen != expected_rows_per_pass
+            ):
+                raise ValueError(
+                    "Unsloth MLX VLM: the streaming source's declared length "
+                    "does not match one trainable row per source row. Use "
+                    "max_steps for filtered or expanding streams."
+                )
+            if deferred_final is not None:
+                yielded = True
+                yield _build_batch(deferred_final, batch_formatting_func)
+                deferred_final = None
+            if pending:
+                yielded = True
+                yield _build_batch(pending, batch_formatting_func)
+                pending = []
+
+            exhausted_iterator = current_iterator
+            current_iterator = None
+            _close_mlx_owned_iterator(exhausted_iterator)
+            if not yielded:
+                raise ValueError(
+                    "Unsloth MLX VLM: streaming dataset produced no trainable rows."
+                )
+            if replayable is False:
+                raise _exhaustion_error()
+            epoch += 1
+            _set_epoch(epoch)
+            if cached_next_iterator is not None:
+                current_iterator = cached_next_iterator
+                cached_next_iterator = None
+                del exhausted_iterator
+                continue
+            try:
+                candidate = iter(source_dataset)
+            except Exception as exc:
+                if replayable is True:
+                    raise RuntimeError(
+                        "Unsloth MLX VLM: replayable streaming source failed "
+                        f"to create an iterator for epoch {epoch}: {exc}"
+                    ) from exc
+                raise _exhaustion_error() from exc
+            if candidate is exhausted_iterator:
+                raise _exhaustion_error()
+            current_iterator = candidate
+            replayable = True
+            del exhausted_iterator
+    finally:
+        active_iterator = current_iterator
+        current_iterator = None
+        replay_iterator = cached_next_iterator
+        cached_next_iterator = None
+        cleanup_iterators = (
+            (active_iterator,)
+            if replay_iterator is active_iterator
+            else (active_iterator, replay_iterator)
+        )
+        # A processor/cardinality error may already be unwinding; attempt every
+        # owned cursor without replacing that primary failure.
+        for iterator in cleanup_iterators:
+            try:
+                _close_mlx_owned_iterator(iterator)
+            except Exception:
+                pass
+
 def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   max_seq_length, seed=42,
                                   response_mask_fn=None,
                                   formatting_func=None,
                                   dataset_order="default",
                                   completion_only_loss=None,
-                                  image_size=None, comm_group=None):
+                                  image_size=None, comm_group=None,
+                                  require_replayable=False,
+                                  expected_rows_per_pass=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -4525,7 +4761,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             completion_only_loss=completion_only_loss,
         )
 
-    if hasattr(dataset, "__len__"):
+    if _vlm_has_sized_index_space(dataset):
         if len(dataset) <= 0:
             raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
         base_indices = list(range(len(dataset)))
@@ -4608,75 +4844,18 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     )
             epoch += 1
     else:
-        # Streaming has no index space to permute; torch_randperm needs sized epochs.
-        if dataset_order == "torch_randperm":
-            raise ValueError(
-                "Unsloth MLX VLM: preserve_dataset_order / "
-                "dataset_order='torch_randperm' requires a sized "
-                "(`__len__`) dataset."
-            )
-        if dataset_order not in (None, "default", "sequential"):
-            raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
-        def _filter_stream_item(item):
-            """Return a formatted trainable streaming row, or None to skip it."""
-            if response_mask_fn is None:
-                return item
-            if formatting_func is not None:
-                item = formatting_func(item)
-            batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
-                [item],
-                processor,
-                config,
-                max_seq_length,
-                image_size,
-                response_mask_fn=response_mask_fn,
-                formatting_func=None,
-                ignore_token_ids=ignore_token_ids,
-                completion_only_loss=completion_only_loss,
-                return_prompt_completion=True,
-            )
-            if is_prompt_completion:
-                return item
-            valid_rows = _vlm_trainable_label_rows(batch_dict)
-            if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
-                return None
-            return item
-
-        batch_formatting_func = None if response_mask_fn is not None else formatting_func
-        while True:
-            pending = []
-            yielded = False
-            for item in dataset:
-                item = _filter_stream_item(item)
-                if item is None:
-                    continue
-                pending.append(item)
-                if len(pending) >= global_batch_size:
-                    local_items = _rank_slice_distributed_batch(
-                        pending,
-                        batch_size,
-                        comm_group=comm_group,
-                        pad_source=pending,
-                    )
-                    if local_items:
-                        yielded = True
-                        yield _build_batch(local_items, batch_formatting_func)
-                    pending = []
-            if pending:
-                local_items = _rank_slice_distributed_batch(
-                    pending,
-                    batch_size,
-                    comm_group=comm_group,
-                    pad_source=pending,
-                )
-                if local_items:
-                    yielded = True
-                    yield _build_batch(local_items, batch_formatting_func)
-            if not yielded:
-                raise ValueError(
-                    "Unsloth MLX VLM: streaming dataset produced no rows. "
-                    "If resuming, use a replayable iterable rather than a one-shot iterator."
-                )
+        yield from _iterate_lazy_vlm_training_batches(
+            dataset, processor, config, batch_size, max_seq_length,
+            response_mask_fn=response_mask_fn,
+            formatting_func=formatting_func,
+            dataset_order=dataset_order,
+            completion_only_loss=completion_only_loss,
+            image_size=image_size,
+            comm_group=comm_group,
+            require_replayable=require_replayable,
+            expected_rows_per_pass=expected_rows_per_pass,
+            ignore_token_ids=ignore_token_ids,
+        )
 
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
@@ -5700,6 +5879,41 @@ def _close_mlx_owned_iterator(iterator):
         close()
 
 
+
+def _probe_lazy_replayability(source_dataset, current_iterator, set_epoch,
+                              require_replayable, resume_error):
+    """Classify a lazy source's replayability; prove it when resume needs it.
+
+    Returns ``(replayable, cached_next_iterator)`` where ``replayable`` is
+    True / False / None (unknown until first restart) and the cached iterator
+    is a proven-fresh traversal retained only for sources without
+    ``set_epoch`` (epoch-aware sources recreate after ``set_epoch`` advances).
+    """
+    if isinstance(source_dataset, Iterator):
+        replayable = False
+    elif _is_mlx_hf_iterable_text_source(source_dataset):
+        replayable = True
+    else:
+        replayable = None
+    cached_next_iterator = None
+    if require_replayable:
+        if replayable is False:
+            raise resume_error()
+        if replayable is None:
+            try:
+                candidate = iter(source_dataset)
+            except Exception as exc:
+                raise resume_error() from exc
+            if candidate is current_iterator:
+                raise resume_error()
+            if not callable(set_epoch):
+                cached_next_iterator = candidate
+            else:
+                _close_mlx_owned_iterator(candidate)
+            replayable = True
+    return replayable, cached_next_iterator
+
+
 def _validate_streaming_length_window(value):
     """Validate streaming_text_length_window_batches before source consumption."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -5816,29 +6030,10 @@ def _iterate_lazy_text_training_batches(
     current_iterator = iter(source_dataset)
     cached_next_iterator = None
     try:
-        if isinstance(source_dataset, Iterator):
-            replayable = False
-        elif _is_mlx_hf_iterable_text_source(source_dataset):
-            replayable = True
-        else:
-            replayable = None
-
-        if require_replayable:
-            if replayable is False:
-                raise _resume_replay_error()
-            if replayable is None:
-                try:
-                    candidate = iter(source_dataset)
-                except Exception as exc:
-                    raise _resume_replay_error() from exc
-                if candidate is current_iterator:
-                    raise _resume_replay_error()
-                if not callable(set_epoch):
-                    cached_next_iterator = candidate
-                else:
-                    _close_mlx_owned_iterator(candidate)
-                    del candidate
-                replayable = True
+        replayable, cached_next_iterator = _probe_lazy_replayability(
+            source_dataset, current_iterator, set_epoch,
+            require_replayable, _resume_replay_error,
+        )
 
         def _make_batch(local_items):
             if state.get("schema") == "raw" and state.get("label_state") is False:

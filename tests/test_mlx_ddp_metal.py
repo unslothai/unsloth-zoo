@@ -382,6 +382,13 @@ try:
     resume_mismatch = ""
 except RuntimeError as exc:
     resume_mismatch = str(exc)
+def vlm_stream_rejection():
+    try:
+        next(iter(iterate_vlm_training_batches(ReplayableVLMStream(), TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world)))
+        return "no-error"
+    except ValueError as exc:
+        return "rejected" if "DDP training" in str(exc) else f"wrong: {exc}"
+
 payload = {
     "rank": int(world.rank()),
     "size": int(world.size()),
@@ -452,7 +459,7 @@ payload = {
     "stream_labeled_empty": [{"ids": batch.tolist(), "lengths": lengths.tolist(), "labels": labels.tolist()} for batch, lengths, labels in list(iterate_training_batches(ReplayableLabeledStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world, repeat=False, distributed_pad_mode="empty"))],
     "vlm": [[int(row[0]) for row in batch["input_ids"].tolist()] for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 15)], TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world)],
     "vlm_empty_eval": [{"ids": batch["input_ids"].tolist(), "mask": batch["attention_mask"].tolist(), "labels": batch["labels"].tolist()} for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 13)], TinyProcessor(), {"image_token_id": 20}, batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world, distributed_pad_mode="empty")],
-    "stream_vlm": take_stream_rows(iterate_vlm_training_batches(ReplayableVLMStream(), TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world), 2),
+    "stream_vlm_rejection": vlm_stream_rejection(),
     "stream_window": take_stream_rows(iterate_training_batches(ReplayableStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="default", comm_group=world, repeat=False, length_window_batches=2), 3),
 }
 Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
@@ -477,7 +484,6 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert all(path.exists() for path in outputs), proc.stdout + proc.stderr
     ranks = [json.loads(path.read_text()) for path in outputs]
     expected = [[[10, 12], [14, 11]], [[11, 13], [10, 12]]]
-    expected_stream = [[[10, 12], [14, 14]], [[11, 13], [14, 14]]]
     assert [rank["size"] for rank in ranks] == [2, 2]
     assert [rank["synced_stop"] for rank in ranks] == [True, True]
     assert [rank["loop_main"] for rank in ranks] == [True, False]
@@ -578,7 +584,9 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[0]["stream_labeled_empty"][1]["labels"][0] == [-100, 32]
     assert ranks[1]["stream_labeled_empty"][1]["lengths"][0] == [0, 0]
     assert ranks[1]["stream_labeled_empty"][1]["labels"][0] == [-100, -100]
-    assert [rank["stream_vlm"] for rank in ranks] == expected_stream
+    # Intentional compatibility break: every-rank lazy-VLM consumption is
+    # replaced by a synchronized pre-consumption rejection on all ranks.
+    assert [rank["stream_vlm_rejection"] for rank in ranks] == ["rejected", "rejected"]
     # W=2 owner-side window: rows 10..14 (equal length) pool into chunks
     # [10,11],[12,13]; seed-42 permutation emits [12,13] first, so the pass-tail
     # partial [14] cycle-pads from that first dispatched batch.
