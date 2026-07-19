@@ -2477,32 +2477,26 @@ def convert_to_gguf(
             }
         runs_to_do.append((args, final_output, "model"))
 
-    # A bare --outfile (just a filename, no directory) is created by llama.cpp in the
-    # process CWD. On Windows that CWD is frequently not writable (e.g. an app launched
-    # from a protected/install dir), so the final write died with PermissionError
-    # [Errno 13] even though conversion fully succeeded. Only in that case do we redirect
-    # the bare name into input_folder. When the CWD is writable we change nothing, so
-    # behavior on Linux/Colab/Mac (and Windows-with-writable-CWD) is byte-for-byte as
-    # before: the file is written to CWD and callers relocate it from there.
+    # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
+    # (app launched from a protected dir), so the final write failed with PermissionError
+    # [Errno 13] even though conversion succeeded. Only then redirect the bare name into
+    # input_folder; a writable CWD (Linux/Mac/Colab) is left unchanged.
     def _dir_is_writable(d):
+        # mkstemp is exclusive: never truncates an existing file or follows a symlink.
         try:
-            # Exclusive, unique temp file (never truncates an existing path or follows
-            # a planted symlink); its existence proves the dir is writable.
             fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
             os.close(fd)
             os.remove(probe)
             return True
         except Exception:
             return False
-    # Probe the CWD once; input_folder is only probed if we actually need to redirect.
     _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
     for args, output_file, description in runs_to_do:
-        # Redirect only a bare filename, and only when the CWD (where llama.cpp would
-        # otherwise write it) is not writable. Relative paths that include a directory
-        # and absolute paths are the caller's chosen destination and are left untouched;
-        # input_folder is never assumed writable (it may be a read-only model source).
+        # Redirect only a bare filename under an unwritable CWD. Absolute paths and
+        # relative paths with a directory are the caller's choice; input_folder is probed
+        # too since it may be a read-only model source.
         if (not _cwd_writable
                 and not os.path.isabs(output_file)
                 and os.path.dirname(output_file) == ""):
