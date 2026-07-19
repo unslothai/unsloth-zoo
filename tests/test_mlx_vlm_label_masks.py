@@ -1047,6 +1047,10 @@ def test_vlm_sized_index_routing_guard_and_cleanup():
     sized_trainer = _vlm_trainer_shell(2, SizedIterableMap())
     _batches, sized_stream = sized_trainer._prepare_data(is_vlm=True)
     assert next(sized_stream)["input_ids"].shape[0] == 1
+    knob_trainer = _vlm_trainer_shell(1, SizedIterableMap())
+    knob_trainer.args.streaming_prefetch_batches = 1
+    _b2, s2 = knob_trainer._prepare_data(is_vlm=True)  # notice path must not crash
+    assert next(s2)["input_ids"].shape[0] == 1
     # ...while a genuinely unsized source is rejected before consumption.
     lazy_probe = _LifecycleVLMRows(4)
     with pytest.raises(ValueError, match="DDP training"):

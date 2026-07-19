@@ -2570,3 +2570,123 @@ def test_host_staging_seam_parity_and_host_valued_flag():
            "chat_template_kwargs": {"state": "CA", "_unsloth_state": "USER"}}
     assert _tokenize_mlx_prompt_completion_row(TemplateTok(), row) is not None
     assert seen_kwargs.get("state") == "CA" and seen_kwargs.get("_unsloth_state") == "USER"
+
+
+def test_streaming_prefetch_identity_laziness_and_knob():
+    rows = _window_rows(_WINDOW_LENGTHS)
+    sync = _window_batches(rows, window=4)
+    prefetched = _window_batches(rows, window=4, prefetch_batches=2)
+    assert prefetched == sync  # bit-for-bit consumer-visible sequence
+
+    probe = _CountingTextRows(rows)
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+    stream = iterate_training_batches(
+        dataset=probe, tokenizer=_streaming_text_tokenizer(), batch_size=2,
+        max_seq_length=64, seed=3407, dataset_order="default", repeat=False,
+        length_window_batches=4, prefetch_batches=2)
+    assert probe.pulls == 0  # construction-lazy at P>0
+    first = next(iter(stream))
+    assert first[0].shape[0] == 2 and probe.pulls >= 2
+
+    for bad in (True, -1, 1.5):
+        with pytest.raises(ValueError, match="streaming_prefetch_batches"):
+            next(iter(_window_stream(rows, window=1, prefetch_batches=bad)))
+
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig, _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert "streaming_prefetch_batches" in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert MLXTrainingConfig().streaming_prefetch_batches == 0  # default OFF
+
+    # Producer-side resume skip parity: first batch equals the sync sequence
+    # at the skip offset (single skip authority — no double fast-forward).
+    sync_all = _window_batches(rows, window=4)
+    skipped = _window_stream(rows, window=4, prefetch_batches=2,
+                             prefetch_skip_batches=2)
+    first_after_skip = [row[0] for row in next(iter(skipped))[0].tolist()]
+    assert first_after_skip == sync_all[2][0]
+
+    # Trainer records prefetch eligibility synchronously (guards its own
+    # legacy fast-forward) and the orphan gate survives exceptional teardown.
+    _T, trainer = _streaming_text_trainer(
+        per_device_train_batch_size=2, max_seq_length=64,
+        streaming_prefetch_batches=2)
+    trainer.train_dataset = _CountingTextRows(rows)
+    _b, _stream = trainer._prepare_data(is_vlm=False)
+    assert trainer._mlx_prefetch_control.get("eligible") is True
+
+    class FakeOrphan:
+        def close(self): pass
+        def orphan_alive(self): return True
+    trainer._mlx_prefetch_control = {"prefetcher": FakeOrphan()}
+    trainer._active_batch_iter = None
+    trainer._close_active_batch_iterator()  # exceptional-teardown path
+    assert trainer._mlx_prefetch_orphan.orphan_alive()
+
+
+def test_prefetcher_lifecycle_quiescence_orphan_and_positioned_error():
+    import threading
+    import time
+    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx.utils import _LazyTextPrefetcher
+
+    tok = _streaming_text_tokenizer()
+
+    def staged(rows, **kwargs):
+        return lambda: mlx_utils._iterate_lazy_text_training_batches(
+            _CountingTextRows(rows), tok, 1, 64, repeat=False,
+            yield_host_staged=True, **kwargs)
+
+    # Quiesce/resume mid-stream, then clean terminal close (no orphan).
+    pf = _LazyTextPrefetcher(staged(["1 2", "3 4", "5 6"]), depth=1)
+    next(pf)
+    pf.quiesce()
+    pf.resume()
+    next(pf)
+    assert pf.close() and not pf.orphan_alive()
+
+    # A blocked source orphans within the bounded join and gates trainer reuse.
+    gate, entered = threading.Event(), threading.Event()
+    class Blocked:
+        def __iter__(self):
+            def _gen():
+                entered.set()
+                gate.wait()
+                yield {"text": "1 2"}
+            return _gen()
+    stuck = _LazyTextPrefetcher(
+        lambda: mlx_utils._iterate_lazy_text_training_batches(
+            Blocked(), tok, 1, 64, repeat=False, yield_host_staged=True),
+        depth=1)
+    stuck._JOIN_TIMEOUT = 0.2
+    try:
+        stuck._ensure_started()
+        assert entered.wait(timeout=2.0)  # deterministically inside the pull
+        assert not stuck.close() and stuck.orphan_alive()
+        from unsloth_zoo.mlx.trainer import MLXTrainer
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer._mlx_prefetch_orphan = stuck
+        trainer._mlx_prefetch_control = {}
+        with pytest.raises(RuntimeError, match="refusing to serialize"):
+            trainer._quiesce_prefetcher_for_save()
+    finally:
+        gate.set()
+        assert stuck._done.wait(timeout=2.0)
+        stuck._thread.join(timeout=2.0)
+        assert not stuck._thread.is_alive()  # no daemon leak beyond the test
+
+    # Producer exceptions arrive positioned after prior good batches.
+    class Exploding(_StreamingTextTokenizer):
+        def __init__(self): super().__init__(); self.count = 0
+        def encode(self, text, add_special_tokens=True):
+            self.count += 1
+            if self.count > 2:
+                raise RuntimeError("late tokenizer failure")
+            return super().encode(text, add_special_tokens)
+    boom = _LazyTextPrefetcher(
+        lambda: mlx_utils._iterate_lazy_text_training_batches(
+            _CountingTextRows(["1 2", "3 4", "5 6"]), Exploding(), 1, 64,
+            repeat=False, yield_host_staged=True),
+        depth=2)
+    assert next(boom) is not None and next(boom) is not None
+    with pytest.raises(RuntimeError, match="late tokenizer failure"):
+        next(boom)
+    boom.close()

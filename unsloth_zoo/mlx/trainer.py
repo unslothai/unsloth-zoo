@@ -309,6 +309,7 @@ from .utils import (
     create_ordered_batches,
     iterate_training_batches,
     _validate_streaming_length_window,
+    _validate_streaming_prefetch,
     _is_mlx_lazy_text_source,
     _vlm_has_sized_index_space,
     _MLXIterableTokenizedDatasetView,
@@ -677,6 +678,7 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
 _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",
+    "streaming_prefetch_batches",
 )
 
 
@@ -775,6 +777,10 @@ class MLXTrainingConfig:
     # behavior). Memory scales with world size; the DDP owner also retains one
     # pass-long cycle-padding batch (documented bound W + 1).
     streaming_text_length_window_batches: int = 8
+    # Lazy text streams: prepare up to this many batches ahead on a producer
+    # thread (0 = synchronous, the default; single-process only; host-valued
+    # rows required). Retention adds the queued batches to the window bound.
+    streaming_prefetch_batches: int = 0
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -2082,7 +2088,58 @@ class MLXTrainer:
                 # Cleanup must not mask the training error already in flight or
                 # make distributed ranks diverge after their final collective.
                 pass
+        # Normal, failed, and interrupted exits all pass through here: close
+        # the producer and persist a live orphan so the next run's gate sees it.
+        control = getattr(self, "_mlx_prefetch_control", None)
+        prefetcher = control.get("prefetcher") if control else None
+        if prefetcher is not None:
+            try:
+                prefetcher.close()
+            except Exception:
+                pass
+            if prefetcher.orphan_alive():
+                self._mlx_prefetch_orphan = prefetcher
+            control["prefetcher"] = None
 
+
+    def _quiesce_prefetcher_for_save(self, terminal=False):
+        """Make serialization exclusive over shared preprocessing objects.
+
+        ``terminal=True`` (end of training) closes the producer for good;
+        otherwise an active producer is PAUSED and returned so the caller can
+        resume it after the save. Live persisted orphans always refuse.
+        """
+        orphan = getattr(self, "_mlx_prefetch_orphan", None)
+        if orphan is not None:
+            if orphan.orphan_alive():
+                raise RuntimeError(
+                    "Unsloth MLX: a prefetch producer is still blocked inside "
+                    "its source and shares this trainer's tokenizer; refusing "
+                    "to serialize concurrently. Wait for the thread to "
+                    "terminate, then call save_model() again."
+                )
+            self._mlx_prefetch_orphan = None
+        control = getattr(self, "_mlx_prefetch_control", None)
+        prefetcher = control.get("prefetcher") if control else None
+        if prefetcher is None:
+            return None
+        if not terminal:
+            prefetcher.quiesce()
+            return prefetcher
+        prefetcher.close()
+        if prefetcher.orphan_alive():
+            self._mlx_prefetch_orphan = prefetcher
+            control["prefetcher"] = None
+            raise RuntimeError(
+                "Unsloth MLX: the prefetch producer is blocked inside its "
+                "source and shares this trainer's tokenizer; refusing to "
+                "serialize concurrently. Wait for the thread to terminate, "
+                "then call save_model() again."
+            )
+        # Terminal close succeeded: drop the control reference so the ensuing
+        # save_model() wrapper gate is a no-op (no quiesce/resume re-entry).
+        control["prefetcher"] = None
+        return None
 
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
@@ -2299,9 +2356,46 @@ class MLXTrainer:
         # Prepare data, determine total_steps first. Keep any prebuilt flag
         # from train_on_responses_only; _prepare_data returns self._batches
         # early and never re-derives it for the completion-only text path.
+        previous_orphan = getattr(self, "_mlx_prefetch_orphan", None)
+        if previous_orphan is not None:
+            if previous_orphan.orphan_alive():
+                raise RuntimeError(
+                    "Unsloth MLX: a previous prefetch producer is still "
+                    "blocked inside its source and shares this trainer's "
+                    "preprocessing objects. Wait for that thread to terminate "
+                    "before training with this trainer again."
+                )
+            # Terminated orphan: release its thread/closures/queued batches.
+            self._mlx_prefetch_orphan = None
+        self._mlx_resume_step_for_prefetch = 0
+        self._mlx_resume_state_cache = None
+        _wants_prefetch = bool(
+            _validate_streaming_prefetch(
+                getattr(self.args, "streaming_prefetch_batches", 0)
+            )
+            and self.distributed_world_size == 1
+            and getattr(self.args, "streaming", False)
+        )
+        if _wants_prefetch and getattr(self, "_resume_from_checkpoint", None):
+            # Single authority: the same validated load feeds the producer skip
+            # now and the scalar restoration later (world size is 1 here, so no
+            # duplicated distributed collectives). Failures stay hard.
+            _early_resume = self._validate_distributed_resume_checkpoint(
+                self._resume_from_checkpoint
+            )
+            if _early_resume:
+                _early_state = load_trainer_state(_early_resume)
+                self._mlx_resume_state_cache = (_early_resume, _early_state)
+                self._mlx_resume_step_for_prefetch = int(
+                    _early_state.get("global_step", 0)
+                )
         if self._batches is None:
             self._prepared_batches_include_epochs = False
         batches, batch_iter = self._prepare_data(is_vlm)
+        _prefetch_active = bool(
+            getattr(self, "_mlx_prefetch_control", None)
+            and self._mlx_prefetch_control.get("eligible")
+        )
         self._active_batch_iter = batch_iter
 
         if batches is not None and not batches:
@@ -2369,7 +2463,12 @@ class MLXTrainer:
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
                 #    pre-fix checkpoints (which lack these keys) resumable.
-                ts = load_trainer_state(_resume_from)
+                _cached = getattr(self, "_mlx_resume_state_cache", None)
+                ts = (
+                    _cached[1]
+                    if _cached is not None and _cached[0] == _resume_from
+                    else load_trainer_state(_resume_from)
+                )
                 _resume_step = int(ts.get("global_step", 0))
                 # Seed the live step counter from the checkpoint so a no-op
                 # resume (checkpoint already at max_steps, loop body never runs)
@@ -2991,7 +3090,7 @@ class MLXTrainer:
         # The seed is the same and create_batches/iterate_*_batches is
         # deterministic, so consuming N batches gives us the same data
         # ordering the killed run would have produced.
-        if _resume_step > 0 and batch_iter is not None:
+        if _resume_step > 0 and batch_iter is not None and not _prefetch_active:
             for _ in range(_resume_step * grad_accum):
                 fast_forward_error = None
                 try:
@@ -3273,8 +3372,18 @@ class MLXTrainer:
             # Eval
             if (eval_batches and args.eval_steps > 0
                     and current_step % args.eval_steps == 0):
-                val_loss, ppl = self._evaluate(
-                    eval_batches, loss_fn, is_vlm=is_vlm)
+                _pf = (
+                    self._mlx_prefetch_control.get("prefetcher")
+                    if getattr(self, "_mlx_prefetch_control", None) else None
+                )
+                if _pf is not None:
+                    _pf.quiesce()
+                try:
+                    val_loss, ppl = self._evaluate(
+                        eval_batches, loss_fn, is_vlm=is_vlm)
+                finally:
+                    if _pf is not None:
+                        _pf.resume()
                 model.train()
                 _main_print(
                     f"  Eval  {current_step}/{total_steps} | "
@@ -3416,6 +3525,7 @@ class MLXTrainer:
         # Report the step actually reached, which is < total_steps after an
         # early stop (self._global_step == total_steps on a full run).
         completed_steps = self._global_step
+
         _main_print(
             f"\nUnsloth: Training complete! "
             f"Avg loss: {avg_loss:.4f} | "
@@ -3448,6 +3558,7 @@ class MLXTrainer:
         final_save_error = None
         if is_main_process:
             try:
+                self._quiesce_prefetcher_for_save(terminal=True)
                 self.save_model()
             except ValueError as e:
                 _main_print(f"Unsloth: skipped final save ({e})")
@@ -3591,6 +3702,15 @@ class MLXTrainer:
                 else None
             )
             if args.streaming:
+                if _validate_streaming_prefetch(
+                    getattr(args, "streaming_prefetch_batches", 0)
+                ) and not getattr(self, "_mlx_prefetch_vlm_notice", False):
+                    self._mlx_prefetch_vlm_notice = True
+                    if getattr(self, "_distributed_is_main_process", True):
+                        print(
+                            "Unsloth: streaming_prefetch_batches does not "
+                            "cover VLM streams yet; continuing synchronously."
+                        )
                 vlm_lazy = not _vlm_has_sized_index_space(train_dataset)
                 if vlm_lazy and self.distributed_world_size > 1:
                     raise ValueError(
@@ -3730,6 +3850,29 @@ class MLXTrainer:
                         )
                     expected_rows_per_pass = source_length
                     require_replayable = True
+                prefetch_depth = _validate_streaming_prefetch(
+                    getattr(args, "streaming_prefetch_batches", 0)
+                )
+                if prefetch_depth and self.distributed_world_size > 1:
+                    if not getattr(self, "_mlx_prefetch_ddp_notice", False):
+                        self._mlx_prefetch_ddp_notice = True
+                        if getattr(self, "_distributed_is_main_process", True):
+                            print(
+                                "Unsloth: streaming_prefetch_batches is "
+                                "single-process only; continuing "
+                                "synchronously under DDP."
+                            )
+                    prefetch_depth = 0
+                self._mlx_prefetch_control = {
+                    "eligible": bool(
+                        prefetch_depth
+                        and _is_mlx_lazy_text_source(train_dataset)
+                    ),
+                }
+                resume_skip = (
+                    int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
+                    * args.gradient_accumulation_steps
+                )
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -3754,6 +3897,9 @@ class MLXTrainer:
                             args, "streaming_text_length_window_batches", 8,
                         )
                     ),
+                    prefetch_batches=prefetch_depth,
+                    prefetch_skip_batches=resume_skip if prefetch_depth else 0,
+                    prefetch_control=self._mlx_prefetch_control,
                 )
             else:
                 batch_kwargs = dict(
@@ -3798,6 +3944,17 @@ class MLXTrainer:
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
+        paused_prefetcher = self._quiesce_prefetcher_for_save()
+        try:
+            return self._save_model_impl(output_dir)
+        finally:
+            # A mid-training save (e.g. from a step callback) pauses the
+            # producer for exclusivity and resumes it; only the end-of-training
+            # path closes it terminally.
+            if paused_prefetcher is not None:
+                paused_prefetcher.resume()
+
+    def _save_model_impl(self, output_dir=None):
         from .utils import (
             _coerce_mlx_lora_scale,
             _get_mlx_dropout_probability,

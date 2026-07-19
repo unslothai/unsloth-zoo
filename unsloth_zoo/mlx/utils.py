@@ -34,7 +34,9 @@ import os
 import sys
 import shutil
 import tempfile
+import queue as _queue_module
 import threading
+import time
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -6036,6 +6038,210 @@ def _probe_lazy_replayability(source_dataset, current_iterator, set_epoch,
     return replayable, cached_next_iterator
 
 
+
+def _validate_streaming_prefetch(value):
+    """Validate streaming_prefetch_batches before source consumption."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "Unsloth MLX: streaming_prefetch_batches must be an integer >= 0 "
+            f"(got {value!r})."
+        )
+    if value < 0:
+        raise ValueError(
+            "Unsloth MLX: streaming_prefetch_batches must be >= 0 "
+            f"(got {value})."
+        )
+    return value
+
+
+_PREFETCH_ITEM = "item"
+_PREFETCH_END = "end"
+_PREFETCH_ERROR = "error"
+
+
+class _LazyTextPrefetcher:
+    """Bounded single-producer prefetch over host-staged text batches.
+
+    The producer thread owns source consumption and host staging (tokenizer,
+    formatter, response-mask closures included); MLX finalization runs only on
+    the consumer thread. A queue slot is reserved BEFORE staging each batch so
+    read-ahead is exactly the configured depth. Cancellation is cooperative:
+    the stop event is honored between batches, cleanup closes the owned
+    iterator in ``finally``, and a bounded join that times out marks the
+    prefetcher ORPHANED — while the orphan thread lives, reusing the shared
+    preprocessing objects is refused by the trainer.
+    """
+
+    _JOIN_TIMEOUT = 5.0
+    _QUIESCE_TIMEOUT = 30.0
+
+    def __init__(self, make_iterator, depth, skip_batches=0,
+                 finalize=None, include_epoch=False):
+        self._make_iterator = make_iterator
+        self._depth = int(depth)
+        self._skip_batches = int(skip_batches)
+        self._finalize = finalize or _finalize_text_batch
+        self._include_epoch = include_epoch
+        self._slots = threading.BoundedSemaphore(self._depth)
+        self._envelopes = _queue_module.Queue()
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._quiescent = threading.Event()
+        self._ready = threading.Event()
+        self._done = threading.Event()
+        self._thread = None
+        self.orphaned = False
+        self._closed = False
+        self._close_finished = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+
+    # -- producer side ----------------------------------------------------
+    def _run(self):
+        iterator = None
+        try:
+            iterator = self._make_iterator()
+            for _ in range(self._skip_batches):
+                if self._stop.is_set():
+                    return
+                try:
+                    next(iterator)  # resume fast-forward on the producer thread
+                except StopIteration:
+                    if self._stop.is_set():
+                        return  # cooperative stop during skip, not exhaustion
+                    raise RuntimeError(
+                        "Unsloth: streaming dataset exhausted while "
+                        "fast-forwarding to the resume position. Dataset may "
+                        "be shorter than the killed run consumed."
+                    ) from None
+            self._ready.set()
+            while not self._stop.is_set():
+                if self._pause.is_set():
+                    self._quiescent.set()
+                    while self._pause.is_set() and not self._stop.is_set():
+                        time.sleep(0.005)
+                    self._quiescent.clear()
+                    continue
+                if not self._slots.acquire(timeout=0.05):
+                    continue  # queue full: stay responsive to stop/pause
+                try:
+                    staged = next(iterator)
+                except StopIteration:
+                    self._slots.release()
+                    self._envelopes.put((_PREFETCH_END, None))
+                    return
+                except BaseException as exc:  # positioned via FIFO envelope
+                    self._slots.release()
+                    self._envelopes.put((_PREFETCH_ERROR, exc))
+                    return
+                self._envelopes.put((_PREFETCH_ITEM, staged))
+        except BaseException as exc:
+            self._envelopes.put((_PREFETCH_ERROR, exc))
+        finally:
+            self._ready.set()
+            try:
+                if iterator is not None:
+                    try:
+                        _close_mlx_owned_iterator(iterator)
+                    except Exception:
+                        pass
+            finally:
+                # Published only after producer-owned cleanup: quiesce() treats
+                # _done as proof the thread no longer touches shared objects.
+                self._done.set()
+
+    def _ensure_started(self):
+        with self._lifecycle_lock:
+            # One lock covers the closed check and thread publication so a
+            # concurrent close() cannot return "clean" and then observe a
+            # producer started afterwards.
+            if self._closed or self._stop.is_set():
+                raise StopIteration
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="unsloth-mlx-prefetch", daemon=True,
+                )
+                self._thread.start()
+        while not self._ready.wait(timeout=0.1):
+            if self._closed or self._stop.is_set():
+                raise StopIteration
+
+    # -- consumer side ----------------------------------------------------
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._ensure_started()
+        while True:
+            try:
+                kind, payload = self._envelopes.get(timeout=0.5)
+            except _queue_module.Empty:
+                if self._stop.is_set():
+                    raise StopIteration
+                continue
+            break
+        if kind == _PREFETCH_ITEM:
+            self._slots.release()
+            if self._include_epoch:
+                staged, epoch = payload
+                return self._finalize(staged), epoch
+            return self._finalize(payload)
+        if kind == _PREFETCH_END:
+            raise StopIteration
+        raise payload
+
+    # -- lifecycle --------------------------------------------------------
+    def quiesce(self):
+        """RUNNING -> PAUSE_REQUESTED -> QUIESCENT; bounded, actionable."""
+        if self._thread is None or not self._thread.is_alive():
+            return
+        self._pause.set()
+        deadline = time.monotonic() + self._QUIESCE_TIMEOUT
+        while True:
+            if self._quiescent.wait(timeout=0.05):
+                return
+            if self._done.is_set():
+                return  # a terminated producer is trivially quiescent
+            if time.monotonic() >= deadline:
+                self._pause.clear()
+                raise RuntimeError(
+                    "Unsloth MLX: the prefetch producer did not quiesce (it "
+                    "may be blocked inside the tokenizer or source). Use "
+                    "streaming_prefetch_batches=0 for this run."
+                )
+
+    def resume(self):
+        self._pause.clear()
+
+    def close(self):
+        """Terminal and idempotent: only the first call pays the bounded join."""
+        with self._lifecycle_lock:
+            self._stop.set()
+            self._pause.clear()
+            first_close = not self._closed
+            self._closed = True
+            thread = self._thread
+        if not first_close:
+            # Wait for the first closer's join to settle so a concurrent
+            # second close never reports clean while the producer still runs.
+            settled = self._close_finished.wait(timeout=self._JOIN_TIMEOUT + 1.0)
+            if not settled and self._thread is not None and self._thread.is_alive():
+                self.orphaned = True  # conservative: unsettled + alive = orphan
+            return not self.orphan_alive()
+        try:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=self._JOIN_TIMEOUT)
+        finally:
+            # Conservative: classify any still-live thread as orphaned before
+            # publishing settlement, including interrupted joins.
+            if thread is not None and thread.is_alive():
+                self.orphaned = True
+            self._close_finished.set()
+        return not self.orphaned
+
+    def orphan_alive(self):
+        return self.orphaned and self._thread is not None and self._thread.is_alive()
+
+
 def _validate_streaming_length_window(value):
     """Validate streaming_text_length_window_batches before source consumption."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -6087,6 +6293,8 @@ def _iterate_lazy_text_training_batches(
     length_window_batches=1,
     window_seed=0,
     yield_host_staged=False,
+    reject_mlx_valued=False,
+    should_stop=None,
 ):
     """Yield text batches without materializing an unsized source.
 
@@ -6126,7 +6334,7 @@ def _iterate_lazy_text_training_batches(
         tokenizer = prepared_view._tokenizer
     source_dataset = _mlx_lazy_text_source(dataset)
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    state = {}
+    state = {"reject_mlx_valued": True} if reject_mlx_valued else {}
     epoch = 0
     set_epoch = getattr(source_dataset, "set_epoch", None)
 
@@ -6256,7 +6464,7 @@ def _iterate_lazy_text_training_batches(
 
             def _exactly_one_prepared_row_per_source():
                 nonlocal source_rows_seen
-                for item in current_iterator:
+                for item in pass_source:
                     source_rows_seen += 1
                     if source_rows_seen > expected_rows_per_pass:
                         raise ValueError(
@@ -6277,12 +6485,39 @@ def _iterate_lazy_text_training_batches(
                         )
                     yield first
 
+            def _stoppable(source):
+                # Cooperative cancellation lands between SOURCE rows — checked
+                # BEFORE each pull (a stop during row processing must not cost
+                # another blocking read) and after, for stops during next().
+                iterator = iter(source)
+                while True:
+                    if should_stop():
+                        return
+                    try:
+                        source_item = next(iterator)
+                    except StopIteration:
+                        return
+                    if should_stop():
+                        return
+                    yield source_item
+
+            pass_source = (
+                _stoppable(current_iterator)
+                if should_stop is not None else current_iterator
+            )
             row_iterator = (
                 _exactly_one_prepared_row_per_source()
                 if expected_rows_per_pass is not None
-                else _tokenized_rows(current_iterator)
+                else _tokenized_rows(pass_source)
             )
-            for row in row_iterator:
+            rows_pending = iter(row_iterator)
+            while True:
+                if should_stop is not None and should_stop():
+                    return
+                try:
+                    row = next(rows_pending)
+                except StopIteration:
+                    break
                 prepared_rows_seen += 1
                 if (
                     expected_rows_per_pass is not None
@@ -6328,6 +6563,8 @@ def _iterate_lazy_text_training_batches(
                 yield _yield_value(local_items)
                 pending = []
 
+            if should_stop is not None and should_stop():
+                return  # cooperative stop: skip pass-end flush and validation
             if expected_rows_per_pass is not None and (
                 source_rows_seen != expected_rows_per_pass
                 or prepared_rows_seen != expected_rows_per_pass
@@ -6759,7 +6996,10 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              response_mask_fn=None, repeat=True,
                              distributed_pad_mode="cycle",
                              expected_rows_per_pass=None,
-                             length_window_batches=1):
+                             length_window_batches=1,
+                             prefetch_batches=0,
+                             prefetch_skip_batches=0,
+                             prefetch_control=None):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -6798,6 +7038,29 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             length_window_batches=length_window_batches,
             window_seed=seed,
         )
+        prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
+        if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
+            prefetcher = _LazyTextPrefetcher(
+                None,
+                prefetch_depth,
+                skip_batches=prefetch_skip_batches,
+            )
+            prefetcher._make_iterator = (
+                lambda pf=prefetcher: _iterate_lazy_text_training_batches(
+                    dataset, tokenizer, batch_size, max_seq_length,
+                    comm_group=None, distributed_pad_mode=distributed_pad_mode,
+                    yield_host_staged=True, reject_mlx_valued=True,
+                    should_stop=pf._stop.is_set,
+                    **lazy_batch_kwargs,
+                )
+            )
+            if prefetch_control is not None:
+                prefetch_control["prefetcher"] = prefetcher
+            try:
+                yield from prefetcher
+            finally:
+                prefetcher.close()
+            return
         if _distributed_rank_size(comm_group)[1] > 1:
             yield from _iterate_dispatched_lazy_text_training_batches(
                 dataset,
