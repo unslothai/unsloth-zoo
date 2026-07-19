@@ -23,10 +23,10 @@ import inspect
 import os
 import math
 import logging
-import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
+from .log import logger
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
@@ -406,6 +406,7 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -498,7 +499,10 @@ def grpo_compute_loss(
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-
+        # IS-corrected KL as in TRL (use_bias_correction_kl): pre-clamp non-detached
+        # coef_1, applied before the loss_type dispatch; also feeds the mean_kl metric.
+        if use_bias_correction_kl:
+            kl_i = kl_i * coef_1
     else:
         # Zeros with the correct shape.
         if importance_sampling_level == "sequence":
@@ -748,6 +752,69 @@ pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
+def _warn_unsupported_grpo_options(trainer):
+    """Warn once per trainer about TRL GRPOConfig options the optimized GRPO path
+    ignores, so setting them is not silently dropped. UnslothGRPOConfig forwards every
+    field via **kwargs, but the fast path does not implement top_entropy_quantile < 1.0
+    (entropy masking). The TRL default (grpo_config, TRL 1.7.1) is 1.0, so only
+    non-defaults warn. use_bias_correction_kl IS supported (grpo_compute_loss applies
+    kl_i * coef_1), so it must not be listed here.
+    """
+    if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
+        return
+    args = getattr(trainer, "args", None)
+
+    unsupported = []
+    top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
+    if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
+        unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
+
+    if unsupported:
+        message = (
+            "Unsloth: GRPOConfig option(s) " + ", ".join(unsupported) + " are set but "
+            "are not supported by Unsloth's optimized GRPO path and will be ignored "
+            "(training proceeds as standard GRPO)."
+        )
+        try:
+            logger.warning(message)
+        except Exception:
+            import warnings as _warnings
+            _warnings.warn(message)
+    trainer._unsloth_grpo_unsupported_warned = True
+    return
+pass
+RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
+
+
+_n_chunks_deprecation_warned = False
+
+def _warn_deprecated_n_chunks(n_chunks):
+    """Warn once per process when unsloth_num_chunks is set to a non-default value.
+    grpo_accumulated_loss still accepts n_chunks because unsloth's generated GRPO
+    trainer passes unsloth_num_chunks, but loss chunking was removed and the value
+    has no effect.
+    """
+    global _n_chunks_deprecation_warned
+    if _n_chunks_deprecation_warned:
+        return
+    if n_chunks is None or n_chunks == -1 or n_chunks == 1:
+        return
+    _n_chunks_deprecation_warned = True
+    message = (
+        "Unsloth: unsloth_num_chunks is deprecated and has no effect; loss chunking "
+        "was removed since memory is managed by unsloth_grpo_mini_batch and "
+        "unsloth_logit_chunk_multiplier."
+    )
+    try:
+        logger.warning(message)
+    except Exception:
+        import warnings as _warnings
+        _warnings.warn(message)
+    return
+pass
+RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -762,7 +829,12 @@ def grpo_accumulated_loss(
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
-    bsz, qlen = input_ids.shape
+    # Body-local import so the copy inlined into the generated trainer cache resolves.
+    try:
+        from unsloth_zoo.rl_replacements import _warn_unsupported_grpo_options
+        _warn_unsupported_grpo_options(trainer)
+    except Exception:
+        pass
 
     pixel_values = kwargs.get('pixel_values',None)
     image_grid_thw = kwargs.get('image_grid_thw',None)
@@ -800,11 +872,16 @@ def grpo_accumulated_loss(
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    # KL bias correction (TRL 0.27.0+); older TRL lacks the field -> off, the default.
+    kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
-    # Snap n_chunks to the closest divisor of bsz.
-    factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
-    if n_chunks == -1: n_chunks = bsz
-    n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
+    # n_chunks stays in the signature (generated trainers still pass unsloth_num_chunks)
+    # but chunking was removed; body-local import for the inlined trainer-cache copy.
+    try:
+        from unsloth_zoo.rl_replacements import _warn_deprecated_n_chunks
+        _warn_deprecated_n_chunks(n_chunks)
+    except Exception:
+        pass
 
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
