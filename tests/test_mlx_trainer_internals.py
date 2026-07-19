@@ -2504,3 +2504,69 @@ def test_streaming_window_trainer_routing_and_config_copy():
         clone = MLXTrainingConfig(**copied)
         assert clone.streaming_text_length_window_batches == 8
         assert clone._unsloth_mlx_warmup_steps_explicit is False
+
+
+def test_host_staging_seam_parity_and_host_valued_flag():
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (
+        _HostStagedTextBatch, _finalize_text_batch, _stage_tokenized_text_batch,
+    )
+    rows = _window_rows((5, 3, 4, 2))
+
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+    def _direct(**kwargs):
+        return _iterate_lazy_text_training_batches(
+            _CountingTextRows(rows), _streaming_text_tokenizer(), 2, 64,
+            repeat=False, length_window_batches=2, window_seed=3407, **kwargs)
+    staged_stream = _direct(yield_host_staged=True)
+    finalized_stream = _direct()
+    for _ in range(2):
+        staged = next(staged_stream)
+        assert isinstance(staged, _HostStagedTextBatch)
+        assert isinstance(staged.ids, np.ndarray) and staged.host_valued
+        batch, lengths, labels = next(finalized_stream)
+        f_batch, f_lengths, f_labels = _finalize_text_batch(staged)
+        assert f_batch.tolist() == batch.tolist()
+        assert f_lengths.tolist() == lengths.tolist()
+        assert f_labels is None and labels is None
+
+    # MLX-valued rows via the REAL pipeline: origin recorded pre-.tolist().
+    class MxRows:
+        def __iter__(self):
+            return iter([
+                {"input_ids": mx.array([7, 8, 9])},
+                {"input_ids": [1, 2, 3]},
+            ])
+    mx_staged = next(_iterate_lazy_text_training_batches(
+        MxRows(), _streaming_text_tokenizer(), 2, 8,
+        repeat=False, yield_host_staged=True))
+    assert mx_staged.host_valued is False       # flagged for the prefetch producer
+    ids, _lengths, _labels = _finalize_text_batch(mx_staged)
+    assert ids.tolist()[0][:3] == [7, 8, 9]     # sync mode still accepts it
+
+    assert not _stage_tokenized_text_batch(
+        [(mx.array([7, 8]), None), ([1, 2], None)], 8).host_valued
+
+    # Raw-text pipeline end-to-end: an mx-returning tokenizer must surface as a
+    # host_valued=False STAGED batch (the raw stager forwards the stream flag).
+    class MxRawTok(_StreamingTextTokenizer):
+        def encode(self, text, add_special_tokens=True):
+            return mx.array(super().encode(text, add_special_tokens))
+    raw_staged = next(_iterate_lazy_text_training_batches(
+        _CountingTextRows(["5 6 7", "8 9 10"]), MxRawTok(), 2, 8,
+        repeat=False, yield_host_staged=True))
+    assert raw_staged.host_valued is False
+
+    # User chat-template variables named 'state' must keep working.
+    from unsloth_zoo.mlx.utils import _tokenize_mlx_prompt_completion_row
+    seen_kwargs = {}
+    class TemplateTok(_StreamingTextTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            seen_kwargs.update(kwargs)
+            return [10, 11, 12]
+    row = {"prompt": [{"role": "user", "content": "1 2"}],
+           "completion": [{"role": "assistant", "content": "3 4"}],
+           "chat_template_kwargs": {"state": "CA", "_unsloth_state": "USER"}}
+    assert _tokenize_mlx_prompt_completion_row(TemplateTok(), row) is not None
+    assert seen_kwargs.get("state") == "CA" and seen_kwargs.get("_unsloth_state") == "USER"

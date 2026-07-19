@@ -2394,7 +2394,28 @@ def normalize_vlm_processor_chat_template(
     )
 
 
-def encode_mlx_text(tokenizer, text):
+def _contains_mlx_values(value):
+    if isinstance(value, mx.array):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_contains_mlx_values(element) for element in value)
+    return False
+
+
+def _guard_host_token_output(value, state, context):
+    """Record/reject an MLX-valued tokenizer or template output pre-conversion."""
+    if state is not None and _contains_mlx_values(value):
+        if state.get("reject_mlx_valued"):
+            raise ValueError(
+                f"Unsloth MLX: {context} returned an MLX array; the prefetch "
+                "producer must not convert MLX values off the consumer "
+                "thread. Use streaming_prefetch_batches=0."
+            )
+        state["host_valued"] = False
+    return value
+
+
+def encode_mlx_text(tokenizer, text, state=None):
     """Tokenize text while mirroring Unsloth's double-BOS guard."""
     add_special_tokens = True
     bos_token = getattr(tokenizer, "bos_token", None)
@@ -2402,9 +2423,10 @@ def encode_mlx_text(tokenizer, text):
         add_special_tokens = False
 
     try:
-        return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        encoded = tokenizer.encode(text, add_special_tokens=add_special_tokens)
     except TypeError:
-        return tokenizer.encode(text)
+        encoded = tokenizer.encode(text)
+    return _guard_host_token_output(encoded, state, "the tokenizer")
 
 
 def _raise_mlx_chat_template_error(target, *, is_vlm=False):
@@ -2851,10 +2873,11 @@ def _looks_like_mlx_chat_value(value):
     )
 
 
-def _flatten_mlx_chat_template_ids(value):
+def _flatten_mlx_chat_template_ids(value, state=None):
     """Flatten tokenizer chat-template output to a single token-id list."""
     if isinstance(value, Mapping):
         value = value["input_ids"]
+    value = _guard_host_token_output(value, state, "the chat template")
     if hasattr(value, "tolist"):
         value = value.tolist()
     if len(value) > 0 and isinstance(value[0], list):
@@ -2862,10 +2885,11 @@ def _flatten_mlx_chat_template_ids(value):
     return list(value)
 
 
-def _flatten_mlx_chat_template_field(value, field_name):
+def _flatten_mlx_chat_template_field(value, field_name, state=None):
     """Flatten one field from tokenizer chat-template output."""
     if isinstance(value, Mapping):
         value = value[field_name]
+    value = _guard_host_token_output(value, state, "the chat template")
     if hasattr(value, "tolist"):
         value = value.tolist()
     if len(value) > 0 and isinstance(value[0], list):
@@ -2873,20 +2897,22 @@ def _flatten_mlx_chat_template_field(value, field_name):
     return list(value)
 
 
-def _apply_mlx_chat_template_ids(tokenizer, messages, **kwargs):
+def _apply_mlx_chat_template_ids(tokenizer, messages, _unsloth_state=None, /, **kwargs):
     """Tokenize messages through apply_chat_template with a HF-compatible fallback."""
     try:
         return _flatten_mlx_chat_template_ids(
-            tokenizer.apply_chat_template(messages, **kwargs)
+            tokenizer.apply_chat_template(messages, **kwargs),
+            state=_unsloth_state,
         )
     except TypeError:
         kwargs.pop("return_dict", None)
         return _flatten_mlx_chat_template_ids(
-            tokenizer.apply_chat_template(messages, **kwargs)
+            tokenizer.apply_chat_template(messages, **kwargs),
+            state=_unsloth_state,
         )
 
 
-def _apply_mlx_chat_template_dict(tokenizer, messages, **kwargs):
+def _apply_mlx_chat_template_dict(tokenizer, messages, _unsloth_state=None, /, **kwargs):
     """Tokenize messages through apply_chat_template and preserve returned masks."""
     try:
         value = tokenizer.apply_chat_template(messages, **kwargs)
@@ -2896,9 +2922,12 @@ def _apply_mlx_chat_template_dict(tokenizer, messages, **kwargs):
         kwargs.pop("return_assistant_tokens_mask", None)
         kwargs.pop("return_dict", None)
         value = tokenizer.apply_chat_template(messages, **kwargs)
-    if isinstance(value, Mapping):
-        return value
-    return {"input_ids": value}
+    if not isinstance(value, Mapping):
+        value = {"input_ids": value}
+    if _unsloth_state is not None:
+        for field_value in value.values():
+            _guard_host_token_output(field_value, _unsloth_state, "the chat template")
+    return value
 
 
 def _apply_mlx_text_label_masks(input_ids, *, completion_mask=None, assistant_mask=None):
@@ -2982,6 +3011,7 @@ def _tokenize_mlx_conversational_prompt_completion(
     chat_template_kwargs=None,
     assistant_only_loss=False,
     completion_only_loss=None,
+    state=None,
 ):
     """Tokenize conversational prompt/completion rows using TRL's split."""
     prompt_messages = _normalize_mlx_messages(prompt, is_vlm=False)
@@ -2990,6 +3020,7 @@ def _tokenize_mlx_conversational_prompt_completion(
     prompt_ids = _apply_mlx_chat_template_ids(
         tokenizer,
         prompt_messages,
+        state,
         tokenize=True,
         add_generation_prompt=True,
         tools=tools,
@@ -2998,6 +3029,7 @@ def _tokenize_mlx_conversational_prompt_completion(
     prompt_completion_processed = _apply_mlx_chat_template_dict(
         tokenizer,
         prompt_messages + completion_messages,
+        state,
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=bool(assistant_only_loss),
@@ -3005,12 +3037,12 @@ def _tokenize_mlx_conversational_prompt_completion(
         **template_kwargs,
     )
     input_ids = _flatten_mlx_chat_template_field(
-        prompt_completion_processed, "input_ids"
+        prompt_completion_processed, "input_ids", state=state,
     )
     assistant_mask = None
     if "assistant_masks" in prompt_completion_processed:
         assistant_mask = _flatten_mlx_chat_template_field(
-            prompt_completion_processed, "assistant_masks"
+            prompt_completion_processed, "assistant_masks", state=state,
         )
         _validate_mlx_assistant_mask(
             input_ids, assistant_mask, source="conversational"
@@ -3036,10 +3068,11 @@ def _tokenize_mlx_prompt_completion(
     *,
     append_eos=True,
     completion_only_loss=None,
+    state=None,
 ):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
-    prompt_ids = list(encode_mlx_text(tokenizer, prompt))
-    input_ids = list(encode_mlx_text(tokenizer, prompt + completion))
+    prompt_ids = list(encode_mlx_text(tokenizer, prompt, state=state))
+    input_ids = list(encode_mlx_text(tokenizer, prompt + completion, state=state))
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
         prompt_ids,
@@ -3091,6 +3124,7 @@ def _tokenize_mlx_prompt_completion_row(
     append_eos=True,
     completion_only_loss=None,
     assistant_only_loss=False,
+    state=None,
 ):
     """Tokenize one text prompt/completion row, including conversational rows."""
     if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
@@ -3106,6 +3140,7 @@ def _tokenize_mlx_prompt_completion_row(
             chat_template_kwargs=item.get("chat_template_kwargs"),
             assistant_only_loss=assistant_only_loss,
             completion_only_loss=completion_only_loss,
+            state=state,
         )
     pair = _render_mlx_prompt_completion_texts(
         tokenizer,
@@ -3121,10 +3156,11 @@ def _tokenize_mlx_prompt_completion_row(
         pair[1],
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
+        state=state,
     )
 
 
-def _tokenize_mlx_assistant_messages_row(tokenizer, item):
+def _tokenize_mlx_assistant_messages_row(tokenizer, item, state=None):
     """Tokenize one conversational row with chat-template assistant masks."""
     messages = (
         item if _looks_like_mlx_chat_messages(item)
@@ -3142,16 +3178,17 @@ def _tokenize_mlx_assistant_messages_row(tokenizer, item):
     processed = _apply_mlx_chat_template_dict(
         tokenizer,
         messages,
+        state,
         return_dict=True,
         tokenize=True,
         return_assistant_tokens_mask=True,
         tools=item.get("tools") if isinstance(item, Mapping) else None,
         **template_kwargs,
     )
-    input_ids = _flatten_mlx_chat_template_field(processed, "input_ids")
+    input_ids = _flatten_mlx_chat_template_field(processed, "input_ids", state=state)
     assistant_mask = None
     if "assistant_masks" in processed:
-        assistant_mask = _flatten_mlx_chat_template_field(processed, "assistant_masks")
+        assistant_mask = _flatten_mlx_chat_template_field(processed, "assistant_masks", state=state)
         _validate_mlx_assistant_mask(input_ids, assistant_mask, source="text")
     else:
         _validate_mlx_assistant_mask(input_ids, [0] * len(input_ids), source="text")
@@ -3200,8 +3237,23 @@ def _prepare_labeled_text_dataset(
     return formatted
 
 
-def _coerce_mlx_token_list(value, field_name):
-    """Convert one token-id field from a pretokenized row to a Python list."""
+def _coerce_mlx_token_list(value, field_name, state=None):
+    """Convert one token-id field from a pretokenized row to a Python list.
+
+    When ``state`` is provided and the value arrived as an MLX array, the
+    stream is marked ``host_valued=False`` BEFORE conversion — the conversion
+    itself is MLX work, which the prefetch producer must reject rather than
+    perform off the consumer thread.
+    """
+    if state is not None and _contains_mlx_values(value):
+        if state.get("reject_mlx_valued"):
+            raise ValueError(
+                f"Unsloth MLX: pretokenized '{field_name}' is an MLX array; "
+                "the prefetch producer must not convert MLX values off the "
+                "consumer thread. Use streaming_prefetch_batches=0 "
+                "(synchronous mode) for MLX-valued rows."
+            )
+        state["host_valued"] = False
     if hasattr(value, "tolist"):
         value = value.tolist()
     if not isinstance(value, (list, tuple)):
@@ -3250,15 +3302,16 @@ def _tokenize_mlx_pretokenized_row(
     *,
     completion_only_loss=None,
     assistant_only_loss=False,
+    state=None,
 ):
     """Read input_ids plus optional labels/completion_mask from one text row."""
     if not isinstance(item, Mapping) or "input_ids" not in item:
         return None
 
-    input_ids = _coerce_mlx_token_list(item["input_ids"], "input_ids")
+    input_ids = _coerce_mlx_token_list(item["input_ids"], "input_ids", state=state)
     labels = None
     if item.get("labels") is not None:
-        labels = _coerce_mlx_token_list(item["labels"], "labels")
+        labels = _coerce_mlx_token_list(item["labels"], "labels", state=state)
         if len(labels) != len(input_ids):
             raise ValueError(
                 "Unsloth MLX: pretokenized 'labels' must match 'input_ids' length."
@@ -3266,7 +3319,7 @@ def _tokenize_mlx_pretokenized_row(
 
     if completion_only_loss is True and item.get("completion_mask") is not None:
         completion_mask = _coerce_mlx_token_list(
-            item["completion_mask"], "completion_mask"
+            item["completion_mask"], "completion_mask", state=state,
         )
         if len(completion_mask) != len(input_ids):
             raise ValueError(
@@ -3289,7 +3342,7 @@ def _tokenize_mlx_pretokenized_row(
     # Match TRL's collator: pretokenized assistant_masks are labels metadata.
     if assistant_masks is not None:
         assistant_mask = _coerce_mlx_token_list(
-            assistant_masks, "assistant_masks"
+            assistant_masks, "assistant_masks", state=state,
         )
         if len(assistant_mask) != len(input_ids):
             raise ValueError(
@@ -3511,13 +3564,48 @@ def _labeled_row_has_supervision(labels, max_seq_length):
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
-def _create_tokenized_text_batch(
+class _HostStagedTextBatch:
+    """Host-side (python/numpy) text batch awaiting MLX finalization.
+
+    ``host_valued`` is False when any staged field arrived as an MLX array;
+    synchronous mode accepts such rows unchanged, while the prefetch producer
+    must reject them via the FIFO envelope.
+    """
+
+    __slots__ = ("ids", "lengths_info", "labels", "host_valued")
+
+    def __init__(self, ids, lengths_info, labels, host_valued=True):
+        self.ids = ids
+        self.lengths_info = lengths_info
+        self.labels = labels
+        self.host_valued = host_valued
+
+
+def _is_host_valued_field(value):
+    return not _contains_mlx_values(value)
+
+
+def _finalize_text_batch(staged):
+    """The single point where staged text batches become MLX arrays."""
+    labels_array = (
+        mx.array(staged.labels) if staged.labels is not None else None
+    )
+    return mx.array(staged.ids), mx.array(staged.lengths_info), labels_array
+
+
+def _stage_tokenized_text_batch(
     batch_items,
     max_seq_length,
     pad_id=0,
     labels_expected=None,
+    host_valued=None,
 ):
-    """Pad pretokenized ids plus optional labels for one MLX text batch."""
+    """Host staging of one pretokenized text batch (no MLX work).
+
+    ``host_valued=None`` computes the flag from the items; the lazy pipeline
+    passes the stream-level flag recorded at row normalization, where MLX
+    origin is still visible (rows are lists by the time they reach staging).
+    """
     valid_items = [item for item in batch_items if item is not None]
     lengths = [
         0 if item is None else min(len(item[0]), max_seq_length)
@@ -3539,6 +3627,12 @@ def _create_tokenized_text_batch(
             "Unsloth MLX: pretokenized rows with labels/completion_mask must "
             "not be batched with rows that do not provide labels."
         )
+    if host_valued is None:
+        host_valued = all(
+            _is_host_valued_field(item[0])
+            and (item[1] is None or _is_host_valued_field(item[1]))
+            for item in valid_items
+        )
     batch_labels = (
         np.full((len(batch_items), max_length), -100, dtype=np.int64)
         if has_labels else None
@@ -3552,8 +3646,18 @@ def _create_tokenized_text_batch(
         if batch_labels is not None:
             batch_labels[row_idx, :length] = labels[:length]
     lengths_info = [[0, length] for length in lengths]
-    labels_array = mx.array(batch_labels) if batch_labels is not None else None
-    return mx.array(batch_ids), mx.array(lengths_info), labels_array
+    return _HostStagedTextBatch(batch_ids, lengths_info, batch_labels, host_valued)
+
+
+def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0,
+                                 labels_expected=None):
+    """Pad pretokenized ids plus optional labels for one MLX text batch."""
+    # host_valued=True skips the recursive provenance scan: this wrapper
+    # finalizes immediately, so the flag is never consumed.
+    return _finalize_text_batch(_stage_tokenized_text_batch(
+        batch_items, max_seq_length, pad_id=pad_id,
+        labels_expected=labels_expected, host_valued=True,
+    ))
 
 
 def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
@@ -5141,6 +5245,13 @@ def _rank_slice_distributed_batch(
 
 
 def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
+    """Tokenize raw rows and pad to the mlx-lm rule (finalized MLX batch)."""
+    return _finalize_text_batch(
+        _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length)
+    )
+
+
+def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_valued=True):
     """Build a text training batch from tokenized items."""
     valid_items = [item for item in batch_items if item is not None]
     with_offsets = bool(
@@ -5185,10 +5296,11 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
             list(ids)[:truncated_length]
             + [pad_id] * (max_length - truncated_length)
         )
-    return (
-        mx.array(np.asarray(batch_ids, dtype=np.int32)),
-        mx.array(np.asarray(list(zip(offsets, truncated_lengths)), dtype=np.int32)),
+    return _HostStagedTextBatch(
+        np.asarray(batch_ids, dtype=np.int32),
+        np.asarray(list(zip(offsets, truncated_lengths)), dtype=np.int32),
         None,
+        host_valued,
     )
 
 
@@ -5498,7 +5610,7 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
                 yield (ids, 0)
 
 
-def _apply_mlx_response_mask_to_text_row(input_ids, labels, mask_fn):
+def _apply_mlx_response_mask_to_text_row(input_ids, labels, mask_fn, state=None):
     """Apply the CUDA response-marker closure to one tokenized text row."""
     mask_batch = {"input_ids": [list(input_ids)]}
     if labels is not None:
@@ -5506,6 +5618,14 @@ def _apply_mlx_response_mask_to_text_row(input_ids, labels, mask_fn):
         mask_batch["labels"] = np.asarray([labels], dtype=np.int64)
     result = mask_fn(mask_batch)
     masked = result.get("labels") if isinstance(result, Mapping) else None
+    if isinstance(masked, mx.array) and state is not None:
+        if state.get("reject_mlx_valued"):
+            raise ValueError(
+                "Unsloth MLX: the response mask returned an MLX array; the "
+                "prefetch producer must not convert MLX values off the "
+                "consumer thread. Use streaming_prefetch_batches=0."
+            )
+        state["host_valued"] = False
     if hasattr(masked, "tolist"):
         masked = masked.tolist()
     if not isinstance(masked, (list, tuple)) or len(masked) != 1:
@@ -5513,7 +5633,7 @@ def _apply_mlx_response_mask_to_text_row(input_ids, labels, mask_fn):
             "Unsloth MLX: train_on_responses_only masking must return one "
             "labels row for each input_ids row."
         )
-    masked = _coerce_mlx_token_list(masked[0], "labels")
+    masked = _coerce_mlx_token_list(masked[0], "labels", state=state)
     if len(masked) != len(input_ids):
         raise ValueError(
             "Unsloth MLX: train_on_responses_only labels must match "
@@ -5695,6 +5815,7 @@ def _iter_lazy_tokenized_text_rows(
                 row,
                 completion_only_loss=row_completion_only_loss,
                 assistant_only_loss=assistant_only_loss,
+                state=state,
             )
             if tokenized is not None:
                 ids, labels = tokenized
@@ -5714,7 +5835,7 @@ def _iter_lazy_tokenized_text_rows(
                 )
                 if response_mask_fn is not None:
                     ids, labels = _apply_mlx_response_mask_to_text_row(
-                        ids, labels, response_mask_fn,
+                        ids, labels, response_mask_fn, state=state,
                     )
                 usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
@@ -5758,9 +5879,10 @@ def _iter_lazy_tokenized_text_rows(
                     append_eos=append_eos,
                     completion_only_loss=row_completion_only_loss,
                     assistant_only_loss=assistant_only_loss,
+                    state=state,
                 )
                 if labeled is None and assistant_only_loss:
-                    labeled = _tokenize_mlx_assistant_messages_row(tokenizer, row)
+                    labeled = _tokenize_mlx_assistant_messages_row(tokenizer, row, state=state)
             if labeled is not None:
                 ids, labels = labeled
                 if max_seq_length is not None:
@@ -5768,7 +5890,7 @@ def _iter_lazy_tokenized_text_rows(
                     labels = labels[:max_seq_length]
                 if response_mask_fn is not None:
                     ids, labels = _apply_mlx_response_mask_to_text_row(
-                        ids, labels, response_mask_fn,
+                        ids, labels, response_mask_fn, state=state,
                     )
                 usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
@@ -5829,7 +5951,7 @@ def _iter_lazy_tokenized_text_rows(
                 )
                 continue
             for text in texts:
-                ids = list(encode_mlx_text(tokenizer, text))
+                ids = list(encode_mlx_text(tokenizer, text, state=state))
                 if eos_id is not None and (not ids or ids[-1] != eos_id):
                     ids.append(int(eos_id))
                 if max_seq_length is not None:
@@ -5838,7 +5960,7 @@ def _iter_lazy_tokenized_text_rows(
                 labels = None
                 if response_mask_fn is not None:
                     ids, labels = _apply_mlx_response_mask_to_text_row(
-                        ids, None, response_mask_fn,
+                        ids, None, response_mask_fn, state=state,
                     )
                 usable = len(ids) >= 2 and _labeled_row_has_supervision(
                     labels, len(ids)
@@ -5964,6 +6086,7 @@ def _iterate_lazy_text_training_batches(
     include_epoch=False,
     length_window_batches=1,
     window_seed=0,
+    yield_host_staged=False,
 ):
     """Yield text batches without materializing an unsized source.
 
@@ -6037,23 +6160,26 @@ def _iterate_lazy_text_training_batches(
 
         def _make_batch(local_items):
             if state.get("schema") == "raw" and state.get("label_state") is False:
-                return _make_text_batch_from_items(
+                return _stage_text_batch_from_items(
                     [
                         None if item is None else item[0]
                         for item in local_items
                     ],
                     tokenizer,
                     max_seq_length,
+                    host_valued=state.get("host_valued", True),
                 )
-            return _create_tokenized_text_batch(
+            return _stage_tokenized_text_batch(
                 local_items,
                 max_seq_length,
                 pad_id=_mlx_text_pad_id(tokenizer),
                 labels_expected=state.get("label_state"),
+                host_valued=state.get("host_valued", True),
             )
 
         def _yield_value(local_items):
-            batch = _make_batch(local_items)
+            staged = _make_batch(local_items)
+            batch = staged if yield_host_staged else _finalize_text_batch(staged)
             return (batch, epoch) if include_epoch else batch
 
         while True:
