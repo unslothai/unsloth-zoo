@@ -4088,7 +4088,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     _n_epochs_materialize = (
         max(1, int(num_epochs)) if num_epochs is not None else 1
     )
-    from .utils import _normalize_seed
+    from .utils import _finite_text_pad_width, _normalize_seed
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
     # these plans carry explicitly materialized epoch blocks.
@@ -4116,8 +4116,11 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                 default=2,
             )
             # +1 for autoregressive shift (mlx-lm iterate_batches parity).
-            padded_len = 1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE
-            padded_len = min(padded_len, max_seq_length)
+            padded_len = _finite_text_pad_width(
+                max_len,
+                pad_to_multiple=_PAD_MULTIPLE,
+                max_seq_length=max_seq_length,
+            )
             epoch_schedule.append((tuple(batch_indices), padded_len))
 
         # 4. Legacy length-sort: shuffle batches so adjacent steps differ.

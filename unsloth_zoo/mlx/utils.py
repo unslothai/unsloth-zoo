@@ -3380,6 +3380,25 @@ class _FiniteTextRow:
     labels: tuple | None = None
 
 
+def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
+                           max_seq_length):
+    """Shared finite text pad-width policy.
+
+    Order of operations is observable and fixed: optional
+    ``1 + pad_to_multiple * ceil(raw_width / pad_to_multiple)`` round-up
+    (identity when the multiple is zero), then minimum width, then the
+    ``max_seq_length`` cap.
+    """
+    width = int(raw_width)
+    if pad_to_multiple:
+        width = 1 + pad_to_multiple * (
+            (width + pad_to_multiple - 1) // pad_to_multiple
+        )
+    if width < minimum_width:
+        width = minimum_width
+    return min(int(max_seq_length), width)
+
+
 class FiniteTextBatchPlan:
     """CPU-backed finite text schedule with on-demand MLX materialization."""
 
@@ -3512,12 +3531,12 @@ class FiniteTextBatchPlan:
         ]
         if self._widths is not None:
             return self._widths[int(index)]
-        width = max(lengths, default=0)
-        if self.pad_to_multiple:
-            width = 1 + self.pad_to_multiple * (
-                (width + self.pad_to_multiple - 1) // self.pad_to_multiple
-            )
-        return min(self.max_seq_length, max(self.minimum_width, width))
+        return _finite_text_pad_width(
+            max(lengths, default=0),
+            pad_to_multiple=self.pad_to_multiple,
+            minimum_width=self.minimum_width,
+            max_seq_length=self.max_seq_length,
+        )
 
     def batch_family(self, index):
         batch_indices = self._schedule[index]
@@ -5196,9 +5215,12 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    pad_to = 32
-    max_length = max(2, 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to))
-    max_length = min(max_length, max_seq_length)
+    max_length = _finite_text_pad_width(
+        max(lengths),
+        pad_to_multiple=32,
+        minimum_width=2,
+        max_seq_length=max_seq_length,
+    )
     batch_ids = []
     truncated_lengths = []
     for ids, length in zip(batch, lengths):
