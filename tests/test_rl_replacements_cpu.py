@@ -25,6 +25,7 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -210,3 +211,152 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     }
     missing = expected - set(rr.RL_REPLACEMENTS.keys())
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# Unsloth_Offloaded_Log_Softmax backward returns LOCAL input gradients
+# ---------------------------------------------------------------------------
+# backward must return LOCAL grads via autograd.grad; backward + leaf .grad
+# double-counts through the outer AccumulateGrad when lm_head is trainable.
+
+
+def test_offloaded_log_softmax_uses_autograd_grad_not_backward():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert "class Unsloth_Offloaded_Log_Softmax" in src
+    assert "torch.autograd.grad(" in src
+    assert "torch.autograd.backward(output, grad_output)" not in src
+    assert "lm_head.grad if ctx.lm_head_requires_grad else None" not in src
+
+
+def _recompute_fn(use_backward):
+    # Recompute-in-backward mirror; use_backward=True is the buggy variant, False the fix.
+    class _Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, W):
+            ctx.x = x.detach()
+            ctx.W = W
+            ctx.W_rg = W.requires_grad
+            with torch.no_grad():
+                return x @ W
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x = ctx.x.clone().requires_grad_(True)
+            W = ctx.W
+            with torch.enable_grad():
+                out = x @ W
+            if use_backward:
+                torch.autograd.backward(out, grad_output)
+                return x.grad, (W.grad if ctx.W_rg else None)
+            grads = torch.autograd.grad(out, (x, W) if ctx.W_rg else (x,), grad_output)
+            return grads[0], (grads[1] if ctx.W_rg else None)
+
+    return _Fn
+
+
+def _weight_grad(op, shared, preexisting):
+    torch.manual_seed(0)
+    x1 = torch.randn(6, 8)
+    x2 = torch.randn(6, 8)
+    W = torch.randn(8, 10, requires_grad=True)
+    g1 = torch.randn(6, 10)
+    g2 = torch.randn(6, 10)
+    W.grad = torch.randn(8, 10) if preexisting else None
+    torch.autograd.backward(op(x1, W), g1, retain_graph=True)
+    if shared:
+        torch.autograd.backward(op(x2, W), g2)
+    return W.grad.clone()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting):
+    ref = _weight_grad(lambda x, W: x @ W, shared, preexisting)
+    fixed = _recompute_fn(use_backward=False)
+    assert torch.allclose(_weight_grad(fixed.apply, shared, preexisting), ref, atol=1e-6)
+    # Buggy variant must diverge, or this test proves nothing.
+    buggy = _recompute_fn(use_backward=True)
+    assert not torch.allclose(_weight_grad(buggy.apply, shared, preexisting), ref, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Unsloth_Offloaded_Log_Softmax offload paths (pinned / keep-on-GPU / CPU)
+# ---------------------------------------------------------------------------
+# Pins CPU-fallback numerics and CUDA-path source invariants; backward's event
+# wait is load-bearing (pinned non_blocking copy races without it).
+
+
+def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
+                                 logit_scale_multiply, logit_scale_divide,
+                                 logit_softcapping, temperature):
+    # Eager mirror of chunked_hidden_states_selective_log_softmax (no compile).
+    logits = hidden_states.reshape(-1, hidden_states.shape[-1]).to(lm_head.dtype) @ lm_head.t()
+    if logit_scale_multiply != 0.0:
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide != 0.0:
+        logits = logits / logit_scale_divide
+    if logit_softcapping != 0.0:
+        logits = logit_softcapping * torch.tanh(logits / logit_softcapping)
+    logits = logits.to(torch.float32)
+    if temperature != 1.0:
+        logits = logits / temperature
+    flat_index = index.reshape(-1)
+    selected = torch.gather(logits, dim=-1, index=flat_index.unsqueeze(-1)).squeeze(-1)
+    out = selected - torch.logsumexp(logits, dim=-1)
+    return out.reshape(index.shape)
+
+
+def _extract_offloaded_log_softmax(inner_fn):
+    # Exec the real Unsloth_Offloaded_Log_Softmax block against `inner_fn`.
+    import textwrap
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    block = textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
+    ns = {"torch": torch, "chunked_hidden_states_selective_log_softmax": inner_fn}
+    exec(block, ns)
+    return ns["Unsloth_Offloaded_Log_Softmax"]
+
+
+@pytest.mark.parametrize("lm_requires_grad", [False, True])
+def test_offloaded_log_softmax_cpu_path_grads_bitwise_exact(lm_requires_grad):
+    Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
+    args = (4, 1.5, 2.0, 20.0, 0.8)
+
+    def run(op):
+        torch.manual_seed(0)
+        hs = (torch.randn(3, 32, 16) * 0.02).requires_grad_(True)
+        lm = (torch.randn(64, 16) * 0.02).requires_grad_(lm_requires_grad)
+        idx = torch.randint(0, 64, (3, 32))
+        go = torch.randn(3, 32)
+        out = op(hs, lm, idx, *args)
+        out.backward(go)
+        return out.detach(), hs.grad, (lm.grad if lm_requires_grad else None)
+
+    out_ref, hs_ref, lm_ref = run(_eager_selective_log_softmax)
+    out_fn, hs_fn, lm_fn = run(Fn.apply)
+    assert torch.equal(out_fn, out_ref)
+    assert torch.equal(hs_fn, hs_ref)
+    if lm_requires_grad:
+        assert torch.equal(lm_fn, lm_ref)
+
+
+def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    fwd = src[src.index("class Unsloth_Offloaded_Log_Softmax"):src.index("def efficient_log_softmax")]
+    # Pinned D2H must record an event, keep the source alive, and backward must wait on it.
+    assert "pin_memory = True" in fwd
+    assert "copy_event.record(copy_stream)" in fwd
+    assert "record_stream(copy_stream)" in fwd
+    assert "ctx.copy_event.wait(" in fwd
+    # CUDA machinery stays behind is_cuda; CPU-only platforms take the pageable path.
+    assert "is_cuda" in fwd
+    assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
+
+
+def test_offloaded_log_softmax_keep_on_gpu_budget_is_cumulative():
+    # The padded GRPO loop runs N forwards before any backward; a per-chunk
+    # 4x-free check alone compounds retained chunks toward all free memory.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    block = src[src.index("    def to_device"):src.index("    def efficient_log_softmax")]
+    assert "offload_retained_bytes = [0]" in block
+    assert "4 * (tensor_bytes + offload_retained_bytes[0]) <= free_bytes" in block
+    assert "offload_retained_bytes[0] += tensor_bytes" in block
