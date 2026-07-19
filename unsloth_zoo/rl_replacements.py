@@ -85,10 +85,19 @@ def chunked_hidden_states_selective_log_softmax(
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
 
+    # If UNSLOTH_RETURN_HIDDEN_STATES could not be honored (e.g. a full finetuning forward that
+    # returns logits), the incoming tensor is already logits, not hidden states. Detect that
+    # (last dim == vocab) and skip the lm_head projection; logits are exactly
+    # hidden_states @ lm_head.t(), so using them directly is equivalent. No-op for hidden states.
+    already_logits = hidden_states.shape[-1] == lm_head.shape[0]
+
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        if already_logits:
+            chunk_logits = chunk_hidden_states
+        else:
+            chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
