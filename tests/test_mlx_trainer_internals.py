@@ -499,13 +499,12 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
 def test_global_norm_clip_reduces_in_float32():
     import inspect
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32
+    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
 
-    source = inspect.getsource(_clip_grad_norm_fp32)
-
-    assert "g.astype(mx.float32)" in source
-    assert "scale.astype(g.dtype)" in source
-    assert "tree_reduce" in source
+    norm_source = inspect.getsource(_global_grad_norm_fp32)
+    assert "g.astype(mx.float32)" in norm_source
+    assert "tree_reduce" in norm_source
+    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
 
 
 @pytest.mark.parametrize(

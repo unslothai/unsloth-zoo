@@ -392,8 +392,8 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [
         str(launcher), "-n", "2", "--backend", "ring",
-        "--python", sys.executable, "--cwd", str(repo_root),
-        str(script), str(tmp_path),
+        "--cwd", str(repo_root),
+        "--", sys.executable, str(script), str(tmp_path),
     ]
     proc = subprocess.run(
         cmd, capture_output=True, env=env, text=True, timeout=120,
