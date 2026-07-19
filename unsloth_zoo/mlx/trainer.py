@@ -308,6 +308,7 @@ from .utils import (
     create_batches,
     create_ordered_batches,
     iterate_training_batches,
+    _validate_streaming_length_window,
     _is_mlx_lazy_text_source,
     _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
@@ -669,6 +670,15 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
               f"(save_total_limit={save_total_limit})")
 
 
+# Fields added after the original public MLXTrainingConfig surface. They must
+# stay a suffix of the declaration order (append new ones at the end and list
+# them here) so positional copies from older configs keep mapping correctly.
+_MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
+    "max_eval_batches",
+    "streaming_text_length_window_batches",
+)
+
+
 @dataclass
 class MLXTrainingConfig:
     """Training configuration mirroring SFTConfig / TrainingArguments field names."""
@@ -759,6 +769,11 @@ class MLXTrainingConfig:
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
     max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
+    # Lazy default-order text streams: pool this many global micro-batches,
+    # length-sort, emit seeded-permuted batches. 1 = exact source order (prior
+    # behavior). Memory scales with world size; the DDP owner also retains one
+    # pass-long cycle-padding batch (documented bound W + 1).
+    streaming_text_length_window_batches: int = 8
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -796,13 +811,12 @@ class MLXTrainingConfig:
 
         warmup_steps_default = type(self).warmup_steps
         warmup_ratio_default = type(self).warmup_ratio
-        copied_all_fields = len(provided) == len(config_fields) or (
-            "max_eval_batches" not in provided
-            and all(
-                field.name in provided
-                for field in config_fields
-                if field.name != "max_eval_batches"
-            )
+        # A config copied field-by-field from an older Unsloth may omit fields
+        # added later; treat such copies as full copies for warmup semantics.
+        copied_all_fields = all(
+            field.name in provided
+            or field.name in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+            for field in config_fields
         )
         copied_default_warmup_with_ratio = (
             copied_all_fields
@@ -3685,6 +3699,11 @@ class MLXTrainer:
                     comm_group=comm_group,
                     require_replayable=require_replayable,
                     expected_rows_per_pass=expected_rows_per_pass,
+                    length_window_batches=_validate_streaming_length_window(
+                        getattr(
+                            args, "streaming_text_length_window_batches", 8,
+                        )
+                    ),
                 )
             else:
                 batch_kwargs = dict(

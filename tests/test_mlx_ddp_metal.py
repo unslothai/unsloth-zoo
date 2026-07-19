@@ -453,6 +453,7 @@ payload = {
     "vlm": [[int(row[0]) for row in batch["input_ids"].tolist()] for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 15)], TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world)],
     "vlm_empty_eval": [{"ids": batch["input_ids"].tolist(), "mask": batch["attention_mask"].tolist(), "labels": batch["labels"].tolist()} for batch in create_vlm_batches([{"text": str(i)} for i in range(10, 13)], TinyProcessor(), {"image_token_id": 20}, batch_size=1, max_seq_length=8, dataset_order="sequential", comm_group=world, distributed_pad_mode="empty")],
     "stream_vlm": take_stream_rows(iterate_vlm_training_batches(ReplayableVLMStream(), TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world), 2),
+    "stream_window": take_stream_rows(iterate_training_batches(ReplayableStream(), TinyTokenizer(), batch_size=1, max_seq_length=8, dataset_order="default", comm_group=world, repeat=False, length_window_batches=2), 3),
 }
 Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
 """,
@@ -578,3 +579,9 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["stream_labeled_empty"][1]["lengths"][0] == [0, 0]
     assert ranks[1]["stream_labeled_empty"][1]["labels"][0] == [-100, -100]
     assert [rank["stream_vlm"] for rank in ranks] == expected_stream
+    # W=2 owner-side window: rows 10..14 (equal length) pool into chunks
+    # [10,11],[12,13]; seed-42 permutation emits [12,13] first, so the pass-tail
+    # partial [14] cycle-pads from that first dispatched batch.
+    assert [rank["stream_window"] for rank in ranks] == [
+        [[12], [10], [14]], [[13], [11], [12]],
+    ]

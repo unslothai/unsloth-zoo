@@ -5700,6 +5700,35 @@ def _close_mlx_owned_iterator(iterator):
         close()
 
 
+def _validate_streaming_length_window(value):
+    """Validate streaming_text_length_window_batches before source consumption."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "Unsloth MLX: streaming_text_length_window_batches must be an "
+            f"integer >= 1 (got {value!r})."
+        )
+    if value < 1:
+        raise ValueError(
+            "Unsloth MLX: streaming_text_length_window_batches must be >= 1 "
+            f"(got {value})."
+        )
+    return value
+
+
+def _lazy_window_sort_key(item, max_seq_length):
+    """Window grouping key: exact truncated prepared-token length (lazy rows
+    carry ``(input_ids, labels)`` for every schema)."""
+    if item is None:
+        return 0
+    return min(len(item[0]), max_seq_length)
+
+
+def _window_batch_permutation(seed, epoch, window_ordinal, count):
+    """Deterministic batch-order permutation for one flushed window."""
+    mix = (int(seed) * 1_000_003 + int(epoch) * 9_973 + int(window_ordinal)) % (2 ** 32)
+    return np.random.RandomState(mix).permutation(count)
+
+
 def _iterate_lazy_text_training_batches(
     dataset,
     tokenizer,
@@ -5719,8 +5748,16 @@ def _iterate_lazy_text_training_batches(
     distributed_pad_mode="cycle",
     expected_rows_per_pass=None,
     include_epoch=False,
+    length_window_batches=1,
+    window_seed=0,
 ):
-    """Yield source-ordered text batches without materializing an unsized source.
+    """Yield text batches without materializing an unsized source.
+
+    ``sequential`` order and ``length_window_batches=1`` emit exact source
+    order. Default order with a window > 1 pools that many global micro-batches
+    of trainable rows, stable-sorts them by truncated prepared-token length,
+    and emits the full chunks in a seeded deterministic permutation (partial
+    chunk last) — a documented, deterministic reordering.
 
     Custom replayable sources must return independent fresh traversals from
     ``iter(source)``. Resume validation may create one non-consuming iterator
@@ -5734,6 +5771,16 @@ def _iterate_lazy_text_training_batches(
         )
     if dataset_order not in (None, "default", "sequential"):
         raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+
+    length_window = _validate_streaming_length_window(length_window_batches)
+    if dataset_order == "sequential":
+        # Sequential contract: exact source order, length grouping off.
+        length_window = 1
+    window_seed = _normalize_seed(window_seed)
+    # Cycle padding only feeds direct multi-rank slicing; the single-process
+    # path and the rank-0 owner iterator (comm_group=None, outer cycle_source)
+    # must not retain a pass-long first batch on top of the window bound.
+    needs_padding_source = _distributed_rank_size(comm_group)[1] > 1
 
     prepared_view = (
         dataset if isinstance(dataset, _MLXIterableTokenizedDatasetView) else None
@@ -5821,6 +5868,52 @@ def _iterate_lazy_text_training_batches(
             yielded = False
             source_rows_seen = 0
             prepared_rows_seen = 0
+            window_rows = []
+            window_ordinal = 0
+
+            def _flush_window():
+                # Emit pooled rows as length-grouped global batches: stable sort
+                # by truncated length with arrival tiebreak, chunk, then a seeded
+                # permutation of the FULL chunks only — a trailing partial chunk
+                # always emits last so mid-stream batches keep uniform row counts.
+                nonlocal window_rows, window_ordinal, yielded
+                if not window_rows:
+                    return
+                order = sorted(
+                    range(len(window_rows)),
+                    key=lambda i: (
+                        _lazy_window_sort_key(window_rows[i], max_seq_length),
+                        i,
+                    ),
+                )
+                chunks = [
+                    [window_rows[i] for i in order[start:start + global_batch_size]]
+                    for start in range(0, len(order), global_batch_size)
+                ]
+                full = len(chunks)
+                if chunks and len(chunks[-1]) < global_batch_size:
+                    full -= 1
+                emit = list(_window_batch_permutation(
+                    window_seed, epoch, window_ordinal, full,
+                )) + list(range(full, len(chunks)))
+                window_ordinal += 1
+                window_rows = []
+                for chunk_index in emit:
+                    # Release each chunk as it is emitted so flush-time retention
+                    # stays within the W-batch window bound.
+                    chunk = chunks[chunk_index]
+                    chunks[chunk_index] = None
+                    local_items = _rank_slice_distributed_batch(
+                        chunk,
+                        batch_size,
+                        comm_group=comm_group,
+                        pad_source=padding_source,
+                        pad_mode=distributed_pad_mode,
+                    )
+                    chunk = None
+                    yielded = True
+                    yield _yield_value(local_items)
+                    local_items = None
 
             def _tokenized_rows(source):
                 if prepared_view is not None:
@@ -5882,10 +5975,19 @@ def _iterate_lazy_text_training_batches(
                         "trainable text row per declared source row. Use "
                         "max_steps when rows expand or are filtered."
                     )
-                if len(padding_source) < global_batch_size:
+                if needs_padding_source and len(padding_source) < global_batch_size:
                     padding_source.append(row)
                 pending.append(row)
                 if len(pending) < global_batch_size:
+                    continue
+                if length_window > 1:
+                    window_rows.extend(pending)
+                    pending = []
+                    if len(window_rows) >= length_window * global_batch_size and (
+                        expected_rows_per_pass is None
+                        or prepared_rows_seen < expected_rows_per_pass
+                    ):
+                        yield from _flush_window()
                     continue
                 if (
                     expected_rows_per_pass is not None
@@ -5914,6 +6016,11 @@ def _iterate_lazy_text_training_batches(
                     "does not match one trainable row per source row. Use "
                     "max_steps for filtered or expanding streams."
                 )
+
+            if length_window > 1:
+                window_rows.extend(pending)
+                pending = []
+                yield from _flush_window()
 
             if deferred_final is not None:
                 local_items = _rank_slice_distributed_batch(
@@ -6130,6 +6237,9 @@ def _iterate_dispatched_lazy_text_training_batches(
             width = 0
             has_labels = 0
             status = 0
+            # Drop the previous fetch's tensors before the owner pulls the next
+            # batch so dispatch never holds two batches alongside the window.
+            owner_batch = input_ids = lengths = labels = None
             if rank == 0:
                 try:
                     if owner_contract_error is not None:
@@ -6327,12 +6437,16 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              comm_group=None, require_replayable=False,
                              response_mask_fn=None, repeat=True,
                              distributed_pad_mode="cycle",
-                             expected_rows_per_pass=None):
+                             expected_rows_per_pass=None,
+                             length_window_batches=1):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
-    text sources are normalized and tokenized incrementally in source order,
-    with only one distributed micro-batch retained at a time.
+    text sources are normalized and tokenized incrementally, retaining at most
+    ``length_window_batches`` global micro-batches of prepared rows (plus the
+    rank-0 owner's pass-long cycle-padding batch under DDP). Default order with
+    a window > 1 emits length-grouped, seeded-permuted batches; ``sequential``
+    and window 1 preserve exact source order.
 
     Yields:
         (batch, lengths, labels) tuples — same format as create_batches.
@@ -6360,6 +6474,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             require_replayable=require_replayable,
             repeat=repeat,
             expected_rows_per_pass=expected_rows_per_pass,
+            length_window_batches=length_window_batches,
+            window_seed=seed,
         )
         if _distributed_rank_size(comm_group)[1] > 1:
             yield from _iterate_dispatched_lazy_text_training_batches(
