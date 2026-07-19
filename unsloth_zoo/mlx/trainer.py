@@ -2441,17 +2441,6 @@ class MLXTrainer:
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = compile_policy.mode != "eager"
         _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
-        if (
-            _use_compile
-            and not _ddp_compile_local_grad
-            and max_grad_norm > 0
-            and grad_accum > 1
-        ):
-            _main_print(
-                "Unsloth: mx.compile disabled because MLX global norm "
-                "clipping is enabled with gradient accumulation."
-            )
-            _use_compile = False
         if is_vlm and _use_compile:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:

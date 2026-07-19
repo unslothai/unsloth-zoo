@@ -232,3 +232,63 @@ def test_reporting_flag_never_changes_update_numerics(tmp_path):
         assert off_snap[key][0] == on_snap[key][0], key
         assert np.array_equal(off_snap[key][1], on_snap[key][1]), key
     assert on_t._grad_norm_history and not off_t._grad_norm_history
+
+
+# ---- Compiled global-norm clipping with gradient accumulation ----
+
+@metal_only
+def test_compiled_clip_accum_matches_eager_bitwise(tmp_path, capsys):
+    import numpy as np
+
+    runs = {
+        c: _norm_train(tmp_path / str(c), "global", compiled=c, accum=3,
+                       max_steps=2, dtype=mx.bfloat16, batches=_norm_batches(6))
+        for c in (False, True)
+    }
+    assert "mx.compile disabled because MLX global norm" not in capsys.readouterr().out
+    (eager_t, _r, _cb, eager_snap), (comp_t, comp_res, _cb2, comp_snap) = runs[False], runs[True]
+    assert comp_res["compile_enabled"] is True
+    assert comp_res["compile_scope"] == "full_step"
+    assert eager_t._train_loss_history == comp_t._train_loss_history
+    assert eager_t._grad_norm_history == comp_t._grad_norm_history
+    for key in eager_snap:
+        assert eager_snap[key][0] == comp_snap[key][0], key
+        assert np.array_equal(eager_snap[key][1], comp_snap[key][1]), key
+
+
+
+@metal_only
+def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch, capsys):
+    import functools
+
+    real_eval, real_compile = mx.eval, mx.compile
+    state = {"armed": False, "raised": False, "step_ran": False}
+
+    def failing_eval(*a, **k):
+        if state["armed"] and not state["raised"]:
+            state["raised"] = True
+            raise RuntimeError("injected compile evaluation failure")
+        return real_eval(*a, **k)
+
+    def arming_compile(fn, *ca, **ck):
+        compiled = real_compile(fn, *ca, **ck)
+
+        @functools.wraps(fn)
+        def wrapper(*fa, **fk):
+            # Arm AFTER the compiled step returns so the next mx.eval is the
+            # unified post-call boundary; a regression moving that eval inside
+            # the fallback try would retry eagerly and fail this test.
+            result = compiled(*fa, **fk)
+            state["step_ran"] = True
+            state["armed"] = True
+            return result
+        return wrapper
+
+    monkeypatch.setattr(mx, "eval", failing_eval)
+    monkeypatch.setattr(mx, "compile", arming_compile)
+    with pytest.raises(RuntimeError, match="injected compile evaluation failure"):
+        _norm_train(tmp_path, "global", compiled=True, accum=2,
+                    batches=_norm_batches(2),
+                    overrides={"compile_mode": "best_effort"})
+    assert state["step_ran"] and state["raised"]
+    assert "falling back to eager" not in capsys.readouterr().out
