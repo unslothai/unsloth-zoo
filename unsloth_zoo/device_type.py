@@ -14,6 +14,8 @@
 
 __all__ = [
     "is_hip",
+    "get_amd_attention_implementation",
+    "get_amd_flash_attn_func",
     "get_device_type",
     "DEVICE_TYPE",
     "DEVICE_TYPE_TORCH",
@@ -212,6 +214,59 @@ def is_hip():
         return False
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 pass
+
+@functools.cache
+def get_amd_attention_implementation():
+    """
+    Return the best available attention implementation for AMD ROCm.
+
+    Priority order:
+    1. amd-aiter FlashAttention (pip install amd-aiter, requires ROCm >= 7.0)
+       - Full MFMA on both QK^T and P@V gemms
+       - ~5-9x faster than PyTorch SDPA for prefill (benchmark: 51.5 TFLOPS vs 8.7 TFLOPS)
+       - Causal tile skip: ~50% of KV iterations skipped for long-sequence causal prefill
+       - Install: pip install amd-aiter  (https://github.com/ROCm/aiter)
+    2. PyTorch SDPA (always available on ROCm)
+       - Uses MIOpen FlashAttention kernel
+       - ~37% faster than eager for inference; -28% VRAM in training
+    3. eager (fallback)
+
+    Returns:
+        str: "amd_aiter" | "sdpa" | "eager"
+    """
+    if not is_hip():
+        return "sdpa"  # Not AMD — caller should use their own logic
+
+    # Check for amd-aiter (ROCm >= 7.0 required)
+    try:
+        import importlib
+        aiter_spec = importlib.util.find_spec("aiter")
+        if aiter_spec is not None:
+            # Verify it's the AMD AI tensor engine, not the async iterator library
+            import aiter as _aiter
+            if hasattr(_aiter, "flash_attn_func") or hasattr(_aiter, "FlashAttnFunc"):
+                return "amd_aiter"
+    except Exception:
+        pass
+
+    return "sdpa"
+
+
+@functools.cache
+def get_amd_flash_attn_func():
+    """
+    Return the AMD aiter flash_attn_func if available, else None.
+    When available, call as: flash_attn_func(q, k, v, causal=True)
+    q/k/v shape: (batch, seqlen, nheads, headdim), dtype=float16 or bfloat16
+    """
+    if get_amd_attention_implementation() != "amd_aiter":
+        return None
+    try:
+        from aiter import flash_attn_func
+        return flash_attn_func
+    except ImportError:
+        return None
+
 
 @functools.cache
 def get_device_type():

@@ -3416,7 +3416,13 @@ def _test_get_vllm_state_dict(
         model_name,
         device_map          = "sequential",
         # torch_dtype         = dtype,  transformers moved torch_dtype to dtype
-        attn_implementation = "sdpa",
+        attn_implementation = (
+            # AMD ROCm: use amd-aiter Flash Attention when available (requires ROCm >= 7.0)
+            # Provides ~5-9x speedup over SDPA for prefill via full MFMA + causal tile skip
+            # Falls back to SDPA when amd-aiter is not installed (e.g. ROCm < 7.0)
+            "flash_attention_2" if get_amd_attention_implementation() == "amd_aiter"
+            else "sdpa"
+        ),
         low_cpu_mem_usage   = True,
         **kwargs,
     )
