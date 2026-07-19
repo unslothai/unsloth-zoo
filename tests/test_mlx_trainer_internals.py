@@ -2676,3 +2676,43 @@ def test_quantized_linear_forward():
     # x @ W.T  with W = [[0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7]] = [28, 28]
     out = layer(x)
     torch.testing.assert_close(out, torch.tensor([[28.0, 28.0]]))
+
+
+def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
+    # Golden pure epoch permutations; guard raw catalog equals resolved visits.
+    import numpy as np
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.shape_guard import phase_for_microstep
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    np.random.seed(999)  # ambient state must not influence visits
+    rows = tuple(
+        _FiniteTextRow(tuple(range(1, w + 1)), 1, tuple(range(1, w + 1)))
+        for w in (10, 11, 30, 50)
+    )
+    plan = FiniteTextBatchPlan(
+        rows, tuple((i,) for i in range(4)), max_seq_length=64, pad_id=99,
+        visit_policy="epoch_permute", visit_seed=1,
+    )
+    assert [plan.batch_index_for_visit(v) for v in range(12)] == [
+        0, 1, 2, 3, 2, 3, 1, 0, 3, 1, 0, 2,
+    ]
+    args = MLXTrainingConfig(max_steps=4, gradient_accumulation_steps=2)
+    shape_plan, report, _ok, _ = _plan_single_process_text_shapes(
+        plan, None, args=args, total_steps=4, is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+    assert shape_plan.raw_catalog == frozenset(
+        (
+            report.compile_scope,
+            phase_for_microstep(report.compile_scope, 2, m),
+            plan.batch_family(plan.batch_index_for_visit(m)),
+            plan.batch_width(plan.batch_index_for_visit(m)),
+        )
+        for m in range(8)
+    )

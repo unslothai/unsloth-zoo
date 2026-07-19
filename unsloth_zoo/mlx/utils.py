@@ -29,6 +29,7 @@ import copy
 import inspect
 import importlib
 import json
+import operator
 import numpy as np
 import os
 import sys
@@ -3392,7 +3393,12 @@ class FiniteTextBatchPlan:
         "pad_to_multiple",
         "label_dtype",
         "_shape_plan",
+        "_visit_policy",
+        "_visit_seed",
+        "_visit_epoch_cache",
     )
+
+    _VISIT_POLICIES = ("identity", "epoch_permute")
 
     def __init__(
         self,
@@ -3405,6 +3411,8 @@ class FiniteTextBatchPlan:
         pad_to_multiple=0,
         widths=None,
         label_dtype=np.int64,
+        visit_policy="identity",
+        visit_seed=None,
     ):
         self._rows = tuple(rows)
         self._schedule = tuple(tuple(batch) for batch in schedule)
@@ -3415,6 +3423,14 @@ class FiniteTextBatchPlan:
         self.pad_to_multiple = int(pad_to_multiple)
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
+        self._visit_policy = str(visit_policy)
+        # Normalized eagerly so visits never depend on ambient RNG state and a
+        # reconstructed plan (fresh-process resume) derives identical visits.
+        self._visit_seed = (
+            None if self._visit_policy == "identity"
+            else _normalize_seed(visit_seed)
+        )
+        self._visit_epoch_cache = None
         if self.max_seq_length < 1:
             raise ValueError("max_seq_length must be positive")
         if self.minimum_width < 0:
@@ -3423,6 +3439,11 @@ class FiniteTextBatchPlan:
             raise ValueError("pad_to_multiple must be non-negative")
         if self._widths is not None and len(self._widths) != len(self._schedule):
             raise ValueError("widths must contain one entry per scheduled batch")
+        if self._visit_policy not in self._VISIT_POLICIES:
+            raise ValueError(
+                f"visit_policy must be one of {self._VISIT_POLICIES}, "
+                f"got {visit_policy!r}"
+            )
 
     @property
     def rows(self):
@@ -3438,6 +3459,45 @@ class FiniteTextBatchPlan:
 
     def __len__(self):
         return len(self._schedule)
+
+    @property
+    def visit_policy(self):
+        return self._visit_policy
+
+    def batch_index_for_visit(self, absolute_visit):
+        """Map an absolute batch visit to one stored schedule index.
+
+        Identity plans replay the stored schedule cyclically (the historical
+        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
+        order for epoch 0, then visit a deterministic permutation of the same
+        batch multiset in every later epoch, derived only from the normalized
+        seed and the epoch — never from ambient RNG state.
+        """
+        count = len(self._schedule)
+        if count == 0:
+            raise ValueError("cannot resolve a visit on an empty schedule")
+        # operator.index rejects fractional/np-float visits instead of
+        # silently truncating them onto a neighboring visit.
+        visit = operator.index(absolute_visit)
+        if visit < 0:
+            raise ValueError("absolute_visit must be non-negative")
+        epoch, position = divmod(visit, count)
+        if self._visit_policy != "epoch_permute" or epoch == 0:
+            return position
+        cached = self._visit_epoch_cache
+        if cached is None or cached[0] != epoch:
+            cached = (epoch, self._build_visit_permutation(epoch))
+            self._visit_epoch_cache = cached
+        return cached[1][position]
+
+    def _build_visit_permutation(self, epoch):
+        """One O(len) deterministic permutation build per epoch transition."""
+        rng = np.random.RandomState(
+            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
+        )
+        return tuple(
+            int(index) for index in rng.permutation(len(self._schedule))
+        )
 
     def batch_width(self, index):
         batch_indices = self._schedule[index]
@@ -3588,7 +3648,6 @@ def _shuffled_full_batch_schedule(
     sort_key,
     num_batches,
     seed,
-    seed_when_zero=True,
 ):
     if row_count < batch_size:
         raise ValueError(
@@ -3600,11 +3659,14 @@ def _shuffled_full_batch_schedule(
         tuple(indices[start : start + batch_size])
         for start in range(0, row_count - batch_size + 1, batch_size)
     ]
-    if seed is not None and (seed_when_zero or int(seed) != 0):
-        np.random.seed(int(seed))
+    # Plan-local RNG through _normalize_seed: same permutation stream as the
+    # historical np.random.seed(int(seed)) global path for explicit seeds,
+    # while ``None`` (and the default creator's previously ambient ``0``) are
+    # canonicalized so fresh-process resume can reconstruct the schedule.
+    rng = np.random.RandomState(_normalize_seed(seed))
     schedule = []
     while True:
-        for group_index in np.random.permutation(len(groups)):
+        for group_index in rng.permutation(len(groups)):
             schedule.append(groups[int(group_index)])
             if num_batches is not None and len(schedule) >= num_batches:
                 return tuple(schedule)
@@ -3660,6 +3722,10 @@ def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
         ),
         max_seq_length=max_seq_length,
         pad_id=pad_id,
+        # One reusable shuffled cycle: eligible for epoch-permuted visits.
+        # Horizon-expanded/truncated schedules replay stored order (identity).
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
     )
 
 
@@ -4876,7 +4942,6 @@ def _create_default_text_plan(
         sort_key=dataset.itemlen,
         num_batches=num_batches,
         seed=seed,
-        seed_when_zero=False,
     )
     rows = _finite_text_rows(
         [dataset[index] for index in range(len(dataset))],
@@ -4887,6 +4952,8 @@ def _create_default_text_plan(
         schedule,
         max_seq_length=max_seq_length,
         pad_id=0,
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
     )
 
 
@@ -5242,6 +5309,9 @@ def _create_distributed_text_plan(
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
         pad_to_multiple=32,
+        # Same normalized seed on every rank keeps DDP visit vectors aligned.
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
     )
 
 

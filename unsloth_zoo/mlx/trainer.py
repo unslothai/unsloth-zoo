@@ -767,7 +767,10 @@ def _plan_single_process_text_shapes(
     total_microsteps = total_steps * args.gradient_accumulation_steps
     event_counts = {}
     for microstep in range(total_microsteps):
-        batch_index = microstep % len(batches)
+        # Same visit mapping as the runtime fetch, so the enumerated catalog
+        # equals the actually visited (family, width, phase) sequence even for
+        # epoch-permuted plans.
+        batch_index = batches.batch_index_for_visit(microstep)
         family = batches.batch_family(batch_index)
         width = batches.batch_width(batch_index)
         phase = phase_for_microstep(
@@ -3078,9 +3081,9 @@ class MLXTrainer:
         trained_tokens = 0
         train_time = 0
         grad_accum_state = None
-        # When resuming, start batch_idx at the resume position so
-        # batches[batch_idx % len(batches)] lands on the same batch the
-        # original run would have seen next.
+        # When resuming, start batch_idx at the resume position so the visit
+        # mapping (plan-provided for finite plans, modulo for eager lists)
+        # lands on the same batch the original run would have seen next.
         batch_idx = _resume_step * grad_accum
 
         # Streaming mode: fast-forward the iterator to the resume position.
@@ -3190,7 +3193,14 @@ class MLXTrainer:
                 if batch_iter is not None:
                     batch_data = next(batch_iter)
                 else:
-                    scheduled_index = batch_idx % len(batches)
+                    # Resolve the absolute visit exactly once; compiled
+                    # materialization, eager access, and both compile-failure
+                    # retries all reuse this resolved stored index.
+                    scheduled_index = (
+                        batches.batch_index_for_visit(batch_idx)
+                        if isinstance(batches, FiniteTextBatchPlan)
+                        else batch_idx % len(batches)
+                    )
                     if (
                         _use_compile
                         and _compile_scope in (
@@ -4078,7 +4088,11 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     _n_epochs_materialize = (
         max(1, int(num_epochs)) if num_epochs is not None else 1
     )
-    rng = random.Random(seed)
+    from .utils import _normalize_seed
+    # Normalized so seed=None is deterministic (canonicalized) instead of
+    # entropy-derived; explicit seeds are unchanged. Visits stay identity —
+    # these plans carry explicitly materialized epoch blocks.
+    rng = random.Random(_normalize_seed(seed))
     schedule = []
     widths = []
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
