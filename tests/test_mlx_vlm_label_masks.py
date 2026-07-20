@@ -1329,9 +1329,7 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     class LazyMxProcessor(_FakeProcessor):
         def __call__(self, text, **kwargs):
             out = super().__call__(text, **kwargs)
-            ids = np.asarray(out["input_ids"])
-            ids = ids.reshape(1, -1) if ids.ndim == 1 else ids
-            rows, width = ids.shape
+            rows, width = np.asarray(out["input_ids"]).shape
             return {
                 "input_ids": mx.broadcast_to(mx.arange(1, width + 1), (rows, width)),
                 "attention_mask": mx.broadcast_to(mx.array(1), (rows, width)),
@@ -1358,8 +1356,10 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     assert np.asarray(batch["input_ids"]).tolist() == [[1, 2, 3, 4, 5]] * 2
     it.close()
 
-    pc_rows = [{"prompt": "101", "completion": "102"},
-               {"prompt": "103", "completion": "104"}]
+    class _PCRows:  # replayable UNSIZED source: the pc_opaque producer runs
+        def __iter__(self):
+            return iter([{"prompt": "101", "completion": "102"},
+                         {"prompt": "103", "completion": "104"}])
 
     def take(iterator, count):
         taken = []
@@ -1369,13 +1369,14 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
                           np.asarray(b["labels"]).tolist(), b["labels"].dtype))
         return taken
 
-    sync_seq = take(iter(stream(pc_rows, batch_size=1)), 2)
-    pf_it = iter(stream(pc_rows, batch_size=1, prefetch_batches=1))
-    pf_seq = take(pf_it, 2)
-    pf_it.close()
-    assert pf_seq == sync_seq  # bit-for-bit parity with the sync legacy route
-    assert label_threads and all(
-        t is threading.main_thread() for t in label_threads)
+    for pc_loss in (None, False):
+        sync_seq = take(iter(stream(
+            _PCRows(), batch_size=1, completion_only_loss=pc_loss)), 2)
+        pf_it = iter(stream(_PCRows(), batch_size=1, prefetch_batches=1,
+                            completion_only_loss=pc_loss))
+        assert take(pf_it, 2) == sync_seq  # parity incl. label dtypes
+        pf_it.close()
+    assert label_threads and set(label_threads) == {threading.main_thread()}
 
     # pc_opaque carries tokenizer-derived data, never the live processor:
     # finalize must succeed after the tokenizer is torn down.
@@ -1385,7 +1386,8 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
 
     proc = LazyMxProcessor()
     staged = U._collate_vlm_prompt_completion_batch(
-        pc_rows[:1], proc, 8, None, reject_mlx_valued=True)
+        [{"prompt": "101", "completion": "102"}], proc, 8, None,
+        reject_mlx_valued=True)
     assert staged.pc_opaque is not None
     proc.tokenizer = _PoisonedTokenizer()
     poisoned = U._finalize_vlm_batch(staged)
