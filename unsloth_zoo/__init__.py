@@ -385,13 +385,13 @@ if not _SKIP_GPU_INIT:
         # CCE also fails in HIP / AMD
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
 
-    # ROCm RDNA (gfx10xx/11xx/12xx): the bundled hipBLASLt has no fallback Tensile
-    # kernels, so odd GEMM shapes from the compiled fwd+bwd graph get JIT-built via
-    # Composable Kernel on the first training step (the ~300s "a_grid_desc_*"
-    # descriptor flood). rocBLAS has prebuilt fallbacks and never JITs, so prefer it.
-    # torch reads these env vars lazily at first BLAS init, so setting them here
-    # (before any GEMM) is honoured, and it is the only lever that works on Windows.
-    # NVIDIA/Intel/Mac and AMD CDNA (good hipBLASLt coverage) are untouched.
+    # ROCm RDNA2/3/3.5/4: the bundled hipBLASLt can ship no fallback Tensile kernels
+    # (e.g. none for gfx1151, unlike rocBLAS), so odd GEMM shapes from the compiled
+    # fwd+bwd graph get JIT-built via Composable Kernel on the first training step
+    # (the ~300s "a_grid_desc_*" descriptor flood). rocBLAS has prebuilt fallbacks
+    # and never JITs, so prefer it. torch reads these env vars lazily at first BLAS
+    # init, so setting them here (before any GEMM) is honoured, and is the only lever
+    # that works on Windows. NVIDIA/Intel/Mac and AMD CDNA are untouched.
     # Kill switch: UNSLOTH_ROCM_PREFER_ROCBLAS=0.
     if IS_HIP_RUNTIME and os.environ.get(
         "UNSLOTH_ROCM_PREFER_ROCBLAS", "1"
