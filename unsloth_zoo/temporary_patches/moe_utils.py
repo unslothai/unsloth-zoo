@@ -887,16 +887,24 @@ def get_weight_preprocessor(model_type: str):
 
 
 def _logical_expert_shape(param):
-    """Return the logical expert shape without dequantizing.
+    """Return the logical expert shape without dequantizing or materializing.
 
-    Resolve PEFT parameters before module wrappers. Packed bnb weights record their
-    logical shape in _original_shape.
+    Resolve PEFT parameters before module wrappers. A recorded logical shape (bnb
+    Params4bit _original_shape, ParameterModule shape_3d) is read directly so a
+    get_param provider is never materialized just to read its shape.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
     seen = set()
     while param is not None and id(param) not in seen:
         seen.add(id(param))
+
+        # Recorded logical shape avoids materializing a get_param provider.
+        recorded = getattr(param, "_original_shape", None)
+        if recorded is None:
+            recorded = getattr(param, "shape_3d", None)
+        if recorded is not None:
+            return tuple(int(x) for x in recorded)
 
         get_param = getattr(param, "get_param", None)
         if callable(get_param):
@@ -921,9 +929,6 @@ def _logical_expert_shape(param):
 
         break
 
-    original_shape = getattr(param, "_original_shape", None)
-    if original_shape is not None:
-        return tuple(int(x) for x in original_shape)
     shape = getattr(param, "shape", None)
     if shape is None:
         return None

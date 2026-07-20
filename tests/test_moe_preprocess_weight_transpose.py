@@ -152,3 +152,14 @@ def test_square_grouped_weight_preserved_via_paramwrapper_sibling():
     assert _logical_expert_shape(experts.down_proj) == tuple(dn_g.shape)
     out = preprocess_weight(gu_g, "gate_up", H, experts_module=experts)
     assert torch.equal(out, gu_g), "a grouped square weight must not be transposed"
+
+
+def test_logical_expert_shape_reads_shape_3d_without_materializing():
+    class _Provider:
+        # ParameterModule-like: shape_3d is recorded; get_param would build a full tensor.
+        shape_3d = (4, 64, 128)
+
+        def get_param(self):
+            raise AssertionError("get_param must not run when shape_3d is recorded")
+
+    assert _logical_expert_shape(_Provider()) == (4, 64, 128)
