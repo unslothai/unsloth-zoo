@@ -420,8 +420,8 @@ if not _SKIP_GPU_INIT:
             if not _user_blas and _sys.platform != "win32" and _torch is not None:
                 _pref = getattr(getattr(_torch.backends, "cuda", None), "preferred_blas_library", None)
                 if callable(_pref):
-                    try: _pref("cublas")  # rocBLAS on ROCm
-                    except Exception: pass
+                    try: _pref("cublas")  # prefer rocBLAS on ROCm
+                    except Exception: pass  # best-effort; some builds lack the setter
                 del _pref
         del _torch, _rocm_arch, _sys, _user_blas
     del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
