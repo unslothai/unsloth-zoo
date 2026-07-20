@@ -25,6 +25,7 @@ and merged models (safetensors, GGUF, HuggingFace Hub).
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
+import ast
 import collections
 import copy
 import inspect
@@ -32,6 +33,7 @@ import importlib
 import json
 import numbers
 import operator
+import textwrap
 import numpy as np
 import os
 import sys
@@ -625,13 +627,105 @@ OutputHeadDescriptor = collections.namedtuple(
 _RAW_HEAD_TYPES = (nn.Linear, nn.QuantizedLinear, nn.Embedding, nn.QuantizedEmbedding)
 
 
-def _unique_child_of_type(owner, types):
+def _self_attr_chain(node):
+    """Dotted chain for an ``ast.Attribute`` rooted at the name ``self``,
+    else None (subscripts, calls, or other roots break the chain)."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id == "self":
+        return ".".join(reversed(parts))
+    return None
+
+
+def _output_accessor_chains(tree):
+    """Chains with recognized accessor syntax within a parsed body: the X of
+    ``self.X.as_linear(...)`` and ``self.X.weight.T``. Syntax-level, so
+    strings, comments, and prose can never contribute."""
+    chains = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "as_linear":
+            chain = _self_attr_chain(node.func.value)
+            if chain:
+                chains.append(chain)
+        elif isinstance(node, ast.Attribute) and node.attr == "T" \
+                and isinstance(node.value, ast.Attribute) \
+                and node.value.attr == "weight":
+            chain = _self_attr_chain(node.value.value)
+            if chain:
+                chains.append(chain)
+    return chains
+
+
+def _output_accessor_modules(tm):
+    """Live modules with recognized accessors in the analyzed forward bodies.
+
+    Parses ``type(tm).__call__`` (AST, so only real ``self.X.as_linear(...)``
+    calls and ``self.X.weight.T`` attribute expressions count — never strings
+    or comments), follows one hop of ``self.<method>(...)`` delegation to
+    methods the entry point syntactically calls, and resolves each extracted
+    chain on the LIVE module tree; unresolvable chains contribute nothing.
+    Neither reachability nor terminal position is analyzed: ANY
+    syntactically recognized accessor counts — dead branches, reachable
+    side computations, nested scopes, or a shadowed ``self``. Uniqueness
+    and fail-closed consumers bound the resulting risk: mis-selection
+    additionally requires that no other candidate contributes a recognized,
+    live-resolving accessor (the real route may use unsupported syntax, an
+    alias, or deeper delegation). Returns ``{id(module): (relative_path, module)}``."""
+    cls = type(tm)
+
+    def _parse(method):
+        try:
+            return ast.parse(textwrap.dedent(inspect.getsource(method)))
+        except (OSError, TypeError, AttributeError, SyntaxError):
+            return None
+
+    entry = _parse(getattr(cls, "__call__", None))
+    if entry is None:
+        return {}
+    trees = [entry]
+    invoked = {
+        node.func.attr
+        for node in ast.walk(entry)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
+    }
+    for helper in invoked - {"__call__"}:
+        method = getattr(cls, helper, None)
+        if callable(method):
+            tree = _parse(method)
+            if tree is not None:
+                trees.append(tree)
+    modules = {}
+    for tree in trees:
+        for chain in _output_accessor_chains(tree):
+            obj = tm
+            for part in chain.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                modules[id(obj)] = (chain, obj)
+    return modules
+
+
+def _resolve_embedding_anchor(owner, types, accessor_modules=None):
     """(name, module) of the unique direct child whose type is exactly in
-    ``types``; None when absent, ambiguous, or not a module tree."""
+    ``types``; None when absent, ambiguous, or not a module tree. Multiple
+    embedding candidates (Gemma-4 backbones carry a second vocab-sized
+    per-layer embedding) resolve ONLY by live accessor identity — the unique
+    candidate that IS one of the modules the output route accesses
+    (`_output_accessor_modules`). Dimensional agreement is deliberately not
+    identity evidence (metadata can be stale after a vocab resize).
+    Still-ambiguous stays None (fail closed)."""
     children = getattr(owner, "children", None)
     if not callable(children):
         return None
     found = [(n, c) for n, c in children().items() if type(c) in types]
+    if len(found) > 1 and accessor_modules:
+        found = [e for e in found if id(e[1]) in accessor_modules]
     return found[0] if len(found) == 1 else None
 
 
@@ -660,10 +754,15 @@ def _resolve_module_path(model, path):
 def describe_output_head(model):
     """Resolve the live output head with affirmative evidence only: a True
     tie flag, a real ``lm_head``, or (only when no flag attribute exists) an
-    unconditional ``embed_tokens.as_linear`` forward route. Missing ``lm_head``
-    never implies tying; conflicting flags fail closed. ``path`` is rooted at
-    the argument (VLM wrappers keep the ``language_model.`` prefix); at
-    unknown status ``candidate_*`` carry the unique shape-matched child.
+    embedding with a recognized, live-resolving accessor syntactically
+    present in the analyzed forward bodies — any embedding name, via
+    ``.as_linear(...)`` or ``.weight.T``, including one hop of
+    ``self.<method>()`` delegation (see ``_output_accessor_modules``).
+    Missing ``lm_head`` never implies tying; conflicting flags fail closed.
+    ``path`` is rooted at the argument (VLM wrappers keep the
+    ``language_model.`` prefix); at unknown status ``candidate_*`` carry the
+    unique structural shape-matched alternative head (accessor identity
+    selects only the embedding anchor).
     """
     prefix = "language_model." if hasattr(model, "language_model") else ""
     tm = _get_text_model(model)
@@ -672,7 +771,11 @@ def describe_output_head(model):
         emb_owner, emb_prefix = backbone, prefix + "model."
     else:
         emb_owner, emb_prefix = tm, prefix
-    emb_entry = _unique_child_of_type(emb_owner, (nn.Embedding, nn.QuantizedEmbedding))
+    accessor_modules = _output_accessor_modules(tm)
+    emb_entry = _resolve_embedding_anchor(
+        emb_owner, (nn.Embedding, nn.QuantizedEmbedding),
+        accessor_modules=accessor_modules,
+    )
 
     flags, flag_attr_present = [], False
     for holder in (tm, getattr(tm, "args", None)):
@@ -694,11 +797,9 @@ def describe_output_head(model):
     elif backbone is not None and getattr(backbone, "lm_head", None) is not None:
         head, path, status = backbone.lm_head, prefix + "model.lm_head", "untied"
     elif not flag_attr_present and emb_entry is not None:
-        try:
-            source = inspect.getsource(type(tm).__call__)
-        except (OSError, TypeError):
-            source = ""
-        if "embed_tokens.as_linear" in source:
+        # Same structured interpretation as the anchor: tied evidence means
+        # the analyzed output-route bodies access THIS embedding module.
+        if id(emb_entry[1]) in accessor_modules:
             head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
 
     candidate, candidate_path = None, None
