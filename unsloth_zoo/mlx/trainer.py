@@ -172,6 +172,7 @@ from .utils import (
     _FiniteTextRow,
     _create_text_batch_plan,
     _create_ordered_text_plan,
+    _normalize_label_smoothing,
     create_batches,
     iterate_training_batches,
     create_vlm_batches,
@@ -511,6 +512,18 @@ def _clip_grad_norm_fp32(grad, max_norm):
     return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
 
 
+def _validate_label_smoothing(value, is_vlm):
+    """Configuration gate for ``label_smoothing_factor``: delegates the
+    domain check to the shared loss-layer normalizer (config errors raise,
+    unlike model-derived properties, which fall back) and adds the VLM rule."""
+    eps = _normalize_label_smoothing(value)
+    if is_vlm and eps > 0.0:
+        raise ValueError(
+            "label_smoothing_factor > 0 is not supported for VLM training on MLX."
+        )
+    return eps
+
+
 def _prune_stale_checkpoints(output_dir, save_total_limit):
     """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
 
@@ -635,6 +648,8 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
+    # Appended last: the initializer binds positional args by field order.
+    label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -2353,8 +2368,13 @@ class MLXTrainer:
             if is_main_process:
                 print(*print_args, **print_kwargs)
 
-        # Pick loss function (returns (loss, ntoks))
+        # Pick loss function (returns (loss, ntoks)). Validate configuration
+        # before any model-derived loss selection (config errors raise; model
+        # properties fall back).
         use_cce = args.use_cce
+        label_smoothing = _validate_label_smoothing(
+            getattr(args, "label_smoothing_factor", 0.0), is_vlm,
+        )
         _vlm_ignore_token_ids = None
 
         if is_vlm:
@@ -2391,7 +2411,7 @@ class MLXTrainer:
                 _main_print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
             if use_cce:
-                loss_fn = make_cce_loss_fn(model)
+                loss_fn = make_cce_loss_fn(model, label_smoothing=label_smoothing)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 if cce_backend == "baseline-fallback":
                     use_cce = False
@@ -2406,7 +2426,7 @@ class MLXTrainer:
                         "for memory-efficient training."
                     )
             else:
-                loss_fn = make_baseline_loss_fn()
+                loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
                 _main_print("Unsloth: Using standard cross-entropy loss.")
 
         compile_policy = build_compile_policy(args=args)

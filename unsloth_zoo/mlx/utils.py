@@ -44,6 +44,7 @@ from pathlib import Path
 
 
 from .cce import _get_runtime_cce
+from .cce.runtime_cce import _normalize_label_smoothing
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
@@ -717,7 +718,7 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
-def make_cce_loss_fn(model):
+def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
     CCE computes loss directly from hidden states and the LM head weight,
@@ -727,6 +728,7 @@ def make_cce_loss_fn(model):
     With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
     The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
+    label_smoothing = _normalize_label_smoothing(label_smoothing)
     # Validate before announcing any CCE configuration so an abandoned CCE
     # never advertises itself first.
     logit_scale, _scale_invalid = _get_logit_scale(model)
@@ -734,7 +736,7 @@ def make_cce_loss_fn(model):
         print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
               "non-scalar, or outside the supported range); falling back to "
               "standard cross-entropy.")
-        loss_fn = make_baseline_loss_fn()
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
 
@@ -804,6 +806,7 @@ def make_cce_loss_fn(model):
             group_size=group_size,
             bits=bits,
             mode=quant_mode,
+            label_smoothing=label_smoothing,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -849,6 +852,7 @@ def make_cce_loss_fn(model):
         rt_cce = _get_runtime_cce(
             ignore_index=-100,
             logit_softcap=softcap,
+            label_smoothing=label_smoothing,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -885,14 +889,29 @@ def make_cce_loss_fn(model):
     return loss_fn
 
 
-def make_baseline_loss_fn():
+def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
     Used when use_cce=False. Returns a function
     (model, batch, lengths, labels=None) -> (loss, ntoks). With labels, uses
-    labels[:,1:] and (targets != -100) as mask. The labels=None branch is
-    byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
+    labels[:,1:] and (targets != -100) as mask. With label_smoothing=0 the
+    labels=None branch is byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
+    eps = _normalize_label_smoothing(label_smoothing)
+    if eps > 0.0:
+
+        def _token_ce(logits, targets):
+            # HF LabelSmoother form: lse - (1-eps)*target - eps*mean_v, with
+            # the smoothed vocabulary term reduced in float32.
+            logits32 = logits.astype(mx.float32)
+            lse = mx.logsumexp(logits32, axis=-1)
+            tgt = mx.take_along_axis(
+                logits32, mx.expand_dims(targets, -1), axis=-1
+            ).squeeze(-1)
+            return lse - (1.0 - eps) * tgt - eps * logits32.mean(axis=-1)
+    else:
+        _token_ce = nn.losses.cross_entropy
+
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
@@ -902,7 +921,7 @@ def make_baseline_loss_fn():
             logits = model(inputs)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
-            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ce = _token_ce(logits, targets) * mask
             ntoks = mask.sum()
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
@@ -925,7 +944,7 @@ def make_baseline_loss_fn():
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         return loss, ntoks

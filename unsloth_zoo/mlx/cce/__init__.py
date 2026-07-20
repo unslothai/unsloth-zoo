@@ -26,10 +26,14 @@ except ImportError:
 
 if _MLX_AVAILABLE:
     from .runtime_cce import (
+        _normalize_label_smoothing,
         make_chunked_cross_entropy_loss,
         make_runtime_cce_loss_fused_finalize,
     )
 else:
+    def _normalize_label_smoothing(value):
+        return float(value)
+
     def make_chunked_cross_entropy_loss(**kwargs):
         raise RuntimeError("mlx is required for CCE loss but is not installed")
 
@@ -43,7 +47,7 @@ __all__ = [
 ]
 
 
-_RUNTIME_CCE_CACHE: dict[tuple[int, float, int, bool, int | None, int | None, str], Any] = {}
+_RUNTIME_CCE_CACHE: dict[tuple[int, float, int, bool, int | None, int | None, str, float], Any] = {}
 
 
 def _get_runtime_cce(
@@ -55,8 +59,12 @@ def _get_runtime_cce(
     group_size: int | None = None,
     bits: int | None = None,
     mode: str = "affine",
+    label_smoothing: float = 0.0,
 ):
-    key = (ignore_index, logit_softcap, chunk_size, quantized, group_size, bits, mode)
+    # Normalize BEFORE key lookup: a cached entry must never let an invalid
+    # value (e.g. True -> 1.0) bypass validation.
+    label_smoothing = _normalize_label_smoothing(label_smoothing)
+    key = (ignore_index, logit_softcap, chunk_size, quantized, group_size, bits, mode, label_smoothing)
     runtime_cce = _RUNTIME_CCE_CACHE.get(key)
     if runtime_cce is None:
         runtime_cce, _ = make_chunked_cross_entropy_loss(
@@ -67,6 +75,7 @@ def _get_runtime_cce(
             group_size=group_size,
             bits=bits,
             mode=mode,
+            label_smoothing=label_smoothing,
         )
         _RUNTIME_CCE_CACHE[key] = runtime_cce
     return runtime_cce
