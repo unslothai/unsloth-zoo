@@ -1075,6 +1075,14 @@ def _reject_mlx_valued_vlm(context):
     )
 
 
+def _reject_non_integer_host_vlm_ids(context):
+    raise ValueError(
+        f"Unsloth MLX VLM: {context} produced non-integer host token ids, "
+        "which need the synchronous legacy conversion path. Use "
+        "streaming_prefetch_batches=0 for this stream."
+    )
+
+
 def _vlm_ids_integer_host(inputs):
     """True when label-bearing ids are integer host values (the staged case).
 
@@ -1149,10 +1157,11 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
     if staged.prefinalized is not None:
         return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
     if staged.pc_opaque is not None:
-        (prompt_inputs, completion_inputs, processor, max_seq_length,
+        (prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
          completion_only_loss) = staged.pc_opaque
         inner = _combine_vlm_prompt_completion_inputs(
-            prompt_inputs, completion_inputs, processor, max_seq_length,
+            prompt_inputs, completion_inputs, flush_side, pad_id,
+            max_seq_length,
             ignore_token_ids=staged.ignore_token_ids,
             completion_only_loss=completion_only_loss,
         )
@@ -1162,8 +1171,9 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
     if staged.label_mask is None:
         # Opaque processor outputs (the processor itself returned MLX arrays,
         # e.g. mlx-vlm wrappers): label semantics run the legacy path here on
-        # the consumer thread. No Unsloth-issued MLX op touched the payload
-        # producer-side — it was carried through untouched.
+        # the consumer thread. Producer-side, Unsloth only ran the permitted
+        # materialization barrier over the processor's own pending graphs —
+        # no new MLX computation or value transform touched the payload.
         batch["labels"] = _apply_vlm_label_masks(
             batch, ignore_token_ids=staged.ignore_token_ids,
         )
@@ -4445,6 +4455,11 @@ def _collate_vlm_prompt_completion_batch(
         _vlm_inputs_host_valued(prompt_inputs)
         and _vlm_inputs_host_valued(completion_inputs)
     )
+    # Snapshot the tokenizer-derived collation scalars while this thread
+    # still exclusively owns the processor; the carrier transports data, not
+    # the live processor, so the consumer never dereferences it.
+    flush_side = _vlm_tokenizer_padding_side(processor)
+    pad_id = _vlm_pad_token_id(processor)
     if not pc_host_valued and reject_mlx_valued:
         # Processor-owned MLX outputs: materialize their pending graphs on
         # this thread (lazy arrays cannot cross the thread boundary) and
@@ -4453,11 +4468,11 @@ def _collate_vlm_prompt_completion_batch(
         return _HostStagedVLMBatch(
             None, None, host_valued=False,
             ignore_token_ids=ignore_token_ids,
-            pc_opaque=(prompt_inputs, completion_inputs, processor,
+            pc_opaque=(prompt_inputs, completion_inputs, flush_side, pad_id,
                        max_seq_length, completion_only_loss),
         )
     return _combine_vlm_prompt_completion_inputs(
-        prompt_inputs, completion_inputs, processor, max_seq_length,
+        prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
         reject_mlx_valued=reject_mlx_valued,
@@ -4467,7 +4482,8 @@ def _collate_vlm_prompt_completion_batch(
 def _combine_vlm_prompt_completion_inputs(
     prompt_inputs,
     completion_inputs,
-    processor,
+    flush_side,
+    pad_id,
     max_seq_length,
     ignore_token_ids=None,
     completion_only_loss=None,
@@ -4476,7 +4492,8 @@ def _combine_vlm_prompt_completion_inputs(
     """Concatenate prompt/completion processor outputs into one staged batch.
 
     Runs on the collating thread for host-valued outputs and on the consumer
-    thread (via the ``pc_opaque`` carrier) for MLX-valued outputs.
+    thread (via the ``pc_opaque`` carrier) for MLX-valued outputs. Takes the
+    tokenizer-derived collation scalars, never the processor itself.
     """
     pc_host_valued = (
         _vlm_inputs_host_valued(prompt_inputs)
@@ -4497,8 +4514,6 @@ def _combine_vlm_prompt_completion_inputs(
     if token_type_key is not None:
         extras[token_type_key] = token_type_ids
 
-    flush_side = _vlm_tokenizer_padding_side(processor)
-    pad_id = _vlm_pad_token_id(processor)
     input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
         input_ids, attention_mask, flush_side, pad_id, extras,
     )
@@ -4529,7 +4544,7 @@ def _combine_vlm_prompt_completion_inputs(
     if reject_mlx_valued:
         # Non-stageable producer batches (float/exotic ids) must never reach
         # MLX conversion off the consumer thread.
-        _reject_mlx_valued_vlm("the processor")
+        _reject_non_integer_host_vlm_ids("the processor")
     batch = _to_mx_vlm_batch(combined_inputs)
     batch["labels"] = _apply_vlm_label_masks(
         batch, ignore_token_ids=ignore_token_ids,
@@ -4630,7 +4645,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     elif reject_mlx_valued:
         # Host-valued but non-integer ids: legacy conversion would run
         # producer-side, so reject with the synchronous remedy.
-        _reject_mlx_valued_vlm("the processor")
+        _reject_non_integer_host_vlm_ids("the processor")
     else:
         # MLX-valued processor outputs: legacy synchronous label path, wrapped
         # so the single finalizer stays the only exit to the trainer.

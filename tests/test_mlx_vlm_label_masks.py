@@ -1376,3 +1376,17 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     assert pf_seq == sync_seq  # bit-for-bit parity with the sync legacy route
     assert label_threads and all(
         t is threading.main_thread() for t in label_threads)
+
+    # pc_opaque carries tokenizer-derived data, never the live processor:
+    # finalize must succeed after the tokenizer is torn down.
+    class _PoisonedTokenizer:
+        def __getattr__(self, name):
+            raise AssertionError(f"finalize dereferenced tokenizer.{name}")
+
+    proc = LazyMxProcessor()
+    staged = U._collate_vlm_prompt_completion_batch(
+        pc_rows[:1], proc, 8, None, reject_mlx_valued=True)
+    assert staged.pc_opaque is not None
+    proc.tokenizer = _PoisonedTokenizer()
+    poisoned = U._finalize_vlm_batch(staged)
+    assert np.asarray(poisoned["input_ids"]).tolist() == sync_seq[0][0]
