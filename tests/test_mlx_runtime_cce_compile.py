@@ -504,3 +504,5 @@ def test_quantized_runtime_cce_rejects_missing_affine_biases():
 
     with pytest.raises(ValueError, match="Biases must be provided for affine"):
         mx.eval(loss_fn(hidden))
+
+

@@ -29,6 +29,7 @@ import copy
 import inspect
 import importlib
 import json
+import numbers
 import operator
 import numpy as np
 import os
@@ -643,6 +644,42 @@ def _get_logit_softcap(model):
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
+def _get_logit_scale(model):
+    """Get the scalar multiplier some archs apply to lm-head logits, if any.
+
+    Cohere-family models (mlx-lm ``cohere``/``cohere2``, mlx-vlm
+    ``aya_vision``/``cohere2_moe``) multiply logits by ``logit_scale`` inside
+    the forward — a step CCE bypasses and must re-apply. Returns
+    ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
+    bool/non-scalar/non-finite/out-of-range values (callers must fall back).
+    """
+    tm = _get_text_model(model)
+    # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
+    # then config (aya_vision); no upstream forward reads a direct attribute.
+    scale = None
+    if hasattr(tm, "args"):
+        scale = getattr(tm.args, "logit_scale", None)
+    if scale is None and hasattr(tm, "config"):
+        scale = getattr(tm.config, "logit_scale", None)
+    if scale is None:
+        return None, False
+    if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
+        return None, True
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError, OverflowError):
+        return None, True
+    if not np.isfinite(scale):
+        return None, True
+    if scale == 1.0:
+        return None, False
+    # Pre-scaling is validated only for moderate magnitudes; extreme scales
+    # can under/overflow before accumulation, so fail closed outside 2^-6..4.
+    if scale != 0.0 and not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
+        return None, True
+    return scale, False
+
+
 def _is_lm_head_trainable(model):
     """Whether the LM head weight is trainable (not frozen by LoRA).
 
@@ -690,9 +727,22 @@ def make_cce_loss_fn(model):
     With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
     The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
+    # Validate before announcing any CCE configuration so an abandoned CCE
+    # never advertises itself first.
+    logit_scale, _scale_invalid = _get_logit_scale(model)
+    if _scale_invalid:
+        print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
+              "non-scalar, or outside the supported range); falling back to "
+              "standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn()
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+
     softcap = _get_logit_softcap(model)
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
@@ -782,6 +832,11 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # (h * s) @ W equals s * (h @ W) per vocab chunk, so softcap
+                # and the CCE backward see the model's own scaled logits while
+                # cached kernels stay scale-independent.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -818,6 +873,9 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # Same pre-scaling identity as the quantized branch above.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)

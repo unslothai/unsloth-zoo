@@ -2387,10 +2387,18 @@ class MLXTrainer:
             if use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                _main_print(
-                    f"Unsloth: Using CCE loss ({cce_backend}) "
-                    "for memory-efficient training."
-                )
+                if cce_backend == "baseline-fallback":
+                    use_cce = False
+                    # The factory already printed the specific reason (topology,
+                    # head eligibility, or logit transform); keep this generic.
+                    _main_print(
+                        "Unsloth: fused CCE is unavailable for this model; "
+                        "using standard cross-entropy loss.")
+                else:
+                    _main_print(
+                        f"Unsloth: Using CCE loss ({cce_backend}) "
+                        "for memory-efficient training."
+                    )
             else:
                 loss_fn = make_baseline_loss_fn()
                 _main_print("Unsloth: Using standard cross-entropy loss.")

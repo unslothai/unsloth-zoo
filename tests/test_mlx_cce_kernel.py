@@ -259,3 +259,45 @@ def test_transpose_two_args_unchanged():
     t = torch.zeros(2, 3, 4)
     out = t.transpose(0, 1)
     assert out.shape == (3, 2, 4)
+
+
+# 7. logit_scale discovery/normalization feeding CCE loss selection.
+
+def _stub_model(where=None, value=None):
+    class _Holder:
+        pass
+
+    model = _Holder()
+    if where == "attr":
+        model.logit_scale = value
+    elif where in ("args", "config"):
+        setattr(model, where, _Holder())
+        getattr(model, where).logit_scale = value
+    return model
+
+
+@pytest.mark.parametrize(
+    "where,value,expected",
+    [
+        (None, None, (None, False)),
+        ("attr", 0.0625, (None, False)),       # direct attr deliberately ignored
+        ("args", 0.0625, (0.0625, False)),     # mlx-lm cohere / cohere2_moe
+        ("config", 0.0625, (0.0625, False)),   # mlx-vlm aya_vision
+        ("args", 0.0, (0.0, False)),           # honored: matches model forward
+        ("args", 1.0, (None, False)),          # identity -> no-op path
+        ("args", True, (None, True)),          # bool is not a scale
+        ("args", 8.0, (None, True)),           # above supported range
+    ],
+)
+def test_get_logit_scale_normalization(where, value, expected):
+    from unsloth_zoo.mlx.utils import _get_logit_scale
+
+    assert _get_logit_scale(_stub_model(where, value)) == expected
+
+
+def test_invalid_logit_scale_selects_baseline_fallback():
+    # Selection precedes lm-head introspection, so a bare stub suffices.
+    from unsloth_zoo.mlx.utils import make_cce_loss_fn
+
+    fn = make_cce_loss_fn(_stub_model("args", float("nan")))
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
