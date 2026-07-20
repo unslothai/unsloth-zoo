@@ -733,19 +733,30 @@ def describe_output_head(model):
     )
 
 
+def _cce_head_ineligibility(desc):
+    """Reason fused CCE must not run for this head, or None when eligible."""
+    if desc.status == "unknown":
+        return "unresolved output-head topology"
+    if not desc.raw:
+        return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
+    if desc.has_additive_bias:
+        return "additive output-head bias"
+    return None
+
+
 def _get_lm_head_layer(model):
-    """The affirmatively resolved output head (see describe_output_head),
-    with the historical lookup preserved for unresolved topologies."""
+    """The affirmatively resolved output head (see describe_output_head).
+
+    Raises for unknown topology: the loss factories gate on the descriptor
+    first, so reaching this without a resolved head is a caller bug.
+    """
     desc = describe_output_head(model)
-    if desc.module is not None:
-        return desc.module
-    tm = _get_text_model(model)
-    if getattr(tm, "lm_head", None) is not None:
-        return tm.lm_head
-    backbone = getattr(tm, "model", tm)
-    if getattr(backbone, "lm_head", None) is not None:
-        return backbone.lm_head
-    return backbone.embed_tokens
+    if desc.module is None:
+        raise ValueError(
+            "Unsloth: output-head topology is unresolved for this model; "
+            "gate on describe_output_head before requesting the head layer."
+        )
+    return desc.module
 
 
 def _is_quantized_layer(layer):
@@ -846,8 +857,16 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
     label_smoothing = _normalize_label_smoothing(label_smoothing)
-    # Validate before announcing any CCE configuration so an abandoned CCE
-    # never advertises itself first.
+    # Head eligibility first, then scale validation — no positive CCE notice
+    # may precede an ineligibility decision.
+    head_desc = describe_output_head(model)
+    _ineligible = _cce_head_ineligibility(head_desc)
+    if _ineligible is not None:
+        print(f"Unsloth: fused CCE cannot faithfully use this model's output "
+              f"head ({_ineligible}); falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
     logit_scale, _scale_invalid = _get_logit_scale(model)
     if _scale_invalid:
         print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
@@ -863,20 +882,18 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     if logit_scale is not None:
         print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
-    lm_layer = _get_lm_head_layer(model)
+    lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
 
-    _head_path = describe_output_head(model).path
+    _head_path = head_desc.path
 
     def _get_backbone(model):
         """Get backbone (for hidden states) from the live model tree."""
         return _forward_text_hidden_states
 
     def _get_lm_weight_layer(model):
-        """Get LM head or embed_tokens layer from the live model tree."""
-        if _head_path is not None:
-            return _resolve_module_path(model, _head_path)
-        return _get_lm_head_layer(model)
+        """Re-resolve the head from the live model tree by its descriptor path."""
+        return _resolve_module_path(model, _head_path)
 
     if use_quantized:
         # Backstop: quantized CCE backward zeros the weight gradient
@@ -2314,6 +2331,13 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
+    head_desc = describe_output_head(model)
+    _ineligible = _cce_head_ineligibility(head_desc)
+    if _ineligible is not None:
+        print(f"Unsloth: fused CCE cannot faithfully use this model's output "
+              f"head ({_ineligible}); falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+
     logit_scale, _scale_invalid = _get_logit_scale(model)
     if _scale_invalid:
         print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
@@ -2322,9 +2346,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         return _marked_vlm_baseline()
 
     softcap = _get_logit_softcap(model)
-    lm_layer = _get_lm_head_layer(model)
+    lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
-    _head_path = describe_output_head(model).path
+    _head_path = head_desc.path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
@@ -2368,7 +2392,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            lm_head = _resolve_module_path(model, _head_path) if _head_path is not None else _get_lm_head_layer(model)
+            lm_head = _resolve_module_path(model, _head_path)
             w = lm_head.weight
             sc = lm_head.scales
             bi = getattr(lm_head, "biases", None)
@@ -2399,7 +2423,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = (_resolve_module_path(model, _head_path) if _head_path is not None else _get_lm_head_layer(model)).weight
+            w = _resolve_module_path(model, _head_path).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))

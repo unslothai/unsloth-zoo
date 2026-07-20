@@ -295,26 +295,24 @@ def test_get_logit_scale_normalization(where, value, expected):
     assert _get_logit_scale(_stub_model(where, value)) == expected
 
 
-def test_invalid_logit_scale_selects_baseline_fallback():
-    # Selection precedes lm-head introspection, so a bare stub suffices.
-    from unsloth_zoo.mlx.utils import make_cce_loss_fn
-
-    fn = make_cce_loss_fn(_stub_model("args", float("nan")))
-    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
-
-
 @pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale"])
 def test_vlm_cce_fallbacks_are_marked(case):
     # Every VLM fallback path must return a loss fn carrying the eager
     # fallback marker.
     from unsloth_zoo.mlx.utils import make_vlm_cce_loss_fn
 
+    from unsloth_zoo.mlx import utils as U
+
     model = _stub_model()
-    model.language_model = _stub_model(
-        "args", float("nan") if case == "invalid_scale" else 0.0625
-    )
-    if case != "no_backbone":
-        model.language_model.model = object()  # separable backbone present
+    if case == "invalid_scale":
+        lm = _lm(U.nn, head=U.nn.Linear(32, 96, bias=False))
+        lm.args = type("A", (), {})()
+        lm.args.logit_scale = float("nan")
+        model.language_model = lm
+    else:
+        model.language_model = _stub_model("args", 0.0625)
+        if case != "no_backbone":
+            model.language_model.model = object()  # separable backbone present
     if case != "no_embeddings":
         model.get_input_embeddings = lambda: None
     with pytest.warns(UserWarning) if case != "invalid_scale" else _no_warning():
