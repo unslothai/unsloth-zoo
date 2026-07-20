@@ -887,13 +887,10 @@ def get_weight_preprocessor(model_type: str):
 
 
 def _logical_expert_shape(param):
-    """Best-effort logical (E, d1, d2) shape of an expert weight without dequantizing.
+    """Return the logical expert shape without dequantizing.
 
-    Resolve PEFT ParamWrappers before walking ordinary module wrappers: their base_layer
-    points back to the experts module, while get_param() returns the underlying parameter.
-    A bnb Params4bit's .shape is the packed uint8 layout, so prefer its recorded
-    _original_shape. Returns None if the logical shape can't be determined cheaply (caller
-    degrades gracefully).
+    Resolve PEFT parameters before module wrappers. Packed bnb weights record their
+    logical shape in _original_shape.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
@@ -916,7 +913,7 @@ def _logical_expert_shape(param):
             param = base_layer
             continue
 
-        # Linear-like modules (including bnb Linear4bit) store the parameter in .weight.
+        # Linear modules store parameters on .weight.
         weight = getattr(param, "weight", None)
         if weight is not None and weight is not param:
             param = weight
@@ -937,24 +934,18 @@ def _logical_expert_shape(param):
 
 
 def _orientation_needs_transpose(shape, proj_type, hidden_dim):
-    """Whether an expert weight is stored F.linear (needs transpose to grouped_mm layout).
-
-    Returns True (stored F.linear -> transpose), False (already grouped_mm layout), or
-    None when the two matmul dims are equal so the shape carries no layout signal.
-    """
+    """Return whether a weight needs transposition, or None when ambiguous."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if shape is None or len(shape) < 3:
         return None
     d1, d2 = int(shape[1]), int(shape[2])
     if d1 == d2:
-        return None  # square: ambiguous, shape reveals nothing
+        return None
     if proj_type == "gate_up":
-        # grouped_mm (E, hidden_dim, 2*intermediate) has shape[1] == hidden_dim;
-        # F.linear (E, 2*intermediate, hidden_dim) does not.
+        # grouped_mm uses (E, hidden, 2I).
         return d1 != hidden_dim
-    # down: grouped_mm (E, intermediate, hidden_dim) has shape[2] == hidden_dim;
-    # F.linear (E, hidden_dim, intermediate) does not.
+    # grouped_mm down uses (E, I, hidden).
     return d2 != hidden_dim
 
 
@@ -968,15 +959,14 @@ def _warn_ambiguous_layout_once(proj_type, shape, hidden_dim):
     if key in _WARNED_AMBIGUOUS_LAYOUTS:
         return
     _WARNED_AMBIGUOUS_LAYOUTS.add(key)
-    # Not gated behind UNSLOTH_ENABLE_LOGGING: a wrong guess here silently corrupts
-    # training (unslothai/unsloth-zoo#849), so it must always be visible.
+    # Always warn because a wrong guess corrupts training (#849).
     print(
         f"Unsloth: MoE '{proj_type}' expert weight of shape {tuple(shape)} has equal matmul "
         f"dims (hidden_dim={hidden_dim}), so its layout is ambiguous, and no unambiguous "
         f"sibling projection was reachable to disambiguate it. Assuming the transformers "
         f"F.linear layout and transposing to grouped_mm layout. If these experts were "
         f"already in grouped_mm layout this transpose is WRONG and trains on transposed "
-        f"weights (see unslothai/unsloth-zoo#849) — register an explicit preprocessor via "
+        f"weights (see unslothai/unsloth-zoo#849). Register an explicit preprocessor via "
         f"register_weight_preprocessor('<model_type>', ...) to remove the guess.",
         file=sys.stderr,
     )
@@ -986,29 +976,21 @@ def preprocess_weight(
     weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None,
     experts_module=None,
 ):
-    """Preprocess a weight into (E, in_dim, out_dim) for grouped_mm.
+    """Convert an expert weight to grouped_mm layout.
 
-    Uses a registered model-specific preprocessor if present, else infers the layout by
-    shape. proj_type is "gate_up" or "down". When the two matmul dims are equal
-    (2*moe_intermediate == hidden_size for gate_up, or moe_intermediate == hidden_size for
-    down) shape alone is ambiguous; passing experts_module lets the guaranteed-non-square
-    sibling projection resolve the layout instead of silently guessing (#849).
+    Registered preprocessors take precedence. Square weights use the non-square sibling.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if model_type and model_type in _WEIGHT_PREPROCESSORS:
         return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
 
-    # Non-ambiguous fast path (behaviour-identical to the historical shape check): the two
-    # matmul dims differ, so shape alone reveals the layout.
+    # Non-square shapes reveal layout directly.
     needs_transpose = _orientation_needs_transpose(tuple(weight.shape), proj_type, hidden_dim)
     if needs_transpose is not None:
         return weight.transpose(-2, -1) if needs_transpose else weight
 
-    # Ambiguous square case. The pair {gate_up, down} can never be square at once
-    # (2I == H forces down (H, I) non-square; I == H forces gate_up (2I, H) non-square), so
-    # the sibling projection unambiguously reveals the module-wide layout. Same principle as
-    # transformers#47031.
+    # One sibling is always non-square and reveals the shared layout.
     if experts_module is not None:
         sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
         sibling_type = "down" if proj_type == "gate_up" else "gate_up"
@@ -1020,8 +1002,7 @@ def preprocess_weight(
             if sibling_transpose is not None:
                 return weight.transpose(-2, -1) if sibling_transpose else weight
 
-    # No unambiguous sibling reachable: assume the F.linear layout that loaded transformers
-    # modules always hold, and warn loudly so a wrong guess is diagnosable rather than silent.
+    # Default to F.linear when no sibling is readable.
     _warn_ambiguous_layout_once(proj_type, weight.shape, hidden_dim)
     return weight.transpose(-2, -1)
 
