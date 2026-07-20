@@ -14,6 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import sys
+
 from .common import (
     TEMPORARY_PATCHES,
     UNSLOTH_ENABLE_LOGGING,
@@ -136,7 +138,18 @@ def patch_olmoe_moe():
 
     # Pass the function object directly (no closure): patch_function serializes the source into
     # the compiled cache, so a closure var would be a NameError there. Mirrors qwen3_moe.py.
-    patch_function(OlmoeExperts, "forward", forward_backend)
+    # Strict matching is the drift tripwire: if a future transformers changes the forward
+    # signature (or postpones annotations into strings), patch_function returns False — in
+    # that case the native forward would still crash on 4-bit (#850), so say why loudly and
+    # leave the sentinel unset instead of recording success that didn't happen.
+    if not patch_function(OlmoeExperts, "forward", forward_backend):
+        print(
+            "Unsloth: could not install the MoE forward on OlmoeExperts (signature "
+            "drift in this transformers version?). OLMoE load_in_4bit will crash on "
+            "its first forward (unslothai/unsloth-zoo#850).",
+            file=sys.stderr,
+        )
+        return
     OlmoeExperts._unsloth_already_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:

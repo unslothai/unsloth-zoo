@@ -187,3 +187,25 @@ def test_preprocessor_registered_in_executing_namespace(monkeypatch):
     assert installed is split.forward_moe_backend
     assert installed.__globals__["_WEIGHT_PREPROCESSORS"].get("olmoe") is _olmoe_weight_preprocessor
     assert split.get_weight_preprocessor("olmoe") is _olmoe_weight_preprocessor
+
+
+# --- 5. A rejected forward patch must not record success (Codex review on #915): if
+#        patch_function returns False (e.g. signature drift in a future transformers),
+#        the sentinel must stay unset and the skip must be loudly diagnosable — a silent
+#        sentinel would leave the native forward installed and #850 crashing with no clue. ---
+
+@requires_fused_olmoe
+def test_rejected_patch_does_not_set_sentinel(monkeypatch, capsys):
+    import unsloth_zoo.temporary_patches.olmoe as olmoe_mod
+
+    monkeypatch.setattr(OlmoeExperts, "forward", OlmoeExperts.forward)
+    monkeypatch.setattr(OlmoeExperts, "_unsloth_already_patched", False, raising=False)
+    monkeypatch.setattr(olmoe_mod, "patch_function", lambda *a, **k: False)
+
+    olmoe_mod.patch_olmoe_moe()
+
+    assert not getattr(OlmoeExperts, "_unsloth_already_patched", False), (
+        "sentinel must not be set when patch_function rejects the patch"
+    )
+    err = capsys.readouterr().err
+    assert "#850" in err and "OlmoeExperts" in err
