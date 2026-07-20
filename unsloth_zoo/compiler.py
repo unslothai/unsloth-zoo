@@ -373,6 +373,95 @@ def replace_with_grouped_query_attention(module, source):
 pass
 
 
+
+
+def replace_sdpa_with_amd_aiter(source):
+    """
+    For AMD ROCm with amd-aiter installed: replace scaled_dot_product_attention
+    calls with amd-aiter's Flash Attention implementation in the compiled source.
+
+    amd-aiter uses full MFMA on both QK^T and P@V matrix multiplications,
+    plus a fast exp2-based softmax and causal tile skip — giving ~5-9x higher
+    TFLOPS than PyTorch SDPA for prefill workloads.
+
+    This function rewrites the source string so that the compiled model calls
+    aiter.flash_attn_func instead of torch.nn.functional.scaled_dot_product_attention.
+
+    Input/output conventions:
+    - transformers attention: q/k/v shape = (B, n_heads, S, D)  [B,H,S,D]
+    - aiter flash_attn_func:  q/k/v shape = (B, S, n_heads, D)  [B,S,H,D]
+    - So we must transpose 1↔2 before and after the aiter call.
+
+    Only activates on AMD ROCm when get_amd_attention_implementation() == "amd_aiter".
+    No-op on NVIDIA and on ROCm without amd-aiter or ROCm < 7.0.
+    """
+    if get_amd_attention_implementation() != "amd_aiter":
+        return source
+
+    # Pattern: capture the SDPA call and all its arguments
+    # Matches: attn_output = torch.nn.functional.scaled_dot_product_attention(
+    #              query_states, key_states, value_states,
+    #              attn_mask=..., dropout_p=..., is_causal=...
+    #          )
+    sdpa_call_pattern = (
+        r"([ 	]*)([A-Za-z_][A-Za-z0-9_]*)[ 	]*=[ 	]*"
+        r"(?:[A-Za-z_.]*scaled_dot_product_attention)"
+        r"\("
+        r"[ 	
+]*([A-Za-z_][A-Za-z0-9_]*)[ 	]*,"   # query
+        r"[ 	
+]*([A-Za-z_][A-Za-z0-9_]*)[ 	]*,"   # key
+        r"[ 	
+]*([A-Za-z_][A-Za-z0-9_]*)[ 	]*"    # value
+        r"([^)]*)\)"                                    # remaining args
+    )
+
+    import re
+
+    def aiter_replacement(m):
+        indent = m.group(1)
+        out_var = m.group(2)
+        q_var = m.group(3)
+        k_var = m.group(4)
+        v_var = m.group(5)
+        rest_args = m.group(6)
+
+        # Extract is_causal from rest_args (default False if not found)
+        causal_match = re.search(r"is_causal\s*=\s*(True|False|[A-Za-z_][A-Za-z0-9_]*)", rest_args)
+        is_causal = causal_match.group(1) if causal_match else "False"
+
+        # Build aiter call:
+        # aiter expects (B, S, H, D) but transformers uses (B, H, S, D) -> transpose 1,2
+        return (
+            f"{indent}# AMD aiter Flash Attention (MFMA + fast softmax + causal tile skip)
+"
+            f"{indent}# Requires: pip install amd-aiter  (ROCm >= 7.0)
+"
+            f"{indent}_aiter_q = {q_var}.transpose(1, 2)  # (B,H,S,D) -> (B,S,H,D)
+"
+            f"{indent}_aiter_k = {k_var}.transpose(1, 2)
+"
+            f"{indent}_aiter_v = {v_var}.transpose(1, 2)
+"
+            f"{indent}_aiter_fn = get_amd_flash_attn_func()
+"
+            f"{indent}if _aiter_fn is not None:
+"
+            f"{indent}    {out_var} = _aiter_fn(_aiter_q, _aiter_k, _aiter_v, causal={is_causal}).transpose(1, 2)
+"
+            f"{indent}else:
+"
+            f"{indent}    {out_var} = torch.nn.functional.scaled_dot_product_attention(
+"
+            f"{indent}        {q_var}, {k_var}, {v_var}{rest_args})"
+        )
+
+    new_source, n = re.subn(sdpa_call_pattern, aiter_replacement, source, flags=re.DOTALL)
+    if n > 0:
+        pass  # Successfully replaced SDPA with aiter
+    return new_source
+
+
 def _get_compile_folder(use_tempfile=False):
     global UNSLOTH_COMPILE_LOCATION
     global UNSLOTH_COMPILE_USE_TEMP
@@ -3809,6 +3898,8 @@ def unsloth_compile_transformers(
                 disabled_scaled_dot_product_attention_modules.append(module)
             pass
         pass
+        # AMD ROCm: replace SDPA with amd-aiter Flash Attention if available
+        new_source = replace_sdpa_with_amd_aiter(new_source)
         scaled_dot_product_attention_modules[module] = new_source
     pass
 
