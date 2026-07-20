@@ -169,6 +169,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
                 load_method = self._lora_model_cls.from_lora_tensors
                 kwargs["tensors"] = lora_request.lora_tensors
                 kwargs["device"] = None # Keep whatever the original device was
+                kwargs["weights_mapper"] = None
             else:
                 load_method = self._lora_model_cls.from_local_checkpoint
                 kwargs["lora_dir"] = lora_path
