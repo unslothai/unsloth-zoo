@@ -777,8 +777,15 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor"):
-            raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        # Accept image processors, audio-only processors (Qwen2-Audio, Voxtral,
+        # Granite-Speech, ... expose a feature_extractor but no image_processor),
+        # and combined vision+audio processors. Reject only a bare text tokenizer.
+        # feature_extractor is the same audio signal used by
+        # _fix_audio_feature_extractor_padding_side below.
+        if not hasattr(processor, "image_processor") and getattr(processor, "feature_extractor", None) is None:
+            raise TypeError(
+                "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
+            )
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
