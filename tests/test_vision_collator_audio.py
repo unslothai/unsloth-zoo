@@ -31,6 +31,12 @@ Hermetic CPU tests with stub processors, no model or network needed:
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
+from collections import UserDict
+
 import numpy as np
 import pytest
 import torch
@@ -478,3 +484,163 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
     assert clips[0].dtype == np.float32
     assert clips[0].dtype != object
     assert clips[0].ndim == 1
+
+
+# ---------------------------------------------------------------------------
+# Unpatched torchcodec AudioDecoder (unsloth/unsloth#7226, follow-up)
+#
+# UnslothVisionDataCollator is exported and can be driven on datasets >= 4
+# Audio() columns WITHOUT importing `unsloth` -- which is what applies
+# patch_torchcodec_audio_decoder() (unsloth/_gpu_init.py). An *unpatched* decoder
+# exposes only __getitem__ (no get/keys/__contains__), so a duck-typed gate alone
+# misses it and it reaches the feature extractor as an object array. The gate now
+# also matches the AudioDecoder type directly, and _resolve_audio_dict reads
+# values through _audio_get, which subscripts when .get is absent.
+#
+# In CI (no torchcodec) we stand a fake class in as the recognized decoder type by
+# patching _audio_decoder_types; the real-decoder variant runs in a fresh
+# subprocess because the monkey-patch mutates the class for the whole process.
+# ---------------------------------------------------------------------------
+
+
+class _UnpatchedFakeAudioDecoder:
+    """An *unpatched* datasets torchcodec AudioDecoder surface: only __getitem__,
+    none of the get/keys/__contains__/__iter__ methods the patch grafts."""
+
+    def __getitem__(self, key):
+        if key == "array":
+            return DECODED
+        if key == "sampling_rate":
+            return 16000
+        raise KeyError(key)
+
+
+@pytest.fixture
+def _recognize_unpatched_decoder(monkeypatch):
+    # Treat _UnpatchedFakeAudioDecoder as the torchcodec AudioDecoder type so these
+    # run in CI without datasets >= 4 / torchcodec installed.
+    monkeypatch.setattr(
+        "unsloth_zoo.vision_utils._audio_decoder_types",
+        lambda: (_UnpatchedFakeAudioDecoder,),
+    )
+
+
+def test_unpatched_decoder_is_recognized_by_type(_recognize_unpatched_decoder):
+    decoder = _UnpatchedFakeAudioDecoder()
+    # The premise: not a dict and none of the grafted mapping methods exist.
+    assert not isinstance(decoder, dict)
+    assert not hasattr(decoder, "get")
+    assert not hasattr(decoder, "keys")
+    assert _is_audio_mapping(decoder)
+
+
+def test_unpatched_decoder_top_level_gate(_recognize_unpatched_decoder):
+    collator = make_collator()
+    clips = collator._extract_audio_for_example(
+        {"audio": _UnpatchedFakeAudioDecoder()}, msgs({"type": "text", "text": "hi"})
+    )
+    assert len(clips) == 1
+    assert clips[0].dtype == np.float32
+    assert clips[0].dtype != object
+    np.testing.assert_allclose(clips[0], DECODED)
+
+
+def test_unpatched_decoder_list_gate(_recognize_unpatched_decoder):
+    # Also guards the flat-samples branch: a list of decoders is a list of clips.
+    collator = make_collator()
+    clips = collator._extract_audio_for_example(
+        {"audio": [_UnpatchedFakeAudioDecoder(), _UnpatchedFakeAudioDecoder()]},
+        msgs({"type": "text", "text": "hi"}),
+    )
+    assert len(clips) == 2
+    for clip in clips:
+        assert clip.dtype == np.float32
+        np.testing.assert_allclose(clip, DECODED)
+
+
+def test_unpatched_decoder_inline_gate(_recognize_unpatched_decoder):
+    out = extract_audio_info(msgs({"type": "audio", "audio": _UnpatchedFakeAudioDecoder()}))
+    assert len(out) == 1
+    assert out[0].dtype == np.float32
+    np.testing.assert_allclose(out[0], DECODED)
+
+
+def test_unpatched_decoder_sampling_rate_still_validated(_recognize_unpatched_decoder):
+    # Resolves via subscript through _resolve_audio_dict, so validation still fires.
+    with pytest.raises(ValueError, match="does not match the feature extractor"):
+        extract_audio_info(
+            msgs({"type": "audio", "audio": _UnpatchedFakeAudioDecoder()}), sampling_rate=24000
+        )
+
+
+class _NonCallableMappingAttrs:
+    """get / keys / __contains__ exist as attributes but are not callable."""
+
+    get = None
+    keys = None
+    __contains__ = None
+
+
+def test_non_callable_mapping_attrs_are_not_treated_as_mappings():
+    # hasattr would accept this and then fail later calling a None `.get`; the
+    # callable() gate rejects it up front instead.
+    assert not _is_audio_mapping(_NonCallableMappingAttrs())
+
+
+def test_userdict_audio_payload_resolves():
+    # A non-dict collections.abc.Mapping still routes through _resolve_audio_dict.
+    collator = make_collator()
+    clips = collator._extract_audio_for_example(
+        {"audio": UserDict({"array": DECODED, "sampling_rate": 16000})},
+        msgs({"type": "text", "text": "hi"}),
+    )
+    assert len(clips) == 1
+    np.testing.assert_allclose(clips[0], DECODED)
+
+
+def test_real_unpatched_decoder_decodes_in_fresh_process():
+    # Gold-standard: a REAL torchcodec AudioDecoder, never patched, decoded through
+    # the collator in a clean interpreter (the patch mutates the class globally, so
+    # this must not share a process with the patched real-decoder tests above).
+    pytest.importorskip("datasets", minversion="4.0.0")
+    pytest.importorskip("torchcodec")
+    code = textwrap.dedent(
+        """
+        import io, struct, wave
+        from types import SimpleNamespace
+        import numpy as np
+        from datasets.features._torchcodec import AudioDecoder
+        from unsloth_zoo.vision_utils import (
+            UnslothVisionDataCollator, _is_audio_mapping, extract_audio_info,
+        )
+
+        sr = 16000
+        samples = (0.3 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.25, sr // 4, endpoint=False))).astype(np.float32)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as h:
+            h.setnchannels(1); h.setsampwidth(2); h.setframerate(sr)
+            h.writeframes(b"".join(struct.pack("<h", int(s * 32767)) for s in samples))
+        def decoder():
+            return AudioDecoder(buf.getvalue())
+
+        assert not hasattr(decoder(), "get"), "decoder unexpectedly already patched"
+        assert _is_audio_mapping(decoder())
+
+        c = UnslothVisionDataCollator.__new__(UnslothVisionDataCollator)
+        c.processor = SimpleNamespace(feature_extractor=SimpleNamespace(sampling_rate=sr))
+        m = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        inline = [{"role": "user", "content": [{"type": "audio", "audio": decoder()}]}]
+        for clips in (
+            c._extract_audio_for_example({"audio": decoder()}, m),
+            c._extract_audio_for_example({"audio": [decoder()]}, m),
+            extract_audio_info(inline),
+        ):
+            assert clips[0].dtype == np.float32 and clips[0].dtype != object and clips[0].ndim == 1
+        print("OK")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=os.environ.copy()
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert result.stdout.strip().endswith("OK")

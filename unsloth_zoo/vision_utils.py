@@ -47,6 +47,7 @@ import time
 import warnings
 import os
 from functools import lru_cache
+from collections.abc import Mapping
 
 
 import requests
@@ -551,30 +552,64 @@ def _fix_audio_feature_extractor_padding_side(processor):
         feature_extractor.padding_side = "right"
 
 
-def _is_audio_mapping(audio):
+@lru_cache(maxsize=1)
+def _audio_decoder_types():
     # datasets >= 4 hands back torchcodec AudioDecoder objects for Audio() columns.
-    # patch_torchcodec_audio_decoder grafts the mapping protocol onto that class
-    # rather than making it a dict subclass, so isinstance(audio, dict) is False
-    # even though _resolve_audio_dict's `.get("array")` access works on it. Gating
-    # on isinstance alone therefore drops decoders into the raw-waveform catch-all,
-    # and they reach the feature extractor as an object array (see #7226). Match on
-    # the interface the patch actually grafts so the gates agree with the patch.
-    if isinstance(audio, dict):
+    # Recognize that class directly so the gates work whether or not
+    # patch_torchcodec_audio_decoder() has grafted the mapping protocol onto it:
+    # UnslothVisionDataCollator is exported and can be used without importing
+    # `unsloth` (which is what applies the patch, in unsloth/_gpu_init.py). An
+    # *unpatched* decoder exposes only __getitem__, so a duck-typed get/keys check
+    # misses it and it reaches the feature extractor as an object array (see #7226).
+    # Returns () when the optional dependency is unavailable (e.g. datasets < 4).
+    try:
+        from datasets.features._torchcodec import AudioDecoder
+    except (ImportError, AttributeError, RuntimeError):
+        return ()
+    return (AudioDecoder,)
+
+
+def _is_audio_mapping(audio):
+    # A value that _resolve_audio_dict can pull an "array"/"sampling_rate" out of:
+    # a genuine mapping (dict / UserDict / ...), a torchcodec AudioDecoder (patched
+    # or not), or a test double that grafts the same mapping protocol. Gating on
+    # isinstance(dict) alone drops decoders into the raw-waveform catch-all (#7226).
+    # The decoder type check covers the unpatched decoder; the callable duck-type
+    # fallback covers a patched decoder even where the class identity is not
+    # importable. callable() (not hasattr) avoids matching objects with a non-
+    # callable `get`/`keys` attribute.
+    if isinstance(audio, Mapping):
+        return True
+    if isinstance(audio, _audio_decoder_types()):
         return True
     return (
-        hasattr(audio, "get") and
-        hasattr(audio, "keys") and
-        hasattr(audio, "__contains__")
+        callable(getattr(audio, "get", None)) and
+        callable(getattr(audio, "keys", None)) and
+        callable(getattr(audio, "__contains__", None))
     )
+
+
+def _audio_get(audio, key, default=None):
+    # Mapping-style lookup that also works on an *unpatched* torchcodec AudioDecoder
+    # (only __getitem__, no .get). Genuine dicts and patched decoders keep using
+    # .get; the subscript fallback is reached only for the unpatched decoder, whose
+    # __getitem__ raises KeyError for anything other than "array"/"sampling_rate".
+    getter = getattr(audio, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return audio[key]
+    except (KeyError, TypeError, IndexError):
+        return default
 
 
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
-    _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
-    value = audio.get("array")
+    _check_audio_sampling_rate(_audio_get(audio, "sampling_rate"), sampling_rate)
+    value = _audio_get(audio, "array")
     if value is None:
-        value = audio.get("path") or audio.get("url")
+        value = _audio_get(audio, "path") or _audio_get(audio, "url")
     return value
 
 
