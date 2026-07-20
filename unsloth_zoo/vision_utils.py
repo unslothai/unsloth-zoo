@@ -551,6 +551,23 @@ def _fix_audio_feature_extractor_padding_side(processor):
         feature_extractor.padding_side = "right"
 
 
+def _is_audio_mapping(audio):
+    # datasets >= 4 hands back torchcodec AudioDecoder objects for Audio() columns.
+    # patch_torchcodec_audio_decoder grafts the mapping protocol onto that class
+    # rather than making it a dict subclass, so isinstance(audio, dict) is False
+    # even though _resolve_audio_dict's `.get("array")` access works on it. Gating
+    # on isinstance alone therefore drops decoders into the raw-waveform catch-all,
+    # and they reach the feature extractor as an object array (see #7226). Match on
+    # the interface the patch actually grafts so the gates agree with the patch.
+    if isinstance(audio, dict):
+        return True
+    return (
+        hasattr(audio, "get") and
+        hasattr(audio, "keys") and
+        hasattr(audio, "__contains__")
+    )
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
@@ -581,7 +598,7 @@ def extract_audio_info(
                     # Feature extractors also accept local paths and URLs as strings
                     if audio is None:
                         audio = ele.get("url") or ele.get("path")
-                    if isinstance(audio, dict):
+                    if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
@@ -1049,7 +1066,7 @@ class UnslothVisionDataCollator:
             # No usable top-level audio -> fall back to inline message content
             clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
-        elif isinstance(audio_val, dict):
+        elif _is_audio_mapping(audio_val):
             clip = _resolve_audio_dict(audio_val, target_sr)
             if clip is None:
                 raise ValueError(
@@ -1062,12 +1079,16 @@ class UnslothVisionDataCollator:
                 clips = []
             # A flat list of samples is one clip, not a list of clips
             # (strings are path/url clips, so they stay in the list-of-clips branch)
-            elif not isinstance(audio_val[0], (dict, list, tuple, str)) and getattr(audio_val[0], "ndim", 0) == 0:
+            elif (
+                not _is_audio_mapping(audio_val[0])
+                and not isinstance(audio_val[0], (list, tuple, str))
+                and getattr(audio_val[0], "ndim", 0) == 0
+            ):
                 clips = [audio_val]
             else:
                 clips = []
                 for clip in audio_val:
-                    if isinstance(clip, dict):
+                    if _is_audio_mapping(clip):
                         clip = _resolve_audio_dict(clip, target_sr)
                         if clip is None:
                             raise ValueError(

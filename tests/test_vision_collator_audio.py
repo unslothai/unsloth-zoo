@@ -38,6 +38,7 @@ import torch
 from unsloth_zoo.vision_utils import (
     UnslothVisionDataCollator,
     _fix_audio_feature_extractor_padding_side,
+    _is_audio_mapping,
     extract_audio_info,
 )
 
@@ -331,3 +332,149 @@ def test_truncation_cutting_audio_span_raises():
     }
     with pytest.raises(ValueError, match="audio tokens"):
         collator._truncate_sequence_tensors(batch, seq_len=6)
+
+
+# ---------------------------------------------------------------------------
+# datasets >= 4 torchcodec AudioDecoder columns (unsloth/unsloth#7226)
+#
+# patch_torchcodec_audio_decoder grafts the mapping protocol onto AudioDecoder
+# instead of making it a dict subclass, so the audio gates' isinstance(x, dict)
+# checks used to reject it and drop the decoder into the raw-waveform catch-all.
+# It then reached the feature extractor as an object array and blew up inside
+# np.fft.rfft. These cover all three gates.
+#
+# _FakeAudioDecoder mirrors the real class: __getitem__ plus exactly the methods
+# patch_torchcodec_audio_decoder grafts, not a dict subclass, and no ndim. These
+# tests run in CI. The real-decoder tests below need datasets >= 4 + torchcodec
+# and skip when either is missing.
+# ---------------------------------------------------------------------------
+
+DECODED = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
+
+
+class _FakeAudioDecoder:
+    """Same surface as a patched datasets.features._torchcodec.AudioDecoder."""
+
+    def __getitem__(self, key):
+        if key == "array":
+            return DECODED
+        if key == "sampling_rate":
+            return 16000
+        raise KeyError(key)
+
+    # exactly what patch_torchcodec_audio_decoder grafts
+    def __contains__(self, key):
+        return key in ("array", "sampling_rate")
+
+    def __iter__(self):
+        return iter(("array", "sampling_rate"))
+
+    def keys(self):
+        return ("array", "sampling_rate")
+
+    def get(self, key, default=None):
+        return self[key] if key in ("array", "sampling_rate") else default
+
+
+def test_fake_decoder_is_not_a_dict():
+    # The premise of the bug: the gates' isinstance check cannot see this object.
+    decoder = _FakeAudioDecoder()
+    assert not isinstance(decoder, dict)
+    assert _is_audio_mapping(decoder)
+
+
+def test_gate1_top_level_decoder_column_decoded():
+    collator = make_collator()
+    clips = collator._extract_audio_for_example({"audio": _FakeAudioDecoder()}, msgs({"type": "text", "text": "hi"}))
+    assert len(clips) == 1
+    assert clips[0].dtype == np.float32
+    assert clips[0].dtype != object
+    np.testing.assert_allclose(clips[0], DECODED)
+
+
+def test_gate2_list_of_decoders_is_list_of_clips():
+    # Guards the flat-samples branch too: a list of decoders must not be
+    # collapsed into a single clip.
+    collator = make_collator()
+    clips = collator._extract_audio_for_example(
+        {"audio": [_FakeAudioDecoder(), _FakeAudioDecoder()]}, msgs({"type": "text", "text": "hi"})
+    )
+    assert len(clips) == 2
+    for clip in clips:
+        assert clip.dtype == np.float32
+        np.testing.assert_allclose(clip, DECODED)
+
+
+def test_gate3_inline_decoder_message_content_decoded():
+    out = extract_audio_info(msgs({"type": "audio", "audio": _FakeAudioDecoder()}))
+    assert len(out) == 1
+    assert out[0].dtype == np.float32
+    np.testing.assert_allclose(out[0], DECODED)
+
+
+def test_decoder_sampling_rate_still_validated():
+    # The decoder must go through _resolve_audio_dict, not bypass its checks.
+    with pytest.raises(ValueError, match="does not match the feature extractor"):
+        extract_audio_info(msgs({"type": "audio", "audio": _FakeAudioDecoder()}), sampling_rate=24000)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.zeros(8, dtype=np.float32),          # bare ndarray
+        [0.0, 1.0, 2.0],                        # flat list
+        "clip.wav",                             # path string
+        torch.zeros(8),                         # torch tensor
+    ],
+)
+def test_non_mapping_audio_values_are_not_treated_as_mappings(value):
+    # The capability check is looser than isinstance; make sure the ordinary
+    # waveform/path payloads still fall through to their own branches.
+    assert not _is_audio_mapping(value)
+
+
+# --- the real decoder, when the optional deps are installed ----------------
+
+def _real_decoder():
+    datasets = pytest.importorskip("datasets", minversion="4.0.0")
+    pytest.importorskip("torchcodec")
+    try:
+        from datasets.features._torchcodec import AudioDecoder
+    except ImportError:
+        pytest.skip("datasets.features._torchcodec.AudioDecoder unavailable")
+
+    from unsloth_zoo.dataset_utils import patch_torchcodec_audio_decoder
+    patch_torchcodec_audio_decoder()
+
+    import io, struct, wave
+    sr = 16000
+    samples = (0.3 * np.sin(2 * np.pi * 440 * np.linspace(0, 0.25, sr // 4, endpoint=False))).astype(np.float32)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sr)
+        handle.writeframes(b"".join(struct.pack("<h", int(s * 32767)) for s in samples))
+    return AudioDecoder(buffer.getvalue())
+
+
+def test_real_decoder_is_not_a_dict_but_is_a_mapping():
+    decoder = _real_decoder()
+    assert not isinstance(decoder, dict)
+    assert _is_audio_mapping(decoder)
+
+
+@pytest.mark.parametrize("gate", ["top_level", "list", "inline"])
+def test_real_decoder_decodes_to_float32_at_every_gate(gate):
+    decoder = _real_decoder()
+    collator = make_collator()
+    if gate == "top_level":
+        clips = collator._extract_audio_for_example({"audio": decoder}, msgs({"type": "text", "text": "hi"}))
+    elif gate == "list":
+        clips = collator._extract_audio_for_example({"audio": [decoder]}, msgs({"type": "text", "text": "hi"}))
+    else:
+        clips = extract_audio_info(msgs({"type": "audio", "audio": decoder}))
+    assert len(clips) == 1
+    assert clips[0].dtype == np.float32
+    assert clips[0].dtype != object
+    assert clips[0].ndim == 1
