@@ -554,14 +554,9 @@ def _fix_audio_feature_extractor_padding_side(processor):
 
 @lru_cache(maxsize=1)
 def _audio_decoder_types():
-    # datasets >= 4 hands back torchcodec AudioDecoder objects for Audio() columns.
-    # Recognize that class directly so the gates work whether or not
-    # patch_torchcodec_audio_decoder() has grafted the mapping protocol onto it:
-    # UnslothVisionDataCollator is exported and can be used without importing
-    # `unsloth` (which is what applies the patch, in unsloth/_gpu_init.py). An
-    # *unpatched* decoder exposes only __getitem__, so a duck-typed get/keys check
-    # misses it and it reaches the feature extractor as an object array (see #7226).
-    # Returns () when the optional dependency is unavailable (e.g. datasets < 4).
+    # torchcodec AudioDecoder type (datasets >= 4 Audio() columns), matched
+    # directly so an unpatched decoder (only __getitem__) is still recognized.
+    # Returns () when datasets < 4 / the dep is unavailable. See #7226.
     try:
         from datasets.features._torchcodec import AudioDecoder
     except (ImportError, AttributeError, RuntimeError):
@@ -570,14 +565,10 @@ def _audio_decoder_types():
 
 
 def _is_audio_mapping(audio):
-    # A value that _resolve_audio_dict can pull an "array"/"sampling_rate" out of:
-    # a genuine mapping (dict / UserDict / ...), a torchcodec AudioDecoder (patched
-    # or not), or a test double that grafts the same mapping protocol. Gating on
-    # isinstance(dict) alone drops decoders into the raw-waveform catch-all (#7226).
-    # The decoder type check covers the unpatched decoder; the callable duck-type
-    # fallback covers a patched decoder even where the class identity is not
-    # importable. callable() (not hasattr) avoids matching objects with a non-
-    # callable `get`/`keys` attribute.
+    # True for anything _resolve_audio_dict can read "array"/"sampling_rate" from:
+    # a Mapping, a torchcodec AudioDecoder, or a duck-typed mapping. isinstance(dict)
+    # alone drops decoders into the raw-waveform catch-all (#7226). callable() (not
+    # hasattr) rejects objects with a non-callable get/keys.
     if isinstance(audio, Mapping):
         return True
     if isinstance(audio, _audio_decoder_types()):
@@ -590,10 +581,8 @@ def _is_audio_mapping(audio):
 
 
 def _audio_get(audio, key, default=None):
-    # Mapping-style lookup that also works on an *unpatched* torchcodec AudioDecoder
-    # (only __getitem__, no .get). Genuine dicts and patched decoders keep using
-    # .get; the subscript fallback is reached only for the unpatched decoder, whose
-    # __getitem__ raises KeyError for anything other than "array"/"sampling_rate".
+    # Mapping-style lookup that falls back to subscripting for an unpatched
+    # AudioDecoder (only __getitem__, no .get).
     getter = getattr(audio, "get", None)
     if callable(getter):
         return getter(key, default)

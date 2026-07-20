@@ -344,15 +344,10 @@ def test_truncation_cutting_audio_span_raises():
 # datasets >= 4 torchcodec AudioDecoder columns (unsloth/unsloth#7226)
 #
 # patch_torchcodec_audio_decoder grafts the mapping protocol onto AudioDecoder
-# instead of making it a dict subclass, so the audio gates' isinstance(x, dict)
-# checks used to reject it and drop the decoder into the raw-waveform catch-all.
-# It then reached the feature extractor as an object array and blew up inside
-# np.fft.rfft. These cover all three gates.
-#
-# _FakeAudioDecoder mirrors the real class: __getitem__ plus exactly the methods
-# patch_torchcodec_audio_decoder grafts, not a dict subclass, and no ndim. These
-# tests run in CI. The real-decoder tests below need datasets >= 4 + torchcodec
-# and skip when either is missing.
+# rather than subclassing dict, so the gates' isinstance(x, dict) checks rejected
+# it, dropped it into the raw-waveform catch-all and blew up inside np.fft.rfft.
+# _FakeAudioDecoder mirrors the patched surface and runs in CI; the real-decoder
+# tests below need datasets >= 4 + torchcodec and skip otherwise.
 # ---------------------------------------------------------------------------
 
 DECODED = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
@@ -368,7 +363,7 @@ class _FakeAudioDecoder:
             return 16000
         raise KeyError(key)
 
-    # exactly what patch_torchcodec_audio_decoder grafts
+    # the methods patch_torchcodec_audio_decoder grafts
     def __contains__(self, key):
         return key in ("array", "sampling_rate")
 
@@ -383,7 +378,7 @@ class _FakeAudioDecoder:
 
 
 def test_fake_decoder_is_not_a_dict():
-    # The premise of the bug: the gates' isinstance check cannot see this object.
+    # Premise of the bug: the gates' isinstance check cannot see this object.
     decoder = _FakeAudioDecoder()
     assert not isinstance(decoder, dict)
     assert _is_audio_mapping(decoder)
@@ -399,8 +394,7 @@ def test_gate1_top_level_decoder_column_decoded():
 
 
 def test_gate2_list_of_decoders_is_list_of_clips():
-    # Guards the flat-samples branch too: a list of decoders must not be
-    # collapsed into a single clip.
+    # A list of decoders must not be collapsed into a single clip.
     collator = make_collator()
     clips = collator._extract_audio_for_example(
         {"audio": [_FakeAudioDecoder(), _FakeAudioDecoder()]}, msgs({"type": "text", "text": "hi"})
@@ -434,8 +428,7 @@ def test_decoder_sampling_rate_still_validated():
     ],
 )
 def test_non_mapping_audio_values_are_not_treated_as_mappings(value):
-    # The capability check is looser than isinstance; make sure the ordinary
-    # waveform/path payloads still fall through to their own branches.
+    # Ordinary waveform/path payloads still fall through to their own branches.
     assert not _is_audio_mapping(value)
 
 
@@ -489,17 +482,13 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
 # ---------------------------------------------------------------------------
 # Unpatched torchcodec AudioDecoder (unsloth/unsloth#7226, follow-up)
 #
-# UnslothVisionDataCollator is exported and can be driven on datasets >= 4
-# Audio() columns WITHOUT importing `unsloth` -- which is what applies
-# patch_torchcodec_audio_decoder() (unsloth/_gpu_init.py). An *unpatched* decoder
-# exposes only __getitem__ (no get/keys/__contains__), so a duck-typed gate alone
-# misses it and it reaches the feature extractor as an object array. The gate now
-# also matches the AudioDecoder type directly, and _resolve_audio_dict reads
-# values through _audio_get, which subscripts when .get is absent.
-#
-# In CI (no torchcodec) we stand a fake class in as the recognized decoder type by
-# patching _audio_decoder_types; the real-decoder variant runs in a fresh
-# subprocess because the monkey-patch mutates the class for the whole process.
+# Driving the collator without importing `unsloth` skips
+# patch_torchcodec_audio_decoder(), leaving a decoder with only __getitem__ (no
+# get/keys/__contains__) that a duck-typed gate misses. The gate now matches the
+# AudioDecoder type directly and _audio_get subscripts when .get is absent.
+# In CI (no torchcodec) a fake stands in as the decoder type via _audio_decoder_types;
+# the real-decoder variant runs in a fresh subprocess since the patch mutates the
+# class process-wide.
 # ---------------------------------------------------------------------------
 
 
@@ -517,8 +506,7 @@ class _UnpatchedFakeAudioDecoder:
 
 @pytest.fixture
 def _recognize_unpatched_decoder(monkeypatch):
-    # Treat _UnpatchedFakeAudioDecoder as the torchcodec AudioDecoder type so these
-    # run in CI without datasets >= 4 / torchcodec installed.
+    # Treat _UnpatchedFakeAudioDecoder as the decoder type so these run in CI.
     monkeypatch.setattr(
         "unsloth_zoo.vision_utils._audio_decoder_types",
         lambda: (_UnpatchedFakeAudioDecoder,),
@@ -527,7 +515,7 @@ def _recognize_unpatched_decoder(monkeypatch):
 
 def test_unpatched_decoder_is_recognized_by_type(_recognize_unpatched_decoder):
     decoder = _UnpatchedFakeAudioDecoder()
-    # The premise: not a dict and none of the grafted mapping methods exist.
+    # Premise: not a dict and none of the grafted mapping methods exist.
     assert not isinstance(decoder, dict)
     assert not hasattr(decoder, "get")
     assert not hasattr(decoder, "keys")
@@ -546,7 +534,7 @@ def test_unpatched_decoder_top_level_gate(_recognize_unpatched_decoder):
 
 
 def test_unpatched_decoder_list_gate(_recognize_unpatched_decoder):
-    # Also guards the flat-samples branch: a list of decoders is a list of clips.
+    # A list of decoders is a list of clips.
     collator = make_collator()
     clips = collator._extract_audio_for_example(
         {"audio": [_UnpatchedFakeAudioDecoder(), _UnpatchedFakeAudioDecoder()]},
@@ -582,8 +570,7 @@ class _NonCallableMappingAttrs:
 
 
 def test_non_callable_mapping_attrs_are_not_treated_as_mappings():
-    # hasattr would accept this and then fail later calling a None `.get`; the
-    # callable() gate rejects it up front instead.
+    # callable() gate rejects this up front (hasattr would accept, then fail on None .get).
     assert not _is_audio_mapping(_NonCallableMappingAttrs())
 
 
@@ -599,9 +586,9 @@ def test_userdict_audio_payload_resolves():
 
 
 def test_real_unpatched_decoder_decodes_in_fresh_process():
-    # Gold-standard: a REAL torchcodec AudioDecoder, never patched, decoded through
-    # the collator in a clean interpreter (the patch mutates the class globally, so
-    # this must not share a process with the patched real-decoder tests above).
+    # A REAL, never-patched torchcodec AudioDecoder through the collator in a clean
+    # interpreter (the patch mutates the class globally, so it can't share a process
+    # with the patched real-decoder tests above).
     pytest.importorskip("datasets", minversion="4.0.0")
     pytest.importorskip("torchcodec")
     code = textwrap.dedent(
