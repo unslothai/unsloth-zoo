@@ -3702,15 +3702,19 @@ class MLXTrainer:
                 else None
             )
             if args.streaming:
-                if _validate_streaming_prefetch(
+                vlm_prefetch_depth = _validate_streaming_prefetch(
                     getattr(args, "streaming_prefetch_batches", 0)
-                ) and not getattr(self, "_mlx_prefetch_vlm_notice", False):
-                    self._mlx_prefetch_vlm_notice = True
-                    if getattr(self, "_distributed_is_main_process", True):
-                        print(
-                            "Unsloth: streaming_prefetch_batches does not "
-                            "cover VLM streams yet; continuing synchronously."
-                        )
+                )
+                if vlm_prefetch_depth and self.distributed_world_size > 1:
+                    if not getattr(self, "_mlx_prefetch_ddp_notice", False):
+                        self._mlx_prefetch_ddp_notice = True
+                        if getattr(self, "_distributed_is_main_process", True):
+                            print(
+                                "Unsloth: streaming_prefetch_batches is "
+                                "single-process only; continuing "
+                                "synchronously under DDP."
+                            )
+                    vlm_prefetch_depth = 0
                 vlm_lazy = not _vlm_has_sized_index_space(train_dataset)
                 if vlm_lazy and self.distributed_world_size > 1:
                     raise ValueError(
@@ -3751,6 +3755,13 @@ class MLXTrainer:
                         )
                     vlm_expected_rows = declared
                     vlm_require_replayable = True
+                self._mlx_prefetch_control = {
+                    "eligible": bool(vlm_prefetch_depth and vlm_lazy),
+                }
+                vlm_resume_skip = (
+                    int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
+                    * args.gradient_accumulation_steps
+                )
                 return None, iterate_vlm_training_batches(
                     dataset=train_dataset,
                     processor=processor,
@@ -3766,6 +3777,12 @@ class MLXTrainer:
                     comm_group=comm_group,
                     require_replayable=vlm_require_replayable,
                     expected_rows_per_pass=vlm_expected_rows,
+                    prefetch_batches=vlm_prefetch_depth if vlm_lazy else 0,
+                    prefetch_skip_batches=(
+                        vlm_resume_skip
+                        if vlm_prefetch_depth and vlm_lazy else 0
+                    ),
+                    prefetch_control=self._mlx_prefetch_control,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None

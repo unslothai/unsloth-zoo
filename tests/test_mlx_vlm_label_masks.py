@@ -1034,37 +1034,20 @@ def test_vlm_sized_index_routing_guard_and_cleanup():
         def __getitem__(self, idx): return self.rows[idx]
         def __iter__(self): return iter(self.rows)
 
-    def _vlm_trainer_shell(world_size, dataset):
-        import types as _types
-        from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
-        trainer = MLXTrainer.__new__(MLXTrainer)
-        trainer.args = MLXTrainingConfig(
-            per_device_train_batch_size=1, max_seq_length=8, streaming=True,
-        )
-        trainer.model = _types.SimpleNamespace(_config={})
-        trainer.tokenizer = _FakeProcessor()
-        trainer.processor = trainer.tokenizer
-        trainer.train_dataset = dataset
-        trainer._batches = None
-        trainer.formatting_func = None
-        trainer._distributed_initialized = True
-        trainer._distributed_world = None
-        trainer._distributed_world_size = world_size
-        return trainer
 
     # Trainer seam: a sized iterable-map hybrid must pass the DDP gate and
     # batch via the sized path...
-    sized_trainer = _vlm_trainer_shell(2, SizedIterableMap())
+    sized_trainer = _vlm_trainer_shell_for(world_size=2, dataset=SizedIterableMap())
     _batches, sized_stream = sized_trainer._prepare_data(is_vlm=True)
     assert next(sized_stream)["input_ids"].shape[0] == 1
-    knob_trainer = _vlm_trainer_shell(1, SizedIterableMap())
+    knob_trainer = _vlm_trainer_shell_for(world_size=1, dataset=SizedIterableMap())
     knob_trainer.args.streaming_prefetch_batches = 1
     _b2, s2 = knob_trainer._prepare_data(is_vlm=True)  # notice path must not crash
     assert next(s2)["input_ids"].shape[0] == 1
     # ...while a genuinely unsized source is rejected before consumption.
     lazy_probe = _LifecycleVLMRows(4)
     with pytest.raises(ValueError, match="DDP training"):
-        _vlm_trainer_shell(2, lazy_probe)._prepare_data(is_vlm=True)
+        _vlm_trainer_shell_for(world_size=2, dataset=lazy_probe)._prepare_data(is_vlm=True)
     assert lazy_probe.pulls == 0 and lazy_probe.epochs == []
 
     with pytest.raises(ValueError, match="__len__ and __getitem__"):
@@ -1249,3 +1232,77 @@ def test_vlm_host_label_authority_and_staged_finalize():
         [{"text": "101"}], WideProcessor(), {}, 8, None,
         response_mask_fn=identity_closure)
     assert seen["first"] == 2**32 - 100
+
+
+def _vlm_trainer_shell_for(dataset, world_size=1, prefetch=0):
+    import types as _types
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        per_device_train_batch_size=1, max_seq_length=8, streaming=True,
+        streaming_prefetch_batches=prefetch,
+    )
+    trainer.model = _types.SimpleNamespace(_config={})
+    trainer.tokenizer = _FakeProcessor()
+    trainer.processor = trainer.tokenizer
+    trainer.train_dataset = dataset
+    trainer.formatting_func = None
+    trainer._batches = None
+    trainer._distributed_initialized = True
+    trainer._distributed_world = None
+    trainer._distributed_world_size = world_size
+    return trainer
+
+
+def test_vlm_prefetch_identity_laziness_and_masked_rejection():
+    from unsloth_zoo.mlx.utils import iterate_vlm_training_batches
+
+    class ContentProcessor(_FakeProcessor):
+        """Encodes each row's text so batch content tracks source order."""
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            ids = np.asarray(out["input_ids"]).copy()
+            for row, value in enumerate(text):
+                ids[row, 0] = int(str(value).split()[0])
+            out["input_ids"] = ids
+            return out
+
+    def stream(source, **kwargs):
+        return iterate_vlm_training_batches(
+            dataset=source, processor=ContentProcessor(), config={},
+            batch_size=2, max_seq_length=8, **kwargs)
+
+    sync = [b["input_ids"].tolist()
+            for b in (lambda it: [next(it) for _ in range(4)])(
+                iter(stream(_LifecycleVLMRows(6))))]
+    assert sync[0] != sync[1]  # content varies with source rows
+    control = {}
+    prefetched_iter = iter(stream(_LifecycleVLMRows(6), prefetch_batches=2,
+                                  prefetch_control=control))
+    prefetched = [next(prefetched_iter)["input_ids"].tolist() for _ in range(4)]
+    assert prefetched == sync  # bit-for-bit consumer-visible sequence
+    assert control["prefetcher"].close()
+
+    # Trainer wiring: eligibility, control registration, and cleanup.
+    shell_probe = _LifecycleVLMRows(6)
+    trainer = _vlm_trainer_shell_for(shell_probe, prefetch=2)
+    _b, shell_stream = trainer._prepare_data(is_vlm=True)
+    assert trainer._mlx_prefetch_control.get("eligible") is True
+    assert next(iter(shell_stream))["input_ids"].shape[0] == 1
+    shell_pf = trainer._mlx_prefetch_control.get("prefetcher")
+    assert shell_pf is not None
+    trainer._active_batch_iter = shell_stream
+    trainer._close_active_batch_iterator()
+    assert trainer._mlx_prefetch_control.get("prefetcher") is None
+
+    probe = _LifecycleVLMRows(6)
+    lazy = iter(stream(probe, prefetch_batches=2))
+    assert probe.pulls == 0  # construction-lazy at P>0
+    next(lazy)
+    assert probe.pulls >= 2
+
+    masked_probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        next(iter(stream(masked_probe, prefetch_batches=1,
+                         response_mask_fn=lambda b: {"labels": b["input_ids"]})))
+    assert masked_probe.pulls == 0 and masked_probe.epochs == []

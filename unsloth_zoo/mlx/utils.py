@@ -5111,7 +5111,10 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   completion_only_loss=None,
                                   image_size=None, comm_group=None,
                                   require_replayable=False,
-                                  expected_rows_per_pass=None):
+                                  expected_rows_per_pass=None,
+                                  prefetch_batches=0,
+                                  prefetch_skip_batches=0,
+                                  prefetch_control=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -5221,6 +5224,42 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     )
             epoch += 1
     else:
+        prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
+        if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
+            # The shared prefetch producer generalizes over host-staged
+            # batches; the VLM finalizer converts on the consumer thread.
+            # Response-masked streams reject at the iterator entry
+            # (zero-touch).
+            prefetcher = _LazyTextPrefetcher(
+                None,
+                prefetch_depth,
+                skip_batches=prefetch_skip_batches,
+                finalize=_finalize_vlm_batch,
+            )
+            prefetcher._make_iterator = (
+                lambda pf=prefetcher: _iterate_lazy_vlm_training_batches(
+                    dataset, processor, config, batch_size, max_seq_length,
+                    response_mask_fn=response_mask_fn,
+                    formatting_func=formatting_func,
+                    dataset_order=dataset_order,
+                    completion_only_loss=completion_only_loss,
+                    image_size=image_size,
+                    comm_group=None,
+                    require_replayable=require_replayable,
+                    expected_rows_per_pass=expected_rows_per_pass,
+                    ignore_token_ids=ignore_token_ids,
+                    yield_host_staged=True,
+                    reject_mlx_valued=True,
+                    should_stop=pf._stop.is_set,
+                )
+            )
+            if prefetch_control is not None:
+                prefetch_control["prefetcher"] = prefetcher
+            try:
+                yield from prefetcher
+            finally:
+                prefetcher.close()
+            return
         yield from _iterate_lazy_vlm_training_batches(
             dataset, processor, config, batch_size, max_seq_length,
             response_mask_fn=response_mask_fn,
