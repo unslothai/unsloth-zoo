@@ -4536,7 +4536,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     each encoded row. Default True preserves the pre-PR behavior that
     delegated EOS appending to ``mlx_lm.tuner.datasets.TextDataset`` for
     direct MLX text fine-tuning callers (raw ``{"text": str}`` rows
-    without already-rendered EOS). Studio passes False because its
+    without already-rendered EOS). Unsloth passes False because its
     chat-template rendering already includes EOS.
 
     Returns:
@@ -4583,7 +4583,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
 
     class _StudioTextDataset:
         """TextDataset variant. Optionally appends EOS (mlx-lm parity);
-        Studio passes append_eos=False because chat templates already render it."""
+        Unsloth passes append_eos=False because chat templates already render it."""
 
         def __init__(self, data, tokenizer, text_key="text", eos_id=None):
             self._data = data
@@ -4950,7 +4950,7 @@ def _torch_randperm_order(length, seed):
     except Exception as exc:
         raise ImportError(
             "Unsloth MLX: dataset_order='torch_randperm' requires torch so MLX "
-            "Studio can mirror CUDA Studio batch order."
+            "Unsloth can mirror CUDA Unsloth batch order."
         ) from exc
     generator = torch.Generator()
     generator.manual_seed(3407 if seed is None else int(seed))
@@ -4967,7 +4967,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            comm_group=None):
     """Create text batches with an explicit dataset order.
 
-    Studio uses this to mirror CUDA's effective sampler stream without
+    Unsloth uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
 
     In DDP, ``batch_size`` remains local to each rank. ``comm_group`` expands
@@ -5542,7 +5542,7 @@ def save_trainable_adapters(model, path, adapter_config=None):
 
     Includes all LoRA adapter tensors (frozen or not). Excludes wrapped
     base weights INSIDE a LoRA module (reload-leaked state that would
-    reintroduce the original Studio adapter-export bloat).
+    reintroduce the original Unsloth adapter-export bloat).
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
@@ -7246,20 +7246,13 @@ def save_pretrained_gguf(
                     f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
                 )
 
-        # Strip MTP/nextn config keys so llama.cpp converter
-        # doesn't inflate block_count / inject nextn_predict_layers.
-        # Also restore architectures from the original HF config since
-        # mlx-vlm's save_config strips that key.
+        # Restore architectures from the original HF config since mlx-vlm's
+        # save_config strips that key. convert_to_gguf reconciles MTP metadata
+        # with the exported tensor names for every save path.
         _config_path = tmp_path / "config.json"
         if _config_path.exists():
             _cfg = json.loads(_config_path.read_text())
             _changed = False
-            for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
-                if _cfg.pop(_key, None) is not None:
-                    _changed = True
-                _tc = _cfg.get("text_config")
-                if _tc and _tc.pop(_key, None) is not None:
-                    _changed = True
             # Restore architectures from the original HF config
             if "architectures" not in _cfg:
                 _orig_cfg_path = getattr(tokenizer, "name_or_path", None)

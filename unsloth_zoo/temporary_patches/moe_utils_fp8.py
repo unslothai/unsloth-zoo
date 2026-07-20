@@ -431,7 +431,7 @@ def _prepare_scaled_grouped_mm_weight(experts_module, param_name: str, proj_type
     weight, quant_state, quant_kind = _get_moe_weight_and_quant_info(experts_module, param_name)
     if not _is_float8_tensor(weight):
         return None
-    processed_weight = preprocess_weight(weight, proj_type, hidden_dim, model_type)
+    processed_weight = preprocess_weight(weight, proj_type, hidden_dim, model_type, experts_module=experts_module)
     processed_weight = _make_grouped_mm_rhs_column_major(processed_weight)
     scale = _extract_scaled_grouped_mm_weight_scale(weight, processed_weight, quant_state, quant_kind)
     if scale is None:

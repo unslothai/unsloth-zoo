@@ -4803,7 +4803,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
             combined_score = calculate_combined_score(3.0, chunk_size)
 
             suitable_strategies.append({
-                'device_type': 'cuda',
+                'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
                 'device_id': gpu['device_id'],
                 'rows_per_chunk': chunk_size,
                 'available_memory': gpu['free'] * GPU_SAFETY_FACTOR,
@@ -4877,7 +4877,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     # Add GPU fallbacks
     for gpu in stats['gpus']:
         fallback_options.append({
-            'device_type': 'cuda',
+            'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
             'device_id': gpu['device_id'],
             'available': gpu['free'] * GPU_SAFETY_FACTOR,
             'total_available': gpu['free']

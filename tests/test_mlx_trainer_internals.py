@@ -555,7 +555,7 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
 
 
 def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
-    """Studio formatting owns EOS decisions; MLX batching must not add one."""
+    """Unsloth formatting owns EOS decisions; MLX batching must not add one."""
     import sys
 
     class CacheDataset:
@@ -586,7 +586,7 @@ def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
             assert text == "hello"
             return [1, 2, 3]
 
-    # append_eos=False is what Studio passes (chat-template renders EOS).
+    # append_eos=False is what Unsloth passes (chat-template renders EOS).
     dataset = _prepare_dataset([{"text": "hello"}], Tokenizer(), append_eos=False)
     assert dataset[0] == ([1, 2, 3], 0)
 

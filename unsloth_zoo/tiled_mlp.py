@@ -63,6 +63,30 @@ def get_max_flat_qlen(
     return max_flat_qlen
 pass
 
+
+def _default_target_gb():
+    # Size the tile memory budget from the free memory actually available on the
+    # current backend, so a device with little memory left does not pick chunks
+    # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
+    if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+        # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
+        return torch.cuda.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+    if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
+        # Lunar Lake). When the accelerator cannot report free memory, use a small
+        # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
+        try:
+            return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+        except Exception:
+            return 4.0
+    # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1024 / 1024 / 1024 * 0.5
+    except Exception:
+        return 4.0
+pass
+
 class TiledMLP(torch.autograd.Function):
     @staticmethod
     def handle_output(output, extra_lists):
@@ -221,10 +245,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             intermediate_size = hd * 4
 
         if target_gb is None:
-            free, total = torch.cuda.mem_get_info(0)
-            free_gb = free / 1024 / 1024 / 1024
-            free_gb = free_gb * 0.5
-            target_gb = free_gb
+            target_gb = _default_target_gb()
 
         max_flat_qlen = get_max_flat_qlen(
             hd = hd,
