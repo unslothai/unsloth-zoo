@@ -25,6 +25,7 @@ and merged models (safetensors, GGUF, HuggingFace Hub).
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
+import collections
 import copy
 import inspect
 import importlib
@@ -615,18 +616,134 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     return _run_hidden_stack(tm, inputs, inputs_embeds=inputs_embeds, **kwargs)
 
 
-def _get_lm_head_layer(model):
-    """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
+OutputHeadDescriptor = collections.namedtuple(
+    "OutputHeadDescriptor",
+    ["module", "path", "status", "has_additive_bias", "quantized",
+     "wrapper_type", "raw", "candidate_module", "candidate_path"],
+)
 
-    Prefers a separate lm_head (untied models like Qwen), else falls back to
-    embed_tokens (tied models like Gemma/Llama). Returns the layer object (not
-    its weight) so callers can read .weight/.scales/.biases/.group_size/.bits.
+_RAW_HEAD_TYPES = (nn.Linear, nn.QuantizedLinear, nn.Embedding, nn.QuantizedEmbedding)
+
+
+def _unique_child_of_type(owner, types):
+    """(name, module) of the unique direct child whose type is exactly in
+    ``types``; None when absent, ambiguous, or not a module tree."""
+    children = getattr(owner, "children", None)
+    if not callable(children):
+        return None
+    found = [(n, c) for n, c in children().items() if type(c) in types]
+    return found[0] if len(found) == 1 else None
+
+
+def _embedding_dims(emb):
+    """Semantic (vocab, hidden). QuantizedEmbedding packs its weight, so read
+    the stored attributes instead of the array shape."""
+    if type(emb) is nn.QuantizedEmbedding:
+        return int(emb.num_embeddings), int(emb.dims)
+    return int(emb.weight.shape[0]), int(emb.weight.shape[1])
+
+
+def _linear_semantic_dims(layer):
+    out_dim, in_dim = int(layer.weight.shape[0]), int(layer.weight.shape[1])
+    if type(layer) is nn.QuantizedLinear:
+        in_dim = in_dim * 32 // int(layer.bits)
+    return out_dim, in_dim
+
+
+def _resolve_module_path(model, path):
+    obj = model
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def describe_output_head(model):
+    """Resolve the live output head with affirmative evidence only: a True
+    tie flag, a real ``lm_head``, or (only when no flag attribute exists) an
+    unconditional ``embed_tokens.as_linear`` forward route. Missing ``lm_head``
+    never implies tying; conflicting flags fail closed. ``path`` is rooted at
+    the argument (VLM wrappers keep the ``language_model.`` prefix); at
+    unknown status ``candidate_*`` carry the unique shape-matched child.
     """
+    prefix = "language_model." if hasattr(model, "language_model") else ""
     tm = _get_text_model(model)
-    if hasattr(tm, "lm_head") and tm.lm_head is not None:
+    backbone = getattr(tm, "model", None)
+    if backbone is not None:
+        emb_owner, emb_prefix = backbone, prefix + "model."
+    else:
+        emb_owner, emb_prefix = tm, prefix
+    emb_entry = _unique_child_of_type(emb_owner, (nn.Embedding, nn.QuantizedEmbedding))
+
+    flags, flag_attr_present = [], False
+    for holder in (tm, getattr(tm, "args", None)):
+        if holder is None or not hasattr(holder, "tie_word_embeddings"):
+            continue
+        flag_attr_present = True
+        value = holder.tie_word_embeddings
+        if isinstance(value, bool):
+            flags.append(value)
+    conflicting = len(flags) == 2 and flags[0] != flags[1]
+
+    head, path, status = None, None, "unknown"
+    if conflicting:
+        pass
+    elif flags and flags[0] and emb_entry is not None:
+        head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+    elif getattr(tm, "lm_head", None) is not None:
+        head, path, status = tm.lm_head, prefix + "lm_head", "untied"
+    elif backbone is not None and getattr(backbone, "lm_head", None) is not None:
+        head, path, status = backbone.lm_head, prefix + "model.lm_head", "untied"
+    elif not flag_attr_present and emb_entry is not None:
+        try:
+            source = inspect.getsource(type(tm).__call__)
+        except (OSError, TypeError):
+            source = ""
+        if "embed_tokens.as_linear" in source:
+            head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+
+    candidate, candidate_path = None, None
+    if status == "unknown" and emb_entry is not None:
+        vocab, hidden = _embedding_dims(emb_entry[1])
+        owners = [(tm, prefix)]
+        if backbone is not None:
+            owners.append((backbone, prefix + "model."))
+        matches, seen = [], set()
+        for owner, owner_prefix in owners:
+            for name, child in (owner.children() if callable(getattr(owner, "children", None)) else {}).items():
+                if id(child) in seen:
+                    continue
+                seen.add(id(child))
+                if (type(child) in (nn.Linear, nn.QuantizedLinear)
+                        and _linear_semantic_dims(child) == (vocab, hidden)):
+                    matches.append((owner_prefix + name, child))
+        if len(matches) == 1:
+            candidate_path, candidate = matches[0]
+
+    target = head if head is not None else candidate
+    return OutputHeadDescriptor(
+        module=head,
+        path=path,
+        status=status,
+        has_additive_bias=(target is not None and "bias" in target),
+        quantized=(target is not None and hasattr(target, "scales")),
+        wrapper_type=(type(target) if target is not None else None),
+        raw=(target is not None and type(target) in _RAW_HEAD_TYPES),
+        candidate_module=candidate,
+        candidate_path=candidate_path,
+    )
+
+
+def _get_lm_head_layer(model):
+    """The affirmatively resolved output head (see describe_output_head),
+    with the historical lookup preserved for unresolved topologies."""
+    desc = describe_output_head(model)
+    if desc.module is not None:
+        return desc.module
+    tm = _get_text_model(model)
+    if getattr(tm, "lm_head", None) is not None:
         return tm.lm_head
     backbone = getattr(tm, "model", tm)
-    if hasattr(backbone, "lm_head") and backbone.lm_head is not None:
+    if getattr(backbone, "lm_head", None) is not None:
         return backbone.lm_head
     return backbone.embed_tokens
 
@@ -749,13 +866,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
 
-    _has_wrapper = hasattr(model, "language_model")
-    tm = _get_text_model(model)
-    backbone = getattr(tm, "model", None)
-    _has_lm_head = (
-        (hasattr(tm, "lm_head") and tm.lm_head is not None)
-        or (backbone is not None and hasattr(backbone, "lm_head") and backbone.lm_head is not None)
-    )
+    _head_path = describe_output_head(model).path
 
     def _get_backbone(model):
         """Get backbone (for hidden states) from the live model tree."""
@@ -763,18 +874,9 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
 
     def _get_lm_weight_layer(model):
         """Get LM head or embed_tokens layer from the live model tree."""
-        if _has_wrapper:
-            tm = model.language_model
-        else:
-            tm = model
-        if _has_lm_head:
-            if hasattr(tm, "lm_head") and tm.lm_head is not None:
-                return tm.lm_head
-            backbone = getattr(tm, "model", tm)
-            if hasattr(backbone, "lm_head") and backbone.lm_head is not None:
-                return backbone.lm_head
-        backbone = getattr(tm, "model", tm)
-        return backbone.embed_tokens
+        if _head_path is not None:
+            return _resolve_module_path(model, _head_path)
+        return _get_lm_head_layer(model)
 
     if use_quantized:
         # Backstop: quantized CCE backward zeros the weight gradient
@@ -2222,6 +2324,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
     use_quantized = _is_quantized_layer(lm_layer)
+    _head_path = describe_output_head(model).path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
@@ -2265,7 +2368,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            lm_head = _get_lm_head_layer(model)
+            lm_head = _resolve_module_path(model, _head_path) if _head_path is not None else _get_lm_head_layer(model)
             w = lm_head.weight
             sc = lm_head.scales
             bi = getattr(lm_head, "biases", None)
@@ -2296,7 +2399,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = _get_lm_head_layer(model).weight
+            w = (_resolve_module_path(model, _head_path) if _head_path is not None else _get_lm_head_layer(model)).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))

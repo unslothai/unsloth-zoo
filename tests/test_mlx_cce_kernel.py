@@ -328,3 +328,64 @@ def _no_warning():
     return contextlib.nullcontext()
 
 
+_UNSET = object()
+
+
+def _lm(nn, tied_flag=_UNSET, args_flag=_UNSET, head=None, emb_name="embed_tokens",
+        alt=None, call_src="plain"):
+    class _Backbone(nn.Module):
+        pass
+
+    backbone = _Backbone()
+    setattr(backbone, emb_name, nn.Embedding(96, 32))
+    if alt is not None:
+        setattr(backbone, alt, nn.Linear(32, 96, bias=False))
+
+    if call_src == "as_linear":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return self.model.embed_tokens.as_linear(x)
+    else:
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return x
+
+    lm = _LM()
+    lm.model = backbone
+    if tied_flag is not _UNSET:
+        lm.tie_word_embeddings = tied_flag
+    if args_flag is not _UNSET:
+        lm.args = type("A", (), {})()
+        lm.args.tie_word_embeddings = args_flag
+    if head is not None:
+        lm.lm_head = head
+    return lm
+
+
+def test_describe_output_head_evidence_ladder():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    rows = [
+        # (model, status, path, candidate_path)
+        (_lm(nn, head=nn.Linear(32, 96, bias=False)), "untied", "lm_head", None),
+        # Helium-style dead lm_head + True flag -> tied via embedding
+        (_lm(nn, args_flag=True, head=nn.Linear(32, 96, bias=False)),
+         "tied", "model.embed_tokens", None),
+        # flag False blocks source evidence; alt head -> candidate
+        (_lm(nn, tied_flag=False, alt="output", call_src="as_linear"),
+         "unknown", None, "model.output"),
+        # Conflicting flags fail closed; the head surfaces as an exclusion
+        # candidate (identity, not proof of tying)
+        (_lm(nn, tied_flag=True, args_flag=False, head=nn.Linear(32, 96, bias=False)),
+         "unknown", None, "lm_head"),
+        # No flag: unconditional as_linear source evidence -> tied
+        (_lm(nn, call_src="as_linear"), "tied", "model.embed_tokens", None),
+        # GPT-NeoX embed_in/embed_out shapes -> alt-name candidate
+        (_lm(nn, emb_name="embed_in", alt="embed_out"), "unknown", None, "model.embed_out"),
+    ]
+    for i, (model, status, path, cand) in enumerate(rows):
+        d = U.describe_output_head(model)
+        assert (d.status, d.path, d.candidate_path) == (status, path, cand), (i, d)
+
+
