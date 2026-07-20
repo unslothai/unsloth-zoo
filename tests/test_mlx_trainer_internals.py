@@ -2690,3 +2690,23 @@ def test_prefetcher_lifecycle_quiescence_orphan_and_positioned_error():
     with pytest.raises(RuntimeError, match="late tokenizer failure"):
         next(boom)
     boom.close()
+
+
+def test_lazy_text_producer_rejects_mlx_valued_rows_before_parsing():
+    """Raw rows / formatter results carrying MLX values reject actionably
+    before any truthiness probe or parsing can evaluate them off-thread."""
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+
+    def _reject_probe(row=None, formatting_func=None):
+        def _src():
+            yield row if row is not None else {"text": "hello"}
+        with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+            next(_iterate_lazy_text_training_batches(
+                _src(), None, 1, 32, formatting_func=formatting_func,
+                yield_host_staged=True, reject_mlx_valued=True))
+
+    _reject_probe({"text": mx.array([1, 2])})
+    _reject_probe({"messages": mx.array([1, 2])})
+    _reject_probe(formatting_func=lambda item: {"text": mx.array([3, 4])})

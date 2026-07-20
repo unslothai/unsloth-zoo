@@ -2609,6 +2609,14 @@ def _materialize_mlx_values(*trees):
         mx.eval(*arrays)
 
 
+def _reject_mlx_valued_text(context):
+    raise ValueError(
+        f"Unsloth MLX text: {context} carried MLX-array values; the prefetch "
+        "producer must not convert MLX values off the consumer thread. Use "
+        "streaming_prefetch_batches=0 for this stream."
+    )
+
+
 def _guard_host_token_output(value, state, context):
     """Record/reject an MLX-valued tokenizer or template output pre-conversion."""
     if state is not None and _contains_mlx_values(value):
@@ -6072,6 +6080,7 @@ def _iter_lazy_tokenized_text_rows(
 ):
     """Normalize an unsized source one row at a time and lock its schema."""
     state = {} if state is None else state
+    reject_rows = bool(state.get("reject_mlx_valued"))
     eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
     saw_usable_this_pass = False
     completion_labels_seen_this_pass = False
@@ -6157,6 +6166,10 @@ def _iter_lazy_tokenized_text_rows(
         return () if label_owned else None
 
     for item in dataset:
+        if reject_rows and _contains_mlx_values(item):
+            # Rows carrying MLX arrays must reject before any parsing,
+            # truthiness probe, or formatter call can touch them off-thread.
+            _reject_mlx_valued_text("the dataset row")
         item_has_completion_boundary = (
             isinstance(item, Mapping)
             and "prompt" in item
@@ -6188,6 +6201,9 @@ def _iter_lazy_tokenized_text_rows(
             state["assistant_source_checked"] = True
         if formatting_func is not None and not source_has_input_ids:
             formatted = formatting_func(item)
+            if reject_rows and _contains_mlx_values(formatted):
+                # Formatters can introduce MLX values after the row scan.
+                _reject_mlx_valued_text("the formatting function")
             formatter_applied = True
             formatter_needs_completion_boundary = (
                 completion_only_loss is None
