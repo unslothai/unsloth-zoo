@@ -51,6 +51,8 @@ def _make_olmoe_moe_lora_extractor():
             return None, None
 
         base = wrapper.get_base_layer()
+        if base is None:
+            return None, None
         param_name = getattr(wrapper, "parameter_name", None)
         if param_name == "gate_up_proj":
             input_dim = getattr(base, "hidden_dim", None)
@@ -100,7 +102,7 @@ def patch_olmoe_moe():
     # moe_grouped_modulelist) -> strict no-op there.
     try:
         from transformers.models.olmoe.modeling_olmoe import OlmoeExperts
-    except Exception:
+    except ImportError:
         return
 
     if getattr(OlmoeExperts, "_unsloth_already_patched", False):
@@ -113,12 +115,28 @@ def patch_olmoe_moe():
     if get_weight_preprocessor("olmoe") is None:
         register_weight_preprocessor("olmoe", _olmoe_weight_preprocessor)
 
+    # get_forward_moe_backend() prefers the unsloth_compiled_cache copy of moe_utils —
+    # a distinct module object with its own (empty) _WEIGHT_PREPROCESSORS, where the
+    # package registration above is invisible and square gate_up falls back to shape
+    # inference (#849). Register through the executing namespace's own API as well.
+    forward_backend = get_forward_moe_backend()
+    backend_ns = getattr(forward_backend, "__globals__", None) or {}
+    ns_get = backend_ns.get("get_weight_preprocessor")
+    ns_register = backend_ns.get("register_weight_preprocessor")
+    if (
+        callable(ns_get)
+        and callable(ns_register)
+        and ns_get is not get_weight_preprocessor
+        and ns_get("olmoe") is None
+    ):
+        ns_register("olmoe", _olmoe_weight_preprocessor)
+
     _olmoe_lora_extractor = _make_olmoe_moe_lora_extractor()
     OlmoeExperts._unsloth_lora_extractor_fn = staticmethod(_olmoe_lora_extractor)
 
     # Pass the function object directly (no closure): patch_function serializes the source into
     # the compiled cache, so a closure var would be a NameError there. Mirrors qwen3_moe.py.
-    patch_function(OlmoeExperts, "forward", get_forward_moe_backend())
+    patch_function(OlmoeExperts, "forward", forward_backend)
     OlmoeExperts._unsloth_already_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:

@@ -28,6 +28,8 @@ OLMoE expert math on CPU. The bnb-4bit path itself needs CUDA and is exercised b
 the end-to-end run in the PR.
 """
 
+import types
+
 import pytest
 import torch
 
@@ -43,7 +45,7 @@ from unsloth_zoo.temporary_patches.moe_utils import (
 try:
     from transformers.models.olmoe.modeling_olmoe import OlmoeExperts
     from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
-except Exception:  # transformers < 5: ModuleList experts, the patch is a strict no-op
+except ImportError:  # transformers < 5: ModuleList experts, the patch is a strict no-op
     OlmoeExperts = None
     OlmoeConfig = None
 
@@ -127,3 +129,61 @@ def test_patched_forward_matches_stock_math_cpu(monkeypatch):
         )
     finally:
         select_moe_backend.cache_clear()
+
+
+# --- 4. The compiled-cache registry split (Codex review on #915): get_forward_moe_backend
+#        may resolve the forward from the unsloth_compiled_cache copy of moe_utils — a
+#        distinct module object whose _WEIGHT_PREPROCESSORS starts empty, where a package-
+#        only registration is invisible and OLMoE's square gate_up falls back to shape
+#        inference (#849). The patch must land the preprocessor in BOTH namespaces. ---
+
+_SPLIT_NAMESPACE_SRC = """
+import torch
+
+_WEIGHT_PREPROCESSORS = {}
+
+def register_weight_preprocessor(model_type, preprocessor_fn):
+    _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
+
+def get_weight_preprocessor(model_type):
+    return _WEIGHT_PREPROCESSORS.get(model_type)
+
+# The signature (names + annotations) must match the real dispatcher: patch_function's
+# strict fingerprint check compares them before installing the replacement.
+def forward_moe_backend(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    raise NotImplementedError("routing stand-in; never called in this test")
+"""
+
+
+@requires_fused_olmoe
+def test_preprocessor_registered_in_executing_namespace(monkeypatch):
+    import unsloth_zoo.temporary_patches.olmoe as olmoe_mod
+
+    # Stand-in for the cache-loaded moe_utils: a real module object with its own empty
+    # registry, its own register/get API, and a forward bound to its namespace.
+    split = types.ModuleType("unsloth_cached_moe_utils_standin")
+    exec(compile(_SPLIT_NAMESPACE_SRC, split.__name__, "exec"), split.__dict__)
+    assert split.forward_moe_backend.__globals__ is split.__dict__
+
+    # Re-run the patch with the stand-in as the resolved backend; register the current
+    # forward with monkeypatch so it is restored for the other tests afterwards.
+    monkeypatch.setattr(OlmoeExperts, "forward", OlmoeExperts.forward)
+    monkeypatch.setattr(OlmoeExperts, "_unsloth_already_patched", False, raising=False)
+    monkeypatch.setattr(
+        olmoe_mod, "get_forward_moe_backend", lambda: split.forward_moe_backend
+    )
+
+    olmoe_mod.patch_olmoe_moe()
+
+    # The package registry has the preprocessor ...
+    assert get_weight_preprocessor("olmoe") is _olmoe_weight_preprocessor
+    # ... and so does the namespace the installed forward actually reads.
+    installed = OlmoeExperts.forward
+    assert installed is split.forward_moe_backend
+    assert installed.__globals__["_WEIGHT_PREPROCESSORS"].get("olmoe") is _olmoe_weight_preprocessor
+    assert split.get_weight_preprocessor("olmoe") is _olmoe_weight_preprocessor
