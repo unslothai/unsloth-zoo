@@ -1231,6 +1231,19 @@ def create_new_function(
 pass
 
 
+def fix_gemma4_audio_feature_dtype(source):
+    """Align Gemma 4 audio features with the destination embedding dtype."""
+    rewritten, count = re.subn(
+        r"audio_features\.to\(\s*inputs_embeds\.device\s*\)",
+        "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)",
+        source,
+    )
+    if count != 1:
+        return source
+    return rewritten
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -1258,6 +1271,8 @@ def create_standalone_class(
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
+    if module == "Gemma4Model":
+        forward_source = fix_gemma4_audio_feature_dtype(forward_source)
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
@@ -1505,6 +1520,8 @@ def create_standalone_class(
         source,
     )
 
+    if module == "Gemma4Model":
+        source = fix_gemma4_audio_feature_dtype(source)
     return source
 
 

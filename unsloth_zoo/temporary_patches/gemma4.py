@@ -14,8 +14,12 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import ast
+import inspect
+import linecache
+import sys
+
 import torch
-import os
 from .common import TEMPORARY_PATCHES
 from .utils import raise_error, patch_function
 
@@ -656,6 +660,136 @@ def patch_Gemma4TextModel_forward_kv_shared_no_cache():
         return raise_error("Gemma4TextModel.forward kv-shared GC fix", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextModel_forward_kv_shared_no_cache)
+
+
+def _is_gemma4_attr(node, owner, attr):
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == owner
+    )
+
+
+def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
+    """Align audio features to the actual text-embedding dtype at the merge site."""
+    marker = "_unsloth_audio_feature_dtype_patched"
+    if getattr(model_cls, marker, False):
+        return False
+
+    module = sys.modules.get(model_cls.__module__)
+    source_file = inspect.getsourcefile(model_cls)
+    if module is None or source_file is None:
+        return False
+
+    module_source = inspect.getsource(module)
+    tree = ast.parse(module_source, filename=source_file)
+    class_nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == model_cls.__name__
+    ]
+    if len(class_nodes) != 1:
+        return False
+    forward_nodes = [
+        node for node in class_nodes[0].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "forward"
+    ]
+    if len(forward_nodes) != 1:
+        return False
+    forward_node = forward_nodes[0]
+
+    buggy_casts = []
+    fixed_casts = []
+    for node in ast.walk(forward_node):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "masked_scatter"
+            and len(node.args) >= 2
+        ):
+            continue
+        source = node.args[1]
+        if not (
+            isinstance(source, ast.Call)
+            and _is_gemma4_attr(source.func, "audio_features", "to")
+            and source.args
+            and _is_gemma4_attr(source.args[0], "inputs_embeds", "device")
+        ):
+            continue
+        has_dtype = (
+            len(source.args) >= 2
+            and _is_gemma4_attr(source.args[1], "inputs_embeds", "dtype")
+        ) or any(
+            keyword.arg == "dtype"
+            and _is_gemma4_attr(keyword.value, "inputs_embeds", "dtype")
+            for keyword in source.keywords
+        )
+        (fixed_casts if has_dtype else buggy_casts).append(source)
+
+    if not buggy_casts and len(fixed_casts) == 1:
+        setattr(model_cls, marker, True)
+        return False
+    if len(buggy_casts) != 1 or fixed_casts:
+        return False
+
+    buggy_cast = buggy_casts[0]
+    old_cast_source = ast.get_source_segment(module_source, buggy_cast)
+    if old_cast_source is None or module_source.count(old_cast_source) != 1:
+        return False
+    buggy_cast.args.append(
+        ast.Attribute(
+            value=ast.Name(id="inputs_embeds", ctx=ast.Load()),
+            attr="dtype",
+            ctx=ast.Load(),
+        )
+    )
+    new_cast_source = old_cast_source[:-1] + ", inputs_embeds.dtype)"
+    patched_module_source = module_source.replace(
+        old_cast_source,
+        new_cast_source,
+        1,
+    )
+
+    # Keep Hugging Face's installed decorators intact. Re-running a method-level
+    # @auto_docstring outside its class loses class context and fails; transplant
+    # only the undecorated function body beneath the existing wrapper chain.
+    forward_node.decorator_list = []
+    ast.fix_missing_locations(forward_node)
+    namespace = {}
+    exec(
+        compile(ast.Module(body=[forward_node], type_ignores=[]), source_file, "exec"),
+        module.__dict__,
+        namespace,
+    )
+    original_body = inspect.unwrap(model_cls.forward)
+    patched_body = namespace["forward"]
+    if original_body.__code__.co_freevars != patched_body.__code__.co_freevars:
+        return False
+    original_body.__code__ = patched_body.__code__
+    linecache.cache[source_file] = (
+        len(patched_module_source),
+        None,
+        patched_module_source.splitlines(keepends=True),
+        source_file,
+    )
+    setattr(model_cls, marker, True)
+    return True
+
+
+def patch_Gemma4Model_audio_feature_dtype():
+    """Fix mixed-dtype audio merging without adding a per-forward wrapper."""
+    try:
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4Model
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("Gemma4Model.forward audio feature dtype fix", e)
+    try:
+        _patch_gemma4_audio_feature_dtype_on_class(Gemma4Model)
+    except Exception as e:
+        return raise_error("Gemma4Model.forward audio feature dtype fix", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4Model_audio_feature_dtype)
 
 
 def patch_Gemma4Model_forward_kv_shared_no_cache():
