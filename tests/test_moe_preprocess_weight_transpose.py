@@ -150,11 +150,37 @@ def test_orientation_primitive_returns_none_on_square():
     assert _orientation_needs_transpose((4, 16, 64), "down", 64) is False     # (E, I, H)
 
 
-def test_logical_expert_shape_prefers_original_shape():
+def test_logical_expert_shape_prefers_original_shape_after_linear_unwrap():
     class _PackedParam:
         # bnb Params4bit-like: .shape is packed, _original_shape is logical.
         shape = (2048, 1)
         _original_shape = (4, 128, 64)
 
+    class _QuantLinear:
+        # bnb Linear4bit-like: the logical shape lives on its Params4bit weight.
+        weight = _PackedParam()
+
     assert _logical_expert_shape(_PackedParam()) == (4, 128, 64)
+    assert _logical_expert_shape(_QuantLinear()) == (4, 128, 64)
     assert _logical_expert_shape(torch.randn(4, 128, 64)) == (4, 128, 64)
+
+
+def test_square_grouped_weight_preserved_via_paramwrapper_sibling():
+    class _ParamWrapper:
+        """PEFT-like wrapper whose base_layer is the experts module, not the parameter."""
+
+        def __init__(self, base_layer, param):
+            self.base_layer = base_layer
+            self._param = param
+
+        def get_param(self):
+            return self._param
+
+    E, H, I = 4, 64, 32
+    _gu_f, _dn_f, gu_g, dn_g = _make_flinear_experts(E, H, I)
+    experts = _FakeExperts(gu_g, dn_g)
+    experts.down_proj = _ParamWrapper(experts, dn_g)
+
+    assert _logical_expert_shape(experts.down_proj) == tuple(dn_g.shape)
+    out = preprocess_weight(gu_g, "gate_up", H, experts_module=experts)
+    assert torch.equal(out, gu_g), "a grouped square weight must not be transposed"

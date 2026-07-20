@@ -889,22 +889,44 @@ def get_weight_preprocessor(model_type: str):
 def _logical_expert_shape(param):
     """Best-effort logical (E, d1, d2) shape of an expert weight without dequantizing.
 
-    Mirrors _get_base_weight's unwrap order but reads shape only. A bnb Params4bit's
-    .shape is the packed uint8 layout, so prefer its recorded _original_shape. Returns
-    None if the logical shape can't be determined cheaply (caller degrades gracefully).
+    Resolve PEFT ParamWrappers before walking ordinary module wrappers: their base_layer
+    points back to the experts module, while get_param() returns the underlying parameter.
+    A bnb Params4bit's .shape is the packed uint8 layout, so prefer its recorded
+    _original_shape. Returns None if the logical shape can't be determined cheaply (caller
+    degrades gracefully).
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    while hasattr(param, "base_layer"):
-        param = param.base_layer
+    seen = set()
+    while param is not None and id(param) not in seen:
+        seen.add(id(param))
+
+        get_param = getattr(param, "get_param", None)
+        if callable(get_param):
+            try:
+                inner = get_param()
+            except Exception:
+                inner = None
+            if inner is not None and inner is not param:
+                param = inner
+                continue
+
+        base_layer = getattr(param, "base_layer", None)
+        if base_layer is not None and base_layer is not param:
+            param = base_layer
+            continue
+
+        # Linear-like modules (including bnb Linear4bit) store the parameter in .weight.
+        weight = getattr(param, "weight", None)
+        if weight is not None and weight is not param:
+            param = weight
+            continue
+
+        break
+
     original_shape = getattr(param, "_original_shape", None)
     if original_shape is not None:
         return tuple(int(x) for x in original_shape)
-    # Plain Parameters / Linear layers expose the logical shape directly; only unwrap a
-    # `.weight` container (a Linear-like module), not a `get_param` provider we'd rather
-    # not materialize.
-    if not hasattr(param, "get_param") and hasattr(param, "weight"):
-        param = param.weight
     shape = getattr(param, "shape", None)
     if shape is None:
         return None
