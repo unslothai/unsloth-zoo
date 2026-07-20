@@ -3519,6 +3519,10 @@ class FiniteTextBatchPlan:
         )
 
     def batch_width(self, index):
+        # Explicit widths are authoritative; skip the per-row length scan
+        # (constructor validation keeps widths/schedule index-aligned).
+        if self._widths is not None:
+            return self._widths[int(index)]
         batch_indices = self._schedule[index]
         lengths = [
             0
@@ -3529,8 +3533,6 @@ class FiniteTextBatchPlan:
             )
             for row_index in batch_indices
         ]
-        if self._widths is not None:
-            return self._widths[int(index)]
         return _finite_text_pad_width(
             max(lengths, default=0),
             pad_to_multiple=self.pad_to_multiple,
