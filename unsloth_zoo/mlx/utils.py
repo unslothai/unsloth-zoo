@@ -1014,6 +1014,155 @@ def _normalize_cce_label_dtype(labels):
     return labels
 
 
+def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
+    """Host-side label-mask AUTHORITY for VLM batches: placement only.
+
+    Decides WHICH positions are ignored (ignore tokens, attention zeros, and
+    positions a response/completion mask already set to -100). Label VALUES
+    and dtypes are assembled at finalize time from the SAME converted ids the
+    legacy path used, so coercion parity holds by construction — including
+    legacy's conversion-time rejections. Float comparisons mirror MLX's
+    effective float32 narrowing so placement matches the finalized tensors.
+    """
+    if labels is None:
+        labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
+        if labels is None:
+            labels = inputs["input_ids"]
+    if isinstance(labels, np.ndarray):
+        values = labels
+    elif hasattr(labels, "tolist"):
+        try:
+            values = np.asarray(labels)  # dtype-preserving (torch fp16 etc.)
+        except (TypeError, ValueError):
+            values = np.asarray(labels.tolist())
+    else:
+        values = np.asarray(labels)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if values.dtype == np.float64:
+        values = values.astype(np.float32)
+    if np.issubdtype(values.dtype, np.integer):
+        # Compare on the SAME normalized representation finalize uses for the
+        # label base (wide unsigned ids become their int64 sentinels first).
+        values = _normalize_numpy_cce_labels(values)
+    mask = values == -100
+    if ignore_token_ids:
+        compare = np.asarray(list(ignore_token_ids))
+        if np.issubdtype(values.dtype, np.floating):
+            compare = compare.astype(values.dtype)  # mirror mx scalar narrowing
+        mask = mask | np.isin(values, compare)
+    attention = inputs.get("attention_mask")
+    if attention is not None:
+        attention_np = (
+            attention if isinstance(attention, np.ndarray)
+            else np.asarray(
+                attention.tolist() if hasattr(attention, "tolist")
+                else attention
+            )
+        )
+        if attention_np.ndim == 1:
+            attention_np = attention_np.reshape(1, -1)
+        if attention_np.dtype == np.float64:
+            attention_np = attention_np.astype(np.float32)
+        mask = mask | (attention_np.astype(np.int32) == 0)
+    return mask
+
+def _reject_mlx_valued_vlm(context):
+    raise ValueError(
+        f"Unsloth MLX VLM: {context} produced MLX-array values; the prefetch "
+        "producer must not convert MLX values off the consumer thread. Use "
+        "streaming_prefetch_batches=0 for this stream."
+    )
+
+
+def _vlm_ids_integer_host(inputs):
+    """True when label-bearing ids are integer host values (the staged case).
+
+    Real processors emit integer token ids; float or exotic-dtype ids (fp16,
+    bf16, float64 probes) route to the bit-exact legacy path instead of a
+    numpy re-implementation of MLX float semantics.
+    """
+    ids = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
+    if ids is None:
+        ids = inputs.get("input_ids")
+    if isinstance(ids, np.ndarray):
+        return np.issubdtype(ids.dtype, np.integer)
+    if isinstance(ids, (list, tuple)):
+        def _all_integer_leaves(value):
+            if isinstance(value, (list, tuple)):
+                return all(_all_integer_leaves(element) for element in value)
+            return (
+                isinstance(value, (int, np.integer))
+                and not isinstance(value, bool)
+            )
+        return _all_integer_leaves(ids)
+    try:
+        arr = np.asarray(ids)
+    except (TypeError, ValueError):
+        return False
+    return np.issubdtype(arr.dtype, np.integer)
+
+
+def _vlm_inputs_host_valued(inputs):
+    """False when any processor output field arrived as an MLX array."""
+    return not any(_contains_mlx_values(value) for value in inputs.values())
+
+
+class _HostStagedVLMBatch:
+    """Host-side VLM batch: processor fields + decided labels, pre-MLX.
+
+    ``prefinalized`` carries an already-MLX legacy batch for MLX-valued
+    processor outputs (``host_valued=False``) — synchronous mode only; the
+    Stage-6 producer rejects such streams before staging.
+    """
+
+    __slots__ = ("inputs", "label_mask", "widen_labels_int64", "host_valued",
+                 "ignore_token_ids", "config", "prefinalized")
+
+    def __init__(self, inputs, label_mask, host_valued=True,
+                 ignore_token_ids=None, config=None, prefinalized=None,
+                 widen_labels_int64=False):
+        self.inputs = inputs
+        self.label_mask = label_mask
+        self.host_valued = host_valued
+        self.ignore_token_ids = ignore_token_ids
+        self.config = config
+        self.prefinalized = prefinalized
+        self.widen_labels_int64 = widen_labels_int64
+
+
+def _finalize_vlm_batch(staged, keep_raw_carrier=False):
+    """The single consumer-thread point converting staged VLM batches to MLX.
+
+    Conversion and compile preparation only — every semantic label decision
+    already happened host-side (or, for ``prefinalized`` legacy batches, on
+    this same thread inside the collator).
+    """
+    if staged.prefinalized is not None:
+        return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
+    batch = _to_mx_vlm_batch(staged.inputs)
+    if staged.label_mask is not None:
+        # Values ride the SAME converted ids the legacy path used; only the
+        # host-decided placement differs from raw ids. Conversion-time errors
+        # therefore match legacy exactly.
+        raw = (
+            batch.get(_RAW_INPUT_IDS_FOR_LABELS)
+            if keep_raw_carrier
+            else batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+        )
+        base = _normalize_cce_label_dtype(
+            raw if raw is not None else batch["input_ids"]
+        )
+        ignore = mx.array(-100, dtype=base.dtype)
+        labels = mx.where(mx.array(staged.label_mask), ignore, base)
+        if staged.widen_labels_int64:
+            labels = mx.array(
+                np.asarray(labels.tolist(), dtype=np.int64)
+            )  # legacy completion-branch coercion, verbatim
+        batch["labels"] = labels
+    return _prepare_vlm_batch_for_compile(batch, staged.config)
+
+
 def _mask_label_token_ids(targets, ignore_token_ids, ignore_index=-100):
     if not ignore_token_ids:
         return targets
@@ -2401,6 +2550,8 @@ def _contains_mlx_values(value):
         return True
     if isinstance(value, (list, tuple)):
         return any(_contains_mlx_values(element) for element in value)
+    if isinstance(value, Mapping):
+        return any(_contains_mlx_values(element) for element in value.values())
     return False
 
 
@@ -4164,6 +4315,7 @@ def _collate_vlm_prompt_completion_batch(
     image_size,
     ignore_token_ids=None,
     completion_only_loss=None,
+    reject_mlx_valued=False,
 ):
     prompt_texts = []
     completion_texts = []
@@ -4227,6 +4379,12 @@ def _collate_vlm_prompt_completion_batch(
         padding_side="right",
     )
 
+    pc_host_valued = (
+        _vlm_inputs_host_valued(prompt_inputs)
+        and _vlm_inputs_host_valued(completion_inputs)
+    )
+    if not pc_host_valued and reject_mlx_valued:
+        _reject_mlx_valued_vlm("the processor")
     p_ids = _as_numpy_vlm_field(prompt_inputs, "input_ids")
     c_ids = _as_numpy_vlm_field(completion_inputs, "input_ids")
     p_mask = _as_numpy_vlm_field(prompt_inputs, "attention_mask")
@@ -4256,21 +4414,41 @@ def _collate_vlm_prompt_completion_batch(
     combined_inputs["attention_mask"] = attention_mask
     if token_type_key is not None:
         combined_inputs[token_type_key] = extras[token_type_key]
+    completion_only_loss_enabled = (
+        True if completion_only_loss is None else bool(completion_only_loss)
+    )
+    if pc_host_valued and _vlm_ids_integer_host(combined_inputs):
+        label_mask = _stage_vlm_label_mask_np(
+            combined_inputs, ignore_token_ids=ignore_token_ids,
+        )
+        if completion_only_loss_enabled:
+            label_mask = label_mask | (
+                np.asarray(extras["completion_mask"]) == 0
+            )
+        return _HostStagedVLMBatch(
+            combined_inputs, label_mask, ignore_token_ids=ignore_token_ids,
+            widen_labels_int64=completion_only_loss_enabled,
+        )
+    if reject_mlx_valued:
+        # Non-stageable producer batches (float/exotic ids) must never reach
+        # MLX conversion off the consumer thread.
+        _reject_mlx_valued_vlm("the processor")
     batch = _to_mx_vlm_batch(combined_inputs)
     batch["labels"] = _apply_vlm_label_masks(
-        batch,
-        ignore_token_ids=ignore_token_ids,
+        batch, ignore_token_ids=ignore_token_ids,
     )
-
-    completion_only_loss_enabled = True if completion_only_loss is None else bool(completion_only_loss)
     if completion_only_loss_enabled:
-        labels_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
-        labels_np[np.asarray(extras["completion_mask"]) == 0] = -100
-        batch["labels"] = mx.array(labels_np)
-    return batch
+        legacy_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
+        legacy_np[np.asarray(extras["completion_mask"]) == 0] = -100
+        batch["labels"] = mx.array(legacy_np)
+    return _HostStagedVLMBatch(
+        None, None, host_valued=False,
+        ignore_token_ids=ignore_token_ids, prefinalized=batch,
+    )
 
 
 def _collate_vlm_batch(items, processor, max_seq_length, image_size,
+                       reject_mlx_valued=False,
                        formatting_func=None, ignore_token_ids=None,
                        completion_only_loss=None,
                        return_prompt_completion=False):
@@ -4281,10 +4459,17 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     tokenization + image processing + padding.
     """
     normalize_vlm_processor_chat_template(processor, strict=False)
+    if reject_mlx_valued and any(_contains_mlx_values(item) for item in items):
+        # Source rows carrying MLX arrays (e.g. mx image tensors) must reject
+        # before formatting or the processor touches them off-thread.
+        _reject_mlx_valued_vlm("the dataset row")
     formatted_items = []
     for item in items:
         if formatting_func is not None:
             item = formatting_func(item)
+            if reject_mlx_valued and _contains_mlx_values(item):
+                # Formatters can introduce MLX values after the row-level scan.
+                _reject_mlx_valued_vlm("the formatting function")
         formatted_items.append(item)
 
     if (
@@ -4297,6 +4482,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             formatted_items, processor, max_seq_length, image_size,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            reject_mlx_valued=reject_mlx_valued,
         )
         return (batch, True) if return_prompt_completion else batch
 
@@ -4326,12 +4512,27 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         processor, all_texts, all_images, max_seq_length,
         suffixes=all_suffixes,
     )
-    batch = _to_mx_vlm_batch(inputs)
-    batch["labels"] = _apply_vlm_label_masks(
-        batch,
-        ignore_token_ids=ignore_token_ids,
-    )
-    return (batch, False) if return_prompt_completion else batch
+    if _vlm_inputs_host_valued(inputs) and _vlm_ids_integer_host(inputs):
+        label_mask = _stage_vlm_label_mask_np(
+            inputs, ignore_token_ids=ignore_token_ids,
+        )
+        staged = _HostStagedVLMBatch(
+            inputs, label_mask, ignore_token_ids=ignore_token_ids,
+        )
+    elif reject_mlx_valued:
+        _reject_mlx_valued_vlm("the processor")
+    else:
+        # MLX-valued processor outputs: legacy synchronous label path, wrapped
+        # so the single finalizer stays the only exit to the trainer.
+        batch = _to_mx_vlm_batch(inputs)
+        batch["labels"] = _apply_vlm_label_masks(
+            batch, ignore_token_ids=ignore_token_ids,
+        )
+        staged = _HostStagedVLMBatch(
+            None, None, host_valued=False,
+            ignore_token_ids=ignore_token_ids, prefinalized=batch,
+        )
+    return (staged, False) if return_prompt_completion else staged
 
 
 def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None):
@@ -4375,6 +4576,14 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
 
 def _vlm_trainable_label_rows(batch_dict):
     """Return per-row trainability from VLM labels after response masking."""
+    if isinstance(batch_dict, _HostStagedVLMBatch):
+        if batch_dict.prefinalized is not None:
+            return _vlm_trainable_label_rows(batch_dict.prefinalized)
+        mask = batch_dict.label_mask
+        if mask is None:
+            return None
+        mask_np = mask if mask.ndim > 1 else mask.reshape(1, -1)
+        return [bool(np.any(~row[1:])) for row in mask_np]
     labels = batch_dict.get("labels")
     if labels is None:
         return None
@@ -4396,22 +4605,51 @@ def _build_response_masked_vlm_batch(
     ignore_token_ids=None,
     completion_only_loss=None,
     return_prompt_completion=False,
+    yield_host_staged=False,
+    reject_mlx_valued=False,
 ):
-    """Collate VLM rows and apply the CUDA response-mask closure."""
-    batch_dict, is_prompt_completion = _collate_vlm_batch(
+    """Collate VLM rows and apply the CUDA response-mask closure.
+
+    Plain-SFT and prompt/completion streams stage host-side and exit through
+    the single ``_finalize_vlm_batch`` call (``yield_host_staged`` defers it
+    for the prefetch producer). Response-masked streams run the verbatim
+    legacy consumer-side order and are rejected in producer modes.
+    """
+    staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
+        reject_mlx_valued=reject_mlx_valued,
         formatting_func=formatting_func,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
         return_prompt_completion=True,
     )
-    batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
+    staged.config = config
     if response_mask_fn is not None and not is_prompt_completion:
+        # Closure semantics are DEFINED on the converted, compile-prepared
+        # tensors (image-token expansion shifts positions), so response
+        # masking is consumer-side by nature and runs the verbatim legacy
+        # order. Producer-destined staging therefore cannot cover it.
+        if yield_host_staged:
+            raise ValueError(
+                "Unsloth MLX VLM: train_on_responses_only streams are not "
+                "covered by the prefetch producer yet; use "
+                "streaming_prefetch_batches=0 for response-masked VLM "
+                "streams."
+            )
+        batch_dict = _finalize_vlm_batch(staged, keep_raw_carrier=True)
         batch_dict = _apply_response_mask_to_vlm_batch(
             batch_dict,
             response_mask_fn,
             ignore_token_ids=ignore_token_ids,
         )
+        if return_prompt_completion:
+            return batch_dict, is_prompt_completion
+        return batch_dict
+    if yield_host_staged:
+        if return_prompt_completion:
+            return staged, is_prompt_completion
+        return staged
+    batch_dict = _finalize_vlm_batch(staged)
     if return_prompt_completion:
         return batch_dict, is_prompt_completion
     return batch_dict
@@ -4638,7 +4876,8 @@ def _iterate_lazy_vlm_training_batches(
     response_mask_fn=None, formatting_func=None, dataset_order="default",
     completion_only_loss=None, image_size=None, comm_group=None,
     require_replayable=False, expected_rows_per_pass=None,
-    ignore_token_ids=None,
+    ignore_token_ids=None, yield_host_staged=False, reject_mlx_valued=False,
+    should_stop=None,
 ):
     """Unsized VLM batches under the lazy text-stream lifecycle contracts.
 
@@ -4647,6 +4886,13 @@ def _iterate_lazy_vlm_training_batches(
     tensors is a planned follow-up. Per-row trainability filtering, label
     masking, and collation reuse the sized-path helpers unchanged.
     """
+    if (yield_host_staged or reject_mlx_valued) and response_mask_fn is not None:
+        # Zero-touch rejection: no set_epoch, no iterator, no source pull.
+        raise ValueError(
+            "Unsloth MLX VLM: train_on_responses_only streams are not "
+            "covered by the prefetch producer yet; use "
+            "streaming_prefetch_batches=0 for response-masked VLM streams."
+        )
     if _distributed_rank_size(comm_group)[1] > 1:
         raise ValueError(
             "Unsloth MLX VLM: DDP training with an unsized streaming VLM "
@@ -4670,12 +4916,26 @@ def _iterate_lazy_vlm_training_batches(
             formatting_func=batch_formatting_func,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            yield_host_staged=yield_host_staged,
+            reject_mlx_valued=reject_mlx_valued,
         )
 
     def _filter_stream_item(item):
-        """Return a formatted trainable streaming row, or None to skip it."""
+        """Return a formatted trainable streaming row, or None to skip it.
+
+        Synchronous response-masked filtering finalizes and runs the legacy
+        closure (consumer thread); producer modes reject before reaching here.
+        """
         if response_mask_fn is None:
             return item
+        if yield_host_staged or reject_mlx_valued:
+            # Producer-destined streams cannot run the consumer-side closure.
+            raise ValueError(
+                "Unsloth MLX VLM: train_on_responses_only streams are not "
+                "covered by the prefetch producer yet; use "
+                "streaming_prefetch_batches=0 for response-masked VLM "
+                "streams."
+            )
         if formatting_func is not None:
             item = formatting_func(item)
         batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
@@ -4731,7 +4991,16 @@ def _iterate_lazy_vlm_training_batches(
             yielded = False
             source_rows_seen = 0
             prepared_rows_seen = 0
-            for item in current_iterator:
+            source_iter = iter(current_iterator)
+            while True:
+                if should_stop is not None and should_stop():
+                    return
+                try:
+                    item = next(source_iter)
+                except StopIteration:
+                    break
+                if should_stop is not None and should_stop():
+                    return  # stop arrived during the blocking pull
                 source_rows_seen += 1
                 item = _filter_stream_item(item)
                 if item is None:
@@ -4766,6 +5035,8 @@ def _iterate_lazy_vlm_training_batches(
                 yield _build_batch(pending, batch_formatting_func)
                 pending = []
 
+            if should_stop is not None and should_stop():
+                return  # skip pass-end validation and flush on cooperative stop
             if expected_rows_per_pass is not None and (
                 source_rows_seen != expected_rows_per_pass
                 or prepared_rows_seen != expected_rows_per_pass

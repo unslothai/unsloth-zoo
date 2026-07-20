@@ -160,6 +160,16 @@ class _ConversationalPromptCompletionProcessor:
         }
 
 
+def _finalized_collate(*args, **kwargs):
+    """Direct-collate tests exercise the production staged+finalize composition."""
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch, _finalize_vlm_batch
+    result = _collate_vlm_batch(*args, **kwargs)
+    if isinstance(result, tuple):
+        staged, is_pc = result
+        return _finalize_vlm_batch(staged), is_pc
+    return _finalize_vlm_batch(result)
+
+
 def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
     from unsloth_zoo.mlx.utils import (
         _collate_vlm_batch,
@@ -171,7 +181,7 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         processor=processor,
         config={"image_token_id": 200},
     )
-    batch = _collate_vlm_batch(
+    batch = _finalized_collate(
         [{"text": "first"}, {"text": "second"}],
         processor,
         max_seq_length=8,
@@ -425,13 +435,13 @@ def test_vlm_prompt_completion_skips_response_mask_like_cuda():
 def test_vlm_prompt_completion_honors_completion_only_loss_false():
     from unsloth_zoo.mlx.utils import _collate_vlm_batch
 
-    default_batch = _collate_vlm_batch(
+    default_batch = _finalized_collate(
         [{"prompt": "prompt", "completion": "completion"}],
         _PromptCompletionProcessor(),
         max_seq_length=8,
         image_size=16,
     )
-    batch = _collate_vlm_batch(
+    batch = _finalized_collate(
         [{"prompt": "prompt", "completion": "completion"}],
         _PromptCompletionProcessor(),
         max_seq_length=8,
@@ -447,7 +457,7 @@ def test_vlm_prompt_completion_conversational_uses_cuda_prompt_split():
     from unsloth_zoo.mlx.utils import _collate_vlm_batch
 
     processor = _ConversationalPromptCompletionProcessor()
-    batch = _collate_vlm_batch(
+    batch = _finalized_collate(
         [{
             "prompt": [{"role": "user", "content": [{"type": "text", "text": "Q"}]}],
             "completion": [{"role": "assistant", "content": [{"type": "text", "text": "A"}]}],
@@ -465,7 +475,7 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     from unsloth_zoo.mlx.utils import _collate_vlm_batch
 
     processor = _ConversationalPromptCompletionProcessor()
-    _collate_vlm_batch(
+    _finalized_collate(
         [{
             "image": "top-level",
             "prompt": [{
@@ -1111,3 +1121,131 @@ def test_vlm_sized_index_routing_guard_and_cleanup():
         next(stream)
     stream.close()
     assert sorted(closed) == ["cached", "serving"]         # both closed, error kept
+
+
+def test_vlm_host_label_authority_and_staged_finalize():
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (
+        _HostStagedVLMBatch, _collate_vlm_batch, _finalize_vlm_batch,
+        _stage_vlm_label_mask_np, _vlm_inputs_host_valued,
+        _RAW_INPUT_IDS_FOR_LABELS,
+    )
+
+    # Placement authority: ignore ids, attention zeros, existing -100s; float
+    # comparisons mirror the finalized float32/int32 narrowing.
+    mask = _stage_vlm_label_mask_np(
+        {"input_ids": np.array([[101, 200, 2, 7]]),
+         "attention_mask": np.array([[1, 1, 0, 1]])},
+        ignore_token_ids=[200])
+    assert mask.tolist() == [[False, True, True, False]]
+    fractional = _stage_vlm_label_mask_np(
+        {"input_ids": [[7, 8, 9]], "attention_mask": [[1, 0.5, 0.99999999]]})
+    assert fractional.tolist() == [[False, True, False]]
+
+    # Float/exotic token-id streams never stage: they route to the bit-exact
+    # legacy path (sync) and reject in producer modes.
+    from unsloth_zoo.mlx.utils import _vlm_ids_integer_host
+    assert _vlm_ids_integer_host({"input_ids": np.array([[1, 2]])}) is True
+    assert _vlm_ids_integer_host(
+        {"input_ids": np.array([[1.0, 2.0]], dtype=np.float64)}) is False
+    assert _vlm_ids_integer_host({"input_ids": [[1, 2.5]]}) is False
+    assert _vlm_ids_integer_host({"input_ids": [[1, True]]}) is False
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch(
+            [{"text": "101", "images": [mx.array([1.0])]}],
+            _FakeProcessor(), 8, None, reject_mlx_valued=True)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch(
+            [{"text": "101"}], _FakeProcessor(), 8, None,
+            reject_mlx_valued=True,
+            formatting_func=lambda item: {
+                "text": item["text"], "images": [mx.array([1.0])],
+            })
+    class FloatProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            out["input_ids"] = np.asarray(out["input_ids"], dtype=np.float32)
+            return out
+    floaty = _collate_vlm_batch([{"text": "101"}], FloatProcessor(), 8, None)
+    assert floaty.prefinalized is not None  # sync legacy route
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch([{"text": "101"}], FloatProcessor(), 8, None,
+                           reject_mlx_valued=True)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch(
+            [{"prompt": "101", "completion": "102"}], FloatProcessor(), 8,
+            None, reject_mlx_valued=True)
+
+    # Finalized values ride the SAME converted ids as legacy (dtype/keys/carrier
+    # by construction), incl. the P/C completion-branch int64 widening.
+    plain = _finalized_collate([{"text": "101"}], _FakeProcessor(), 8, None)
+    assert plain["labels"].dtype == plain["input_ids"].dtype
+    assert _RAW_INPUT_IDS_FOR_LABELS not in plain
+    pc = _finalized_collate(
+        [{"prompt": "101", "completion": "102"}], _FakeProcessor(), 8, None)
+    assert pc["labels"].dtype == mx.int64  # legacy completion branch widens
+    off = _finalized_collate(
+        [{"prompt": "101", "completion": "102"}], _FakeProcessor(), 8, None,
+        completion_only_loss=False)
+    assert off["labels"].dtype == off["input_ids"].dtype
+
+    # MLX-returning processors flag host_valued=False (prefetch contract),
+    # including nested mappings; reject mode raises BEFORE any conversion.
+    assert _vlm_inputs_host_valued(
+        {"input_ids": np.array([[1]])}) is True
+    assert _vlm_inputs_host_valued(
+        {"pixel_values": {"tensor": mx.array([1])}}) is False
+
+    class MxProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            return {k: mx.array(v) for k, v in out.items()}
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch([{"text": "101"}], MxProcessor(), 8, None,
+                           reject_mlx_valued=True)
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch as _brm
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _brm([{"text": "101"}], _FakeProcessor(), {}, 8, None,
+             response_mask_fn=lambda b: {"labels": b["input_ids"]},
+             yield_host_staged=True)
+    # Zero-touch iterator rejection: no set_epoch, no pull, no processor call.
+    from unsloth_zoo.mlx.utils import _iterate_lazy_vlm_training_batches
+    probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        next(_iterate_lazy_vlm_training_batches(
+            probe, _FakeProcessor(), {}, 2, 8,
+            response_mask_fn=lambda b: {"labels": b["input_ids"]},
+            yield_host_staged=True))
+    assert probe.pulls == 0 and probe.epochs == []
+
+    # Routed value-carrying closures finalize through the verbatim legacy
+    # pipeline: custom values (777) and identity-closure dtype both match.
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
+    def _value_closure(mask_batch):
+        width = len(mask_batch["input_ids"][0])
+        return {"labels": [[-100, 777] + [-100] * (width - 2)]}
+    routed = _build_response_masked_vlm_batch(
+        [{"text": "101"}], _FakeProcessor(), {}, 8, None,
+        response_mask_fn=_value_closure,
+    )
+    assert routed["labels"].tolist()[0][1] == 777  # custom value preserved
+    assert routed["labels"].dtype == mx.int64  # legacy value-pipeline dtype
+
+    # The raw wide-id carrier survives finalize for the legacy closure: an
+    # identity closure sees the invalid uint32 id, not a wrapped -100.
+    class WideProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            ids = np.asarray(out["input_ids"], dtype=np.uint32)
+            ids[0, 0] = np.uint32(2**32 - 100)
+            out["input_ids"] = ids
+            return out
+    seen = {}
+    def identity_closure(mask_batch):
+        seen["first"] = int(mask_batch["input_ids"][0][0])
+        return {"labels": [list(row) for row in mask_batch["input_ids"]]}
+    _build_response_masked_vlm_batch(
+        [{"text": "101"}], WideProcessor(), {}, 8, None,
+        response_mask_fn=identity_closure)
+    assert seen["first"] == 2**32 - 100
