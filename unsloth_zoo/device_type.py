@@ -222,27 +222,31 @@ def get_amd_attention_implementation():
 
     Priority order:
     1. amd-aiter FlashAttention (pip install amd-aiter, requires ROCm >= 7.0)
-       - Full MFMA on both QK^T and P@V gemms
-       - ~5-9x faster than PyTorch SDPA for prefill (benchmark: 51.5 TFLOPS vs 8.7 TFLOPS)
-       - Causal tile skip: ~50% of KV iterations skipped for long-sequence causal prefill
-       - Install: pip install amd-aiter  (https://github.com/ROCm/aiter)
     2. PyTorch SDPA (always available on ROCm)
-       - Uses MIOpen FlashAttention kernel
-       - ~37% faster than eager for inference; -28% VRAM in training
     3. eager (fallback)
 
     Returns:
         str: "amd_aiter" | "sdpa" | "eager"
     """
     if not is_hip():
-        return "sdpa"  # Not AMD — caller should use their own logic
+        return "sdpa"
 
-    # Check for amd-aiter (ROCm >= 7.0 required)
+    # Gate on ROCm >= 7.0 (amd-aiter has hard ABI dependency on libamdhip64.so.7)
+    rocm_version = _detect_rocm_major_minor()
+    if rocm_version is not None:
+        try:
+            major = int(rocm_version.split(".")[0])
+            if major < 7:
+                return "sdpa"
+        except (ValueError, IndexError):
+            pass
+
+    # Check for amd-aiter (AMD AI Tensor Engine for ROCm)
     try:
-        import importlib
+        import importlib.util  # Fix: must import submodule explicitly
         aiter_spec = importlib.util.find_spec("aiter")
         if aiter_spec is not None:
-            # Verify it's the AMD AI tensor engine, not the async iterator library
+            # Validate it's the AMD AI tensor engine, not the 'aiter' async iterator library
             import aiter as _aiter
             if hasattr(_aiter, "flash_attn_func") or hasattr(_aiter, "FlashAttnFunc"):
                 return "amd_aiter"
@@ -256,16 +260,28 @@ def get_amd_attention_implementation():
 def get_amd_flash_attn_func():
     """
     Return the AMD aiter flash_attn_func if available, else None.
-    When available, call as: flash_attn_func(q, k, v, causal=True)
+
+    Handles both naming conventions across amd-aiter versions:
+    - flash_attn_func (lowercase, used in newer versions)
+    - FlashAttnFunc (class-based, used in some versions)
+
+    When available, call as: func(q, k, v, causal=True)
     q/k/v shape: (batch, seqlen, nheads, headdim), dtype=float16 or bfloat16
+    Returns: output tensor of same shape as q
     """
     if get_amd_attention_implementation() != "amd_aiter":
         return None
     try:
-        from aiter import flash_attn_func
-        return flash_attn_func
-    except ImportError:
-        return None
+        import aiter as _aiter
+        # Try lowercase function first (preferred in newer amd-aiter)
+        if hasattr(_aiter, "flash_attn_func"):
+            return _aiter.flash_attn_func
+        # Fall back to class-based callable
+        if hasattr(_aiter, "FlashAttnFunc"):
+            return _aiter.FlashAttnFunc
+    except Exception:
+        pass
+    return None
 
 
 @functools.cache
