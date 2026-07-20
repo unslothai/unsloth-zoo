@@ -1184,9 +1184,13 @@ def test_vlm_host_label_authority_and_staged_finalize():
         def __call__(self, text, **kwargs):
             out = super().__call__(text, **kwargs)
             return {k: mx.array(v) for k, v in out.items()}
-    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
-        _collate_vlm_batch([{"text": "101"}], MxProcessor(), 8, None,
-                           reject_mlx_valued=True)
+    # Processor-owned MLX outputs (mlx-vlm wrappers) stage OPAQUELY in
+    # producer mode: labels defer to the consumer-side finalizer.
+    opaque = _collate_vlm_batch([{"text": "101"}], MxProcessor(), 8, None,
+                                reject_mlx_valued=True)
+    assert opaque.host_valued is False and opaque.label_mask is None
+    finalized_opaque = _finalize_vlm_batch(opaque)
+    assert "labels" in finalized_opaque
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch as _brm
     with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
         _brm([{"text": "101"}], _FakeProcessor(), {}, 8, None,

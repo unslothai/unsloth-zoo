@@ -1141,6 +1141,16 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
     if staged.prefinalized is not None:
         return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
     batch = _to_mx_vlm_batch(staged.inputs)
+    if staged.label_mask is None:
+        # Opaque processor outputs (the processor itself returned MLX arrays,
+        # e.g. mlx-vlm wrappers): label semantics run the legacy path here on
+        # the consumer thread. No Unsloth-issued MLX op touched the payload
+        # producer-side — it was carried through untouched.
+        batch["labels"] = _apply_vlm_label_masks(
+            batch, ignore_token_ids=staged.ignore_token_ids,
+        )
+        batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+        return _prepare_vlm_batch_for_compile(batch, staged.config)
     if staged.label_mask is not None:
         # Values ride the SAME converted ids the legacy path used; only the
         # host-decided placement differs from raw ids. Conversion-time errors
@@ -4519,7 +4529,17 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         staged = _HostStagedVLMBatch(
             inputs, label_mask, ignore_token_ids=ignore_token_ids,
         )
+    elif reject_mlx_valued and not _vlm_inputs_host_valued(inputs):
+        # The PROCESSOR itself emitted MLX arrays (mlx-vlm wrappers do this
+        # regardless of return_tensors): carry them through untouched and
+        # decide labels at finalize. Producer-side unsloth MLX ops: none.
+        staged = _HostStagedVLMBatch(
+            inputs, None, host_valued=False,
+            ignore_token_ids=ignore_token_ids,
+        )
     elif reject_mlx_valued:
+        # Host-valued but non-integer ids: legacy conversion would run
+        # producer-side, so reject with the synchronous remedy.
         _reject_mlx_valued_vlm("the processor")
     else:
         # MLX-valued processor outputs: legacy synchronous label path, wrapped
