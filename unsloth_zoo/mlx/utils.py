@@ -1112,16 +1112,20 @@ class _HostStagedVLMBatch:
     """Host-side VLM batch: processor fields + decided labels, pre-MLX.
 
     ``prefinalized`` carries an already-MLX legacy batch for MLX-valued
-    processor outputs (``host_valued=False``) — synchronous mode only; the
-    Stage-6 producer rejects such streams before staging.
+    processor outputs (``host_valued=False``) in synchronous mode. In
+    producer mode, MLX-valued PROCESSOR outputs stage opaquely instead —
+    materialized producer-side first, because lazy MLX graphs cannot cross
+    threads: plain-SFT payloads ride ``inputs`` with ``label_mask=None``;
+    prompt/completion payloads ride ``pc_opaque`` with the combine deferred
+    to the consumer finalizer.
     """
 
     __slots__ = ("inputs", "label_mask", "widen_labels_int64", "host_valued",
-                 "ignore_token_ids", "config", "prefinalized")
+                 "ignore_token_ids", "config", "prefinalized", "pc_opaque")
 
     def __init__(self, inputs, label_mask, host_valued=True,
                  ignore_token_ids=None, config=None, prefinalized=None,
-                 widen_labels_int64=False):
+                 widen_labels_int64=False, pc_opaque=None):
         self.inputs = inputs
         self.label_mask = label_mask
         self.host_valued = host_valued
@@ -1129,17 +1133,31 @@ class _HostStagedVLMBatch:
         self.config = config
         self.prefinalized = prefinalized
         self.widen_labels_int64 = widen_labels_int64
+        self.pc_opaque = pc_opaque
 
 
 def _finalize_vlm_batch(staged, keep_raw_carrier=False):
     """The single consumer-thread point converting staged VLM batches to MLX.
 
-    Conversion and compile preparation only — every semantic label decision
-    already happened host-side (or, for ``prefinalized`` legacy batches, on
-    this same thread inside the collator).
+    For host-staged batches every semantic label decision already happened
+    host-side; only conversion and compile preparation run here. Opaque
+    processor-owned payloads (plain-SFT with ``label_mask=None``, and
+    ``pc_opaque`` prompt/completion carriers) instead run their combine and
+    legacy label decisions here on the consumer thread — the producer only
+    materialized and transported them.
     """
     if staged.prefinalized is not None:
         return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
+    if staged.pc_opaque is not None:
+        (prompt_inputs, completion_inputs, processor, max_seq_length,
+         completion_only_loss) = staged.pc_opaque
+        inner = _combine_vlm_prompt_completion_inputs(
+            prompt_inputs, completion_inputs, processor, max_seq_length,
+            ignore_token_ids=staged.ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+        )
+        inner.config = staged.config
+        return _finalize_vlm_batch(inner, keep_raw_carrier=keep_raw_carrier)
     batch = _to_mx_vlm_batch(staged.inputs)
     if staged.label_mask is None:
         # Opaque processor outputs (the processor itself returned MLX arrays,
@@ -2563,6 +2581,32 @@ def _contains_mlx_values(value):
     if isinstance(value, Mapping):
         return any(_contains_mlx_values(element) for element in value.values())
     return False
+
+
+def _collect_mlx_values(value, out):
+    if isinstance(value, mx.array):
+        out.append(value)
+    elif isinstance(value, (list, tuple)):
+        for element in value:
+            _collect_mlx_values(element, out)
+    elif isinstance(value, Mapping):
+        for element in value.values():
+            _collect_mlx_values(element, out)
+
+
+def _materialize_mlx_values(*trees):
+    """Force pending MLX graphs on the thread that created them.
+
+    Lazy MLX arrays cannot be evaluated from another thread, so opaque
+    processor-owned payloads must cross the prefetch boundary materialized.
+    This completes computation the processor already issued on this thread;
+    Unsloth still introduces no new MLX computation off the consumer thread.
+    """
+    arrays = []
+    for tree in trees:
+        _collect_mlx_values(tree, arrays)
+    if arrays:
+        mx.eval(*arrays)
 
 
 def _guard_host_token_output(value, state, context):
@@ -4394,7 +4438,42 @@ def _collate_vlm_prompt_completion_batch(
         and _vlm_inputs_host_valued(completion_inputs)
     )
     if not pc_host_valued and reject_mlx_valued:
-        _reject_mlx_valued_vlm("the processor")
+        # Processor-owned MLX outputs: materialize their pending graphs on
+        # this thread (lazy arrays cannot cross the thread boundary) and
+        # defer the combine + label decisions to the consumer finalizer.
+        _materialize_mlx_values(prompt_inputs, completion_inputs)
+        return _HostStagedVLMBatch(
+            None, None, host_valued=False,
+            ignore_token_ids=ignore_token_ids,
+            pc_opaque=(prompt_inputs, completion_inputs, processor,
+                       max_seq_length, completion_only_loss),
+        )
+    return _combine_vlm_prompt_completion_inputs(
+        prompt_inputs, completion_inputs, processor, max_seq_length,
+        ignore_token_ids=ignore_token_ids,
+        completion_only_loss=completion_only_loss,
+        reject_mlx_valued=reject_mlx_valued,
+    )
+
+
+def _combine_vlm_prompt_completion_inputs(
+    prompt_inputs,
+    completion_inputs,
+    processor,
+    max_seq_length,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+    reject_mlx_valued=False,
+):
+    """Concatenate prompt/completion processor outputs into one staged batch.
+
+    Runs on the collating thread for host-valued outputs and on the consumer
+    thread (via the ``pc_opaque`` carrier) for MLX-valued outputs.
+    """
+    pc_host_valued = (
+        _vlm_inputs_host_valued(prompt_inputs)
+        and _vlm_inputs_host_valued(completion_inputs)
+    )
     p_ids = _as_numpy_vlm_field(prompt_inputs, "input_ids")
     c_ids = _as_numpy_vlm_field(completion_inputs, "input_ids")
     p_mask = _as_numpy_vlm_field(prompt_inputs, "attention_mask")
@@ -4531,8 +4610,11 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         )
     elif reject_mlx_valued and not _vlm_inputs_host_valued(inputs):
         # The PROCESSOR itself emitted MLX arrays (mlx-vlm wrappers do this
-        # regardless of return_tensors): carry them through untouched and
-        # decide labels at finalize. Producer-side unsloth MLX ops: none.
+        # regardless of return_tensors): materialize its pending graphs on
+        # this thread (lazy arrays cannot cross the thread boundary), carry
+        # the payload through otherwise untouched, and decide labels at
+        # finalize. Unsloth issues no new MLX computation producer-side.
+        _materialize_mlx_values(inputs)
         staged = _HostStagedVLMBatch(
             inputs, None, host_valued=False,
             ignore_token_ids=ignore_token_ids,

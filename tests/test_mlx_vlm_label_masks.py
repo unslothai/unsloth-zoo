@@ -1310,3 +1310,69 @@ def test_vlm_prefetch_identity_laziness_and_masked_rejection():
         next(iter(stream(masked_probe, prefetch_batches=1,
                          response_mask_fn=lambda b: {"labels": b["input_ids"]})))
     assert masked_probe.pulls == 0 and masked_probe.epochs == []
+
+
+def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
+    """Lazy processor-owned MLX graphs must cross the prefetch boundary.
+
+    Regression: without the producer-side materialization barrier, consumer
+    evaluation raises "There is no Stream ... in current thread". Label
+    decisions for both opaque routes (plain-SFT and prompt/completion) must
+    run on the consumer thread only.
+    """
+    import threading
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx import utils as U
+
+    class LazyMxProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            ids = np.asarray(out["input_ids"])
+            ids = ids.reshape(1, -1) if ids.ndim == 1 else ids
+            rows, width = ids.shape
+            return {
+                "input_ids": mx.broadcast_to(mx.arange(1, width + 1), (rows, width)),
+                "attention_mask": mx.broadcast_to(mx.array(1), (rows, width)),
+            }
+
+    label_threads = []
+    legacy_masks = U._apply_vlm_label_masks
+
+    def _spy(*args, **kwargs):
+        label_threads.append(threading.current_thread())
+        return legacy_masks(*args, **kwargs)
+
+    monkeypatch.setattr(U, "_apply_vlm_label_masks", _spy)
+
+    def stream(source, **kwargs):
+        kwargs.setdefault("batch_size", 2)
+        return U.iterate_vlm_training_batches(
+            dataset=source, processor=LazyMxProcessor(), config={},
+            max_seq_length=8, **kwargs)
+
+    it = iter(stream(_LifecycleVLMRows(4), prefetch_batches=1))
+    batch = next(it)
+    mx.eval(batch["input_ids"], batch["labels"])  # consumer-side evaluation
+    assert np.asarray(batch["input_ids"]).tolist() == [[1, 2, 3, 4, 5]] * 2
+    it.close()
+
+    pc_rows = [{"prompt": "101", "completion": "102"},
+               {"prompt": "103", "completion": "104"}]
+
+    def take(iterator, count):
+        taken = []
+        for _ in range(count):
+            b = next(iterator)
+            taken.append((np.asarray(b["input_ids"]).tolist(),
+                          np.asarray(b["labels"]).tolist(), b["labels"].dtype))
+        return taken
+
+    sync_seq = take(iter(stream(pc_rows, batch_size=1)), 2)
+    pf_it = iter(stream(pc_rows, batch_size=1, prefetch_batches=1))
+    pf_seq = take(pf_it, 2)
+    pf_it.close()
+    assert pf_seq == sync_seq  # bit-for-bit parity with the sync legacy route
+    assert label_threads and all(
+        t is threading.main_thread() for t in label_threads)
