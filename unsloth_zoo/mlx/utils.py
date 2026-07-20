@@ -2165,6 +2165,15 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     assistant_token_id > 0 enables completion-only training (mask tokens before
     the first occurrence). Returns a function (model, batch_dict) -> (loss, ntoks).
     """
+    def _marked_vlm_baseline():
+        loss_fn = make_vlm_baseline_loss_fn(
+            model,
+            assistant_token_id=assistant_token_id,
+            ignore_token_ids=ignore_token_ids,
+        )
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+
     if not hasattr(model, "get_input_embeddings"):
         import warnings
         warnings.warn(
@@ -2172,11 +2181,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(
-            model,
-            assistant_token_id=assistant_token_id,
-            ignore_token_ids=ignore_token_ids,
-        )
+        return _marked_vlm_baseline()
 
     tm = _get_text_model(model)
     if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
@@ -2186,11 +2191,14 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(
-            model,
-            assistant_token_id=assistant_token_id,
-            ignore_token_ids=ignore_token_ids,
-        )
+        return _marked_vlm_baseline()
+
+    logit_scale, _scale_invalid = _get_logit_scale(model)
+    if _scale_invalid:
+        print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
+              "non-scalar, or outside the supported range); falling back to "
+              "standard cross-entropy.")
+        return _marked_vlm_baseline()
 
     softcap = _get_logit_softcap(model)
     lm_layer = _get_lm_head_layer(model)
@@ -2248,6 +2256,10 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # (h * s) @ W equals s * (h @ W) per vocab chunk (Aya Vision,
+                # Cohere2-MoE apply logit_scale in their forward tails).
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -2269,6 +2281,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # Same pre-scaling identity as the quantized branch above.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)

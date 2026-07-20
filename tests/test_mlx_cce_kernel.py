@@ -301,3 +301,30 @@ def test_invalid_logit_scale_selects_baseline_fallback():
 
     fn = make_cce_loss_fn(_stub_model("args", float("nan")))
     assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+
+
+@pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale"])
+def test_vlm_cce_fallbacks_are_marked(case):
+    # Every VLM fallback path must return a loss fn carrying the eager
+    # fallback marker.
+    from unsloth_zoo.mlx.utils import make_vlm_cce_loss_fn
+
+    model = _stub_model()
+    model.language_model = _stub_model(
+        "args", float("nan") if case == "invalid_scale" else 0.0625
+    )
+    if case != "no_backbone":
+        model.language_model.model = object()  # separable backbone present
+    if case != "no_embeddings":
+        model.get_input_embeddings = lambda: None
+    with pytest.warns(UserWarning) if case != "invalid_scale" else _no_warning():
+        fn = make_vlm_cce_loss_fn(model)
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+
+
+def _no_warning():
+    import contextlib
+
+    return contextlib.nullcontext()
+
+

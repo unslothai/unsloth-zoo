@@ -2372,10 +2372,16 @@ class MLXTrainer:
                     ignore_token_ids=_vlm_ignore_token_ids,
                 )
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                _main_print(
-                    f"Unsloth: Using VLM CCE loss ({cce_backend}) "
-                    "for memory-efficient training."
-                )
+                if cce_backend == "baseline-fallback":
+                    use_cce = False
+                    _main_print(
+                        "Unsloth: VLM CCE is unavailable for this model; using "
+                        "standard cross-entropy loss.")
+                else:
+                    _main_print(
+                        f"Unsloth: Using VLM CCE loss ({cce_backend}) "
+                        "for memory-efficient training."
+                    )
             else:
                 loss_fn = make_vlm_baseline_loss_fn(
                     model,
