@@ -19,6 +19,7 @@ import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
 from contextlib import contextmanager, nullcontext
 import os
+import functools
 import warnings
 import gc
 import threading
@@ -57,23 +58,30 @@ INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
 
 
+@functools.cache
+def _active_device_is_integrated():
+    # Gate on the active training device, not any visible one: a discrete GPU
+    # sharing a box with an APU has a real H2D copy and should keep the overlap,
+    # so an unrelated integrated device must not disable it. Cached: a device's
+    # integrated flag is immutable for the process (call _active_device_is_
+    # integrated.cache_clear() if the visible-device set is swapped mid-process).
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    try:
+        idx = torch.cuda.current_device()
+        return bool(getattr(torch.cuda.get_device_properties(idx), "is_integrated", 0))
+    except Exception:
+        return False
+
+
 def _double_buffer_disabled():
     # Double buffering overlaps the H2D offload copy with compute. On unified-
     # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) GPU and system RAM are
     # one physical pool, so there is no real transfer to hide: the overlap is
     # pure overhead (~2x slower, no memory saved). Default it off there; an
-    # explicit UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 always wins.
+    # explicit UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 always wins (read every call).
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
-    if DEVICE_TYPE not in ("cuda", "hip"): return False
-    try:
-        # Gate on the active training device, not any visible one: a discrete
-        # GPU sharing a box with an APU has a real H2D copy and should keep the
-        # overlap, so an unrelated integrated device must not disable it.
-        idx = torch.cuda.current_device()
-        return bool(getattr(torch.cuda.get_device_properties(idx), "is_integrated", 0))
-    except Exception:
-        return False
+    return _active_device_is_integrated()
 
 
 @contextmanager
