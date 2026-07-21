@@ -7216,7 +7216,10 @@ def _iterate_dispatched_lazy_text_training_batches(
                     "global unsharded Hugging Face iterable. Pass the source "
                     "before split_dataset_by_node(); MLX owns rank partitioning."
                 )
-        except Exception as exc:
+        except BaseException as exc:
+            # Even interrupts must be deferred: peers block in the dispatch
+            # collective below, so rank 0 cannot unwind before the failure
+            # status is broadcast. Re-raised through the loop's rank-0 path.
             owner_contract_error = exc
         owner_iterator = _iterate_lazy_text_training_batches(
             dataset,
@@ -7263,7 +7266,11 @@ def _iterate_dispatched_lazy_text_training_batches(
                     status = 1
                 except StopIteration:
                     pass
-                except Exception as exc:
+                except BaseException as exc:
+                    # Synchronize interrupts too (KeyboardInterrupt during a
+                    # source/formatter/tokenizer call): peers are entering the
+                    # all_sum below and would hang if rank 0 unwound past it.
+                    # The original error is re-raised on rank 0 after sync.
                     owner_error = exc
                     status = -1
 
