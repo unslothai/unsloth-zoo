@@ -659,21 +659,17 @@ def _output_accessor_chains(tree):
     return chains
 
 
-def _output_accessor_modules(tm):
-    """Live modules with recognized accessors in the analyzed forward bodies.
+def _analyze_output_route(tm):
+    """Syntactic evidence from the analyzed forward bodies, live-resolved.
 
-    Parses ``type(tm).__call__`` (AST, so only real ``self.X.as_linear(...)``
-    calls and ``self.X.weight.T`` attribute expressions count — never strings
-    or comments), follows one hop of ``self.<method>(...)`` delegation to
-    methods the entry point syntactically calls, and resolves each extracted
-    chain on the LIVE module tree; unresolvable chains contribute nothing.
-    Neither reachability nor terminal position is analyzed: ANY
-    syntactically recognized accessor counts — dead branches, reachable
-    side computations, nested scopes, or a shadowed ``self``. Uniqueness
-    and fail-closed consumers bound the resulting risk: mis-selection
-    additionally requires that no other candidate contributes a recognized,
-    live-resolving accessor (the real route may use unsupported syntax, an
-    alias, or deeper delegation). Returns ``{id(module): (relative_path, module)}``."""
+    Parses ``type(tm).__call__`` (AST — strings/comments never count) plus one
+    hop of ``self.<method>()`` delegation, returning ``(accessor_modules,
+    called_module_ids, references_tie_flag)``: chains under
+    ``self.X.as_linear(...)`` / ``self.X.weight.T``; modules a self-rooted chain
+    is called on (``self.lm_head(x)``); and whether ``tie_word_embeddings`` is
+    referenced anywhere. Reachability is NOT analyzed — any recognized syntax
+    counts (dead branches included); uniqueness plus fail-closed consumers bound
+    mis-selection. Unresolvable chains contribute nothing."""
     cls = type(tm)
 
     def _parse(method):
@@ -684,7 +680,7 @@ def _output_accessor_modules(tm):
 
     entry = _parse(getattr(cls, "__call__", None))
     if entry is None:
-        return {}
+        return {}, set(), False
     trees = [entry]
     invoked = {
         node.func.attr
@@ -698,17 +694,37 @@ def _output_accessor_modules(tm):
             tree = _parse(method)
             if tree is not None:
                 trees.append(tree)
-    modules = {}
+
+    def _resolve(chain):
+        obj = tm
+        for part in chain.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+        return obj
+
+    modules, called, references_flag = {}, set(), False
     for tree in trees:
         for chain in _output_accessor_chains(tree):
-            obj = tm
-            for part in chain.split("."):
-                obj = getattr(obj, part, None)
-                if obj is None:
-                    break
+            obj = _resolve(chain)
             if obj is not None:
                 modules[id(obj)] = (chain, obj)
-    return modules
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "tie_word_embeddings":
+                references_flag = True
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                chain = _self_attr_chain(node.func)
+                if chain:
+                    obj = _resolve(chain)
+                    if obj is not None:
+                        called.add(id(obj))
+    return modules, called, references_flag
+
+
+def _output_accessor_modules(tm):
+    """Live modules with recognized accessors in the analyzed forward bodies
+    (see ``_analyze_output_route``). Returns ``{id(module): (path, module)}``."""
+    return _analyze_output_route(tm)[0]
 
 
 def _resolve_embedding_anchor(owner, types, accessor_modules=None):
@@ -752,17 +768,18 @@ def _resolve_module_path(model, path):
 
 
 def describe_output_head(model):
-    """Resolve the live output head with affirmative evidence only: a True
-    tie flag, a real ``lm_head``, or (only when no flag attribute exists) an
-    embedding with a recognized, live-resolving accessor syntactically
-    present in the analyzed forward bodies — any embedding name, via
-    ``.as_linear(...)`` or ``.weight.T``, including one hop of
-    ``self.<method>()`` delegation (see ``_output_accessor_modules``).
-    Missing ``lm_head`` never implies tying; conflicting flags fail closed.
-    ``path`` is rooted at the argument (VLM wrappers keep the
-    ``language_model.`` prefix); at unknown status ``candidate_*`` carry the
-    unique structural shape-matched alternative head (accessor identity
-    selects only the embedding anchor).
+    """Resolve the live output head with affirmative evidence only: a True tie
+    flag, a real ``lm_head``, or (when no flag attribute exists) an embedding
+    named via a live-resolving ``.as_linear(...)`` / ``.weight.T`` accessor in
+    the analyzed forward bodies (see ``_analyze_output_route``). Missing
+    ``lm_head`` never implies tying; conflicting flags fail closed. ``path`` is
+    rooted at the argument (VLM wrappers keep the ``language_model.`` prefix);
+    at unknown status ``candidate_*`` carry the unique shape-matched alt head.
+    A True flag is corroborated against the route: if a live ``lm_head`` is
+    called there with no syntactic flag reference and no accessor for the
+    anchored embedding, it fails closed to unknown (Qwen2-MoE ships a dead
+    flag). Syntax is evidence, not proof — deeper consultation downgrades
+    conservatively to baseline; a dead reference keeps today's resolution.
     """
     prefix = "language_model." if hasattr(model, "language_model") else ""
     tm = _get_text_model(model)
@@ -771,7 +788,7 @@ def describe_output_head(model):
         emb_owner, emb_prefix = backbone, prefix + "model."
     else:
         emb_owner, emb_prefix = tm, prefix
-    accessor_modules = _output_accessor_modules(tm)
+    accessor_modules, called_modules, references_flag = _analyze_output_route(tm)
     emb_entry = _resolve_embedding_anchor(
         emb_owner, (nn.Embedding, nn.QuantizedEmbedding),
         accessor_modules=accessor_modules,
@@ -783,15 +800,41 @@ def describe_output_head(model):
             continue
         flag_attr_present = True
         value = holder.tie_word_embeddings
-        if isinstance(value, bool):
-            flags.append(value)
+        # Mirror the forward's `if self.args.tie_word_embeddings:` truthiness for
+        # any value: from_dict does not coerce, so a config may ship the flag as
+        # an int or string, and the forward consumes it by truth value. Only a
+        # value whose truth is undefined (raises) stays unread.
+        try:
+            flags.append(bool(value))
+        except Exception:
+            pass
     conflicting = len(flags) == 2 and flags[0] != flags[1]
+
+    # An uncorroborated True flag: the analyzed route calls a live lm_head
+    # at EITHER supported location (any type — a wrapped head the forward
+    # uses is just as contradictory as a raw one), shows no syntactic flag
+    # consultation, and no accessor evidence for the anchored embedding.
+    # When both routes are syntactically visible the flag plausibly selects
+    # between them through indirection the analyzer cannot see, so the flag
+    # keeps winning there. No execution-order claim is made; syntax alone
+    # fails closed (see the docstring for both residual directions).
+    live_head_ids = {
+        id(owner.lm_head)
+        for owner in (tm, backbone)
+        if owner is not None and getattr(owner, "lm_head", None) is not None
+    }
+    flag_contradicted = (
+        bool(live_head_ids & called_modules)
+        and not references_flag
+        and (emb_entry is None or id(emb_entry[1]) not in accessor_modules)
+    )
 
     head, path, status = None, None, "unknown"
     if conflicting:
         pass
     elif flags and flags[0] and emb_entry is not None:
-        head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+        if not flag_contradicted:
+            head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
     elif getattr(tm, "lm_head", None) is not None:
         head, path, status = tm.lm_head, prefix + "lm_head", "untied"
     elif backbone is not None and getattr(backbone, "lm_head", None) is not None:

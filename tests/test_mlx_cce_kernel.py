@@ -344,6 +344,35 @@ def test_softcap_alias_value_domain(value, expected):
         assert (softcap, problem) == expected
 
 
+def test_dead_tie_flag_fails_closed_to_unknown():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    head = lambda: nn.Linear(32, 96, bias=False)
+    # Qwen2-MoE hazard: True flag never referenced + unconditional lm_head call.
+    desc = U.describe_output_head(
+        _lm(nn, args_flag=True, head=head(), call_src="calls_lm_head"))
+    assert desc.status == "unknown" and desc.candidate_path == "lm_head"
+    assert U._cce_head_ineligibility(desc) is not None
+    # A referenced flag keeps tied (flag_ref pins the `not references_flag` conjunct).
+    for src in ("flag_guarded", "flag_ref_calls_lm_head"):
+        d = U.describe_output_head(_lm(nn, args_flag=True, head=head(), call_src=src))
+        assert d.status == "tied" and d.path == "model.embed_tokens"
+    # False flag resolves the live head; no live head keeps the True flag tied.
+    assert U.describe_output_head(
+        _lm(nn, args_flag=False, head=head(), call_src="calls_lm_head")).status == "untied"
+    assert U.describe_output_head(
+        _lm(nn, args_flag=True, emb_name="tok_embeddings")).status == "tied"
+    # A non-bool truthy tie flag (int 1 or string "true"; from_dict does not
+    # coerce) is read by truthiness like the forward -> tied, not a fall-through
+    # to lm_head; a falsy value ("" / 0) stays untied.
+    for truthy in (1, "true"):
+        assert U.describe_output_head(
+            _lm(nn, args_flag=truthy, head=head(), call_src="flag_guarded")).status == "tied"
+    assert U.describe_output_head(
+        _lm(nn, args_flag="", head=head(), call_src="calls_lm_head")).status == "untied"
+
+
 def test_is_lm_head_trainable_follows_descriptor_path():
     from unsloth_zoo.mlx import utils as U
 
@@ -444,6 +473,21 @@ def _lm(nn, tied_flag=_UNSET, args_flag=_UNSET, head=None, emb_name="embed_token
         class _LM(nn.Module):
             def __call__(self, x):
                 return self.model.embed_tokens.as_linear(x)
+    elif call_src == "calls_lm_head":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return self.lm_head(x)
+    elif call_src == "flag_guarded":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                if self.args.tie_word_embeddings:
+                    return self.model.embed_tokens.as_linear(x)
+                return self.lm_head(x)
+    elif call_src == "flag_ref_calls_lm_head":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                _ = self.args.tie_word_embeddings
+                return self.lm_head(x)
     else:
         class _LM(nn.Module):
             def __call__(self, x):
@@ -486,5 +530,3 @@ def test_describe_output_head_evidence_ladder():
     for i, (model, status, path, cand) in enumerate(rows):
         d = U.describe_output_head(model)
         assert (d.status, d.path, d.candidate_path) == (status, path, cand), (i, d)
-
-
