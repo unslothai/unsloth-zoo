@@ -186,6 +186,9 @@ def test_megacache_does_not_load_through_directory_symlinks(
     if unsafe_component == "root":
         configured_root = tmp_path / "cache-link"
         configured_root.symlink_to(real_root, target_is_directory = True)
+        # realpath follows the link, so the resolved target must itself be
+        # untrusted (world-writable) to be rejected.
+        real_root.chmod(0o777)
     else:
         configured_root = tmp_path / "cache"
         configured_root.mkdir(mode = 0o700)
@@ -503,3 +506,19 @@ def test_megacache_save_repairs_group_writable_existing_bundle(monkeypatch, tmp_
     assert module.megacache_save() is True
     # the untrusted leftover must be rewritten owner-only, not skipped
     assert ((key_dir / bundle_name).stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX symlink semantics")
+def test_megacache_cache_root_is_symlink_canonicalized(monkeypatch, tmp_path):
+    module = _load_module()
+    (tmp_path / "attacker").mkdir()
+    (tmp_path / "trusted").mkdir()
+    (tmp_path / "trusted" / "link").symlink_to(
+        tmp_path / "attacker", target_is_directory = True)
+    # A symlink followed by ".." resolves differently than abspath collapses it;
+    # _cache_root must return the real path so validation matches actual access.
+    configured = tmp_path / "trusted" / "link" / ".." / "unsafe"
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE_DIR", str(configured))
+    root = module._cache_root()
+    assert root == os.path.realpath(str(configured))
+    assert root != os.path.abspath(str(configured))

@@ -103,7 +103,11 @@ def _cache_root():
         if home == "~" or not os.path.isdir(home):
             return None
         root = os.path.join(home, ".cache", "unsloth", "mega_cache")
-    return root
+    # Canonicalize symlinks and ".." so the path we validate is exactly the one
+    # later reads and writes resolve to. abspath only collapses ".." lexically,
+    # so a symlinked component followed by ".." would validate one directory
+    # while the kernel accesses another.
+    return os.path.realpath(root)
 pass
 
 
