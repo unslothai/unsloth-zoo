@@ -2123,26 +2123,35 @@ class MLXTrainer:
         """Best-effort release of an iterator owned by the training run."""
         batch_iter = getattr(self, "_active_batch_iter", None)
         self._active_batch_iter = None
-        close = getattr(batch_iter, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                # Cleanup must not mask the training error already in flight or
-                # make distributed ranks diverge after their final collective.
-                pass
-        # Normal, failed, and interrupted exits all pass through here: close
-        # the producer and persist a live orphan so the next run's gate sees it.
+        # Normal, failed, and interrupted exits all pass through here: close the
+        # producer and persist a live orphan so the next run's gate sees it.
         control = getattr(self, "_mlx_prefetch_control", None)
         prefetcher = control.get("prefetcher") if control else None
-        if prefetcher is not None:
-            try:
-                prefetcher.close()
-            except Exception:
-                pass
-            if prefetcher.orphan_alive():
-                self._mlx_prefetch_orphan = prefetcher
-            control["prefetcher"] = None
+        try:
+            close = getattr(batch_iter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    # An ordinary cleanup error must not mask the training error
+                    # already in flight or diverge ranks after a final
+                    # collective. A propagating signal is honored (see finally).
+                    pass
+            if prefetcher is not None:
+                try:
+                    prefetcher.close()
+                except Exception:
+                    pass
+        finally:
+            if prefetcher is not None:
+                # close() marks a conservative orphan before doing anything, so
+                # a not-clean close OR a propagating interrupt leaves
+                # orphaned=True; persist it either way (a clean, drained close
+                # clears the flag). The next run's gate drains and clears it.
+                if prefetcher.orphaned:
+                    self._mlx_prefetch_orphan = prefetcher
+                if control is not None:
+                    control["prefetcher"] = None
 
 
     def _quiesce_prefetcher_for_save(self, terminal=False):
@@ -2161,6 +2170,10 @@ class MLXTrainer:
                     "to serialize concurrently. Wait for the thread to "
                     "terminate, then call save_model() again."
                 )
+            # Terminated orphan: close() drains its queued batches (device
+            # tensors for opaque VLM outputs) before this save, rather than
+            # relying on the reference drop to eventually free them.
+            orphan.close()
             self._mlx_prefetch_orphan = None
         control = getattr(self, "_mlx_prefetch_control", None)
         prefetcher = control.get("prefetcher") if control else None
@@ -2169,8 +2182,10 @@ class MLXTrainer:
         if not terminal:
             prefetcher.quiesce()
             return prefetcher
-        prefetcher.close()
-        if prefetcher.orphan_alive():
+        # Gate on close()'s return, not a fresh orphan_alive() read: close()
+        # drained the queue iff it reports clean, so this cannot proceed to
+        # save with staged batches (device tensors) still queued.
+        if not prefetcher.close():
             self._mlx_prefetch_orphan = prefetcher
             control["prefetcher"] = None
             raise RuntimeError(
@@ -2408,7 +2423,9 @@ class MLXTrainer:
                     "preprocessing objects. Wait for that thread to terminate "
                     "before training with this trainer again."
                 )
-            # Terminated orphan: release its thread/closures/queued batches.
+            # Terminated orphan: close() drains its queued batches before the
+            # reference is dropped, releasing them deterministically.
+            previous_orphan.close()
             self._mlx_prefetch_orphan = None
         self._mlx_resume_step_for_prefetch = 0
         self._mlx_resume_state_cache = None

@@ -2614,6 +2614,7 @@ def test_streaming_prefetch_identity_laziness_and_knob():
     assert trainer._mlx_prefetch_control.get("eligible") is True
 
     class FakeOrphan:
+        orphaned = True
         def close(self): pass
         def orphan_alive(self): return True
     trainer._mlx_prefetch_control = {"prefetcher": FakeOrphan()}

@@ -6539,8 +6539,8 @@ class _LazyTextPrefetcher:
         self._thread = None
         self.orphaned = False
         self._closed = False
-        self._close_finished = threading.Event()
         self._lifecycle_lock = threading.Lock()
+        self._close_lock = threading.Lock()
 
     # -- producer side ----------------------------------------------------
     def _run(self):
@@ -6660,30 +6660,50 @@ class _LazyTextPrefetcher:
         self._pause.clear()
 
     def close(self):
-        """Terminal and idempotent: only the first call pays the bounded join."""
+        """Join the producer, then release any queued batches once it is
+        confirmed dead. Terminal, idempotent, and safe under concurrent
+        callers. Returns True when the producer terminated (queue drained),
+        False when it overran the join and is a live orphan.
+
+        The join, classification, and drain run under one lock, and the return
+        reflects this caller's own post-join observation — so a True return
+        guarantees the queue was drained under that lock before it was reported,
+        and no concurrent closer can observe it half-drained. ``orphaned`` is
+        set conservatively before the join, so an interrupted join leaves a live
+        producer classified as an orphan rather than falsely clean."""
+        # Mark a conservative orphan up front: if anything below is interrupted
+        # (a signal during lock acquisition, the join, or the drain), the
+        # producer is already recorded as unresolved rather than left falsely
+        # clean. A clean termination clears it below.
+        self.orphaned = True
         with self._lifecycle_lock:
             self._stop.set()
             self._pause.clear()
-            first_close = not self._closed
             self._closed = True
             thread = self._thread
-        if not first_close:
-            # Wait for the first closer's join to settle so a concurrent
-            # second close never reports clean while the producer still runs.
-            settled = self._close_finished.wait(timeout=self._JOIN_TIMEOUT + 1.0)
-            if not settled and self._thread is not None and self._thread.is_alive():
-                self.orphaned = True  # conservative: unsettled + alive = orphan
-            return not self.orphan_alive()
-        try:
+        with self._close_lock:
             if thread is not None and thread.is_alive():
                 thread.join(timeout=self._JOIN_TIMEOUT)
-        finally:
-            # Conservative: classify any still-live thread as orphaned before
-            # publishing settlement, including interrupted joins.
-            if thread is not None and thread.is_alive():
-                self.orphaned = True
-            self._close_finished.set()
-        return not self.orphaned
+            terminated = thread is None or not thread.is_alive()
+            if terminated:
+                # A joined-dead thread has published its final enqueue and will
+                # never write again, so draining here cannot lose a batch. Clear
+                # the orphan flag only AFTER the drain completes: a signal during
+                # the drain then still leaves a conservative orphan (flag set,
+                # queue not yet empty) for the caller's finally to persist.
+                self._drain_envelopes()
+                self.orphaned = False
+            return terminated
+
+    def _drain_envelopes(self):
+        """Discard queued batches so their payloads (device tensors for opaque
+        VLM outputs) are released instead of retained until the consumer
+        generator is collected — a terminal close is followed by a save."""
+        while True:
+            try:
+                self._envelopes.get_nowait()
+            except _queue_module.Empty:
+                return
 
     def orphan_alive(self):
         return self.orphaned and self._thread is not None and self._thread.is_alive()
