@@ -1769,12 +1769,20 @@ class MLXTrainer:
         if args.streaming and _is_mlx_lazy_text_source(eval_dataset):
             max_batches = getattr(args, "max_eval_batches", None)
             if max_batches is not None:
-                max_batches = int(max_batches)
-                if max_batches <= 0:
+                # Reject rather than truncate non-integral values (1.9, True):
+                # silent coercion would change how much eval data is scored.
+                coerced = None
+                if not isinstance(max_batches, bool):
+                    try:
+                        coerced = int(max_batches)
+                    except (TypeError, ValueError):
+                        coerced = None
+                if coerced is None or coerced != max_batches or coerced <= 0:
                     raise ValueError(
                         "Unsloth MLX: max_eval_batches must be a positive "
                         "integer when provided."
                     )
+                max_batches = coerced
 
             def _factory():
                 return iterate_training_batches(

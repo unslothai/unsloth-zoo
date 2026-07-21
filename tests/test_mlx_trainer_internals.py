@@ -2710,3 +2710,18 @@ def test_lazy_text_producer_rejects_mlx_valued_rows_before_parsing():
     _reject_probe({"text": mx.array([1, 2])})
     _reject_probe({"messages": mx.array([1, 2])})
     _reject_probe(formatting_func=lambda item: {"text": mx.array([3, 4])})
+
+
+def test_max_eval_batches_rejects_non_integer_values():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8),
+    )
+    for bad in (True, 1.9, 0, "2"):
+        trainer.args.max_eval_batches = bad
+        with pytest.raises(ValueError, match="max_eval_batches"):
+            trainer._create_text_eval_batches(
+                _CountingTextRows(({"text": "10 1"},)), 1, False, False)
