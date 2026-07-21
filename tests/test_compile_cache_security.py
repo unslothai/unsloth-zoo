@@ -460,3 +460,46 @@ def test_megacache_save_does_not_repermission_existing_root(monkeypatch, tmp_pat
     # per-key child is clamped to owner-only.
     assert (root.stat().st_mode & 0o777) == 0o755
     assert ((root / "deadbeef").stat().st_mode & 0o777) == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+def test_megacache_creates_dirs_without_mutating_process_umask(monkeypatch, tmp_path):
+    module = _load_module()
+    real_umask = os.umask
+    previous = real_umask(0o002)  # a lax umask that must not leak to other threads
+    try:
+        monkeypatch.setattr(module.os, "umask", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not mutate the process-wide umask")))
+        nested = tmp_path / "root" / "unsloth" / "mega_cache"
+        assert module._ensure_private_directory(str(nested)) is True
+        assert (nested.parent.stat().st_mode & 0o777) == 0o700
+        assert (nested.stat().st_mode & 0o777) == 0o700
+    finally:
+        real_umask(previous)
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+def test_megacache_save_repairs_group_writable_existing_bundle(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "mega"
+    key_dir = root / "deadbeef"
+    key_dir.mkdir(parents = True)
+    root.chmod(0o700)
+    key_dir.chmod(0o700)
+    data = b"artifact-bytes"
+    bundle_name = "megacache-%s.bin" % hashlib.sha256(data).hexdigest()[:16]
+    # a leftover group-writable bundle at the content-addressed name
+    (key_dir / bundle_name).write_bytes(data)
+    (key_dir / bundle_name).chmod(0o664)
+    fake_torch = types.SimpleNamespace(compiler = types.SimpleNamespace(
+        load_cache_artifacts = lambda b: {},
+        save_cache_artifacts = lambda: (data, {})))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE_DIR", str(root))
+    module._STATE["armed"] = True
+    module._STATE["loaded_key"] = "deadbeef"
+
+    assert module.megacache_save() is True
+    # the untrusted leftover must be rewritten owner-only, not skipped
+    assert ((key_dir / bundle_name).stat().st_mode & 0o777) == 0o600

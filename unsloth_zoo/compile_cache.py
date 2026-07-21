@@ -169,30 +169,34 @@ pass
 
 
 def _ensure_private_directory(path):
-    """Create a trusted, owner-only cache directory.
+    """Create a trusted, owner-only cache directory tree.
 
-    makedirs' ``mode`` only applies to the leaf since Python 3.7, so force the
-    umask to 0700 while creating: a lax umask would otherwise leave a fresh
-    parent (e.g. ~/.cache/unsloth) group-writable and get it rejected. Only
-    chmod a directory we just created; never re-permission a pre-existing
-    configured root such as ``UNSLOTH_MEGA_CACHE_DIR=/tmp``, which would break
-    it for every other process. A pre-existing root is used as-is only if
-    ``_is_trusted_directory`` already accepts it."""
+    Create each missing component with an explicit 0700 mode. That mode
+    survives any normal umask (it has no group/other bits to strip), unlike
+    ``makedirs`` whose mode applies only to the leaf so a lax umask would leave
+    a fresh parent group-writable and then rejected. Pre-existing components
+    are left untouched, so a configured root such as
+    ``UNSLOTH_MEGA_CACHE_DIR=/tmp`` is never re-permissioned; it is used as-is
+    only if ``_is_trusted_directory`` accepts it. No process-wide umask change."""
     try:
-        existed = os.path.exists(path)
-        if os.name == "posix":
-            old_umask = os.umask(0o077)
+        target = os.path.abspath(os.fspath(path))
+        if os.name != "posix":
+            os.makedirs(target, exist_ok = True)
+            return _is_trusted_directory(target)
+        components = []
+        current = target
+        while True:
+            components.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        for directory in reversed(components):
             try:
-                os.makedirs(path, mode = 0o700, exist_ok = True)
-            finally:
-                os.umask(old_umask)
-        else:
-            os.makedirs(path, mode = 0o700, exist_ok = True)
-        if not _is_trusted_directory(path):
-            return False
-        if os.name == "posix" and not existed:
-            os.chmod(path, 0o700)
-        return _is_trusted_directory(path)
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+        return _is_trusted_directory(target)
     except Exception:
         return False
 pass
@@ -503,7 +507,12 @@ def megacache_save():
         # own complete file. Same name always implies same bytes.
         bundle_name = f"megacache-{new_sha[:16]}.bin"
         bundle_path = os.path.join(directory, bundle_name)
-        if not os.path.isfile(bundle_path):
+        # Content-addressing means a trusted file with this name already holds
+        # these bytes. But a leftover from an older writer could be group-
+        # writable; skipping the write would leave the manifest pointing at an
+        # untrusted bundle that every load then rejects. (Re)write unless the
+        # existing file already passes the trusted-file checks.
+        if _read_trusted_file(bundle_path, binary = True) is None:
             temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
             with open(temporary_path, "wb") as file:
                 file.write(data)
