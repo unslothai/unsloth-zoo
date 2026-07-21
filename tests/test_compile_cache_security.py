@@ -527,3 +527,27 @@ def test_megacache_cache_root_is_symlink_canonicalized(monkeypatch, tmp_path):
     root = module._cache_root()
     assert root == os.path.realpath(str(configured))
     assert root != os.path.abspath(str(configured))
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX sticky-directory semantics")
+def test_megacache_permits_private_key_under_root_owned_sticky_root(monkeypatch, tmp_path):
+    module = _load_module()
+    shared = tmp_path / "shared"
+    key_dir, data = _seed_bundle(shared)
+    shared.chmod(0o1777)
+    key_dir.chmod(0o700)
+
+    # Present `shared` as a root-owned sticky parent like /tmp: the per-key dir
+    # is still owned by us, so the bundle must load.
+    fixture_lstat = module.os.lstat
+
+    def sticky_root(path, *args, **kwargs):
+        if os.path.abspath(os.fspath(path)) == str(shared):
+            return os.stat_result((stat.S_IFDIR | 0o1777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return fixture_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "lstat", sticky_root)
+    loaded = []
+    _configure_load(monkeypatch, module, shared, loaded)
+    assert module.megacache_load("victim-model") is True
+    assert loaded == [data]

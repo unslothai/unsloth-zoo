@@ -301,7 +301,11 @@ def _bundle_paths(key):
     if root is None:
         return None, None
     directory = os.path.join(root, key)
-    if not (_is_trusted_directory(root) and _is_trusted_directory(directory)):
+    # Validate the per-key directory: its walk also vets the root as an
+    # ancestor (a sticky root-owned parent like /tmp is fine), so a shared
+    # sticky root with a private owned key dir is permitted, while the key dir
+    # itself must still be owned by us.
+    if not _is_trusted_directory(directory):
         _log("cache directory is not trusted; skipping")
         return None, None
     return directory, os.path.join(directory, _MANIFEST_NAME)
@@ -431,14 +435,10 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         _STATE["atexit_registered"] = True
 
     # Missing paths are safe to create later but never safe to read from.
-    # Revalidate both dirs as existing right before opening the manifest so an
-    # attacker cannot win a create-after-check race under a sticky shared
-    # parent such as /tmp.
-    root = os.path.dirname(directory)
-    if not (
-        _is_trusted_directory(root, allow_missing = False)
-        and _is_trusted_directory(directory, allow_missing = False)
-    ):
+    # Revalidate the key dir as existing (its walk re-vets the root ancestor)
+    # right before opening the manifest so an attacker cannot win a
+    # create-after-check race under a sticky shared parent such as /tmp.
+    if not _is_trusted_directory(directory, allow_missing = False):
         _log(f"no trusted bundle for key {key} (will compile locally and save on exit)")
         return False
 
@@ -485,13 +485,11 @@ def megacache_save():
         directory, manifest_path = _bundle_paths(key)
         if manifest_path is None:
             return False
-        root = os.path.dirname(directory)
-        # Establish owned private dirs before reading/deserializing any prior
-        # bundle; closes the analogous race on the save path.
-        if not (
-            _ensure_private_directory(root)
-            and _ensure_private_directory(directory)
-        ):
+        # Establish the owned private key dir (creating any missing parents as
+        # 0700) before reading/deserializing any prior bundle; closes the
+        # analogous race on the save path. A pre-existing sticky shared root is
+        # left as-is and vetted as an ancestor by the trust walk.
+        if not _ensure_private_directory(directory):
             _log("cache directory is not trusted; skipping save")
             return False
         # Fold the on-disk bundle back into the manager before serializing so a
