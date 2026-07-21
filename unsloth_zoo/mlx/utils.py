@@ -963,6 +963,41 @@ def _validated_knob(value, source):
     return value, None
 
 
+def _detect_logit_softcap(model):
+    """Logit softcap from either known attr, as ``(softcap, problem)``.
+
+    ``final_logit_softcapping`` keeps its ``_get_logit_softcap`` semantics.
+    ``logits_soft_cap`` (RecurrentGemma) caps for any truthy value: None/0.0
+    mean no cap, a positive finite real caps, anything else (or both attrs
+    present) fails closed rather than dropping the cap.
+    """
+    tm = _get_text_model(model)
+    # Presence, not value: an explicitly-None legacy attr still makes the
+    # dual-attr combination unverified.
+    legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
+    if legacy is _KNOB_MISSING and hasattr(tm, "args"):
+        legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
+    alias, conflict = _knob_value(tm, "logits_soft_cap", ("args", "config"))
+    if conflict:
+        return 0.0, ("logits_soft_cap differs between its configuration "
+                     "sites")
+    if alias is not _KNOB_MISSING and legacy is not _KNOB_MISSING:
+        return 0.0, ("both final_logit_softcapping and logits_soft_cap are "
+                     "present, an unverified combination")
+    if alias is _KNOB_MISSING:
+        return _get_logit_softcap(model), None
+    if alias is None:
+        return 0.0, None  # falsy: the forward skips the cap entirely
+    value, problem = _validated_knob(alias, "logits_soft_cap")
+    if problem is not None:
+        return 0.0, problem
+    if value == 0.0:
+        return 0.0, None  # falsy: the forward skips the cap entirely
+    if value < 0:
+        return 0.0, "logits_soft_cap must be positive when set"
+    return value, None
+
+
 def _aux_knob(tm, name):
     """A ratio's companion knob: value or a fail-closed reason string."""
     value, conflict = _knob_value(tm, name, _KNOB_AUX_SITES[name])
@@ -1114,7 +1149,12 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
 
-    softcap = _get_logit_softcap(model)
+    softcap, _softcap_problem = _detect_logit_softcap(model)
+    if _softcap_problem is not None:
+        print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -2576,14 +2616,15 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
               f"head ({_ineligible}); falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
 
-    logit_scale, _scale_invalid = _get_logit_scale(model)
-    if _scale_invalid:
-        print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
-              "non-scalar, or outside the supported range); falling back to "
-              "standard cross-entropy.")
+    logit_scale, _transform_problem = _detect_head_transform(model, head_desc.status)
+    if _transform_problem is not None:
+        print(f"Unsloth: {_transform_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
 
-    softcap = _get_logit_softcap(model)
+    softcap, _softcap_problem = _detect_logit_softcap(model)
+    if _softcap_problem is not None:
+        print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
     lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path

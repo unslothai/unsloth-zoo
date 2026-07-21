@@ -325,6 +325,25 @@ def test_detect_head_transform_rows(attrs, status, expected):
         assert (scale, problem) == expected
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (30.0, (30.0, None)),
+        (None, (0.0, None)),   # falsy: the forward skips the cap
+        (-5.0, "positive"),
+        (True, "not a finite real scalar"),
+    ],
+)
+def test_softcap_alias_value_domain(value, expected):
+    from unsloth_zoo.mlx.utils import _detect_logit_softcap
+
+    softcap, problem = _detect_logit_softcap(_knobbed(logits_soft_cap=value))
+    if isinstance(expected, str):
+        assert problem is not None and expected in problem
+    else:
+        assert (softcap, problem) == expected
+
+
 def test_backboneless_text_model_selects_baseline_fallback(capsys):
     # nanochat shape (stack under .transformer, no separable .model): the
     # biased head would trip the eligibility gate, so seeing ONLY the topology
@@ -345,19 +364,23 @@ def test_backboneless_text_model_selects_baseline_fallback(capsys):
     assert "separable hidden-state backbone" in out and "output head" not in out
 
 
-@pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale"])
+@pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale",
+                                  "masked_tail_knob"])
 def test_vlm_cce_fallbacks_are_marked(case):
-    # Every VLM fallback path must return a loss fn carrying the eager
-    # fallback marker.
+    # Every VLM fallback path returns a loss fn carrying the eager marker,
+    # including the knob-table routes (invalid scale, masked-tail knob).
     from unsloth_zoo.mlx.utils import make_vlm_cce_loss_fn
 
     from unsloth_zoo.mlx import utils as U
 
     model = _stub_model()
-    if case == "invalid_scale":
+    if case in ("invalid_scale", "masked_tail_knob"):
         lm = _lm(U.nn, head=U.nn.Linear(32, 96, bias=False))
         lm.args = type("A", (), {})()
-        lm.args.logit_scale = float("nan")
+        if case == "invalid_scale":
+            lm.args.logit_scale = float("nan")
+        else:
+            lm.args.mup_width_multiplier = 2.0
         model.language_model = lm
     else:
         model.language_model = _stub_model("args", 0.0625)
@@ -365,7 +388,8 @@ def test_vlm_cce_fallbacks_are_marked(case):
             model.language_model.model = object()  # separable backbone present
     if case != "no_embeddings":
         model.get_input_embeddings = lambda: None
-    with pytest.warns(UserWarning) if case != "invalid_scale" else _no_warning():
+    warns = case in ("no_embeddings", "no_backbone")
+    with pytest.warns(UserWarning) if warns else _no_warning():
         fn = make_vlm_cce_loss_fn(model)
     assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
 
