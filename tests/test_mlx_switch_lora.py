@@ -152,7 +152,11 @@ def _direct_layer_model(layers):
 
 
 @pytest.mark.parametrize("quantized", [False, True])
-def test_type_driven_peft_trains_routed_expert_without_unfreezing_base(quantized):
+@pytest.mark.parametrize("init_lora_weights", [True, "gaussian", False])
+def test_type_driven_peft_trains_routed_expert_without_unfreezing_base(
+    quantized, init_lora_weights,
+):
+    import math
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -175,14 +179,22 @@ def test_type_driven_peft_trains_routed_expert_without_unfreezing_base(quantized
 
     FastMLXModel.get_peft_model(
         model, r=4, lora_alpha=4, target_modules=["proj"],
+        init_lora_weights=init_lora_weights,
         use_gradient_checkpointing=False,
     )
     dense = model.model.layers[0].proj
     switch = model.model.layers[1].proj
     assert isinstance(dense, LoRALinear)
     assert isinstance(switch, LoRASwitchLinear)
-    assert bool(mx.allclose(dense(dense_x), dense_before))
-    assert bool(mx.allclose(switch(switch_x, indices), switch_before))
+    if init_lora_weights is not False:
+        assert bool(mx.allclose(dense(dense_x), dense_before))
+        assert bool(mx.allclose(switch(switch_x, indices), switch_before))
+    if init_lora_weights == "gaussian":
+        assert 0.15 < float(mx.std(switch.lora_a)) < 0.35
+    elif init_lora_weights is False:
+        assert float(mx.max(mx.abs(switch.lora_a))) <= 1.0 / math.sqrt(64)
+        assert float(mx.max(mx.abs(switch.lora_b))) <= 1.0 / math.sqrt(4)
+        assert bool(mx.any(switch.lora_b != 0))
     trainable = dict(tree_flatten(model.trainable_parameters()))
     assert trainable and all(name.endswith(("lora_a", "lora_b")) for name in trainable)
 
@@ -433,14 +445,26 @@ def test_switch_adapter_public_lifecycle(
 
 
 def test_legacy_switch_rank_layout(tmp_path):
+    import math
     import mlx.core as mx
     import unsloth_zoo.mlx.loader as loader
     import unsloth_zoo.mlx.utils as mlx_utils
 
     module = types.SimpleNamespace(
         lora_a=mx.zeros((4, 64)), lora_b=mx.zeros((2, 16, 2)),
+        num_experts=2,
     )
     assert mlx_utils._infer_mlx_lora_rank(module) == 2
+
+    model = _Model([("proj", module)])
+    mx.random.seed(31)
+    loader._apply_mlx_lora_initialization(model, "gaussian")
+    assert 0.35 < float(mx.std(module.lora_a)) < 0.65
+    mx.random.seed(31)
+    loader._apply_mlx_lora_initialization(model, False)
+    assert float(mx.max(mx.abs(module.lora_a))) <= 1.0 / math.sqrt(64)
+    assert float(mx.max(mx.abs(module.lora_b))) <= 1.0 / math.sqrt(2)
+    assert bool(mx.any(module.lora_b != 0))
 
     weights = tmp_path / "legacy.safetensors"
     mx.save_safetensors(str(weights), {

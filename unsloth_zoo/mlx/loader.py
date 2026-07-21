@@ -4911,6 +4911,9 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
         b_shape = _lora_tensor_shape(module.lora_b)
         if a_shape is None or b_shape is None:
             continue
+        is_routed = hasattr(module, "num_experts")
+        a_scale_dim = a_shape[-1] if is_routed else a_shape[0]
+        b_scale_dim = b_shape[-1] if is_routed else b_shape[0]
         if init_lora_weights == "gaussian":
             if hasattr(module, "embedding"):
                 _assign_lora_tensor(module, "lora_a", mx.zeros(a_shape))
@@ -4918,23 +4921,23 @@ def _apply_mlx_lora_initialization(model, init_lora_weights):
             else:
                 _assign_lora_tensor(
                     module, "lora_a",
-                    mx.random.normal(shape=a_shape) * (1.0 / b_shape[0]),
+                    mx.random.normal(shape=a_shape) * (1.0 / b_scale_dim),
                 )
                 _assign_lora_tensor(module, "lora_b", mx.zeros(b_shape))
         elif init_lora_weights is False:
             _assign_lora_tensor(
                 module, "lora_a",
                 mx.random.uniform(
-                    low=-1.0 / math.sqrt(a_shape[0]),
-                    high=1.0 / math.sqrt(a_shape[0]),
+                    low=-1.0 / math.sqrt(a_scale_dim),
+                    high=1.0 / math.sqrt(a_scale_dim),
                     shape=a_shape,
                 ),
             )
             _assign_lora_tensor(
                 module, "lora_b",
                 mx.random.uniform(
-                    low=-1.0 / math.sqrt(b_shape[0]),
-                    high=1.0 / math.sqrt(b_shape[0]),
+                    low=-1.0 / math.sqrt(b_scale_dim),
+                    high=1.0 / math.sqrt(b_scale_dim),
                     shape=b_shape,
                 ),
             )
