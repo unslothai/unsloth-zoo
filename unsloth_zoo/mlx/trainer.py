@@ -173,7 +173,6 @@ from .utils import (
     _create_text_batch_plan,
     _create_ordered_text_plan,
     create_batches,
-    create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
     iterate_vlm_training_batches,
@@ -3245,6 +3244,21 @@ class MLXTrainer:
                     grad_norm = _apply_update(grad, toks_f)
                     grad_accum_state = None
             else:
+                # Compiled full step threads mx.random.state through its outputs;
+                # snapshot it so an eager retry after a trace-time failure resumes
+                # from the pre-call RNG (mirrors the DDP local-grad path). Guard on
+                # the list form so the torch-sim test shim (callable state) is a no-op.
+                rng_state_before = None
+                _rng_state = mx.random.state
+                if (
+                    _use_compile
+                    and not _ddp_compile_local_grad
+                    and isinstance(_rng_state, list)
+                    and _rng_state
+                ):
+                    rng_state_before = mx.array(
+                        _rng_state[0].tolist(), dtype=mx.uint32,
+                    )
                 try:
                     lvalue, toks, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
@@ -3268,6 +3282,8 @@ class MLXTrainer:
                         _compile_fallback_reason = "runtime_error"
                         if isinstance(batches, FiniteTextBatchPlan):
                             batch_data = batches[scheduled_index]
+                        if rng_state_before is not None:
+                            mx.random.state[0] = rng_state_before
                         state = [model.state, optimizer.state, mx.random.state]
                         lvalue, toks, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
