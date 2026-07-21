@@ -507,8 +507,14 @@ class _UnpatchedFakeAudioDecoder:
 @pytest.fixture
 def _recognize_unpatched_decoder(monkeypatch):
     # Treat _UnpatchedFakeAudioDecoder as the decoder type so these run in CI.
+    # Patch the imported module object directly rather than the
+    # "unsloth_zoo.vision_utils._audio_decoder_types" string path: the string
+    # form resolves unsloth_zoo through sys.modules at runtime, so a preceding
+    # test that swaps unsloth_zoo in sys.modules would break resolution here.
+    import unsloth_zoo.vision_utils as vision_utils
     monkeypatch.setattr(
-        "unsloth_zoo.vision_utils._audio_decoder_types",
+        vision_utils,
+        "_audio_decoder_types",
         lambda: (_UnpatchedFakeAudioDecoder,),
     )
 
