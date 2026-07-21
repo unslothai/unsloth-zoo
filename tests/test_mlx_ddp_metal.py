@@ -30,7 +30,7 @@ def test_mlx_launch_ordered_text_batches_are_rank_sharded(tmp_path):
         pytest.skip("mlx.launch not found beside current Python executable")
 
     script = tmp_path / "ddp_batch_probe.py"
-    script.write_text(f"#!{sys.executable}\n" + """import json, sys
+    script.write_text("""import json, sys
 from pathlib import Path
 
 import mlx.core as mx
@@ -465,15 +465,16 @@ payload = {
 Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
 """,
         encoding="utf-8")
-    script.chmod(script.stat().st_mode | 0o111)
 
     env = os.environ.copy()
     repo_root = Path(__file__).resolve().parents[1]
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    # The ring launcher bash-execs the command array verbatim, so pin the
+    # interpreter as argv[0] instead of relying on a shebang + chmod.
     cmd = [
         str(launcher), "-n", "2", "--backend", "ring",
         "--cwd", str(repo_root),
-        str(script), str(tmp_path),
+        sys.executable, str(script), str(tmp_path),
     ]
     proc = subprocess.run(
         cmd, capture_output=True, env=env, text=True, timeout=120,
