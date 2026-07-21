@@ -20,7 +20,7 @@ import linecache
 import sys
 
 import torch
-from .common import TEMPORARY_PATCHES
+from .common import TEMPORARY_PATCHES, logger
 from .utils import raise_error, patch_function
 
 
@@ -730,6 +730,13 @@ def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
         setattr(model_cls, marker, True)
         return False
     if len(buggy_casts) != 1 or fixed_casts:
+        if not buggy_casts and not fixed_casts:
+            logger.warning(
+                f"Unsloth: Gemma4 audio dtype patch skipped for "
+                f"`{model_cls.__name__}.forward` - the expected `masked_scatter` audio "
+                f"cast was not found (transformers source drift). Audio merges may hit a "
+                f"dtype mismatch until the patch is updated."
+            )
         return False
 
     buggy_cast = buggy_casts[0]

@@ -1256,8 +1256,10 @@ def _unsloth_gemma4_ple_cast_input(module, x):
     quant_state = getattr(weight, "quant_state", None)
     if quant_state is not None:
         return x
-    dtype = weight.dtype
+    dtype = getattr(weight, "dtype", None)
     if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return x
+    if getattr(dtype, "itemsize", 2) < 2:
         return x
     return x if x.dtype == dtype else x.to(dtype)
 pass
@@ -1540,9 +1542,6 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
-    if module in ("Gemma4TextModel", "Gemma4TextDecoderLayer") and \
-        os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-        source += _GEMMA4_PLE_CAST_HELPER
     if supports_return_hidden_states:
         source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
 
@@ -1592,6 +1591,15 @@ def create_standalone_class(
         source = fix_gemma4_audio_feature_dtype(source)
     elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
         source = fix_gemma4_forced_float32_ple_dtype(source, module)
+
+    # Append the PLE cast helper only once a call to it actually exists in the
+    # generated source (from the rewrite above, or from already-cast eager source
+    # read back through inspect.getsource). This keeps the emitted helper name in
+    # sync with the eager patch and avoids appending dead code when nothing was
+    # rewritten (drift / already-fixed upstream / flag off).
+    if "_unsloth_gemma4_ple_cast_input(" in source and \
+        "def _unsloth_gemma4_ple_cast_input" not in source:
+        source += _GEMMA4_PLE_CAST_HELPER
     return source
 
 

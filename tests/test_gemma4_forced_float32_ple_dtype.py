@@ -10,7 +10,7 @@ from unsloth_zoo.compiler import (
     _GEMMA4_PLE_CAST_HELPER,
     fix_gemma4_forced_float32_ple_dtype,
 )
-from unsloth_zoo.temporary_patches.gemma4_float32 import _gemma4_ple_cast_input
+from unsloth_zoo.temporary_patches.gemma4_float32 import _unsloth_gemma4_ple_cast_input
 from unsloth_zoo.temporary_patches.gemma4_float32 import _patch_gemma4_ple_dtype_on_method
 
 
@@ -20,7 +20,7 @@ def _compiler_ple_cast_input(module, x):
     return namespace["_unsloth_gemma4_ple_cast_input"](module, x)
 
 
-@pytest.fixture(params=[_gemma4_ple_cast_input, _compiler_ple_cast_input])
+@pytest.fixture(params=[_unsloth_gemma4_ple_cast_input, _compiler_ple_cast_input])
 def ple_cast_input(request):
     return request.param
 
@@ -152,12 +152,12 @@ def test_gemma4_ple_method_patch_lifecycle_covers_all_three_boundaries(tmp_path,
         (("per_layer_input_gate", "hidden_states"), ("per_layer_projection", "hidden_states")),
     ) is True
 
-    assert "_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds)" in inspect.getsource(
+    assert "_unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds)" in inspect.getsource(
         model_cls.project_per_layer_inputs
     )
     patched_decoder = inspect.getsource(decoder_cls.forward)
-    assert "_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states)" in patched_decoder
-    assert "_gemma4_ple_cast_input(self.per_layer_projection, hidden_states)" in patched_decoder
+    assert "_unsloth_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states)" in patched_decoder
+    assert "_unsloth_gemma4_ple_cast_input(self.per_layer_projection, hidden_states)" in patched_decoder
     assert model_cls._unsloth_ple_dtype_project_per_layer_inputs_patched is True
     assert decoder_cls._unsloth_ple_dtype_forward_patched is True
 
@@ -199,7 +199,7 @@ def test_gemma4_ple_method_patch_lifecycle_covers_all_three_boundaries(tmp_path,
     [
         (
             "fixed",
-            "return self.per_layer_model_projection(_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds))",
+            "return self.per_layer_model_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds))",
             True,
         ),
         (
@@ -287,14 +287,14 @@ def test_gemma4_ple_three_boundary_eager_and_compiled_parity():
 
         def forward(self, inputs_embeds, hidden_states, per_layer_input):
             self.per_layer_model_projection(
-                _gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds)
+                _unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds)
             )
             hidden_states = self.per_layer_input_gate(
-                _gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states)
+                _unsloth_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states)
             )
             hidden_states = torch.nn.functional.silu(hidden_states) * per_layer_input
             return self.per_layer_projection(
-                _gemma4_ple_cast_input(self.per_layer_projection, hidden_states)
+                _unsloth_gemma4_ple_cast_input(self.per_layer_projection, hidden_states)
             )
 
     model = ThreePLEBoundaries()
@@ -307,3 +307,162 @@ def test_gemma4_ple_three_boundary_eager_and_compiled_parity():
         pytest.skip("torch.compile is unavailable")
     compiled = torch.compile(model, backend="eager", fullgraph=True)
     torch.testing.assert_close(compiled(inputs, hidden_states, per_layer_input), eager)
+
+
+class _WeightStub:
+    """Minimal `.weight` stand-in: the cast helper only reads dtype/quant_state."""
+    pass
+
+
+def test_gemma4_ple_cast_input_leaves_fp8_weight_unchanged(ple_cast_input):
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("float8_e4m3fn is unavailable on this torch build")
+    x = torch.randn(2, 3, dtype=torch.float32)
+    weight = _WeightStub()
+    weight.dtype = fp8  # sub-2-byte float, no quant_state
+
+    cast = ple_cast_input(_ModuleWithWeight(weight), x)
+
+    # Must not downcast the fp32 carrier to fp8 (fp8 kernels scale internally).
+    assert cast is x
+    assert cast.dtype == torch.float32
+
+
+def test_gemma4_ple_cast_input_leaves_weight_without_dtype_unchanged(ple_cast_input):
+    x = torch.randn(2, 3, dtype=torch.float32)
+    # A weight proxy that does not expose `.dtype` must not raise AttributeError.
+    cast = ple_cast_input(_ModuleWithWeight(_WeightStub()), x)
+
+    assert cast is x
+    assert cast.dtype == torch.float32
+
+
+def test_gemma4_ple_dry_run_classifies_without_mutating(tmp_path, monkeypatch):
+    module = _load_fake_ple_module(
+        tmp_path,
+        monkeypatch,
+        "fake_gemma4_ple_dryrun",
+        """
+        import torch
+
+        class Gemma4TextModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.per_layer_model_projection = torch.nn.Linear(3, 3, bias=False, dtype=torch.float16)
+
+            def project_per_layer_inputs(self, inputs_embeds):
+                return self.per_layer_model_projection(inputs_embeds)
+
+        class Gemma4TextModelDrifted(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.per_layer_model_projection = torch.nn.Linear(3, 3, bias=False, dtype=torch.float16)
+
+            def project_per_layer_inputs(self, inputs_embeds):
+                return self.per_layer_model_projection(inputs_embeds.to(inputs_embeds.dtype))
+        """,
+    )
+    targets = (("per_layer_model_projection", "inputs_embeds"),)
+
+    ok_cls = module.Gemma4TextModel
+    original_code = ok_cls.project_per_layer_inputs.__code__
+    status = _patch_gemma4_ple_dtype_on_method(
+        ok_cls, "project_per_layer_inputs", targets, dry_run=True,
+    )
+    assert status == "PATCH"
+    # Dry run must not touch bytecode, the marker, or linecache.
+    assert ok_cls.project_per_layer_inputs.__code__ is original_code
+    assert not getattr(ok_cls, "_unsloth_ple_dtype_project_per_layer_inputs_patched", False)
+
+    drift_cls = module.Gemma4TextModelDrifted
+    assert _patch_gemma4_ple_dtype_on_method(
+        drift_cls, "project_per_layer_inputs", targets, dry_run=True,
+    ) == "DRIFT"
+
+    # A real (non-dry) call on the drifted class fails closed without mutating.
+    drift_code = drift_cls.project_per_layer_inputs.__code__
+    assert _patch_gemma4_ple_dtype_on_method(
+        drift_cls, "project_per_layer_inputs", targets,
+    ) is False
+    assert drift_cls.project_per_layer_inputs.__code__ is drift_code
+
+    # Dry run on the already-marked good class reports ALREADY.
+    assert _patch_gemma4_ple_dtype_on_method(ok_cls, "project_per_layer_inputs", targets) is True
+    assert _patch_gemma4_ple_dtype_on_method(
+        ok_cls, "project_per_layer_inputs", targets, dry_run=True,
+    ) == "ALREADY"
+
+
+def _make_fake_decoder_module(tmp_path, monkeypatch, name):
+    return _load_fake_ple_module(
+        tmp_path,
+        monkeypatch,
+        name,
+        """
+        import torch
+
+        class Gemma4TextDecoderLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.per_layer_input_gate = torch.nn.Linear(3, 3, bias=False, dtype=torch.float16)
+                self.per_layer_projection = torch.nn.Linear(3, 3, bias=False, dtype=torch.float16)
+
+            def forward(self, hidden_states, per_layer_input):
+                hidden_states = self.per_layer_input_gate(hidden_states)
+                hidden_states = hidden_states * per_layer_input
+                return self.per_layer_projection(hidden_states)
+        """,
+    )
+
+
+def test_gemma4_ple_compiler_appends_helper_only_when_call_present(tmp_path, monkeypatch):
+    from unsloth_zoo import compiler
+
+    module = _make_fake_decoder_module(tmp_path, monkeypatch, "fake_gemma4_ple_append")
+    monkeypatch.setattr(compiler, "fake_gemma4_ple_append", module, raising=False)
+
+    # Flag off: no PLE rewrite, so no helper call and no appended helper def.
+    monkeypatch.delenv("UNSLOTH_FORCE_FLOAT32", raising=False)
+    off = compiler.create_standalone_class(
+        "Gemma4TextDecoderLayer", "fake_gemma4_ple_append", dir(module), disable=True,
+    )
+    assert "_unsloth_gemma4_ple_cast_input(" not in off
+    assert "def _unsloth_gemma4_ple_cast_input" not in off
+
+    # Flag on: the rewrite inserts the call, so the helper def is appended exactly once.
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    on = compiler.create_standalone_class(
+        "Gemma4TextDecoderLayer", "fake_gemma4_ple_append", dir(module), disable=True,
+    )
+    assert "_unsloth_gemma4_ple_cast_input(" in on
+    assert on.count("def _unsloth_gemma4_ple_cast_input") == 1
+    compile(on, "<gemma4-ple-append>", "exec")
+
+
+def test_gemma4_ple_eager_then_compile_share_one_helper_name(tmp_path, monkeypatch):
+    """Guards the fixed bug: compiling AFTER the eager patch must not emit a call to
+    a helper name the generated module never defines (previously a NameError)."""
+    from unsloth_zoo import compiler
+
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    module = _make_fake_decoder_module(tmp_path, monkeypatch, "fake_gemma4_ple_crosspath")
+    decoder_cls = module.Gemma4TextDecoderLayer
+
+    # Eager patch first: rewrites __code__ AND poisons linecache with wrapped source.
+    assert _patch_gemma4_ple_dtype_on_method(
+        decoder_cls, "forward",
+        (("per_layer_input_gate", "hidden_states"), ("per_layer_projection", "hidden_states")),
+    ) is True
+    # inspect.getsource (which the compiler uses) now returns the eager-patched source.
+    assert "_unsloth_gemma4_ple_cast_input(" in inspect.getsource(decoder_cls.forward)
+
+    # The compiler reads that poisoned source; the generated module must DEFINE the
+    # same helper name it CALLS.
+    monkeypatch.setattr(compiler, "fake_gemma4_ple_crosspath", module, raising=False)
+    generated = compiler.create_standalone_class(
+        "Gemma4TextDecoderLayer", "fake_gemma4_ple_crosspath", dir(module), disable=True,
+    )
+    assert "_unsloth_gemma4_ple_cast_input(" in generated
+    assert generated.count("def _unsloth_gemma4_ple_cast_input") == 1
+    compile(generated, "<gemma4-ple-crosspath>", "exec")
