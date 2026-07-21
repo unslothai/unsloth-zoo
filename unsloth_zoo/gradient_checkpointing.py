@@ -67,8 +67,11 @@ def _double_buffer_disabled():
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     try:
-        return any(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0)
-                   for i in range(torch.cuda.device_count()))
+        # Gate on the active training device, not any visible one: a discrete
+        # GPU sharing a box with an APU has a real H2D copy and should keep the
+        # overlap, so an unrelated integrated device must not disable it.
+        idx = torch.cuda.current_device()
+        return bool(getattr(torch.cuda.get_device_properties(idx), "is_integrated", 0))
     except Exception:
         return False
 
