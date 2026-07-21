@@ -295,6 +295,26 @@ def test_get_logit_scale_normalization(where, value, expected):
     assert _get_logit_scale(_stub_model(where, value)) == expected
 
 
+def test_backboneless_text_model_selects_baseline_fallback(capsys):
+    # nanochat shape (stack under .transformer, no separable .model): the
+    # biased head would trip the eligibility gate, so seeing ONLY the topology
+    # notice pins topology as decided first, at construction not first use.
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+
+    class _BackbonelessLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.lm_head = nn.Linear(32, 96, bias=True)
+
+    fn = U.make_cce_loss_fn(_BackbonelessLM())
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+    out = capsys.readouterr().out
+    assert "separable hidden-state backbone" in out and "output head" not in out
+
+
 @pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale"])
 def test_vlm_cce_fallbacks_are_marked(case):
     # Every VLM fallback path must return a loss fn carrying the eager

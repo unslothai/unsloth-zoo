@@ -958,8 +958,18 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
     label_smoothing = _normalize_label_smoothing(label_smoothing)
-    # Head eligibility first, then scale validation — no positive CCE notice
-    # may precede an ineligibility decision.
+    # Topology first (mirrors the VLM factory), then head eligibility, then
+    # scale validation — no positive CCE notice may precede a fallback decision.
+    # Backboneless models (e.g. a stack not exposed as `.model` or as direct
+    # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
+    # so the full model forward is the only faithful loss.
+    tm = _get_text_model(model)
+    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+        print("Unsloth: text model does not expose a separable hidden-state "
+              "backbone for CCE; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
