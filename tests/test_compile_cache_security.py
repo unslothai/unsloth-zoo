@@ -400,3 +400,40 @@ def test_megacache_ignores_bundle_name_path_traversal(monkeypatch, tmp_path):
     # basename() keeps the read inside the key dir, so "../evil" misses.
     assert module.megacache_load("victim-model") is False
     assert loaded == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX umask semantics")
+def test_megacache_creates_private_parents_under_lax_umask(tmp_path):
+    module = _load_module()
+    # makedirs' mode only clamps the leaf, so a lax umask must not leave a
+    # group-writable parent that the trust walk would then reject.
+    old = os.umask(0o002)
+    try:
+        nested = tmp_path / "root" / "unsloth" / "mega_cache"
+        assert module._ensure_private_directory(str(nested)) is True
+        assert (nested.parent.stat().st_mode & 0o777) == 0o700
+    finally:
+        os.umask(old)
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX ownership")
+def test_megacache_read_rejects_foreign_owned_file(monkeypatch, tmp_path):
+    module = _load_module()
+    target = tmp_path / "bundle"
+    target.write_bytes(b"x")
+    target.chmod(0o600)
+    real_fstat = module.os.fstat
+    monkeypatch.setattr(module.os, "fstat", lambda fd: os.stat_result((
+        real_fstat(fd).st_mode, 0, 0, 1, os.geteuid() + 1, 0, 1, 0, 0, 0)))
+    assert module._read_trusted_file(target, binary = True) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX symlink semantics")
+def test_megacache_read_rejects_symlinked_file(tmp_path):
+    module = _load_module()
+    real = tmp_path / "real"
+    real.write_bytes(b"x")
+    real.chmod(0o600)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert module._read_trusted_file(link, binary = True) is None
