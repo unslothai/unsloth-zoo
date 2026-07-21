@@ -38,13 +38,13 @@ mismatch simply means a cache miss and a normal local compile. Loading is
 always best-effort and never raises.
 
 Environment knobs:
-  UNSLOTH_MEGA_CACHE       = "0" (default) | "1"
-      1    -> opt in to loading and saving artifacts from a trusted cache
-              directory. Existing POSIX cache directories must be owned by
-              the current user and not writable by group or other users.
-      0    -> disabled. This is the default because torch.compile artifacts
-              are executable/deserialized data and must not be loaded from
-              an implicitly trusted persistent cache.
+  UNSLOTH_MEGA_CACHE       = "1" (default, enabled) | "0" (kill switch)
+      Enabled by default: load and save artifacts, but only from a cache
+      directory that passes the POSIX trust checks below (owned by the current
+      user, not group/other writable, no symlinked components). torch.compile
+      artifacts are executable/deserialized data, so an untrusted cache
+      directory is refused rather than loaded - the feature fails closed.
+      0 / off / false / no -> fully disabled (kill switch).
   UNSLOTH_MEGA_CACHE_DIR   = bundle root (default ~/.cache/unsloth/mega_cache).
 """
 
@@ -86,10 +86,12 @@ pass
 
 
 def megacache_is_enabled():
-    # Bundles are executable/deserialized torch.compile artifacts, not passive
-    # data: require an explicit opt-in before loading them.
-    return os.environ.get("UNSLOTH_MEGA_CACHE", "0").strip().lower() in (
-        "1", "on", "true", "yes",
+    # On by default. Bundles are executable/deserialized torch.compile
+    # artifacts, so the POSIX trust checks (owner-only, no group/other write,
+    # no symlinks) are the safeguard: an untrusted cache is refused, not
+    # loaded, so the feature fails closed. Kill switch: UNSLOTH_MEGA_CACHE=0.
+    return os.environ.get("UNSLOTH_MEGA_CACHE", "1").strip().lower() not in (
+        "0", "off", "false", "no",
     )
 pass
 

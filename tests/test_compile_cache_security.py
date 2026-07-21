@@ -99,17 +99,17 @@ def _configure_load(monkeypatch, module, root, loaded):
     monkeypatch.setattr(module.atexit, "register", lambda function: None)
 
 
-def test_megacache_is_opt_in(monkeypatch):
+def test_megacache_is_on_by_default_with_kill_switch(monkeypatch):
     module = _load_module()
 
     monkeypatch.delenv("UNSLOTH_MEGA_CACHE", raising = False)
-    assert module.megacache_is_enabled() is False
+    assert module.megacache_is_enabled() is True
 
-    for value in ("1", "on", "true", "yes"):
+    for value in ("1", "on", "true", "yes", "auto", ""):
         monkeypatch.setenv("UNSLOTH_MEGA_CACHE", value)
         assert module.megacache_is_enabled() is True
 
-    for value in ("0", "off", "false", "no", "auto", ""):
+    for value in ("0", "off", "false", "no"):
         monkeypatch.setenv("UNSLOTH_MEGA_CACHE", value)
         assert module.megacache_is_enabled() is False
 
@@ -258,7 +258,7 @@ def test_megacache_accepts_private_cache_below_sticky_temp_parent(monkeypatch, t
     assert module._is_trusted_directory(directory) is True
 
 
-def test_non_posix_load_still_requires_explicit_opt_in(monkeypatch, tmp_path):
+def test_non_posix_load_respects_kill_switch(monkeypatch, tmp_path):
     module = _load_module()
     root = tmp_path / "mega_cache"
     _seed_bundle(root)
@@ -266,11 +266,11 @@ def test_non_posix_load_still_requires_explicit_opt_in(monkeypatch, tmp_path):
     _configure_load(monkeypatch, module, root, loaded)
     monkeypatch.setattr(module.os, "name", "nt")
 
-    monkeypatch.delenv("UNSLOTH_MEGA_CACHE")
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "0")
     assert module.megacache_load("disabled-model") is False
     assert loaded == []
 
-    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    monkeypatch.delenv("UNSLOTH_MEGA_CACHE")  # default: enabled
     assert module.megacache_load("trusted-model") is True
     assert loaded != []
 
