@@ -169,6 +169,11 @@ from .utils import (
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
     create_batches,
+    create_preference_batches,
+    _hf_encoding_tokenizer,
+    make_orpo_loss_fn,
+    make_dpo_loss_fn,
+    make_grpo_loss_fn,
     create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
@@ -185,7 +190,10 @@ from .utils import (
     save_trainer_state,
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
+    model_has_non_lora_trainable_params,
     iter_mlx_lora_modules,
+    _get_mlx_dropout_probability,
+    _read_mlx_lora_dropout,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -197,6 +205,7 @@ from .utils import (
     _get_text_model,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
+    _normalize_seed,
 )
 from .compile import (
     build_compile_policy,
@@ -421,6 +430,73 @@ def _normalize_mlx_scheduler_type(name):
     return sched_type
 
 
+def _mlx_identity(x):
+    return x
+
+
+def _mlx_is_dropout_module(mod):
+    """Whether ``mod`` is an nn.Dropout-like module.
+
+    mlx.nn.Dropout stores its keep-probability in ``_p_1`` (== 1 - p); match on
+    that (real mlx) or on a ``*Dropout`` class name (shims / ported modules) so
+    both are covered. A LoRA dropout already replaced by ``_mlx_identity`` (a
+    plain function, not a module) matches neither, so it is not re-counted.
+    """
+    return hasattr(mod, "_p_1") or type(mod).__name__.endswith("Dropout")
+
+
+def _mlx_disable_lora_dropout(model):
+    """Disable dropout for TRL DPO/ORPO parity (disable_dropout_in_model).
+
+    TRL's DPOConfig and ORPOConfig default disable_dropout=True and call
+    disable_dropout_in_model, which sets ``p = 0`` on EVERY ``nn.Dropout`` in the
+    model, so the preference log-prob forwards are deterministic. The MLX
+    preference loss runs inside the train()-mode compiled step, where a per-step
+    model.eval() is unreliable, so neutralize dropout once at setup instead:
+
+    1. LoRA/DoRA adapter dropout: mlx-lm's LoRALinear/DoRALinear call
+       ``self.dropout(x)``, so replacing that submodule with identity makes the
+       adapter forward deterministic.
+    2. Every other ``nn.Dropout`` in the module tree, matching TRL's
+       disable_dropout_in_model (not just adapters). mlx-lm base LMs currently
+       carry no standalone dropout, so this is a no-op superset there, but an
+       HF-ported / custom mlx model may, and under train() that dropout would
+       perturb the log-probs vs TRL. mlx.nn.Dropout's ``__call__`` returns its
+       input unchanged when ``_p_1 == 1.0`` (p == 0), so set it in place, mirroring
+       TRL's ``module.p = 0``.
+
+    lora_dropout=0 is already a no-op, so default (dropout-free) configs are
+    unaffected. NOT applied to GRPO, whose TRL default disable_dropout is False.
+    """
+    count = 0
+    for _, mod in iter_mlx_lora_modules(model):
+        if getattr(mod, "dropout", None) is not None:
+            # Stash the configured dropout probability BEFORE swapping in the
+            # identity. Replacing mod.dropout with _mlx_identity makes the
+            # forward deterministic but ERASES the probability the save path
+            # (_extract_mlx_lora_parameters / save_model / _enrich_mlx_adapter_
+            # config) reads back off the live module -- so a checkpoint saved
+            # after ORPO/DPO would record dropout=0.0 in adapter_config.json and
+            # no longer match the trained LoRA config on reload. _read_mlx_lora_
+            # dropout prefers this stash. Guard with hasattr so a repeated
+            # disable (reused trainer) keeps the ORIGINAL value instead of
+            # re-reading 0.0 off the already-neutralized module.
+            if not hasattr(mod, "_unsloth_orig_lora_dropout"):
+                mod._unsloth_orig_lora_dropout = _get_mlx_dropout_probability(
+                    mod.dropout
+                )
+            mod.dropout = _mlx_identity
+            count += 1
+    for _, mod in model.named_modules():
+        if _mlx_is_dropout_module(mod):
+            if hasattr(mod, "_p_1"):
+                mod._p_1 = 1.0
+            if hasattr(mod, "p"):
+                mod.p = 0.0
+            count += 1
+    return count
+
+
 def _resolve_mlx_grad_clipping(args):
     """Resolve mutually exclusive MLX clipping knobs.
 
@@ -577,6 +653,10 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    loss_type: str = "sft"  # "sft" or "orpo"
+    orpo_beta: float = 0.1  # ORPO odds-ratio weight (TRL default)
+    dpo_beta: float = 0.1  # DPO beta (TRL default)
+    reference_free: bool = False  # DPO: drop the reference term if True
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
     greater_is_better: bool = False
@@ -664,6 +744,40 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
+
+
+# init=False so the subclass keeps MLXTrainingConfig's custom __init__ rather
+# than getting a dataclass-generated one. The base __init__ is the only place
+# that records _unsloth_mlx_warmup_steps_explicit (and does the kwargs coercion
+# / unknown-argument checks); a generated __init__ would skip it and silently
+# treat an explicit warmup_steps that happens to equal the default as implicit,
+# dropping it in favour of warmup_ratio. init=False still registers the new
+# fields below in fields(), which the inherited __init__ iterates over.
+@dataclass(init=False)
+class MLXORPOConfig(MLXTrainingConfig):
+    """ORPO config mirroring TRL's ORPOConfig. Presets loss_type='orpo';
+    tune orpo_beta (inherited). Use with MLXORPOTrainer."""
+    loss_type: str = "orpo"
+
+
+@dataclass(init=False)
+class MLXDPOConfig(MLXTrainingConfig):
+    """DPO config mirroring TRL's DPOConfig. Presets loss_type='dpo';
+    tune dpo_beta / reference_free (inherited). Use with MLXDPOTrainer."""
+    loss_type: str = "dpo"
+
+
+@dataclass(init=False)
+class MLXGRPOConfig(MLXTrainingConfig):
+    """GRPO config mirroring TRL's GRPOConfig. Presets loss_type='grpo'.
+    Use with MLXGRPOTrainer (pass reward_funcs to the trainer)."""
+    loss_type: str = "grpo"
+    num_generations: int = 4          # completions per prompt (the group)
+    grpo_beta: float = 0.0            # KL penalty weight (TRL GRPOConfig.beta default 0.0: no reference/KL unless set)
+    grpo_epsilon: float = 0.2         # PPO clip epsilon (low and high)
+    temperature: float = 1.0          # rollout sampling temperature
+    max_completion_length: int = 128  # max new tokens per completion
+    reference_free: bool = False      # drop the KL term if True
 
 
 class MLXTrainer:
@@ -757,6 +871,7 @@ class MLXTrainer:
         runs and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
+        self._kl_history = []  # GRPO: mean k3 KL per logged step
         self._grad_norm_history = []
         self._tokens_per_second_history = []
         self._peak_memory_history = []
@@ -1974,6 +2089,51 @@ class MLXTrainer:
             except Exception:
                 pass
 
+    def _fast_forward_resume_batches(self, batch_iter, n_skip):
+        """Advance a streaming batch iterator to the resume position.
+
+        Base (streaming SFT/VLM/text) path: pull and discard ``n_skip`` batches.
+        create_batches / iterate_*_batches is deterministic under the same seed,
+        so consuming N batches reproduces the data ordering the killed run saw,
+        and each ``next`` is cheap and side-effect free. MLXGRPOTrainer overrides
+        this: its ``batch_iter`` is an on-policy rollout generator, so consuming
+        it would regenerate + re-score every skipped rollout rather than just
+        advance a cursor (see the override).
+        """
+        for _ in range(n_skip):
+            try:
+                next(batch_iter)
+            except StopIteration:
+                raise RuntimeError(
+                    f"Unsloth: streaming dataset exhausted while "
+                    f"fast-forwarding {n_skip} batches to the resume position. "
+                    f"Dataset may be shorter than the killed run consumed."
+                ) from None
+        return batch_iter
+
+    def _maybe_seed_grpo_rng(self):
+        """Seed the global MLX RNG from ``args.seed`` for GRPO reproducibility.
+
+        GRPO rollout sampling (``make_sampler``) draws from the process-global
+        ``mx.random`` state, which nothing else seeds from ``args.seed`` (only the
+        numpy prompt permutation is seeded). Without this, re-running an identical
+        GRPO job -- or running one after any prior ``mx.random`` use in the same
+        process -- samples different completions / rewards, breaking
+        reproducibility; TRL seeds the process RNG via ``set_seed(args.seed)``
+        (transformers Trainer). Offset by rank so DDP ranks draw distinct
+        completions yet stay deterministic. No-op for non-GRPO losses (SFT / DPO /
+        ORPO do not sample), leaving their RNG behavior byte-for-byte unchanged.
+        Returns the applied seed, or ``None`` when it did not seed.
+        """
+        args = self.args
+        if getattr(args, "loss_type", "sft") != "grpo":
+            return None
+        seed = (
+            _normalize_seed(getattr(args, "seed", 42)) + int(self.distributed_rank)
+        ) % (2 ** 32)
+        mx.random.seed(int(seed))
+        return int(seed)
+
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
         args = self.args
@@ -2017,7 +2177,89 @@ class MLXTrainer:
                 )
                 _main_print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
-            if use_cce:
+            if getattr(args, "loss_type", "sft") == "orpo":
+                _ob = getattr(args, "orpo_beta", 0.1)
+                # TRL's ORPOConfig defaults disable_dropout=True; the single ORPO
+                # forward (SFT + odds-ratio) runs under train() mode, so nonzero
+                # LoRA dropout would perturb the log-probs vs TRL. Disable it.
+                _mlx_disable_lora_dropout(model)
+                loss_fn = make_orpo_loss_fn(beta=_ob)
+                print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
+            elif getattr(args, "loss_type", "sft") == "dpo":
+                _db = getattr(args, "dpo_beta", 0.1)
+                _rf = bool(getattr(args, "reference_free", False))
+                _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
+                if (_lora_mods and not _rf
+                        and model_has_non_lora_trainable_params(model)):
+                    raise ValueError(
+                        "Unsloth: DPO with a LoRA reference is not supported when "
+                        "non-LoRA parameters (e.g. a directly-trained lm_head / "
+                        "embed_tokens) are also trainable. The reference is obtained "
+                        "by disabling LoRA adapters, but those non-LoRA tensors keep "
+                        "moving during training, so the reference would no longer be "
+                        "the frozen initial policy and the DPO gradient would be "
+                        "wrong. Train LoRA adapters only, or pass "
+                        "reference_free=True to train without a reference."
+                    )
+                if (_lora_mods and not _rf
+                        and any(type(m).__name__.startswith("DoRA")
+                                for m in _lora_mods)):
+                    raise ValueError(
+                        "Unsloth: DPO with a reference is not supported for DoRA "
+                        "adapters. The reference is obtained by zeroing the LoRA "
+                        "scale, but a DoRA layer still applies its trainable "
+                        "magnitude m/||W|| (initialized to ||W|| but drifting as m "
+                        "trains), so the reference would no longer be the frozen "
+                        "initial policy and the DPO gradient would be wrong. Use a "
+                        "plain LoRA adapter, or pass reference_free=True to train "
+                        "without a reference."
+                    )
+                # TRL's DPOConfig defaults disable_dropout=True. The DPO policy
+                # forward runs under train() mode, so nonzero LoRA dropout would
+                # perturb the policy log-probs (the reference forward is already
+                # clean via scale=0) and bias the preference margin vs TRL. Disable
+                # it. (reference_free runs still benefit: the policy is perturbed
+                # the same way.)
+                _mlx_disable_lora_dropout(model)
+                loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
+                print("Unsloth: Using DPO loss (beta=" + str(_db) +
+                      (", reference_free" if _rf else "") + ").")
+            elif getattr(args, "loss_type", "sft") == "grpo":
+                _gb = getattr(args, "grpo_beta", 0.0)
+                _ge = getattr(args, "grpo_epsilon", 0.2)
+                _grf = bool(getattr(args, "reference_free", False))
+                _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
+                if (_lora_mods and _gb != 0.0 and not _grf
+                        and model_has_non_lora_trainable_params(model)):
+                    raise ValueError(
+                        "Unsloth: GRPO KL regularization with a LoRA reference is "
+                        "not supported when non-LoRA parameters (e.g. a "
+                        "directly-trained lm_head / embed_tokens) are also "
+                        "trainable. The KL reference is obtained by disabling LoRA "
+                        "adapters, but those non-LoRA tensors keep moving during "
+                        "training, so the reference would no longer be the frozen "
+                        "initial policy and the KL term would be wrong. Train LoRA "
+                        "adapters only, or set grpo_beta=0 (equivalently "
+                        "reference_free=True) to train without the KL term."
+                    )
+                if (_lora_mods and _gb != 0.0 and not _grf
+                        and any(type(m).__name__.startswith("DoRA")
+                                for m in _lora_mods)):
+                    raise ValueError(
+                        "Unsloth: GRPO KL regularization with a reference is not "
+                        "supported for DoRA adapters. The KL reference is obtained "
+                        "by zeroing the LoRA scale, but a DoRA layer still applies "
+                        "its trainable magnitude m/||W|| (initialized to ||W|| but "
+                        "drifting as m trains), so the reference would no longer be "
+                        "the frozen initial policy and the KL term would be wrong. "
+                        "Use a plain LoRA adapter, or set grpo_beta=0 (equivalently "
+                        "reference_free=True) to train without the KL term."
+                    )
+                loss_fn = make_grpo_loss_fn(beta=_gb, lora_mods=_lora_mods,
+                    reference_free=_grf, epsilon_low=_ge, epsilon_high=_ge,
+                    temperature=float(getattr(args, "temperature", 1.0) or 1.0))
+                print("Unsloth: Using GRPO loss (beta=" + str(_gb) + ").")
+            elif use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 _main_print(
@@ -2053,6 +2295,15 @@ class MLXTrainer:
             else:
                 total_steps = n_batches // grad_accum
             total_steps = max(1, total_steps)
+        elif getattr(self, "_grpo_epoch_total_steps", None) is not None:
+            # GRPO drives the loop from a rollout generator, so _prepare_data
+            # returns batches=None even though its train_dataset is finite. An
+            # epoch-based GRPO run (max_steps<=0, num_train_epochs>0) therefore
+            # cannot count batches here; its planned step total was computed in
+            # MLXGRPOTrainer._prepare_data from the finite prompt set and stashed.
+            # Use it so num_train_epochs works for GRPO like it does for SFT/DPO,
+            # instead of misreporting the finite dataset as streaming below.
+            total_steps = max(1, int(self._grpo_epoch_total_steps))
         else:
             # Streaming mode — must have max_steps
             if args.num_train_epochs > 0:
@@ -2063,6 +2314,11 @@ class MLXTrainer:
             raise ValueError(
                 "max_steps must be > 0 when using streaming mode."
             )
+
+        # Total planned optimizer steps for this run. Exposed so the GRPO rollout
+        # can surface a minimal trainer_state (global_step / max_steps) to reward
+        # funcs that declare it, mirroring TRL (see _reward_func_wants_trainer_state).
+        self._planned_total_steps = total_steps
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
@@ -2188,6 +2444,11 @@ class MLXTrainer:
             )
         _clip_grad_value = max_grad_value > 0
         _clip_grad_leaf_norm = max_grad_leaf_norm > 0
+        # Seed the global MLX RNG (GRPO only) BEFORE capturing `state` below, so
+        # the seeded mx.random.state is the one the compiled step threads and the
+        # rollout sampler draws from -- making GRPO completions/rewards
+        # reproducible run-to-run. No-op for SFT/DPO/ORPO.
+        self._maybe_seed_grpo_rng()
         state = [model.state, optimizer.state, mx.random.state]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
@@ -2587,7 +2848,10 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
-        if args.eval_steps > 0 and self.eval_dataset is not None:
+        if (getattr(args, "loss_type", "sft") in ("orpo", "dpo", "grpo")
+                and args.eval_steps > 0 and self.eval_dataset is not None):
+            _main_print(f"Unsloth: eval is not yet supported for {args.loss_type}; skipping eval.")
+        elif args.eval_steps > 0 and self.eval_dataset is not None:
             eval_batch_size = (
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
@@ -2710,18 +2974,17 @@ class MLXTrainer:
 
         # Streaming mode: fast-forward the iterator to the resume position.
         # The seed is the same and create_batches/iterate_*_batches is
-        # deterministic, so consuming N batches gives us the same data
-        # ordering the killed run would have produced.
+        # deterministic, so consuming N batches gives the same data ordering the
+        # killed run produced. GRPO overrides _fast_forward_resume_batches: its
+        # batch_iter is an on-policy rollout generator, so consuming it would
+        # regenerate + re-score every skipped rollout with the already-updated
+        # checkpoint model (slow, side-effecting, RNG-desyncing) instead of just
+        # advancing a prompt cursor. Dispatch through the hook so each trainer
+        # skips correctly.
         if _resume_step > 0 and batch_iter is not None:
-            for _ in range(_resume_step * grad_accum):
-                try:
-                    next(batch_iter)
-                except StopIteration:
-                    raise RuntimeError(
-                        f"Unsloth: streaming dataset exhausted while "
-                        f"fast-forwarding to resume step {_resume_step}. "
-                        f"Dataset may be shorter than the killed run consumed."
-                    ) from None
+            batch_iter = self._fast_forward_resume_batches(
+                batch_iter, _resume_step * grad_accum,
+            )
 
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""
@@ -2832,6 +3095,21 @@ class MLXTrainer:
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
 
+            # Pre-update GRPO KL probe (eager, outside the compiled step). Runs
+            # only for steps that will be logged, on the SAME batch/lengths the
+            # loss uses, and BEFORE the optimizer update -- so the KL reflects the
+            # step's (pre-update) weights and is comparable to CUDA's logged KL.
+            # Kept BEFORE the DDP dispatch/all-reduce below so grouped advantages
+            # are computed on each rank before any collective op.
+            self._pending_grpo_kl = None
+            if (do_update and hasattr(self, "_grpo_mean_kl")
+                    and not isinstance(batch_data, dict)):
+                _prospective_step = it // grad_accum
+                if (_prospective_step % args.logging_steps == 0
+                        or _prospective_step == total_steps):
+                    self._pending_grpo_kl = self._grpo_mean_kl(
+                        batch_data[0], batch_data[1])
+
             if _ddp_update_outside_step:
                 lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
                     batch_data, grad_accum_state, do_update,
@@ -2931,6 +3209,8 @@ class MLXTrainer:
                 peak_mem = mx.get_peak_memory() / 1e9
 
                 self._train_loss_history.append(train_loss)
+                if getattr(self, "_pending_grpo_kl", None) is not None:
+                    self._kl_history.append(self._pending_grpo_kl)
                 grad_norm_val = (
                     float(grad_norm.item())
                     if grad_norm is not None else None
@@ -2955,10 +3235,15 @@ class MLXTrainer:
                     f"Grad: {grad_norm_val:.4f} | "
                     if grad_norm_val is not None else ""
                 )
+                kl_text = (
+                    f"KL: {self._pending_grpo_kl:.4f} | "
+                    if getattr(self, "_pending_grpo_kl", None) is not None else ""
+                )
                 _main_print(
                     f"  Step {current_step}/{total_steps} | "
                     f"Loss: {train_loss:.4f} | "
                     f"{grad_text}"
+                    f"{kl_text}"
                     f"LR: {lr_val:.2e} | "
                     f"Tok/s: {tokens_sec:.0f} | "
                     f"Peak: {peak_mem:.2f} GB"
@@ -3249,6 +3534,37 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        # GRPO needs the rollout data path (and reward_funcs), which only
+        # MLXGRPOTrainer supplies via its own _prepare_data override. Reaching
+        # here with loss_type='grpo' means the base MLXTrainer was used with a
+        # GRPO config, which would feed SFT batches into the GRPO loss and
+        # crash on advantages.reshape. Fail fast with a clear message instead.
+        if getattr(args, "loss_type", "sft") == "grpo":
+            raise ValueError(
+                "Unsloth: GRPO training requires MLXGRPOTrainer (which supplies "
+                "reward_funcs and generates rollouts). Use MLXGRPOTrainer instead "
+                "of the base MLXTrainer for loss_type='grpo'."
+            )
+        # Reject unknown loss_type values before any batch construction. Only "sft"
+        # (default), "orpo", and "dpo" are implemented on the base MLXTrainer path
+        # ("grpo" is handled above via MLXGRPOTrainer). The loss selection in
+        # _train_inner and the preference branch below BOTH fall through to the
+        # SFT/CCE path for anything else, so a misconfigured preference run -- a typo
+        # like "dppo", or a real TRL DPO loss variant that is not implemented here
+        # ("ipo", "sigmoid", "hinge", "kto", ...) -- would silently optimize a plain
+        # cross-entropy objective instead of failing. Fail fast so the wrong
+        # objective is never trained.
+        _supported_loss_types = ("sft", "orpo", "dpo")
+        _loss_type = getattr(args, "loss_type", "sft")
+        if _loss_type not in _supported_loss_types:
+            raise ValueError(
+                f"Unsloth MLX: unsupported loss_type={_loss_type!r}. Supported "
+                f"values are {_supported_loss_types!r} (plus 'grpo' via "
+                "MLXGRPOTrainer). DPO loss variants such as 'ipo', 'sigmoid', or "
+                "'hinge' are not implemented on MLX; without this check they would "
+                "silently train a plain SFT cross-entropy objective. Use "
+                "loss_type='dpo' (sigmoid DPO), 'orpo', or 'sft'."
+            )
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3267,6 +3583,19 @@ class MLXTrainer:
             )
 
         if self._batches is not None:
+            # Defense in depth: prebuilt batches are SFT-shaped (from
+            # train_on_responses_only). They must never reach the DPO/ORPO
+            # preference losses, which would mis-split them into [chosen; rejected]
+            # pairs. train_on_responses_only already fails fast for these
+            # loss_types; guard here too so no future caller can slip SFT batches
+            # through.
+            if getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
+                raise ValueError(
+                    "Unsloth: prebuilt response-only SFT batches are not valid for "
+                    "DPO/ORPO preference losses (they would be mis-paired as "
+                    "[chosen; rejected]). Do not use train_on_responses_only() with "
+                    "a preference loss_type."
+                )
             return self._batches, None
 
         total_batches_needed = (
@@ -3276,6 +3605,66 @@ class MLXTrainer:
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
         comm_group = self.distributed_world
+
+        if getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
+            if is_vlm:
+                raise ValueError(
+                    f"{args.loss_type.upper()} is not yet supported for VLM models on MLX."
+                )
+            if self.distributed_world_size > 1:
+                # Multi-GPU (MLX DDP) DPO/ORPO is not sharded. The SFT/VLM data
+                # path builds a global micro-batch and hands each rank its own
+                # slice (items[rank::world_size] via _create_distributed_text_
+                # batches / _rank_slice_distributed_batch), so the gradients that
+                # _apply_update all-reduces cover the intended global batch.
+                # create_preference_batches has no comm_group/rank argument: every
+                # rank would build the SAME sorted preference batches (identical
+                # seed, data, sort) and _apply_update would all-reduce duplicate
+                # gradients, so multi-GPU training would silently mistrain on one
+                # rank's stream rather than the global shard (and, under a
+                # max_steps random-subset cap, on the same reduced subset on every
+                # rank). Correctly sharding the concatenated [chosen; rejected]
+                # builder (global-batch construction plus cross-rank tail padding
+                # so collectives stay aligned) cannot be validated on the single-
+                # process CI, so fail fast rather than mistrain. This is a no-op
+                # at world_size == 1 (the common single-GPU case).
+                raise NotImplementedError(
+                    "Unsloth MLX: distributed (multi-GPU) DPO/ORPO preference "
+                    "training is not yet implemented "
+                    f"(distributed_world_size={self.distributed_world_size}). The "
+                    "preference batches are not sharded across ranks, so every "
+                    "rank would train on identical data and all-reduce duplicate "
+                    "gradients instead of the intended global shard. Run DPO/ORPO "
+                    "on a single GPU (world_size=1), or pre-shard the dataset "
+                    "across ranks yourself before training."
+                )
+            if args.streaming:
+                # create_preference_batches materializes the WHOLE dataset: it
+                # collects every prompt/chosen/rejected row before batching and only
+                # honors num_batches afterwards, so an iterable/streaming dataset is
+                # fully consumed up front. The SFT/VLM paths honor streaming by
+                # returning a bounded iterator (iterate_training_batches /
+                # iterate_vlm_training_batches) that yields only max_steps worth of
+                # batches; the preference path has no such iterator, so
+                # args.streaming=True on an unbounded IterableDataset would hang or
+                # OOM instead of stopping at max_steps. Fail fast rather than blow up.
+                raise NotImplementedError(
+                    "Unsloth MLX: streaming DPO/ORPO preference training is not "
+                    "yet implemented. create_preference_batches materializes the "
+                    "entire dataset before batching, so an unbounded streaming "
+                    "dataset would hang or run out of memory instead of stopping "
+                    "at max_steps. Disable streaming (streaming=False) for "
+                    "DPO/ORPO, or use a finite (map-style) dataset."
+                )
+            batches = create_preference_batches(
+                dataset=self.train_dataset,
+                tokenizer=self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+                seed=getattr(args, "seed", 42),
+            )
+            return batches, None
 
         if is_vlm:
             if text_assistant_only_loss:
@@ -3409,7 +3798,7 @@ class MLXTrainer:
         """Save LoRA adapters or full merged model (if no LoRA)."""
         from .utils import (
             _coerce_mlx_lora_scale,
-            _get_mlx_dropout_probability,
+            _read_mlx_lora_dropout,
             _infer_mlx_lora_rank,
             save_merged_model,
         )
@@ -3436,9 +3825,10 @@ class MLXTrainer:
                 # _coerce handles LoRASwitchLinear's per-expert mx.array where
                 # raw float()/.item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
-                _lora_dropout = _get_mlx_dropout_probability(
-                    getattr(m, "dropout", None)
-                )
+                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
+                # (which swapped the live dropout for an identity) still records
+                # the configured lora_dropout, not 0.0.
+                _lora_dropout = _read_mlx_lora_dropout(m)
                 break
 
             from .utils import _get_transformer_layers
@@ -3487,24 +3877,7 @@ class MLXTrainer:
             # module; drop wrapped base weights INSIDE one (else q_proj.weight
             # under a LoRA-wrapped q_proj re-leaks the Unsloth reload bug). Uses
             # the shared filter to match save_trainable_adapters / _merged.
-            trainable = dict(tree_flatten(self.model.trainable_parameters()))
-            adapter_keys = set(adapter_tensors)
-            lora_module_prefixes = tuple(
-                f"{name}." for name, _ in iter_mlx_lora_modules(self.model)
-                if name
-            )
-            from .utils import _is_base_tensor_inside_lora_module
-            has_root_lora_module = any(
-                name == "" for name, _ in iter_mlx_lora_modules(self.model)
-            )
-            has_non_lora_trainable = any(
-                key not in adapter_keys
-                and not _is_base_tensor_inside_lora_module(
-                    key, lora_module_prefixes, has_root_lora_module,
-                )
-                for key in trainable
-            )
-            if has_non_lora_trainable:
+            if model_has_non_lora_trainable_params(self.model):
                 save_trainable_adapters(
                     self.model, output_dir, adapter_config=adapter_config,
                 )
@@ -3542,6 +3915,814 @@ class MLXTrainer:
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
             save_merged_model(self.model, self.tokenizer, output_dir)
+
+
+class MLXORPOTrainer(MLXTrainer):
+    """ORPO trainer mirroring TRL's ORPOTrainer. Forces loss_type='orpo' so
+    the class is authoritative regardless of the config passed."""
+    def __init__(self, model, tokenizer, train_dataset, eval_dataset=None,
+                 dataset_text_field=None, max_seq_length=None, packing=None,
+                 data_collator=None, args=None, formatting_func=None, processor=None):
+        if args is None:
+            args = MLXORPOConfig()
+        elif getattr(args, "loss_type", "sft") != "orpo":
+            args.loss_type = "orpo"
+        super().__init__(model, tokenizer, train_dataset, eval_dataset,
+                         dataset_text_field, max_seq_length, packing,
+                         data_collator, args, formatting_func, processor)
+
+
+class MLXDPOTrainer(MLXTrainer):
+    """DPO trainer mirroring TRL's DPOTrainer. Forces loss_type='dpo' so
+    the class is authoritative regardless of the config passed."""
+    def __init__(self, model, tokenizer, train_dataset, eval_dataset=None,
+                 dataset_text_field=None, max_seq_length=None, packing=None,
+                 data_collator=None, args=None, formatting_func=None, processor=None):
+        if args is None:
+            args = MLXDPOConfig()
+        elif getattr(args, "loss_type", "sft") != "dpo":
+            args.loss_type = "dpo"
+        super().__init__(model, tokenizer, train_dataset, eval_dataset,
+                         dataset_text_field, max_seq_length, packing,
+                         data_collator, args, formatting_func, processor)
+
+
+def _reward_func_wants_completion_ids(func):
+    """True if a GRPO reward callable can receive the generated ``completion_ids``.
+
+    TRL passes the generated ``completion_ids`` (per-completion token id lists) to
+    every reward function so token-level rewards (length / special-token counts)
+    can score the exact sampled tokens. But a reward callback with a strict
+    signature -- only its real dataset columns, no ``**kwargs`` (e.g.
+    ``def r(completions, prompts, answer)``) -- is also a supported form here (the
+    reward-kwargs are sourced from the original dataset columns), so passing
+    ``completion_ids`` unconditionally would raise ``TypeError: unexpected keyword``
+    on such a function. Gate the pass on the signature: forward ``completion_ids``
+    only when the function declares a ``completion_ids`` parameter or accepts
+    ``**kwargs``; otherwise omit it (back-compat with strict-signature rewards).
+    """
+    import inspect
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        # Builtins / C callables that expose no signature: assume they cannot
+        # accept completion_ids rather than risk an unexpected-keyword crash.
+        return False
+    if "completion_ids" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _reward_func_wants_trainer_state(func):
+    """True if a GRPO reward callable can receive ``trainer_state``.
+
+    TRL passes ``trainer_state`` (its ``transformers.TrainerState``) to every
+    reward function so rewards can shape by training progress -- e.g. curriculum
+    rewards keyed on the current step (grpo_trainer.py: ``reward_kwargs[
+    "trainer_state"] = self.state``). A reward that declares a REQUIRED
+    ``trainer_state`` parameter (no default, no ``**kwargs``) would otherwise
+    raise ``TypeError: missing required argument`` here, since the rollout call
+    only supplies completions / prompts / dataset columns. Mirror the
+    ``completion_ids`` gate: forward ``trainer_state`` only when the function
+    declares a ``trainer_state`` parameter or accepts ``**kwargs``; otherwise
+    omit it (back-compat with strict-signature rewards that neither want nor
+    accept it).
+    """
+    import inspect
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if "trainer_state" in params:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+class MLXGRPOTrainer(MLXTrainer):
+    """GRPO trainer mirroring TRL's GRPOTrainer. Forces loss_type='grpo'.
+
+    Unlike SFT/DPO/ORPO (static data), GRPO generates rollouts on the fly:
+    each step generates ``num_generations`` completions per prompt, scores
+    them with ``reward_funcs``, computes group-relative advantages, and yields
+    a (batch, lengths, advantages) tuple to the training loop. Rollout runs
+    uncompiled (mlx-lm generation); only the grad step is compiled.
+
+    reward_funcs: a callable or list of callables, each
+        ``fn(completions, prompts=..., **kwargs) -> list[float]`` (TRL signature).
+        Multiple reward functions are summed.
+    """
+    def __init__(self, model, tokenizer, train_dataset, reward_funcs,
+                 eval_dataset=None, args=None, formatting_func=None, processor=None):
+        if args is None:
+            args = MLXGRPOConfig()
+        elif getattr(args, "loss_type", "sft") != "grpo":
+            args.loss_type = "grpo"
+        # A base MLXTrainingConfig (or any non-GRPO config) coerced to
+        # loss_type='grpo' lacks the GRPO-only fields (num_generations,
+        # max_completion_length, ...). Fill them with the documented
+        # MLXGRPOConfig defaults so rollout setup does not AttributeError.
+        _grpo_defaults = MLXGRPOConfig()
+        for _field in fields(MLXGRPOConfig):
+            if not hasattr(args, _field.name):
+                setattr(args, _field.name, getattr(_grpo_defaults, _field.name))
+        if not isinstance(reward_funcs, (list, tuple)):
+            reward_funcs = [reward_funcs]
+        self.reward_funcs = list(reward_funcs)
+        # GRPO requires at least one reward function (TRL's GRPOTrainer does too).
+        # An empty reward_funcs is accepted by the list coercion above, but then the
+        # rollout's reward loop has nothing to sum: every completion scores 0, so all
+        # group-relative advantages are 0 (r - mean == 0) and the policy receives no
+        # reward gradient -- a silent no-op that still looks like it is training
+        # (with grpo_beta=0/reference_free it is a pure no-op update). Fail fast at
+        # construction rather than train a degenerate objective.
+        if not self.reward_funcs:
+            raise ValueError(
+                "Unsloth: GRPO requires at least one reward function, but "
+                "reward_funcs is empty. With no reward function every completion "
+                "scores 0, so all group-relative advantages are 0 and the policy "
+                "receives no reward gradient (a silent no-op update). Pass a reward "
+                "callable (or a list of callables) as reward_funcs, matching TRL's "
+                "GRPOTrainer."
+            )
+        super().__init__(model, tokenizer, train_dataset, eval_dataset,
+                         None, None, None, None, args, formatting_func, processor)
+
+    def _grpo_prompts(self):
+        """Extract prompt strings from the dataset (expects a 'prompt' column)."""
+        prompts = []
+        for ex in self.train_dataset:
+            if "prompt" not in ex:
+                raise ValueError("GRPO requires a 'prompt' column in the dataset.")
+            prompts.append(ex["prompt"])
+        return prompts
+
+    def _grpo_render_prompt(self, prompt, tokenizer):
+        """Render a GRPO prompt to a string for rollout.
+
+        Conversational prompts (a list of ``{"role","content"}`` message dicts,
+        as passed by the GRPO notebooks) are rendered via the tokenizer's chat
+        template with ``add_generation_prompt``, mirroring TRL's
+        ``maybe_apply_chat_template`` (add_generation_prompt when the last role
+        is 'user'; continue_final_message when it is 'assistant'). Plain-string
+        prompts pass through unchanged (back-compat).
+
+        ``tokenizer`` must be the wrapper-level tokenizer (``self.tokenizer``),
+        NOT the unwrapped HF tokenizer. mlx-lm's TokenizerWrapper defines its own
+        ``apply_chat_template`` that honors a wrapper-level custom template
+        (``_chat_template`` / ``chat_template_type`` from the model's tokenizer
+        config) which the inner HF tokenizer (``_tokenizer``) does not carry, so
+        rendering through the wrapper matches the SFT/DPO render path and the
+        configured ``chat_template`` override normalized in ``_prepare_data``.
+        Rendering through the unwrapped HF tokenizer would use the wrong template
+        (or raise when the inner tokenizer has none).
+        """
+        if (isinstance(prompt, list) and prompt
+                and isinstance(prompt[0], dict)
+                and "role" in prompt[0] and "content" in prompt[0]):
+            last_role = prompt[-1]["role"]
+            if last_role == "user":
+                add_gen, cont = True, False
+            elif last_role == "assistant":
+                add_gen, cont = False, True
+            else:
+                raise ValueError(
+                    f"GRPO chat prompt: invalid last-message role {last_role!r}; "
+                    "expected 'user' or 'assistant'."
+                )
+            return tokenizer.apply_chat_template(
+                prompt, tokenize=False,
+                add_generation_prompt=add_gen,
+                continue_final_message=cont,
+            )
+        return prompt
+
+    def _grpo_mean_kl(self, batch, lengths):
+        """Eager masked-mean k3 KL for a GRPO batch at the CURRENT weights.
+
+        Mirrors make_grpo_loss_fn's KL term: policy logp with adapters,
+        reference logp via LoRA-disable, ``exp(d) - d - 1``, masked-mean over
+        completion tokens then mean over the group. Used only for logging; runs
+        eagerly OUTSIDE the compiled step. Toggles eval mode so dropout draws no
+        RNG (keeps the training trajectory and the compiled step untouched).
+        Returns a float, or None when KL is undefined for the config (no LoRA
+        adapters, beta == 0, or reference_free).
+        """
+        import mlx.core as mx
+        import mlx.nn as nn
+        args = self.args
+        if (getattr(args, "grpo_beta", 0.0) == 0.0
+                or bool(getattr(args, "reference_free", False))):
+            return None
+        mods = [mod for _, mod in iter_mlx_lora_modules(self.model)]
+        if not mods:
+            return None
+
+        _temp = float(getattr(args, "temperature", 1.0) or 1.0)
+
+        def _logp_mask(b, ln):
+            inp, tgt = b[:, :-1], b[:, 1:]
+            logits = self.model(inp)
+            # Match make_grpo_loss_fn: temperature-scale logits so the logged KL is
+            # computed on the same tempered distribution as the loss KL term.
+            if _temp != 1.0:
+                logits = logits / _temp
+            steps = mx.arange(1, tgt.shape[1] + 1)
+            mask = mx.logical_and(
+                steps >= ln[:, 0:1], steps < ln[:, 1:]
+            ).astype(mx.float32)
+            return -nn.losses.cross_entropy(logits, tgt), mask
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            pol, mask = _logp_mask(batch, lengths)
+            saved = [md.scale for md in mods]
+            try:
+                for md in mods:
+                    md.scale = 0.0
+                ref, _ = _logp_mask(batch, lengths)
+            finally:
+                for md, s in zip(mods, saved):
+                    md.scale = s
+        finally:
+            if was_training:
+                self.model.train()
+        d = ref - pol
+        per_tok_kl = mx.exp(d) - d - 1
+        denom = mx.maximum(mask.sum(-1), 1.0)
+        kl = ((per_tok_kl * mask).sum(-1) / denom).mean()
+        mx.eval(kl)
+        return float(kl.item())
+
+    def _fast_forward_resume_batches(self, batch_iter, n_skip):
+        """Resume a GRPO run WITHOUT replaying rollouts.
+
+        The base implementation fast-forwards by consuming ``n_skip`` items from
+        ``batch_iter``. For GRPO that iterator is the on-policy rollout generator,
+        so each consumed item would generate ``num_generations`` completions with
+        the ALREADY-updated checkpoint model, re-run the (possibly side-effecting)
+        reward functions on them, and advance the sampling RNG by a different,
+        stop-length-dependent amount -- making resume slow, non-reproducible, and
+        divergent from the killed run's trajectory. TRL's resume advances only the
+        prompt sampler and never regenerates skipped rollouts. Match that: rebuild
+        the generator with its prompt cursor advanced past the completed rollouts,
+        so training resumes at the correct prompt position with no regeneration or
+        scoring. The passed-in (still un-started) generator is discarded.
+        """
+        return self._grpo_rollout_generator(skip_rollouts=n_skip)
+
+    def _grpo_rollout_generator(self, skip_rollouts=0):
+        """Infinite generator: each next() does generate->reward->advantage
+        and yields (batch, lengths, advantages). Runs uncompiled.
+
+        ``skip_rollouts`` advances the prompt cursor past that many rollouts
+        WITHOUT generating or scoring them (used by resume; see
+        _fast_forward_resume_batches).
+        """
+        import inspect as _inspect
+        import numpy as np
+        from types import SimpleNamespace
+        # batch_generate is the rollout backend (one generate call per prompt group).
+        # It was added to mlx-lm in 0.28.0 (mlx-lm PR #443); the pyproject mlx extra
+        # only pins mlx-lm>=0.22.0, so a user on a declared-compatible 0.22-0.27.x
+        # install would hit a cryptic "cannot import name 'batch_generate'"
+        # ImportError on the first GRPO rollout. Surface a clear, actionable message
+        # naming the required floor instead (the SFT/DPO/ORPO paths never import
+        # batch_generate, so this only gates GRPO).
+        try:
+            from mlx_lm import batch_generate
+        except ImportError as _e:
+            try:
+                import mlx_lm as _mlx_lm_mod
+                _mlx_lm_ver = getattr(_mlx_lm_mod, "__version__", "unknown")
+            except Exception:
+                _mlx_lm_ver = "unknown"
+            raise ImportError(
+                "Unsloth: MLX GRPO training requires mlx-lm>=0.28.0, which added "
+                "batch_generate for rollout generation (found mlx-lm "
+                f"{_mlx_lm_ver}). Upgrade with `pip install -U mlx-lm`."
+            ) from _e
+        from mlx_lm.sample_utils import make_sampler
+        # _common_prefix_len: robust prompt/response boundary for the re-encode
+        # fallback (below). _normalize_seed: seeded prompt-order shuffle.
+        from .utils import _common_prefix_len, _normalize_seed
+        # Newer mlx-lm (>= the return_token_ids addition) surfaces the exact
+        # generated token IDs from batch_generate. Prefer them for scoring so the
+        # GRPO loss/KL run on the sequence the policy actually sampled, rather
+        # than on a decode->re-encode roundtrip of the completion text (which is
+        # not identity: byte-fallback/cleanup tokens and prompt/completion
+        # boundary merges can yield different IDs). Fall back to re-encoding on
+        # older mlx-lm that lacks the flag.
+        _supports_token_ids = (
+            "return_token_ids" in _inspect.signature(batch_generate).parameters
+        )
+        args = self.args
+        hf = _hf_encoding_tokenizer(self.tokenizer)
+        pad_id = hf.eos_token_id if hf.eos_token_id is not None else 0
+        N = args.num_generations
+        # GRPO advantages are group-relative: (r - mean) / (std + eps). With a
+        # single generation per prompt the group has one element, so mean == r
+        # and std == 0, making every advantage exactly 0. The run would appear
+        # to train but receive no reward-policy gradient (a silent no-op GRPO
+        # objective). TRL's GRPOTrainer requires a group of at least 2 for the
+        # same reason; fail fast instead of training a no-op.
+        if N < 2:
+            raise ValueError(
+                "Unsloth: GRPO requires num_generations >= 2 (got "
+                f"{N}). A single generation per prompt yields a zero-variance "
+                "group, so every group-relative advantage is 0 and the policy "
+                "receives no reward gradient. Set num_generations to 2 or more."
+            )
+        # GRPO needs stochastic sampling to produce a diverse group. At
+        # temperature <= 0, make_sampler is greedy argmax, so all num_generations
+        # completions of a prompt are IDENTICAL: deterministic reward funcs then
+        # score them equally, every group has zero reward variance, and all
+        # group-relative advantages are 0 -- the policy receives no reward
+        # gradient (a silent no-op GRPO objective; with grpo_beta>0 only the KL
+        # term trains). This is the same zero-variance failure the N<2 guard
+        # above rejects. TRL's GRPO samples with temperature>0 (GRPOConfig default
+        # 1.0). Fail fast rather than silently train a no-op. The default here is
+        # 1.0, so normal runs are unaffected.
+        _temp = getattr(args, "temperature", 1.0)
+        if _temp is None or float(_temp) <= 0.0:
+            raise ValueError(
+                "Unsloth: GRPO requires temperature > 0 (got "
+                f"{_temp!r}). At temperature <= 0 sampling is greedy argmax, so "
+                "all num_generations completions of a prompt are identical, every "
+                "group has zero reward variance, and all group-relative advantages "
+                "are 0 -- the policy receives no reward gradient (a silent no-op). "
+                "Set a positive temperature (TRL's GRPO default is 1.0)."
+            )
+        sampler = make_sampler(temp=float(_temp))
+        prompts = self._grpo_prompts()
+        # Fail fast on an empty prompt set. The epoch path (_prepare_data) already
+        # raises "No GRPO prompts found" for max_steps<=0/num_train_epochs>0, but the
+        # default max_steps>0 path never runs that check, so an empty or fully
+        # filtered dataset would reach the "_order[idx % len(prompts)]" fetch below
+        # with len(prompts)==0 and crash with an opaque ZeroDivisionError (integer
+        # modulo by zero) inside the rollout loop. Surface the same clear dataset
+        # message here so every entry path reports the empty dataset up front.
+        if not prompts:
+            raise ValueError(
+                "No GRPO prompts found. Check your dataset and the "
+                "'prompt' column."
+            )
+        # Full dataset rows, in the same order as prompts, so reward_kwargs can
+        # pass through each row's other columns (e.g. 'answer'). prompt and
+        # example are indexed by the SAME cycled index below to stay aligned.
+        # Use the ORIGINAL (pre-view) dataset rows, not self.train_dataset: the
+        # latter is the _MLXTokenizedDatasetView, which injects synthetic
+        # input_ids/attention_mask columns onto any row it can render (e.g. a
+        # prompt+completion dataset) for SFT parity. Those tokenized columns must
+        # NOT leak into reward_kwargs below -- TRL builds reward kwargs from the
+        # raw dataset columns only (excluding prompt/completion/completion_ids)
+        # and never forwards input_ids/attention_mask, so an otherwise valid
+        # reward callback that accepts only its real columns (def r(completions,
+        # prompts, answer)) would crash on the unexpected token kwargs. The
+        # original rows carry exactly the user's columns.
+        examples = list(self._train_dataset_for_batches())
+        # Shard the prompt cycle across MLX DDP ranks. Without an offset every
+        # rank starts idx at 0 and steps by 1, so all ranks roll out the SAME
+        # prompt row for every microbatch and the gradients _apply_update all-
+        # reduces carry the prompt diversity of a single rank (duplicated rollout
+        # and reward work on the other ranks). Start each rank at its own rank
+        # index and stride by world_size so rank r rolls out prompts[r::world_
+        # size]; the all-reduced gradient then aggregates world_size distinct
+        # prompts' groups per global step, mirroring how the SFT path slices one
+        # global batch (items[rank::world_size]). No-op at world_size == 1 (rank
+        # 0, stride 1) -- the single-GPU path is byte-for-byte unchanged.
+        # Prompt visitation order. TRL's GRPO samples prompts with a shuffling
+        # sampler by DEFAULT (GRPOTrainer._get_train_sampler returns
+        # RepeatSampler(shuffle=self.shuffle_dataset) and GRPOConfig.shuffle_
+        # dataset defaults to True), so a run capped by max_steps below the
+        # dataset size still samples ACROSS the whole dataset. A plain sequential
+        # 0..N cycle (the prior behavior) would instead roll out only the ordered
+        # PREFIX under such a cap -- a silent, systematic bias in which prompts
+        # are ever trained (e.g. a large ordered dataset trains only its first
+        # max_steps rows). Mirror the SFT/preference builders (create_preference_
+        # batches / _create_labeled_batches, which shuffle before truncating):
+        # take a seeded permutation of the prompt order. The permutation is
+        # identical on every MLX DDP rank (same seed), so the rank-strided cycle
+        # below stays a disjoint shard (rank r still visits distinct prompts).
+        # Honor an explicit sequential-order request (preserve_dataset_order /
+        # dataset_order == "sequential"), matching the text/VLM dataset_order
+        # control; then the order is byte-for-byte the old 0..N cycle.
+        _sequential = (
+            getattr(args, "preserve_dataset_order", False)
+            or getattr(args, "dataset_order", "default") == "sequential"
+        )
+        if _sequential:
+            _order = list(range(len(prompts)))
+        else:
+            _perm = np.random.RandomState(
+                _normalize_seed(getattr(args, "seed", 42))
+            ).permutation(len(prompts))
+            _order = [int(i) for i in _perm]
+        _ddp_rank = self.distributed_rank
+        _ddp_world = self.distributed_world_size
+        # Base seed for the per-rollout sampling RNG (below). Same source as the
+        # seeded prompt permutation above, so both derive from args.seed.
+        _base_seed = _normalize_seed(getattr(args, "seed", 42))
+        # Resume: start the cursor already advanced past the rollouts the killed
+        # run completed (skip_rollouts * world_size), landing on exactly the prompt
+        # the generic consume-based fast-forward would have reached -- but without
+        # regenerating or scoring any skipped rollout (see
+        # _fast_forward_resume_batches). skip_rollouts == 0 (fresh run) is the
+        # byte-for-byte prior behavior.
+        idx = _ddp_rank + int(skip_rollouts) * _ddp_world
+        # Rank-local rollout counter, started past the skipped rollouts on resume so
+        # the per-rollout sampling seed (below) is a function of this index: rollout
+        # k samples identically whether reached fresh (index counts 0,1,2,...) or via
+        # resume (skip_rollouts lands the index on the same k).
+        _rollout_index = int(skip_rollouts)
+        while True:
+            j = _order[idx % len(prompts)]
+            prompt = prompts[j]
+            example = examples[j]
+            idx += _ddp_world
+            # Render through the wrapper-level tokenizer (self.tokenizer) so a
+            # wrapper-level custom chat template (mlx-lm TokenizerWrapper) or the
+            # chat_template override normalized in _prepare_data is honored,
+            # matching the SFT/DPO render path. hf (the unwrapped HF tokenizer) is
+            # reserved for raw token encoding only, below.
+            rendered = self._grpo_render_prompt(prompt, self.tokenizer)
+            # Chat templates (Llama/Qwen/Gemma-style) already emit a leading BOS
+            # when rendering the prompt string, so tokenizing with the raw
+            # encode()'s default add_special_tokens=True would prepend a SECOND
+            # BOS and corrupt the rollout prompt distribution. Route through the
+            # same double-BOS guard the SFT path uses (encode_mlx_text drops
+            # add_special_tokens when the rendered text already starts with the
+            # BOS token); plain-string prompts still get their single BOS.
+            pids = encode_mlx_text(hf, rendered)
+            # Rollout generation must sample from the deterministic policy, not a
+            # dropout-perturbed one. The training loop has already put the model in
+            # train() mode, so any LoRA/DoRA dropout layers are active, and mlx-lm's
+            # batch_generate never toggles eval. Without this guard the sampled
+            # completions -- and the log-probs the GRPO loss later scores them with
+            # -- would come from a randomly masked sub-network, so the advantages
+            # and the policy gradient would be computed for a different stochastic
+            # policy than the one that generated the tokens. Generate in eval mode
+            # and restore the prior training mode (mirrors _grpo_mean_kl /
+            # _grpo_ref_kl). Dropout=0 models are unaffected (eval is a no-op there).
+            #
+            # Per-rollout deterministic sampling seed. GRPO rollout sampling draws
+            # from the process-global mx.random state; seeding it only ONCE up front
+            # (_maybe_seed_grpo_rng) makes a RESUMED run start from the initial RNG
+            # subsequence rather than the state an uninterrupted run would hold after
+            # this many rollouts, so the first resumed rollout would sample DIFFERENT
+            # completions/rewards/gradients despite the same seed. Derive the seed
+            # from the rank-local rollout index instead (folding in rank so DDP ranks
+            # draw distinct groups): rollout k samples identically whether reached
+            # fresh or via resume -> same seed -> same completions, making resume
+            # bit-reproducible while keeping fresh runs reproducible. numpy
+            # SeedSequence mixes the three inputs into a well-separated stream per
+            # rollout (no cross-rollout correlation). Seed just before generation;
+            # nothing between here and batch_generate draws from mx.random.
+            mx.random.seed(int(np.random.SeedSequence(
+                [int(_base_seed), int(_ddp_rank), int(_rollout_index)]
+            ).generate_state(1)[0]))
+            _rollout_index += 1
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                # Bound generation so prompt + completion fits max_seq_length. The
+                # reward funcs score the FULL generated text (comps below), so if
+                # (pids + comp) were post-hoc truncated to max_seq_length the loss/
+                # KL would score only the surviving prefix while the reward (and
+                # thus the group-relative advantage) already reflects the dropped
+                # suffix: a silent reward/score misattribution that also corrupts
+                # the other rows' advantages via the group mean/std. TRL avoids
+                # this by bounding the prompt (max_prompt_length) and completion
+                # (max_completion_length) so their sum fits; cap generation to the
+                # trainable remainder here for the same effect. A single prompt
+                # that already fills max_seq_length leaves no trainable completion,
+                # so fail fast rather than emit an empty/degenerate loss span.
+                _avail = args.max_seq_length - len(pids)
+                if _avail <= 0:
+                    raise ValueError(
+                        f"Unsloth MLX GRPO: the rendered prompt uses {len(pids)} "
+                        f"tokens, leaving no room for a completion within "
+                        f"max_seq_length={args.max_seq_length}. Increase "
+                        f"max_seq_length or shorten the prompt."
+                    )
+                _gen_max = min(args.max_completion_length, _avail)
+                _gen_kwargs = dict(
+                    max_tokens=_gen_max,
+                    sampler=sampler, verbose=False,
+                )
+                if _supports_token_ids:
+                    _gen_kwargs["return_token_ids"] = True
+                resp = batch_generate(
+                    self.model, self.tokenizer, prompts=[pids] * N,
+                    **_gen_kwargs,
+                )
+            finally:
+                if was_training:
+                    self.model.train()
+            comps = resp.texts
+            # Exact generated IDs per completion (see _supports_token_ids note);
+            # None when unavailable, in which case rows fall back to re-encoding.
+            comp_ids = getattr(resp, "token_ids", None) if _supports_token_ids else None
+            # Build the concatenated group batch BEFORE scoring rewards so the
+            # exact per-completion generated ids that the loss will train on are
+            # available to the reward functions (TRL forwards these generated
+            # completion_ids to every reward func). The rows do not depend on the
+            # advantages, so building them first is a pure reorder of the prior
+            # rewards-then-rows sequence.
+            pe = len(pids)
+            # EOS re-append policy, shared by BOTH scoring paths (the comp_ids
+            # branch and the re-encode fallback). mlx-lm's batch_generate strips
+            # the terminal EOS from a normally-terminating row (finish_reason ==
+            # "stop") -- from the returned ids AND from resp.texts -- keeping all
+            # _gen_max tokens only when it truncated on length. TRL's GRPO
+            # completion mask is inclusive of that EOS (sequence_indices <=
+            # eos_idx), so the stop action gets advantage-weighted gradient/KL.
+            # Re-add the EOS when a row stopped normally (its completion is shorter
+            # than the generation cap _gen_max) so the loss scores the model's
+            # probability of stopping and does not bias completion-length/EOS
+            # behavior; a row at the cap was length-truncated (no EOS emitted) and
+            # is left as-is, mirroring TRL's default mask_truncated_completions=
+            # False. _gen_max already bounds the prompt + completion (+ this EOS)
+            # to max_seq_length, so the cut below never drops a reward-scored token.
+            # Only re-append when the stop token is unambiguous. mlx-lm stops on ANY
+            # id in the tokenizer's eos set and strips whichever one stopped the row
+            # without surfacing which, so for a model with multiple eos ids (e.g. a
+            # chat end-of-turn token distinct from eos_token_id) appending the
+            # singular hf.eos_token_id could train the probability of the WRONG
+            # terminal token. Re-append only when there is no multi-eos set or it is
+            # a single id equal to hf.eos_token_id; otherwise skip (leaving the stop
+            # action unscored is safer than scoring a wrong token). Single-eos
+            # models keep the exact prior behavior.
+            _eos_id = getattr(hf, "eos_token_id", None)
+            _mlx_eos = getattr(self.tokenizer, "eos_token_ids", None)
+            if isinstance(_mlx_eos, int):
+                _mlx_eos = [_mlx_eos]
+            _eos_unambiguous = (
+                _eos_id is not None
+                and (not _mlx_eos
+                     or (len(_mlx_eos) == 1 and _eos_id in _mlx_eos))
+            )
+            rows, lengths, completion_ids_list = [], [], []
+            for i, c in enumerate(comps):
+                if comp_ids is not None and comp_ids[i] is not None:
+                    # Score the EXACT generated continuation: prompt ids followed
+                    # by the sampled completion ids. This makes pe a true prefix
+                    # length by construction and avoids the decode->re-encode
+                    # roundtrip corrupting the tokens the policy generated. len(comp)
+                    # is the surfaced token count, so len(comp) < _gen_max marks a
+                    # normal stop (see the EOS policy above).
+                    comp = [int(t) for t in comp_ids[i]]
+                    if _eos_unambiguous and len(comp) < _gen_max:
+                        comp = comp + [int(_eos_id)]
+                    full = (pids + comp)[: args.max_seq_length]
+                    # pids is a true prefix of full by construction here (full is
+                    # pids followed by the sampled ids), so the boundary is len(pids).
+                    _pe_row = pe
+                else:
+                    # Fallback (older mlx-lm without generated-id surfacing):
+                    # guard the prompt+completion tokenization against the same
+                    # double BOS as the prompt above, and with the SAME guard so
+                    # the response boundary pe (from the guarded prompt encode)
+                    # stays a true prefix length of this full sequence.
+                    full = encode_mlx_text(hf, rendered + c)
+                    # Recompute the prompt/response boundary from the SHARED prefix
+                    # of the standalone prompt ids and this re-encoded row, rather
+                    # than reusing pe = len(pids). Encoding rendered + c is not a
+                    # plain concatenation of encode(rendered) and encode(c): a
+                    # BPE/SentencePiece tokenizer can MERGE the boundary token (the
+                    # last prompt token fuses with the first completion token) or
+                    # append a prompt-only EOS, so pids stops being a true prefix of
+                    # full. Reusing len(pids) would then mask the wrong span -- the
+                    # loss/KL would train a merged (part-response) token as prompt or
+                    # drop the first real completion token -- and forward the wrong
+                    # completion_ids to the reward funcs. _common_prefix_len stops at
+                    # the first divergence (this is the SAME merge-bug fix the
+                    # preference path uses in create_preference_batches); it returns
+                    # len(pids) unchanged when pids IS a true prefix (a no-op on the
+                    # common case). Computed on the re-encoded ids BEFORE the EOS
+                    # re-append below, which only extends the completion.
+                    _pe_row = _common_prefix_len(pids, full)
+                    # Mirror the comp_ids branch's EOS re-append here too: on a
+                    # normal stop batch_generate already stripped the terminal EOS
+                    # from resp.texts, so the re-encoded row has none to score and
+                    # the loss/KL would silently stop training EOS/length behavior on
+                    # this compatibility path. The completion's re-encoded span is
+                    # len(full) - pe; when it is below the generation cap _gen_max the
+                    # row stopped normally, so append the EOS (a span at _gen_max was
+                    # length-truncated and is left as-is). _gen_max bounds pe + span
+                    # (+ EOS) to max_seq_length, so the cut below keeps the EOS.
+                    _comp_len = len(full) - _pe_row
+                    if _eos_unambiguous and 0 <= _comp_len < _gen_max:
+                        full = full + [int(_eos_id)]
+                    full = full[: args.max_seq_length]
+                rows.append(full)
+                lengths.append([_pe_row, len(full)])
+                # The exact generated completion ids the loss trains on for this
+                # row: the [pe, len(full)) span of `full`. Forwarded to reward
+                # funcs that declare a completion_ids parameter (below), matching
+                # TRL, which passes the GENERATED ids -- not any dataset
+                # completion_ids column -- to each reward function. Identical in
+                # both branches because full[pe:] is the response span whether
+                # `full` came from the comp_ids continuation or the re-encode
+                # fallback (_pe_row is a true prefix length in each), so token-
+                # level rewards score the same tokens the policy is optimized on.
+                completion_ids_list.append(full[_pe_row:])
+            L = max(len(r) for r in rows)
+            batch = mx.array([r + [pad_id] * (L - len(r)) for r in rows], dtype=mx.int32)
+            # rewards: sum across reward functions (TRL-style). Pass through the
+            # dataset row's other columns as kwargs (repeated per generation to
+            # align row-for-row with completions), mirroring
+            # GRPOTrainer._calculate_rewards. The 'prompt'/'completion'/
+            # 'completion_ids' dataset columns are excluded exactly as TRL does;
+            # the GENERATED completion_ids (completion_ids_list above) are then
+            # forwarded separately, signature-gated so a strict-signature reward
+            # without a completion_ids parameter / **kwargs is not handed an
+            # unexpected keyword (see _reward_func_wants_completion_ids). A minimal
+            # trainer_state (global_step / max_steps) is likewise forwarded, gated,
+            # to rewards that declare it (see _reward_func_wants_trainer_state).
+            reward_kwargs = {
+                k: [example[k]] * N
+                for k in example
+                if k not in ("prompt", "completion", "completion_ids")
+            }
+            # TRL converts the generated completion TEXT back into assistant-
+            # message lists before calling custom reward functions when the prompt
+            # is conversational (grpo_trainer.py: for a conversational input,
+            # completions.append([{"role":"assistant","content": bootstrap +
+            # completion}])). A chat-style reward function that indexes message
+            # roles/content (e.g. completion[0]["content"]) would otherwise crash
+            # or score the wrong payload on the raw generated string. Mirror TRL:
+            # wrap each completion as a single assistant message when the row's
+            # prompt is a list of {"role","content"} message dicts; a plain-string
+            # prompt keeps the raw-string completions (back-compat / no-op). When
+            # the last prompt message is itself an assistant turn being continued
+            # (continue_final_message), TRL drops it from the prompt passed to the
+            # reward and prepends its content to each completion (the bootstrap
+            # prefix); replicate that without mutating the shared prompt row.
+            if (
+                isinstance(prompt, list) and prompt
+                and isinstance(prompt[0], dict)
+                and "role" in prompt[0] and "content" in prompt[0]
+            ):
+                if prompt[-1].get("role") == "assistant":
+                    _bootstrap = prompt[-1].get("content", "")
+                    _reward_prompt = prompt[:-1]
+                else:
+                    _bootstrap = ""
+                    _reward_prompt = prompt
+                _reward_completions = [
+                    [{"role": "assistant", "content": _bootstrap + c}]
+                    for c in comps
+                ]
+            else:
+                _reward_prompt = prompt
+                _reward_completions = comps
+            # Minimal trainer_state for progress-aware (e.g. curriculum) rewards,
+            # mirroring TRL's reward_kwargs["trainer_state"] = self.state. Only the
+            # fields the trainer actually tracks are exposed (no fabrication):
+            # global_step (completed optimizer steps so far -- self._global_step is
+            # set to the last completed step before this rollout runs, matching
+            # TRL's state.global_step during generation) and max_steps (the run's
+            # planned total, stashed in _train_inner). Built per rollout so
+            # global_step reflects the current step. getattr defaults keep the
+            # standalone-generator harness (no _train_inner) working.
+            _trainer_state = SimpleNamespace(
+                global_step=int(getattr(self, "_global_step", 0)),
+                max_steps=getattr(self, "_planned_total_steps", None),
+            )
+            total = [0.0] * N
+            for rf in self.reward_funcs:
+                _call_kwargs = dict(
+                    completions=_reward_completions,
+                    prompts=[_reward_prompt] * N,
+                )
+                _call_kwargs.update(reward_kwargs)
+                # Forward the generated completion_ids only to reward funcs that
+                # can accept them (declare a completion_ids parameter or **kwargs).
+                # A strict-signature reward (def r(completions, prompts, answer))
+                # is a supported form here, and handing it an unexpected
+                # completion_ids keyword would raise TypeError -- so gate the pass.
+                if _reward_func_wants_completion_ids(rf):
+                    _call_kwargs["completion_ids"] = completion_ids_list
+                # Forward trainer_state only to rewards that declare it (a
+                # trainer_state parameter or **kwargs); a reward that REQUIRES it
+                # (curriculum rewards keyed on the step) would otherwise raise
+                # TypeError for a missing argument, and a strict-signature reward
+                # that neither wants nor accepts it must not be handed an
+                # unexpected keyword. Mirrors the completion_ids gate.
+                if _reward_func_wants_trainer_state(rf):
+                    _call_kwargs["trainer_state"] = _trainer_state
+                vals = rf(**_call_kwargs)
+                # TRL's reward-function contract is one score per completion:
+                # len(vals) must equal N. A shorter list would leave the unfilled
+                # positions at their initial 0.0 (silently fabricating rewards and
+                # corrupting the group-relative advantages); a longer one would
+                # index out of range below. Fail fast with a clear message.
+                if len(vals) != N:
+                    _rf_name = getattr(rf, "__name__", type(rf).__name__)
+                    raise ValueError(
+                        f"Unsloth: GRPO reward function {_rf_name!r} returned "
+                        f"{len(vals)} scores for {N} completions. Each reward "
+                        "function must return exactly one score per completion "
+                        "(len(completions) == num_generations)."
+                    )
+                for i, v in enumerate(vals):
+                    # TRL-style reward funcs may return None to skip a sample
+                    # (multi-task rewards); TRL maps None to NaN and drops it
+                    # from the sum. Skip None here instead of crashing on
+                    # float(None).
+                    if v is not None:
+                        total[i] += float(v)
+            rewards = mx.array(total)
+            # TRL standardizes grouped rewards with the sample (Bessel-corrected)
+            # std: torch.std defaults to unbiased=True. mx.std defaults to the
+            # population std (ddof=0), which is systematically smaller and inflates
+            # the advantage magnitude by sqrt(N/(N-1)) (~1.41x at num_generations=2,
+            # ~1.15x at 4), mis-scaling the objective the PPO clip epsilon and KL
+            # beta are calibrated against. Compute the ddof=1 std explicitly from
+            # primitives (rather than mx.std(ddof=1)) so the expression is identical
+            # under real mlx and the torch-backed test shim, whose std() signatures
+            # differ. num_generations >= 2 is enforced above so N - 1 >= 1, and the
+            # all-equal-rewards (std==0) case is still absorbed by the +1e-4.
+            _mean = rewards.mean()
+            _std = (((rewards - _mean) ** 2).sum() / (rewards.shape[0] - 1)) ** 0.5
+            advantages = (rewards - _mean) / (_std + 1e-4)
+            yield batch, mx.array(lengths), advantages
+
+    def _prepare_data(self, is_vlm):
+        if is_vlm:
+            raise ValueError("GRPO is not yet supported for VLM models on MLX.")
+        # Apply the configured chat_template override to the tokenizer BEFORE the
+        # rollout generator renders chat-message prompts, mirroring the SFT/DPO
+        # data path (MLXTrainer._prepare_data). Without this, _grpo_render_prompt
+        # calls apply_chat_template on the raw, un-normalized tokenizer: a
+        # MLXTrainingConfig(chat_template=...) override would be silently ignored
+        # (rollouts rendered with the wrong template) and a tokenizer without a
+        # built-in template would raise, even though the same config trains fine
+        # under SFT/DPO. Normalizing here restores that parity. It is a no-op when
+        # chat_template is None, so default runs are unchanged.
+        args = self.args
+        # GRPO drives training from a rollout generator that first materializes the
+        # dataset: _grpo_prompts() walks every row and examples=list(...) consumes
+        # the whole dataset before the first generate call. An unbounded streaming
+        # IterableDataset would therefore hang (or OOM) before a single rollout,
+        # despite max_steps -- there is no streaming rollout path. Fail fast here
+        # (mirroring the SFT/preference streaming guards) rather than hang.
+        if getattr(args, "streaming", False):
+            raise NotImplementedError(
+                "Unsloth MLX: streaming GRPO training is not yet implemented. The "
+                "rollout generator materializes the whole dataset (it walks every "
+                "prompt and lists all rows) before the first generation, so an "
+                "unbounded streaming dataset would hang or run out of memory instead "
+                "of stopping at max_steps. Disable streaming (streaming=False) for "
+                "GRPO, or use a finite (map-style) dataset."
+            )
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        model_name = getattr(self.model, "_hf_repo", None)
+        self.tokenizer = normalize_mlx_chat_template(
+            self.tokenizer,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        # Epoch-based finite GRPO (TRL/HF's standard num_train_epochs path). The
+        # rollout generator returned below is an infinite cycle over the finite
+        # prompt set (idx % len(prompts)), so batches is None and _train_inner --
+        # which counts materialized batches -- cannot derive the step total and
+        # would otherwise fall into its streaming branch and wrongly raise
+        # "num_train_epochs requires a finite dataset" for this finite dataset.
+        # Compute the planned optimizer steps here instead, mirroring the SFT/DPO
+        # epoch formula (total_steps = batches_per_epoch * num_epochs // grad_accum,
+        # _train_inner:2289). One GRPO microbatch rolls out one prompt PER RANK
+        # (rank r visits prompts[r::world_size], the rollout generator's stride),
+        # so a rank's batches_per_epoch is ceil(len(prompts)/world_size). max_steps
+        # > 0 keeps the existing behavior (num_train_epochs ignored, matching HF),
+        # so only the epoch path stashes a value; otherwise leave it None.
+        self._grpo_epoch_total_steps = None
+        if (getattr(args, "max_steps", 0) <= 0
+                and getattr(args, "num_train_epochs", 0) > 0):
+            n_prompts = len(self._grpo_prompts())
+            if n_prompts == 0:
+                raise ValueError(
+                    "No GRPO prompts found. Check your dataset and the "
+                    "'prompt' column."
+                )
+            grad_accum = max(1, int(args.gradient_accumulation_steps))
+            world = max(1, int(getattr(self, "distributed_world_size", 1) or 1))
+            batches_per_epoch = math.ceil(n_prompts / world)
+            total_steps = int(
+                (batches_per_epoch * args.num_train_epochs) // grad_accum
+            )
+            self._grpo_epoch_total_steps = max(1, total_steps)
+        # GRPO drives the loop with a rollout generator, not static batches.
+        return None, self._grpo_rollout_generator()
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
@@ -3906,6 +5087,49 @@ def train_on_responses_only(
     from ..dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
+
+    # Fail fast before any tokenization work: train_on_responses_only builds
+    # SFT-shaped (batch, lengths, labels) batches and stores them on
+    # trainer._batches, which _prepare_data returns before the DPO/ORPO preference
+    # branch. The preference losses split each batch into row halves as
+    # [chosen; rejected] (batch.shape[0]//2), so SFT rows get paired as unrelated
+    # chosen/rejected examples (garbage gradient), and at
+    # per_device_train_batch_size=1 the chosen half is empty -> NaN. Mirror the
+    # DPO+VLM / DPO+non-LoRA fail-fast guards rather than train silently on
+    # corrupted pairs. return_function=True only builds and returns the masking
+    # closure (it never touches trainer._batches or the dataset) and is a
+    # supported way to reuse the trainer's tokenizer/template autodetection, so
+    # the guards below skip it and only block the mutating trainer path.
+    if (trainer is not None and not return_function
+            and getattr(trainer.args, "loss_type", "sft") == "grpo"):
+        # GRPO drives training from on-the-fly rollouts that need the ORIGINAL
+        # prompt rows (and each row's reward kwargs). train_on_responses_only builds
+        # response-only SFT batches and replaces trainer.train_dataset /
+        # _mlx_train_dataset_for_batches with the tokenized, response-masked rows, so
+        # the rollout's _grpo_prompts()/examples would then read those SFT rows
+        # instead of the user's prompt dataset -- corrupting every rollout (or
+        # erroring on the now-missing 'prompt' column). It is a no-op for GRPO
+        # regardless, so reject it up front (mirrors the DPO/ORPO guard below, which
+        # only catches those two loss_types).
+        raise ValueError(
+            "Unsloth: train_on_responses_only() builds response-only SFT batches "
+            "and replaces the training dataset, but GRPO trains from rollouts that "
+            "need the original prompt rows (and per-row reward kwargs). Applying it "
+            "to an MLXGRPOTrainer corrupts the rollout data. Remove the "
+            "train_on_responses_only() call for GRPO -- reward functions already "
+            "score only the generated completion."
+        )
+    if (trainer is not None and not return_function
+            and getattr(trainer.args, "loss_type", "sft") in ("dpo", "orpo")):
+        raise ValueError(
+            "Unsloth: train_on_responses_only() masks SFT completion tokens and is "
+            "incompatible with preference losses. DPO/ORPO build their own "
+            "[chosen; rejected] batches via create_preference_batches (prompt "
+            "masking is handled there); feeding response-only SFT batches to the "
+            "preference loss pairs unrelated rows as chosen/rejected and yields NaN "
+            "at per_device_train_batch_size=1. Remove the train_on_responses_only() "
+            "call for loss_type in {'dpo','orpo'}."
+        )
 
     # Resolve tokenizer: kwarg > trainer.tokenizer
     _source = tokenizer
