@@ -329,6 +329,30 @@ def test_mlx_training_config_each_optim(optim_name):
     assert cfg.optim == optim_name
 
 
+def test_optimizer_state_norm_supported_excludes_adamax():
+    """The post-update ||g|| estimate recovers the gradient from an Adam-style
+    second moment. Adamax exposes betas and a `v` state too, but its `v` is an
+    infinity norm, so it must be excluded (like the non-Adam optimizers) rather
+    than reporting a wildly scaled grad norm."""
+    from unsloth_zoo.mlx.trainer import _mlx_optimizer_state_norm_supported
+
+    def _fake(name, betas=None):
+        # A genuinely distinct type so type(obj).__name__ == name.
+        obj = type(name, (), {})()
+        if betas is not None:
+            obj.betas = betas
+        return obj
+
+    # Adam/AdamW keep a genuine second moment -> supported.
+    assert _mlx_optimizer_state_norm_supported(_fake("Adam", (0.9, 0.999)))
+    assert _mlx_optimizer_state_norm_supported(_fake("AdamW", (0.9, 0.999)))
+    # Adamax exposes betas but its `v` is an infinity norm -> excluded.
+    assert not _mlx_optimizer_state_norm_supported(_fake("Adamax", (0.9, 0.999)))
+    # Non-Adam optimizers without betas were already skipped.
+    assert not _mlx_optimizer_state_norm_supported(_fake("RMSprop"))
+    assert not _mlx_optimizer_state_norm_supported(_fake("Adagrad"))
+
+
 def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer,

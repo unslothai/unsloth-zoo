@@ -52,7 +52,24 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
-SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
+SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion", "rmsprop", "adamax", "adagrad", "adadelta")
+
+
+def _mlx_optimizer_state_norm_supported(optimizer):
+    """Whether ||g|| can be recovered from the optimizer's post-update state.
+
+    The recovery assumes an Adam-style exponential second moment
+    (v_t = beta2*v_{t-1} + (1 - beta2)*g_t^2), so it applies to Adam/AdamW.
+    Adamax also exposes ``betas`` and keeps a ``v`` state, but its ``v`` is an
+    infinity norm (v_t = max(beta2*v_{t-1}, |g_t|)); reusing the second-moment
+    formula there yields a wildly scaled grad norm, so treat Adamax like the
+    other non-Adam optimizers and skip the estimate. Optimizers without
+    ``betas`` (or, like Lion, without a ``v`` state) are already skipped
+    upstream.
+    """
+    if type(optimizer).__name__ == "Adamax":
+        return False
+    return bool(getattr(optimizer, "betas", None))
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 
@@ -1360,6 +1377,24 @@ class MLXTrainer:
         elif opt_name == "lion":
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
+        elif opt_name == "rmsprop":
+            # HF/PyTorch RMSprop, Adamax, Adagrad, and Adadelta fold weight
+            # decay into the gradient as coupled L2 (grad += wd * param),
+            # unlike AdamW's decoupled shrink. Use the same coupled path as
+            # SGD so the adaptive denominator and optimizer state see the
+            # decay term and the trained result matches the requested
+            # optimizer.
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.RMSprop(learning_rate=initial_lr)
+        elif opt_name == "adamax":
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.Adamax(learning_rate=initial_lr, **adam_kwargs)
+        elif opt_name == "adagrad":
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.Adagrad(learning_rate=initial_lr)
+        elif opt_name == "adadelta":
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.AdaDelta(learning_rate=initial_lr)
         self._resolved_optimizer_name = opt_name
         return optimizer
 
@@ -2296,8 +2331,9 @@ class MLXTrainer:
         def _can_report_optimizer_state_norm():
             # Adam-family: recover ||g|| from the second moment after update
             # (v_t = beta2*v_{t-1} + (1-beta2)*g_t^2), avoiding a second
-            # consumer on the lazy backward graph.
-            return getattr(optimizer, "betas", None)
+            # consumer on the lazy backward graph. Adamax exposes betas but its
+            # `v` is an infinity norm, so it is excluded (see the helper).
+            return _mlx_optimizer_state_norm_supported(optimizer)
 
         def _apply_update(grad, toks_f):
             """Scale accumulated grads by supervised-token count, apply the
