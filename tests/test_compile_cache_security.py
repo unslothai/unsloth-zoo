@@ -366,6 +366,17 @@ def test_megacache_does_not_load_a_group_writable_bundle_file(monkeypatch, tmp_p
     assert loaded == []
 
 
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX FIFO semantics")
+def test_megacache_refuses_a_fifo_bundle_without_blocking(tmp_path):
+    module = _load_module()
+    fifo = tmp_path / "bundle.fifo"
+    os.mkfifo(fifo)
+    os.chmod(fifo, 0o600)
+    # A non-regular file is refused; O_NONBLOCK keeps the open from hanging on
+    # a FIFO with no writer so the S_ISREG check can reject it.
+    assert module._read_trusted_file(fifo, binary = True) is None
+
+
 @pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
 def test_megacache_ignores_bundle_name_path_traversal(monkeypatch, tmp_path):
     module = _load_module()

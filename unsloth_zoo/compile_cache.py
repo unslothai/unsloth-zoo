@@ -280,12 +280,22 @@ def _read_trusted_file(path, *, binary = False):
     """Read a cache file, refusing symlinks and foreign-owned or group/other
     writable files. Directory trust stops an attacker creating files here, but
     a group-writable file already present can have its bytes (and matching
-    checksum) rewritten in place; reject those. Returns None if untrusted."""
+    checksum) rewritten in place; reject those. Returns None if the file is
+    missing or untrusted, and never blocks on a FIFO/device."""
     mode = "rb" if binary else "r"
     if os.name != "posix":
-        with open(path, mode) as file:
-            return file.read()
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            with open(path, mode) as file:
+                return file.read()
+        except OSError:
+            return None
+    # O_NOFOLLOW rejects a symlinked file; O_NONBLOCK stops a stray FIFO/device
+    # at this path from blocking the open so the S_ISREG check below can reject it.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
     try:
         file_stat = os.fstat(fd)
         if (not stat.S_ISREG(file_stat.st_mode)
