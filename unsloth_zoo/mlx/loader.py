@@ -2820,6 +2820,29 @@ _ADAPTER_LORA_KEY_SUFFIXES = (
 )
 
 
+def _unfreeze_saved_mlx_non_adapter_parameters(model, adapter_weights_file):
+    """Restore trainability for non-adapter tensors saved in a checkpoint."""
+    from safetensors import safe_open
+    from mlx.utils import tree_flatten
+    from .utils import collect_mlx_lora_adapter_tensors
+
+    with safe_open(adapter_weights_file, framework="numpy") as adapter_file:
+        saved_keys = set(adapter_file.keys())
+    live_keys = {name for name, _ in tree_flatten(model.parameters())}
+    adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
+    modules = {"": model, **dict(model.named_modules())}
+    for path in (saved_keys & live_keys) - adapter_keys:
+        parts = path.split(".")
+        for split in range(len(parts) - 1, -1, -1):
+            module_path = ".".join(parts[:split])
+            module = modules.get(module_path)
+            if module is None:
+                continue
+            key = ".".join(parts[split:])
+            module.unfreeze(keys=[key], recurse=False, strict=False)
+            break
+
+
 def _saved_mlx_lora_tensor_shapes(adapter_weights_file):
     """Return raw MLX LoRA A/B shapes grouped by module path."""
     if not adapter_weights_file or not os.path.exists(adapter_weights_file):
@@ -5572,6 +5595,9 @@ class FastMLXModel:
                                 "LoRA before reload."
                             ) from _dora_exc
                     if _saved_lora_paths:
+                        if not full_finetuning:
+                            _fix_missing_no_grad(model)
+                            model.freeze()
                         _apply_lora_at_paths(
                             model, _saved_lora_paths, adapter_cfg,
                             adapter_weights_file=adapter_weights_file,
@@ -5587,6 +5613,9 @@ class FastMLXModel:
                                 f"({_missing_before_load[:5]!r})."
                             )
                         model.load_weights(adapter_weights_file, strict=False)
+                        _unfreeze_saved_mlx_non_adapter_parameters(
+                            model, adapter_weights_file,
+                        )
                     else:
                         from mlx_lm.tuner.utils import load_adapters
 

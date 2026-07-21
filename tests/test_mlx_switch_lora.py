@@ -302,6 +302,7 @@ def test_direct_layers_respect_finetune_last_n_layers():
 
 def test_mixed_dora_switch_reload_preserves_routed_lora():
     import mlx.nn as nn
+    from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import SwitchLinear
     from mlx_lm.tuner.dora import DoRALinear
     from mlx_lm.tuner.lora import LoRASwitchLinear
@@ -310,6 +311,7 @@ def test_mixed_dora_switch_reload_preserves_routed_lora():
     model = nn.Module()
     model.dense = nn.Linear(64, 16, bias=False)
     model.experts = SwitchLinear(64, 16, 2, bias=False)
+    model.freeze()
     attached = _apply_lora_at_paths(
         model,
         ["dense", "experts"],
@@ -322,6 +324,10 @@ def test_mixed_dora_switch_reload_preserves_routed_lora():
     assert attached == 2
     assert isinstance(model.dense, DoRALinear)
     assert isinstance(model.experts, LoRASwitchLinear)
+    assert set(dict(tree_flatten(model.trainable_parameters()))) == {
+        "dense.lora_a", "dense.lora_b", "dense.m",
+        "experts.lora_a", "experts.lora_b",
+    }
 
 
 @pytest.mark.parametrize("quantized", [False, True])
@@ -375,10 +381,15 @@ def test_switch_adapter_public_lifecycle(
 ):
     import mlx.core as mx
     import mlx_lm.utils as mlx_lm_utils
+    from mlx.utils import tree_flatten
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
     from mlx_lm.tuner.lora import LoRASwitchLinear
     import unsloth_zoo.mlx.loader as loader
-    from unsloth_zoo.mlx.utils import save_lora_adapters, save_merged_model
+    from unsloth_zoo.mlx.utils import (
+        save_lora_adapters,
+        save_merged_model,
+        save_trainable_adapters,
+    )
 
     switch, quantized_switch, wrapper = (
         _install_vlm_types(monkeypatch)
@@ -386,6 +397,7 @@ def test_switch_adapter_public_lifecycle(
         else (SwitchLinear, QuantizedSwitchLinear, LoRASwitchLinear)
     )
     projection_type = quantized_switch if quantized else switch
+    external_case = backend == "mlx_lm" and not quantized and corrupt is None
 
     def make_model():
         mx.random.seed(17)
@@ -395,6 +407,8 @@ def test_switch_adapter_public_lifecycle(
             else projection_type(64, 16, 2, bias=False)
         )
         model = _direct_layer_model([_Block(projection)])
+        if external_case:
+            model.external = {"scale": mx.zeros((1,)), "m": mx.zeros((1,))}
         return model
 
     trained, base = make_model(), make_model()
@@ -405,12 +419,17 @@ def test_switch_adapter_public_lifecycle(
     trained.layers[0].proj.lora_b = mx.ones_like(
         trained.layers[0].proj.lora_b,
     ) * 0.125
+    if external_case:
+        trained.unfreeze(keys=["external.scale", "external.m"], recurse=False)
     trained._hf_repo = "test/switch-base"
     x = mx.random.normal((1, 2, 1, 1, 64))
     indices = mx.array([[[0], [1]]])
     expected = trained.layers[0].proj(x, indices)
     adapter = tmp_path / f"{backend}-{'q' if quantized else 'dense'}-{corrupt}"
-    save_lora_adapters(trained, adapter)
+    if external_case:
+        save_trainable_adapters(trained, adapter)
+    else:
+        save_lora_adapters(trained, adapter)
     config = json.loads((adapter / "adapter_config.json").read_text())
     path = "backbone.blocks.0.proj"
     assert config["unsloth_mlx_lora_module_paths"] == [path]
@@ -421,7 +440,9 @@ def test_switch_adapter_public_lifecycle(
         assert config["base_resolved_quantization_map_supports_switch"] is True
     weights_path = adapter / "adapters.safetensors"
     weights = mx.load(str(weights_path))
-    assert {value.ndim for value in weights.values()} == {3}
+    assert {value.ndim for value in weights.values()} == (
+        {1, 3} if external_case else {3}
+    )
     if corrupt == "pathless":
         config.pop("unsloth_mlx_lora_module_paths")
         (adapter / "adapter_config.json").write_text(json.dumps(config))
@@ -459,6 +480,13 @@ def test_switch_adapter_public_lifecycle(
     loaded, tokenizer = original(str(adapter), load_in_4bit=False)
     assert isinstance(loaded.layers[0].proj, wrapper)
     assert bool(mx.allclose(loaded.layers[0].proj(x, indices), expected))
+    if corrupt != "pathless":
+        expected_trainable = {f"{path}.lora_a", f"{path}.lora_b"}
+        if external_case:
+            expected_trainable.update({"external.scale", "external.m"})
+        assert set(dict(tree_flatten(loaded.trainable_parameters()))) == (
+            expected_trainable
+        )
     if not quantized:
         monkeypatch.setattr(mlx_lm_utils, "save_model", lambda *args, **kwargs: None)
         monkeypatch.setattr(mlx_lm_utils, "create_model_card", lambda *args, **kwargs: None)
