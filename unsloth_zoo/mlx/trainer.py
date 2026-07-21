@@ -76,7 +76,11 @@ def _mlx_rank0_resolve_int(comm_group, resolver, context):
         try:
             value = int(resolver())
             status = 1
-        except Exception as exc:
+        except BaseException as exc:
+            # Synchronize the failure (KeyboardInterrupt/SystemExit included)
+            # before it propagates: peers are already blocking in the metadata
+            # collective and would hang if rank 0 unwound past it silently.
+            # The original error is re-raised on rank 0 below.
             owner_error = exc
             status = -1
     metadata = mx.array(
@@ -214,20 +218,28 @@ def _mlx_stream_declares_infinite(dataset):
             and getattr(ex_iterable, "num_times", 0) is None
         ):
             return True
+        # These are private datasets internals: read them defensively so a
+        # rename in a future release degrades detection (the stream just
+        # is not recognized as infinite) instead of failing eval for every
+        # stream whose wrapper class matches by name.
         if kind in (
             "VerticallyConcatenatedMultiSourcesExamplesIterable",
             "HorizontallyConcatenatedMultiSourcesExamplesIterable",
         ):
-            return any(_is_infinite(child, seen) for child in ex_iterable.ex_iterables)
+            return any(
+                _is_infinite(child, seen)
+                for child in getattr(ex_iterable, "ex_iterables", ())
+            )
         if kind in (
             "CyclingMultiSourcesExamplesIterable",
             "RandomlyCyclingMultiSourcesExamplesIterable",
         ):
-            children = ex_iterable.ex_iterables
+            children = getattr(ex_iterable, "ex_iterables", ())
             probabilities = getattr(ex_iterable, "probabilities", None)
+            stopping_strategy = getattr(ex_iterable, "stopping_strategy", "")
             if probabilities is not None:
                 if (
-                    ex_iterable.stopping_strategy.startswith("all_exhausted")
+                    stopping_strategy.startswith("all_exhausted")
                     and any(probability <= 0 for probability in probabilities)
                 ):
                     return True
@@ -238,7 +250,7 @@ def _mlx_stream_declares_infinite(dataset):
             infinite = [_is_infinite(child, seen) for child in children]
             return (
                 any(infinite)
-                if ex_iterable.stopping_strategy.startswith("all_exhausted")
+                if stopping_strategy.startswith("all_exhausted")
                 else bool(infinite) and all(infinite)
             )
         return _is_infinite(getattr(ex_iterable, "ex_iterable", None), seen)
@@ -272,14 +284,21 @@ class _MLXLazyEvalBatchView:
                 "so evaluation has an explicit boundary."
             )
         iterator = iter(self._factory())
-        if self._max_batches is None:
-            yield from iterator
-            return
-        for _ in range(self._max_batches):
-            try:
-                yield next(iterator)
-            except StopIteration:
+        try:
+            if self._max_batches is None:
+                yield from iterator
                 return
+            for _ in range(self._max_batches):
+                try:
+                    yield next(iterator)
+                except StopIteration:
+                    return
+        finally:
+            # max_eval_batches truncation (and early consumer exits) must
+            # release the lazy pass's owned source cursors deterministically.
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
 
 
 def _mlx_declared_iterable_length(dataset):
