@@ -344,6 +344,33 @@ def test_softcap_alias_value_domain(value, expected):
         assert (softcap, problem) == expected
 
 
+def test_is_lm_head_trainable_follows_descriptor_path():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    # Alt-named tied embedding (InternLM2 tok_embeddings) trains under full
+    # fine-tuning: name segments used to miss it and drop the head gradient.
+    assert U._is_lm_head_trainable(
+        _lm(nn, tied_flag=True, emb_name="tok_embeddings")) is True
+    # Property-backed wrapper: language_model returns self, so the descriptor
+    # access path is not a registered prefix — module identity must still find
+    # the head in the parameter tree.
+    class _PropWrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(32, 96, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+    assert U._is_lm_head_trainable(_PropWrapped()) is True
+    # Unresolved head never reports trainable, even with an empty tree.
+    unresolved = _lm(nn)
+    unresolved.freeze()
+    assert U._is_lm_head_trainable(unresolved) is False
+
+
 def test_backboneless_text_model_selects_baseline_fallback(capsys):
     # nanochat shape (stack under .transformer, no separable .model): the
     # biased head would trip the eligibility gate, so seeing ONLY the topology

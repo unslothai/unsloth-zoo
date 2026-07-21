@@ -1075,21 +1075,36 @@ def _detect_head_transform(model, head_status):
 
 
 def _is_lm_head_trainable(model):
-    """Whether the LM head weight is trainable (not frozen by LoRA).
+    """Whether fused CCE should compute the output head's weight gradient.
 
-    When frozen, its CCE gradient is a wasted V x chunk_size x H matmul per
-    chunk, so callers wrap the weight with mx.stop_gradient (returns False).
+    Returns False when the head is frozen by a LoRA/adapter setup or is
+    unresolved (its gradient would be a wasted V x chunk_size x H matmul per
+    chunk, so callers wrap the weight with mx.stop_gradient); True when the
+    resolved head carries a trainable param, or when there are no adapters at
+    all (full fine-tuning). Resolution is by descriptor module identity in the
+    registered tree, not by name — a property-backed ``language_model``
+    returning ``self`` is not a registered child, and an alt-named tied
+    embedding (InternLM2 ``tok_embeddings``) is classified like any head.
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     # Module-anchored so unrelated trainables containing the substring
     # "lora" are not treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
-    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped lm_head (would
+    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped head (would
     # defeat the CCE memory guard) while keeping intentional trainables
     # like `lm_head.bias`. Shares the filter with save_trainable_adapters.
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
     lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
     has_root_lora_module = any(name == "" for name in _lora_module_names)
+    head_module = describe_output_head(model).module
+    head_prefix = None
+    if head_module is not None:
+        for name, module in model.named_modules():
+            if module is head_module and name:
+                head_prefix = f"{name}."
+                break
+    if head_prefix is None:
+        return False
     for key in trainable:
         if key in adapter_keys:
             continue
@@ -1097,16 +1112,7 @@ def _is_lm_head_trainable(model):
             key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
-        # Segment-match (not substring) so e.g.
-        # `decoder.not_lm_head_router.weight` is not classified as lm_head.
-        segments = key.split(".")
-        is_lm_head_param = "lm_head" in segments
-        is_embed_tokens_weight = (
-            len(segments) >= 2
-            and segments[-2] == "embed_tokens"
-            and segments[-1] == "weight"
-        )
-        if is_lm_head_param or is_embed_tokens_weight:
+        if key.startswith(head_prefix):
             return True
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
