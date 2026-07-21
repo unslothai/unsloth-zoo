@@ -2725,3 +2725,18 @@ def test_max_eval_batches_rejects_non_integer_values():
         with pytest.raises(ValueError, match="max_eval_batches"):
             trainer._create_text_eval_batches(
                 _CountingTextRows(({"text": "10 1"},)), 1, False, False)
+
+
+def test_distributed_failure_reraises_interrupts_unwrapped():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8))
+    for interrupt in (KeyboardInterrupt, SystemExit):
+        with pytest.raises(interrupt):
+            trainer._raise_distributed_failure_from_any(True, "save", interrupt())
+        assert not trainer.stop_requested  # reuse must not inherit a stop
+    with pytest.raises(RuntimeError, match="failed during save"):
+        trainer._raise_distributed_failure_from_any(True, "save", ValueError("x"))
+    assert trainer.stop_requested

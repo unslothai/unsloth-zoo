@@ -1238,6 +1238,12 @@ class MLXTrainer:
         """Abort this rank after a rank-wide failure consensus."""
         if not failed_any:
             return
+        if exc is not None and not isinstance(exc, Exception):
+            # Interrupts (KeyboardInterrupt/SystemExit) were captured only so
+            # this rank could join the consensus; re-raise them unwrapped and
+            # without mutating trainer state, so a reused trainer does not
+            # inherit a stop request from an interrupt.
+            raise exc
         self.stop_requested = True
         if exc is not None:
             raise RuntimeError(
@@ -1705,7 +1711,9 @@ class MLXTrainer:
                 batch_data = next(iterator)
             except StopIteration:
                 break
-            except Exception as exc:
+            except BaseException as exc:
+                # Interrupts included: every rank must reach the eval status
+                # collective below, or the surviving ranks hang in it.
                 failed = True
                 error = exc
 
@@ -1722,7 +1730,7 @@ class MLXTrainer:
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
                     mx.eval(all_losses, ntokens)
-                except Exception as exc:
+                except BaseException as exc:
                     failed = True
                     error = exc
 
@@ -2917,15 +2925,32 @@ class MLXTrainer:
                 )
                 _compiled_local_grad_step = None
                 _compile_setup_error = None
+                _compile_setup_abort = None
                 try:
                     _compiled_local_grad_step = mx.compile(
                         _local_grad_step,
                         inputs=_compile_state,
                         outputs=_compile_state,
                     )
-                except Exception as e:
-                    _compile_setup_error = e
-                if self._distributed_any_flag(_compile_setup_error is not None):
+                except BaseException as e:
+                    # Ordinary failures keep the eager-fallback path; an
+                    # interrupt must abort through the consensus instead of
+                    # silently downgrading the run to eager mode.
+                    if isinstance(e, Exception):
+                        _compile_setup_error = e
+                    else:
+                        _compile_setup_abort = e
+                _setup_base = distributed_world_size + 1
+                _setup_status = self._distributed_status_mask(
+                    (1 if _compile_setup_error is not None else 0)
+                    + _setup_base * (1 if _compile_setup_abort is not None else 0)
+                )
+                self._raise_distributed_failure_from_any(
+                    (_setup_status // _setup_base) > 0,
+                    "compile setup",
+                    _compile_setup_abort,
+                )
+                if (_setup_status % _setup_base) > 0:
                     if not _compile_fallback_allowed():
                         _strict_compile_error(
                             _compile_setup_error,
@@ -3128,7 +3153,7 @@ class MLXTrainer:
                         f"fast-forwarding to resume step {_resume_step}. "
                         f"Dataset may be shorter than the killed run consumed."
                     )
-                except Exception as e:
+                except BaseException as e:
                     fast_forward_error = e
                 if distributed_world_size > 1:
                     self._raise_distributed_failure(
@@ -3163,7 +3188,7 @@ class MLXTrainer:
             try:
                 result = step_fn(batch_data, prev_state, do_update)
                 _eval_local_result(result)
-            except Exception as e:
+            except BaseException as e:
                 if isinstance(e, _DDPCompiledLocalGradError):
                     compile_error = e
                 else:
@@ -3204,7 +3229,7 @@ class MLXTrainer:
                 try:
                     result = step_fn(batch_data, prev_state, do_update)
                     _eval_local_result(result)
-                except Exception as e:
+                except BaseException as e:
                     local_error = e
                 self._raise_distributed_failure(
                     local_error is not None,
@@ -3231,7 +3256,7 @@ class MLXTrainer:
                 else:
                     batch_data = batches[batch_idx % len(batches)]
                     batch_idx += 1
-            except Exception as e:
+            except BaseException as e:
                 batch_error = e
             if distributed_world_size > 1:
                 self._raise_distributed_failure(
@@ -3471,7 +3496,7 @@ class MLXTrainer:
                                 save_trainable_adapters(model, f"{args.output_dir}/best")
                             except ValueError as e:
                                 print(f"  Unsloth: skipped best-model save ({e})")
-                            except Exception as e:
+                            except BaseException as e:
                                 best_save_error = e
                         self._raise_distributed_failure(
                             best_save_error is not None,
@@ -3535,7 +3560,7 @@ class MLXTrainer:
                                     args.output_dir,
                                     args.save_total_limit,
                                 )
-                    except Exception as e:
+                    except BaseException as e:
                         checkpoint_error = e
                 self._raise_distributed_failure(
                     checkpoint_error is not None,
@@ -3562,6 +3587,7 @@ class MLXTrainer:
         )
 
         # load_best_model_at_end: restore best adapters before the final save.
+        restore_abort = None
         if getattr(args, "load_best_model_at_end", False) and self._best_step is not None:
             _best_path = f"{args.output_dir}/best/adapters.safetensors"
             if os.path.exists(_best_path):
@@ -3573,6 +3599,16 @@ class MLXTrainer:
                     )
                 except Exception as e:
                     _main_print(f"Unsloth: failed to restore best model ({e}).")
+                except BaseException as e:
+                    # Ordinary restore failures stay log-and-continue, but an
+                    # interrupt must reach the consensus below before the
+                    # diagnostics collective, or peers hang in it.
+                    restore_abort = e
+        self._raise_distributed_failure(
+            restore_abort is not None,
+            "best-model restore",
+            restore_abort,
+        )
 
         distributed_diagnostics = self._distributed_training_diagnostics(
             total_time=total_time,
@@ -3589,7 +3625,7 @@ class MLXTrainer:
                 self.save_model()
             except ValueError as e:
                 _main_print(f"Unsloth: skipped final save ({e})")
-            except Exception as e:
+            except BaseException as e:
                 final_save_error = e
             else:
                 _main_print(f"Unsloth: Saved final adapters to {args.output_dir}")
