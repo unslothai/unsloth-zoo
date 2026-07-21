@@ -77,8 +77,8 @@ def _seed_bundle(root):
             }
         )
     )
-    # A trusted bundle is owner-only; the tool writes 0600 and the reader
-    # rejects group/other-writable files (umask 0002 would otherwise seed 0664).
+    # Trusted bundles are owner-only: mirror the tool's 0600 so the reader
+    # accepts them (umask 0002 would otherwise seed 0664).
     if os.name == "posix":
         (key_dir / bundle_name).chmod(0o600)
         (key_dir / "manifest.json").chmod(0o600)
@@ -331,7 +331,7 @@ def test_megacache_rejects_cache_below_foreign_owned_sticky_parent(monkeypatch, 
     parent.chmod(0o1777)
 
     # Sticky bit is not enough: the parent's owner can rename our leaf, so a
-    # foreign-owned sticky parent must be rejected.
+    # foreign-owned sticky parent is rejected.
     real_lstat = module.os.lstat
 
     def foreign_owner(path, *args, **kwargs):
@@ -372,8 +372,8 @@ def test_megacache_refuses_a_fifo_bundle_without_blocking(tmp_path):
     fifo = tmp_path / "bundle.fifo"
     os.mkfifo(fifo)
     os.chmod(fifo, 0o600)
-    # A non-regular file is refused; O_NONBLOCK keeps the open from hanging on
-    # a FIFO with no writer so the S_ISREG check can reject it.
+    # O_NONBLOCK keeps the open from hanging on a writerless FIFO so the
+    # S_ISREG check can refuse this non-regular file.
     assert module._read_trusted_file(fifo, binary = True) is None
 
 

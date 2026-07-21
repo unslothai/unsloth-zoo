@@ -68,8 +68,8 @@ _FORMAT_VERSION = 1
 _BUNDLE_NAME = "megacache.bin"
 _MANIFEST_NAME = "manifest.json"
 
-# Process-level state: one fingerprint accumulates all models loaded in this
-# process (multiple unsloth_compile_transformers calls extend the key).
+# One fingerprint accumulates every model loaded in this process; each
+# unsloth_compile_transformers call extends the key.
 _STATE = {
     "armed": False,
     "loaded_key": None,
@@ -86,8 +86,8 @@ pass
 
 
 def megacache_is_enabled():
-    # Mega-cache bundles are executable/deserialized torch.compile artifacts,
-    # not passive data. Require an explicit opt-in before loading them.
+    # Bundles are executable/deserialized torch.compile artifacts, not passive
+    # data: require an explicit opt-in before loading them.
     return os.environ.get("UNSLOTH_MEGA_CACHE", "0").strip().lower() in (
         "1", "on", "true", "yes",
     )
@@ -130,8 +130,8 @@ def _is_trusted_directory(path, *, allow_missing = True):
                 return allow_missing
             return stat.S_ISDIR(directory_stat.st_mode)
 
-        # Validate the full path, not only its leaf. A 0700 cache below a
-        # non-sticky group/world-writable parent can be renamed and replaced
+        # Validate the whole path, not just the leaf: a 0700 cache under a
+        # non-sticky group/world-writable parent can be renamed and swapped
         # between this check and open(), defeating the leaf permission check.
         target = os.path.abspath(os.fspath(path))
         current = target
@@ -146,9 +146,9 @@ def _is_trusted_directory(path, *, allow_missing = True):
                     if directory_stat.st_uid != os.geteuid():
                         return False
                 writable_by_others = directory_stat.st_mode & 0o022
-                # A sticky dir's OWNER can still rename its entries, so only
-                # trust the exception for root- or self-owned parents (/tmp),
-                # never an attacker-owned sticky directory.
+                # A sticky dir's owner can still rename its entries, so trust
+                # the sticky exception only for root- or self-owned parents
+                # (/tmp), never an attacker-owned sticky directory.
                 sticky_trusted = (directory_stat.st_mode & stat.S_ISVTX) and (
                     directory_stat.st_uid in (0, os.geteuid())
                 )
@@ -231,8 +231,8 @@ def _environment_fingerprint():
         fingerprint["torch"] = str(torch.__version__)
         fingerprint["cuda"] = str(torch.version.cuda)
         if torch.cuda.is_available():
-            # The bound device, not device 0: mixed-architecture hosts must
-            # not save one GPU's kernels under another's key.
+            # The bound device, not device 0: mixed-arch hosts must not save
+            # one GPU's kernels under another's key.
             device = torch.cuda.current_device()
             fingerprint["gpu_name"] = torch.cuda.get_device_name(device)
             capability = torch.cuda.get_device_capability(device)
@@ -310,7 +310,7 @@ def _read_trusted_file(path, *, binary = False):
         except OSError:
             return None
     # O_NOFOLLOW rejects a symlinked file; O_NONBLOCK stops a stray FIFO/device
-    # at this path from blocking the open so the S_ISREG check below can reject it.
+    # here from blocking the open so the S_ISREG check below can reject it.
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags)
@@ -370,8 +370,8 @@ def _merge_recorded_artifacts(data):
         merged = 0
         for artifact_type, items in artifacts.items():
             for artifact in items:
-                # Value-equality dedup: artifacts this run re-recorded on its
-                # own hits are already present and are skipped.
+                # Skip artifacts already present from this run's own hits
+                # (value-equality dedup).
                 if artifact in CacheArtifactManager._seen_artifacts:
                     continue
                 CacheArtifactManager._new_cache_artifacts[artifact_type].append(artifact)
@@ -411,17 +411,17 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
 
     _STATE["armed"] = True
     _STATE["loaded_key"] = key
-    # A hit for an earlier cumulative key does not cover this one: reset so a
+    # A hit on an earlier cumulative key does not cover this one: reset so a
     # miss here still saves the extended bundle at exit.
     _STATE["hit"] = False
     if not _STATE["atexit_registered"]:
         atexit.register(megacache_save)
         _STATE["atexit_registered"] = True
 
-    # Missing paths are safe to create later, but never safe to read from.
-    # Revalidate both directories as existing immediately before opening the
-    # manifest so an attacker cannot win a create-after-check race under a
-    # sticky shared parent such as /tmp.
+    # Missing paths are safe to create later but never safe to read from.
+    # Revalidate both dirs as existing right before opening the manifest so an
+    # attacker cannot win a create-after-check race under a sticky shared
+    # parent such as /tmp.
     root = os.path.dirname(directory)
     if not (
         _is_trusted_directory(root, allow_missing = False)
@@ -461,9 +461,8 @@ def megacache_save():
     """
     if not (_STATE["armed"] and megacache_is_enabled() and _mega_cache_supported()):
         return False
-    # Distributed launches: one writer per NODE (cache roots default to
-    # node-local disks), guarded against shared roots by the pid-unique
-    # temp + atomic replace below.
+    # One writer per NODE (cache roots default to node-local disks); shared
+    # roots are guarded by the pid-unique temp + atomic replace below.
     if os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")) != "0":
         return False
     key = _STATE["loaded_key"]
@@ -475,17 +474,17 @@ def megacache_save():
         if manifest_path is None:
             return False
         root = os.path.dirname(directory)
-        # Establish owned private directories before reading or deserializing
-        # any prior bundle. This closes the analogous race on the save path.
+        # Establish owned private dirs before reading/deserializing any prior
+        # bundle; closes the analogous race on the save path.
         if not (
             _ensure_private_directory(root)
             and _ensure_private_directory(directory)
         ):
             _log("cache directory is not trusted; skipping save")
             return False
-        # Union semantics: fold the current on-disk bundle back into the
-        # manager before serializing, so a run that exercised only part of a
-        # warm bundle cannot narrow it (see _merge_recorded_artifacts).
+        # Fold the on-disk bundle back into the manager before serializing so a
+        # run that exercised only part of a warm bundle cannot narrow it (union
+        # semantics; see _merge_recorded_artifacts).
         _, existing = _read_disk_bundle(directory, manifest_path)
         if existing is not None:
             _merge_recorded_artifacts(existing)
@@ -495,22 +494,22 @@ def megacache_save():
             return False
         data = result[0]
         new_sha = hashlib.sha256(data).hexdigest()
-        # Skip rewriting a byte-identical bundle so a no-op run does not churn
-        # the cache (and its mtime) on every process exit.
+        # Skip rewriting a byte-identical bundle so a no-op run doesn't churn
+        # the cache (and its mtime) every exit.
         if existing is not None and hashlib.sha256(existing).hexdigest() == new_sha:
             _log("bundle unchanged; skipping save")
             return False
-        # The bundle file is content-addressed and the manifest names it, so
-        # the (bundle, manifest) pair is consistent without a cross-file lock:
-        # concurrent writers produce differently named bundles, the manifest
-        # replace is atomic, and whichever manifest lands last points at its
-        # own complete file. Same name always implies same bytes.
+        # The bundle is content-addressed and the manifest names it, so the
+        # pair is consistent without a cross-file lock: concurrent writers
+        # produce differently named bundles, the manifest replace is atomic, and
+        # the last manifest to land points at its own complete file. Same name
+        # always implies same bytes.
         bundle_name = f"megacache-{new_sha[:16]}.bin"
         bundle_path = os.path.join(directory, bundle_name)
-        # Content-addressing means a trusted file with this name already holds
-        # these bytes. But a leftover from an older writer could be group-
+        # Content-addressing means a trusted file of this name already holds
+        # these bytes, but a leftover from an older writer could be group-
         # writable; skipping the write would leave the manifest pointing at an
-        # untrusted bundle that every load then rejects. (Re)write unless the
+        # untrusted bundle that every load rejects. (Re)write unless the
         # existing file already passes the trusted-file checks.
         if _read_trusted_file(bundle_path, binary = True) is None:
             temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
@@ -538,9 +537,8 @@ def megacache_save():
         os.replace(temporary_manifest, manifest_path)
         _log(f"saved bundle for key {key} ({len(data)} bytes)")
         # Best-effort GC of superseded bundle files (including the legacy
-        # fixed-name bundle). A concurrent reader that already opened one
-        # keeps its file handle; a reader that comes later re-reads the
-        # manifest and finds the new name.
+        # fixed-name one). A reader that already opened one keeps its handle;
+        # a later reader re-reads the manifest and finds the new name.
         try:
             for name in os.listdir(directory):
                 is_stale_bundle = (
