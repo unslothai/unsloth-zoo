@@ -825,6 +825,575 @@ def make_cce_loss_fn(model):
     return loss_fn
 
 
+# ============================================================================
+# ORPO (Odds Ratio Preference Optimization) — text models.
+# Mirrors TRL/CUDA's concatenated-forward: chosen and rejected are stacked into
+# one batch (chosen block then rejected block) and run through a single forward,
+# then split. Loss follows the ORPO paper: L = L_SFT + beta * L_OR, where
+# L_OR = -log(sigmoid(log_odds_chosen - log_odds_rejected)) and the odds use the
+# full p/(1-p) form (not a simplified log-prob ratio). Built on this module's
+# own length-mask convention (see make_baseline_loss_fn), not ported from TRL
+# (no TRL on MLX) or copied from third-party MLX projects.
+# ============================================================================
+def _orpo_odds_ratio_loss(logp_c, logp_r):
+    """ORPO odds-ratio term L_OR, computed in float32 for numerical stability.
+
+    Returns -mean(log_sigmoid(log_odds_chosen - log_odds_rejected)) where the
+    per-side odds are p/(1-p), i.e. log(1-p) = log(-expm1(logp)). The inputs are
+    upcast to float32 before the log(1-p) step, mirroring TRL's
+    ORPOTrainer.odds_ratio_loss (policy_chosen_logps.float() /
+    policy_rejected_logps.float()). This is required, not merely defensive: in
+    float16 the 1e-12 floor underflows to 0.0 (float16's smallest positive
+    subnormal is ~5.96e-8), so on any perfectly-predicted response row
+    (logp -> 0, e.g. an empty response span where response_start == seq_end)
+    -expm1(logp) is 0.0, mx.maximum(0.0, 0.0) stays 0.0, and mx.log(0.0) = -inf,
+    producing NaN gradients. In float32 the floor is representable and the term
+    stays finite. See ORPO (arXiv:2403.07691) and TRL issue #1473 (ORPO NaN).
+    """
+    logp_c = logp_c.astype(mx.float32)
+    logp_r = logp_r.astype(mx.float32)
+    floor = mx.array(1e-12, mx.float32)
+    val_c = mx.maximum(-mx.expm1(logp_c), floor)
+    val_r = mx.maximum(-mx.expm1(logp_r), floor)
+    log_odds = (logp_c - mx.log(val_c)) - (logp_r - mx.log(val_r))
+    return -mx.mean(nn.log_sigmoid(log_odds))
+
+
+def make_orpo_loss_fn(beta=0.1):
+    """Create an ORPO loss function over a concatenated [chosen; rejected] batch.
+
+    Signature matches make_baseline_loss_fn: (model, batch, lengths, labels=None)
+    -> (loss, ntoks), so it drops into the trainer's text step path unchanged.
+
+    Expects ``batch`` shape (2B, L) where rows [0:B] are chosen and rows [B:2B]
+    are rejected, paired by index (produced by ``create_preference_batches``).
+    ``lengths`` is (2B, 2) with per-row [response_start, seq_end). The odds-ratio
+    term scores response tokens only; the SFT/NLL term (TRL chosen_nll_loss) is
+    computed over the full prompt+response span (all non-pad chosen tokens).
+    """
+    def loss_fn(model, batch, lengths, labels=None):
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        logits = model(inputs)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        ce_tok = nn.losses.cross_entropy(logits, targets)
+        mask = mx.logical_and(
+            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
+        ).astype(mx.float32)
+        logp_tok = -ce_tok * mask
+        ntok_row = mask.sum(axis=1)
+        logp = logp_tok.sum(axis=1) / mx.maximum(ntok_row, mx.array(1.0))
+        B = batch.shape[0] // 2
+        logp_c, logp_r = logp[:B], logp[B:]
+        # SFT term: TRL chosen_nll_loss. Pooled token-mean cross-entropy over the
+        # full prompt+response span (all non-pad chosen tokens), matching TRL's
+        # nn.CrossEntropyLoss default reduction. This is NOT the response-only,
+        # length-normalized logp used for the odds-ratio term below.
+        nll_mask = (steps < lengths[:, 1:]).astype(mx.float32)[:B]
+        sft = (ce_tok[:B] * nll_mask).sum() / mx.maximum(nll_mask.sum(), mx.array(1.0))
+        # Odds-ratio term. log(p/(1-p)) per side; computed in float32 (see
+        # _orpo_odds_ratio_loss) so the 1-exp(logp) floor does not underflow in
+        # float16 and drive log(0) = -inf / NaN gradients. Cast back to the SFT
+        # (model) dtype so the combined loss dtype is unchanged.
+        or_loss = _orpo_odds_ratio_loss(logp_c, logp_r)
+        loss = sft + beta * or_loss.astype(sft.dtype)
+        # Return the PAIR count, not the response-token count. This is a
+        # preference loss reduced as a mean over pairs (the odds-ratio term),
+        # so the trainer's accumulate-then-normalize machinery must weight each
+        # microbatch by its pair count. Weighting by tokens would make
+        # long-completion microbatches dominate and break equivalence with a
+        # single batch of the same pairs under gradient_accumulation_steps > 1.
+        return loss, mx.array(B, dtype=mx.int32)
+    return loss_fn
+
+
+def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False,
+                     neftune_mods=None):
+    """Create a DPO (Direct Preference Optimization) loss function.
+
+    Operates on a concatenated [chosen; rejected] batch (same layout as
+    make_orpo_loss_fn / create_preference_batches): rows [0:B] chosen,
+    [B:2B] rejected. Signature matches the other loss fns:
+    (model, batch, lengths, labels=None) -> (loss, ntoks).
+
+    DPO compares the policy's per-response log-probs against a frozen
+    reference. For LoRA models the reference is the base model: obtained by
+    temporarily zeroing the LoRA scales (adapters off), running the reference
+    forward under stop_gradient, then restoring the scales in a finally block.
+    Mirrors TRL's disable-adapter approach (no second model copy). With
+    reference_free=True the reference term is dropped, matching TRL.
+
+    ``lora_mods`` is the list of LoRALinear modules to toggle; collected once
+    by the trainer at setup.
+
+    ``neftune_mods`` is the list of NEFTune-wrapped embedding modules (empty
+    unless ``neftune_noise_alpha > 0``). NEFTune adds fresh random noise to the
+    input embeddings whenever the module is training, and the DPO loop keeps the
+    model in train() for both forwards. Left alone, the reference (adapters-off)
+    forward would compare the policy against a SECOND noisy base-model pass, so
+    the DPO reward would carry random NEFTune noise. To keep the reference clean
+    (matching TRL, whose frozen reference logps are computed without NEFTune),
+    the reference pass temporarily disables the noise on these modules and
+    restores it in a finally block, so only the policy forward is augmented.
+    """
+    _mods = list(lora_mods) if lora_mods is not None else []
+    _neftune = list(neftune_mods) if neftune_mods is not None else []
+    if not _mods and not reference_free:
+        raise ValueError(
+            "Unsloth: DPO with a reference model is not yet supported for full "
+            "fine-tuning on MLX — the reference is obtained by disabling LoRA "
+            "adapters, but this model has none. Use a LoRA/PEFT model, or pass "
+            "reference_free=True to train without a reference (TRL-style "
+            "reference-free DPO)."
+        )
+
+    def _row_logp_and_mask(model, batch, lengths):
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        logits = model(inputs)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = mx.logical_and(
+            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
+        ).astype(mx.float32)
+        logp_tok = -nn.losses.cross_entropy(logits, targets) * mask
+        return logp_tok.sum(axis=1), mask.sum()
+
+    def loss_fn(model, batch, lengths, labels=None):
+        B = batch.shape[0] // 2
+        pol, _ = _row_logp_and_mask(model, batch, lengths)
+        pol_c, pol_r = pol[:B], pol[B:]
+
+        if reference_free or not _mods:
+            ref_c = mx.zeros(pol_c.shape)
+            ref_r = mx.zeros(pol_r.shape)
+        else:
+            saved = [md.scale for md in _mods]
+            # Also silence NEFTune for the reference forward: the model stays in
+            # train() so the wrapped embedding would otherwise inject fresh random
+            # noise, making the "frozen" reference logps noisy and corrupting
+            # log(pi_policy / pi_ref). Disabling the noise flag (default True)
+            # yields a clean reference while the policy forward above keeps its
+            # NEFTune augmentation. Restored in finally alongside the LoRA scales.
+            neft_saved = [
+                getattr(m, "_neftune_noise_enabled", True) for m in _neftune
+            ]
+            try:
+                for md in _mods:
+                    md.scale = 0.0
+                for m in _neftune:
+                    m._neftune_noise_enabled = False
+                ref, _ = _row_logp_and_mask(model, batch, lengths)
+                ref = mx.stop_gradient(ref)
+            finally:
+                for md, s in zip(_mods, saved):
+                    md.scale = s
+                for m, s in zip(_neftune, neft_saved):
+                    m._neftune_noise_enabled = s
+            ref_c, ref_r = ref[:B], ref[B:]
+
+        logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
+        loss = -mx.mean(nn.log_sigmoid(logits))
+        # Return the PAIR count, not the response-token count. DPO is a mean
+        # over preference pairs, so the trainer must weight each microbatch by
+        # its pair count when accumulating; token weighting would let
+        # long-completion microbatches dominate and break equivalence with a
+        # single batch of the same pairs under gradient_accumulation_steps > 1.
+        return loss, mx.array(B, dtype=mx.int32)
+    return loss_fn
+
+
+def _hf_encoding_tokenizer(tokenizer):
+    """Return the Hugging Face tokenizer used for text encoding.
+
+    mlx-lm's ``TokenizerWrapper`` stores the HF tokenizer under ``_tokenizer``,
+    so unwrapping it exposes ``eos_token_id`` and a list-returning ``encode``.
+    HF fast tokenizers ALSO expose ``_tokenizer``, but there it is the
+    low-level Rust ``tokenizers.Tokenizer`` (no ``eos_token_id``; ``encode``
+    returns ``Encoding`` objects). Only unwrap when the object is not already
+    an HF tokenizer, mirroring ``_get_processor_tokenizer`` /
+    ``_resolve_response_mask_tokenizer``.
+    """
+    try:
+        from transformers import PreTrainedTokenizerBase
+        if isinstance(tokenizer, PreTrainedTokenizerBase):
+            return tokenizer
+    except Exception:
+        pass
+    return getattr(tokenizer, "_tokenizer", tokenizer)
+
+
+def _common_prefix_len(*seqs):
+    """Length of the longest shared leading prefix across all sequences.
+
+    Locates the prompt/completion boundary for a preference pair from the
+    standalone-prompt ids (``p_ids``) and the two concatenated prompt+completion
+    encodings (``c_full``, ``r_full``). It is correct whether or not the
+    tokenizer appends an end-of-sequence special token during ``encode``:
+
+    * With ``add_eos_token=True`` (e.g. a LLaMA tokenizer loaded that way), the
+      standalone prompt carries a trailing prompt-only EOS that is NOT present at
+      the prompt/completion seam inside ``encode(prompt + completion)``. A plain
+      ``min(len(...))`` boundary would then overcount the prompt by that EOS and
+      mask out (or, for a one-token completion, score only) the first completion
+      token. Walking the shared prefix stops at the first divergent id (the
+      prompt EOS vs. the first completion token), giving the true boundary.
+    * In the normal case (no prompt EOS) the standalone prompt IS a true prefix
+      of both completions, so this returns ``len(p_ids)`` -- identical to the old
+      ``min(len(...))`` and a no-op. It is also strictly more correct when the
+      concatenated tokenization merges the boundary token: the shared prefix is
+      then shorter than ``len(p_ids)``, so both rows keep a single, real
+      ``response_start`` (``c_full[:pe] == r_full[:pe]`` holds by construction).
+    """
+    if not seqs:
+        return 0
+    limit = min(len(s) for s in seqs)
+    first = seqs[0]
+    i = 0
+    while i < limit and all(s[i] == first[i] for s in seqs[1:]):
+        i += 1
+    return i
+
+
+def _is_conversational_messages(value):
+    """True if value is a non-empty list of {"role","content"} message dicts."""
+    return (
+        isinstance(value, list) and len(value) > 0
+        and isinstance(value[0], dict)
+        and "role" in value[0] and "content" in value[0]
+    )
+
+
+def _render_preference_example(tokenizer, prompt, chosen, rejected,
+                               tools=None, chat_template_kwargs=None):
+    """Return (prompt_str, prompt_chosen_str, prompt_rejected_str) for one
+    preference row, rendering conversational (message-list) rows through the
+    tokenizer chat template.
+
+    TRL's DPO/ORPO natively accept BOTH the standard (string) and the
+    conversational (message-list) preference formats: their dataset pipeline
+    runs maybe_apply_chat_template, which for a conversational row applies
+    apply_chat_template (trl/data_utils.py) to render the prompt, prompt+chosen
+    and prompt+rejected as strings (add_generation_prompt when the last prompt
+    role is 'user', continue_final_message when it is 'assistant'), and is a
+    no-op on string rows. Without this, string-concatenating message LISTS
+    (``prompt + chosen``) and calling encode_mlx_text on them raises -- encode
+    does ``text.startswith(bos_token)`` (lists have no ``.startswith``) and then
+    ``tokenizer.encode`` on a list of dicts -- so the very common conversational
+    preference datasets crash before any training. Mirror TRL and the SFT chat
+    render path here so both formats train; the downstream boundary split then
+    operates on the rendered strings exactly as it does for pre-rendered string
+    prompts. Plain string rows fall through unchanged (byte-identical to the
+    prior concat).
+
+    ``tools`` / ``chat_template_kwargs`` are the per-row function-calling schema
+    and extra template kwargs. TRL's apply_chat_template threads them into EVERY
+    render of a preference row (prompt, prompt+chosen, prompt+rejected --
+    trl/data_utils.py: tools=tools, **example.get("chat_template_kwargs", {})),
+    and this codebase's SFT conversational path threads the same per-row fields
+    (_tokenize_mlx_conversational_prompt_completion / the assistant-mask row:
+    tools=item.get("tools"), **item.get("chat_template_kwargs", {})). Dropping
+    them here would (a) render a tool/function-calling template WITHOUT its tool
+    schema (raising inside templates that reference ``tools``, or omitting the
+    tool block), and (b) ignore a per-row chat_template_kwargs knob (e.g. Qwen3
+    ``enable_thinking``), so ORPO/DPO would train on DIFFERENT text than the SFT
+    path and TRL for the identical row. Thread them into all three renders to
+    match. Only affects the conversational branch; plain string rows ignore them
+    (TRL's maybe_apply_chat_template is a no-op on non-conversational rows).
+    """
+    if _is_conversational_messages(prompt):
+        last_role = prompt[-1].get("role")
+        if last_role == "user":
+            add_gen, cont = True, False
+        elif last_role == "assistant":
+            add_gen, cont = False, True
+        else:
+            raise ValueError(
+                "Unsloth MLX preference: conversational chat prompt has invalid "
+                f"last-message role {last_role!r}; expected 'user' or 'assistant'."
+            )
+        # Only inject tools / chat_template_kwargs when the row actually carries
+        # them, so rows WITHOUT these fields render byte-identically to before
+        # (and tokenizers whose apply_chat_template omits a tools= parameter keep
+        # working). A real HF tokenizer defaults tools=None, so this is equivalent
+        # to TRL's unconditional tools=tools for the no-tools case.
+        extra_kwargs = dict(chat_template_kwargs or {})
+        if tools is not None:
+            extra_kwargs["tools"] = tools
+        prompt_str = tokenizer.apply_chat_template(
+            prompt, tokenize=False,
+            add_generation_prompt=add_gen, continue_final_message=cont,
+            **extra_kwargs,
+        )
+        prompt_chosen_str = tokenizer.apply_chat_template(
+            list(prompt) + list(chosen), tokenize=False,
+            **extra_kwargs,
+        )
+        prompt_rejected_str = tokenizer.apply_chat_template(
+            list(prompt) + list(rejected), tokenize=False,
+            **extra_kwargs,
+        )
+        return prompt_str, prompt_chosen_str, prompt_rejected_str
+    # Standard string preference row (or a prompt already rendered to a chat
+    # string): concatenate, matching the prior behavior exactly. tools /
+    # chat_template_kwargs do not apply to non-conversational rows (TRL's
+    # maybe_apply_chat_template is a no-op on them).
+    return prompt, prompt + chosen, prompt + rejected
+
+
+def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
+                        prompt_key="prompt", chosen_key="chosen",
+                        rejected_key="rejected", pad_to_multiple=32,
+                        num_batches=None, dataset_order="default",
+                        preserve_dataset_order=False, seed=None,
+                        append_eos=True, num_epochs=None):
+    """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
+
+    Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
+    Pairs are grouped into batches of ``batch_size`` PAIRS, and every row in a
+    batch is padded to that batch's max length, rounded up to
+    ``pad_to_multiple`` (Apple-Silicon padding).
+
+    ``dataset_order`` controls how pairs are ordered before batching (mirrors
+    the SFT/VLM builders so preference runs can match CUDA/TRL parity):
+      "default"       length-sort by ``max(len(chosen), len(rejected))`` — least
+                      padding / best throughput; the historical behavior.
+      "sequential"    keep dataset order — matches CUDA ``SequentialSampler``.
+      "torch_randperm" seeded permutation — matches CUDA ``RandomSampler``.
+    ``preserve_dataset_order=True`` forces "sequential" (Studio wiring).
+    ``seed`` seeds the "torch_randperm" order.
+
+    ``num_epochs`` is set by epoch-based runs (max_steps<=0, num_train_epochs>0)
+    that leave ``num_batches`` None. For "torch_randperm" it materializes one
+    reseeded (``base_seed + epoch``) permutation PER EPOCH so the trainer's
+    modulo-cycled loop (``batches[i % len]``) sees a fresh order each epoch --
+    matching the SFT ``create_ordered_batches`` per-epoch reseed and the CUDA
+    ``RandomSampler`` -- instead of replaying one permutation every epoch. Epoch
+    0 uses ``base_seed``, byte-identical to the single-pass order. "default"
+    (length-sort) and "sequential" need no expansion: both modulo-cycle one pass
+    exactly like their SFT counterparts (create_batches / SequentialSampler).
+
+    ``append_eos`` (default True, matching TRL) appends the tokenizer's EOS id
+    to each chosen/rejected completion, guarded to avoid a double EOS (mirrors
+    TRL's ``add_eos_token_if_needed``). EOS is appended before truncation to
+    ``max_seq_length``. Because EOS lands after the prompt boundary it falls
+    inside the ``[response_start, seq_end)`` loss span, so it is trained on — as
+    in TRL.
+
+    Rows longer than ``max_seq_length`` are truncated PROMPT-FIRST (keeping the
+    END of the prompt, TRL's default ``truncation_mode="keep_end"``) so the
+    completion is preserved; a plain right-truncation would drop the response
+    tail on a long prompt and leave an empty ``[response_start, seq_end)`` span
+    with no preference signal. Both rows in a pair share the same truncated
+    prompt prefix, so they keep a single ``response_start``.
+
+    Returns a list of ``(batch, lengths, None)`` tuples:
+      batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
+      lengths: (2B, 2) — per row [response_start, seq_end)
+    """
+    order_mode = "sequential" if preserve_dataset_order else dataset_order
+    if order_mode not in ("default", "sequential", "torch_randperm"):
+        raise ValueError(
+            f"Unsloth MLX: unsupported preference dataset_order={order_mode!r}. "
+            "Expected 'default', 'sequential', or 'torch_randperm'."
+        )
+    hf = _hf_encoding_tokenizer(tokenizer)
+    eos_id = hf.eos_token_id
+    pad_id = eos_id if eos_id is not None else 0
+
+    def _with_eos(ids):
+        # TRL appends EOS to the completion, avoiding a double EOS
+        # (add_eos_token_if_needed). Append before max_seq_length truncation,
+        # matching the SFT path's append-then-truncate contract.
+        if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
+            ids = ids + [eos_id]
+        return ids
+
+    def _truncate_preference_pair(p_ids, c_full, r_full):
+        # Fit the concatenated prompt+completion rows into max_seq_length while
+        # PRESERVING the completion, mirroring TRL's ORPO/DPO tokenize_row
+        # (truncate the prompt first, then the response only if still too long).
+        # A plain right-truncation (``ids[:max_seq_length]``) drops the response
+        # tail whenever the prompt is long, so a legitimate long-prompt row would
+        # collapse to prompt-only tokens and the [response_start, seq_end) span
+        # would be empty -> no ORPO/DPO preference signal for that pair.
+        #
+        # ``p_len`` is the shared prompt boundary: the longest prefix common to
+        # the standalone prompt and both concatenated prompt+completion rows. A
+        # plain min(len(...)) breaks when the tokenizer appends EOS during encode
+        # (add_eos_token=True): p_ids then ends with a prompt-only EOS absent at
+        # the prompt/completion seam, so min(len) lands one token past the true
+        # boundary and masks out the first completion token. The common prefix
+        # stops at that EOS-vs-first-completion divergence (and also at any
+        # merged boundary token), so it is correct with or without a prompt EOS.
+        p_len = _common_prefix_len(p_ids, c_full, r_full)
+        resp_c = c_full[p_len:]
+        resp_r = r_full[p_len:]
+        longer_resp = max(len(resp_c), len(resp_r))
+        if p_len + longer_resp <= max_seq_length:
+            # Whole pair already fits; both rows are unchanged. This is identical
+            # to the previous append-then-right-truncate result for such rows.
+            return p_len, c_full[:max_seq_length], r_full[:max_seq_length]
+        # Reserve room for the (longer) response, then keep the END of the prompt
+        # (TRL's default truncation_mode="keep_end"). Both rows share the same
+        # prompt prefix, so they keep a single response_start. If the response
+        # alone exceeds the budget, the prompt is dropped and the response is
+        # right-truncated (still leaving a non-empty response span with signal).
+        keep_prompt = max(0, max_seq_length - longer_resp)
+        prompt_prefix = c_full[:p_len]  # == r_full[:p_len]
+        prompt_kept = prompt_prefix[p_len - keep_prompt:]
+        c_ids = (prompt_kept + resp_c)[:max_seq_length]
+        r_ids = (prompt_kept + resp_r)[:max_seq_length]
+        pe = min(keep_prompt, len(c_ids), len(r_ids))
+        return pe, c_ids, r_ids
+
+    rows = []
+    for ex in dataset:
+        if prompt_key not in ex or chosen_key not in ex or rejected_key not in ex:
+            raise ValueError(
+                f"ORPO requires '{prompt_key}', '{chosen_key}', '{rejected_key}' "
+                f"columns; got {sorted(ex.keys())}."
+            )
+        prompt = ex[prompt_key]
+        # Per-row function-calling schema / extra chat-template kwargs, threaded
+        # into the conversational render below exactly as the SFT path and TRL's
+        # apply_chat_template do (tools=item.get("tools"),
+        # **item.get("chat_template_kwargs", {})). No-op for plain string rows.
+        _ex_tools = ex.get("tools") if isinstance(ex, Mapping) else None
+        _ex_template_kwargs = (
+            ex.get("chat_template_kwargs") if isinstance(ex, Mapping) else None
+        )
+        # Conversational (message-list) prompt/chosen/rejected are rendered
+        # through the chat template first (TRL maybe_apply_chat_template parity);
+        # standard string rows pass through unchanged. This yields the prompt
+        # string and the two prompt+completion strings the encodes below expect.
+        prompt, chosen_full_text, rejected_full_text = _render_preference_example(
+            tokenizer, prompt, ex[chosen_key], ex[rejected_key],
+            tools=_ex_tools, chat_template_kwargs=_ex_template_kwargs,
+        )
+        # Use the shared text encoder (same as the SFT path) so a prompt that
+        # was already rendered with the chat template's leading BOS does not get
+        # a second BOS from encode()'s default add_special_tokens=True. Raw
+        # hf.encode here would train ORPO/DPO on duplicated special tokens and
+        # diverge from the rest of the MLX trainer for identical rendered text.
+        p_ids = encode_mlx_text(hf, prompt)
+        c_full = _with_eos(encode_mlx_text(hf, chosen_full_text))
+        r_full = _with_eos(encode_mlx_text(hf, rejected_full_text))
+        pe, c_ids, r_ids = _truncate_preference_pair(p_ids, c_full, r_full)
+        rows.append((pe, c_ids, r_ids))
+
+    # rows are collected in dataset order above; reorder per the requested mode.
+    if order_mode == "default":
+        rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
+    # "sequential": leave rows in dataset order (CUDA SequentialSampler parity).
+    # "torch_randperm" permutes the ROWS per pass below (RandomSampler parity),
+    # so it is intentionally NOT pre-permuted here.
+
+    # Group rows into fixed-size batch chunks, then RESHUFFLE the pass order on
+    # every epoch and take the first num_batches, mirroring the text/SFT path
+    # (mlx_lm.iterate_batches with loop=True draws a fresh permutation per pass;
+    # see create_batches, loop=(num_batches is not None)) and the text
+    # create_ordered_batches (which reseeds its order per epoch). Two problems
+    # this fixes:
+    #   1) A single length-sorted pass puts the shortest pairs first, so a
+    #      step-limited (max_steps>0) run whose num_batches is SMALLER than one
+    #      pass would train ORPO/DPO only on the shortest prompts/completions and
+    #      silently ignore the rest.
+    #   2) When num_batches (= max_steps * grad_accum) spans MORE than one pass,
+    #      the trainer modulo-cycles the returned list (batches[batch_idx % len]).
+    #      Materializing a single fixed pass would then repeat the SAME order
+    #      every epoch, biasing small-dataset / long-max_steps runs toward one
+    #      deterministic pass order (whereas SFT, via iterate_batches loop=True,
+    #      reshuffles each epoch). Emitting a fresh order per pass up to
+    #      num_batches makes each cycled epoch distinct, matching the SFT/TRL
+    #      per-epoch reshuffle.
+    # The DEFAULT (length-sort) mode reshuffles the BATCH order from ONE seeded
+    # numpy RandomState so the DEFAULT path stays torch-free (MLX/Apple Silicon
+    # installs have no torch). The opt-in "torch_randperm" mode instead redraws a
+    # fresh seeded ROW permutation per pass (base_seed + epoch), exactly like the
+    # text path's create_ordered_batches, so a modulo-cycled multi-pass run does
+    # not replay the same "random" order every epoch (CUDA RandomSampler parity).
+    # Both keep a single sub-epoch selection byte-identical to the prior
+    # single-pass materialization: pass 0 uses base_seed (the first permutation),
+    # first num_batches. "sequential" carries the user's intended fixed order
+    # (SequentialSampler parity), so it is left single-pass.
+    base_starts = list(range(0, len(rows), batch_size))
+    if order_mode == "default" and num_batches is not None and base_starts:
+        rng = np.random.RandomState(_normalize_seed(seed))
+        ordered_starts = []
+        while len(ordered_starts) < num_batches:
+            perm = rng.permutation(len(base_starts))
+            ordered_starts.extend(base_starts[int(i)] for i in perm)
+        chunks = [rows[s:s + batch_size] for s in ordered_starts[:num_batches]]
+    elif order_mode == "torch_randperm" and num_batches is not None and rows:
+        base_seed = _normalize_seed(seed)
+        chunks = []
+        epoch = 0
+        while len(chunks) < num_batches:
+            order = _torch_randperm_order(len(rows), base_seed + epoch)
+            rows_epoch = [rows[i] for i in order]
+            chunks.extend(
+                rows_epoch[j:j + batch_size]
+                for j in range(0, len(rows_epoch), batch_size)
+            )
+            epoch += 1
+        chunks = chunks[:num_batches]
+    elif order_mode == "torch_randperm" and num_epochs is not None and rows:
+        # Epoch-based run (num_batches is None): materialize num_epochs passes,
+        # each a freshly reseeded (base_seed + epoch) row permutation, so the
+        # trainer's modulo-cycled loop (batches[i % len]) draws a distinct order
+        # every epoch instead of replaying one permutation. Mirrors the
+        # step-based branch above and the SFT create_ordered_batches per-epoch
+        # reseed (CUDA RandomSampler parity). Epoch 0 uses base_seed, so it is
+        # byte-identical to the single-pass branch below -- only later epochs
+        # gain reshuffling. (default/sequential need no expansion: both
+        # modulo-cycle one pass exactly like their SFT counterparts.)
+        base_seed = _normalize_seed(seed)
+        chunks = []
+        for _epoch in range(max(1, int(num_epochs))):
+            order = _torch_randperm_order(len(rows), base_seed + _epoch)
+            rows_epoch = [rows[i] for i in order]
+            chunks.extend(
+                rows_epoch[j:j + batch_size]
+                for j in range(0, len(rows_epoch), batch_size)
+            )
+    elif order_mode == "torch_randperm":
+        # num_batches is None (or no rows): a single seeded permutation,
+        # identical to pass 0 (base_seed) of the multi-pass branch above.
+        order = _torch_randperm_order(len(rows), _normalize_seed(seed))
+        rows_ordered = [rows[i] for i in order]
+        chunks = [rows_ordered[s:s + batch_size] for s in base_starts]
+    else:
+        chunks = [rows[s:s + batch_size] for s in base_starts]
+
+    out = []
+    for chunk in chunks:
+        Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
+        if pad_to_multiple:
+            Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
+            # Cap the rounded padded length back to max_seq_length. Rows were
+            # already truncated to max_seq_length, but rounding up to
+            # pad_to_multiple overshoots it when max_seq_length is not a multiple
+            # (e.g. max_seq_length=50, pad_to_multiple=64 -> 64), which would make
+            # the ORPO/DPO forwards process sequences past the configured limit
+            # and defeat memory / context-limit experiments. The text batching
+            # path caps the same way.
+            Lmax = min(Lmax, max_seq_length)
+        chosen_rows, rejected_rows, lengths = [], [], []
+        for pe, c, r in chunk:
+            chosen_rows.append(c + [pad_id] * (Lmax - len(c)))
+            lengths.append([pe, len(c)])
+        for pe, c, r in chunk:
+            rejected_rows.append(r + [pad_id] * (Lmax - len(r)))
+            lengths.append([pe, len(r)])
+        batch = mx.array(chosen_rows + rejected_rows, dtype=mx.int32)
+        lengths_arr = mx.array(lengths)
+        out.append((batch, lengths_arr, None))
+        if num_batches is not None and len(out) >= num_batches:
+            break
+    mx.eval([b for b, _, _ in out] + [l for _, l, _ in out])
+    return out
+
+
 def make_baseline_loss_fn():
     """Create a standard cross-entropy loss function (full logits via LM head).
 
@@ -5439,23 +6008,11 @@ def _extract_mlx_lora_parameters(model):
             rank = int(a_shape[-1])
         scale = getattr(m, "scale", 1.0)
 
-        drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
-        if drop is None:
-            dropout = 0.0
-        else:
-            keep = getattr(drop, "_p_1", None)
-            if keep is not None:
-                try:
-                    dropout = float(1.0 - float(keep))
-                except (TypeError, ValueError):
-                    dropout = 0.0
-            else:
-                p = getattr(drop, "p", None)
-                try:
-                    dropout = float(p) if p is not None else 0.0
-                except (TypeError, ValueError):
-                    dropout = 0.0
+        # Prefer the pre-disable stash so a checkpoint saved after ORPO/DPO
+        # (which swaps the live adapter dropout for an identity) still records
+        # the configured lora_dropout instead of 0.0; falls back to the live
+        # dropout module (mlx.nn.Dropout keep-prob in _p_1, else .p) otherwise.
+        dropout = _read_mlx_lora_dropout(m)
         break
     return rank, scale, dropout
 
@@ -5770,6 +6327,92 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
+def _read_mlx_lora_dropout(module):
+    """Return a LoRA module's CONFIGURED dropout probability for adapter_config.
+
+    ORPO/DPO neutralize adapter dropout for deterministic preference forwards by
+    replacing ``module.dropout`` with an identity (``_mlx_disable_lora_dropout``),
+    which erases the probability the live module would otherwise report -- so a
+    naive ``_get_mlx_dropout_probability(module.dropout)`` at save time would
+    persist ``dropout=0.0`` and break reload parity with the trained LoRA config.
+    That disable stashes the original probability on
+    ``module._unsloth_orig_lora_dropout`` first, so prefer it here and fall back
+    to reading the live dropout module for SFT / never-disabled adapters.
+    """
+    stashed = getattr(module, "_unsloth_orig_lora_dropout", None)
+    if stashed is not None:
+        try:
+            return float(stashed)
+        except (TypeError, ValueError):
+            pass
+    return _get_mlx_dropout_probability(getattr(module, "dropout", None))
+
+
+def _iter_mlx_dropout_modules(model):
+    """Yield every dropout-type module in the model tree (TRL parity).
+
+    TRL's ``disable_dropout_in_model`` (trl/trainer/utils.py) walks
+    ``model.modules()`` and zeroes EVERY ``nn.Dropout``, not just adapter
+    dropout. The MLX equivalent walks ``model.named_modules()`` and matches
+    mlx.nn's Dropout family (Dropout/Dropout2d/Dropout3d, which store the
+    keep-probability in ``_p_1``). Detection is by ``isinstance`` against the
+    installed mlx.nn dropout classes when available, plus a structural fallback
+    (a numeric ``_p_1`` keep-prob marker or a ``*Dropout`` class name) so it also
+    fires under the torch-backed test shim and for any dropout-like leaf.
+    """
+    dropout_types = ()
+    try:
+        import mlx.nn as _mlx_nn
+        dropout_types = tuple(
+            cls for cls in (
+                getattr(_mlx_nn, name, None)
+                for name in ("Dropout", "Dropout2d", "Dropout3d")
+            )
+            if isinstance(cls, type)
+        )
+    except Exception:
+        dropout_types = ()
+    named = getattr(model, "named_modules", None)
+    if not callable(named):
+        return
+    for _, mod in named():
+        if mod is None:
+            continue
+        if (
+            (dropout_types and isinstance(mod, dropout_types))
+            or getattr(mod, "_p_1", None) is not None
+            or type(mod).__name__.endswith("Dropout")
+        ):
+            yield mod
+
+
+def _disable_mlx_base_dropout(model):
+    """Neutralize every dropout module in the model tree in place (TRL parity).
+
+    Mirrors TRL's ``disable_dropout_in_model``, which sets ``module.p = 0`` on
+    every ``nn.Dropout`` so the DPO/ORPO forwards are deterministic under
+    ``disable_dropout=True``. ``_mlx_disable_lora_dropout`` already replaces the
+    LoRA/DoRA adapter dropout; this walks the WHOLE tree so a base transformer
+    that carries residual/attention dropout is disabled too. mlx-lm's base
+    transformers currently ship no dropout, so for common models this is a safe
+    no-op superset. Setting ``mlx.nn.Dropout._p_1 = 1`` makes its forward an
+    identity passthrough (``Dropout.__call__`` returns ``x`` unchanged when
+    ``_p_1 == 1``); ``.p = 0`` covers torch-style dropout leaves. Returns the
+    count of modules that were actually ACTIVE (dropout probability > 0) so an
+    already-off model reports 0.
+    """
+    count = 0
+    for mod in _iter_mlx_dropout_modules(model):
+        was_active = _get_mlx_dropout_probability(mod) > 0.0
+        if getattr(mod, "_p_1", None) is not None:
+            mod._p_1 = 1.0
+        if getattr(mod, "p", None) is not None:
+            mod.p = 0
+        if was_active:
+            count += 1
+    return count
+
+
 def _coerce_mlx_lora_scale(scale, default=1.0):
     """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
 
@@ -6043,9 +6686,9 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
-                lora_dropout = _get_mlx_dropout_probability(
-                    getattr(module, "dropout", None)
-                )
+                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
+                # still records the configured lora_dropout rather than 0.0.
+                lora_dropout = _read_mlx_lora_dropout(module)
 
         # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:

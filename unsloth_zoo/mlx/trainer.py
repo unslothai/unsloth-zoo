@@ -169,6 +169,9 @@ from .utils import (
     make_vlm_cce_loss_fn,
     make_vlm_baseline_loss_fn,
     create_batches,
+    create_preference_batches,
+    make_orpo_loss_fn,
+    make_dpo_loss_fn,
     create_ordered_batches,
     iterate_training_batches,
     create_vlm_batches,
@@ -186,6 +189,9 @@ from .utils import (
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
+    _disable_mlx_base_dropout,
+    _get_mlx_dropout_probability,
+    _read_mlx_lora_dropout,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -495,6 +501,55 @@ def _clip_grad_norm_fp32(grad, max_norm):
     return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
 
 
+def _mlx_identity(x):
+    return x
+
+
+def _mlx_disable_lora_dropout(model):
+    """Neutralize LoRA/DoRA adapter dropout for TRL DPO/ORPO parity.
+
+    TRL's DPOConfig and ORPOConfig default ``disable_dropout=True`` and call
+    ``disable_dropout_in_model`` (trl/trainer/dpo_trainer.py:378-381,
+    trl/trainer/orpo_trainer.py:302-303), so the preference log-prob forwards are
+    DETERMINISTIC. The MLX preference loss runs inside the train()-mode step
+    (``model.train()`` at the loop start), where a per-step ``model.eval()`` is
+    unreliable, so neutralize the adapter dropout once at setup instead: mlx-lm's
+    LoRALinear/DoRALinear apply ``self.dropout(x)`` before the low-rank matmul, so
+    replacing that module with identity makes the policy forward deterministic
+    (for referenced DPO the reference forward is already clean via scale=0, which
+    zeros the delta regardless of the mask). ``lora_dropout=0`` is already a no-op,
+    so default configs are unaffected. Only ORPO/DPO call this; SFT keeps dropout.
+
+    TRL's ``disable_dropout_in_model`` disables EVERY ``nn.Dropout`` in the model
+    tree, not only the adapters, so for exact parity also walk the whole module
+    tree and neutralize any base-model dropout in place. mlx-lm's base
+    transformers ship no dropout today, so that pass is a safe no-op superset for
+    common models, but it keeps ORPO/DPO deterministic even for an architecture
+    that does add residual/attention dropout.
+    """
+    count = 0
+    for _, mod in iter_mlx_lora_modules(model):
+        if getattr(mod, "dropout", None) is not None:
+            # Stash the configured dropout probability BEFORE swapping in the
+            # identity. Replacing mod.dropout with _mlx_identity makes the
+            # forward deterministic but ERASES the probability the save path
+            # (_extract_mlx_lora_parameters / save_model / _enrich_mlx_adapter_
+            # config) reads back off the live module -- so a checkpoint saved
+            # after ORPO/DPO would record dropout=0.0 in adapter_config.json and
+            # no longer match the trained LoRA config on reload. _read_mlx_lora_
+            # dropout prefers this stash. Guard with hasattr so a repeated
+            # disable (reused trainer) keeps the ORIGINAL value instead of
+            # re-reading 0.0 off the already-neutralized module.
+            if not hasattr(mod, "_unsloth_orig_lora_dropout"):
+                mod._unsloth_orig_lora_dropout = _get_mlx_dropout_probability(
+                    mod.dropout
+                )
+            mod.dropout = _mlx_identity
+            count += 1
+    count += _disable_mlx_base_dropout(model)
+    return count
+
+
 def _prune_stale_checkpoints(output_dir, save_total_limit):
     """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
 
@@ -577,6 +632,10 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
+    loss_type: str = "sft"  # "sft" or "orpo"
+    orpo_beta: float = 0.1  # ORPO odds-ratio weight (TRL default)
+    dpo_beta: float = 0.1  # DPO beta (TRL default)
+    reference_free: bool = False  # DPO: drop the reference term if True
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
     greater_is_better: bool = False
@@ -664,6 +723,20 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
+
+
+@dataclass(init=False)
+class MLXORPOConfig(MLXTrainingConfig):
+    """ORPO config mirroring TRL's ORPOConfig. Presets loss_type='orpo';
+    tune orpo_beta (inherited). Use with MLXORPOTrainer."""
+    loss_type: str = "orpo"
+
+
+@dataclass(init=False)
+class MLXDPOConfig(MLXTrainingConfig):
+    """DPO config mirroring TRL's DPOConfig. Presets loss_type='dpo';
+    tune dpo_beta / reference_free (inherited). Use with MLXDPOTrainer."""
+    loss_type: str = "dpo"
 
 
 class MLXTrainer:
@@ -1780,9 +1853,15 @@ class MLXTrainer:
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
+            # NEFTune is a training-only augmentation. The DPO/ORPO reference
+            # forward (adapters off) runs with the model still in train(), so it
+            # flips this flag off to compute a CLEAN, noise-free reference (see
+            # make_dpo_loss_fn); the policy forward keeps it True and stays noisy.
+            _neftune_noise_enabled = True
             def __call__(self, x):
                 out = _Base.__call__(self, x)
-                if getattr(self, "training", False):
+                if (getattr(self, "training", False)
+                        and getattr(self, "_neftune_noise_enabled", True)):
                     dim = out.shape[-1] * out.shape[-2]
                     scale = _alpha / (dim ** 0.5)
                     noise = mx.random.uniform(
@@ -2017,7 +2096,57 @@ class MLXTrainer:
                 )
                 _main_print("Unsloth: Using VLM standard cross-entropy loss.")
         else:
-            if use_cce:
+            if getattr(args, "loss_type", "sft") == "orpo":
+                _ob = getattr(args, "orpo_beta", 0.1)
+                # TRL's ORPOConfig defaults disable_dropout=True; the single ORPO
+                # forward (SFT + odds-ratio) runs under train() mode, so nonzero
+                # LoRA dropout would perturb the policy log-probs vs TRL. Disable
+                # it (no-op when lora_dropout=0).
+                _mlx_disable_lora_dropout(model)
+                loss_fn = make_orpo_loss_fn(beta=_ob)
+                print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
+            elif getattr(args, "loss_type", "sft") == "dpo":
+                _db = getattr(args, "dpo_beta", 0.1)
+                _rf = bool(getattr(args, "reference_free", False))
+                # tree_flatten only recurses dict/list/tuple, so a bare
+                # nn.Module is a single leaf and never reaches nested LoRA
+                # layers. Walk the module tree instead so LoRALinear,
+                # LoRAEmbedding, LoRASwitchLinear and DoRA adapters are all
+                # collected for the reference (adapters-off) pass.
+                _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
+                if (_lora_mods and not _rf
+                        and any(type(m).__name__.startswith("DoRA")
+                                for m in _lora_mods)):
+                    raise ValueError(
+                        "Unsloth: DPO with a reference is not supported for DoRA "
+                        "adapters. The reference is obtained by zeroing the LoRA "
+                        "scale, but a DoRA layer still applies its trainable "
+                        "magnitude m/||W|| (initialized to ||W|| but drifting as m "
+                        "trains), so the reference would no longer be the frozen "
+                        "initial policy and the DPO gradient would be wrong. Use a "
+                        "plain LoRA adapter, or pass reference_free=True to train "
+                        "without a reference."
+                    )
+                # NEFTune (if installed by _install_neftune) noises the input
+                # embeddings while training; hand the wrapped module to the loss
+                # so the reference (adapters-off) forward can run it clean and the
+                # DPO reward is not corrupted by reference-side NEFTune noise.
+                _neft = getattr(self, "_neftune_emb", None)
+                _neftune_mods = [_neft] if _neft is not None else []
+                # TRL's DPOConfig defaults disable_dropout=True. The DPO policy
+                # forward runs under train() mode, so nonzero LoRA dropout would
+                # perturb the policy log-probs (and, for referenced DPO, the
+                # policy and reference forwards would even see different masks)
+                # and bias the preference margin vs TRL. Disable it (no-op when
+                # lora_dropout=0); the reference forward is already clean via
+                # scale=0.
+                _mlx_disable_lora_dropout(model)
+                loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods,
+                                           reference_free=_rf,
+                                           neftune_mods=_neftune_mods)
+                print("Unsloth: Using DPO loss (beta=" + str(_db) +
+                      (", reference_free" if _rf else "") + ").")
+            elif use_cce:
                 loss_fn = make_cce_loss_fn(model)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
                 _main_print(
@@ -2587,7 +2716,10 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
-        if args.eval_steps > 0 and self.eval_dataset is not None:
+        if (getattr(args, "loss_type", "sft") in ("orpo", "dpo")
+                and args.eval_steps > 0 and self.eval_dataset is not None):
+            print(f"Unsloth: eval is not yet supported for {args.loss_type}; skipping eval.")
+        elif args.eval_steps > 0 and self.eval_dataset is not None:
             eval_batch_size = (
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
@@ -3249,6 +3381,24 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        # Reject unknown loss_type values before any batch construction. Only
+        # "sft" (default), "orpo", and "dpo" are implemented on MLX. The loss
+        # selection in _train_inner and the preference branch below BOTH fall
+        # through to the SFT/CCE path for anything else, so a misconfigured
+        # preference run -- a typo like "dppo", or a real TRL DPO loss_type that
+        # is not implemented here ("ipo", "sigmoid", "hinge", "kto", ...) -- would
+        # silently optimize a plain cross-entropy objective instead of failing.
+        # Fail fast so the wrong objective is never trained.
+        _supported_loss_types = ("sft", "orpo", "dpo")
+        _loss_type = getattr(args, "loss_type", "sft")
+        if _loss_type not in _supported_loss_types:
+            raise ValueError(
+                f"Unsloth MLX: unsupported loss_type={_loss_type!r}. Supported "
+                f"values are {_supported_loss_types!r}. DPO loss variants such as "
+                "'ipo', 'sigmoid', or 'hinge' are not implemented on MLX; without "
+                "this check they would silently train a plain SFT cross-entropy "
+                "objective. Use loss_type='dpo' (sigmoid DPO), 'orpo', or 'sft'."
+            )
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3267,6 +3417,27 @@ class MLXTrainer:
             )
 
         if self._batches is not None:
+            # Prebuilt batches carrying SFT labels -- (input_ids, lengths, labels),
+            # e.g. from train_on_responses_only -- are NOT the concatenated
+            # [chosen; rejected] preference layout the ORPO/DPO loss requires. That
+            # loss ignores labels and reads B = batch.shape[0] // 2 as pairs, so it
+            # would silently pair unrelated rows and optimize the wrong objective,
+            # while also bypassing create_preference_batches' prompt/chosen/rejected
+            # column validation. Preference batches use labels=None, so reject only
+            # the labeled (SFT) prebuilt batches and leave preference ones untouched.
+            if getattr(args, "loss_type", "sft") in ("orpo", "dpo") and any(
+                len(b) >= 3 and b[2] is not None for b in self._batches
+            ):
+                raise ValueError(
+                    "Unsloth: train_on_responses_only / response-masked (prebuilt "
+                    "SFT) batches are not compatible with ORPO/DPO. Those rows are "
+                    "(input_ids, lengths, labels) SFT batches, but the ORPO/DPO loss "
+                    "expects a concatenated [chosen; rejected] preference layout and "
+                    "would silently pair unrelated rows and optimize the wrong "
+                    "objective. Remove train_on_responses_only for preference "
+                    "training (ORPO/DPO already supervise only the response span), "
+                    "or set loss_type='sft'."
+                )
             return self._batches, None
 
         total_batches_needed = (
@@ -3276,6 +3447,100 @@ class MLXTrainer:
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
         comm_group = self.distributed_world
+
+        if getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
+            if is_vlm:
+                raise ValueError(
+                    f"{args.loss_type.upper()} is not yet supported for VLM models on MLX."
+                )
+            if self.distributed_world_size > 1:
+                # Multi-GPU (MLX DDP) DPO/ORPO is not sharded. The SFT/VLM data
+                # path builds a global micro-batch and hands each rank its own
+                # slice (comm_group is threaded into create_batches /
+                # iterate_training_batches / create_vlm_batches), so the gradients
+                # _apply_update all-reduces cover the intended global batch.
+                # create_preference_batches takes no comm_group/rank argument:
+                # every rank would build the SAME sorted preference batches
+                # (identical seed, data, sort) and _apply_update would all-reduce
+                # duplicate gradients, so multi-GPU training would silently train
+                # on one rank's stream rather than the global shard (and, under a
+                # max_steps random-subset cap, on the same reduced subset on every
+                # rank). Correctly sharding the concatenated [chosen; rejected]
+                # builder (global-batch construction plus cross-rank tail padding
+                # so collectives stay aligned) cannot be validated on the
+                # single-process CI, so fail fast rather than mistrain. No-op at
+                # world_size == 1 (the common single-GPU case).
+                raise NotImplementedError(
+                    "Unsloth MLX: distributed (multi-GPU) DPO/ORPO preference "
+                    "training is not yet implemented "
+                    f"(distributed_world_size={self.distributed_world_size}). The "
+                    "preference batches are not sharded across ranks, so every "
+                    "rank would train on identical data and all-reduce duplicate "
+                    "gradients instead of the intended global shard. Run DPO/ORPO "
+                    "on a single GPU (world_size=1), or pre-shard the dataset "
+                    "across ranks yourself before training."
+                )
+            if args.streaming:
+                # create_preference_batches materializes the WHOLE dataset: it
+                # collects every prompt/chosen/rejected row before batching and
+                # only honors num_batches afterwards, so an iterable/streaming
+                # dataset is fully consumed up front. The SFT/VLM paths honor
+                # streaming by returning a bounded iterator
+                # (iterate_training_batches / iterate_vlm_training_batches) that
+                # yields only max_steps worth of batches; the preference path has
+                # no such iterator, so args.streaming=True on an unbounded
+                # IterableDataset would hang or OOM instead of stopping at
+                # max_steps. Fail fast rather than silently blow up.
+                raise NotImplementedError(
+                    "Unsloth MLX: streaming DPO/ORPO preference training is not "
+                    "yet implemented. create_preference_batches materializes the "
+                    "entire dataset before batching, so an unbounded streaming "
+                    "dataset would hang or run out of memory instead of stopping "
+                    "at max_steps. Disable streaming (streaming=False) for "
+                    "DPO/ORPO, or use a finite (map-style) dataset."
+                )
+            pref_dataset_order = (
+                "sequential"
+                if getattr(args, "preserve_dataset_order", False)
+                else getattr(args, "dataset_order", "default")
+            )
+            # Epoch-based preference runs (max_steps<=0, num_train_epochs>1) get
+            # num_batches=None, so without num_epochs create_preference_batches
+            # would materialize ONE torch_randperm pass and the modulo-cycled
+            # training loop (batches[i % len]) would replay that identical
+            # "random" order every epoch -- the same bias the step-based per-pass
+            # reshuffle fixed, and divergent from the SFT create_ordered_batches
+            # path that reseeds torch_randperm per epoch. Thread num_epochs so
+            # the reshuffle spans every epoch. Only torch_randperm needs it:
+            # "default" (length-sort) and "sequential" modulo-cycle one pass
+            # exactly like their SFT counterparts (create_batches /
+            # SequentialSampler), so their per-epoch order already matches SFT.
+            # Step-based runs (num_batches set) are unchanged.
+            pref_num_epochs = (
+                int(args.num_train_epochs)
+                if (
+                    args.max_steps <= 0
+                    and getattr(args, "num_train_epochs", -1) > 0
+                    and pref_dataset_order == "torch_randperm"
+                )
+                else None
+            )
+            batches = create_preference_batches(
+                dataset=self.train_dataset,
+                tokenizer=self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+                dataset_order=pref_dataset_order,
+                seed=getattr(args, "seed", None),
+                append_eos=bool(getattr(args, "append_eos", True)),
+                num_epochs=pref_num_epochs,
+            )
+            # When num_epochs was materialized the returned list already spans
+            # every epoch, so total_steps must use n_batches // grad_accum (not
+            # n_batches * num_train_epochs); mirror the SFT/VLM ordered paths.
+            self._prepared_batches_include_epochs = pref_num_epochs is not None
+            return batches, None
 
         if is_vlm:
             if text_assistant_only_loss:
@@ -3409,7 +3674,7 @@ class MLXTrainer:
         """Save LoRA adapters or full merged model (if no LoRA)."""
         from .utils import (
             _coerce_mlx_lora_scale,
-            _get_mlx_dropout_probability,
+            _read_mlx_lora_dropout,
             _infer_mlx_lora_rank,
             save_merged_model,
         )
@@ -3436,9 +3701,10 @@ class MLXTrainer:
                 # _coerce handles LoRASwitchLinear's per-expert mx.array where
                 # raw float()/.item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
-                _lora_dropout = _get_mlx_dropout_probability(
-                    getattr(m, "dropout", None)
-                )
+                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
+                # (which swapped the live dropout for an identity) still records
+                # the configured lora_dropout, not 0.0.
+                _lora_dropout = _read_mlx_lora_dropout(m)
                 break
 
             from .utils import _get_transformer_layers
@@ -3542,6 +3808,36 @@ class MLXTrainer:
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
             save_merged_model(self.model, self.tokenizer, output_dir)
+
+
+class MLXORPOTrainer(MLXTrainer):
+    """ORPO trainer mirroring TRL's ORPOTrainer. Forces loss_type='orpo' so
+    the class is authoritative regardless of the config passed."""
+    def __init__(self, model, tokenizer, train_dataset, eval_dataset=None,
+                 dataset_text_field=None, max_seq_length=None, packing=None,
+                 data_collator=None, args=None, formatting_func=None, processor=None):
+        if args is None:
+            args = MLXORPOConfig()
+        elif getattr(args, "loss_type", "sft") != "orpo":
+            args.loss_type = "orpo"
+        super().__init__(model, tokenizer, train_dataset, eval_dataset,
+                         dataset_text_field, max_seq_length, packing,
+                         data_collator, args, formatting_func, processor)
+
+
+class MLXDPOTrainer(MLXTrainer):
+    """DPO trainer mirroring TRL's DPOTrainer. Forces loss_type='dpo' so
+    the class is authoritative regardless of the config passed."""
+    def __init__(self, model, tokenizer, train_dataset, eval_dataset=None,
+                 dataset_text_field=None, max_seq_length=None, packing=None,
+                 data_collator=None, args=None, formatting_func=None, processor=None):
+        if args is None:
+            args = MLXDPOConfig()
+        elif getattr(args, "loss_type", "sft") != "dpo":
+            args.loss_type = "dpo"
+        super().__init__(model, tokenizer, train_dataset, eval_dataset,
+                         dataset_text_field, max_seq_length, packing,
+                         data_collator, args, formatting_func, processor)
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
