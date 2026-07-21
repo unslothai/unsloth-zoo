@@ -2746,3 +2746,14 @@ def test_lazy_text_mixed_plain_and_prompt_completion_rejects_any_order():
         with pytest.raises(ValueError, match="mixed|requires prompt"):
             list(_iterate_lazy_text_training_batches(
                 iter(list(ordering)), _StreamingTextTokenizer(), 1, 8, repeat=False))
+
+
+def test_eval_batch_totals_aborts_before_pull_when_stopped():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    tr = MLXTrainer(_MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8))
+    class _Boom:
+        def __iter__(self): raise AssertionError("pulled despite stop")
+    tr.stop_requested = True
+    assert int(tr._evaluate_batch_totals(_Boom(), loss_fn=None)[1]) == 0

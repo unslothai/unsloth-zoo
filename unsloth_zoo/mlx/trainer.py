@@ -1702,6 +1702,14 @@ class MLXTrainer:
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        # A stop requested before evaluation (e.g. a step callback firing on an
+        # eval step) must abort before the first pull: an unsized source's next
+        # row can block, so cancellation could otherwise never take effect. The
+        # check is rank-synchronized, so peers return together instead of
+        # diverging at the in-loop status collective.
+        should_stop, _ = self._distributed_eval_status()
+        if should_stop:
+            return all_losses, ntokens
         iterator = iter(eval_batches)
 
         while True:
