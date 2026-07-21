@@ -169,13 +169,17 @@ pass
 
 
 def _ensure_private_directory(path):
-    """Create or clamp an owned, trusted cache directory to mode 0700.
+    """Create a trusted, owner-only cache directory.
 
-    makedirs' ``mode`` only applies to the leaf since Python 3.7, so under a
-    lax umask a freshly created parent (e.g. ~/.cache/unsloth) would be
-    group-writable and then rejected by ``_is_trusted_directory``, silently
-    disabling the cache. Force the umask so every created dir is 0700."""
+    makedirs' ``mode`` only applies to the leaf since Python 3.7, so force the
+    umask to 0700 while creating: a lax umask would otherwise leave a fresh
+    parent (e.g. ~/.cache/unsloth) group-writable and get it rejected. Only
+    chmod a directory we just created; never re-permission a pre-existing
+    configured root such as ``UNSLOTH_MEGA_CACHE_DIR=/tmp``, which would break
+    it for every other process. A pre-existing root is used as-is only if
+    ``_is_trusted_directory`` already accepts it."""
     try:
+        existed = os.path.exists(path)
         if os.name == "posix":
             old_umask = os.umask(0o077)
             try:
@@ -186,7 +190,7 @@ def _ensure_private_directory(path):
             os.makedirs(path, mode = 0o700, exist_ok = True)
         if not _is_trusted_directory(path):
             return False
-        if os.name == "posix":
+        if os.name == "posix" and not existed:
             os.chmod(path, 0o700)
         return _is_trusted_directory(path)
     except Exception:

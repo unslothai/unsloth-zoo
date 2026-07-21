@@ -437,3 +437,26 @@ def test_megacache_read_rejects_symlinked_file(tmp_path):
     link = tmp_path / "link"
     link.symlink_to(real)
     assert module._read_trusted_file(link, binary = True) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+def test_megacache_save_does_not_repermission_existing_root(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "shared_root"
+    root.mkdir()
+    root.chmod(0o755)  # pre-existing, user-owned, not group-writable
+    data = b"artifact"
+    fake_torch = types.SimpleNamespace(compiler = types.SimpleNamespace(
+        load_cache_artifacts = lambda b: {},
+        save_cache_artifacts = lambda: (data, {})))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE", "1")
+    monkeypatch.setenv("UNSLOTH_MEGA_CACHE_DIR", str(root))
+    module._STATE["armed"] = True
+    module._STATE["loaded_key"] = "deadbeef"
+
+    assert module.megacache_save() is True
+    # A configured root the user pointed at keeps its mode; only our own
+    # per-key child is clamped to owner-only.
+    assert (root.stat().st_mode & 0o777) == 0o755
+    assert ((root / "deadbeef").stat().st_mode & 0o777) == 0o700
