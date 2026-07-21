@@ -94,11 +94,6 @@ def megacache_is_enabled():
 pass
 
 
-def _refresh_enabled():
-    return megacache_is_enabled()
-pass
-
-
 def _cache_root():
     root = os.path.expanduser(os.environ.get("UNSLOTH_MEGA_CACHE_DIR", ""))
     if root == "":
@@ -151,8 +146,13 @@ def _is_trusted_directory(path, *, allow_missing = True):
                     if directory_stat.st_uid != os.geteuid():
                         return False
                 writable_by_others = directory_stat.st_mode & 0o022
-                sticky_directory = directory_stat.st_mode & stat.S_ISVTX
-                if writable_by_others and not sticky_directory:
+                # A sticky dir's OWNER can still rename its entries, so only
+                # trust the exception for root- or self-owned parents (/tmp),
+                # never an attacker-owned sticky directory.
+                sticky_trusted = (directory_stat.st_mode & stat.S_ISVTX) and (
+                    directory_stat.st_uid in (0, os.geteuid())
+                )
+                if writable_by_others and not sticky_trusted:
                     return False
             except FileNotFoundError:
                 pass
@@ -276,18 +276,46 @@ def _bundle_paths(key):
 pass
 
 
+def _read_trusted_file(path, *, binary = False):
+    """Read a cache file, refusing symlinks and foreign-owned or group/other
+    writable files. Directory trust stops an attacker creating files here, but
+    a group-writable file already present can have its bytes (and matching
+    checksum) rewritten in place; reject those. Returns None if untrusted."""
+    mode = "rb" if binary else "r"
+    if os.name != "posix":
+        with open(path, mode) as file:
+            return file.read()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        file_stat = os.fstat(fd)
+        if (not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.geteuid()
+                or file_stat.st_mode & 0o022):
+            return None
+        with os.fdopen(fd, mode) as file:
+            fd = -1
+            return file.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+pass
+
+
 def _read_disk_bundle(directory, manifest_path):
     """Read the (manifest, bundle bytes) pair for a key, returning
-    ``(None, None)`` unless the manifest checksum matches the bundle file it
-    points at. The caller must establish directory trust first: this checksum
-    detects corruption but does not authenticate a bundle against a writer who
-    can also replace the manifest."""
+    ``(None, None)`` unless both files pass ``_read_trusted_file`` and the
+    manifest checksum matches the bundle file it points at. The caller must
+    establish directory trust first: this checksum detects corruption but does
+    not authenticate a bundle against a writer who can also replace both."""
     try:
-        with open(manifest_path, "r") as file:
-            manifest = json.load(file)
+        manifest_text = _read_trusted_file(manifest_path)
+        if manifest_text is None:
+            return None, None
+        manifest = json.loads(manifest_text)
         bundle_name = os.path.basename(str(manifest.get("bundle", _BUNDLE_NAME)))
-        with open(os.path.join(directory, bundle_name), "rb") as file:
-            data = file.read()
+        data = _read_trusted_file(os.path.join(directory, bundle_name), binary = True)
+        if data is None:
+            return None, None
         if manifest.get("sha256") != hashlib.sha256(data).hexdigest():
             return None, None
         return manifest, data
@@ -437,10 +465,11 @@ def megacache_save():
             return False
         data = result[0]
         new_sha = hashlib.sha256(data).hexdigest()
-        if not _refresh_enabled() and existing is not None:
-            if hashlib.sha256(existing).hexdigest() == new_sha:
-                _log("bundle unchanged; skipping save")
-                return False
+        # Skip rewriting a byte-identical bundle so a no-op run does not churn
+        # the cache (and its mtime) on every process exit.
+        if existing is not None and hashlib.sha256(existing).hexdigest() == new_sha:
+            _log("bundle unchanged; skipping save")
+            return False
         # The bundle file is content-addressed and the manifest names it, so
         # the (bundle, manifest) pair is consistent without a cross-file lock:
         # concurrent writers produce differently named bundles, the manifest
@@ -452,6 +481,9 @@ def megacache_save():
             temporary_path = f"{bundle_path}.tmp.{os.getpid()}"
             with open(temporary_path, "wb") as file:
                 file.write(data)
+            # Owner-only so a same-group user cannot rewrite the bytes later.
+            if os.name == "posix":
+                os.chmod(temporary_path, 0o600)
             os.replace(temporary_path, bundle_path)
         manifest = {
             "format": _FORMAT_VERSION,
@@ -466,6 +498,8 @@ def megacache_save():
         temporary_manifest = f"{manifest_path}.tmp.{os.getpid()}"
         with open(temporary_manifest, "w") as file:
             json.dump(manifest, file, indent = 2, sort_keys = True, default = str)
+        if os.name == "posix":
+            os.chmod(temporary_manifest, 0o600)
         os.replace(temporary_manifest, manifest_path)
         _log(f"saved bundle for key {key} ({len(data)} bytes)")
         # Best-effort GC of superseded bundle files (including the legacy

@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 import sys
 import types
 from pathlib import Path
@@ -29,6 +30,39 @@ def _load_module():
     return module
 
 
+@pytest.fixture(autouse = True)
+def _trust_ambient_tmp_ancestors(tmp_path_factory, monkeypatch):
+    """Make dirs at/above pytest's basetemp look owner-only + sticky so the
+    full-chain walk in ``_is_trusted_directory`` depends only on the dirs each
+    test builds under ``tmp_path``. Without this the suite is non-hermetic: a
+    group-writable, non-sticky temp root (common on shared CI runners) rejects
+    every path and turns the accept-side tests red for the wrong reason."""
+    if os.name != "posix":
+        yield
+        return
+    ambient, current = set(), os.path.abspath(str(tmp_path_factory.getbasetemp()))
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        ambient.add(parent)
+        current = parent
+    real_lstat, euid = os.lstat, os.geteuid()
+
+    def fake_lstat(path, *args, **kwargs):
+        real = real_lstat(path, *args, **kwargs)
+        if os.path.abspath(os.fspath(path)) not in ambient:
+            return real
+        return os.stat_result((
+            (real.st_mode & ~0o777) | stat.S_ISVTX | 0o700,
+            real.st_ino, real.st_dev, real.st_nlink, euid, real.st_gid,
+            real.st_size, real.st_atime, real.st_mtime, real.st_ctime,
+        ))
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    yield
+
+
 def _seed_bundle(root):
     key_dir = root / "deadbeef"
     key_dir.mkdir(parents = True)
@@ -43,6 +77,11 @@ def _seed_bundle(root):
             }
         )
     )
+    # A trusted bundle is owner-only; the tool writes 0600 and the reader
+    # rejects group/other-writable files (umask 0002 would otherwise seed 0664).
+    if os.name == "posix":
+        (key_dir / bundle_name).chmod(0o600)
+        (key_dir / "manifest.json").chmod(0o600)
     return key_dir, data
 
 
@@ -280,3 +319,73 @@ def test_megacache_save_secures_directories_before_existing_read(monkeypatch, tm
     assert module.megacache_save() is True
     assert read_observations == [(True, True)]
     assert key_dir.is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX sticky-directory semantics")
+def test_megacache_rejects_cache_below_foreign_owned_sticky_parent(monkeypatch, tmp_path):
+    module = _load_module()
+    parent = tmp_path / "shared"
+    directory = parent / "cache"
+    directory.mkdir(parents = True, mode = 0o700)
+    directory.chmod(0o700)
+    parent.chmod(0o1777)
+
+    # Sticky bit is not enough: the parent's owner can rename our leaf, so a
+    # foreign-owned sticky parent must be rejected.
+    real_lstat = module.os.lstat
+
+    def foreign_owner(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        if os.path.abspath(os.fspath(path)) == str(parent):
+            return os.stat_result((
+                info.st_mode, info.st_ino, info.st_dev, info.st_nlink,
+                os.geteuid() + 1, info.st_gid, info.st_size,
+                info.st_atime, info.st_mtime, info.st_ctime,
+            ))
+        return info
+
+    monkeypatch.setattr(module.os, "lstat", foreign_owner)
+    assert module._is_trusted_directory(directory) is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+def test_megacache_does_not_load_a_group_writable_bundle_file(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "mega_cache"
+    key_dir, _ = _seed_bundle(root)
+    root.chmod(0o700)
+    key_dir.chmod(0o700)
+    # Directories are trusted, but a group-writable bundle file can be rewritten
+    # in place by a same-group attacker along with its checksum.
+    (key_dir / "megacache-seeded.bin").chmod(0o664)
+
+    loaded = []
+    _configure_load(monkeypatch, module, root, loaded)
+
+    assert module.megacache_load("victim-model") is False
+    assert loaded == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "POSIX permissions")
+def test_megacache_ignores_bundle_name_path_traversal(monkeypatch, tmp_path):
+    module = _load_module()
+    root = tmp_path / "mega_cache"
+    key_dir = root / "deadbeef"
+    key_dir.mkdir(parents = True)
+    root.chmod(0o700)
+    key_dir.chmod(0o700)
+    payload = b"pwned"
+    outside = root / "evil"
+    outside.write_bytes(payload)
+    outside.chmod(0o600)
+    (key_dir / "manifest.json").write_text(
+        json.dumps({"bundle": "../evil", "sha256": hashlib.sha256(payload).hexdigest()})
+    )
+    (key_dir / "manifest.json").chmod(0o600)
+
+    loaded = []
+    _configure_load(monkeypatch, module, root, loaded)
+
+    # basename() keeps the read inside the key dir, so "../evil" misses.
+    assert module.megacache_load("victim-model") is False
+    assert loaded == []
