@@ -2693,8 +2693,6 @@ def test_prefetcher_lifecycle_quiescence_orphan_and_positioned_error():
 
 
 def test_lazy_text_producer_rejects_mlx_valued_rows_before_parsing():
-    """Raw rows / formatter results carrying MLX values reject actionably
-    before any truthiness probe or parsing can evaluate them off-thread."""
     import mlx.core as mx
 
     from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
@@ -2718,8 +2716,7 @@ def test_max_eval_batches_rejects_non_integer_values():
     trainer = MLXTrainer(
         _MinimalTextModel(), _streaming_text_tokenizer(),
         _CountingTextRows(({"text": "10 1"},)),
-        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8),
-    )
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8))
     for bad in (True, 1.9, 0, "2"):
         trainer.args.max_eval_batches = bad
         with pytest.raises(ValueError, match="max_eval_batches"):
@@ -2740,3 +2737,12 @@ def test_distributed_failure_reraises_interrupts_unwrapped():
     with pytest.raises(RuntimeError, match="failed during save"):
         trainer._raise_distributed_failure_from_any(True, "save", ValueError("x"))
     assert trainer.stop_requested
+
+
+def test_lazy_text_mixed_plain_and_prompt_completion_rejects_any_order():
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+    rows = [{"text": "10 1"}, {"prompt": "10", "completion": " 1 2"}]
+    for ordering in (rows, rows[::-1]):
+        with pytest.raises(ValueError, match="mixed|requires prompt"):
+            list(_iterate_lazy_text_training_batches(
+                iter(list(ordering)), _StreamingTextTokenizer(), 1, 8, repeat=False))

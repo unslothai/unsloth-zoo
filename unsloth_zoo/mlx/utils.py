@@ -6162,11 +6162,15 @@ def _iter_lazy_tokenized_text_rows(
     def _resolve_completion_mode(item_has_boundary, row_has_boundary=False):
         if completion_only_loss is not None:
             return completion_only_loss
-        if "pretokenized_completion_only_loss" in state:
-            return state["pretokenized_completion_only_loss"]
         if item_has_boundary or row_has_boundary:
+            # A prompt/completion row always resolves the default mask mode
+            # from its own shape; inheriting a plain-text row's False here
+            # would silently train prompt tokens, and ordering would decide.
+            # The schema/label validators then reject mixed streams.
             state["pretokenized_completion_only_loss"] = True
             return True
+        if "pretokenized_completion_only_loss" in state:
+            return state["pretokenized_completion_only_loss"]
         return False
 
     def _filtered_label_observation(
