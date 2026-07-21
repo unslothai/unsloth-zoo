@@ -300,6 +300,30 @@ def test_direct_layers_respect_finetune_last_n_layers():
     assert isinstance(model.layers[2].proj, LoRASwitchLinear)
 
 
+def test_mixed_dora_switch_reload_preserves_routed_lora():
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwitchLinear
+    from mlx_lm.tuner.dora import DoRALinear
+    from mlx_lm.tuner.lora import LoRASwitchLinear
+    from unsloth_zoo.mlx.loader import _apply_lora_at_paths
+
+    model = nn.Module()
+    model.dense = nn.Linear(64, 16, bias=False)
+    model.experts = SwitchLinear(64, 16, 2, bias=False)
+    attached = _apply_lora_at_paths(
+        model,
+        ["dense", "experts"],
+        {
+            "fine_tune_type": "dora",
+            "lora_parameters": {"rank": 2, "scale": 1.0, "dropout": 0.0},
+        },
+    )
+
+    assert attached == 2
+    assert isinstance(model.dense, DoRALinear)
+    assert isinstance(model.experts, LoRASwitchLinear)
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_independent_vlm_switch_uses_matching_wrapper(monkeypatch, quantized):
     import mlx.core as mx

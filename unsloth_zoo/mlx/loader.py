@@ -2698,9 +2698,9 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         # Skip already-wrapped paths so we don't nest LoRALinear(LoRALinear).
         if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
             continue
-        type_spec = None if use_dora else _mlx_lora_spec_for_module(
-            module, type_specs,
-        )
+        type_spec = _mlx_lora_spec_for_module(module, type_specs)
+        if use_dora and isinstance(module, linear_types):
+            type_spec = None
         lora_cls = None
         if type_spec is None and use_dora and isinstance(module, linear_types):
             # Fail loud: a plain-LoRA downgrade drops the saved DoRA `.m`
