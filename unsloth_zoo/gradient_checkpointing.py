@@ -57,6 +57,22 @@ INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
 
 
+def _double_buffer_disabled():
+    # Double buffering overlaps the H2D offload copy with compute. On unified-
+    # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) GPU and system RAM are
+    # one physical pool, so there is no real transfer to hide: the overlap is
+    # pure overhead (~2x slower, no memory saved). Default it off there; an
+    # explicit UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 always wins.
+    env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
+    if env is not None: return env == "1"
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    try:
+        return any(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0)
+                   for i in range(torch.cuda.device_count()))
+    except Exception:
+        return False
+
+
 @contextmanager
 def _no_inference_mode():
     # Allocate GC buffers outside inference_mode (but in no_grad) so a later
@@ -427,8 +443,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     try:
         with _no_inference_mode():
             GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-        # Double buffering: try to allocate buffer B (can be disabled via env var)
-        if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
+        # Double buffering: try to allocate buffer B (auto-off on unified memory, or via env var)
+        if _double_buffer_disabled():
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
@@ -1009,7 +1025,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
             NEXT_BUFFER_SLOT[i] = 0
 
     # Reset double buffering if buffer B still exists, or try to re-allocate
-    if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
+    if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
             for i in range(len(GPU_BUFFERS_B)):
                 if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
