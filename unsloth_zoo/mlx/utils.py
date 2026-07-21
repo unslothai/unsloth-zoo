@@ -910,6 +910,135 @@ def _get_logit_scale(model):
     return scale, False
 
 
+_KNOB_MISSING = object()
+
+# Knobs whose consuming forwards transform logits after the output head,
+# with lookup sites in consumer-preference order. "attr" = the live module
+# attribute (Granite/Phi3Small forwards read a constructor copy, so copy vs
+# config drift must fail closed); others read args (config for VLM wrappers).
+_HEAD_TRANSFORM_KNOBS = {
+    "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
+    "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
+    "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
+    "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
+}
+_KNOB_AUX_SITES = {
+    "embedding_multiplier": ("args", "config"),
+    "hidden_size": ("args", "config"),
+}
+
+
+def _knob_values_equal(a, b):
+    """Total equality: raising / non-boolean comparisons count as disagreement."""
+    try:
+        return a is b or bool(a == b)
+    except Exception:
+        return False
+
+
+def _knob_value(tm, name, sites):
+    """(value, conflict) from the consumer sites; ``_KNOB_MISSING`` when no
+    site defines the knob. A present ``None`` is a value, never absence."""
+    holders = {"attr": tm, "args": getattr(tm, "args", None), "config": getattr(tm, "config", None)}
+    found = [v for site in sites if holders[site] is not None
+             for v in (getattr(holders[site], name, _KNOB_MISSING),)
+             if v is not _KNOB_MISSING]
+    if not found:
+        return _KNOB_MISSING, False
+    conflict = any(not _knob_values_equal(v, found[0]) for v in found[1:])
+    return found[0], conflict
+
+
+def _validated_knob(value, source):
+    """Normalize one knob value to a finite float, or return a reason string."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None, f"{source} is not a finite real scalar"
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{source} is not a finite real scalar"
+    if not np.isfinite(value):
+        return None, f"{source} is not a finite real scalar"
+    return value, None
+
+
+def _aux_knob(tm, name):
+    """A ratio's companion knob: value or a fail-closed reason string."""
+    value, conflict = _knob_value(tm, name, _KNOB_AUX_SITES[name])
+    if conflict or value is _KNOB_MISSING:
+        return None, (f"{name} is missing or inconsistent across its "
+                      "configuration sites")
+    return _validated_knob(value, name)
+
+
+def _detect_head_transform(model, head_status):
+    """Resolve known output-transform knobs to one effective logit scale.
+
+    Mirrors the scalar transforms the consuming forwards apply between the
+    output head and the returned logits. Returns ``(scale, problem)``: a
+    reason string means fall back to the eager baseline; scale None is the
+    no-op case; accepted scales obey the ``_get_logit_scale`` range.
+    ``head_status`` selects branch-conditional transforms as the forwards do.
+    """
+    tm = _get_text_model(model)
+    present = {}
+    for name, sites in _HEAD_TRANSFORM_KNOBS.items():
+        value, conflict = _knob_value(tm, name, sites)
+        if conflict:
+            return None, f"{name} is inconsistent across its configuration sites"
+        if value is not _KNOB_MISSING:
+            present[name] = value
+    if len(present) > 1:
+        return None, ("multiple output-transform knobs are present "
+                      f"({', '.join(present)}), an unverified combination")
+    if not present:
+        return None, None
+    knob, raw = next(iter(present.items()))
+    if knob == "mup_width_multiplier":
+        # Its only consumer (Phi3Small) masks dummy-token logits after the
+        # value-guarded divide: presence alone makes the tail non-scalar.
+        return None, ("mup_width_multiplier models mask logits after the "
+                      "output head, which fused CCE cannot reproduce")
+    if knob == "logit_scale":
+        # A present-None value is malformed live state (the forward would
+        # multiply logits by None); fail closed rather than run unscaled.
+        if raw is None:
+            return None, "logit_scale is present but None"
+        scale, invalid = _get_logit_scale(model)
+        if invalid:
+            return None, ("logit_scale cannot be applied by fused CCE "
+                          "(non-finite, non-scalar, or outside the "
+                          "supported range)")
+        return scale, None
+    # The remaining knobs are ratios num/den mirrored from their forwards.
+    if knob == "logits_scaling":
+        num, problem = 1.0, None
+        den, p2 = _validated_knob(raw, knob)
+    elif knob == "lm_head_multiplier":
+        if head_status != "tied":  # the untied branch applies the plain head
+            return None, None
+        num, problem = _validated_knob(raw, knob)
+        den, p2 = _aux_knob(tm, "embedding_multiplier")
+    else:  # dim_model_base: divide by hidden_size/dim_model_base pre-head
+        if head_status != "untied":  # the tied branch is a plain matmul
+            return None, None
+        num, problem = _validated_knob(raw, knob)
+        den, p2 = _aux_knob(tm, "hidden_size")
+    problem = problem or p2
+    if problem is None and den == 0.0:
+        problem = f"the {knob} configuration divides the logits by zero"
+    if problem is not None:
+        return None, problem
+    scale = num / den
+    if scale == 1.0:
+        return None, None
+    if not np.isfinite(scale) or not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
+        return None, (f"effective logit scale {scale!r} from {knob} is "
+                      "outside the range validated for fused CCE")
+    return scale, None
+
+
 def _is_lm_head_trainable(model):
     """Whether the LM head weight is trainable (not frozen by LoRA).
 
@@ -978,11 +1107,9 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
-    logit_scale, _scale_invalid = _get_logit_scale(model)
-    if _scale_invalid:
-        print("Unsloth: logit_scale cannot be applied by fused CCE (non-finite, "
-              "non-scalar, or outside the supported range); falling back to "
-              "standard cross-entropy.")
+    logit_scale, _transform_problem = _detect_head_transform(model, head_desc.status)
+    if _transform_problem is not None:
+        print(f"Unsloth: {_transform_problem}; falling back to standard cross-entropy.")
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn

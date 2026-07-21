@@ -295,6 +295,36 @@ def test_get_logit_scale_normalization(where, value, expected):
     assert _get_logit_scale(_stub_model(where, value)) == expected
 
 
+def _knobbed(_where="args", **attrs):
+    model = type("Model", (), {})()
+    setattr(model, _where, type("Holder", (), attrs)())
+    return model
+
+
+@pytest.mark.parametrize(
+    "attrs,status,expected",
+    [
+        # Each row mirrors its consuming forward's arithmetic and branch.
+        (dict(logits_scaling=4.0), "untied", (0.25, None)),  # granite divide
+        (dict(lm_head_multiplier=2.0, embedding_multiplier=1.0), "tied", (2.0, None)),
+        (dict(lm_head_multiplier=0.0390625, embedding_multiplier=5.656854249492381),
+         "tied", "outside the range"),  # Falcon-H1 defaults ~x0.0069 -> fallback
+        (dict(dim_model_base=16, hidden_size=32), "untied", (0.5, None)),  # minicpm, untied only
+        (dict(mup_width_multiplier=2.0), "untied", "cannot reproduce"),  # phi3small masked tail
+        (dict(logit_scale=None), "tied", "present but None"),  # malformed -> fail closed
+        (dict(logit_scale=0.0625, logits_scaling=4.0), "tied", "multiple output-transform knobs"),
+    ],
+)
+def test_detect_head_transform_rows(attrs, status, expected):
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    scale, problem = _detect_head_transform(_knobbed(**attrs), status)
+    if isinstance(expected, str):
+        assert problem is not None and expected in problem
+    else:
+        assert (scale, problem) == expected
+
+
 def test_backboneless_text_model_selects_baseline_fallback(capsys):
     # nanochat shape (stack under .transformer, no separable .model): the
     # biased head would trip the eligibility gate, so seeing ONLY the topology
