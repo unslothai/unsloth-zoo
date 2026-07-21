@@ -53,7 +53,16 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
-SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
+SUPPORTED_MLX_LR_SCHEDULERS = (
+    "linear",
+    "cosine",
+    "constant",
+    "cosine_with_restarts",
+    "polynomial",
+    "constant_with_warmup",
+    "inverse_sqrt",
+    "warmup_stable_decay",
+)
 
 
 def _mlx_distributed_backend_from_env():
@@ -541,7 +550,14 @@ class MLXTrainingConfig:
     warmup_steps: int = 5
     warmup_ratio: float = 0.0
     learning_rate: float = 2e-4
-    lr_scheduler_type: str = "linear"  # "cosine", "linear", "constant"
+    # Floor LR as a fraction of peak (cosine/polynomial/warmup_stable_decay).
+    # 0.0 means decay all the way to 0 (matches HF default).
+    lr_scheduler_min_lr_rate: float = 0.0
+    # Number of cosine cycles (cosine_with_restarts only). HF parity.
+    lr_scheduler_num_cycles: float = 1.0
+    # Polynomial decay power (polynomial only). HF parity.
+    lr_scheduler_power: float = 1.0
+    lr_scheduler_type: str = "linear"  # see SUPPORTED_MLX_LR_SCHEDULERS
 
     # Optimization
     optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
@@ -1235,10 +1251,21 @@ class MLXTrainer:
     def _build_schedule(self, total_steps):
         """Build LR schedule from config. Returns a callable or float."""
         lr = self.args.learning_rate
+        # HF parity: warmup_steps/warmup_ratio resolution lives in the shared
+        # helper (rounds up via math.ceil). Keep only the extra schedule
+        # parameters the additional scheduler types need.
         warmup = self._resolve_warmup_steps(total_steps)
+        min_lr_rate = float(getattr(self.args, "lr_scheduler_min_lr_rate", 0.0) or 0.0)
+        # HF parity: an explicit 0.0 is a meaningful value (WSD zero decay
+        # fraction / cosine_with_restarts zero cycles), so only a missing/None
+        # value falls back to the 1.0 default -- never an `or 1.0` truthiness cast.
+        num_cycles_attr = getattr(self.args, "lr_scheduler_num_cycles", 1.0)
+        num_cycles = float(1.0 if num_cycles_attr is None else num_cycles_attr)
+        power_attr = getattr(self.args, "lr_scheduler_power", 1.0)
+        power = float(1.0 if power_attr is None else power_attr)
         sched_type = _normalize_mlx_scheduler_type(self.args.lr_scheduler_type)
 
-        if sched_type == "constant" and warmup == 0:
+        if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
             return lr
 
         def warmup_multiplier(step):
@@ -1255,20 +1282,109 @@ class MLXTrainer:
             # HF Trainer LR parity; `step` is zero-based optimizer-step index.
             step = mx.array(step).astype(mx.float32)
             if warmup > 0:
-                warm = lr * warmup_multiplier(step)
+                warm_factor = warmup_multiplier(step)
+                if sched_type == "warmup_stable_decay":
+                    # HF get_wsd_schedule offsets the warmup ramp by min_lr_rate
+                    # (factor * (1 - min_lr_rate) + min_lr_rate), so the first
+                    # update starts at lr*min_lr_rate rather than zero. Other
+                    # schedules keep the plain 0 -> 1 warmup ramp (HF parity).
+                    warm_factor = warm_factor * mx.array(
+                        1.0 - min_lr_rate, dtype=mx.float32
+                    ) + mx.array(min_lr_rate, dtype=mx.float32)
+                warm = mx.array(lr, dtype=mx.float32) * warm_factor
             else:
                 warm = mx.array(lr, dtype=mx.float32)
 
             progress = decay_progress(step)
             if sched_type == "cosine":
+                # progress in [0, 1] -> cosine from 1 to 0
                 decay = mx.array(0.5, dtype=mx.float32) * (
                     mx.array(1.0, dtype=mx.float32) + mx.cos(mx.array(math.pi) * progress)
                 )
+            elif sched_type == "cosine_with_restarts":
+                # HF parity: 0.5 * (1 + cos(pi * ((num_cycles * progress) mod 1)))
+                cycle_progress = (
+                    mx.array(num_cycles, dtype=mx.float32) * progress
+                )
+                cycle_progress = cycle_progress - mx.floor(cycle_progress)
+                decay = mx.array(0.5, dtype=mx.float32) * (
+                    mx.array(1.0, dtype=mx.float32) + mx.cos(
+                        mx.array(math.pi) * cycle_progress
+                    )
+                )
             elif sched_type == "linear":
                 decay = mx.array(1.0, dtype=mx.float32) - progress
-            else:  # constant with warmup
+            elif sched_type == "polynomial":
+                # HF parity: (1 - progress) ** power
+                base = mx.maximum(
+                    mx.array(1.0, dtype=mx.float32) - progress,
+                    mx.array(0.0, dtype=mx.float32),
+                )
+                decay = mx.power(base, mx.array(power, dtype=mx.float32))
+            elif sched_type == "inverse_sqrt":
+                # HF get_inverse_sqrt_schedule parity. The timescale defaults to
+                # num_warmup_steps, or 10_000 when warmup is zero, so zero-warmup
+                # recipes hold the LR near base early instead of collapsing.
+                # decay = 1 / sqrt((step + shift) / timescale) with
+                # shift = timescale - warmup; post_warmup_step ==
+                # warmup + progress * (total - warmup) == step.
+                timescale = warmup if warmup > 0 else 10000
+                shift = timescale - warmup
+                post = mx.array(warmup, dtype=mx.float32) + progress * mx.array(
+                    max(total_steps - warmup, 1), dtype=mx.float32
+                )
+                # Floor the argument so the dead pre-warmup branch stays finite
+                # before mx.where selects the warmup value instead.
+                arg = mx.maximum(
+                    (post + mx.array(shift, dtype=mx.float32))
+                    / mx.array(timescale, dtype=mx.float32),
+                    mx.array(1e-8, dtype=mx.float32),
+                )
+                decay = mx.array(1.0, dtype=mx.float32) / mx.sqrt(arg)
+            elif sched_type == "warmup_stable_decay":
+                # HF parity: constant until decay_start = 1 - lr_scheduler_num_cycles
+                # of the decay window, then cosine-decay through the remainder.
+                # We reuse num_cycles as the "decay fraction" (HF
+                # get_wsd_schedule uses num_decay_steps; expressed here as a
+                # fraction of the post-warmup window).
+                decay_frac = mx.array(
+                    min(max(num_cycles, 0.0), 1.0), dtype=mx.float32
+                )
+                stable_end = mx.array(1.0, dtype=mx.float32) - decay_frac
+                in_stable = progress < stable_end
+                # Progress through the final decay_frac of the window, in [0, 1].
+                decay_progress_local = mx.maximum(
+                    (progress - stable_end) / mx.maximum(
+                        decay_frac, mx.array(1e-8, dtype=mx.float32),
+                    ),
+                    mx.array(0.0, dtype=mx.float32),
+                )
+                # HF get_wsd_schedule defaults decay_type="cosine", num_cycles=0.5,
+                # so the decay factor is 0.5 * (1 + cos(pi * num_cycles * 2 * p)),
+                # which for num_cycles=0.5 reduces to the half cosine
+                # 0.5 * (1 + cos(pi * p)) falling from 1 to 0 over the decay window.
+                # Match that shape (not a linear falloff) so ported WSD recipes
+                # follow HF's default LR trajectory.
+                decay_phase = mx.array(0.5, dtype=mx.float32) * (
+                    mx.array(1.0, dtype=mx.float32)
+                    + mx.cos(mx.array(math.pi) * decay_progress_local)
+                )
+                decay = mx.where(
+                    in_stable,
+                    mx.array(1.0, dtype=mx.float32),
+                    decay_phase,
+                )
+            else:  # constant / constant_with_warmup
                 decay = mx.array(1.0, dtype=mx.float32)
+            # HF parity: min_lr_rate rescales the [0, 1] decay factor into
+            # [min_lr_rate, 1] via decay*(1 - r) + r so the LR decays from
+            # base_lr down to base_lr*min_lr_rate (min_lr), not to 0. This
+            # matches get_cosine_with_min_lr_schedule_with_warmup / get_wsd;
+            # it does not clamp.
             decay = mx.maximum(decay, mx.array(0.0, dtype=mx.float32))
+            decay = decay * mx.array(1.0 - min_lr_rate, dtype=mx.float32) + mx.array(
+                min_lr_rate, dtype=mx.float32,
+            )
             main = mx.array(lr, dtype=mx.float32) * decay
             return mx.where(step < warmup, warm, main)
 
