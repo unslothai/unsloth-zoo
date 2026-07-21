@@ -38,13 +38,15 @@ mismatch simply means a cache miss and a normal local compile. Loading is
 always best-effort and never raises.
 
 Environment knobs:
-  UNSLOTH_MEGA_CACHE       = "1" (default, enabled) | "0" (kill switch)
-      Enabled by default: load and save artifacts, but only from a cache
-      directory that passes the POSIX trust checks below (owned by the current
-      user, not group/other writable, no symlinked components). torch.compile
-      artifacts are executable/deserialized data, so an untrusted cache
-      directory is refused rather than loaded - the feature fails closed.
-      0 / off / false / no -> fully disabled (kill switch).
+  UNSLOTH_MEGA_CACHE       = "1" (enable) | "0" (disable) | unset (default)
+      Unset -> enabled on POSIX, where the trust checks below enforce that a
+      cache directory is owned by the current user and not group/other writable
+      (an untrusted directory is refused, not loaded, so the feature fails
+      closed). Unset -> disabled on non-POSIX platforms, whose ACLs those POSIX
+      ownership/mode checks cannot model; there an explicit opt-in is the trust
+      boundary. torch.compile artifacts are executable/deserialized data.
+      0 / off / false / no -> fully disabled (kill switch), any platform.
+      1 / on / true / yes  -> enabled, any platform.
   UNSLOTH_MEGA_CACHE_DIR   = bundle root (default ~/.cache/unsloth/mega_cache).
 """
 
@@ -86,13 +88,17 @@ pass
 
 
 def megacache_is_enabled():
-    # On by default. Bundles are executable/deserialized torch.compile
-    # artifacts, so the POSIX trust checks (owner-only, no group/other write,
-    # no symlinks) are the safeguard: an untrusted cache is refused, not
-    # loaded, so the feature fails closed. Kill switch: UNSLOTH_MEGA_CACHE=0.
-    return os.environ.get("UNSLOTH_MEGA_CACHE", "1").strip().lower() not in (
-        "0", "off", "false", "no",
-    )
+    # Bundles are executable/deserialized torch.compile artifacts. On by
+    # default where the POSIX trust checks can enforce it (owner-only, no
+    # group/other write, no symlinks) so an untrusted cache is refused, not
+    # loaded - the feature fails closed. On non-POSIX platforms, whose ACLs
+    # those checks cannot model, require an explicit opt-in. Kill switch: 0.
+    value = os.environ.get("UNSLOTH_MEGA_CACHE", "").strip().lower()
+    if value in ("0", "off", "false", "no"):
+        return False
+    if value in ("1", "on", "true", "yes"):
+        return True
+    return os.name == "posix"
 pass
 
 
