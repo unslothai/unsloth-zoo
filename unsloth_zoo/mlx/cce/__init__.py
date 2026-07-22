@@ -32,7 +32,18 @@ if _MLX_AVAILABLE:
     )
 else:
     def _normalize_label_smoothing(value):
-        return float(value)
+        # Mirror the MLX implementation's domain check so validation is
+        # consistent whether or not MLX is installed.
+        import math
+        import numbers
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise ValueError(
+                f"label_smoothing must be a real number in [0, 1], got {value!r}")
+        value = float(value)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"label_smoothing must be a finite value in [0, 1], got {value!r}")
+        return value
 
     def make_chunked_cross_entropy_loss(**kwargs):
         raise RuntimeError("mlx is required for CCE loss but is not installed")

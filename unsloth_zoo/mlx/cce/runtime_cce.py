@@ -725,6 +725,8 @@ def _fallback_dlogits(
     label_smoothing: float = 0.0,
     vocab_size: int = 0,
 ) -> mx.array:
+    if label_smoothing > 0.0 and vocab_size <= 0:
+        raise ValueError("vocab_size must be positive when label_smoothing > 0")
     capped = _apply_softcap(logits, logit_softcap)
     probs = mx.exp(capped - mx.expand_dims(lse, -1))
 
