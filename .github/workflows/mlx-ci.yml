@@ -87,6 +87,11 @@ jobs:
         # MLXTrainer, exercising the PR 684 trainer rework end to end.
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
 
+      - name: tests/test_mlx_cpt_partition_metal.py
+        # Continued-pretraining partition (embed_tokens / lm_head), target
+        # normalization, and full-module save routing on real Metal.
+        run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs
+
       - name: tests/test_mlx_pr684_full_validation_metal.py
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
