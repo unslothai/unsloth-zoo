@@ -4281,7 +4281,15 @@ class MLXKTOTrainer(MLXTrainer):
                 "non-empty completions per batch)."
             )
 
-        total_steps = args.max_steps if args.max_steps and args.max_steps > 0 else len(batches)
+        # total_steps counts optimizer steps. When max_steps is unset, one pass
+        # over the data is len(batches) // grad_accum optimizer steps (matching
+        # MLXTrainer); at least 1 so a run with fewer batches than grad_accum
+        # still takes a (short) step.
+        grad_accum = max(int(args.gradient_accumulation_steps), 1)
+        if args.max_steps and args.max_steps > 0:
+            total_steps = args.max_steps
+        else:
+            total_steps = max(len(batches) // grad_accum, 1)
         optimizer = self._build_optimizer(total_steps)
         (max_grad_norm, max_grad_value, max_grad_leaf_norm,
          _clip_mode) = _resolve_mlx_grad_clipping(args)
@@ -4304,7 +4312,20 @@ class MLXKTOTrainer(MLXTrainer):
             kl_scalar = _kto_kl_baseline(pol_kl, ref_kl)
             return ref_comp, kl_scalar
 
+        # gradient accumulation: run grad_accum micro-batches, average their
+        # gradients, then take one optimizer step, so the effective batch size
+        # is per_device_train_batch_size * grad_accum. step/total_steps and the
+        # LR schedule count optimizer steps (not micro-batches), matching
+        # MLXTrainer and TRL's HF-Trainer-backed KTOTrainer. A simple mean is
+        # used rather than the token-weighted accumulation MLXTrainer uses for
+        # SFT: the KTO loss is a per-example preference objective, not a
+        # per-token mean, so each micro-batch contributes equally. grad_accum is
+        # resolved above (it also sets total_steps).
         step = 0
+        micro = 0            # micro-batches accumulated in the current window
+        acc_grad = None      # running mean of the window's gradients
+        acc_loss = 0.0       # running mean of the window's losses
+        acc_kl = 0.0         # running mean of the window's KL diagnostics
         stop = False
         max_epochs = 1_000_000
         for _epoch in range(max_epochs):
@@ -4334,6 +4355,24 @@ class MLXKTOTrainer(MLXTrainer):
 
                 loss, grad = nn.value_and_grad(model, loss_fn)(model)
 
+                # Accumulate the mean gradient. Dividing each micro-batch by
+                # grad_accum before summing keeps the accumulator at update
+                # scale; sum(g_i / N) == mean(g_i).
+                contrib = tree_map(lambda g: g / grad_accum, grad)
+                if acc_grad is None:
+                    acc_grad = contrib
+                else:
+                    acc_grad = tree_map(lambda a, g: a + g, acc_grad, contrib)
+                acc_loss += float(loss) / grad_accum
+                acc_kl += float(kl_scalar) / grad_accum
+                micro += 1
+                if micro < grad_accum:
+                    # Materialize the running accumulator so the autograd graph
+                    # does not grow across the window.
+                    mx.eval(acc_grad)
+                    continue
+
+                grad = acc_grad
                 if max_grad_norm > 0:
                     grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
                 if max_grad_value is not None and max_grad_value > 0:
@@ -4344,19 +4383,23 @@ class MLXKTOTrainer(MLXTrainer):
                 self._apply_manual_weight_decay(model, optimizer, grad)
                 self._set_optimizer_lr_for_step(optimizer, step)
                 optimizer.update(model, grad)
-                mx.eval(model.parameters(), optimizer.state, loss)
+                mx.eval(model.parameters(), optimizer.state)
 
-                train_loss = float(loss)
+                train_loss = acc_loss
                 self._train_loss_history.append(train_loss)
-                self._kl_history.append(float(kl_scalar))
+                self._kl_history.append(acc_kl)
                 self._global_step = step + 1
                 if args.logging_steps and (step % max(int(args.logging_steps), 1) == 0):
                     print(
                         f"Unsloth KTO: step {step + 1}/{total_steps} "
-                        f"loss={train_loss:.4f} kl={float(kl_scalar):.4f} "
+                        f"loss={train_loss:.4f} kl={acc_kl:.4f} "
                         f"(desirable={len(chosen_idx)} undesirable={len(rejected_idx)})"
                     )
                 step += 1
+                acc_grad = None
+                acc_loss = 0.0
+                acc_kl = 0.0
+                micro = 0
 
         # Honor the documented save_steps=0 contract (save at end of training),
         # matching MLXTrainer.train(). Without this the trained adapters live

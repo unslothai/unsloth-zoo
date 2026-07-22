@@ -63,7 +63,10 @@ def _load_peft():
 
 def _config(**overrides):
     from unsloth_zoo.mlx.trainer import MLXKTOConfig
+    # gradient_accumulation_steps=1 keeps these tests at one optimizer step per
+    # batch; the accumulation path has its own test below.
     base = dict(per_device_train_batch_size=4, max_steps=6, warmup_steps=1,
+                gradient_accumulation_steps=1,
                 learning_rate=1e-4, beta=0.1, logging_steps=99, seed=3407, report_to="none")
     base.update(overrides)
     return MLXKTOConfig(**base)
@@ -88,6 +91,28 @@ def test_kto_trains_finite_and_decreasing(tmp_path):
     assert output["total_train_steps"] == 6
     # KL baseline recorded per step, finite and clamped >= 0.
     assert trainer._kl_history and all(math.isfinite(k) and k >= 0.0 for k in trainer._kl_history)
+
+
+@metal_only
+def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
+    # 24 examples / batch 4 = 6 micro-batches. With max_steps unset, one epoch
+    # is len(batches) // grad_accum optimizer steps: grad_accum=2 -> 3 steps,
+    # each averaging 2 micro-batches. If accumulation were ignored (one update
+    # per micro-batch) this would be 6 steps, so the history length pins that
+    # grad_accum actually groups micro-batches into optimizer steps.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(
+        model=model, tokenizer=tok, train_dataset=_dataset(),
+        args=_config(output_dir=str(tmp_path), max_steps=0,
+                     gradient_accumulation_steps=2),
+    )
+    output = trainer.train()
+    assert len(trainer._train_loss_history) == 3, trainer._train_loss_history
+    assert len(trainer._kl_history) == 3
+    assert output.global_step == 3
+    assert output["total_train_steps"] == 3
+    assert all(math.isfinite(x) for x in trainer._train_loss_history)
 
 
 @metal_only
