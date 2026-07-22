@@ -4358,6 +4358,19 @@ class MLXKTOTrainer(MLXTrainer):
                     )
                 step += 1
 
+        # Honor the documented save_steps=0 contract (save at end of training),
+        # matching MLXTrainer.train(). Without this the trained adapters live
+        # only in memory and are lost on process exit unless the caller knows to
+        # call save_model() by hand. KTO is LoRA-only, so save_model() takes the
+        # adapter path.
+        if self.is_main_process:
+            try:
+                self.save_model()
+            except ValueError as e:
+                print(f"Unsloth: skipped final save ({e})")
+            else:
+                print(f"Unsloth: Saved final adapters to {args.output_dir}")
+
         # Same result type as MLXTrainer.train(): callers reach for
         # output.metrics / output.global_step / output.training_loss, which a
         # bare list does not provide. The per-step losses stay available on

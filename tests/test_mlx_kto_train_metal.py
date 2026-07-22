@@ -91,6 +91,20 @@ def test_kto_trains_finite_and_decreasing(tmp_path):
 
 
 @metal_only
+def test_kto_saves_adapters_at_end(tmp_path):
+    # save_steps defaults to 0 (save at end); train() must leave adapters on
+    # disk, not only in memory, matching MLXTrainer.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
+                            args=_config(output_dir=str(tmp_path)))
+    trainer.train()
+    written = {p.name for p in tmp_path.iterdir()}
+    assert "adapters.safetensors" in written, f"no adapters saved: {sorted(written)}"
+    assert "adapter_config.json" in written, f"no adapter config saved: {sorted(written)}"
+
+
+@metal_only
 def test_lora_scales_restored_after_training(tmp_path):
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
