@@ -632,7 +632,8 @@ def _forward_chunked_fused_finalize(
             chunk_target = mx.take_along_axis(logits, mx.expand_dims(local_targets, -1), axis=1).squeeze(-1)
             target_logit = mx.where(in_chunk, chunk_target, target_logit)
             if sum_capped is not None:
-                sum_capped = sum_capped + logits.astype(mx.float32).sum(axis=-1)
+                # logits is already float32 here (cast above under the same guard)
+                sum_capped = sum_capped + logits.sum(axis=-1)
 
         lse = running_max + mx.log(running_sum_exp + 1e-9)
         if sum_capped is not None:
