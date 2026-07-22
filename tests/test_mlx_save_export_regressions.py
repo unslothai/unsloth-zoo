@@ -357,6 +357,50 @@ def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
     assert tokenizer("hi") == {"called": True}
 
 
+def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    marker, state = "<|image_1|>Describe it.", {"result": None}
+    def original(*_args, **_kwargs):
+        if isinstance(state["result"], Exception):
+            raise state["result"]
+        return marker if state["result"] is None else state["result"]
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    monkeypatch.setattr(prompt_utils, "_get_role_content", lambda item: (item["role"], item["content"]), raising=False)
+    monkeypatch.setattr(prompt_utils, "get_chat_template", lambda *_a, **_k: "fallback", raising=False)
+    monkeypatch.setattr(prompt_utils, "MODEL_CONFIG", {"phi3_v": object()}, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    for name in ("mlx_vlm.chat", "mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar", "mlx_vlm.server", "mlx_vlm.evals.utils"):
+        if name in sys.modules:
+            monkeypatch.setattr(sys.modules[name], "apply_chat_template", original, raising=False)
+    loader._ensure_vlm_prompt_utils_patched()
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe it."}]}]
+    render = lambda value, model_type="phi3_v", **kwargs: prompt_utils.apply_chat_template(object(), {"model_type": model_type}, value, **kwargs)
+
+    assert render(messages, num_images=1) == marker
+    assert render([{"role": "system", "content": "Be concise."}] + messages, num_images=1) == marker
+    assert render([{"role": "user", "content": [{"type": "audio"}]}], num_audios=1) == marker
+    assert render([{"role": "user", "content": [{"type": "audio"}]}], num_audios=2) == "fallback"
+    assert render(messages, num_images=2) == "fallback"
+    assert render(messages, model_type="unknown", num_images=1) == "fallback"
+    assert render(messages + [{"role": "user", "content": "Again."}], num_images=1) == "fallback"
+    nested = [{"role": "user", "content": [{"type": "group", "content": messages[0]["content"]}]}]
+    assert render(nested, num_images=1) == "fallback"
+    nested_text = [{"type": "group", "content": [{"type": "text", "text": "Policy"}]}]
+    assert render([{"role": "system", "content": nested_text}] + messages, num_images=1) == "fallback"
+    assert render([{"role": "User", "content": messages[0]["content"]}], num_images=1) == "fallback"
+    assert render([{**messages[0], "tool_calls": []}], num_images=1) == "fallback"
+    assert render([{"role": "user", "content": [{"type": "IMAGE"}, {"type": "TEXT", "text": "Describe it."}]}], num_images=1) == "fallback"
+    for video_type in ("video", "input_video", "video_url"):
+        assert render([{"role": "user", "content": [{"type": video_type}]}]) == "fallback"
+    assert render(messages, num_images=1, video="clip.mp4") == "fallback"
+    assert render(messages, num_images=1, return_messages=True) == messages
+    for state["result"] in ("", ValueError("rejected")):
+        assert render(messages, num_images=1) == "fallback"
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
     import torch
     from transformers.tokenization_utils_base import to_py_obj
