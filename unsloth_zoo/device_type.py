@@ -14,6 +14,8 @@
 
 __all__ = [
     "is_hip",
+    "get_amd_attention_implementation",
+    "get_amd_flash_attn_func",
     "get_device_type",
     "DEVICE_TYPE",
     "DEVICE_TYPE_TORCH",
@@ -212,6 +214,74 @@ def is_hip():
         return False
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 pass
+
+
+@functools.cache
+def get_amd_attention_implementation():
+    """
+    Return the best available attention implementation for AMD ROCm.
+
+    Priority:
+    1. "amd_aiter" — AMD aiter (pip install amd-aiter, ROCm >= 7.0 required)
+    2. "sdpa"      — PyTorch SDPA via MIOpen (always available on ROCm)
+
+    Returns: "amd_aiter" | "sdpa"
+    """
+    if not is_hip():
+        return "sdpa"
+
+    # Gate on ROCm >= 7.0 (amd-aiter has hard ABI dep on libamdhip64.so.7)
+    try:
+        rocm_version = _detect_rocm_major_minor()
+        if rocm_version is not None:
+            major = int(rocm_version.split(".")[0])
+            if major < 7:
+                return "sdpa"
+    except Exception:
+        return "sdpa"
+
+    # Check for amd-aiter (AMD AI Tensor Engine for ROCm)
+    try:
+        import importlib.util  # must import submodule explicitly (not bare importlib)
+        if importlib.util.find_spec("aiter") is not None:
+            import aiter as _aiter
+            # Validate: AMD AI tensor engine exposes flash_attn_func or FlashAttnFunc
+            if hasattr(_aiter, "flash_attn_func") or hasattr(_aiter, "FlashAttnFunc"):
+                return "amd_aiter"
+    except Exception:
+        pass
+
+    return "sdpa"
+
+
+@functools.cache
+def get_amd_flash_attn_func():
+    """
+    Return the amd-aiter flash attention function, or None if unavailable.
+
+    Checks both naming conventions across amd-aiter versions:
+    - flash_attn_func (newer, lowercase)
+    - FlashAttnFunc   (older, class-based callable)
+
+    Call signature: func(q, k, v, causal=True)
+    Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
+    Returns: output tensor, same shape as q
+    """
+    if get_amd_attention_implementation() != "amd_aiter":
+        return None
+    try:
+        import aiter as _aiter
+        if hasattr(_aiter, "flash_attn_func"):
+            return _aiter.flash_attn_func
+        if hasattr(_aiter, "FlashAttnFunc"):
+            # Class-based API: must call via .apply(); wrap in lambda so callers
+            # always receive a plain callable with signature (q, k, v, causal=True)
+            _cls = _aiter.FlashAttnFunc
+            return lambda q, k, v, causal=True: _cls.apply(q, k, v, causal)
+    except Exception:
+        pass
+    return None
+
 
 @functools.cache
 def get_device_type():
