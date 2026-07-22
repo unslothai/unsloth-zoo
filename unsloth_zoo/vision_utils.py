@@ -777,12 +777,19 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        # Accept image processors, audio-only processors (Qwen2-Audio, Voxtral,
-        # Granite-Speech, ... expose a feature_extractor but no image_processor),
-        # and combined vision+audio processors. Reject only a bare text tokenizer.
-        # feature_extractor is the same audio signal used by
-        # _fix_audio_feature_extractor_padding_side below.
-        if not hasattr(processor, "image_processor") and getattr(processor, "feature_extractor", None) is None:
+        # Accept image processors, audio-only processors, and combined
+        # vision+audio processors. Reject only a bare text tokenizer.
+        # Audio processors do not agree on one attribute name: Qwen2-Audio and
+        # Voxtral expose "feature_extractor", while Granite-Speech exposes
+        # "audio_processor" (see each model's processor .attributes in
+        # transformers), so both spellings are accepted here. getattr(...) is
+        # None rather than hasattr so a processor that defines the attribute and
+        # sets it to None is treated as not having it.
+        if (
+            getattr(processor, "image_processor", None) is None
+            and getattr(processor, "feature_extractor", None) is None
+            and getattr(processor, "audio_processor", None) is None
+        ):
             raise TypeError(
                 "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
             )

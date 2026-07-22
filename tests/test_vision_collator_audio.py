@@ -629,6 +629,24 @@ class _VisionProcessor(_ChatTemplateMixin):
         self.image_processor = object()
 
 
+class _AudioProcessorAttrProcessor(_ChatTemplateMixin):
+    # Granite-Speech shape: transformers names the audio sub-processor
+    # "audio_processor", not "feature_extractor" (see that model's processor
+    # .attributes). No image_processor either, so a gate that only knows
+    # feature_extractor rejects an audio model it is meant to support.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+
+class _NoneImageProcessor(_ChatTemplateMixin):
+    # Defines image_processor but leaves it None: hasattr() is True while there
+    # is no usable processor, so the gate must look at the value, not the name.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.image_processor = None
+
+
 class _TextOnlyProcessor(_ChatTemplateMixin):
     # Neither image_processor nor feature_extractor -> must still be rejected.
     def __init__(self):
@@ -652,6 +670,23 @@ def test_audio_only_processor_constructs():
     # Masking wiring is intact: the audio placeholder is in the padding ids.
     assert AUDIO_ID in collator.padding_token_ids.tolist()
     assert PAD_ID in collator.padding_token_ids.tolist()
+
+
+def test_audio_processor_attribute_processor_constructs():
+    # Granite-Speech exposes "audio_processor" instead of "feature_extractor";
+    # it must be accepted like any other audio-only processor.
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_AudioProcessorAttrProcessor(),
+    )
+    assert collator.processor.__class__.__name__ == "_AudioProcessorAttrProcessor"
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+
+
+def test_none_image_processor_still_rejected():
+    # hasattr() is True here but the attribute is None, so this is really a
+    # text-only processor and must not slip through the gate.
+    with pytest.raises(TypeError, match="image or audio processor"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_NoneImageProcessor())
 
 
 def test_text_only_processor_still_rejected():
