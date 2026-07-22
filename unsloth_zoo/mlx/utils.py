@@ -4973,6 +4973,11 @@ def _create_default_text_plan(
         schedule,
         max_seq_length=max_seq_length,
         pad_id=0,
+        # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) so the
+        # default text path keeps mlx-lm's causal-shift contract and bounded
+        # signatures, like the distributed/streaming builders.
+        minimum_width=2,
+        pad_to_multiple=32,
         visit_policy="epoch_permute" if num_batches is None else "identity",
         visit_seed=seed,
     )

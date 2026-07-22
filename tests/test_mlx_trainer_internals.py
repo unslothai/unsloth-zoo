@@ -149,6 +149,31 @@ def test_finite_text_training_plan_keeps_long_schedule_cpu_only():
     ]
 
 
+def test_default_text_plan_uses_mlx_lm_padding():
+    # Regression: the default (non-pretokenized) finite text plan must pad to
+    # mlx-lm's 1 + 32*ceil(len/32) width, not the raw row length, so it keeps
+    # the causal-shift contract and the bounded compile signatures.
+    from unsloth_zoo.mlx.utils import _create_default_text_plan
+
+    class _DS:
+        def __init__(self, lengths):
+            self._rows = [(list(range(1, n + 1)), 1) for n in lengths]
+
+        def __len__(self):
+            return len(self._rows)
+
+        def __getitem__(self, index):
+            return self._rows[index]
+
+        def itemlen(self, index):
+            return len(self._rows[index][0])
+
+    plan = _create_default_text_plan(
+        _DS([14]), batch_size=1, max_seq_length=2048, num_batches=1, seed=0,
+    )
+    assert plan.batch_width(0) == 33  # 1 + 32*ceil(14/32)
+
+
 def _make_shape_guard_text_plan(widths, *, schedules=None, labeled=True):
     from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
 
