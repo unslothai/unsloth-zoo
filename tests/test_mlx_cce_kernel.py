@@ -371,6 +371,11 @@ def test_dead_tie_flag_fails_closed_to_unknown():
             _lm(nn, args_flag=truthy, head=head(), call_src="flag_guarded")).status == "tied"
     assert U.describe_output_head(
         _lm(nn, args_flag="", head=head(), call_src="calls_lm_head")).status == "untied"
+    # A config-only truthy flag is read; with no resolvable anchor it fails
+    # closed to unknown, never falling through to a (dead) lm_head.
+    cfg = _lm(nn, head=head(), call_src="calls_lm_head")
+    cfg.model, cfg.config = nn.Module(), type("C", (), {"tie_word_embeddings": True})()
+    assert U.describe_output_head(cfg).status == "unknown"
 
 
 def test_is_lm_head_trainable_follows_descriptor_path():

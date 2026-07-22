@@ -795,7 +795,9 @@ def describe_output_head(model):
     )
 
     flags, flag_attr_present = [], False
-    for holder in (tm, getattr(tm, "args", None)):
+    # Include config: some models (e.g. VLM language stacks) carry the live
+    # tie flag only on tm.config, the same site logit_scale/softcap are read from.
+    for holder in (tm, getattr(tm, "args", None), getattr(tm, "config", None)):
         if holder is None or not hasattr(holder, "tie_word_embeddings"):
             continue
         flag_attr_present = True
@@ -808,7 +810,7 @@ def describe_output_head(model):
             flags.append(bool(value))
         except Exception:
             pass
-    conflicting = len(flags) == 2 and flags[0] != flags[1]
+    conflicting = len(set(flags)) > 1
 
     # An uncorroborated True flag: the analyzed route calls a live lm_head
     # at EITHER supported location (any type — a wrapped head the forward
@@ -832,8 +834,12 @@ def describe_output_head(model):
     head, path, status = None, None, "unknown"
     if conflicting:
         pass
-    elif flags and flags[0] and emb_entry is not None:
-        if not flag_contradicted:
+    elif flags and flags[0]:
+        # A truthy tie flag routes the forward through the embedding: resolve
+        # that anchor (unless the flag is contradicted), else fail closed to
+        # unknown -- never fall through to a possibly-dead lm_head, which would
+        # train the wrong weight.
+        if emb_entry is not None and not flag_contradicted:
             head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
     elif getattr(tm, "lm_head", None) is not None:
         head, path, status = tm.lm_head, prefix + "lm_head", "untied"
