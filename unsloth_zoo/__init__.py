@@ -400,6 +400,11 @@ if not _SKIP_GPU_INIT:
         import sys as _sys  # the MLX-alias _sys was del'd above; re-import locally
         # Did the user pin a BLAS backend? If so, do not override it at runtime.
         _user_blas = "TORCH_BLAS_PREFER_HIPBLASLT" in os.environ or "TORCH_BLAS_PREFER_CUBLASLT" in os.environ
+        # Did they pin it to the LT backend specifically? Then leave addmm on it too.
+        _user_wants_lt = any(
+            os.environ.get(_k, "").strip().lower() in ("1", "on", "true", "yes")
+            for _k in ("TORCH_BLAS_PREFER_HIPBLASLT", "TORCH_BLAS_PREFER_CUBLASLT")
+        )
         try:
             import torch as _torch
             _rocm_arch = str(getattr(
@@ -415,7 +420,8 @@ if not _SKIP_GPU_INIT:
         ):
             os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
             os.environ.setdefault("TORCH_BLAS_PREFER_CUBLASLT", "0")
-            os.environ.setdefault("DISABLE_ADDMM_HIP_LT", "1")
+            if not _user_wants_lt:
+                os.environ.setdefault("DISABLE_ADDMM_HIP_LT", "1")
             # Non-Windows: also flip at runtime (no-op setter on Windows). Skip when
             # the user pinned a backend, so an explicit hipBLASLt choice is honoured.
             if not _user_blas and _sys.platform != "win32" and _torch is not None:
@@ -424,7 +430,7 @@ if not _SKIP_GPU_INIT:
                     try: _pref("cublas")  # prefer rocBLAS on ROCm
                     except Exception: pass  # best-effort; some builds lack the setter
                 del _pref
-        del _torch, _rocm_arch, _sys, _user_blas
+        del _torch, _rocm_arch, _sys, _user_blas, _user_wants_lt
     del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
     del clean_expandable_segments_value
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
