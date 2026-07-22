@@ -348,6 +348,7 @@ payload = {
     "ddp_compile_param_delta": ddp_compile_param_delta,
     "ddp_compile_enabled": bool(ddp_compile_result["compile_enabled"]),
     "ddp_compile_scope": ddp_compile_result["compile_scope"],
+    "ddp_compile_shape_guard": ddp_compile_result["compile_shape_guard"],
     "ddp_eager_tokens": int(ddp_eager_result["trained_tokens"]),
     "ddp_compile_tokens": int(ddp_compile_result["trained_tokens"]),
     "strict_error": strict_error,
@@ -392,8 +393,8 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [
         str(launcher), "-n", "2", "--backend", "ring",
-        "--cwd", str(repo_root),
-        "--", sys.executable, str(script), str(tmp_path),
+        "--python", sys.executable, "--cwd", str(repo_root),
+        sys.executable, str(script), str(tmp_path),
     ]
     proc = subprocess.run(
         cmd, capture_output=True, env=env, text=True, timeout=120,
@@ -404,7 +405,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert all(path.exists() for path in outputs), proc.stdout + proc.stderr
     ranks = [json.loads(path.read_text()) for path in outputs]
     expected = [[[10, 12], [14, 11]], [[11, 13], [10, 12]]]
-    expected_stream = [[[10, 12], [14, 14]], [[11, 13], [14, 14]]]
+    expected_vlm_stream = [[[10, 12], [14, 14]], [[11, 13], [14, 14]]]
     assert [rank["size"] for rank in ranks] == [2, 2]
     assert [rank["synced_stop"] for rank in ranks] == [True, True]
     assert [rank["loop_main"] for rank in ranks] == [True, False]
@@ -443,6 +444,12 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["ddp_compile_param_delta"] < 1e-5
     assert [rank["ddp_compile_enabled"] for rank in ranks] == [True, True]
     assert [rank["ddp_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert all(
+        rank["ddp_compile_shape_guard"]["compile_scope"] == "ddp_local_grad"
+        and rank["ddp_compile_shape_guard"]["planned_signatures"]
+        <= rank["ddp_compile_shape_guard"]["cap"]
+        for rank in ranks
+    )
     assert [rank["ddp_eager_tokens"] for rank in ranks] == [rank["ddp_compile_tokens"] for rank in ranks]
     assert all("runtime fallback is disabled" in rank["strict_error"] for rank in ranks)
     assert [rank["best_effort_compile_enabled"] for rank in ranks] == [False, False]
@@ -492,5 +499,5 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["vlm_empty_eval"][1]["ids"][0][1] == 20
     assert ranks[1]["vlm_empty_eval"][1]["mask"][0] == [1, 1, 1, 1]
     assert all(value == -100 for value in ranks[1]["vlm_empty_eval"][1]["labels"][0])
-    assert [rank["stream_text"] for rank in ranks] == expected_stream
-    assert [rank["stream_vlm"] for rank in ranks] == expected_stream
+    assert [rank["stream_text"] for rank in ranks] == expected
+    assert [rank["stream_vlm"] for rank in ranks] == expected_vlm_stream

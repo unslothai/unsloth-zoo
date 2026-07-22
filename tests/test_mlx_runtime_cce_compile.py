@@ -200,6 +200,35 @@ def test_quantized_runtime_cce_zero_tokens_returns_empty_losses_and_zero_gradien
     assert mx.sum(mx.abs(grad).astype(mx.float32)).item() == pytest.approx(0.0)
 
 
+def test_quantized_runtime_cce_cache_omits_weight_gradient_start_arrays():
+    import inspect
+    import mlx.nn as nn
+
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    linear = nn.Linear(32, 32, bias=False)
+    qlinear = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=4)
+    runtime_cce, _ = make_chunked_cross_entropy_loss(
+        chunk_size=16,
+        quantized=True,
+        group_size=qlinear.group_size,
+        bits=qlinear.bits,
+    )
+    losses = runtime_cce(
+        mx.ones((2, 32), dtype=mx.float32),
+        qlinear.weight,
+        qlinear.scales,
+        qlinear.biases,
+        mx.array([0, 1], dtype=mx.int32),
+    )
+    mx.eval(losses)
+
+    cache_info = runtime_cce._unsloth_chunk_plan_cache_info
+    assert cache_info()["entries"] == 1
+    cache = inspect.getclosurevars(cache_info).nonlocals["chunk_plan_cache"]
+    assert all(plan[3] == () for plan in cache.values())
+
+
 @pytest.mark.parametrize("bad_target", [-1, 32])
 def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
     _skip_torch_shim()

@@ -29,7 +29,9 @@ if _METAL:
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
-    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+    from unsloth_zoo.mlx.utils import (
+        FiniteTextBatchPlan, _FiniteTextRow, make_baseline_loss_fn,
+    )
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
@@ -120,12 +122,13 @@ def _norm_model(seed=77, dtype=None):
 
 
 def _norm_batches(count):
+    # A CPU batch plan (not a raw list) keeps compiled runs compile-eligible.
     rows = ([1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14, 15])
-    return [
-        (mx.array([rows[i % 3]], dtype=mx.int32),
-         mx.array([[0, len(rows[i % 3])]], dtype=mx.int32), None)
-        for i in range(count)
-    ]
+    return FiniteTextBatchPlan(
+        [_FiniteTextRow(input_ids=tuple(row)) for row in rows],
+        [(i % 3,) for i in range(count)],
+        max_seq_length=8, pad_id=0,
+    )
 
 
 _CLIP = {
@@ -179,6 +182,7 @@ def _norm_train(tmp_path, mode, *, report=False, compiled=False, accum=1,
 
 
 def _oracle_norm(batches, seed=77):
+    batches = batches.materialize_all()
     model = _norm_model(seed)
     acc, toks = None, mx.array(0.0, dtype=mx.float32)
     for batch in batches:
