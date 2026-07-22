@@ -828,17 +828,15 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
 # (fp16 request on non-bf16 GPUs keeps the fp16 vision tower with autocast
 # off). E2B / E4B (hidden 768, clipped linears) and bf16 / fp32 are safe.
 #
-# Fix mirrors upstream >= 5.10.1: run the pooler in fp32 (its ops all preserve
-# dtype, so casting the input matches the fixed fp32 output up to fp16 rounding
-# and never overflows), let promotion carry fp32 through the caller's
-# standardization (std_bias cancels the large values; buffer amax 53760 is
-# inside fp16 range), then cast last_hidden_state back to the encoder dtype in
-# Gemma4VisionModel.forward. The cast target is the actual embedder output
-# dtype (upstream's inputs_embeds.dtype) and only engages for fp16 towers, so
-# bf16 / fp32 setups are bit-identical to upstream. Wrappers call the original
-# forwards, preserving HF decorators (@merge_with_config_defaults /
-# @capture_outputs); the already-fixed upstream cast-back makes the wrapper a
-# no-op there.
+# Fix mirrors upstream >= 5.10.1: run the pooler in fp32 (dtype-preserving ops
+# make the cast input match the fixed output up to fp16 rounding, never
+# overflowing), let fp32 carry through the caller's standardization (std_bias
+# cancels the large values; buffer amax 53760 is in fp16 range), then cast
+# last_hidden_state back in Gemma4VisionModel.forward to the actual embedder
+# output dtype (inputs_embeds.dtype). Only fp16 towers engage, so bf16 / fp32
+# stay bit-identical to upstream. Wrappers call the original forwards to
+# preserve HF decorators (@merge_with_config_defaults / @capture_outputs); on
+# already-fixed upstream the cast-back is a no-op.
 #
 # Source-pattern classification (not version compares) stays correct on every
 # release including the yanked 5.10.0: fixed sources skip, unknown (future
