@@ -3952,7 +3952,54 @@ def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
     return min(int(max_seq_length), width)
 
 
-class FiniteTextBatchPlan:
+class _FiniteVisitMixin:
+    """Absolute-visit mapping shared by finite CPU batch plans."""
+
+    __slots__ = ()
+
+    _VISIT_POLICIES = ("identity", "epoch_permute")
+
+    @property
+    def visit_policy(self):
+        return self._visit_policy
+
+    def batch_index_for_visit(self, absolute_visit):
+        """Map an absolute batch visit to one stored schedule index.
+
+        Identity plans replay the stored schedule cyclically (the historical
+        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
+        order for epoch 0, then visit a deterministic permutation of the same
+        batch multiset in every later epoch, derived only from the normalized
+        seed and the epoch — never from ambient RNG state.
+        """
+        count = len(self._schedule)
+        if count == 0:
+            raise ValueError("cannot resolve a visit on an empty schedule")
+        # operator.index rejects fractional/np-float visits instead of
+        # silently truncating them onto a neighboring visit.
+        visit = operator.index(absolute_visit)
+        if visit < 0:
+            raise ValueError("absolute_visit must be non-negative")
+        epoch, position = divmod(visit, count)
+        if self._visit_policy != "epoch_permute" or epoch == 0:
+            return position
+        cached = self._visit_epoch_cache
+        if cached is None or cached[0] != epoch:
+            cached = (epoch, self._build_visit_permutation(epoch))
+            self._visit_epoch_cache = cached
+        return cached[1][position]
+
+    def _build_visit_permutation(self, epoch):
+        """One O(len) deterministic permutation build per epoch transition."""
+        rng = np.random.RandomState(
+            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
+        )
+        return tuple(
+            int(index) for index in rng.permutation(len(self._schedule))
+        )
+
+
+class FiniteTextBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite text schedule with on-demand MLX materialization."""
 
     __slots__ = (
@@ -3969,8 +4016,6 @@ class FiniteTextBatchPlan:
         "_visit_seed",
         "_visit_epoch_cache",
     )
-
-    _VISIT_POLICIES = ("identity", "epoch_permute")
 
     def __init__(
         self,
@@ -4031,45 +4076,6 @@ class FiniteTextBatchPlan:
 
     def __len__(self):
         return len(self._schedule)
-
-    @property
-    def visit_policy(self):
-        return self._visit_policy
-
-    def batch_index_for_visit(self, absolute_visit):
-        """Map an absolute batch visit to one stored schedule index.
-
-        Identity plans replay the stored schedule cyclically (the historical
-        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
-        order for epoch 0, then visit a deterministic permutation of the same
-        batch multiset in every later epoch, derived only from the normalized
-        seed and the epoch — never from ambient RNG state.
-        """
-        count = len(self._schedule)
-        if count == 0:
-            raise ValueError("cannot resolve a visit on an empty schedule")
-        # operator.index rejects fractional/np-float visits instead of
-        # silently truncating them onto a neighboring visit.
-        visit = operator.index(absolute_visit)
-        if visit < 0:
-            raise ValueError("absolute_visit must be non-negative")
-        epoch, position = divmod(visit, count)
-        if self._visit_policy != "epoch_permute" or epoch == 0:
-            return position
-        cached = self._visit_epoch_cache
-        if cached is None or cached[0] != epoch:
-            cached = (epoch, self._build_visit_permutation(epoch))
-            self._visit_epoch_cache = cached
-        return cached[1][position]
-
-    def _build_visit_permutation(self, epoch):
-        """One O(len) deterministic permutation build per epoch transition."""
-        rng = np.random.RandomState(
-            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
-        )
-        return tuple(
-            int(index) for index in rng.permutation(len(self._schedule))
-        )
 
     def batch_width(self, index):
         # Explicit widths are authoritative; skip the per-row length scan
@@ -5056,6 +5062,7 @@ def _filter_trainable_vlm_indices(
     """Filter VLM rows before batching, matching CUDA dataset.filter order."""
     kept_indices = []
     formatted_items = {} if formatting_func is not None else None
+    supervision = {}
     removed = 0
     for idx in indices:
         item = dataset[idx]
@@ -5073,38 +5080,222 @@ def _filter_trainable_vlm_indices(
             completion_only_loss=completion_only_loss,
             return_prompt_completion=True,
         )
+        valid_rows = _vlm_trainable_label_rows(batch_dict)
+        # Removal keeps the causal-shift predicate; the checker flag uses the
+        # legacy full-row predicate (a 1-token row can be checker-good while
+        # shift-untrainable, and the all-masked checker must match legacy).
+        labels = batch_dict.get("labels")
+        if labels is None:
+            checker_good = True
+        else:
+            first_row = labels.tolist()[0]
+            checker_good = any(int(x) != -100 for x in first_row)
         if is_prompt_completion:
             kept_indices.append(idx)
+            supervision[idx] = checker_good
             if formatted_items is not None:
                 formatted_items[idx] = item
             continue
-        valid_rows = _vlm_trainable_label_rows(batch_dict)
         if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
             removed += 1
             continue
         kept_indices.append(idx)
+        supervision[idx] = checker_good
         if formatted_items is not None:
             formatted_items[idx] = item
-    return kept_indices, removed, formatted_items
+    return kept_indices, removed, formatted_items, supervision
 
 
-def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
+class _FiniteVLMRow:
+    """CPU-side formatted VLM item plus its checker-supervision flag."""
+
+    __slots__ = ("item", "checker_good")
+
+    def __init__(self, item, checker_good=True):
+        self.item = item
+        self.checker_good = bool(checker_good)
+
+
+class FiniteVLMBatchPlan(_FiniteVisitMixin):
+    """CPU-backed finite VLM schedule with on-demand MLX materialization.
+
+    Rows hold formatted dataset items (``formatting_func`` is consumed once
+    at construction), the schedule holds compact row positions with a mask of
+    distributed pad slots, and the plan-owned cache retains exactly the most
+    recent batch (callers own anything they keep beyond that). Visits are identity-only: merged VLM epoch
+    semantics replay the stored schedule, so epoch permutation remains a
+    text-plan behavior.
+    """
+
+    __slots__ = (
+        "_rows",
+        "_schedule",
+        "_empty_masks",
+        "_processor",
+        "_config",
+        "max_seq_length",
+        "_image_size",
+        "_response_mask_fn",
+        "_ignore_token_ids",
+        "_completion_only_loss",
+        "_visit_policy",
+        "_visit_seed",
+        "_visit_epoch_cache",
+        "_mru",
+    )
+
+    def __init__(
+        self,
+        rows,
+        schedule,
+        empty_masks,
+        *,
+        processor,
+        config,
+        max_seq_length,
+        image_size,
+        response_mask_fn=None,
+        ignore_token_ids=None,
+        completion_only_loss=None,
+    ):
+        self._rows = tuple(rows)
+        self._schedule = tuple(tuple(int(i) for i in batch) for batch in schedule)
+        self._empty_masks = (
+            None if empty_masks is None else tuple(
+                None if mask is None else tuple(bool(x) for x in mask)
+                for mask in empty_masks
+            )
+        )
+        self._processor = processor
+        self._config = config
+        self.max_seq_length = int(max_seq_length)
+        self._image_size = image_size
+        self._response_mask_fn = response_mask_fn
+        self._ignore_token_ids = ignore_token_ids
+        self._completion_only_loss = completion_only_loss
+        self._visit_policy = "identity"
+        self._visit_seed = None
+        self._visit_epoch_cache = None
+        self._mru = None
+        if self._empty_masks is not None and (
+            len(self._empty_masks) != len(self._schedule)
+        ):
+            raise ValueError(
+                "empty_masks must contain one entry per scheduled batch"
+            )
+        for batch in self._schedule:
+            for row_index in batch:
+                if not 0 <= row_index < len(self._rows):
+                    raise ValueError(
+                        "schedule references a row outside the stored rows"
+                    )
+
+    @property
+    def rows(self):
+        return self._rows
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    def __len__(self):
+        return len(self._schedule)
+
+    def materialize(self, index):
+        """Build one batch through the complete existing VLM builder.
+
+        The tensor-bearing cache holds exactly the most recent batch so a
+        repeated fetch (e.g. a compile-failure retry) is free while live
+        scheduled inputs stay bounded by the current batch.
+        """
+        index = operator.index(index)
+        cached = self._mru
+        if cached is not None and cached[0] == index:
+            return cached[1]
+        batch_items = [self._rows[i].item for i in self._schedule[index]]
+        batch_dict = _build_response_masked_vlm_batch(
+            batch_items,
+            self._processor,
+            self._config,
+            self.max_seq_length,
+            self._image_size,
+            response_mask_fn=self._response_mask_fn,
+            formatting_func=None,
+            ignore_token_ids=self._ignore_token_ids,
+            completion_only_loss=self._completion_only_loss,
+        )
+        empty = (
+            self._empty_masks[index] if self._empty_masks is not None else None
+        )
+        if empty is not None and any(empty):
+            batch_dict = _mask_empty_vlm_padding_rows(
+                batch_dict, list(empty), processor=self._processor,
+            )
+        self._mru = (index, batch_dict)
+        return batch_dict
+
+    def __getitem__(self, index):
+        return self.materialize(index)
+
+    def materialize_all(self):
+        """Eager-list compatibility: build and evaluate every batch."""
+        batches = [self.materialize(index) for index in range(len(self))]
+        all_tensors = []
+        for batch_dict in batches:
+            for value in batch_dict.values():
+                if isinstance(value, mx.array):
+                    all_tensors.append(value)
+        if all_tensors:
+            mx.eval(all_tensors)
+        return batches
+
+    def supervision_counts(self, max_check=100):
+        """(all_masked_rows, trainable_rows) over the first ``max_check``
+        scheduled rows, from construction-time metadata. This method performs
+        no additional processor work or materialization, so a caller's
+        distributed reduction is never preceded by new rank-local work."""
+        seen_bad = 0
+        seen_good = 0
+        checked = 0
+        for batch_index, batch in enumerate(self._schedule):
+            empty = (
+                self._empty_masks[batch_index]
+                if self._empty_masks is not None else None
+            )
+            for slot, row_index in enumerate(batch):
+                padded = bool(empty[slot]) if empty is not None else False
+                if padded or not self._rows[row_index].checker_good:
+                    seen_bad += 1
+                else:
+                    seen_good += 1
+                checked += 1
+                if checked >= max_check:
+                    return seen_bad, seen_good
+        return seen_bad, seen_good
+
+
+
+def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
                        num_epochs=None, completion_only_loss=None,
                        image_size=None, comm_group=None,
                        distributed_pad_mode="cycle"):
-    """Pre-materialize VLM training batches using the processor directly.
+    """Build the CPU-backed finite VLM batch plan (no materialization).
 
-    Mirrors Unsloth's GPU UnslothVisionDataCollator:
-    resize images → processor(text, images, padding=True) → uniform batches.
+    Mirrors the eager builder's construction exactly — filtering, formatting,
+    epoch/global slicing, rank slicing, and pad-slot resolution — but stores
+    row indices and pad masks instead of built batches. Returns ``None`` for
+    an empty dataset (the wrapper preserves the historical ``[]``).
     """
     import numpy as np
 
     image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
-    batch_list = []
+    schedule = []
+    empty_masks = []
+    any_empty = False
     seen = 0
     epoch = 0
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
@@ -5113,8 +5304,9 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     base_indices = list(range(len(dataset)))
     total_removed = 0
     formatted_items = None
+    _supervision = None
     if response_mask_fn is not None:
-        base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+        base_indices, total_removed, formatted_items, _supervision = _filter_trainable_vlm_indices(
             dataset,
             base_indices,
             processor,
@@ -5132,15 +5324,13 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                 "train_on_responses_only masking. Check instruction_part / "
                 "response_part and max_seq_length."
             )
-    batch_formatting_func = None if formatted_items is not None else formatting_func
-
     def _item(idx):
         return formatted_items[idx] if formatted_items is not None else dataset[idx]
 
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
     if not base_indices:
-        return []
+        return None
 
     def _epoch_indices(epoch_idx):
         """Return CUDA-style sampler order over the filtered VLM dataset."""
@@ -5157,7 +5347,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 
     indices = _epoch_indices(epoch)
 
-    while num_batches is None or len(batch_list) < num_batches:
+    while num_batches is None or len(schedule) < num_batches:
         if seen >= len(indices):
             if num_batches is None and target_epochs is not None and epoch + 1 >= target_epochs:
                 break
@@ -5183,28 +5373,13 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             pad_idx = next((idx for idx in bi if idx is not None), None)
             if pad_idx is None:
                 pad_idx = global_indices[0]
-            batch_items = [
-                _item(pad_idx if idx is None else idx)
-                for idx in bi
-            ]
+            resolved = [pad_idx if idx is None else idx for idx in bi]
+            any_empty = True
+            empty_masks.append(tuple(empty_rows))
         else:
-            batch_items = [_item(idx) for idx in bi]
-        batch_dict = _build_response_masked_vlm_batch(
-            batch_items,
-            processor,
-            config,
-            max_seq_length,
-            image_size,
-            response_mask_fn=response_mask_fn,
-            formatting_func=batch_formatting_func,
-            ignore_token_ids=ignore_token_ids,
-            completion_only_loss=completion_only_loss,
-        )
-        if any(empty_rows):
-            batch_dict = _mask_empty_vlm_padding_rows(
-                batch_dict, empty_rows, processor=processor,
-            )
-        batch_list.append(batch_dict)
+            resolved = list(bi)
+            empty_masks.append(None)
+        schedule.append(tuple(resolved))
 
     if total_removed > 0:
         print(
@@ -5212,16 +5387,60 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             f"were -100 after train_on_responses_only masking."
         )
 
-    # Evaluate all tensors
-    all_tensors = []
-    for bd in batch_list:
-        for v in bd.values():
-            if isinstance(v, mx.array):
-                all_tensors.append(v)
-    if all_tensors:
-        mx.eval(all_tensors)
+    # Compact remap: store only rows the schedule references, so dropped and
+    # never-scheduled dataset rows are neither formatted nor retained.
+    used = []
+    seen_used = set()
+    for batch in schedule:
+        for idx in batch:
+            if idx not in seen_used:
+                seen_used.add(idx)
+                used.append(idx)
+    if formatting_func is not None and formatted_items is None:
+        # Consume formatting exactly once per referenced row, in first-visit
+        # order, so lazy re-materialization never re-invokes user code and
+        # unscheduled rows never reach the formatter (legacy parity: the
+        # eager builder only formatted rows it actually batched).
+        formatted_items = {idx: formatting_func(dataset[idx]) for idx in used}
+    position = {idx: pos for pos, idx in enumerate(used)}
+    rows = tuple(
+        _FiniteVLMRow(
+            _item(idx),
+            True if _supervision is None else _supervision[idx],
+        )
+        for idx in used
+    )
+    schedule = [tuple(position[idx] for idx in batch) for batch in schedule]
+    return FiniteVLMBatchPlan(
+        rows,
+        schedule,
+        empty_masks if any_empty else None,
+        processor=processor,
+        config=config,
+        max_seq_length=max_seq_length,
+        image_size=image_size,
+        response_mask_fn=response_mask_fn,
+        ignore_token_ids=ignore_token_ids,
+        completion_only_loss=completion_only_loss,
+    )
 
-    return batch_list
+
+def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
+                       num_batches=None, seed=42, response_mask_fn=None,
+                       formatting_func=None, dataset_order="default",
+                       num_epochs=None, completion_only_loss=None,
+                       image_size=None, comm_group=None,
+                       distributed_pad_mode="cycle"):
+    """Eager-list compatibility wrapper over the finite VLM batch plan."""
+    plan = _create_vlm_batch_plan(
+        dataset, processor, config, batch_size, max_seq_length,
+        num_batches=num_batches, seed=seed,
+        response_mask_fn=response_mask_fn, formatting_func=formatting_func,
+        dataset_order=dataset_order, num_epochs=num_epochs,
+        completion_only_loss=completion_only_loss, image_size=image_size,
+        comm_group=comm_group, distributed_pad_mode=distributed_pad_mode,
+    )
+    return [] if plan is None else plan.materialize_all()
 
 
 def iterate_vlm_training_batches(dataset, processor, config, batch_size,
@@ -5264,7 +5483,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         total_removed = 0
         formatted_items = None
         if response_mask_fn is not None:
-            base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+            base_indices, total_removed, formatted_items, _supervision = _filter_trainable_vlm_indices(
                 dataset,
                 base_indices,
                 processor,

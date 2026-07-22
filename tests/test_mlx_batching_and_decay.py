@@ -313,3 +313,142 @@ def test_norm_output_cast_does_not_double_patch_inherited_norm_call():
         "_unsloth_norm_output_cast_wrapper",
         False,
     )
+
+
+class _CountingProcessor(_ContentProcessor):
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        return super().__call__(text, **kwargs)
+
+
+def _digest_vlm_batches(batches):
+    """Complete-pytree digest: sorted keys, per-array dtype/shape/values,
+    non-array constants verbatim — the serialization the frozen goldens use."""
+    out = []
+    for batch in batches:
+        entry = []
+        for key in sorted(batch.keys()):
+            value = batch[key]
+            if isinstance(value, mx.array):
+                def _tuplify(x):
+                    return (
+                        tuple(_tuplify(item) for item in x)
+                        if isinstance(x, list) else x
+                    )
+                # dtype-native values: float drift must fail the oracle.
+                entry.append((
+                    key, str(value.dtype), tuple(value.shape),
+                    _tuplify(value.tolist()),
+                ))
+            else:
+                entry.append((key, "const", repr(value)))
+        out.append(tuple(entry))
+    return tuple(out)
+
+
+class _MultiModalityStyleProcessor(_ContentProcessor):
+    """Representative of prepare-time sequence expansion: negative-free
+    placeholder ids are repeated by _expand_image_token_sequences for
+    multi_modality model types, changing the final text width."""
+
+    def __call__(self, text, **kwargs):
+        rows = [[int(t), 250, 2] for t in text]
+        return {
+            "input_ids": np.array(rows, dtype=np.int64),
+            "attention_mask": np.array([[1, 1, 1]] * len(rows), dtype=np.int32),
+            "pixel_values": np.full((len(rows), 2), 0.5, dtype=np.float32),
+        }
+
+
+class _FakeWorld:
+    def __init__(self, rank): self._rank = rank
+    def rank(self): return self._rank
+    def size(self): return 2
+
+
+def test_finite_vlm_plan_reproduces_merged_main_goldens():
+    """Independent oracle: complete-pytree digests frozen from the pre-plan
+    eager builder on merged main. Two smoke modes cover the plain default
+    epoch-replay path and the multi_modality prepare-time image-token
+    expansion path; the full 11-mode golden matrix is retained as recorded
+    validation evidence outside the repository."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    # Frozen full-pytree batch digests captured from the pre-plan eager VLM
+    # builder on merged main (independent parity oracle). Values are
+    # dtype-native; regenerate only from a tree WITHOUT the plan diff.
+    GOLDENS = {
+        "default_epoch_replay": ((('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((0, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((0, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((0, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((1, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((1, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((1, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((2, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((2, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((2, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((3, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((3, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((3, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((4, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((4, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((4, -100, 2),)))),
+        "multi_modality_expansion": ((('attention_mask', 'mlx.core.int32', (1, 5), ((1, 1, 1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 5), ((0, 250, 250, 250, 2),)), ('labels', 'mlx.core.int64', (1, 5), ((0, -100, -100, -100, 2),)), ('pixel_values', 'mlx.core.float32', (1, 2), ((0.5, 0.5),))), (('attention_mask', 'mlx.core.int32', (1, 5), ((1, 1, 1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 5), ((1, 250, 250, 250, 2),)), ('labels', 'mlx.core.int64', (1, 5), ((1, -100, -100, -100, 2),)), ('pixel_values', 'mlx.core.float32', (1, 2), ((0.5, 0.5),)))),
+    }
+    cfg = {"image_size": 16, "image_token_id": 200}
+    ds5 = [{"text": str(i)} for i in range(5)]
+    cases = {
+        "default_epoch_replay": (dict(dataset=ds5, batch_size=1, max_seq_length=8), _ContentProcessor(), cfg),
+        "multi_modality_expansion": (dict(dataset=[{"text": str(i)} for i in range(2)], batch_size=1, max_seq_length=16, dataset_order="sequential"), _MultiModalityStyleProcessor(), {"image_size": 16, "image_token_id": 200, "image_token_index": 250, "num_image_tokens": 3, "model_type": "multi_modality"}),
+    }
+    assert sorted(cases) == sorted(GOLDENS)
+    for name, (kwargs, processor, config) in cases.items():
+        kwargs = dict(kwargs)
+        dataset = kwargs.pop("dataset")
+        plan = _create_vlm_batch_plan(
+            dataset=dataset, processor=processor, config=config, **kwargs,
+        )
+        assert plan.visit_policy == "identity", name
+        assert _digest_vlm_batches(plan.materialize_all()) == GOLDENS[name], name
+        assert [
+            plan.batch_index_for_visit(v) for v in range(2 * len(plan))
+        ] == [v % len(plan) for v in range(2 * len(plan))], name
+
+
+def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeypatch):
+    """The pad-slot rank has bad>0 metadata; the checker must reach the
+    all_sum collective without any processor call or materialization even
+    when the processor would fail — a failing rank must not strand peers."""
+    _skip_if_mlx_core_was_replaced()
+    import mlx.core as mx_core
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    processor = _CountingProcessor()
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(5)],
+        processor=processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        comm_group=_FakeWorld(1),
+        distributed_pad_mode="empty",
+    )
+    assert plan.supervision_counts(100) == (1, 2)  # pad slot counts bad
+
+    def poisoned(self, *_a, **_k):
+        raise AssertionError("checker must not invoke the processor")
+
+    # Special methods resolve on the type: poison the class, not the instance.
+    monkeypatch.setattr(_CountingProcessor, "__call__", poisoned)
+    calls_before_check = processor.calls
+    collective_calls = []
+    real_all_sum = mx_core.distributed.all_sum
+
+    def spy_all_sum(value, **kwargs):
+        collective_calls.append(value.tolist())
+        return value  # identity: single fake rank stands in for the sum
+
+    monkeypatch.setattr(mx_core.distributed, "all_sum", spy_all_sum)
+    try:
+        _check_vlm_all_masked(
+            plan, max_check=100, comm_group=_FakeWorld(1), world_size=2,
+        )
+    finally:
+        monkeypatch.setattr(mx_core.distributed, "all_sum", real_all_sum)
+    assert collective_calls == [[1, 2]]
+    assert processor.calls == calls_before_check
+
+
+    # No-materialization proof lives in the fake-rank collective test, which
+    # covers this single-process property strictly (poisoned class __call__).

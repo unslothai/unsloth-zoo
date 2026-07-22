@@ -387,7 +387,7 @@ def test_vlm_filter_caches_only_kept_formatted_rows():
                 labels.append([-100, 12, 13, 0])
         return {"labels": labels}
 
-    kept, removed, formatted_items = _filter_trainable_vlm_indices(
+    kept, removed, formatted_items, _supervision = _filter_trainable_vlm_indices(
         [{"text": "bad"}, {"text": "good"}],
         [0, 1],
         _ResponseMaskFilteringProcessor(),

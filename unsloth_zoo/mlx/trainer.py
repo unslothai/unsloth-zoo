@@ -176,6 +176,8 @@ from .utils import (
     create_batches,
     iterate_training_batches,
     create_vlm_batches,
+    _create_vlm_batch_plan,
+    FiniteVLMBatchPlan,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
@@ -224,6 +226,10 @@ from .shape_guard import (
     resolve_compile_max_variants,
     select_text_shape_padding_budget,
 )
+
+# Finite CPU-backed batch plans the trainer consumes through one protocol
+# (visit mapping, __getitem__/materialize, __len__).
+_FINITE_BATCH_PLAN_TYPES = (FiniteTextBatchPlan, FiniteVLMBatchPlan)
 
 
 def _is_hf_tokenizer(tokenizer):
@@ -3179,7 +3185,7 @@ class MLXTrainer:
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
-                if isinstance(batches, FiniteTextBatchPlan):
+                if isinstance(batches, _FINITE_BATCH_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
                 state = [model.state, optimizer.state, mx.random.state]
                 local_error = None
@@ -3216,7 +3222,7 @@ class MLXTrainer:
                     # retries all reuse this resolved stored index.
                     scheduled_index = (
                         batches.batch_index_for_visit(batch_idx)
-                        if isinstance(batches, FiniteTextBatchPlan)
+                        if isinstance(batches, _FINITE_BATCH_PLAN_TYPES)
                         else batch_idx % len(batches)
                     )
                     if (
@@ -3224,6 +3230,9 @@ class MLXTrainer:
                         and _compile_scope in (
                             FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE,
                         )
+                        # Text-only: phase-aware admission requires an
+                        # installed shape plan; VLM plans expose no
+                        # shape-plan interface.
                         and isinstance(batches, FiniteTextBatchPlan)
                     ):
                         batch_data = batches.materialize(
@@ -3299,7 +3308,7 @@ class MLXTrainer:
                         _use_compile = False
                         _compile_scope = "fallback_eager"
                         _compile_fallback_reason = "runtime_error"
-                        if isinstance(batches, FiniteTextBatchPlan):
+                        if isinstance(batches, _FINITE_BATCH_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         if rng_state_before is not None:
                             mx.random.state[0] = rng_state_before
@@ -3743,7 +3752,7 @@ class MLXTrainer:
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
-                batches = create_vlm_batches(
+                plan = _create_vlm_batch_plan(
                     dataset=train_dataset,
                     processor=processor,
                     config=config,
@@ -3759,7 +3768,8 @@ class MLXTrainer:
                     completion_only_loss=text_completion_only_loss,
                     comm_group=comm_group,
                 )
-                if _vlm_mask_fn is not None and batches:
+                batches = [] if plan is None else plan
+                if _vlm_mask_fn is not None and len(batches) > 0:
                     _check_vlm_all_masked(
                         batches,
                         comm_group=comm_group,
@@ -4268,25 +4278,31 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
     per-rank bad/good counts are all-summed before deciding. Otherwise a rank
     whose shard is entirely masked would raise ZeroDivisionError alone while
     peers advance to the first collective and hang."""
-    seen_bad = 0
-    seen_good = 0
-    checked = 0
-    for batch_dict in batches:
-        labels = batch_dict.get("labels")
-        if labels is None:
-            continue
-        labels_list = labels.tolist()
-        for row in labels_list:
-            unique = set(row)
-            if unique == {-100}:
-                seen_bad += 1
-            else:
-                seen_good += 1
-            checked += 1
+    if isinstance(batches, FiniteVLMBatchPlan):
+        # The checker consumes construction-time metadata: it must not
+        # trigger additional processor work or materialization ahead of the
+        # collective below (a failing rank would strand its peers there).
+        seen_bad, seen_good = batches.supervision_counts(max_check)
+    else:
+        seen_bad = 0
+        seen_good = 0
+        checked = 0
+        for batch_dict in batches:
+            labels = batch_dict.get("labels")
+            if labels is None:
+                continue
+            labels_list = labels.tolist()
+            for row in labels_list:
+                unique = set(row)
+                if unique == {-100}:
+                    seen_bad += 1
+                else:
+                    seen_good += 1
+                checked += 1
+                if checked >= max_check:
+                    break
             if checked >= max_check:
                 break
-        if checked >= max_check:
-            break
 
     # Reduce across ranks before deciding so every rank raises/warns together
     # (all ranks reach this collective; the early return below is post-reduce).
