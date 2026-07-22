@@ -3548,3 +3548,33 @@ def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
         )
         for m in range(8)
     )
+
+
+def test_horizontal_concat_streaming_eval_infinite_only_if_all_children_infinite():
+    from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
+
+    class RepeatExamplesIterable:  # HF infinite marker: num_times=None
+        num_times = None
+        ex_iterable = None
+
+    class _FiniteChild:  # no infinite markers -> finite
+        ex_iterable = None
+
+    class HorizontallyConcatenatedMultiSourcesExamplesIterable:
+        def __init__(self, children): self.ex_iterables = children
+
+    class VerticallyConcatenatedMultiSourcesExamplesIterable:
+        def __init__(self, children): self.ex_iterables = children
+
+    class _Src:
+        def __init__(self, ex): self._ex_iterable = ex
+
+    inf, fin = RepeatExamplesIterable(), _FiniteChild()
+    # Horizontal (lockstep) ends with the shortest child -> finite if any is.
+    assert _mlx_stream_declares_infinite(
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is False
+    assert _mlx_stream_declares_infinite(
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, inf]))) is True
+    # Vertical (sequential) is infinite if any child is.
+    assert _mlx_stream_declares_infinite(
+        _Src(VerticallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is True

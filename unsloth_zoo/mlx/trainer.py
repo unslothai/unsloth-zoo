@@ -222,13 +222,19 @@ def _mlx_stream_declares_infinite(dataset):
         # rename in a future release degrades detection (the stream just
         # is not recognized as infinite) instead of failing eval for every
         # stream whose wrapper class matches by name.
-        if kind in (
-            "VerticallyConcatenatedMultiSourcesExamplesIterable",
-            "HorizontallyConcatenatedMultiSourcesExamplesIterable",
-        ):
+        if kind == "VerticallyConcatenatedMultiSourcesExamplesIterable":
+            # Sequential concat runs children one after another, so it never
+            # ends if ANY child is infinite.
             return any(
                 _is_infinite(child, seen)
                 for child in getattr(ex_iterable, "ex_iterables", ())
+            )
+        if kind == "HorizontallyConcatenatedMultiSourcesExamplesIterable":
+            # Column-wise concat advances children in lockstep and ends with
+            # the shortest, so it is infinite only if EVERY child is.
+            children = getattr(ex_iterable, "ex_iterables", ())
+            return bool(children) and all(
+                _is_infinite(child, seen) for child in children
             )
         if kind in (
             "CyclingMultiSourcesExamplesIterable",
