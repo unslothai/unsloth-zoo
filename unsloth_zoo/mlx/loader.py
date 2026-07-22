@@ -2154,11 +2154,21 @@ def _reject_unsupported_hf_quantization_fields(config_dict):
         "llm_int8_enable_fp32_cpu_offload": (False, None),
         "llm_int8_has_fp16_weight": (False, None),
     }
-    # bnb_4bit_use_double_quant is intentionally NOT rejected: nested (double-
-    # quantized) checkpoints load via the bnb dequant path, which reconstructs
-    # the nested absmax exactly, and as an explicit kwarg it is advisory only
-    # (MLX applies its own affine quantization). Every other bnb-specific field
-    # below still fails loud so users are not silently misconfigured.
+    # bnb_4bit_use_double_quant is intentionally NOT rejected outright: nested
+    # (double-quantized) checkpoints load via the bnb dequant path, which
+    # reconstructs the nested absmax exactly, and as an explicit kwarg it is
+    # advisory only (MLX applies its own affine quantization). The value is
+    # still type-checked here, so a malformed spelling (e.g. the string "true")
+    # fails loud instead of being silently ignored -- accepting the field must
+    # not mean accepting anything at all. Every other bnb-specific field below
+    # still fails loud so users are not silently misconfigured.
+    double_quant = config_dict.get("bnb_4bit_use_double_quant", None)
+    if double_quant is not None and not isinstance(double_quant, bool):
+        raise ValueError(
+            "Unsloth: bnb_4bit_use_double_quant must be a bool (True or False), "
+            f"got {double_quant!r}. Nested/double-quantized checkpoints are "
+            "supported on the MLX path; only this value is invalid."
+        )
     for key in (
         "bnb_4bit_compute_dtype", "bnb_4bit_quant_type",
         "bnb_4bit_quant_storage",
