@@ -58,12 +58,10 @@ INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
 
 
-@functools.cache
 def _any_device_integrated():
-    # True if ANY visible CUDA/HIP device is integrated (unified memory). The visible
-    # device set is fixed for the process, so this is computed once. A single static
-    # check on purpose: an integrated device anywhere makes the global double-buffer
-    # flag pure overhead, and a mixed integrated + discrete box is vanishingly rare.
+    # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
+    # static check on purpose: an integrated device anywhere makes the global double-
+    # buffer flag pure overhead, and a mixed integrated + discrete box is rare.
     try:
         return any(
             bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
@@ -73,12 +71,14 @@ def _any_device_integrated():
         return False
 
 
+@functools.cache
 def _double_buffer_disabled():
-    # Double buffering overlaps the H2D offload copy with compute, but on unified-
-    # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to
-    # hide: pure overhead (~2x slower, no memory saved), so default it off there.
-    # Env UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 always wins; otherwise disable whenever
-    # any visible device is integrated.
+    # Decided once per process (cached): the env and the visible device set are both
+    # fixed by the time gradient checkpointing initializes. Double buffering overlaps
+    # the H2D offload copy with compute, but on unified-memory devices (AMD APUs
+    # gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure overhead (~2x
+    # slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it (set it
+    # before the first GC init); else disable when any visible device is integrated.
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
