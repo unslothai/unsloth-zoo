@@ -733,6 +733,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",
     "streaming_prefetch_batches",
+    "label_smoothing_factor",
 )
 
 
