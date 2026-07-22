@@ -2384,7 +2384,283 @@ def _build_glm_ocr_position_ids(
     return mx.array(position_ids)
 
 
-def _prepare_vlm_batch_for_compile(batch_dict, config):
+_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
+
+# Text-width-aligned arrays the VLM pipeline itself owns, with the inert
+# value their right-padded tail takes ("pad" resolves to the tokenizer pad
+# id at padding time). Only these keys are ever padded; every other array
+# is left untouched and, when it shares an extent with the text width,
+# conservatively blocks padding for its batch instead of risking a
+# wrong-shaped model input.
+_VLM_WIDTH_PADDABLE_KEYS = {
+    "input_ids": "pad",
+    "attention_mask": 0,
+    "labels": -100,
+    _RAW_INPUT_IDS_FOR_LABELS: "pad",
+    "token_type_ids": 0,
+    "mm_token_type_ids": 0,
+}
+# Width-derived arrays generated AFTER width finalization (their sequence
+# axis is the last one, e.g. rope position ids shaped (3, batch, width)).
+_VLM_WIDTH_GENERATED_KEYS = ("position_ids",)
+# Model types whose position ids the position-recording prepare phase
+# builds itself (and rebuilds after planned width padding). For every
+# other model type a position_ids array is processor-authored: the
+# pipeline neither pads nor regenerates it, so its batch must decline.
+_VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "paddleocr_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
+})
+_VLM_POSITION_GENERATING_MODEL_TYPES = (
+    _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
+)
+
+
+def _vlm_pipeline_disposable_keys(config):
+    """Keys the position-recording phase overwrites wholesale for this
+    config. Whatever a processor placed under them is disposable for width
+    admission: it can neither decline a batch nor forbid extents, in any
+    representation."""
+    model_type = _config_get(config, "model_type")
+    if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES:
+        return frozenset(("position_ids",))
+    if model_type == "phi3_v":
+        return frozenset(("image_positions",))
+    return frozenset()
+
+
+def _vlm_width_survey(batch_dict, disposable_keys=None):
+    """(text_width, symbolic_axes, padable, forbidden) for a prepared batch.
+
+    ``text_width`` is the post-prepare ``input_ids`` width. ``symbolic_axes``
+    maps the pipeline-owned width-coupled leaf paths to their sequence axis
+    for ``_vlm_batch_family``. ``forbidden`` is the set of extents appearing
+    in arrays the pipeline does not pad, at ANY nesting depth — a planned
+    endpoint must avoid them, or an untouched array would suddenly share
+    the text width and reclassify the batch. ``padable`` is False — and the
+    axes None — whenever right-padding this batch to a larger width could
+    not be proven safe: unvalidated array-metadata captures; no exact-mx
+    2-D ``input_ids``; position data under a key OUTSIDE ``disposable_keys``
+    (the config-derived set of keys the position phase overwrites
+    wholesale — processor-authored position data the pipeline will not
+    regenerate is neither padded nor rebuilt, so those batches keep exact
+    families); any non-mx shape-carrying leaf
+    (its metadata cannot be read through the validated captures); an
+    ``attention_mask`` row that is not content-then-padding; or any
+    untouched array already sharing an extent with the text width.
+
+    Metadata is read exclusively through the import-time captured
+    descriptors and the walk mirrors the family serializer's raw container
+    traversal, so classification and the symbolic family always describe
+    the same pytree.
+    """
+    if not _MX_ARRAY_CAPTURES_VALID:
+        return None, None, False, frozenset()
+
+    def dims_of(value):
+        return tuple(
+            int(dim)
+            for dim in _MX_ARRAY_SHAPE.__get__(value, _MX_ARRAY_TYPE)
+        )
+
+    input_ids = batch_dict.get("input_ids")
+    if type(input_ids) is not _MX_ARRAY_TYPE:
+        return None, None, False, frozenset()
+    ids_shape = dims_of(input_ids)
+    if len(ids_shape) != 2:
+        return None, None, False, frozenset()
+    width = ids_shape[1]
+    if disposable_keys is None:
+        disposable_keys = frozenset()
+    axes = {}
+    forbidden = set()
+    declined = False
+
+    def visit_untouched(node):
+        nonlocal declined
+        if declined:
+            return
+        # Mirror the family serializer's dispatch exactly: raw runtime
+        # types (a lying __class__ cannot smuggle a non-container in) and
+        # exact built-in constants; anything else has no validated
+        # metadata path and refuses padding rather than guessing.
+        node_type = type(node)
+        if node_type is _MX_ARRAY_TYPE:
+            extents = dims_of(node)
+            forbidden.update(extents)
+            if width in extents:
+                declined = True
+            return
+        if issubclass(node_type, dict):
+            for value in dict.values(node):
+                visit_untouched(value)
+            return
+        if issubclass(node_type, Mapping):
+            declined = True
+            return
+        if issubclass(node_type, (list, tuple)):
+            if issubclass(node_type, tuple) and node_type is not tuple:
+                # The serializer marks tuple subclasses unstable; padding
+                # judgement must agree.
+                declined = True
+                return
+            walk = (
+                list.__iter__(node)
+                if issubclass(node_type, list)
+                else tuple.__iter__(node)
+            )
+            for item in walk:
+                visit_untouched(item)
+            return
+        if node_type is bool or node_type is float or node_type is str:
+            return
+        if node_type is int:
+            # Serializer coherence: out-of-int64 constants are opaque
+            # (mx.compile rejects them), so their batches must not pad.
+            if -(2 ** 63) <= node < 2 ** 63:
+                return
+            declined = True
+            return
+        if node is None:
+            return
+        declined = True
+
+    for key, value in dict.items(batch_dict):
+        if key in _VLM_WIDTH_PADDABLE_KEYS and type(value) is _MX_ARRAY_TYPE:
+            value_dims = dims_of(value)
+            if len(value_dims) == 2 and value_dims[1] == width:
+                axes[(key,)] = 1
+            elif width in value_dims:
+                declined = True
+            else:
+                forbidden.update(value_dims)
+            continue
+        if key in disposable_keys:
+            # The position phase (re)builds this key wholesale for the
+            # current config, so whatever sits here — any layout, any
+            # representation, even a container or opaque value — is
+            # disposable and must neither decline the batch nor forbid
+            # extents. Only a canonical exact-array sequence-last
+            # position_ids earns the symbolic axis; anything else keeps
+            # concrete form in the family, where a genuine post-position
+            # mismatch still surfaces as drift.
+            if (
+                key in _VLM_WIDTH_GENERATED_KEYS
+                and type(value) is _MX_ARRAY_TYPE
+            ):
+                value_dims = dims_of(value)
+                if value_dims and value_dims[-1] == width:
+                    axes[(key,)] = len(value_dims) - 1
+            continue
+        visit_untouched(value)
+    if declined:
+        return width, None, False, frozenset(forbidden)
+    attention_mask = batch_dict.get("attention_mask")
+    if type(attention_mask) is _MX_ARRAY_TYPE and (
+        len(dims_of(attention_mask)) == 2
+    ):
+        mask_np = np.asarray(attention_mask)
+        for row in (mask_np != 0).astype(np.int8):
+            content = int(row.sum())
+            if content and not bool(row[:content].all()):
+                return width, None, False, frozenset(forbidden)
+    return width, axes, True, frozenset(forbidden)
+
+
+def _finalize_vlm_batch_width(
+    batch_dict, target_width, pad_token_id, disposable_keys=None,
+):
+    """Right-pad the pipeline-owned text-aligned arrays to ``target_width``.
+
+    Runs after prepare-time expansion and response masking have produced
+    the final content, and before width-derived sidecars are generated, so
+    every recorded absolute position refers to the preserved content prefix
+    and every generated sidecar is born at the final width. Padded tails
+    are inert: pad id under a zero attention mask, labels -100. Batches the
+    width survey declines are returned unchanged (they keep exact
+    families); a target below the current width is a caller bug and fails
+    hard. ``max_seq_length`` is deliberately never consulted: post-expansion
+    widths may legitimately exceed it.
+    """
+    width, _axes, padable, forbidden = _vlm_width_survey(
+        batch_dict, disposable_keys=disposable_keys,
+    )
+    if not padable:
+        return batch_dict
+    target_width = operator.index(target_width)
+    if target_width < width:
+        raise ValueError(
+            f"Unsloth MLX: VLM width plan endpoint {target_width} is below "
+            f"this batch's prepared width {width}; endpoints must cover "
+            f"every member batch."
+        )
+    if target_width == width:
+        return batch_dict
+    if target_width in forbidden:
+        raise ValueError(
+            f"Unsloth MLX: VLM width plan endpoint {target_width} collides "
+            f"with an extent of an array the pipeline does not pad; "
+            f"endpoints must avoid every member batch's untouched extents."
+        )
+    for key, pad_value in _VLM_WIDTH_PADDABLE_KEYS.items():
+        value = batch_dict.get(key)
+        # The admitting survey guarantees paddable keys are exact mx
+        # arrays; metadata goes through the same captured descriptors it
+        # used, so a patched property can neither hide nor skip a pad.
+        if type(value) is not _MX_ARRAY_TYPE:
+            continue
+        value_shape = tuple(
+            int(dim) for dim in _MX_ARRAY_SHAPE.__get__(value, _MX_ARRAY_TYPE)
+        )
+        if len(value_shape) != 2 or value_shape[1] != width:
+            continue
+        fill = pad_token_id if pad_value == "pad" else pad_value
+        if fill is None:
+            raise ValueError(
+                "Unsloth MLX: a tokenizer pad id is required to pad "
+                f"'{key}' to a planned width."
+            )
+        tail = mx.full(
+            (value_shape[0], target_width - width),
+            fill,
+            dtype=_MX_ARRAY_DTYPE.__get__(value, _MX_ARRAY_TYPE),
+        )
+        batch_dict[key] = mx.concatenate([value, tail], axis=1)
+    return batch_dict
+
+
+def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
+    """Prepare a collated VLM batch for the compiled/training path.
+
+    ``phase`` splits the work at the width seam: ``"content"`` runs sidecar
+    normalization and the prepare-time expansions that may REBUILD the text
+    arrays with data-dependent lengths; ``"positions"`` runs the steps that
+    record absolute positions or generate width-derived sidecars, and must
+    see the FINAL text width. ``None`` runs both back to back (the
+    unplanned public contract, byte-identical to the historical single
+    pass because each model type takes exactly one of the disjoint
+    branches).
+    """
+    if phase is None:
+        batch_dict = _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="content",
+        )
+        return _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="positions",
+        )
+    if phase == "positions":
+        return _vlm_positions_for_compile(batch_dict, config)
+    if phase != "content":
+        raise ValueError(f"unknown VLM prepare phase: {phase!r}")
+    # The provenance marker is pipeline-private: only the position phase
+    # may set it. Processor output carrying it is a forgery and would
+    # misclassify foreign position ids as regenerated.
+    batch_dict.pop("_unsloth_collated_position_ids", None)
     model_type = _config_get(config, "model_type")
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
 
@@ -2413,66 +2689,6 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
         batch_dict["images_spatial_crop"] = images_spatial_crop
     if audio_embed_sizes is not None:
         batch_dict["audio_embed_sizes"] = audio_embed_sizes
-
-    if model_type in {
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "paddleocr_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-        "qwen3_5",
-        "qwen3_5_moe",
-    }:
-        input_ids = batch_dict.get("input_ids")
-        if input_ids is not None:
-            input_ids_np = np.asarray(input_ids)
-            attention_mask = batch_dict.get("attention_mask")
-            attention_mask_np = (
-                np.asarray(attention_mask)
-                if attention_mask is not None
-                else None
-            )
-            batch_dict["position_ids"] = _build_qwen_position_ids(
-                input_ids=input_ids_np,
-                attention_mask=attention_mask_np,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                image_token_id=int(_config_get(config, "image_token_id", _config_get(config, "image_token_index"))),
-                video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
-                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
-            )
-            batch_dict["_unsloth_collated_position_ids"] = True
-
-    if model_type == "glm_ocr":
-        input_ids = batch_dict.get("input_ids")
-        if input_ids is not None:
-            input_ids_np = np.asarray(input_ids)
-            attention_mask = batch_dict.get("attention_mask")
-            attention_mask_np = (
-                np.asarray(attention_mask)
-                if attention_mask is not None
-                else None
-            )
-            batch_dict["position_ids"] = _build_glm_ocr_position_ids(
-                input_ids=input_ids_np,
-                attention_mask=attention_mask_np,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                image_start_token_id=int(_config_get(config, "image_start_token_id")),
-                image_token_id=int(_config_get(config, "image_token_id")),
-                video_token_id=int(_config_get(config, "video_token_id")),
-                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
-            )
-            batch_dict["_unsloth_collated_position_ids"] = True
-
-    if model_type == "phi3_v":
-        input_ids = batch_dict.get("input_ids")
-        if input_ids is not None:
-            input_ids_np = np.asarray(input_ids)
-            batch_dict["image_positions"] = tuple(
-                tuple(int(x) for x in pos)
-                for pos in np.argwhere(input_ids_np < 0).tolist()
-            )
 
     if model_type == "multi_modality":
         input_ids = batch_dict.get("input_ids")
@@ -2624,6 +2840,71 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
+
+    return batch_dict
+
+
+def _vlm_positions_for_compile(batch_dict, config):
+    """Position-recording prepare steps: absolute-position constants and
+    width-derived sidecars, all computed from the FINAL text arrays (after
+    any prepare-time expansion and any planned width padding, whose
+    right-padded tails never shift a content position)."""
+    model_type = _config_get(config, "model_type")
+    vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
+    image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
+    video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+
+    if model_type in _VLM_QWEN_POSITION_MODEL_TYPES:
+        input_ids = batch_dict.get("input_ids")
+        if input_ids is not None:
+            input_ids_np = np.asarray(input_ids)
+            attention_mask = batch_dict.get("attention_mask")
+            attention_mask_np = (
+                np.asarray(attention_mask)
+                if attention_mask is not None
+                else None
+            )
+            batch_dict["position_ids"] = _build_qwen_position_ids(
+                input_ids=input_ids_np,
+                attention_mask=attention_mask_np,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                image_token_id=int(_config_get(config, "image_token_id", _config_get(config, "image_token_index"))),
+                video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
+                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
+            )
+            batch_dict["_unsloth_collated_position_ids"] = True
+
+    if model_type == "glm_ocr":
+        input_ids = batch_dict.get("input_ids")
+        if input_ids is not None:
+            input_ids_np = np.asarray(input_ids)
+            attention_mask = batch_dict.get("attention_mask")
+            attention_mask_np = (
+                np.asarray(attention_mask)
+                if attention_mask is not None
+                else None
+            )
+            batch_dict["position_ids"] = _build_glm_ocr_position_ids(
+                input_ids=input_ids_np,
+                attention_mask=attention_mask_np,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                image_start_token_id=int(_config_get(config, "image_start_token_id")),
+                image_token_id=int(_config_get(config, "image_token_id")),
+                video_token_id=int(_config_get(config, "video_token_id")),
+                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
+            )
+            batch_dict["_unsloth_collated_position_ids"] = True
+
+    if model_type == "phi3_v":
+        input_ids = batch_dict.get("input_ids")
+        if input_ids is not None:
+            input_ids_np = np.asarray(input_ids)
+            batch_dict["image_positions"] = tuple(
+                tuple(int(x) for x in pos)
+                for pos in np.argwhere(input_ids_np < 0).tolist()
+            )
 
     return batch_dict
 
@@ -4544,7 +4825,6 @@ def _format_vlm_images_for_processor(all_images, processor=None, image_layout=No
 # Private key used to pass raw (pre-int32-narrowing) input_ids through
 # the VLM batch dict to labels-free / response-mask paths. Stripped from
 # model forward kwargs so the backbone never sees it.
-_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
 
 
 def _to_mx_vlm_batch(inputs):
@@ -5028,8 +5308,16 @@ def _build_response_masked_vlm_batch(
     ignore_token_ids=None,
     completion_only_loss=None,
     return_prompt_completion=False,
+    target_width=None,
 ):
-    """Collate VLM rows and apply the CUDA response-mask closure."""
+    """Collate VLM rows and apply the CUDA response-mask closure.
+
+    ``target_width`` (an installed shape-plan endpoint) right-pads the
+    text-aligned arrays AFTER expansion and response masking have produced
+    the final content — so padded tails stay inert — and BEFORE the
+    position-recording prepare phase, so absolute-position constants and
+    width-derived sidecars are computed at the final width.
+    """
     batch_dict, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
         formatting_func=formatting_func,
@@ -5037,12 +5325,35 @@ def _build_response_masked_vlm_batch(
         completion_only_loss=completion_only_loss,
         return_prompt_completion=True,
     )
-    batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
-    if response_mask_fn is not None and not is_prompt_completion:
-        batch_dict = _apply_response_mask_to_vlm_batch(
-            batch_dict,
-            response_mask_fn,
-            ignore_token_ids=ignore_token_ids,
+    if target_width is None:
+        # Unplanned: the historical single-pass order, including its
+        # failure ordering (a broken batch raises during position
+        # construction BEFORE the response-mask callback runs).
+        batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
+        if response_mask_fn is not None and not is_prompt_completion:
+            batch_dict = _apply_response_mask_to_vlm_batch(
+                batch_dict,
+                response_mask_fn,
+                ignore_token_ids=ignore_token_ids,
+            )
+    else:
+        batch_dict = _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="content",
+        )
+        if response_mask_fn is not None and not is_prompt_completion:
+            batch_dict = _apply_response_mask_to_vlm_batch(
+                batch_dict,
+                response_mask_fn,
+                ignore_token_ids=ignore_token_ids,
+            )
+        tokenizer = getattr(processor, "tokenizer", processor)
+        batch_dict = _finalize_vlm_batch_width(
+            batch_dict, target_width,
+            getattr(tokenizer, "pad_token_id", None),
+            disposable_keys=_vlm_pipeline_disposable_keys(config),
+        )
+        batch_dict = _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="positions",
         )
     if return_prompt_completion:
         return batch_dict, is_prompt_completion
@@ -5492,6 +5803,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_mru",
         "_descriptors",
         "_survey_stats",
+        "_widths",
+        "_padable",
+        "_forbidden",
     )
 
     def __init__(
@@ -5529,6 +5843,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._mru = None
         self._descriptors = None
         self._survey_stats = None
+        self._widths = None
+        self._padable = None
+        self._forbidden = None
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -5553,8 +5870,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def __len__(self):
         return len(self._schedule)
 
-    def _build_batch(self, index):
-        """Build one batch through the complete existing VLM builder."""
+    def _build_batch(self, index, target_width=None):
+        """Build one batch through the complete existing VLM builder,
+        right-padded to ``target_width`` when an endpoint is given."""
         batch_items = [self._rows[i].item for i in self._schedule[index]]
         batch_dict = _build_response_masked_vlm_batch(
             batch_items,
@@ -5566,6 +5884,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             formatting_func=None,
             ignore_token_ids=self._ignore_token_ids,
             completion_only_loss=self._completion_only_loss,
+            target_width=target_width,
         )
         empty = (
             self._empty_masks[index] if self._empty_masks is not None else None
@@ -5576,19 +5895,22 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             )
         return batch_dict
 
-    def materialize(self, index):
+    def materialize(self, index, target_width=None):
         """Build one batch through the complete existing VLM builder.
 
-        The tensor-bearing cache holds exactly the most recent batch so a
-        repeated fetch (e.g. a compile-failure retry) is free while live
-        scheduled inputs stay bounded by the current batch.
+        The tensor-bearing cache holds exactly the most recent batch (for
+        its exact requested width) so a repeated fetch (e.g. a
+        compile-failure retry) is free while live scheduled inputs stay
+        bounded by the current batch. ``target_width`` right-pads the
+        text-aligned arrays to an installed shape-plan endpoint; ``None``
+        preserves the historical per-batch-maximum padding byte for byte.
         """
         index = operator.index(index)
         cached = self._mru
-        if cached is not None and cached[0] == index:
+        if cached is not None and cached[0] == (index, target_width):
             return cached[1]
-        batch_dict = self._build_batch(index)
-        self._mru = (index, batch_dict)
+        batch_dict = self._build_batch(index, target_width=target_width)
+        self._mru = ((index, target_width), batch_dict)
         return batch_dict
 
     def __getitem__(self, index):
@@ -5644,20 +5966,39 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             return self._descriptors
         self._mru = None
         families = []
+        widths = []
+        padable_flags = []
+        forbidden_sets = []
         array_leaves_max = 0
         for index in range(len(self._schedule)):
             batch = self._build_batch(index)
-            family = _vlm_batch_family(batch)
+            width, axes, padable, forbidden = _vlm_width_survey(
+                batch,
+                disposable_keys=_vlm_pipeline_disposable_keys(self._config),
+            )
+            # Padable batches get symbolic families (batches differing only
+            # in text width coincide); declined batches keep every extent
+            # concrete and therefore discriminate exactly.
+            family = _vlm_batch_family(
+                batch, symbolic_axes=axes if padable else None,
+            )
             del batch
             families.append(family)
+            widths.append(width)
+            padable_flags.append(bool(padable))
+            forbidden_sets.append(forbidden)
             array_leaves_max = max(
                 array_leaves_max, _vlm_family_array_leaves(family),
             )
         self._descriptors = tuple(families)
+        self._widths = tuple(widths)
+        self._padable = tuple(padable_flags)
+        self._forbidden = tuple(forbidden_sets)
         self._survey_stats = {
             "surveyed_batches": len(self._descriptors),
             "distinct_families": len(set(self._descriptors)),
             "array_leaves_max": array_leaves_max,
+            "padable_batches": sum(self._padable),
         }
         return self._descriptors
 
@@ -5675,15 +6016,52 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             )
         return self._descriptors[operator.index(index)]
 
+    def batch_width(self, index):
+        """Surveyed post-prepare text width for one scheduled batch (None
+        when the batch exposes no 2-D input_ids)."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch widths have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return self._widths[operator.index(index)]
+
+    def batch_padable(self, index):
+        """Whether the width survey admitted this batch for right-padding
+        (declined batches keep exact families and unplanned widths)."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch widths have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return self._padable[operator.index(index)]
+
+    def batch_forbidden_widths(self, index):
+        """Extents of this batch's untouched arrays (any nesting depth);
+        a planned endpoint must avoid all of them."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch widths have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return self._forbidden[operator.index(index)]
+
     def check_family_drift(self, index, batch):
         """Hard-fail when a materialized batch's structure leaves its
         surveyed family. Container structure, dict keys and order, constant
-        values, and every array's rank/shape/dtype must hold on every visit;
-        value nondeterminism inside equal-shaped arrays stays undetected by
+        values, and every array extent outside the detected text axis must
+        hold on every visit (the text axis itself is symbolic for padable
+        batches, so planned width padding is not drift); value
+        nondeterminism inside equal-shaped arrays stays undetected by
         design."""
         index = operator.index(index)
+        _width, axes, padable, _forbidden = _vlm_width_survey(
+            batch,
+            disposable_keys=_vlm_pipeline_disposable_keys(self._config),
+        )
         divergence = _vlm_family_divergence(
-            self.batch_family(index), _vlm_batch_family(batch),
+            self.batch_family(index),
+            _vlm_batch_family(batch, symbolic_axes=axes if padable else None),
         )
         if divergence is not None:
             raise RuntimeError(

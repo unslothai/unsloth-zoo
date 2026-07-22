@@ -537,18 +537,22 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
 
 
 class _VarWidthProcessor(_CountingProcessor):
-    """Batch width follows content so different scheduled batches produce
-    genuinely distinct families."""
+    """Batch width AND structure follow content: different scheduled
+    batches produce genuinely distinct families even after the text axis
+    goes symbolic (odd-width batches carry an extra sidecar array)."""
 
     def __call__(self, text, **kwargs):
         self.calls += 1
         width = 3 + max(int(item) % 3 for item in text)
         rows = [([int(item), 200] + [2] * width)[:width] for item in text]
         masks = [[1] * width for _ in rows]
-        return {
+        batch = {
             "input_ids": np.array(rows, dtype=np.int32),
             "attention_mask": np.array(masks, dtype=np.int32),
         }
+        if width % 2:
+            batch["row_flags"] = np.ones((len(rows), 1), dtype=np.int32)
+        return batch
 
 
 def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
@@ -583,18 +587,31 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     assert plan._mru is None
     assert plan.ensure_descriptors() is descriptors
     assert processor.calls == 4
+    from unsloth_zoo.mlx.utils import _vlm_width_survey
+
     for index in range(len(plan)):
-        assert descriptors[index] == _vlm_batch_family(plan._build_batch(index))
+        rebuilt = plan._build_batch(index)
+        width, axes, padable, _forbidden = _vlm_width_survey(rebuilt)
+        assert padable and plan.batch_padable(index)
+        assert plan.batch_width(index) == width
+        assert descriptors[index] == _vlm_batch_family(
+            rebuilt, symbolic_axes=axes,
+        )
+    # Widths merge symbolically; the structural sidecar still splits.
     assert len(set(descriptors)) == 2
     assert plan.batch_family(1) == descriptors[1]
-    arrays_per_batch = sum(
-        1 for value in plan._build_batch(0).values()
-        if isinstance(value, mx.array)
+    arrays_per_batch = max(
+        sum(
+            1 for value in plan._build_batch(index).values()
+            if isinstance(value, mx.array)
+        )
+        for index in range(len(plan))
     )
     assert plan.survey_stats == {
         "surveyed_batches": 3,
         "distinct_families": 2,
         "array_leaves_max": arrays_per_batch,
+        "padable_batches": 3,
     } and arrays_per_batch >= 2
     assert plan.materialize(0)["input_ids"].tolist() == (
         cached_batch["input_ids"].tolist()
@@ -679,9 +696,23 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     retyped = {**batch, "input_ids": batch["input_ids"].astype(mx.int16)}
     with pytest.raises(RuntimeError, match=r"'input_ids'.*int16"):
         plan.check_family_drift(1, retyped)
+    # A width change alone is NOT drift (the text axis is symbolic); an
+    # INCONSISTENT width change — one array narrowed while its siblings
+    # keep the old extent — is.
     narrowed = {**batch, "input_ids": batch["input_ids"][:, :-1]}
-    with pytest.raises(RuntimeError, match=r"'input_ids'"):
+    with pytest.raises(RuntimeError, match=r"batch 1 drifted"):
         plan.check_family_drift(1, narrowed)
+    uniformly_narrowed = {
+        key: (
+            value[:, :-1]
+            if isinstance(value, mx.array)
+            and value.ndim == 2
+            and value.shape[1] == batch["input_ids"].shape[1]
+            else value
+        )
+        for key, value in batch.items()
+    }
+    assert plan.check_family_drift(1, uniformly_narrowed) is None
     # Non-first leaves are checked too: a checker pinned to input_ids alone
     # cannot pass.
     other_key = next(

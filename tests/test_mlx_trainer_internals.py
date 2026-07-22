@@ -2089,7 +2089,8 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
 
     forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
-    prepare_source = inspect.getsource(mlx_utils._prepare_vlm_batch_for_compile)
+    # The marker is set by the position-recording prepare phase.
+    prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)
     assert '"_unsloth_collated_position_ids"' in prepare_source
     assert 'not k.startswith("_unsloth_")' in forward_source
     assert 'use_collated_position_ids and "position_ids" in extra_kwargs' in forward_source
