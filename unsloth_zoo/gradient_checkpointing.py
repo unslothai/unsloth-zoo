@@ -59,8 +59,8 @@ DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable doub
 
 def _any_device_integrated():
     # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
-    # static check on purpose: an integrated device anywhere makes the global double-
-    # buffer flag pure overhead, and a mixed integrated + discrete box is rare.
+    # static check on purpose: an integrated device anywhere makes double buffering
+    # pure overhead, and a mixed integrated + discrete box is rare.
     try:
         return any(
             bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
@@ -70,28 +70,16 @@ def _any_device_integrated():
         return False
 
 
-# Whether to skip double buffering. Resolved lazily on the first checkpointing init
-# (below) and cached here -- NOT at import: get_device_properties forces CUDA lazy-init
-# on GPU 0, which would poison fork workers and pre-empt per-rank device selection.
-# None = unresolved. UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it either way.
-UNSLOTH_DOUBLE_BUFFER_DISABLED = None
-
-
 def _double_buffer_disabled():
-    # Resolve once (after the caller has selected its device), memoized into the global.
-    # Double buffering overlaps the H2D offload copy with compute, but on unified-memory
-    # devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure
-    # overhead (~2x slower, no memory saved), so disable when any device is integrated.
-    global UNSLOTH_DOUBLE_BUFFER_DISABLED
-    if UNSLOTH_DOUBLE_BUFFER_DISABLED is None:
-        env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
-        if env is not None:
-            UNSLOTH_DOUBLE_BUFFER_DISABLED = env == "1"
-        elif DEVICE_TYPE not in ("cuda", "hip"):
-            UNSLOTH_DOUBLE_BUFFER_DISABLED = False
-        else:
-            UNSLOTH_DOUBLE_BUFFER_DISABLED = _any_device_integrated()
-    return UNSLOTH_DOUBLE_BUFFER_DISABLED
+    # Double buffering overlaps the H2D offload copy with compute, but on unified-
+    # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide:
+    # pure overhead (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1
+    # forces it; else disable when any visible device is integrated. Called at GC init,
+    # not import, so it never probes the GPU before the caller selects its device.
+    env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
+    if env is not None: return env == "1"
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    return _any_device_integrated()
 
 
 @contextmanager
