@@ -70,20 +70,28 @@ def _any_device_integrated():
         return False
 
 
-def _double_buffer_disabled():
-    # Double buffering overlaps the H2D offload copy with compute, but on unified-
-    # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to
-    # hide: pure overhead (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER
-    # =0/1 forces it; else disable when any visible device is integrated.
-    env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
-    if env is not None: return env == "1"
-    if DEVICE_TYPE not in ("cuda", "hip"): return False
-    return _any_device_integrated()
+# Whether to skip double buffering. Resolved lazily on the first checkpointing init
+# (below) and cached here -- NOT at import: get_device_properties forces CUDA lazy-init
+# on GPU 0, which would poison fork workers and pre-empt per-rank device selection.
+# None = unresolved. UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it either way.
+UNSLOTH_DOUBLE_BUFFER_DISABLED = None
 
-# Resolved once at import, like DEVICE_TYPE / DEVICE_COUNT (the visible device set and
-# env are fixed by then). Set UNSLOTH_DISABLE_DOUBLE_BUFFER before importing unsloth
-# to override.
-UNSLOTH_DOUBLE_BUFFER_DISABLED = _double_buffer_disabled()
+
+def _double_buffer_disabled():
+    # Resolve once (after the caller has selected its device), memoized into the global.
+    # Double buffering overlaps the H2D offload copy with compute, but on unified-memory
+    # devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure
+    # overhead (~2x slower, no memory saved), so disable when any device is integrated.
+    global UNSLOTH_DOUBLE_BUFFER_DISABLED
+    if UNSLOTH_DOUBLE_BUFFER_DISABLED is None:
+        env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
+        if env is not None:
+            UNSLOTH_DOUBLE_BUFFER_DISABLED = env == "1"
+        elif DEVICE_TYPE not in ("cuda", "hip"):
+            UNSLOTH_DOUBLE_BUFFER_DISABLED = False
+        else:
+            UNSLOTH_DOUBLE_BUFFER_DISABLED = _any_device_integrated()
+    return UNSLOTH_DOUBLE_BUFFER_DISABLED
 
 
 @contextmanager
@@ -457,7 +465,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         with _no_inference_mode():
             GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
         # Double buffering: try to allocate buffer B (auto-off on unified memory, or via env var)
-        if UNSLOTH_DOUBLE_BUFFER_DISABLED:
+        if _double_buffer_disabled():
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
@@ -1038,7 +1046,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
             NEXT_BUFFER_SLOT[i] = 0
 
     # Reset double buffering if buffer B still exists, or try to re-allocate
-    if UNSLOTH_DOUBLE_BUFFER_DISABLED:
+    if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
             for i in range(len(GPU_BUFFERS_B)):
                 if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
