@@ -29,6 +29,7 @@ import copy
 import inspect
 import importlib
 import json
+import operator
 import numpy as np
 import os
 import sys
@@ -39,6 +40,7 @@ import threading
 import time
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -3890,29 +3892,364 @@ def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
     return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
 
 
+@dataclass(frozen=True)
+class _FiniteTextRow:
+    input_ids: tuple
+    offset: int = 0
+    labels: tuple | None = None
+
+
+def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
+                           max_seq_length):
+    """Shared finite text pad-width policy.
+
+    Order of operations is observable and fixed: optional
+    ``1 + pad_to_multiple * ceil(raw_width / pad_to_multiple)`` round-up
+    (identity when the multiple is zero), then minimum width, then the
+    ``max_seq_length`` cap.
+    """
+    width = int(raw_width)
+    if pad_to_multiple:
+        width = 1 + pad_to_multiple * (
+            (width + pad_to_multiple - 1) // pad_to_multiple
+        )
+    if width < minimum_width:
+        width = minimum_width
+    return min(int(max_seq_length), width)
+
+
+class FiniteTextBatchPlan:
+    """CPU-backed finite text schedule with on-demand MLX materialization."""
+
+    __slots__ = (
+        "_rows",
+        "_schedule",
+        "_widths",
+        "max_seq_length",
+        "pad_id",
+        "minimum_width",
+        "pad_to_multiple",
+        "label_dtype",
+        "_shape_plan",
+        "_visit_policy",
+        "_visit_seed",
+        "_visit_epoch_cache",
+    )
+
+    _VISIT_POLICIES = ("identity", "epoch_permute")
+
+    def __init__(
+        self,
+        rows,
+        schedule,
+        *,
+        max_seq_length,
+        pad_id,
+        minimum_width=1,
+        pad_to_multiple=0,
+        widths=None,
+        label_dtype=np.int64,
+        visit_policy="identity",
+        visit_seed=None,
+    ):
+        self._rows = tuple(rows)
+        self._schedule = tuple(tuple(batch) for batch in schedule)
+        self._widths = None if widths is None else tuple(int(x) for x in widths)
+        self.max_seq_length = int(max_seq_length)
+        self.pad_id = int(pad_id)
+        self.minimum_width = int(minimum_width)
+        self.pad_to_multiple = int(pad_to_multiple)
+        self.label_dtype = np.dtype(label_dtype)
+        self._shape_plan = None
+        self._visit_policy = str(visit_policy)
+        # Normalized eagerly so visits never depend on ambient RNG state and a
+        # reconstructed plan (fresh-process resume) derives identical visits.
+        self._visit_seed = (
+            None if self._visit_policy == "identity"
+            else _normalize_seed(visit_seed)
+        )
+        self._visit_epoch_cache = None
+        if self.max_seq_length < 1:
+            raise ValueError("max_seq_length must be positive")
+        if self.minimum_width < 0:
+            raise ValueError("minimum_width must be non-negative")
+        if self.pad_to_multiple < 0:
+            raise ValueError("pad_to_multiple must be non-negative")
+        if self._widths is not None and len(self._widths) != len(self._schedule):
+            raise ValueError("widths must contain one entry per scheduled batch")
+        if self._visit_policy not in self._VISIT_POLICIES:
+            raise ValueError(
+                f"visit_policy must be one of {self._VISIT_POLICIES}, "
+                f"got {visit_policy!r}"
+            )
+
+    @property
+    def rows(self):
+        return self._rows
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    @property
+    def widths(self):
+        return self._widths
+
+    def __len__(self):
+        return len(self._schedule)
+
+    @property
+    def visit_policy(self):
+        return self._visit_policy
+
+    def batch_index_for_visit(self, absolute_visit):
+        """Map an absolute batch visit to one stored schedule index.
+
+        Identity plans replay the stored schedule cyclically (the historical
+        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
+        order for epoch 0, then visit a deterministic permutation of the same
+        batch multiset in every later epoch, derived only from the normalized
+        seed and the epoch — never from ambient RNG state.
+        """
+        count = len(self._schedule)
+        if count == 0:
+            raise ValueError("cannot resolve a visit on an empty schedule")
+        # operator.index rejects fractional/np-float visits instead of
+        # silently truncating them onto a neighboring visit.
+        visit = operator.index(absolute_visit)
+        if visit < 0:
+            raise ValueError("absolute_visit must be non-negative")
+        epoch, position = divmod(visit, count)
+        if self._visit_policy != "epoch_permute" or epoch == 0:
+            return position
+        cached = self._visit_epoch_cache
+        if cached is None or cached[0] != epoch:
+            cached = (epoch, self._build_visit_permutation(epoch))
+            self._visit_epoch_cache = cached
+        return cached[1][position]
+
+    def _build_visit_permutation(self, epoch):
+        """One O(len) deterministic permutation build per epoch transition."""
+        rng = np.random.RandomState(
+            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
+        )
+        return tuple(
+            int(index) for index in rng.permutation(len(self._schedule))
+        )
+
+    def batch_width(self, index):
+        # Explicit widths are authoritative; skip the per-row length scan
+        # (constructor validation keeps widths/schedule index-aligned).
+        if self._widths is not None:
+            return self._widths[int(index)]
+        batch_indices = self._schedule[index]
+        lengths = [
+            0
+            if row_index is None
+            else min(
+                len(self._rows[int(row_index)].input_ids),
+                self.max_seq_length,
+            )
+            for row_index in batch_indices
+        ]
+        return _finite_text_pad_width(
+            max(lengths, default=0),
+            pad_to_multiple=self.pad_to_multiple,
+            minimum_width=self.minimum_width,
+            max_seq_length=self.max_seq_length,
+        )
+
+    def batch_family(self, index):
+        batch_indices = self._schedule[index]
+        real_rows = [
+            self._rows[int(row_index)]
+            for row_index in batch_indices
+            if row_index is not None
+        ]
+        has_labels = bool(
+            (real_rows and real_rows[0].labels is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].labels is not None
+            )
+        )
+        batch_size = len(batch_indices)
+        return (
+            "text_tuple_3",
+            ((batch_size, "sequence"), "int32"),
+            ((batch_size, 2), "int32"),
+            (
+                ((batch_size, "sequence"), self.label_dtype.name)
+                if has_labels else None
+            ),
+        )
+
+    def set_shape_plan(self, shape_plan):
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        self._shape_plan = shape_plan
+
+    def materialize(self, index, *, phase=None):
+        batch_indices = self._schedule[index]
+        selected = [
+            None if row_index is None else self._rows[int(row_index)]
+            for row_index in batch_indices
+        ]
+        real_rows = [row for row in selected if row is not None]
+        has_labels = bool(
+            (real_rows and real_rows[0].labels is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].labels is not None
+            )
+        )
+        if any((row.labels is not None) != has_labels for row in real_rows):
+            raise ValueError(
+                "Unsloth MLX: labeled and unlabeled text rows cannot share a batch."
+            )
+
+        lengths = [
+            0 if row is None else min(len(row.input_ids), self.max_seq_length)
+            for row in selected
+        ]
+        raw_width = self.batch_width(index)
+        width = raw_width
+        if self._shape_plan is not None and phase is not None:
+            family = self.batch_family(index)
+            width = self._shape_plan.endpoint_for(family, raw_width)
+            if not self._shape_plan.allows(
+                family, raw_width, phase,
+            ):
+                raise RuntimeError(
+                    "Unsloth MLX: compiled text batch signature was not "
+                    "admitted by the finite shape plan."
+                )
+        batch_ids = np.full(
+            (len(selected), width), self.pad_id, dtype=np.int32,
+        )
+        batch_labels = (
+            np.full((len(selected), width), -100, dtype=self.label_dtype)
+            if has_labels else None
+        )
+        lengths_info = np.zeros((len(selected), 2), dtype=np.int32)
+
+        for row_index, (row, length) in enumerate(zip(selected, lengths)):
+            if row is None:
+                continue
+            lengths_info[row_index] = (int(row.offset), length)
+            batch_ids[row_index, :length] = row.input_ids[:length]
+            if batch_labels is not None:
+                batch_labels[row_index, :length] = row.labels[:length]
+
+        return (
+            mx.array(batch_ids),
+            mx.array(lengths_info),
+            mx.array(batch_labels) if batch_labels is not None else None,
+        )
+
+    def __getitem__(self, index):
+        return self.materialize(index)
+
+    def materialize_all(self):
+        batches = [self[index] for index in range(len(self))]
+        mx.eval(
+            [batch for batch, _lengths, _labels in batches]
+            + [lengths for _batch, lengths, _labels in batches]
+            + [labels for _batch, _lengths, labels in batches if labels is not None]
+        )
+        return batches
+
+
+def _finite_text_rows(tokenized, *, with_offsets=False):
+    rows = []
+    for item in tokenized:
+        if with_offsets:
+            input_ids, offset = item
+            labels = None
+        else:
+            input_ids, labels = item
+            offset = 0
+        rows.append(
+            _FiniteTextRow(
+                tuple(int(token) for token in input_ids),
+                int(offset),
+                None if labels is None else tuple(int(token) for token in labels),
+            )
+        )
+    return tuple(rows)
+
+
+def _shuffled_full_batch_schedule(
+    row_count,
+    batch_size,
+    *,
+    sort_key,
+    num_batches,
+    seed,
+):
+    if row_count < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size}"
+            f" examples but only has {row_count}."
+        )
+    indices = sorted(range(row_count), key=sort_key)
+    groups = [
+        tuple(indices[start : start + batch_size])
+        for start in range(0, row_count - batch_size + 1, batch_size)
+    ]
+    # Plan-local RNG through _normalize_seed: same permutation stream as the
+    # historical np.random.seed(int(seed)) global path for explicit seeds,
+    # while ``None`` (and the default creator's previously ambient ``0``) are
+    # canonicalized so fresh-process resume can reconstruct the schedule.
+    rng = np.random.RandomState(_normalize_seed(seed))
+    schedule = []
+    while True:
+        for group_index in rng.permutation(len(groups)):
+            schedule.append(groups[int(group_index)])
+            if num_batches is not None and len(schedule) >= num_batches:
+                return tuple(schedule)
+        if num_batches is None:
+            return tuple(schedule)
+
+
+def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
+                                num_batches=None, seed=42, pad_id=0):
+    """Plan pretokenized rows with mlx-lm's sorting and shuffle contract."""
+    tokenized = [
+        row for row in tokenized
+        if _labeled_row_has_supervision(row[1], max_seq_length)
+    ]
+    return FiniteTextBatchPlan(
+        _finite_text_rows(tokenized),
+        _shuffled_full_batch_schedule(
+            len(tokenized),
+            batch_size,
+            sort_key=lambda index: len(tokenized[index][0]),
+            num_batches=num_batches,
+            seed=seed,
+        ),
+        max_seq_length=max_seq_length,
+        pad_id=pad_id,
+        # One reusable shuffled cycle: eligible for epoch-permuted visits.
+        # Horizon-expanded/truncated schedules replay stored order (identity).
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
+    )
+
+
 def _create_tokenized_text_batches(tokenized, batch_size, max_seq_length,
                                    num_batches=None, seed=42, pad_id=0):
     """Batch pretokenized text rows with mlx-lm's sorting and shuffle contract."""
-    batch_iter = _iterate_tokenized_text_batches(
+    return _create_tokenized_text_plan(
         tokenized,
         batch_size,
         max_seq_length,
+        num_batches=num_batches,
         seed=seed,
-        loop=(num_batches is not None),
         pad_id=pad_id,
-    )
-    batch_pairs = []
-    for batch_pair in batch_iter:
-        batch_pairs.append(batch_pair)
-        if num_batches is not None and len(batch_pairs) >= num_batches:
-            break
-
-    mx.eval(
-        [b for b, lengths, labels in batch_pairs]
-        + [lengths for _, lengths, labels in batch_pairs]
-        + [labels for _, lengths, labels in batch_pairs if labels is not None]
-    )
-    return batch_pairs
+    ).materialize_all()
 
 
 def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
@@ -5489,13 +5826,50 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     )
 
 
-def create_batches(dataset, tokenizer, batch_size, max_seq_length,
-                   num_batches=None, seed=42, dataset_text_field="text",
-                   formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None, append_eos=True,
-                   completion_only_loss=None, assistant_only_loss=False,
-                   comm_group=None, distributed_pad_mode="cycle"):
-    """Pre-tokenize and batch a HuggingFace dataset for MLX training.
+def _create_default_text_plan(
+    dataset,
+    batch_size,
+    max_seq_length,
+    *,
+    num_batches=None,
+    seed=42,
+):
+    """Build the CPU equivalent of mlx-lm's finite text batch schedule."""
+    schedule = _shuffled_full_batch_schedule(
+        len(dataset),
+        batch_size,
+        sort_key=dataset.itemlen,
+        num_batches=num_batches,
+        seed=seed,
+    )
+    rows = _finite_text_rows(
+        [dataset[index] for index in range(len(dataset))],
+        with_offsets=True,
+    )
+    return FiniteTextBatchPlan(
+        rows,
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=0,
+        # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) so the
+        # default text path keeps mlx-lm's causal-shift contract and bounded
+        # signatures, like the distributed/streaming builders.
+        minimum_width=2,
+        pad_to_multiple=32,
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
+    )
+
+
+def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
+                            num_batches=None, seed=42,
+                            dataset_text_field="text", formatting_func=None,
+                            chat_template=None, model_name=None,
+                            model_type=None, append_eos=True,
+                            completion_only_loss=None,
+                            assistant_only_loss=False, comm_group=None,
+                            distributed_pad_mode="cycle"):
+    """Build a finite CPU-backed text batch plan.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
     samples are sorted by length, grouped into batches, and padded to the
@@ -5510,13 +5884,9 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     then tail global batches are padded so every rank yields the same number
     of local batches.
 
-    Returns:
-        List of (batch, lengths) tuples, where batch has shape
-        (batch_size, padded_length) and lengths has shape (batch_size, 2)
-        with [offset, length] per sequence (from iterate_batches).
+    Public callers use :func:`create_batches`, which eagerly materializes this
+    plan for compatibility. Finite training retains the plan and indexes it.
     """
-    from mlx_lm.tuner.trainer import iterate_batches
-
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
@@ -5524,7 +5894,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         assistant_only_loss=assistant_only_loss,
     )
     if saw_pretokenized:
-        return _create_tokenized_text_batches(
+        return _create_tokenized_text_plan(
             tokenized,
             batch_size,
             max_seq_length,
@@ -5554,7 +5924,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             assistant_only_loss=assistant_only_loss,
         )
         if tokenized:
-            return _create_labeled_text_batches(
+            return _create_tokenized_text_plan(
                 tokenized,
                 batch_size,
                 max_seq_length,
@@ -5591,7 +5961,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     )
 
     if _distributed_rank_size(comm_group)[1] > 1:
-        batch_pairs = _create_distributed_text_batches(
+        return _create_distributed_text_plan(
             ds, batch_size, max_seq_length,
             num_batches=num_batches,
             seed=seed,
@@ -5599,24 +5969,40 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             distributed_pad_mode=distributed_pad_mode,
             tokenizer=tokenizer,
         )
-    else:
-        batch_pairs = []
-        for batch, lengths_info in iterate_batches(
-            ds, batch_size, max_seq_length,
-            loop=(num_batches is not None),
-            seed=seed,
-        ):
-            max_length = int(mx.max(lengths_info[:, 1]).item())
-            batch = batch[:, :max_length]
-            batch_pairs.append((batch, lengths_info, None))
-            if num_batches is not None and len(batch_pairs) >= num_batches:
-                break
-
-    mx.eval(
-        [b for b, lengths, _ in batch_pairs]
-        + [lengths for _, lengths, _ in batch_pairs]
+    return _create_default_text_plan(
+        ds,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
     )
-    return batch_pairs
+
+
+def create_batches(dataset, tokenizer, batch_size, max_seq_length,
+                   num_batches=None, seed=42, dataset_text_field="text",
+                   formatting_func=None, chat_template=None,
+                   model_name=None, model_type=None, append_eos=True,
+                   completion_only_loss=None, assistant_only_loss=False,
+                   comm_group=None, distributed_pad_mode="cycle"):
+    """Pre-tokenize and eagerly batch a HuggingFace dataset for MLX."""
+    return _create_text_batch_plan(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+        comm_group=comm_group,
+        distributed_pad_mode=distributed_pad_mode,
+    ).materialize_all()
 
 
 def _distributed_rank_size(comm_group=None):
@@ -5721,9 +6107,12 @@ def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_va
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    pad_to = 32
-    max_length = max(2, 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to))
-    max_length = min(max_length, max_seq_length)
+    max_length = _finite_text_pad_width(
+        max(lengths),
+        pad_to_multiple=32,
+        minimum_width=2,
+        max_seq_length=max_seq_length,
+    )
     batch_ids = []
     truncated_lengths = []
     for ids, length in zip(batch, lengths):
@@ -5765,7 +6154,7 @@ def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
     return batch_dict
 
 
-def _create_distributed_text_batches(
+def _create_distributed_text_plan(
     dataset,
     batch_size,
     max_seq_length,
@@ -5802,7 +6191,7 @@ def _create_distributed_text_batches(
     ]
     rng = np.random.RandomState(_normalize_seed(seed))
 
-    batch_pairs = []
+    schedule = []
     while True:
         indices = rng.permutation(len(batch_idx))
         for i in indices:
@@ -5815,19 +6204,54 @@ def _create_distributed_text_batches(
             )
             if not local_idx:
                 continue
-            batch = [None if j is None else dataset[j] for j in local_idx]
-            batch_pairs.append(
-                _make_text_batch_from_items(
-                    batch,
-                    tokenizer=tokenizer,
-                    max_seq_length=max_seq_length,
-                )
-            )
-            if num_batches is not None and len(batch_pairs) >= num_batches:
-                return batch_pairs
+            schedule.append(tuple(local_idx))
+            if num_batches is not None and len(schedule) >= num_batches:
+                break
+        if num_batches is not None and len(schedule) >= num_batches:
+            break
         if num_batches is None:
             break
-    return batch_pairs
+
+    rows = _finite_text_rows(
+        [dataset[index] for index in range(len(dataset))],
+        with_offsets=True,
+    )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return FiniteTextBatchPlan(
+        rows,
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=0 if pad_id is None else int(pad_id),
+        minimum_width=2,
+        pad_to_multiple=32,
+        # Same normalized seed on every rank keeps DDP visit vectors aligned.
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
+    )
+
+
+def _create_distributed_text_batches(
+    dataset,
+    batch_size,
+    max_seq_length,
+    *,
+    num_batches=None,
+    seed=42,
+    comm_group=None,
+    distributed_pad_mode="cycle",
+    tokenizer=None,
+):
+    """Eager compatibility wrapper for distributed text batching."""
+    return _create_distributed_text_plan(
+        dataset,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        comm_group=comm_group,
+        distributed_pad_mode=distributed_pad_mode,
+        tokenizer=tokenizer,
+    ).materialize_all()
 
 
 def _torch_randperm_order(length, seed):
@@ -5843,15 +6267,26 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
-def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
-                           num_batches=None, seed=None, dataset_order="sequential",
-                           dataset_text_field="text",
-                           formatting_func=None, chat_template=None,
-                           model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True,
-                           completion_only_loss=None, assistant_only_loss=False,
-                           comm_group=None):
-    """Create text batches with an explicit dataset order.
+def _create_ordered_text_plan(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    num_batches=None,
+    seed=None,
+    dataset_order="sequential",
+    dataset_text_field="text",
+    formatting_func=None,
+    chat_template=None,
+    model_name=None,
+    model_type=None,
+    num_epochs=None,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+    comm_group=None,
+):
+    """Plan text batches with an explicit dataset order.
 
     Unsloth uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
@@ -5952,7 +6387,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
 
-    batch_pairs = []
+    schedule = []
     epoch = 0
     order = make_order(epoch)
     order_pos = 0
@@ -5962,7 +6397,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         len(tokenized) * (1 if num_epochs is None else int(num_epochs))
         if num_batches is None else None
     )
-    while num_batches is None or len(batch_pairs) < num_batches:
+    while num_batches is None or len(schedule) < num_batches:
         # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
         # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
         if order_pos >= len(order):
@@ -5992,36 +6427,56 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         )
         if not chunk:
             break
-        batch_items = [tokenized[i] for i in chunk]
-
-        max_length = max(len(item[0] if labeled else item) for item in batch_items)
-        # mlx-lm iterate_batches pad convention; raw 0 only if no pad_token_id.
-        _pad_id = getattr(tokenizer, "pad_token_id", None)
-        if _pad_id is None:
-            _pad_id = 0
-        _pad_id = int(_pad_id)
-        if labeled:
-            batch_pairs.append(
-                _create_labeled_text_batch(batch_items, max_seq_length, pad_id=_pad_id)
-            )
-        else:
-            batch_ids = []
-            lengths = []
-            for ids in batch_items:
-                length = len(ids)
-                batch_ids.append(ids + [_pad_id] * (max_length - length))
-                lengths.append([0, length])
-            batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
+        schedule.append(tuple(chunk))
 
         if num_batches is None and target_items is not None and seen >= target_items:
             break
 
-    mx.eval(
-        [b for b, lengths, _ in batch_pairs]
-        + [lengths for _, lengths, _ in batch_pairs]
-        + [labels for _, _, labels in batch_pairs if labels is not None]
+    if labeled:
+        rows = _finite_text_rows(tokenized)
+    else:
+        rows = tuple(
+            _FiniteTextRow(tuple(int(token) for token in input_ids))
+            for input_ids in tokenized
+        )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return FiniteTextBatchPlan(
+        rows,
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=0 if pad_id is None else int(pad_id),
+        minimum_width=2,
     )
-    return batch_pairs
+
+
+def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
+                           num_batches=None, seed=None, dataset_order="sequential",
+                           dataset_text_field="text",
+                           formatting_func=None, chat_template=None,
+                           model_name=None, model_type=None,
+                           num_epochs=None, append_eos=True,
+                           completion_only_loss=None, assistant_only_loss=False,
+                           comm_group=None):
+    """Eagerly create text batches with an explicit dataset order."""
+    return _create_ordered_text_plan(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        dataset_order=dataset_order,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        num_epochs=num_epochs,
+        append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+        comm_group=comm_group,
+    ).materialize_all()
 
 
 def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",

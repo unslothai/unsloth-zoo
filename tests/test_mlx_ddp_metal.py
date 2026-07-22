@@ -420,6 +420,7 @@ payload = {
     "ddp_compile_param_delta": ddp_compile_param_delta,
     "ddp_compile_enabled": bool(ddp_compile_result["compile_enabled"]),
     "ddp_compile_scope": ddp_compile_result["compile_scope"],
+    "ddp_compile_shape_guard": ddp_compile_result["compile_shape_guard"],
     "ddp_eager_tokens": int(ddp_eager_result["trained_tokens"]),
     "ddp_compile_tokens": int(ddp_compile_result["trained_tokens"]),
     "strict_error": strict_error,
@@ -523,6 +524,12 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[1]["ddp_compile_param_delta"] < 1e-5
     assert [rank["ddp_compile_enabled"] for rank in ranks] == [True, True]
     assert [rank["ddp_compile_scope"] for rank in ranks] == ["ddp_local_grad", "ddp_local_grad"]
+    assert all(
+        rank["ddp_compile_shape_guard"]["compile_scope"] == "ddp_local_grad"
+        and rank["ddp_compile_shape_guard"]["planned_signatures"]
+        <= rank["ddp_compile_shape_guard"]["cap"]
+        for rank in ranks
+    )
     assert [rank["ddp_eager_tokens"] for rank in ranks] == [rank["ddp_compile_tokens"] for rank in ranks]
     assert all("runtime fallback is disabled" in rank["strict_error"] for rank in ranks)
     assert [rank["best_effort_compile_enabled"] for rank in ranks] == [False, False]

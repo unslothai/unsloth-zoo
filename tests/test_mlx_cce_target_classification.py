@@ -93,6 +93,46 @@ def test_runtime_cce_rejects_target_length_mismatch():
         runtime_cce(hidden, weight, targets_wrong_len)
 
 
+def test_runtime_cce_chunk_plan_cache_canonicalizes_bounds_and_recreates():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(chunk_size=4)
+    cache_info = runtime_cce._unsloth_chunk_plan_cache_info
+
+    def loss_value(vocab_size, *, n_tokens=1, dtype=mx.float32):
+        hidden = mx.ones((n_tokens, 4), dtype=dtype)
+        weight = mx.ones((vocab_size, 4), dtype=dtype)
+        targets = mx.zeros((n_tokens,), dtype=mx.int32)
+        loss = runtime_cce(hidden, weight, targets).sum()
+        mx.eval(loss)
+        return loss.item()
+
+    expected = loss_value(4)
+    loss_value(4, n_tokens=2)
+    after_same_plan = cache_info()
+    assert after_same_plan["entries"] == 1
+    assert after_same_plan["hits"] > 0
+
+    loss_value(4, dtype=mx.float16)
+    loss_value(4, dtype=mx.bfloat16)
+    assert cache_info()["entries"] == 3
+
+    for vocab_size in range(5, 23):
+        loss_value(vocab_size)
+    bounded = cache_info()
+    assert set(bounded) == {
+        "entries", "max_entries", "hits", "misses", "evictions",
+    }
+    assert bounded["entries"] == bounded["max_entries"] == 16
+    assert bounded["evictions"] > 0
+
+    misses_before = bounded["misses"]
+    assert loss_value(4) == expected
+    assert cache_info()["misses"] > misses_before
+
+
 # ----------------------------------------------------------------------
 # In-vocab ignore_index must take precedence over invalid classification
 # ----------------------------------------------------------------------
