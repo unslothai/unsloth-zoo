@@ -19,6 +19,7 @@ import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
 from contextlib import contextmanager, nullcontext
 import os
+import functools
 import warnings
 import gc
 import threading
@@ -70,12 +71,14 @@ def _any_device_integrated():
         return False
 
 
+@functools.cache
 def _double_buffer_disabled():
-    # Double buffering overlaps the H2D offload copy with compute, but on unified-
-    # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide:
-    # pure overhead (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1
-    # forces it; else disable when any visible device is integrated. Called at GC init,
-    # not import, so it never probes the GPU before the caller selects its device.
+    # Cached: computed once on the first GC init (after device selection), never at
+    # import, so it does not probe the GPU before the caller picks its device. Double
+    # buffering overlaps the H2D offload copy with compute, but on unified-memory devices
+    # (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure overhead
+    # (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it; else
+    # disable when any visible device is integrated.
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
