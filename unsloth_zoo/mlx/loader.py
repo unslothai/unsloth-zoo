@@ -4735,10 +4735,12 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
 
     if isinstance(target_modules, str):
         tm = [target_modules]  # a bare module name, not a char iterable
-    elif isinstance(target_modules, (list, tuple)):
-        tm = list(target_modules)
+    elif isinstance(target_modules, (list, tuple, set, frozenset)):
+        tm = list(target_modules)  # accept any selection iterable, incl. sets
     else:
         tm = []
+    if isinstance(modules_to_save, str):
+        modules_to_save = [modules_to_save]  # a bare name, not a char iterable
     mts = list(dict.fromkeys(modules_to_save or []))  # dedup, keep order
     for name in mts:
         if name not in ("embed_tokens", "lm_head"):
@@ -4777,12 +4779,19 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
     lm_head_lora_path = None
     if "lm_head" in tm or "lm_head" in mts:
         if tied:
-            raise ValueError(
-                "Unsloth: lm_head cannot be trained separately on a tied-"
-                "embedding model — the output head shares embed_tokens' weight. "
-                "Add 'embed_tokens' to target_modules to train the shared matrix."
-            )
-        if desc.module is None:
+            # The tied output head shares embed_tokens' weight, so it trains via
+            # the embed_tokens full module. Accept the common recipe
+            # target_modules=[..., "embed_tokens", "lm_head"] by treating a
+            # co-requested lm_head as already selected; reject only a standalone
+            # lm_head, which cannot train the head without the shared embedding.
+            if "embed_tokens" not in tm and "embed_tokens" not in mts:
+                raise ValueError(
+                    "Unsloth: lm_head cannot be trained separately on a tied-"
+                    "embedding model — the output head shares embed_tokens' "
+                    "weight. Add 'embed_tokens' to target_modules to train the "
+                    "shared matrix."
+                )
+        elif desc.module is None:
             _raise_no_lora_targets(["lm_head"])
         elif "lm_head" in mts:            # precedence: modules_to_save -> full module
             _add_full(desc.path, desc.module)
@@ -6111,7 +6120,10 @@ class FastMLXModel:
         # vision linears, projector, untied lm_head). Walk the tree for those
         # names rather than collapsing to the canonical 7, which would leave
         # fused-attention archs and MoEs mostly un-LoRA'd.
-        if target_modules == ["all-linear"] or target_modules == "all-linear":
+        if target_modules == "all-linear" or (
+            isinstance(target_modules, (list, tuple, set, frozenset))
+            and list(target_modules) == ["all-linear"]
+        ):
             target_modules = _collect_all_linear_target_names(model)
             # PEFT parity: "all-linear" excludes the output layer. Drop the
             # descriptor-resolved head's leaf name (or the unique shape-matched
@@ -6138,8 +6150,9 @@ class FastMLXModel:
             ]
 
         # Filter by finetune_attention_modules / finetune_mlp_modules,
-        # whatever the source of target_modules, so these flags always apply.
-        if isinstance(target_modules, list) and len(target_modules) > 0:
+        # whatever the source of target_modules, so these flags always apply
+        # (incl. set/frozenset/tuple selections, not just lists).
+        if isinstance(target_modules, (list, tuple, set, frozenset)) and len(target_modules) > 0:
             _ATTN = {
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "qkv", "qkv_proj", "Wqkv", "in_proj",

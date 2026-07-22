@@ -17,6 +17,10 @@ import os
 import tempfile
 
 import pytest
+
+# Skip the whole module (before importing mlx.nn/utils) when MLX is absent, so
+# collection on Linux / non-MLX environments does not raise ModuleNotFoundError.
+pytest.importorskip("mlx.core")
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils as mu
@@ -94,5 +98,44 @@ def test_tied_trains_shared_matrix_and_rejects_lm_head():
     m = _tiny(tied=True)
     _peft(m, target_modules=["embed_tokens"], finetune_language_layers=False)
     assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
+    # The documented recipe co-requests embed_tokens + lm_head; on a tied model
+    # that trains the shared matrix via embed_tokens rather than erroring.
+    m2 = _tiny(tied=True)
+    _peft(m2, target_modules=["embed_tokens", "lm_head"], finetune_language_layers=False)
+    assert m2._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
+    trn = set(dict(mu.tree_flatten(m2.trainable_parameters())))
+    assert not any(k.startswith("lm_head") for k in trn)  # tied: no separate head
+    # A standalone lm_head request is still rejected.
     with pytest.raises(ValueError, match="tied"):
         _peft(_tiny(tied=True), target_modules=["lm_head"])
+
+
+def test_set_valued_target_modules_are_not_silently_emptied():
+    # A set/frozenset selection must be honored, not dropped to keys=None.
+    m = _tiny()
+    _peft(m, target_modules={"q_proj", "embed_tokens"})
+    assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
+    # A bare-string modules_to_save must not iterate characters.
+    ms = _tiny()
+    _peft(ms, target_modules=["q_proj"], modules_to_save="embed_tokens")
+    assert ms._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
+
+
+def test_all_linear_sentinel_accepts_set_form():
+    # target_modules={"all-linear"} must expand like the string sentinel rather
+    # than be treated as a literal module name that matches nothing.
+    m = _tiny()
+    _peft(m, target_modules={"all-linear"})
+    trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
+    assert any(k.endswith("q_proj.lora_a") for k in trn)
+
+
+def test_set_target_modules_respects_finetune_filters():
+    # A set selection must still honor finetune_attention_modules=False:
+    # q_proj (attention) is filtered out while embed_tokens still trains.
+    m = _tiny()
+    _peft(m, target_modules={"q_proj", "embed_tokens"},
+          finetune_attention_modules=False)
+    trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
+    assert "model.embed_tokens.weight" in trn
+    assert not any("q_proj.lora" in k for k in trn)
