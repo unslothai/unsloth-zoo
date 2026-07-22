@@ -759,3 +759,28 @@ def _vlm_planner_fixtures(processor=None, rows=6):
         batch_size=1,
         max_seq_length=8,
     )
+
+
+def test_vlm_should_raise_decision_aborts_inside_the_coordinated_block():
+    """A compile decision that mandates an abort raises during planning —
+    inside the coordinated block — rather than surviving as a benign
+    non-planning state that would strand peers at a later rank-local
+    raise."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
+
+    plan = _vlm_planner_fixtures(rows=2)
+    with pytest.raises(RuntimeError, match="compile cannot be enabled"):
+        _plan_single_process_vlm_shapes(
+            plan, None,
+            args=SimpleNamespace(compile_max_variants=None,
+                                 gradient_accumulation_steps=1),
+            total_steps=2, distributed_world_size=2,
+            compile_policy=SimpleNamespace(mode="strict"),
+            compile_decision=SimpleNamespace(
+                enabled=False, should_raise=True, arch="tiny",
+                reason="unsupported architecture",
+            ),
+        )

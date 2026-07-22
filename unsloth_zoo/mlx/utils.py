@@ -6095,6 +6095,43 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             )
         return self._padable[operator.index(index)]
 
+    def planned_event_widths(self):
+        """Per-batch planner event widths from the survey: padable batches
+        take the shared rounded width policy capped at the surveyed maximum
+        final width (never ``max_seq_length`` — post-expansion widths may
+        exceed it) and bumped off the union of untouched-array extents;
+        declined batches keep their exact raw widths. Deterministic given
+        the survey, so planning and post-coordination installation derive
+        identical widths."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch widths have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        forbidden = set()
+        padable_widths = []
+        for index in range(len(self._schedule)):
+            forbidden.update(self._forbidden[index])
+            if self._padable[index]:
+                padable_widths.append(self._widths[index])
+        surveyed_max = max(padable_widths, default=0)
+        widths = []
+        for index in range(len(self._schedule)):
+            raw_width = self._widths[index]
+            if self._padable[index]:
+                width = _finite_text_pad_width(
+                    raw_width,
+                    pad_to_multiple=32,
+                    minimum_width=2,
+                    max_seq_length=surveyed_max,
+                )
+                while width in forbidden:
+                    width += 1
+            else:
+                width = raw_width
+            widths.append(width)
+        return tuple(widths)
+
     def batch_forbidden_widths(self, index):
         """Extents of this batch's untouched arrays (any nesting depth);
         a planned endpoint must avoid all of them."""

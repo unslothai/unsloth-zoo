@@ -759,6 +759,12 @@ def _shape_guard_report(
     )
 
 
+class _VLMCompileDecisionError(RuntimeError):
+    """A compile decision that mandates an abort. Never maskable by
+    best-effort degradation: per-architecture strict overrides can set
+    should_raise while the base policy mode stays best_effort."""
+
+
 def _plan_single_process_vlm_shapes(
     batches,
     batch_iter,
@@ -787,6 +793,18 @@ def _plan_single_process_vlm_shapes(
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
     lazy = isinstance(batches, FiniteVLMBatchPlan)
+    if compile_decision is not None and getattr(
+        compile_decision, "should_raise", False,
+    ):
+        # Checked before EVERY applicability class (including streaming):
+        # the decision mandates an abort, and it must surface inside the
+        # coordinated block rather than at a later rank-local raise.
+        raise _VLMCompileDecisionError(
+            "Unsloth: strict mx.compile requested for VLM arch "
+            f"'{getattr(compile_decision, 'arch', 'unknown')}', but compile "
+            f"cannot be enabled "
+            f"({getattr(compile_decision, 'reason', 'unqualified')})."
+        )
     if batch_iter is not None:
         return None, _shape_guard_report(
             "not_applicable", "streaming", cap, lazy_batches=False,
@@ -794,12 +812,6 @@ def _plan_single_process_vlm_shapes(
     if compile_policy.mode == "eager":
         return None, _shape_guard_report(
             "not_applicable", "compile_disabled", cap, lazy_batches=lazy,
-        ), True, None
-    if distributed_world_size > 1:
-        # Coordinated multi-rank VLM planning is not wired; compiled DDP
-        # behavior is unchanged (unplanned).
-        return None, _shape_guard_report(
-            "not_applicable", "vlm_distributed", cap, lazy_batches=lazy,
         ), True, None
     if compile_decision is None or not getattr(
         compile_decision, "enabled", False,
@@ -809,7 +821,11 @@ def _plan_single_process_vlm_shapes(
             lazy_batches=lazy,
         ), True, None
     max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
-    if max_grad_norm > 0 and args.gradient_accumulation_steps > 1:
+    if (
+        distributed_world_size <= 1
+        and max_grad_norm > 0
+        and args.gradient_accumulation_steps > 1
+    ):
         # Compilation is disabled later for this configuration; do not pay
         # the survey (it materializes every batch) for a plan that could
         # never be compiled.
@@ -817,14 +833,17 @@ def _plan_single_process_vlm_shapes(
             "not_applicable", "compile_ineligible_global_norm", cap,
             lazy_batches=lazy,
         ), False, None
-    compile_scope = FULL_STEP_SCOPE
+    compile_scope = (
+        DDP_LOCAL_GRAD_SCOPE
+        if distributed_world_size > 1 else FULL_STEP_SCOPE
+    )
     if not isinstance(batches, FiniteVLMBatchPlan):
         report = _shape_guard_report(
             "eager", "unsupported_batch_plan", cap, compile_scope,
             lazy_batches=False,
             cap_selection="not_applicable",
         )
-        if compile_policy.mode == "strict":
+        if compile_policy.mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile requires a finite VLM batch plan."
             )
@@ -867,28 +886,7 @@ def _plan_single_process_vlm_shapes(
             )
         return None, report, False, None
 
-    forbidden = set()
-    padable_widths = []
-    for index in range(len(batches)):
-        forbidden.update(batches.batch_forbidden_widths(index))
-        if batches.batch_padable(index):
-            padable_widths.append(batches.batch_width(index))
-    surveyed_max = max(padable_widths, default=0)
-    planned_widths = []
-    for index in range(len(batches)):
-        raw_width = batches.batch_width(index)
-        if batches.batch_padable(index):
-            width = _finite_text_pad_width(
-                raw_width,
-                pad_to_multiple=32,
-                minimum_width=2,
-                max_seq_length=surveyed_max,
-            )
-            while width in forbidden:
-                width += 1
-        else:
-            width = raw_width
-        planned_widths.append(width)
+    planned_widths = batches.planned_event_widths()
 
     total_microsteps = total_steps * args.gradient_accumulation_steps
     event_counts = {}
@@ -2478,6 +2476,207 @@ class MLXTrainer:
                             f"({reason})"
                         )
 
+            # Coordinated VLM shape-guard preflight. Runs AFTER compile
+            # qualification (the descriptor survey materializes every batch
+            # once, so it must not run for unqualified runs) and after
+            # auto-tuning (planning reads the tuned args), and BEFORE any
+            # optimizer or compiled-callable setup: every rank agrees on
+            # failure, mode, and the shared automatic cap while the run is
+            # still trivial to abort. The setup between the decision block
+            # and this preflight (norm patching, memory limits, tracing) is
+            # rank-deterministic — identical models and args fail
+            # identically on every rank — so it needs no collectives of its
+            # own; asymmetric infrastructure failures there are outside the
+            # guard's scope, exactly as for the text path's post-preflight
+            # setup. A strict abort raised here unwinds through train()'s
+            # finally, which restores the norm-output-cast globals; fp32
+            # norm parameter storage and auto-tuned args persist, and both
+            # are idempotent if train() is called again.
+            if self._is_vlm and hasattr(self, "_batches"):
+                preflight_error = None
+                batches = batch_iter = None
+                total_steps = 0
+                compile_policy = build_compile_policy(args=args)
+                self._deferred_vlm_all_masked_check = None
+                try:
+                    if self._batches is None:
+                        self._prepared_batches_include_epochs = False
+                    # Deferred checker: preparation stays collective-free,
+                    # so the status reduction below is the FIRST collective
+                    # on every rank no matter where local preparation
+                    # failed, and the checker's all-reduce runs strictly
+                    # after it on every rank that passed.
+                    batches, batch_iter = self._prepare_data(
+                        True, defer_vlm_checker=True,
+                    )
+                    total_steps = _resolve_training_steps(
+                        args,
+                        batches,
+                        batch_iter,
+                        includes_epochs=getattr(
+                            self, "_prepared_batches_include_epochs", False,
+                        ),
+                    )
+                except Exception as exc:
+                    preflight_error = exc
+                if self.distributed_world_size > 1:
+                    self._raise_distributed_failure(
+                        preflight_error is not None,
+                        "preparing finite VLM shape guard",
+                        preflight_error,
+                    )
+                elif preflight_error is not None:
+                    raise preflight_error
+                deferred_check = self._deferred_vlm_all_masked_check
+                self._deferred_vlm_all_masked_check = None
+                if deferred_check is not None:
+                    # Global counts: every surviving rank computes the same
+                    # ratio, so an all-masked dataset raises symmetrically.
+                    deferred_check()
+                local_plan_error = None
+                shape_plan = None
+                frontier = None
+                try:
+                    (
+                        shape_plan,
+                        report,
+                        compile_allowed,
+                        frontier,
+                    ) = _plan_single_process_vlm_shapes(
+                        batches,
+                        batch_iter,
+                        args=args,
+                        total_steps=total_steps,
+                        distributed_world_size=self.distributed_world_size,
+                        compile_policy=compile_policy,
+                        compile_decision=self._compile_decision,
+                        install_plan=False,
+                    )
+                except Exception as exc:
+                    local_plan_error = exc
+                    report = _shape_guard_report(
+                        "eager",
+                        "planner_error",
+                        resolve_compile_max_variants(args.compile_max_variants),
+                        (
+                            DDP_LOCAL_GRAD_SCOPE
+                            if self.distributed_world_size > 1
+                            else FULL_STEP_SCOPE
+                        ),
+                        cap_selection="not_applicable",
+                    )
+                    compile_allowed = False
+                # Synchronize the planning MODE before coordination:
+                # qualification and applicability resolve rank-locally, and
+                # the coordinator's automatic path enters a max-reduction
+                # only on ranks holding a frontier — mixed planning and
+                # benign non-planning ranks would execute mismatched
+                # collectives there AND divergent compile eligibility later
+                # (only compiling ranks enter the compiled-setup
+                # collectives). Three fixed reductions run on every rank; a
+                # genuinely MIXED state discards plans on planning ranks
+                # and disables compile on every benign/planning rank so all
+                # downstream collective participation stays symmetric.
+                # Uniform benign states (streaming, compile disabled — all
+                # args-derived, hence rank-identical) keep their legacy
+                # unplanned behavior.
+                benign_not_planning = (
+                    local_plan_error is None
+                    and compile_allowed
+                    and shape_plan is None
+                )
+                planning_locally = (
+                    local_plan_error is None
+                    and compile_allowed
+                    and shape_plan is not None
+                )
+                decision_eligible = bool(
+                    self._compile_decision is not None
+                    and getattr(self._compile_decision, "enabled", False)
+                )
+                if self.distributed_world_size > 1:
+                    # Three fixed reductions on every rank, always in this
+                    # order. Eligibility divergence can hide inside ANY
+                    # uniform applicability class (e.g. streaming ranks
+                    # never inspect the decision), so it is synchronized
+                    # directly: a mixed eligible/ineligible group disables
+                    # compile everywhere, keeping every later
+                    # compiled-setup collective (and rank-local decision
+                    # gate) symmetric.
+                    any_ineligible = self._distributed_any_flag(
+                        not decision_eligible,
+                    )
+                    any_benign = self._distributed_any_flag(
+                        benign_not_planning,
+                    )
+                    any_planning = self._distributed_any_flag(
+                        planning_locally,
+                    )
+                    mixed_eligibility = any_ineligible and decision_eligible
+                    peer_split = any_benign and any_planning
+                    if mixed_eligibility or peer_split:
+                        if planning_locally:
+                            report = _shape_guard_report(
+                                "not_applicable",
+                                "vlm_peer_not_planning",
+                                resolve_compile_max_variants(
+                                    args.compile_max_variants,
+                                ),
+                                lazy_batches=isinstance(
+                                    batches, FiniteVLMBatchPlan,
+                                ),
+                            )
+                            shape_plan = None
+                            frontier = None
+                        compile_allowed = False
+                (
+                    shape_plan,
+                    report,
+                    compile_allowed,
+                ) = self._coordinate_text_shape_guard(
+                    shape_plan,
+                    frontier,
+                    report,
+                    compile_allowed,
+                    compile_policy,
+                    automatic=args.compile_max_variants is None,
+                    local_error=local_plan_error,
+                )
+                # Mandatory-abort synchronization: a should_raise decision
+                # (per-arch strict overrides can produce one even under a
+                # best-effort base mode, and qualification may diverge
+                # across ranks) must abort EVERY rank, not just the one
+                # holding the error — a lone exit would strand peers at the
+                # next training collective. One fixed reduction after
+                # coordination keeps the schedule pairable in all states.
+                decision_abort = isinstance(
+                    local_plan_error, _VLMCompileDecisionError,
+                )
+                if self.distributed_world_size > 1:
+                    any_decision_abort = self._distributed_any_flag(
+                        decision_abort,
+                    )
+                else:
+                    any_decision_abort = decision_abort
+                if any_decision_abort:
+                    if decision_abort:
+                        raise local_plan_error
+                    raise RuntimeError(
+                        "Unsloth: a peer DDP rank's compile decision "
+                        "mandates an abort for this VLM run."
+                    )
+                if (
+                    compile_allowed
+                    and shape_plan is not None
+                    and isinstance(batches, FiniteVLMBatchPlan)
+                ):
+                    batches.set_shape_plan(
+                        shape_plan, batches.planned_event_widths(),
+                    )
+                self._text_shape_guard_preflight = (
+                    batches, batch_iter, total_steps, report, compile_allowed,
+                )
+
             # (memory limits already applied above; just log what we configured)
             if self._memory_limits_applied:
                 parts = []
@@ -3873,7 +4072,7 @@ class MLXTrainer:
         self.processor = processor
         return processor
 
-    def _prepare_data(self, is_vlm):
+    def _prepare_data(self, is_vlm, defer_vlm_checker=False):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
         train_dataset = self._train_dataset_for_batches()
@@ -3960,7 +4159,24 @@ class MLXTrainer:
                     comm_group=comm_group,
                 )
                 batches = [] if plan is None else plan
-                if _vlm_mask_fn is not None and len(batches) > 0:
+                run_checker = _vlm_mask_fn is not None and len(batches) > 0
+                if defer_vlm_checker:
+                    # The coordinated preflight owns the collective
+                    # schedule: rank-local preparation must be entirely
+                    # collective-free so its status reduction is the FIRST
+                    # collective on every rank, with the checker's
+                    # all-reduce running strictly after it. The pending
+                    # check is stashed for the preflight to invoke.
+                    self._deferred_vlm_all_masked_check = (
+                        (lambda: _check_vlm_all_masked(
+                            batches,
+                            comm_group=comm_group,
+                            world_size=self.distributed_world_size,
+                        ))
+                        if run_checker else None
+                    )
+                    return batches, None
+                if run_checker:
                     _check_vlm_all_masked(
                         batches,
                         comm_group=comm_group,
