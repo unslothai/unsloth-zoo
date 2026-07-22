@@ -666,9 +666,10 @@ class MLXTrainingConfig:
     # reporting reduction exists in the graph; grad_norm is absent from
     # console/W&B/TB, _grad_norm_history, and the legacy step callback (None).
     # Reporting never changes update numerics; the reported value is the fp32
-    # norm of the token-normalized gradient — after the accumulation divide,
-    # DDP reduction, and the LoRA+/embedding-LR ratios; before any clipping or
-    # weight decay.
+    # norm of the token-normalized gradient — after the accumulation divide and
+    # DDP reduction; before any clipping, weight decay, the optimizer update, and
+    # the LoRA+/embedding-LR post-update step rescale (which no longer scales the
+    # gradient).
     report_grad_norm: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -2607,12 +2608,27 @@ class MLXTrainer:
                     return embedding_lr_ratio
             return None
 
+        # The trainable set is fixed after get_peft_model, so classify the
+        # scoped leaves once here rather than re-running _scoped_step_ratio over
+        # the whole tree every optimizer step.
+        _scoped_ratios = {}
+        if _needs_grad_scaling:
+            for name, _value in tree_flatten(model.trainable_parameters()):
+                r = _scoped_step_ratio(name)
+                # ratio == 1.0 is a no-op rescale (pre + 1*(post-pre) == post);
+                # skip it so no large full-module tensor is snapshotted when the
+                # scoped LR equals the base LR.
+                if r is not None and r != 1.0:
+                    _scoped_ratios[name] = r
+
         def _snapshot_scoped_params():
             """Pre-update values (immutable mx arrays) + ratio for scoped leaves,
             captured before decoupled decay so the rescale scales decay too."""
+            if not _scoped_ratios:
+                return {}
             snap = {}
             for name, value in tree_flatten(model.trainable_parameters()):
-                r = _scoped_step_ratio(name)
+                r = _scoped_ratios.get(name)
                 if r is not None:
                     snap[name] = (value, r)
             return snap
