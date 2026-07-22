@@ -274,7 +274,10 @@ def get_amd_flash_attn_func():
         if hasattr(_aiter, "flash_attn_func"):
             return _aiter.flash_attn_func
         if hasattr(_aiter, "FlashAttnFunc"):
-            return _aiter.FlashAttnFunc
+            # Class-based API: must call via .apply(); wrap in lambda so callers
+            # always receive a plain callable with signature (q, k, v, causal=True)
+            _cls = _aiter.FlashAttnFunc
+            return lambda q, k, v, causal=True: _cls.apply(q, k, v, causal)
     except Exception:
         pass
     return None

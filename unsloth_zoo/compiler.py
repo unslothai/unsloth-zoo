@@ -378,22 +378,31 @@ pass
 def replace_sdpa_with_amd_aiter(source):
     """
     For AMD ROCm with amd-aiter installed: replace scaled_dot_product_attention
-    calls with amd-aiter's Flash Attention implementation in the compiled source.
+    calls with amd-aiter Flash Attention in the compiled source.
 
-    Only activates on AMD ROCm when get_amd_attention_implementation() == "amd_aiter".
+    Safety requirements (all must hold for the aiter path to activate):
+      1. get_amd_attention_implementation() == "amd_aiter"
+      2. is_causal=True as a literal (not a complex expression)
+      3. No extra SDPA args that aiter does not support:
+         attn_mask, dropout_p, scale, enable_gqa
+      4. q/k seq lengths equal (non-square causal has different bias alignment)
+      5. Input dtype is float16 or bfloat16 (aiter does not support float32)
+
     No-op on NVIDIA and on ROCm without amd-aiter or ROCm < 7.0.
     """
-    # Fix 1: import inside function to avoid compile-time NameError in caller scope
+    # Import inside function — avoids compile-time NameError in caller scope
     from unsloth_zoo.device_type import get_amd_attention_implementation
     if get_amd_attention_implementation() != "amd_aiter":
         return source
 
     import re
 
-    # Fix 3: use ((?:[^)]|\([^)]*\))*) to safely handle one level of nested parens
+    # Pattern:  out = <prefix.>scaled_dot_product_attention(q, k, v, ...)
+    # Excludes: disable_compile_scaled_dot_product_attention (opt-out shim)
+    # Uses ((?:[^)]|\([^)]*\))*) to handle one level of nested parens in args
     sdpa_call_pattern = (
         r"([ \t]*)([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*"
-        r"(?:[A-Za-z_.]*scaled_dot_product_attention)"
+        r"(?:(?:torch\.nn\.functional|F|nn\.functional)\.)?scaled_dot_product_attention"
         r"\("
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
@@ -402,42 +411,59 @@ def replace_sdpa_with_amd_aiter(source):
     )
 
     def aiter_replacement(m):
-        indent = m.group(1)
+        indent  = m.group(1)
         out_var = m.group(2)
-        q_var = m.group(3)
-        k_var = m.group(4)
-        v_var = m.group(5)
+        q_var   = m.group(3)
+        k_var   = m.group(4)
+        v_var   = m.group(5)
         rest_args = m.group(6)
 
-        # Extract is_causal value from rest_args
-        causal_match = re.search(r"is_causal\s*=\s*([^,]+)", rest_args)
-        is_causal = causal_match.group(1).strip() if causal_match else "False"
+        # Only rewrite when is_causal=True as a literal — aiter is causal-only;
+        # complex expressions like `is_causal=self.is_causal and mask is None`
+        # cannot be safely evaluated at rewrite time.
+        causal_match = re.search(r"is_causal\s*=\s*(True)\b", rest_args)
+        if causal_match is None:
+            # Not a plain literal True — leave this call unchanged
+            return m.group(0)
 
-        # Fix 3: clean leading newlines from rest_args to avoid blank lines
-        rest_args_clean = rest_args.lstrip("\r\n")
-        rest_args_formatted = (", " + rest_args_clean.strip()) if rest_args_clean.strip() else ""
+        # If any SDPA-only arguments are present, fall back — aiter does not
+        # support attn_mask, dropout_p, scale, or enable_gqa
+        unsupported = ("attn_mask", "dropout_p", "scale", "enable_gqa")
+        if any(kw in rest_args for kw in unsupported):
+            return m.group(0)
 
-        # Fix 4: only route to aiter when is_causal is True (aiter flash_attn is causal-only fast path)
-        # Fix 2: import get_amd_flash_attn_func inside generated code to avoid runtime NameError
-        return (
-            f"{indent}# AMD aiter Flash Attention (MFMA + fast softmax + causal tile skip)\n"
-            f"{indent}# Requires: pip install amd-aiter  (ROCm >= 7.0)\n"
-            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func\n"
-            f"{indent}_aiter_fn = get_amd_flash_attn_func()\n"
-            f"{indent}if _aiter_fn is not None and {is_causal}:\n"
-            f"{indent}    _aiter_q = {q_var}.transpose(1, 2)\n"
-            f"{indent}    _aiter_k = {k_var}.transpose(1, 2)\n"
-            f"{indent}    _aiter_v = {v_var}.transpose(1, 2)\n"
-            f"{indent}    {out_var} = _aiter_fn(_aiter_q, _aiter_k, _aiter_v, causal=True).transpose(1, 2)\n"
-            f"{indent}else:\n"
-            f"{indent}    {out_var} = torch.nn.functional.scaled_dot_product_attention(\n"
-            f"{indent}        {q_var}, {k_var}, {v_var}{rest_args_formatted})"
-        )
+        # Clean leading newlines from rest_args
+        rest_args_clean = rest_args.lstrip("\r\n").strip()
+        # rest_args already starts with a comma when non-empty; do NOT add another
+        rest_args_formatted = (", " + rest_args_clean) if rest_args_clean else ""
+
+        # Generate the replacement block.
+        # All symbols used at runtime are imported inside the generated code so
+        # that the exec()'d module namespace is self-contained (no NameError).
+        lines = [
+            f"{indent}# AMD aiter Flash Attention (MFMA + causal tile skip)",
+            f"{indent}# Requires: pip install amd-aiter  (ROCm >= 7.0)",
+            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as _get_aiter_fn",
+            f"{indent}_aiter_fn = _get_aiter_fn()",
+            f"{indent}_aiter_ok = (",
+            f"{indent}    _aiter_fn is not None",
+            f"{indent}    and {q_var}.shape[-2] == {k_var}.shape[-2]",  # equal seq lengths
+            f"{indent}    and {q_var}.dtype in (torch.float16, torch.bfloat16)",  # dtype guard
+            f"{indent})",
+            f"{indent}if _aiter_ok:",
+            f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
+            f"{indent}    _aiter_k = {k_var}.transpose(1, 2)",
+            f"{indent}    _aiter_v = {v_var}.transpose(1, 2)",
+            f"{indent}    {out_var} = _aiter_fn(_aiter_q, _aiter_k, _aiter_v, causal=True).transpose(1, 2)",
+            f"{indent}else:",
+            f"{indent}    {out_var} = torch.nn.functional.scaled_dot_product_attention(",
+            f"{indent}        {q_var}, {k_var}, {v_var}{rest_args_formatted})",
+        ]
+        return "\n".join(lines)
 
     new_source, n = re.subn(sdpa_call_pattern, aiter_replacement, source, flags=re.DOTALL)
-    if n > 0:
-        pass  # Successfully replaced SDPA with aiter
     return new_source
+
 
 
 def _get_compile_folder(use_tempfile=False):
