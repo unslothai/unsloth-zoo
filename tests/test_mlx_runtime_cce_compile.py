@@ -504,3 +504,32 @@ def test_quantized_runtime_cce_rejects_missing_affine_biases():
 
     with pytest.raises(ValueError, match="Biases must be provided for affine"):
         mx.eval(loss_fn(hidden))
+
+
+def test_label_smoothing_matches_closed_form():
+    # label_smoothing>0 disables the Metal kernels and takes the python chunk
+    # path with the HF LabelSmoother loss/gradient (eps=0 kernel-path no-op is
+    # covered by recorded validation).
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    mx.random.seed(3)
+    hidden, weight = mx.random.normal((5, 8)), mx.random.normal((16, 8))
+    targets = mx.array([1, 7, 15, -100, 4], dtype=mx.int32)
+    valid, eps = targets != -100, 0.1
+    cce, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, chunk_size=4, label_smoothing=eps)
+
+    def manual(h, w):
+        lg = (h @ w.T).astype(mx.float32)
+        safe = mx.where(valid, targets, mx.zeros_like(targets))
+        tgt = mx.take_along_axis(lg, mx.expand_dims(safe, -1), -1).squeeze(-1)
+        tok = mx.logsumexp(lg, -1) - (1.0 - eps) * tgt - eps * lg.mean(-1)
+        return mx.where(valid, tok, mx.zeros_like(tok)).sum()
+
+    lc, gc = mx.value_and_grad(
+        lambda h, w: cce(h, w, targets).astype(mx.float32).sum(), argnums=(0, 1))(hidden, weight)
+    lm, gm = mx.value_and_grad(manual, argnums=(0, 1))(hidden, weight)
+    mx.eval(lc, gc, lm, gm)
+    assert float(lc.item()) == pytest.approx(float(lm.item()), rel=1e-5)
+    assert max(float(mx.abs(a - b).max().item()) for a, b in zip(gc, gm)) < 2e-5
