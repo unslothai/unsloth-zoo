@@ -62,11 +62,14 @@ def make_buggy_classes(standardize=True, model_dtype=torch.float16, return_tuple
         def __init__(self):
             super().__init__()
             self.input_proj = torch.nn.Linear(HIDDEN, HIDDEN, bias=False)
+            with torch.no_grad():
+                self.input_proj.weight.copy_(torch.eye(HIDDEN))
 
         def forward(self, pixel_values):
-            # Like upstream: the embedder casts pixels to its weight dtype.
-            # Identity pass instead of the matmul to keep amax controlled.
-            return pixel_values.to(self.input_proj.weight.dtype)
+            # Like upstream: cast pixels to the weight dtype, then run the
+            # real (autocast-eligible) Linear. Identity weight keeps amax
+            # controlled while preserving autocast dtype semantics.
+            return self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
 
     class TinyVisionModel(torch.nn.Module):
         def __init__(self):
@@ -215,6 +218,42 @@ def test_tuple_output_cast():
     assert isinstance(out, tuple)
     assert out[0].dtype == torch.float16
     assert torch.isfinite(out[0]).all()
+
+
+def test_bf16_autocast_over_fp16_weights_untouched():
+    # Under bf16 autocast an fp16-weight input_proj emits bf16 (the true
+    # inputs_embeds dtype); the wrapper must key on that, not the weight
+    # dtype, or it would downcast a previously-safe bf16 path to fp16.
+    TinyPooler, TinyVisionModel = make_buggy_classes(standardize=False)
+    x = fp16_overflow_input(torch.float32)
+    with torch.autocast("cpu", torch.bfloat16):
+        before = make_model(TinyVisionModel)(x).last_hidden_state
+    assert _patch_gemma4_vision_pooler_fp16(TinyPooler, TinyVisionModel) == "patched"
+    with torch.autocast("cpu", torch.bfloat16):
+        after = make_model(TinyVisionModel)(x).last_hidden_state
+    assert after.dtype == before.dtype
+    assert torch.equal(after, before)
+    assert torch.isfinite(after).all(), "bf16 range must be preserved (no fp16 saturation)"
+
+
+def test_captured_hidden_states_stay_consistent():
+    # transformers' capture wrapper ties hidden_states[-1] to the pre-cast
+    # final state; the wrapper must cast that entry too.
+    TinyPooler, TinyVisionModel = make_buggy_classes()
+
+    original_forward = TinyVisionModel.forward
+
+    def forward_with_capture(self, pixel_values, padding_positions=None):
+        output = original_forward(self, pixel_values, padding_positions)
+        output.hidden_states = (torch.zeros(1, dtype=torch.float16), output.last_hidden_state)
+        return output
+
+    TinyVisionModel.forward = forward_with_capture
+    assert _patch_gemma4_vision_pooler_fp16(TinyPooler, TinyVisionModel) == "patched"
+    out = make_model(TinyVisionModel)(fp16_overflow_input())
+    assert out.last_hidden_state.dtype == torch.float16
+    assert out.hidden_states[-1].dtype == torch.float16
+    assert out.hidden_states[-1] is out.last_hidden_state
 
 
 def test_fixed_source_is_skipped():

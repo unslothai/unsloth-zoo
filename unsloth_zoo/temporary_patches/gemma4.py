@@ -880,12 +880,13 @@ pass
 
 
 def _gemma4_vision_cast_dtype(vision_model, pixel_values):
-    """The dtype upstream >= 5.10.1 casts last_hidden_state back to.
+    """Fallback for the dtype upstream >= 5.10.1 casts last_hidden_state to.
 
-    Upstream uses inputs_embeds.dtype; the patch embedder casts pixels to its
-    input_proj weight dtype, so that weight is the authoritative target even
-    when callers pass fp32 processor pixels to an fp16 tower. Fall back to
-    the pixel dtype only if the embedder shape ever drifts.
+    Upstream uses inputs_embeds.dtype - the ACTUAL patch embedder output
+    dtype, which the vision wrapper captures with a transient forward hook.
+    This fallback approximates it from the input_proj weight dtype (the
+    embedder casts pixels to it outside autocast) only when the hook saw
+    nothing, then from the pixel dtype if the embedder shape ever drifts.
     """
     embedder = getattr(vision_model, "patch_embedder", None)
     weight = getattr(getattr(embedder, "input_proj", None), "weight", None)
@@ -931,10 +932,27 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
         @functools.wraps(_original_vision_forward)
         def vision_forward(self, *args, **kwargs):
             pixel_values = args[0] if args else kwargs.get("pixel_values", None)
-            output = _original_vision_forward(self, *args, **kwargs)
-            target_dtype = _gemma4_vision_cast_dtype(self, pixel_values)
-            # fp16 towers only: bf16 / fp32 setups (uniform or mixed) keep
-            # bit-identical upstream behavior.
+            # Capture the ACTUAL embedder output dtype (upstream's
+            # inputs_embeds.dtype): under bf16 autocast an fp16-weight
+            # input_proj emits bf16, and that path must stay untouched.
+            seen = {}
+            handle = None
+            embedder = getattr(self, "patch_embedder", None)
+            if isinstance(embedder, torch.nn.Module):
+                def _capture_embed_dtype(module, hook_args, hook_output):
+                    if torch.is_tensor(hook_output):
+                        seen["dtype"] = hook_output.dtype
+                handle = embedder.register_forward_hook(_capture_embed_dtype)
+            try:
+                output = _original_vision_forward(self, *args, **kwargs)
+            finally:
+                if handle is not None:
+                    handle.remove()
+            target_dtype = seen.get("dtype")
+            if target_dtype is None:
+                target_dtype = _gemma4_vision_cast_dtype(self, pixel_values)
+            # fp16 towers only: bf16 / fp32 setups (uniform, mixed, or
+            # autocast) keep bit-identical upstream behavior.
             if target_dtype != torch.float16:
                 return output
             is_tuple = isinstance(output, tuple)
@@ -949,11 +967,27 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
             ):
                 # Covers standardize = False checkpoints too: the fp32
                 # pooler output is cast straight back to the encoder dtype.
-                hidden_states = hidden_states.to(target_dtype)
+                cast = hidden_states.to(target_dtype)
                 if is_tuple:
-                    output = (hidden_states,) + output[1:]
+                    # Swap the pre-cast tensor wherever it appears, including
+                    # one level down (return_dict=False may nest the
+                    # hidden-states tuple).
+                    output = tuple(
+                        cast if element is hidden_states else (
+                            tuple(cast if item is hidden_states else item for item in element)
+                            if isinstance(element, tuple) else element
+                        )
+                        for element in output
+                    )
                 else:
-                    output.last_hidden_state = hidden_states
+                    # Keep captured hidden_states consistent: transformers'
+                    # capture wrapper ties the tuple's final entry to the
+                    # (pre-cast) final state.
+                    extra = getattr(output, "hidden_states", None)
+                    if isinstance(extra, tuple) and len(extra) > 0 \
+                            and extra[-1] is hidden_states:
+                        output.hidden_states = extra[:-1] + (cast,)
+                    output.last_hidden_state = cast
             return output
 
         vision_forward._unsloth_vision_pooler_fp16 = True
