@@ -2551,13 +2551,7 @@ def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
     assert adapted(types.SimpleNamespace(training=True), position_ids=object()) == "replacement"
     batched = types.SimpleNamespace(VisionModel=type("V", (), {"_forward_same_grid_batch": lambda self: None}))
     assert mc._paddleocr_vl_has_batched_vision(batched)
-    gemma3n = types.SimpleNamespace(masked_scatter=object())
-    language = types.SimpleNamespace(Gemma3Model=type("G", (), {"__call__": len}))
-    monkeypatch.setattr(mc, "_iter_trait_model_modules", lambda *args, **kwargs: [("gemma3n", gemma3n)])
-    monkeypatch.setattr(mc, "_try_import_module", lambda name: language)
-    mc._install_masked_scatter_multimodal_patches()
-    assert gemma3n.masked_scatter is not mc._masked_scatter_no_numpy
-    assert "gemma3n" not in mc._PATCHED_ARCHES
+    assert mc._gemma3n_language_contract(len) is None
 
 
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
@@ -2593,6 +2587,50 @@ def test_compile_patch_primitives_exist():
     import unsloth_zoo.mlx.compile as mc
     primitives = mc.list_compile_patch_primitives()
     assert len(primitives) > 0
+
+
+def test_shared_family_installers_import_only_allowlisted_models(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+    native = lambda *_args, **_kwargs: None
+    qwen_arches = frozenset({"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"})
+    masked_arches = frozenset({"gemma3", "gemma4", "idefics2", "idefics3"})
+    idefics_arches = frozenset({"idefics2", "idefics3"})
+    assert (mc._QWEN_LIKE_MERGE_ARCHES, mc._MASKED_SCATTER_PATCH_ARCHES, mc._IDEFICS_SHARED_PATCH_ARCHES) == (qwen_arches, masked_arches, idefics_arches)
+    methods = {
+        "merge_input_ids_with_image_features": staticmethod(native),
+        "_prepare_inputs_for_multimodal": native,
+        "get_input_embeddings": native,
+    }
+    modules = {
+        arch: types.SimpleNamespace(
+            masked_scatter=native,
+            Model=type(f"{arch}Model", (), methods),
+        )
+        for arch in qwen_arches | masked_arches
+    }
+    paddle_vision = types.SimpleNamespace(
+        VisionModel=type("PaddleVision", (), {"_forward_same_grid_batch": native})
+    )
+    imported = []
+    def import_module(name):
+        imported.append(name)
+        if name == "mlx_vlm.models.paddleocr_vl.vision":
+            return paddle_vision
+        parts = name.split(".")
+        return modules.get(parts[-1]) if parts[-2:] == [parts[-1], parts[-1]] else None
+    monkeypatch.setattr(mc, "_try_import_module", import_module)
+    monkeypatch.setattr(mc, "build_compile_trait_reports", lambda: pytest.fail("runtime traits"))
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(mc, "_VERIFIED_TRAINING_ARCHES", set(mc._VERIFIED_TRAINING_ARCHES))
+    mc._install_qwen_like_image_merge_patches()
+    mc._install_masked_scatter_multimodal_patches()
+    mc._install_idefics_family_compile_patches()
+    assert not any(name.split(".")[-1] in {"lfm2_vl", "minicpmo", "phi4mm"} for name in imported)
+    assert all(modules[arch].masked_scatter is mc._masked_scatter_no_numpy for arch in masked_arches)
+    assert modules["paddleocr_vl"].Model.merge_input_ids_with_image_features is native
+    assert all(modules[arch].Model.merge_input_ids_with_image_features is mc._merge_special_token_features_only for arch in qwen_arches - {"paddleocr_vl"})
+    assert all(modules[arch].Model.get_input_embeddings is not native for arch in idefics_arches)
 
 
 def test_compile_protocol_requirements_exist():

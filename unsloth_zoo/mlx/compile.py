@@ -1535,6 +1535,15 @@ def _arch_matches_prefixes(arch: str, prefixes: tuple[str, ...]) -> bool:
     return bool(prefixes) and arch.startswith(prefixes)
 
 
+_QWEN_LIKE_MERGE_ARCHES = frozenset(
+    {"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"}
+)
+_MASKED_SCATTER_PATCH_ARCHES = frozenset(
+    {"gemma3", "gemma4", "idefics2", "idefics3"}
+)
+_IDEFICS_SHARED_PATCH_ARCHES = frozenset({"idefics2", "idefics3"})
+
+
 def _adapter_matches(
     adapter: CompilePatchAdapter,
     arch: str,
@@ -1877,30 +1886,6 @@ def _try_import_module(module_name: str):
         return importlib.import_module(module_name)
     except Exception:
         return None
-
-
-def _iter_trait_model_modules(
-    trait: str,
-    *,
-    include_arches: Iterable[str] = (),
-):
-    """Yield model modules for architectures that share a compile trait.
-
-    Trait discovery (over the standard `mlx_vlm.models.<arch>.<arch>` layout)
-    lets future architectures inherit a shared patch automatically.
-    """
-
-    candidate_arches = set(include_arches)
-    candidate_arches.update(
-        arch
-        for arch, report in build_compile_trait_reports().items()
-        if trait in report.pattern_traits
-    )
-    for arch in sorted(candidate_arches):
-        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
-        if module is None:
-            continue
-        yield arch, module
 
 
 def _install_safe_fused_sdpa_mask_patches():
@@ -3387,11 +3372,9 @@ def _install_qwen_like_image_merge_patches():
     plumbing.
     """
 
-    for arch, module in _iter_trait_model_modules(
-        "qwen_like_image_merge",
-        include_arches=("qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"),
-    ):
-        if arch.startswith("qwen3"):
+    for arch in sorted(_QWEN_LIKE_MERGE_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
             continue
         if arch == "paddleocr_vl":
             vision_module = _try_import_module("mlx_vlm.models.paddleocr_vl.vision")
@@ -4477,17 +4460,10 @@ def _install_deepseek_ocr_compile_patches():
 def _install_masked_scatter_multimodal_patches():
     """Patch `masked_scatter` implementations that rely on host-side mutation."""
 
-    for arch, module in _iter_trait_model_modules(
-        "masked_scatter_multimodal",
-        include_arches=("gemma3", "idefics2", "idefics3"),
-    ):
-        if arch == "gemma3n":
-            language = _try_import_module("mlx_vlm.models.gemma3n.language")
-            model = getattr(language, "Gemma3Model", None)
-            if _gemma3n_language_contract(getattr(model, "__call__", None)) is None:
-                _VERIFIED_TRAINING_ARCHES.discard(arch)
-                _PATCHED_ARCHES.discard(arch)
-                continue
+    for arch in sorted(_MASKED_SCATTER_PATCH_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
+            continue
         if getattr(module, "masked_scatter", None) is None:
             continue
         setattr(module, "masked_scatter", _masked_scatter_no_numpy)
@@ -4498,7 +4474,6 @@ def _install_idefics_family_compile_patches():
     """Patch Idefics-family image filtering and multimodal merges for compile.
 
     Shared issue: Python-side padded-image filtering and placeholder merging.
-    Architectures with the same trait and standard layout inherit this patch.
     """
 
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
@@ -4568,11 +4543,9 @@ def _install_idefics_family_compile_patches():
         )
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
-    for arch, module in _iter_trait_model_modules(
-        "padded_image_filtering",
-        include_arches=("idefics2", "idefics3"),
-    ):
-        if arch == "smolvlm":
+    for arch in sorted(_IDEFICS_SHARED_PATCH_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
             continue
         model_cls = getattr(module, "Model", None)
         if model_cls is None:
