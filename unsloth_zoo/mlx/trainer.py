@@ -4679,37 +4679,18 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
 
 
 def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1):
-    """_check_all_masked for VLM batch dicts (a "labels" key, not a 3-tuple).
+    """_check_all_masked for finite VLM batch plans (construction metadata).
 
     As in the text path, in DDP ``batches`` is only this rank's shard, so the
     per-rank bad/good counts are all-summed before deciding. Otherwise a rank
     whose shard is entirely masked would raise ZeroDivisionError alone while
     peers advance to the first collective and hang."""
-    if isinstance(batches, FiniteVLMBatchPlan):
-        # The checker consumes construction-time metadata: it must not
-        # trigger additional processor work or materialization ahead of the
-        # collective below (a failing rank would strand its peers there).
-        seen_bad, seen_good = batches.supervision_counts(max_check)
-    else:
-        seen_bad = 0
-        seen_good = 0
-        checked = 0
-        for batch_dict in batches:
-            labels = batch_dict.get("labels")
-            if labels is None:
-                continue
-            labels_list = labels.tolist()
-            for row in labels_list:
-                unique = set(row)
-                if unique == {-100}:
-                    seen_bad += 1
-                else:
-                    seen_good += 1
-                checked += 1
-                if checked >= max_check:
-                    break
-            if checked >= max_check:
-                break
+    # The checker consumes construction-time plan metadata: it must not
+    # trigger additional processor work or materialization ahead of the
+    # collective below (a failing rank would strand its peers there). Every
+    # finite VLM training path hands it a plan; eager lists no longer reach
+    # it.
+    seen_bad, seen_good = batches.supervision_counts(max_check)
 
     # Reduce across ranks before deciding so every rank raises/warns together
     # (all ranks reach this collective; the early return below is post-reduce).

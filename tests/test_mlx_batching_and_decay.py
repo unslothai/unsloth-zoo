@@ -558,9 +558,8 @@ class _VarWidthProcessor(_CountingProcessor):
 def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     """ensure_descriptors() never runs at construction, stores each index's
     OWN family (the fixture makes families differ across indices), builds
-    once per batch, invalidates rather than reuses the plan cache, is
-    idempotent with no further processor work, and reports fixed-key
-    counters."""
+    once per batch, invalidates rather than reuses the plan cache, and is
+    idempotent with no further processor work."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import (
         _create_vlm_batch_plan,
@@ -592,7 +591,7 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     for index in range(len(plan)):
         rebuilt = plan._build_batch(index)
         width, axes, padable, _forbidden = _vlm_width_survey(rebuilt)
-        assert padable and plan.batch_padable(index)
+        assert padable and plan._padable[index]
         assert plan.batch_width(index) == width
         assert descriptors[index] == _vlm_batch_family(
             rebuilt, symbolic_axes=axes,
@@ -600,19 +599,8 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     # Widths merge symbolically; the structural sidecar still splits.
     assert len(set(descriptors)) == 2
     assert plan.batch_family(1) == descriptors[1]
-    arrays_per_batch = max(
-        sum(
-            1 for value in plan._build_batch(index).values()
-            if isinstance(value, mx.array)
-        )
-        for index in range(len(plan))
-    )
-    assert plan.survey_stats == {
-        "surveyed_batches": 3,
-        "distinct_families": 2,
-        "array_leaves_max": arrays_per_batch,
-        "padable_batches": 3,
-    } and arrays_per_batch >= 2
+    assert len(descriptors) == 3
+    assert plan._padable == (True, True, True)
     assert plan.materialize(0)["input_ids"].tolist() == (
         cached_batch["input_ids"].tolist()
     )

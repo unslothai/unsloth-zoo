@@ -1970,9 +1970,30 @@ def test_eval_callback_stop_request_synced_before_best_model_track():
     assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
 
 
+def _all_masked_vlm_plan():
+    # Response-mask filtering removes all-masked rows outright, so a plan
+    # whose CHECKED rows are all supervision-bad arises only from rows that
+    # bypass or defeat that filter: distributed pad slots, or
+    # prompt/completion rows (which skip response masking) retained with
+    # every label masked. Model that state directly through the class
+    # contract (checker_good=False rows).
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _FiniteVLMRow
+
+    return FiniteVLMBatchPlan(
+        rows=[_FiniteVLMRow({"text": "0"}, False)],
+        schedule=((0,),),
+        empty_masks=None,
+        processor=object(),
+        config={},
+        max_seq_length=8,
+        image_size=None,
+    )
+
+
 def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
     # VLM mirror of the text-path mask check: a fully-masked local shard must
-    # not raise alone in DDP; counts are all-summed before deciding.
+    # not raise alone in DDP; plan supervision counts are all-summed before
+    # deciding.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -1983,18 +2004,16 @@ def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
 
     monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
-    _check_vlm_all_masked(all_bad, comm_group=object(), world_size=2)
+    _check_vlm_all_masked(
+        _all_masked_vlm_plan(), comm_group=object(), world_size=2,
+    )
 
 
 def test_check_vlm_all_masked_single_process_still_raises():
-    import mlx.core as mx
-
     from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
     with pytest.raises(ZeroDivisionError):
-        _check_vlm_all_masked(all_bad)
+        _check_vlm_all_masked(_all_masked_vlm_plan())
 
 
 def test_reset_run_state_clears_last_eval_metrics():
@@ -2739,3 +2758,17 @@ def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
         )
         for m in range(8)
     )
+
+
+def test_vlm_checker_consumes_plan_metadata_only():
+    """Call-path contract after the eager internals were deleted: the
+    all-masked checker reads construction-time plan supervision counts and
+    no longer iterates materialized batch dicts."""
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    source = inspect.getsource(_check_vlm_all_masked)
+    assert "supervision_counts" in source
+    assert "for batch_dict in batches" not in source
+    assert "tolist" not in source

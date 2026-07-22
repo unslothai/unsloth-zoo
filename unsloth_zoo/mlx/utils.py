@@ -5702,15 +5702,6 @@ def _vlm_family_is_plannable(family):
     )
 
 
-def _vlm_family_array_leaves(family):
-    """Number of array leaves recorded in a serialized family."""
-    if not isinstance(family, tuple) or not family:
-        return 0
-    if family[0] == "array":
-        return 1
-    return sum(_vlm_family_array_leaves(item) for item in family)
-
-
 def _vlm_family_divergence(expected, observed, path="batch"):
     """Location and description of the first difference between two families
     produced by ``_vlm_batch_family``, or ``None`` when they are equal."""
@@ -5802,7 +5793,6 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_mru",
         "_descriptors",
-        "_survey_stats",
         "_widths",
         "_padable",
         "_forbidden",
@@ -5844,7 +5834,6 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._visit_epoch_cache = None
         self._mru = None
         self._descriptors = None
-        self._survey_stats = None
         self._widths = None
         self._padable = None
         self._forbidden = None
@@ -6020,7 +6009,6 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         widths = []
         padable_flags = []
         forbidden_sets = []
-        array_leaves_max = 0
         for index in range(len(self._schedule)):
             batch = self._build_batch(index)
             width, axes, padable, forbidden = _vlm_width_survey(
@@ -6038,19 +6026,10 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             widths.append(width)
             padable_flags.append(bool(padable))
             forbidden_sets.append(forbidden)
-            array_leaves_max = max(
-                array_leaves_max, _vlm_family_array_leaves(family),
-            )
         self._descriptors = tuple(families)
         self._widths = tuple(widths)
         self._padable = tuple(padable_flags)
         self._forbidden = tuple(forbidden_sets)
-        self._survey_stats = {
-            "surveyed_batches": len(self._descriptors),
-            "distinct_families": len(set(self._descriptors)),
-            "array_leaves_max": array_leaves_max,
-            "padable_batches": sum(self._padable),
-        }
         return self._descriptors
 
     @property
@@ -6060,11 +6039,6 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         the run to eager before surveying anything."""
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         return getattr(tokenizer, "pad_token_id", None)
-
-    @property
-    def survey_stats(self):
-        """Fixed-key integer counters from the last descriptor survey."""
-        return None if self._survey_stats is None else dict(self._survey_stats)
 
     def batch_family(self, index):
         """Surveyed compile-key family for one scheduled batch."""
@@ -6084,16 +6058,6 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 "call ensure_descriptors() first."
             )
         return self._widths[operator.index(index)]
-
-    def batch_padable(self, index):
-        """Whether the width survey admitted this batch for right-padding
-        (declined batches keep exact families and unplanned widths)."""
-        if self._descriptors is None:
-            raise RuntimeError(
-                "Unsloth MLX: VLM batch widths have not been surveyed; "
-                "call ensure_descriptors() first."
-            )
-        return self._padable[operator.index(index)]
 
     def planned_event_widths(self):
         """Per-batch planner event widths from the survey: padable batches
@@ -6131,16 +6095,6 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 width = raw_width
             widths.append(width)
         return tuple(widths)
-
-    def batch_forbidden_widths(self, index):
-        """Extents of this batch's untouched arrays (any nesting depth);
-        a planned endpoint must avoid all of them."""
-        if self._descriptors is None:
-            raise RuntimeError(
-                "Unsloth MLX: VLM batch widths have not been surveyed; "
-                "call ensure_descriptors() first."
-            )
-        return self._forbidden[operator.index(index)]
 
     def check_family_drift(self, index, batch):
         """Hard-fail when a materialized batch's structure leaves its
