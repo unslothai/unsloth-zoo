@@ -4285,6 +4285,7 @@ class MLXKTOTrainer(MLXTrainer):
         optimizer = self._build_optimizer(total_steps)
         (max_grad_norm, max_grad_value, max_grad_leaf_norm,
          _clip_mode) = _resolve_mlx_grad_clipping(args)
+        start_time = time.perf_counter()
 
         def _reference_and_kl(batch):
             """Policy-KL + reference (LoRA-off) logps, all detached. Scales are
@@ -4357,4 +4358,18 @@ class MLXKTOTrainer(MLXTrainer):
                     )
                 step += 1
 
-        return self._train_loss_history
+        # Same result type as MLXTrainer.train(): callers reach for
+        # output.metrics / output.global_step / output.training_loss, which a
+        # bare list does not provide. The per-step losses stay available on
+        # self._train_loss_history.
+        total_time = time.perf_counter() - start_time
+        avg_loss = (
+            sum(self._train_loss_history) / len(self._train_loss_history)
+            if self._train_loss_history else 0.0
+        )
+        return MLXTrainOutput({
+            "train_loss": avg_loss,
+            "train_runtime": total_time,
+            "train_steps": self._global_step,
+            "total_train_steps": total_steps,
+        })

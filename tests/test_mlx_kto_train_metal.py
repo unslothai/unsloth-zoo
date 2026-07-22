@@ -75,11 +75,17 @@ def test_kto_trains_finite_and_decreasing(tmp_path):
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
                             args=_config(output_dir=str(tmp_path)))
-    hist = trainer.train()
+    output = trainer.train()
 
+    # train() returns MLXTrainOutput, matching MLXTrainer; the per-step losses
+    # live on the trainer.
+    hist = trainer._train_loss_history
     assert len(hist) == 6, f"expected 6 steps, got {len(hist)}"
     assert all(math.isfinite(x) for x in hist), f"non-finite loss: {hist}"
     assert hist[-1] < hist[0], f"loss did not decrease: {hist}"
+    assert output.global_step == 6, f"expected 6 steps, got {output.global_step}"
+    assert math.isfinite(output.training_loss)
+    assert output["total_train_steps"] == 6
     # KL baseline recorded per step, finite and clamped >= 0.
     assert trainer._kl_history and all(math.isfinite(k) and k >= 0.0 for k in trainer._kl_history)
 
