@@ -25,11 +25,15 @@ and merged models (safetensors, GGUF, HuggingFace Hub).
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
+import ast
+import collections
 import copy
 import inspect
 import importlib
 import json
+import numbers
 import operator
+import textwrap
 import numpy as np
 import os
 import sys
@@ -43,6 +47,7 @@ from pathlib import Path
 
 
 from .cce import _get_runtime_cce
+from .cce.runtime_cce import _normalize_label_smoothing
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
@@ -613,20 +618,295 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     return _run_hidden_stack(tm, inputs, inputs_embeds=inputs_embeds, **kwargs)
 
 
-def _get_lm_head_layer(model):
-    """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
+OutputHeadDescriptor = collections.namedtuple(
+    "OutputHeadDescriptor",
+    ["module", "path", "status", "has_additive_bias", "quantized",
+     "wrapper_type", "raw", "candidate_module", "candidate_path"],
+)
 
-    Prefers a separate lm_head (untied models like Qwen), else falls back to
-    embed_tokens (tied models like Gemma/Llama). Returns the layer object (not
-    its weight) so callers can read .weight/.scales/.biases/.group_size/.bits.
+_RAW_HEAD_TYPES = (nn.Linear, nn.QuantizedLinear, nn.Embedding, nn.QuantizedEmbedding)
+
+
+def _self_attr_chain(node):
+    """Dotted chain for an ``ast.Attribute`` rooted at the name ``self``,
+    else None (subscripts, calls, or other roots break the chain)."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id == "self":
+        return ".".join(reversed(parts))
+    return None
+
+
+def _output_accessor_chains(tree):
+    """Chains with recognized accessor syntax within a parsed body: the X of
+    ``self.X.as_linear(...)`` and ``self.X.weight.T``. Syntax-level, so
+    strings, comments, and prose can never contribute."""
+    chains = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "as_linear":
+            chain = _self_attr_chain(node.func.value)
+            if chain:
+                chains.append(chain)
+        elif isinstance(node, ast.Attribute) and node.attr == "T" \
+                and isinstance(node.value, ast.Attribute) \
+                and node.value.attr == "weight":
+            chain = _self_attr_chain(node.value.value)
+            if chain:
+                chains.append(chain)
+    return chains
+
+
+def _analyze_output_route(tm):
+    """Syntactic evidence from the analyzed forward bodies, live-resolved.
+
+    Parses ``type(tm).__call__`` (AST — strings/comments never count) plus one
+    hop of ``self.<method>()`` delegation, returning ``(accessor_modules,
+    called_module_ids, references_tie_flag)``: chains under
+    ``self.X.as_linear(...)`` / ``self.X.weight.T``; modules a self-rooted chain
+    is called on (``self.lm_head(x)``); and whether ``tie_word_embeddings`` is
+    referenced anywhere. Reachability is NOT analyzed — any recognized syntax
+    counts (dead branches included); uniqueness plus fail-closed consumers bound
+    mis-selection. Unresolvable chains contribute nothing."""
+    cls = type(tm)
+
+    def _parse(method):
+        try:
+            return ast.parse(textwrap.dedent(inspect.getsource(method)))
+        except (OSError, TypeError, AttributeError, SyntaxError):
+            return None
+
+    entry = _parse(getattr(cls, "__call__", None))
+    if entry is None:
+        return {}, set(), False
+    trees = [entry]
+    invoked = {
+        node.func.attr
+        for node in ast.walk(entry)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
+    }
+    for helper in invoked - {"__call__"}:
+        method = getattr(cls, helper, None)
+        if callable(method):
+            tree = _parse(method)
+            if tree is not None:
+                trees.append(tree)
+
+    def _resolve(chain):
+        obj = tm
+        for part in chain.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+        return obj
+
+    modules, called, references_flag = {}, set(), False
+    for tree in trees:
+        for chain in _output_accessor_chains(tree):
+            obj = _resolve(chain)
+            if obj is not None:
+                modules[id(obj)] = (chain, obj)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "tie_word_embeddings":
+                references_flag = True
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                chain = _self_attr_chain(node.func)
+                if chain:
+                    obj = _resolve(chain)
+                    if obj is not None:
+                        called.add(id(obj))
+    return modules, called, references_flag
+
+
+def _output_accessor_modules(tm):
+    """Live modules with recognized accessors in the analyzed forward bodies
+    (see ``_analyze_output_route``). Returns ``{id(module): (path, module)}``."""
+    return _analyze_output_route(tm)[0]
+
+
+def _resolve_embedding_anchor(owner, types, accessor_modules=None):
+    """(name, module) of the unique direct child whose type is exactly in
+    ``types``; None when absent, ambiguous, or not a module tree. Multiple
+    embedding candidates (Gemma-4 backbones carry a second vocab-sized
+    per-layer embedding) resolve ONLY by live accessor identity — the unique
+    candidate that IS one of the modules the output route accesses
+    (`_output_accessor_modules`). Dimensional agreement is deliberately not
+    identity evidence (metadata can be stale after a vocab resize).
+    Still-ambiguous stays None (fail closed)."""
+    children = getattr(owner, "children", None)
+    if not callable(children):
+        return None
+    found = [(n, c) for n, c in children().items() if type(c) in types]
+    if len(found) > 1 and accessor_modules:
+        found = [e for e in found if id(e[1]) in accessor_modules]
+    return found[0] if len(found) == 1 else None
+
+
+def _embedding_dims(emb):
+    """Semantic (vocab, hidden). QuantizedEmbedding packs its weight, so read
+    the stored attributes instead of the array shape."""
+    if type(emb) is nn.QuantizedEmbedding:
+        return int(emb.num_embeddings), int(emb.dims)
+    return int(emb.weight.shape[0]), int(emb.weight.shape[1])
+
+
+def _linear_semantic_dims(layer):
+    out_dim, in_dim = int(layer.weight.shape[0]), int(layer.weight.shape[1])
+    if type(layer) is nn.QuantizedLinear:
+        in_dim = in_dim * 32 // int(layer.bits)
+    return out_dim, in_dim
+
+
+def _resolve_module_path(model, path):
+    obj = model
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def describe_output_head(model):
+    """Resolve the live output head with affirmative evidence only: a True tie
+    flag, a real ``lm_head``, or (when no flag attribute exists) an embedding
+    named via a live-resolving ``.as_linear(...)`` / ``.weight.T`` accessor in
+    the analyzed forward bodies (see ``_analyze_output_route``). Missing
+    ``lm_head`` never implies tying; conflicting flags fail closed. ``path`` is
+    rooted at the argument (VLM wrappers keep the ``language_model.`` prefix);
+    at unknown status ``candidate_*`` carry the unique shape-matched alt head.
+    A True flag is corroborated against the route: if a live ``lm_head`` is
+    called there with no syntactic flag reference and no accessor for the
+    anchored embedding, it fails closed to unknown (Qwen2-MoE ships a dead
+    flag). Syntax is evidence, not proof — deeper consultation downgrades
+    conservatively to baseline; a dead reference keeps today's resolution.
     """
+    prefix = "language_model." if hasattr(model, "language_model") else ""
     tm = _get_text_model(model)
-    if hasattr(tm, "lm_head") and tm.lm_head is not None:
-        return tm.lm_head
-    backbone = getattr(tm, "model", tm)
-    if hasattr(backbone, "lm_head") and backbone.lm_head is not None:
-        return backbone.lm_head
-    return backbone.embed_tokens
+    backbone = getattr(tm, "model", None)
+    if backbone is not None:
+        emb_owner, emb_prefix = backbone, prefix + "model."
+    else:
+        emb_owner, emb_prefix = tm, prefix
+    accessor_modules, called_modules, references_flag = _analyze_output_route(tm)
+    emb_entry = _resolve_embedding_anchor(
+        emb_owner, (nn.Embedding, nn.QuantizedEmbedding),
+        accessor_modules=accessor_modules,
+    )
+
+    flags, flag_attr_present = [], False
+    # Include config: some models (e.g. VLM language stacks) carry the live
+    # tie flag only on tm.config, the same site logit_scale/softcap are read from.
+    for holder in (tm, getattr(tm, "args", None), getattr(tm, "config", None)):
+        if holder is None or not hasattr(holder, "tie_word_embeddings"):
+            continue
+        flag_attr_present = True
+        value = holder.tie_word_embeddings
+        # Mirror the forward's `if self.args.tie_word_embeddings:` truthiness for
+        # any value: from_dict does not coerce, so a config may ship the flag as
+        # an int or string, and the forward consumes it by truth value. Only a
+        # value whose truth is undefined (raises) stays unread.
+        try:
+            flags.append(bool(value))
+        except Exception:
+            pass
+    conflicting = len(set(flags)) > 1
+
+    # An uncorroborated True flag: the analyzed route calls a live lm_head
+    # at EITHER supported location (any type — a wrapped head the forward
+    # uses is just as contradictory as a raw one), shows no syntactic flag
+    # consultation, and no accessor evidence for the anchored embedding.
+    # When both routes are syntactically visible the flag plausibly selects
+    # between them through indirection the analyzer cannot see, so the flag
+    # keeps winning there. No execution-order claim is made; syntax alone
+    # fails closed (see the docstring for both residual directions).
+    live_head_ids = {
+        id(owner.lm_head)
+        for owner in (tm, backbone)
+        if owner is not None and getattr(owner, "lm_head", None) is not None
+    }
+    flag_contradicted = (
+        bool(live_head_ids & called_modules)
+        and not references_flag
+        and (emb_entry is None or id(emb_entry[1]) not in accessor_modules)
+    )
+
+    head, path, status = None, None, "unknown"
+    if conflicting:
+        pass
+    elif flags and flags[0]:
+        # A truthy tie flag routes the forward through the embedding: resolve
+        # that anchor (unless the flag is contradicted), else fail closed to
+        # unknown -- never fall through to a possibly-dead lm_head, which would
+        # train the wrong weight.
+        if emb_entry is not None and not flag_contradicted:
+            head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+    elif getattr(tm, "lm_head", None) is not None:
+        head, path, status = tm.lm_head, prefix + "lm_head", "untied"
+    elif backbone is not None and getattr(backbone, "lm_head", None) is not None:
+        head, path, status = backbone.lm_head, prefix + "model.lm_head", "untied"
+    elif not flag_attr_present and emb_entry is not None:
+        # Same structured interpretation as the anchor: tied evidence means
+        # the analyzed output-route bodies access THIS embedding module.
+        if id(emb_entry[1]) in accessor_modules:
+            head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+
+    candidate, candidate_path = None, None
+    if status == "unknown" and emb_entry is not None:
+        vocab, hidden = _embedding_dims(emb_entry[1])
+        owners = [(tm, prefix)]
+        if backbone is not None:
+            owners.append((backbone, prefix + "model."))
+        matches, seen = [], set()
+        for owner, owner_prefix in owners:
+            for name, child in (owner.children() if callable(getattr(owner, "children", None)) else {}).items():
+                if id(child) in seen:
+                    continue
+                seen.add(id(child))
+                if (type(child) in (nn.Linear, nn.QuantizedLinear)
+                        and _linear_semantic_dims(child) == (vocab, hidden)):
+                    matches.append((owner_prefix + name, child))
+        if len(matches) == 1:
+            candidate_path, candidate = matches[0]
+
+    target = head if head is not None else candidate
+    return OutputHeadDescriptor(
+        module=head,
+        path=path,
+        status=status,
+        has_additive_bias=(target is not None and "bias" in target),
+        quantized=(target is not None and hasattr(target, "scales")),
+        wrapper_type=(type(target) if target is not None else None),
+        raw=(target is not None and type(target) in _RAW_HEAD_TYPES),
+        candidate_module=candidate,
+        candidate_path=candidate_path,
+    )
+
+
+def _cce_head_ineligibility(desc):
+    """Reason fused CCE must not run for this head, or None when eligible."""
+    if desc.status == "unknown":
+        return "unresolved output-head topology"
+    if not desc.raw:
+        return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
+    if desc.has_additive_bias:
+        return "additive output-head bias"
+    return None
+
+
+def _get_lm_head_layer(model):
+    """The affirmatively resolved output head (see describe_output_head).
+
+    Raises for unknown topology: the loss factories gate on the descriptor
+    first, so reaching this without a resolved head is a caller bug.
+    """
+    desc = describe_output_head(model)
+    if desc.module is None:
+        raise ValueError(
+            "Unsloth: output-head topology is unresolved for this model; "
+            "gate on describe_output_head before requesting the head layer."
+        )
+    return desc.module
 
 
 def _is_quantized_layer(layer):
@@ -643,22 +923,237 @@ def _get_logit_softcap(model):
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
-def _is_lm_head_trainable(model):
-    """Whether the LM head weight is trainable (not frozen by LoRA).
+def _get_logit_scale(model):
+    """Get the scalar multiplier some archs apply to lm-head logits, if any.
 
-    When frozen, its CCE gradient is a wasted V x chunk_size x H matmul per
-    chunk, so callers wrap the weight with mx.stop_gradient (returns False).
+    Cohere-family models (mlx-lm ``cohere``/``cohere2``, mlx-vlm
+    ``aya_vision``/``cohere2_moe``) multiply logits by ``logit_scale`` inside
+    the forward — a step CCE bypasses and must re-apply. Returns
+    ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
+    bool/non-scalar/non-finite/out-of-range values (callers must fall back).
+    """
+    tm = _get_text_model(model)
+    # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
+    # then config (aya_vision); no upstream forward reads a direct attribute.
+    scale = None
+    if hasattr(tm, "args"):
+        scale = getattr(tm.args, "logit_scale", None)
+    if scale is None and hasattr(tm, "config"):
+        scale = getattr(tm.config, "logit_scale", None)
+    if scale is None:
+        return None, False
+    if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
+        return None, True
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError, OverflowError):
+        return None, True
+    if not np.isfinite(scale):
+        return None, True
+    if scale == 1.0:
+        return None, False
+    # Pre-scaling is validated only for moderate magnitudes; extreme scales
+    # can under/overflow before accumulation, so fail closed outside 2^-6..4.
+    if scale != 0.0 and not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
+        return None, True
+    return scale, False
+
+
+_KNOB_MISSING = object()
+
+# Knobs whose consuming forwards transform logits after the output head,
+# with lookup sites in consumer-preference order. "attr" = the live module
+# attribute (Granite/Phi3Small forwards read a constructor copy, so copy vs
+# config drift must fail closed); others read args (config for VLM wrappers).
+_HEAD_TRANSFORM_KNOBS = {
+    "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
+    "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
+    "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
+    "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
+}
+_KNOB_AUX_SITES = {
+    "embedding_multiplier": ("args", "config"),
+    "hidden_size": ("args", "config"),
+}
+
+
+def _knob_values_equal(a, b):
+    """Total equality: raising / non-boolean comparisons count as disagreement."""
+    try:
+        return a is b or bool(a == b)
+    except Exception:
+        return False
+
+
+def _knob_value(tm, name, sites):
+    """(value, conflict) from the consumer sites; ``_KNOB_MISSING`` when no
+    site defines the knob. A present ``None`` is a value, never absence."""
+    holders = {"attr": tm, "args": getattr(tm, "args", None), "config": getattr(tm, "config", None)}
+    found = [v for site in sites if holders[site] is not None
+             for v in (getattr(holders[site], name, _KNOB_MISSING),)
+             if v is not _KNOB_MISSING]
+    if not found:
+        return _KNOB_MISSING, False
+    conflict = any(not _knob_values_equal(v, found[0]) for v in found[1:])
+    return found[0], conflict
+
+
+def _validated_knob(value, source):
+    """Normalize one knob value to a finite float, or return a reason string."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None, f"{source} is not a finite real scalar"
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{source} is not a finite real scalar"
+    if not np.isfinite(value):
+        return None, f"{source} is not a finite real scalar"
+    return value, None
+
+
+def _detect_logit_softcap(model):
+    """Logit softcap from either known attr, as ``(softcap, problem)``.
+
+    ``final_logit_softcapping`` keeps its ``_get_logit_softcap`` semantics.
+    ``logits_soft_cap`` (RecurrentGemma) caps for any truthy value: None/0.0
+    mean no cap, a positive finite real caps, anything else (or both attrs
+    present) fails closed rather than dropping the cap.
+    """
+    tm = _get_text_model(model)
+    # Presence, not value: an explicitly-None legacy attr still makes the
+    # dual-attr combination unverified.
+    legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
+    if legacy is _KNOB_MISSING and hasattr(tm, "args"):
+        legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
+    alias, conflict = _knob_value(tm, "logits_soft_cap", ("args", "config"))
+    if conflict:
+        return 0.0, ("logits_soft_cap differs between its configuration "
+                     "sites")
+    if alias is not _KNOB_MISSING and legacy is not _KNOB_MISSING:
+        return 0.0, ("both final_logit_softcapping and logits_soft_cap are "
+                     "present, an unverified combination")
+    if alias is _KNOB_MISSING:
+        return _get_logit_softcap(model), None
+    if alias is None:
+        return 0.0, None  # falsy: the forward skips the cap entirely
+    value, problem = _validated_knob(alias, "logits_soft_cap")
+    if problem is not None:
+        return 0.0, problem
+    if value == 0.0:
+        return 0.0, None  # falsy: the forward skips the cap entirely
+    if value < 0:
+        return 0.0, "logits_soft_cap must be positive when set"
+    return value, None
+
+
+def _aux_knob(tm, name):
+    """A ratio's companion knob: value or a fail-closed reason string."""
+    value, conflict = _knob_value(tm, name, _KNOB_AUX_SITES[name])
+    if conflict or value is _KNOB_MISSING:
+        return None, (f"{name} is missing or inconsistent across its "
+                      "configuration sites")
+    return _validated_knob(value, name)
+
+
+def _detect_head_transform(model, head_status):
+    """Resolve known output-transform knobs to one effective logit scale.
+
+    Mirrors the scalar transforms the consuming forwards apply between the
+    output head and the returned logits. Returns ``(scale, problem)``: a
+    reason string means fall back to the eager baseline; scale None is the
+    no-op case; accepted scales obey the ``_get_logit_scale`` range.
+    ``head_status`` selects branch-conditional transforms as the forwards do.
+    """
+    tm = _get_text_model(model)
+    present = {}
+    for name, sites in _HEAD_TRANSFORM_KNOBS.items():
+        value, conflict = _knob_value(tm, name, sites)
+        if conflict:
+            return None, f"{name} is inconsistent across its configuration sites"
+        if value is not _KNOB_MISSING:
+            present[name] = value
+    if len(present) > 1:
+        return None, ("multiple output-transform knobs are present "
+                      f"({', '.join(present)}), an unverified combination")
+    if not present:
+        return None, None
+    knob, raw = next(iter(present.items()))
+    if knob == "mup_width_multiplier":
+        # Its only consumer (Phi3Small) masks dummy-token logits after the
+        # value-guarded divide: presence alone makes the tail non-scalar.
+        return None, ("mup_width_multiplier models mask logits after the "
+                      "output head, which fused CCE cannot reproduce")
+    if knob == "logit_scale":
+        # A present-None value is malformed live state (the forward would
+        # multiply logits by None); fail closed rather than run unscaled.
+        if raw is None:
+            return None, "logit_scale is present but None"
+        scale, invalid = _get_logit_scale(model)
+        if invalid:
+            return None, ("logit_scale cannot be applied by fused CCE "
+                          "(non-finite, non-scalar, or outside the "
+                          "supported range)")
+        return scale, None
+    # The remaining knobs are ratios num/den mirrored from their forwards.
+    if knob == "logits_scaling":
+        num, problem = 1.0, None
+        den, p2 = _validated_knob(raw, knob)
+    elif knob == "lm_head_multiplier":
+        if head_status != "tied":  # the untied branch applies the plain head
+            return None, None
+        num, problem = _validated_knob(raw, knob)
+        den, p2 = _aux_knob(tm, "embedding_multiplier")
+    else:  # dim_model_base: divide by hidden_size/dim_model_base pre-head
+        if head_status != "untied":  # the tied branch is a plain matmul
+            return None, None
+        num, problem = _validated_knob(raw, knob)
+        den, p2 = _aux_knob(tm, "hidden_size")
+    problem = problem or p2
+    if problem is None and den == 0.0:
+        problem = f"the {knob} configuration divides the logits by zero"
+    if problem is not None:
+        return None, problem
+    scale = num / den
+    if scale == 1.0:
+        return None, None
+    if not np.isfinite(scale) or not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
+        return None, (f"effective logit scale {scale!r} from {knob} is "
+                      "outside the range validated for fused CCE")
+    return scale, None
+
+
+def _is_lm_head_trainable(model):
+    """Whether fused CCE should compute the output head's weight gradient.
+
+    Returns False when the head is frozen by a LoRA/adapter setup or is
+    unresolved (its gradient would be a wasted V x chunk_size x H matmul per
+    chunk, so callers wrap the weight with mx.stop_gradient); True when the
+    resolved head carries a trainable param, or when there are no adapters at
+    all (full fine-tuning). Resolution is by descriptor module identity in the
+    registered tree, not by name — a property-backed ``language_model``
+    returning ``self`` is not a registered child, and an alt-named tied
+    embedding (InternLM2 ``tok_embeddings``) is classified like any head.
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     # Module-anchored so unrelated trainables containing the substring
     # "lora" are not treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
-    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped lm_head (would
+    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped head (would
     # defeat the CCE memory guard) while keeping intentional trainables
     # like `lm_head.bias`. Shares the filter with save_trainable_adapters.
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
     lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
     has_root_lora_module = any(name == "" for name in _lora_module_names)
+    head_module = describe_output_head(model).module
+    head_prefix = None
+    if head_module is not None:
+        for name, module in model.named_modules():
+            if module is head_module and name:
+                head_prefix = f"{name}."
+                break
+    if head_prefix is None:
+        return False
     for key in trainable:
         if key in adapter_keys:
             continue
@@ -666,21 +1161,12 @@ def _is_lm_head_trainable(model):
             key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
-        # Segment-match (not substring) so e.g.
-        # `decoder.not_lm_head_router.weight` is not classified as lm_head.
-        segments = key.split(".")
-        is_lm_head_param = "lm_head" in segments
-        is_embed_tokens_weight = (
-            len(segments) >= 2
-            and segments[-2] == "embed_tokens"
-            and segments[-1] == "weight"
-        )
-        if is_lm_head_param or is_embed_tokens_weight:
+        if key.startswith(head_prefix):
             return True
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
-def make_cce_loss_fn(model):
+def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
     CCE computes loss directly from hidden states and the LM head weight,
@@ -690,39 +1176,57 @@ def make_cce_loss_fn(model):
     With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
     The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
-    softcap = _get_logit_softcap(model)
+    label_smoothing = _normalize_label_smoothing(label_smoothing)
+    # Topology first (mirrors the VLM factory), then head eligibility, then
+    # scale validation — no positive CCE notice may precede a fallback decision.
+    # Backboneless models (e.g. a stack not exposed as `.model` or as direct
+    # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
+    # so the full model forward is the only faithful loss.
+    tm = _get_text_model(model)
+    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+        print("Unsloth: text model does not expose a separable hidden-state "
+              "backbone for CCE; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+    head_desc = describe_output_head(model)
+    _ineligible = _cce_head_ineligibility(head_desc)
+    if _ineligible is not None:
+        print(f"Unsloth: fused CCE cannot faithfully use this model's output "
+              f"head ({_ineligible}); falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+    logit_scale, _transform_problem = _detect_head_transform(model, head_desc.status)
+    if _transform_problem is not None:
+        print(f"Unsloth: {_transform_problem}; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+
+    softcap, _softcap_problem = _detect_logit_softcap(model)
+    if _softcap_problem is not None:
+        print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
-    lm_layer = _get_lm_head_layer(model)
+    lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
 
-    _has_wrapper = hasattr(model, "language_model")
-    tm = _get_text_model(model)
-    backbone = getattr(tm, "model", None)
-    _has_lm_head = (
-        (hasattr(tm, "lm_head") and tm.lm_head is not None)
-        or (backbone is not None and hasattr(backbone, "lm_head") and backbone.lm_head is not None)
-    )
+    _head_path = head_desc.path
 
     def _get_backbone(model):
         """Get backbone (for hidden states) from the live model tree."""
         return _forward_text_hidden_states
 
     def _get_lm_weight_layer(model):
-        """Get LM head or embed_tokens layer from the live model tree."""
-        if _has_wrapper:
-            tm = model.language_model
-        else:
-            tm = model
-        if _has_lm_head:
-            if hasattr(tm, "lm_head") and tm.lm_head is not None:
-                return tm.lm_head
-            backbone = getattr(tm, "model", tm)
-            if hasattr(backbone, "lm_head") and backbone.lm_head is not None:
-                return backbone.lm_head
-        backbone = getattr(tm, "model", tm)
-        return backbone.embed_tokens
+        """Re-resolve the head from the live model tree by its descriptor path."""
+        return _resolve_module_path(model, _head_path)
 
     if use_quantized:
         # Backstop: quantized CCE backward zeros the weight gradient
@@ -754,6 +1258,7 @@ def make_cce_loss_fn(model):
             group_size=group_size,
             bits=bits,
             mode=quant_mode,
+            label_smoothing=label_smoothing,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -782,6 +1287,11 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # (h * s) @ W equals s * (h @ W) per vocab chunk, so softcap
+                # and the CCE backward see the model's own scaled logits while
+                # cached kernels stay scale-independent.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -794,6 +1304,7 @@ def make_cce_loss_fn(model):
         rt_cce = _get_runtime_cce(
             ignore_index=-100,
             logit_softcap=softcap,
+            label_smoothing=label_smoothing,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -818,6 +1329,9 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # Same pre-scaling identity as the quantized branch above.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -827,14 +1341,29 @@ def make_cce_loss_fn(model):
     return loss_fn
 
 
-def make_baseline_loss_fn():
+def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
     Used when use_cce=False. Returns a function
     (model, batch, lengths, labels=None) -> (loss, ntoks). With labels, uses
-    labels[:,1:] and (targets != -100) as mask. The labels=None branch is
-    byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
+    labels[:,1:] and (targets != -100) as mask. With label_smoothing=0 the
+    labels=None branch is byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
+    eps = _normalize_label_smoothing(label_smoothing)
+    if eps > 0.0:
+
+        def _token_ce(logits, targets):
+            # HF LabelSmoother form: lse - (1-eps)*target - eps*mean_v, with
+            # the smoothed vocabulary term reduced in float32.
+            logits32 = logits.astype(mx.float32)
+            lse = mx.logsumexp(logits32, axis=-1)
+            tgt = mx.take_along_axis(
+                logits32, mx.expand_dims(targets, -1), axis=-1
+            ).squeeze(-1)
+            return lse - (1.0 - eps) * tgt - eps * logits32.mean(axis=-1)
+    else:
+        _token_ce = nn.losses.cross_entropy
+
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
@@ -844,7 +1373,7 @@ def make_baseline_loss_fn():
             logits = model(inputs)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
-            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ce = _token_ce(logits, targets) * mask
             ntoks = mask.sum()
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
@@ -867,7 +1396,7 @@ def make_baseline_loss_fn():
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         return loss, ntoks
@@ -2107,6 +2636,15 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     assistant_token_id > 0 enables completion-only training (mask tokens before
     the first occurrence). Returns a function (model, batch_dict) -> (loss, ntoks).
     """
+    def _marked_vlm_baseline():
+        loss_fn = make_vlm_baseline_loss_fn(
+            model,
+            assistant_token_id=assistant_token_id,
+            ignore_token_ids=ignore_token_ids,
+        )
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+
     if not hasattr(model, "get_input_embeddings"):
         import warnings
         warnings.warn(
@@ -2114,11 +2652,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(
-            model,
-            assistant_token_id=assistant_token_id,
-            ignore_token_ids=ignore_token_ids,
-        )
+        return _marked_vlm_baseline()
 
     tm = _get_text_model(model)
     if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
@@ -2128,15 +2662,27 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(
-            model,
-            assistant_token_id=assistant_token_id,
-            ignore_token_ids=ignore_token_ids,
-        )
+        return _marked_vlm_baseline()
 
-    softcap = _get_logit_softcap(model)
-    lm_layer = _get_lm_head_layer(model)
+    head_desc = describe_output_head(model)
+    _ineligible = _cce_head_ineligibility(head_desc)
+    if _ineligible is not None:
+        print(f"Unsloth: fused CCE cannot faithfully use this model's output "
+              f"head ({_ineligible}); falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+
+    logit_scale, _transform_problem = _detect_head_transform(model, head_desc.status)
+    if _transform_problem is not None:
+        print(f"Unsloth: {_transform_problem}; falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+
+    softcap, _softcap_problem = _detect_logit_softcap(model)
+    if _softcap_problem is not None:
+        print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+    lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
+    _head_path = head_desc.path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
@@ -2180,7 +2726,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            lm_head = _get_lm_head_layer(model)
+            lm_head = _resolve_module_path(model, _head_path)
             w = lm_head.weight
             sc = lm_head.scales
             bi = getattr(lm_head, "biases", None)
@@ -2190,6 +2736,10 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # (h * s) @ W equals s * (h @ W) per vocab chunk (Aya Vision,
+                # Cohere2-MoE apply logit_scale in their forward tails).
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -2207,10 +2757,13 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = _get_lm_head_layer(model).weight
+            w = _resolve_module_path(model, _head_path).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # Same pre-scaling identity as the quantized branch above.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
