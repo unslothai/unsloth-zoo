@@ -820,48 +820,36 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
 # Gemma-4 vision pooler float16 overflow fix (transformers 5.5.0 - 5.9.x and
 # the yanked 5.10.0; fixed upstream in >= 5.10.1 by PR #46277).
 #
-# Root cause: Gemma4VisionPooler.forward scales pooled activations by
-# sqrt(hidden_size) in the input dtype:
-#     hidden_states *= self.root_hidden_size
-# For the 26B-A4B / 31B vision tower (hidden 1152, sqrt = 33.94,
-# use_clipped_linears = False) fp16 activations around ~2300 scale to ~79k,
-# past the fp16 max of 65504 -> inf -> NaN loss through embed_vision /
-# masked_scatter. Engages under Unsloth forced-float32 mode (fp16 request on
-# non-bf16 GPUs keeps the unquantized vision tower in fp16 with autocast off).
-# E2B / E4B (vision hidden 768, clipped linears) and bf16 / fp32 are safe.
+# Root cause: Gemma4VisionPooler.forward scales by sqrt(hidden_size) in the
+# input dtype (hidden_states *= self.root_hidden_size). On the 26B-A4B / 31B
+# tower (hidden 1152, sqrt 33.94, use_clipped_linears = False) fp16 activations
+# ~2300 scale to ~79k, past the fp16 max 65504 -> inf -> NaN loss via
+# embed_vision / masked_scatter. Engages under Unsloth forced-float32 mode
+# (fp16 request on non-bf16 GPUs keeps the fp16 vision tower with autocast
+# off). E2B / E4B (hidden 768, clipped linears) and bf16 / fp32 are safe.
 #
-# Fix mirrors upstream >= 5.10.1: compute the pooler in fp32 (the buggy
-# pooler's ops - masked_fill, avg pool, scale - all preserve input dtype, so
-# casting the input to fp32 matches the fixed pooler's fp32 output up to fp16
-# rounding of the pooled activations; the patched path is slightly more
-# precise and never overflows), let dtype promotion carry fp32 through the
-# caller's standardization (the std_bias subtraction cancels the large
-# values; buffer amax is 53760, well inside fp16 range), then cast
-# last_hidden_state back to the encoder's working dtype in
-# Gemma4VisionModel.forward. The cast target is the patch embedder's
-# input_proj weight dtype - the embedder casts pixels to it, so it equals
-# upstream's inputs_embeds.dtype even when callers pass fp32 processor
-# pixels to an fp16 tower. The cast only engages for fp16 towers, so bf16 /
-# fp32 setups (uniform or mixed) are bit-identical to upstream. Wrappers
-# call the original forwards, so the HF decorators on Gemma4VisionModel
-# (@merge_with_config_defaults / @capture_outputs) are preserved, and the
-# already-fixed upstream cast-back makes the caller wrapper a no-op there.
+# Fix mirrors upstream >= 5.10.1: run the pooler in fp32 (its ops all preserve
+# dtype, so casting the input matches the fixed fp32 output up to fp16 rounding
+# and never overflows), let promotion carry fp32 through the caller's
+# standardization (std_bias cancels the large values; buffer amax 53760 is
+# inside fp16 range), then cast last_hidden_state back to the encoder dtype in
+# Gemma4VisionModel.forward. The cast target is the actual embedder output
+# dtype (upstream's inputs_embeds.dtype) and only engages for fp16 towers, so
+# bf16 / fp32 setups are bit-identical to upstream. Wrappers call the original
+# forwards, preserving HF decorators (@merge_with_config_defaults /
+# @capture_outputs); the already-fixed upstream cast-back makes the wrapper a
+# no-op there.
 #
-# Source-pattern classification (not version compares) keeps this correct on
-# every release including the yanked 5.10.0: fixed sources are skipped
-# entirely, unrecognized (future drift) sources are left untouched.
-# transformers without gemma4 (e.g. 4.57.6) no-op via ImportError. The pooler
-# runs eager (the Unsloth compiler never traces Gemma4VisionPooler /
-# Gemma4VisionModel), so no compiler-cache companion is needed.
+# Source-pattern classification (not version compares) stays correct on every
+# release including the yanked 5.10.0: fixed sources skip, unknown (future
+# drift) sources are left untouched, transformers without gemma4 no-ops via
+# ImportError. The pooler runs eager, so no compiler-cache companion is needed.
 # ============================================================================
 
 def _gemma4_vision_pooler_status(pooler_cls):
-    """Classify the installed Gemma4VisionPooler.forward source.
-
-    Returns "buggy" (dtype-preserving sqrt(hidden_size) scale, <= 5.9.x),
-    "fixed" (fp32 scale, >= 5.10.1) or "unknown" (source unavailable or
-    drifted - fail open to upstream behavior).
-    """
+    """Classify Gemma4VisionPooler.forward source: "buggy" (dtype-preserving
+    scale, <= 5.9.x), "fixed" (fp32 scale, >= 5.10.1) or "unknown" (source
+    unavailable or drifted - fail open to upstream)."""
     import inspect
     try:
         source = inspect.getsource(pooler_cls.forward)
@@ -880,14 +868,9 @@ pass
 
 
 def _gemma4_vision_cast_dtype(vision_model, pixel_values):
-    """Fallback for the dtype upstream >= 5.10.1 casts last_hidden_state to.
-
-    Upstream uses inputs_embeds.dtype - the ACTUAL patch embedder output
-    dtype, which the vision wrapper captures with a transient forward hook.
-    This fallback approximates it from the input_proj weight dtype (the
-    embedder casts pixels to it outside autocast) only when the hook saw
-    nothing, then from the pixel dtype if the embedder shape ever drifts.
-    """
+    """Fallback cast dtype when the vision wrapper's embedder hook saw nothing:
+    approximate inputs_embeds.dtype from the input_proj weight (pixels are cast
+    to it outside autocast), then from the pixel dtype if the embedder drifts."""
     embedder = getattr(vision_model, "patch_embedder", None)
     weight = getattr(getattr(embedder, "input_proj", None), "weight", None)
     if torch.is_tensor(weight):
@@ -902,14 +885,11 @@ pass
 
 
 def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
-    """Install the fp16-overflow wrappers on a (pooler, vision model) pair.
-
-    Returns the action taken: "already", "repaired", "fixed", "unknown" or
-    "patched". The vision wrapper is installed before the pooler wrapper -
-    the pooler marker is the commit point - so an interrupt can never leave
-    an fp32-emitting pooler without the cast-back, and a missing vision
-    wrapper next to a marked pooler is re-installed ("repaired").
-    """
+    """Install the fp16-overflow wrappers on a (pooler, vision) pair; returns
+    the action ("already"/"repaired"/"fixed"/"unknown"/"patched"). The vision
+    wrapper goes on before the pooler wrapper (the pooler marker is the commit
+    point) so an interrupt can never leave an fp32-emitting pooler without the
+    cast-back; a missing vision wrapper beside a marked pooler is "repaired"."""
     import functools
     pooler_marked = getattr(pooler_cls.forward, "_unsloth_vision_pooler_fp16", False)
     vision_marked = getattr(vision_cls.forward, "_unsloth_vision_pooler_fp16", False)
@@ -932,9 +912,9 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
         @functools.wraps(_original_vision_forward)
         def vision_forward(self, *args, **kwargs):
             pixel_values = args[0] if args else kwargs.get("pixel_values", None)
-            # Capture the ACTUAL embedder output dtype (upstream's
-            # inputs_embeds.dtype): under bf16 autocast an fp16-weight
-            # input_proj emits bf16, and that path must stay untouched.
+            # Capture the actual embedder output dtype (inputs_embeds.dtype):
+            # under bf16 autocast an fp16-weight input_proj emits bf16, which
+            # must stay untouched.
             seen = {}
             handle = None
             embedder = getattr(self, "patch_embedder", None)
@@ -951,8 +931,7 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
             target_dtype = seen.get("dtype")
             if target_dtype is None:
                 target_dtype = _gemma4_vision_cast_dtype(self, pixel_values)
-            # fp16 towers only: bf16 / fp32 setups (uniform, mixed, or
-            # autocast) keep bit-identical upstream behavior.
+            # fp16 towers only; bf16 / fp32 stay bit-identical to upstream.
             if target_dtype != torch.float16:
                 return output
             is_tuple = isinstance(output, tuple)
@@ -965,13 +944,11 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
                 and hidden_states.is_floating_point()
                 and hidden_states.dtype != target_dtype
             ):
-                # Covers standardize = False checkpoints too: the fp32
-                # pooler output is cast straight back to the encoder dtype.
+                # Also covers standardize = False checkpoints.
                 cast = hidden_states.to(target_dtype)
                 if is_tuple:
                     # Swap the pre-cast tensor wherever it appears, including
-                    # one level down (return_dict=False may nest the
-                    # hidden-states tuple).
+                    # one level down (return_dict=False may nest the tuple).
                     output = tuple(
                         cast if element is hidden_states else (
                             tuple(cast if item is hidden_states else item for item in element)
@@ -980,9 +957,8 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
                         for element in output
                     )
                 else:
-                    # Keep captured hidden_states consistent: transformers'
-                    # capture wrapper ties the tuple's final entry to the
-                    # (pre-cast) final state.
+                    # Keep captured hidden_states consistent: the capture
+                    # wrapper ties its final entry to the pre-cast final state.
                     extra = getattr(output, "hidden_states", None)
                     if isinstance(extra, tuple) and len(extra) > 0 \
                             and extra[-1] is hidden_states:
@@ -999,7 +975,7 @@ def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
 
     @functools.wraps(_original_pooler_forward)
     def pooler_forward(self, *args, **kwargs):
-        # fp16 only: bf16 / fp32 keep bit-identical upstream behavior.
+        # fp16 only; bf16 / fp32 stay bit-identical to upstream.
         if args and torch.is_tensor(args[0]) and args[0].dtype == torch.float16:
             args = (args[0].float(),) + args[1:]
         elif torch.is_tensor(kwargs.get("hidden_states", None)) and \
