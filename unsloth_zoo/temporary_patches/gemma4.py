@@ -814,3 +814,136 @@ def patch_Gemma4TextMLP():
         return raise_error("Gemma4TextMLP.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
+
+
+# ============================================================================
+# Gemma-4 vision pooler float16 overflow fix (transformers 5.5.0 - 5.9.x and
+# the yanked 5.10.0; fixed upstream in >= 5.10.1 by PR #46277).
+#
+# Root cause: Gemma4VisionPooler.forward scales pooled activations by
+# sqrt(hidden_size) in the input dtype:
+#     hidden_states *= self.root_hidden_size
+# For the 26B-A4B / 31B vision tower (hidden 1152, sqrt = 33.94,
+# use_clipped_linears = False) fp16 activations around ~2300 scale to ~79k,
+# past the fp16 max of 65504 -> inf -> NaN loss through embed_vision /
+# masked_scatter. Engages under Unsloth forced-float32 mode (fp16 request on
+# non-bf16 GPUs keeps the unquantized vision tower in fp16 with autocast off).
+# E2B / E4B (vision hidden 768, clipped linears) and bf16 / fp32 are safe.
+#
+# Fix mirrors upstream >= 5.10.1: compute the pooler in fp32 (the buggy
+# pooler's ops - masked_fill, avg pool, scale - all preserve input dtype, so
+# casting the input to fp32 reproduces the fixed pooler's fp32 output), let
+# dtype promotion carry fp32 through the caller's standardization (the
+# std_bias subtraction cancels the large values; buffer amax is 53760, well
+# inside fp16 range), then cast last_hidden_state back to the pixel_values
+# dtype in Gemma4VisionModel.forward exactly like the upstream fix. Wrappers
+# call the original forwards, so the HF decorators on Gemma4VisionModel
+# (@merge_with_config_defaults / @capture_outputs) are preserved, and the
+# already-fixed upstream cast-back makes the caller wrapper a no-op there.
+#
+# Source-pattern classification (not version compares) keeps this correct on
+# every release including the yanked 5.10.0: fixed sources are skipped
+# entirely, unrecognized (future drift) sources are left untouched.
+# transformers without gemma4 (e.g. 4.57.6) no-op via ImportError. The pooler
+# runs eager (the Unsloth compiler never traces Gemma4VisionPooler /
+# Gemma4VisionModel), so no compiler-cache companion is needed.
+# ============================================================================
+
+def _gemma4_vision_pooler_status(pooler_cls):
+    """Classify the installed Gemma4VisionPooler.forward source.
+
+    Returns "buggy" (dtype-preserving sqrt(hidden_size) scale, <= 5.9.x),
+    "fixed" (fp32 scale, >= 5.10.1) or "unknown" (source unavailable or
+    drifted - fail open to upstream behavior).
+    """
+    import inspect
+    try:
+        source = inspect.getsource(pooler_cls.forward)
+    except Exception:
+        return "unknown"
+    source = source.replace(" ", "")
+    if "hidden_states.float()*self.root_hidden_size" in source:
+        return "fixed"
+    if (
+        "hidden_states*=self.root_hidden_size" in source
+        or "hidden_states=hidden_states*self.root_hidden_size" in source
+    ):
+        return "buggy"
+    return "unknown"
+pass
+
+
+def _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls):
+    """Install the fp16-overflow wrappers on a (pooler, vision model) pair.
+
+    Returns the action taken: "already", "fixed", "unknown" or "patched".
+    Both classes are patched atomically or not at all.
+    """
+    import functools
+    if getattr(pooler_cls.forward, "_unsloth_vision_pooler_fp16", False):
+        return "already"
+    status = _gemma4_vision_pooler_status(pooler_cls)
+    if status == "fixed":
+        return "fixed"
+    if status == "unknown":
+        raise_error(
+            "Gemma4VisionPooler.forward fp16 overflow fix",
+            "unrecognized upstream pooler source - skipping",
+        )
+        return "unknown"
+
+    _original_pooler_forward = pooler_cls.forward
+    _original_vision_forward = vision_cls.forward
+
+    @functools.wraps(_original_pooler_forward)
+    def pooler_forward(self, *args, **kwargs):
+        # fp16 only: bf16 / fp32 keep bit-identical upstream behavior.
+        if args and torch.is_tensor(args[0]) and args[0].dtype == torch.float16:
+            args = (args[0].float(),) + args[1:]
+        elif torch.is_tensor(kwargs.get("hidden_states", None)) and \
+                kwargs["hidden_states"].dtype == torch.float16:
+            kwargs["hidden_states"] = kwargs["hidden_states"].float()
+        return _original_pooler_forward(self, *args, **kwargs)
+
+    @functools.wraps(_original_vision_forward)
+    def vision_forward(self, *args, **kwargs):
+        pixel_values = args[0] if args else kwargs.get("pixel_values", None)
+        output = _original_vision_forward(self, *args, **kwargs)
+        hidden_states = getattr(output, "last_hidden_state", None)
+        if (
+            torch.is_tensor(pixel_values)
+            and pixel_values.is_floating_point()
+            and torch.is_tensor(hidden_states)
+            and hidden_states.is_floating_point()
+            and hidden_states.dtype != pixel_values.dtype
+        ):
+            # Covers standardize = False checkpoints too: the fp32 pooler
+            # output is cast straight back to the encoder dtype.
+            output.last_hidden_state = hidden_states.to(pixel_values.dtype)
+        return output
+
+    pooler_forward._unsloth_vision_pooler_fp16 = True
+    vision_forward._unsloth_vision_pooler_fp16 = True
+    pooler_cls.forward = pooler_forward
+    vision_cls.forward = vision_forward
+    return "patched"
+pass
+
+
+def patch_Gemma4VisionPoolerFP16():
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as modeling_gemma4
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("Gemma4VisionPooler.forward", e)
+    pooler_cls = getattr(modeling_gemma4, "Gemma4VisionPooler", None)
+    vision_cls = getattr(modeling_gemma4, "Gemma4VisionModel", None)
+    if pooler_cls is None or vision_cls is None:
+        return
+    try:
+        _patch_gemma4_vision_pooler_fp16(pooler_cls, vision_cls)
+    except Exception as e:
+        return raise_error("Gemma4VisionPooler.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
