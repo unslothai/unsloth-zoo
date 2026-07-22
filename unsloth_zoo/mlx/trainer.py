@@ -2579,6 +2579,55 @@ class MLXTrainer:
 
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
 
+        # --- Per-group LR via post-update STEP rescale (not gradient scaling) ---
+        # The update-normalizing optimizers (AdamW/Adam/Lion/Adafactor, and Muon
+        # for rank->=2 matrices) are scale-invariant to a constant gradient
+        # scale, so applying LoRA+ / embedding-LR ratios to the gradient is a
+        # near no-op. Instead, let the single optimizer take its normal step,
+        # then rescale the realized delta of the scoped params:
+        # ``param = pre + ratio*(post - pre)``. This yields effective LR
+        # ``ratio*base_lr`` for ANY optimizer, scales the decoupled decay along
+        # with the step (the snapshot precedes it), and adds no optimizer state.
+        # Scoped keys: LoRA+ -> ``lora_b``; embedding LR -> the full-module
+        # embed_tokens/lm_head weight (registered keys recorded by
+        # get_peft_model's CPT partition when present, else the literal
+        # ``<...>.embed_tokens/lm_head.weight`` fallback).
+        _cpt_full_keys = getattr(
+            model, "_unsloth_cpt_full_module_weight_keys", None) or set()
+
+        def _scoped_step_ratio(name):
+            if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
+                return lora_plus_ratio
+            if use_embedding_lr:
+                if name in _cpt_full_keys:
+                    return embedding_lr_ratio
+                _seg = name.split(".")
+                if (len(_seg) >= 2 and _seg[-1] == "weight"
+                        and _seg[-2] in ("embed_tokens", "lm_head")):
+                    return embedding_lr_ratio
+            return None
+
+        def _snapshot_scoped_params():
+            """Pre-update values (immutable mx arrays) + ratio for scoped leaves,
+            captured before decoupled decay so the rescale scales decay too."""
+            snap = {}
+            for name, value in tree_flatten(model.trainable_parameters()):
+                r = _scoped_step_ratio(name)
+                if r is not None:
+                    snap[name] = (value, r)
+            return snap
+
+        def _rescale_scoped_params(snap):
+            if not snap:
+                return
+            live = dict(tree_flatten(model.trainable_parameters()))
+            updates = []
+            for name, (pre, ratio) in snap.items():
+                post = live[name]
+                r = mx.array(ratio, dtype=mx.float32).astype(post.dtype)
+                updates.append((name, pre + r * (post - pre)))
+            model.update(tree_unflatten(updates))
+
         # Build step functions following mlx-lm's pattern. `max_grad_value`
         # remains an elementwise clamp. MLX's cheap default is now the clearer
         # `max_grad_leaf_norm`, a proportional per-leaf norm cap that avoids
@@ -2663,18 +2712,11 @@ class MLXTrainer:
             optimizer.update to promote params/m/v too).
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            # Suffix-anchor so lora_b_router.weight doesn't pick up the LoRA+ mult.
-            if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
-                scale = scale * lora_plus_ratio
-            # Segment-anchor so not_lm_head_router.weight doesn't pick up embed LR.
-            if use_embedding_lr:
-                _segments = name.split(".")
-                _is_embed_or_lm_head = (
-                    "embed_tokens" in _segments
-                    or "lm_head" in _segments
-                )
-                if _is_embed_or_lm_head:
-                    scale = scale * embedding_lr_ratio
+            # NOTE: the per-group LoRA+ / embedding-LR ratios are NOT applied
+            # here. Scaling the gradient is a near no-op under the update-
+            # normalizing optimizers (AdamW/Lion/Adafactor/Muon), so those
+            # ratios are applied as a post-update STEP rescale instead (see
+            # _snapshot_scoped_params / _rescale_scoped_params).
             if clip_scale is not None:
                 scale = scale * clip_scale
             if dtype is not None and scale.dtype != dtype:
@@ -2714,11 +2756,17 @@ class MLXTrainer:
                 final_grad = _clip_grad_by_value(final_grad, max_grad_value)
             if _clip_grad_leaf_norm:
                 final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
+            # Snapshot the scoped params BEFORE decay so the post-update rescale
+            # scales the whole realized delta (decoupled decay + optimizer step)
+            # by the per-group ratio (LoRA+ / embedding-LR).
+            _scoped_snap = _snapshot_scoped_params() if _needs_grad_scaling else None
             # Coupled (SGD) decay folds into the post-clip grad so it feeds
             # momentum; decoupled (AdamW-family) decay shrinks params directly.
             final_grad = self._apply_coupled_weight_decay(model, final_grad)
             self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
+            if _scoped_snap:
+                _rescale_scoped_params(_scoped_snap)
             _restore_trainable_storage_dtypes()
             return grad_norm
 

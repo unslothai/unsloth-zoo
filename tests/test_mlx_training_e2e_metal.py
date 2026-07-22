@@ -296,3 +296,31 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
                     overrides={"compile_mode": "best_effort"})
     assert state["step_ran"] and state["raised"]
     assert "falling back to eager" not in capsys.readouterr().out
+
+@metal_only
+def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
+    """Post-update step rescale: the LoRA+ ratio must actually scale
+    lora_b's realized step. The old gradient pre-scale was an AdamW no-op, so
+    boosting the ratio left lora_b movement unchanged. lora_b initialises to
+    zero, so its final L2 norm is its total movement. Same mechanism as the
+    embedding-LR scope (validated end-to-end by the CUDA comparison after CPT).
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    def _lora_b_norm(trainer):
+        total = 0.0
+        for k, v in tree_flatten(trainer.model.trainable_parameters()):
+            if k == "lora_b" or k.endswith(".lora_b"):
+                total += float(mx.sqrt(mx.sum(v.astype(mx.float32) ** 2)).item())
+        return total
+
+    base = _lora_b_norm(_train(tmp_path / "r1", lora_plus_ratio=1.0, max_steps=6))
+    boosted = _lora_b_norm(_train(tmp_path / "r8", lora_plus_ratio=8.0, max_steps=6))
+    assert base > 0.0, "lora_b never moved at ratio=1"
+    # Under the fix, boosting the ratio 8x moves lora_b markedly farther; under
+    # the old gradient-scale AdamW no-op, boosted/base would be ~1.0.
+    assert boosted > 3.0 * base, (
+        f"LoRA+ ratio did not scale the step (fix regressed): "
+        f"base={base:.4f} boosted={boosted:.4f} ratio={boosted / base:.2f}"
+    )
