@@ -79,6 +79,32 @@ def _write_config(tmp_path, config):
     return path
 
 
+def test_vlm_detection_requires_a_real_modality(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+    text = tmp_path / "text"
+    text.mkdir()
+    (text / "config.py").write_text("class ModelConfig:\n    text_config: object\n")
+    omni = tmp_path / "omni"
+    omni.mkdir()
+    (omni / "config.py").write_text("class ThinkerConfig:\n    vision_config: object\n")
+    assert not loader._config_source_has_modality(text)
+    assert loader._config_source_has_modality(omni)
+    models = tmp_path / "models"
+    models.mkdir()
+    static_vlm = models / "static_vlm"
+    static_vlm.mkdir()
+    (static_vlm / "__init__.py").write_text("raise RuntimeError('must not import')\n")
+    (static_vlm / "config.py").write_text("class ModelConfig:\n    vision_config: object\n")
+    import mlx_vlm.models as mlx_vlm_models
+    monkeypatch.setattr(mlx_vlm_models, "__path__", [str(models)])
+    assert "static_vlm" in loader._build_vlm_model_types()
+    monkeypatch.setattr(loader, "_vlm_model_types_cache", frozenset({"vendored_vlm"}))
+    assert loader._is_vlm({"vision_config": {"hidden_size": 32}})
+    assert loader._is_vlm({"model_type": "vendored_vlm"})
+    assert not loader._is_vlm({"model_type": "text_only", "architectures": ["TextForCausalLM"]})
+    assert not loader._is_vlm({"vision_config": {}, "model_type": "text_only"})
+
+
 def test_apply_mlx_distributed_sharding_modes_and_guards():
     from unsloth_zoo.mlx.loader import (
         _apply_mlx_distributed_sharding,

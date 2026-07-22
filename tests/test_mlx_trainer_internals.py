@@ -2541,6 +2541,25 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+    upstream = lambda self, input_ids=None, pixel_values=None, **kwargs: "upstream"
+    replacement = lambda self, input_ids=None, pixel_values=None, **kwargs: "replacement"
+    adapted = mc._explicit_position_embedding_adapter(upstream, replacement)
+    assert adapted(types.SimpleNamespace(training=True)) == "upstream"
+    assert adapted(types.SimpleNamespace(training=False), position_ids=object()) == "upstream"
+    assert adapted(types.SimpleNamespace(training=True), position_ids=object()) == "replacement"
+    batched = types.SimpleNamespace(VisionModel=type("V", (), {"_forward_same_grid_batch": lambda self: None}))
+    assert mc._paddleocr_vl_has_batched_vision(batched)
+    gemma3n = types.SimpleNamespace(masked_scatter=object())
+    language = types.SimpleNamespace(Gemma3Model=type("G", (), {"__call__": len}))
+    monkeypatch.setattr(mc, "_iter_trait_model_modules", lambda *args, **kwargs: [("gemma3n", gemma3n)])
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: language)
+    mc._install_masked_scatter_multimodal_patches()
+    assert gemma3n.masked_scatter is not mc._masked_scatter_no_numpy
+    assert "gemma3n" not in mc._PATCHED_ARCHES
+
+
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
     import inspect
     import unsloth_zoo.mlx.utils as mlx_utils

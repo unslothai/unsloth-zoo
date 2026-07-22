@@ -20,6 +20,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 (which pulls in CUDA kernels).
 """
 
+import ast
 import gc
 import json
 import importlib
@@ -50,6 +51,7 @@ from .compile import (
 )
 
 _vlm_model_types_cache = None
+_VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
 _SAFE_TEXT_SANITIZE_PATCHED: set[str] = set()
 _AUDIO_CONV_SANITIZE_PATCHED: set[str] = set()
 _MULTIMODAL_STRIP_KEYS = (
@@ -217,16 +219,11 @@ def _collect_all_linear_target_names(model):
 
 
 def _is_vlm(config: dict) -> bool:
-    """Detect whether a config describes a VLM (via "vision_config" or a
-    model_type in mlx_vlm's supported set)."""
-    if "vision_config" in config:
+    """Detect a VLM from explicit modality data or a modality-aware model set."""
+    if any(config.get(key) not in (None, {}) for key in _VLM_MODALITY_CONFIG_FIELDS):
         return True
-
-    architectures = config.get("architectures") or ()
-    if isinstance(architectures, str):
-        architectures = (architectures,)
-    if any(str(arch).endswith("ForCausalLM") for arch in architectures):
-        return False
+    if _deepseek_ocr_config_model_type(config) is not None:
+        return True
 
     model_type = config.get("model_type", "")
     if not model_type:
@@ -235,6 +232,15 @@ def _is_vlm(config: dict) -> bool:
     global _vlm_model_types_cache
     if _vlm_model_types_cache is None:
         _vlm_model_types_cache = _build_vlm_model_types()
+
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    if (
+        any(str(arch).endswith("ForCausalLM") for arch in architectures)
+        and model_type not in _vlm_model_types_cache
+    ):
+        return False
 
     return model_type in _vlm_model_types_cache
 
@@ -1160,15 +1166,41 @@ def _repair_degraded_vlm_processor(
     return repaired
 
 
+def _config_source_has_modality(package_dir: Path) -> bool:
+    """Inspect config declarations without importing model packages."""
+
+    candidates = (
+        package_dir / "config.py",
+        package_dir / f"{package_dir.name}.py",
+        package_dir / "__init__.py",
+    )
+    for path in candidates:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            fields = {
+                item.target.id for item in node.body
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+            }
+            if fields.intersection(_VLM_MODALITY_CONFIG_FIELDS):
+                return True
+    return False
+
+
 def _build_vlm_model_types():
-    """Frozenset of model_type strings mlx_vlm supports (discovered via
-    pkgutil + MODEL_REMAPPING); cached at module level by _is_vlm()."""
+    """Discover only model types whose mlx-vlm config declares a modality."""
     types_set = set()
     try:
         import mlx_vlm.models as vlm_models_pkg
         import pkgutil
-        for importer, modname, ispkg in pkgutil.iter_modules(vlm_models_pkg.__path__):
-            if ispkg:
+        for finder, modname, ispkg in pkgutil.iter_modules(vlm_models_pkg.__path__):
+            if not ispkg:
+                continue
+            if _config_source_has_modality(Path(finder.path) / modname):
                 types_set.add(modname)
     except ImportError:
         pass
@@ -1176,8 +1208,8 @@ def _build_vlm_model_types():
     try:
         from mlx_vlm.utils import MODEL_REMAPPING
         for src, tgt in MODEL_REMAPPING.items():
-            types_set.add(src)
-            types_set.add(tgt)
+            if src in types_set or tgt in types_set:
+                types_set.update((src, tgt))
     except (ImportError, AttributeError):
         pass
 
@@ -4019,6 +4051,8 @@ def _ensure_vlm_prompt_utils_patched():
     for modname in (
         "mlx_vlm.chat",
         "mlx_vlm.generate",
+        "mlx_vlm.generate.dispatch",
+        "mlx_vlm.generate.ar",
         "mlx_vlm.server",
         "mlx_vlm.evals.utils",
     ):
@@ -4026,7 +4060,7 @@ def _ensure_vlm_prompt_utils_patched():
             module = importlib.import_module(modname)
         except Exception:
             continue
-        if hasattr(module, "apply_chat_template"):
+        if getattr(module, "apply_chat_template", None) is _original_vlm_apply_chat_template:
             module.apply_chat_template = patched_apply_chat_template
 
     _vlm_prompt_utils_patched = True
