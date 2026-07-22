@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.7.2"
+__version__ = "2026.7.4"
 
 import os
 import warnings
@@ -384,6 +384,53 @@ if not _SKIP_GPU_INIT:
     elif DEVICE_TYPE == "hip":
         # CCE also fails in HIP / AMD
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
+
+    # ROCm RDNA2/3/3.5/4: the bundled hipBLASLt can ship no fallback Tensile kernels
+    # (e.g. none for gfx1151, unlike rocBLAS), so odd GEMM shapes from the compiled
+    # fwd+bwd graph get JIT-built via Composable Kernel on the first training step
+    # (the ~300s "a_grid_desc_*" descriptor flood). rocBLAS has prebuilt fallbacks
+    # and never JITs, so prefer it. DISABLE_ADDMM_HIP_LT is read at addmm dispatch,
+    # so setting it here (before the first GEMM) keeps addmm off hipBLASLt-LT even on
+    # Windows, where the runtime setter below is a no-op; the TORCH_BLAS_PREFER_* env
+    # vars back it up on other paths. NVIDIA/Intel/Mac and AMD CDNA are untouched.
+    # Kill switch: UNSLOTH_ROCM_PREFER_ROCBLAS=0.
+    if IS_HIP_RUNTIME and os.environ.get(
+        "UNSLOTH_ROCM_PREFER_ROCBLAS", "1"
+    ).strip().lower() not in ("0", "off", "false", "no"):
+        import sys as _sys  # the MLX-alias _sys was del'd above; re-import locally
+        # Did the user pin a BLAS backend? If so, do not override it at runtime.
+        _user_blas = "TORCH_BLAS_PREFER_HIPBLASLT" in os.environ or "TORCH_BLAS_PREFER_CUBLASLT" in os.environ
+        # Did they pin it to the LT backend specifically? Then leave addmm on it too.
+        _user_wants_lt = any(
+            os.environ.get(_k, "").strip().lower() in ("1", "on", "true", "yes")
+            for _k in ("TORCH_BLAS_PREFER_HIPBLASLT", "TORCH_BLAS_PREFER_CUBLASLT")
+        )
+        try:
+            import torch as _torch
+            _rocm_arch = str(getattr(
+                _torch.cuda.get_device_properties(0), "gcnArchName", "") or ""
+            ).split(":")[0].strip()
+        except Exception:
+            _torch, _rocm_arch = None, ""
+        # is_rdna set (RDNA2/3/3.5/4); CDNA (MI, gfx9xx) excluded on purpose.
+        if _rocm_arch in (
+            "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103",
+            "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+        ):
+            os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
+            os.environ.setdefault("TORCH_BLAS_PREFER_CUBLASLT", "0")
+            if not _user_wants_lt:
+                os.environ.setdefault("DISABLE_ADDMM_HIP_LT", "1")
+            # Non-Windows: also flip at runtime (no-op setter on Windows). Skip when
+            # the user pinned a backend, so an explicit hipBLASLt choice is honoured.
+            if not _user_blas and _sys.platform != "win32" and _torch is not None:
+                _pref = getattr(getattr(_torch.backends, "cuda", None), "preferred_blas_library", None)
+                if callable(_pref):
+                    try: _pref("cublas")  # prefer rocBLAS on ROCm
+                    except Exception: pass  # best-effort; some builds lack the setter
+                del _pref
+        del _torch, _rocm_arch, _sys, _user_blas, _user_wants_lt
     del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
     del clean_expandable_segments_value
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF

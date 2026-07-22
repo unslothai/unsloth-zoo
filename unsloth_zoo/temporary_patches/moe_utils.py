@@ -886,31 +886,130 @@ def get_weight_preprocessor(model_type: str):
     return _WEIGHT_PREPROCESSORS.get(model_type)
 
 
-def preprocess_weight(
-    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None
-):
-    """Preprocess a weight into (E, in_dim, out_dim) for grouped_mm.
+def _logical_expert_shape(param):
+    """Return the logical expert shape without dequantizing or materializing.
 
-    Uses a registered model-specific preprocessor if present, else transposes
-    by shape. proj_type is "gate_up" or "down".
+    Resolve PEFT parameters before module wrappers. A recorded logical shape (bnb
+    Params4bit _original_shape, ParameterModule shape_3d) is read directly so a
+    get_param provider is never materialized just to read its shape.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    seen = set()
+    while param is not None and id(param) not in seen:
+        seen.add(id(param))
+
+        # Recorded logical shape avoids materializing a get_param provider.
+        recorded = getattr(param, "_original_shape", None)
+        if recorded is None:
+            recorded = getattr(param, "shape_3d", None)
+        if recorded is not None:
+            return tuple(int(x) for x in recorded)
+
+        get_param = getattr(param, "get_param", None)
+        if callable(get_param):
+            try:
+                inner = get_param()
+            except Exception:
+                inner = None
+            if inner is not None and inner is not param:
+                param = inner
+                continue
+
+        base_layer = getattr(param, "base_layer", None)
+        if base_layer is not None and base_layer is not param:
+            param = base_layer
+            continue
+
+        # Linear modules store parameters on .weight.
+        weight = getattr(param, "weight", None)
+        if weight is not None and weight is not param:
+            param = weight
+            continue
+
+        break
+
+    shape = getattr(param, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(x) for x in shape)
+    except TypeError:
+        return None
+
+
+def _orientation_needs_transpose(shape, proj_type, hidden_dim):
+    """Return whether a weight needs transposition, or None when ambiguous."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if shape is None or len(shape) < 3:
+        return None
+    d1, d2 = int(shape[1]), int(shape[2])
+    if d1 == d2:
+        return None
+    if proj_type == "gate_up":
+        # grouped_mm uses (E, hidden, 2I).
+        return d1 != hidden_dim
+    # grouped_mm down uses (E, I, hidden).
+    return d2 != hidden_dim
+
+
+_WARNED_AMBIGUOUS_LAYOUTS = set()
+
+
+def _warn_ambiguous_layout_once(proj_type, shape, hidden_dim):
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    key = (proj_type, tuple(shape), hidden_dim)
+    if key in _WARNED_AMBIGUOUS_LAYOUTS:
+        return
+    _WARNED_AMBIGUOUS_LAYOUTS.add(key)
+    # Always warn because a wrong guess corrupts training (#849).
+    print(
+        f"Unsloth: MoE '{proj_type}' expert weight of shape {tuple(shape)} has equal matmul "
+        f"dims (hidden_dim={hidden_dim}), so its layout is ambiguous, and no unambiguous "
+        f"sibling projection was reachable to disambiguate it. Assuming the transformers "
+        f"F.linear layout and transposing to grouped_mm layout. If these experts were "
+        f"already in grouped_mm layout this transpose is WRONG and trains on transposed "
+        f"weights (see unslothai/unsloth-zoo#849). Register an explicit preprocessor via "
+        f"register_weight_preprocessor('<model_type>', ...) to remove the guess.",
+        file=sys.stderr,
+    )
+
+
+def preprocess_weight(
+    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None,
+    experts_module=None,
+):
+    """Convert an expert weight to grouped_mm layout.
+
+    Registered preprocessors take precedence. Square weights use the non-square sibling.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if model_type and model_type in _WEIGHT_PREPROCESSORS:
         return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
 
-    if proj_type == "gate_up":
-        # Want (E, hidden_dim, 2*intermediate).
-        if weight.shape[1] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
-    else:  # down
-        # Want (E, intermediate, hidden_dim).
-        if weight.shape[2] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
+    # Non-square shapes reveal layout directly.
+    needs_transpose = _orientation_needs_transpose(tuple(weight.shape), proj_type, hidden_dim)
+    if needs_transpose is not None:
+        return weight.transpose(-2, -1) if needs_transpose else weight
+
+    # One sibling is always non-square and reveals the shared layout.
+    if experts_module is not None:
+        sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
+        sibling_type = "down" if proj_type == "gate_up" else "gate_up"
+        sibling = getattr(experts_module, sibling_name, None)
+        if sibling is not None:
+            sibling_transpose = _orientation_needs_transpose(
+                _logical_expert_shape(sibling), sibling_type, hidden_dim,
+            )
+            if sibling_transpose is not None:
+                return weight.transpose(-2, -1) if sibling_transpose else weight
+
+    # Default to F.linear when no sibling is readable.
+    _warn_ambiguous_layout_once(proj_type, weight.shape, hidden_dim)
+    return weight.transpose(-2, -1)
 
 
 # Generic MoE detection and ParamWrapper patching.
@@ -1307,8 +1406,8 @@ def forward_native_grouped_mm(
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
-            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt)
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
+            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
         mm1_out = _base_grouped_mm(
             permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
         )
@@ -1477,8 +1576,8 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
-            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt)
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
+            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
         mm2_out = _base_grouped_mm(
             inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
         )

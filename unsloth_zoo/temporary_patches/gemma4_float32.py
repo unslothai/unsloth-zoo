@@ -37,13 +37,223 @@
 # ============================================================================
 
 import os
+import ast
 import inspect
+import linecache
+import sys
 import torch
-from .common import TEMPORARY_PATCHES
+from .common import TEMPORARY_PATCHES, logger
 from .utils import patch_function, raise_error
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+
+
+def _unsloth_gemma4_ple_cast_input(module, x):
+    """Cast at a learned PLE Linear boundary without touching the fp32 carrier."""
+    get_base_layer = getattr(module, "get_base_layer", None)
+    base_layer = get_base_layer() if callable(get_base_layer) else \
+        getattr(module, "base_layer", module)
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        weight = getattr(base_layer, "weight", None)
+    if weight is None:
+        return x
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        return x
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return x
+    # Skip sub-2-byte floats (e.g. float8_e4m3fn / float8_e5m2): casting the fp32
+    # carrier down to fp8 destroys it, and fp8 matmul kernels expect a higher
+    # precision input they scale internally. getattr keeps this a no-op on older
+    # torch builds whose dtypes lack `itemsize`.
+    if getattr(dtype, "itemsize", 2) < 2:
+        return x
+    return x if x.dtype == dtype else x.to(dtype)
+pass
+
+
+def _is_gemma4_ple_linear_call(node, attr, argument):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attr
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == argument
+    )
+
+
+def _is_gemma4_ple_fixed_call(node, attr, argument):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attr
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Call)
+        and isinstance(node.args[0].func, ast.Name)
+        and node.args[0].func.id == "_unsloth_gemma4_ple_cast_input"
+        and len(node.args[0].args) == 2
+        and isinstance(node.args[0].args[0], ast.Attribute)
+        and node.args[0].args[0].attr == attr
+        and isinstance(node.args[0].args[0].value, ast.Name)
+        and node.args[0].args[0].value.id == "self"
+        and isinstance(node.args[0].args[1], ast.Name)
+        and node.args[0].args[1].id == argument
+    )
+
+
+def _gemma4_ple_validate(model_cls, method_name, targets):
+    """Classify a PLE method WITHOUT mutating anything.
+
+    Returns (status, payload) where status is one of:
+      "ALREADY"     - marker set, or every boundary is already cast (safe no-op).
+      "PATCH"       - payload carries what is needed to rewrite the method.
+      "DRIFT"       - the method exists but its source shape is unexpected.
+      "UNAVAILABLE" - the class / source cannot be introspected here.
+    payload is None unless status == "PATCH".
+    """
+    marker = f"_unsloth_ple_dtype_{method_name}_patched"
+    if getattr(model_cls, marker, False):
+        return "ALREADY", None
+    module = sys.modules.get(model_cls.__module__)
+    source_file = inspect.getsourcefile(model_cls)
+    if module is None or source_file is None:
+        return "UNAVAILABLE", None
+    module_source = inspect.getsource(module)
+    tree = ast.parse(module_source, filename = source_file)
+    class_nodes = [x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == model_cls.__name__]
+    if len(class_nodes) != 1:
+        return "DRIFT", None
+    method_nodes = [x for x in class_nodes[0].body if isinstance(x, ast.FunctionDef) and x.name == method_name]
+    if len(method_nodes) != 1:
+        return "DRIFT", None
+    method_node = method_nodes[0]
+
+    raw_calls = {}
+    for attr, argument in targets:
+        raw = [x for x in ast.walk(method_node) if _is_gemma4_ple_linear_call(x, attr, argument)]
+        fixed = [x for x in ast.walk(method_node) if _is_gemma4_ple_fixed_call(x, attr, argument)]
+        if not raw and len(fixed) == 1:
+            raw_calls[attr] = []
+            continue
+        if len(raw) != 1 or fixed:
+            return "DRIFT", None
+        raw_calls[attr] = raw
+    if all(not raw_calls[attr] for attr, _ in targets):
+        return "ALREADY", None
+    return "PATCH", (module, source_file, module_source, method_node, raw_calls)
+
+
+def _patch_gemma4_ple_dtype_on_method(model_cls, method_name, targets, dry_run = False):
+    status, payload = _gemma4_ple_validate(model_cls, method_name, targets)
+    if dry_run:
+        return status
+
+    marker = f"_unsloth_ple_dtype_{method_name}_patched"
+    if status == "ALREADY":
+        # Covers both the marker-preset case and "every boundary already cast".
+        setattr(model_cls, marker, True)
+        return False
+    if status in ("DRIFT", "UNAVAILABLE"):
+        if status == "DRIFT":
+            logger.warning(
+                f"Unsloth: Gemma4 PLE dtype patch skipped for "
+                f"`{model_cls.__name__}.{method_name}` - the expected source shape was "
+                f"not found (transformers source drift). Forced-float32 runs may hit a "
+                f"dtype mismatch here until the patch is updated."
+            )
+        return False
+
+    module, source_file, module_source, method_node, raw_calls = payload
+    patched_module_source = module_source
+    for attr, argument in targets:
+        if not raw_calls[attr]:
+            continue
+        old = ast.get_source_segment(module_source, raw_calls[attr][0])
+        new = f"self.{attr}(_unsloth_gemma4_ple_cast_input(self.{attr}, {argument}))"
+        if old is None or patched_module_source.count(old) != 1:
+            return False
+        patched_module_source = patched_module_source.replace(old, new, 1)
+
+    class PLEInputCast(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            for attr, argument in targets:
+                if _is_gemma4_ple_linear_call(node, attr, argument):
+                    node.args[0] = ast.copy_location(
+                        ast.Call(
+                            func = ast.Name(id = "_unsloth_gemma4_ple_cast_input", ctx = ast.Load()),
+                            args = [node.func, node.args[0]],
+                            keywords = [],
+                        ),
+                        node.args[0],
+                    )
+            return node
+
+    method_node.decorator_list = []
+    method_node = PLEInputCast().visit(method_node)
+    ast.fix_missing_locations(method_node)
+    module.__dict__["_unsloth_gemma4_ple_cast_input"] = _unsloth_gemma4_ple_cast_input
+    namespace = {}
+    exec(compile(ast.Module(body = [method_node], type_ignores = []), source_file, "exec"), module.__dict__, namespace)
+    original_body = inspect.unwrap(getattr(model_cls, method_name))
+    patched_body = namespace[method_name]
+    if original_body.__code__.co_freevars != patched_body.__code__.co_freevars:
+        return False
+    original_body.__code__ = patched_body.__code__
+    linecache.cache[source_file] = (
+        len(patched_module_source), None, patched_module_source.splitlines(keepends = True), source_file,
+    )
+    setattr(model_cls, marker, True)
+    return True
+
+
+def patch_Gemma4PLEInputDtype():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1": return
+    try:
+        import transformers.models.gemma4.modeling_gemma4
+        Gemma4TextModel = transformers.models.gemma4.modeling_gemma4.Gemma4TextModel
+        Gemma4TextDecoderLayer = transformers.models.gemma4.modeling_gemma4.Gemma4TextDecoderLayer
+    except Exception as e:
+        return raise_error("Gemma4 PLE Linear input dtype", e)
+    specs = (
+        (Gemma4TextModel, "project_per_layer_inputs",
+            (("per_layer_model_projection", "inputs_embeds"),)),
+        (Gemma4TextDecoderLayer, "forward",
+            (("per_layer_input_gate", "hidden_states"), ("per_layer_projection", "hidden_states"))),
+    )
+    try:
+        # Validate every boundary before mutating any, so a drift in one method can
+        # never leave a half-patched model that still crashes at the other boundary.
+        statuses = [
+            ((cls, method), _patch_gemma4_ple_dtype_on_method(cls, method, targets, dry_run = True))
+            for cls, method, targets in specs
+        ]
+        # Abort all boundaries if any cannot be safely patched (DRIFT) or introspected
+        # (UNAVAILABLE), so a per-method failure can never leave a half-patched model.
+        if any(status in ("DRIFT", "UNAVAILABLE") for _, status in statuses):
+            for (cls, method), status in statuses:
+                if status == "DRIFT":
+                    logger.warning(
+                        f"Unsloth: Gemma4 PLE dtype patch skipped for "
+                        f"`{cls.__name__}.{method}` (transformers source drift); skipping "
+                        f"all PLE boundaries to avoid a half-patched model."
+                    )
+            return
+        for cls, method, targets in specs:
+            _patch_gemma4_ple_dtype_on_method(cls, method, targets)
+    except Exception as e:
+        return raise_error("Gemma4 PLE Linear input dtype", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4PLEInputDtype)
 
 
 def patch_Gemma4TextScaledWordEmbedding():

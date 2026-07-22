@@ -1231,6 +1231,84 @@ def create_new_function(
 pass
 
 
+def fix_gemma4_audio_feature_dtype(source):
+    """Align Gemma 4 audio features with the destination embedding dtype."""
+    rewritten, count = re.subn(
+        r"audio_features\.to\(\s*inputs_embeds\.device\s*\)",
+        "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)",
+        source,
+    )
+    if count != 1:
+        return source
+    return rewritten
+pass
+
+
+_GEMMA4_PLE_CAST_HELPER = """
+def _unsloth_gemma4_ple_cast_input(module, x):
+    get_base_layer = getattr(module, "get_base_layer", None)
+    base_layer = get_base_layer() if callable(get_base_layer) else getattr(module, "base_layer", module)
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        weight = getattr(base_layer, "weight", None)
+    if weight is None:
+        return x
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        return x
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return x
+    if getattr(dtype, "itemsize", 2) < 2:
+        return x
+    return x if x.dtype == dtype else x.to(dtype)
+pass
+"""
+
+
+def fix_gemma4_forced_float32_ple_dtype(source, module = None):
+    """Align only Gemma 4 PLE Linear inputs for forced-float32 residuals."""
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1":
+        return source
+
+    replacements_by_module = {
+        "Gemma4TextModel": (
+            (
+            "self.per_layer_model_projection(inputs_embeds)",
+            "self.per_layer_model_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds))",
+            ),
+        ),
+        "Gemma4TextDecoderLayer": (
+            (
+            "self.per_layer_input_gate(hidden_states)",
+            "self.per_layer_input_gate(_unsloth_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states))",
+            ),
+            (
+            "self.per_layer_projection(hidden_states)",
+            "self.per_layer_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_projection, hidden_states))",
+            ),
+        ),
+    }
+    replacements = (
+        tuple(item for group in replacements_by_module.values() for item in group)
+        if module is None else replacements_by_module.get(module, ())
+    )
+    if not replacements:
+        return source
+    rewritten = source
+    counts = [rewritten.count(old) for old, _ in replacements]
+    if not any(counts):
+        return source
+    if (module is None and any(count > 1 for count in counts)) or \
+        (module is not None and any(count != 1 for count in counts)):
+        return source
+    for old, new in replacements:
+        if old in rewritten:
+            rewritten = rewritten.replace(old, new, 1)
+    return rewritten
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -1258,6 +1336,10 @@ def create_standalone_class(
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
+    if module == "Gemma4Model":
+        forward_source = fix_gemma4_audio_feature_dtype(forward_source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        forward_source = fix_gemma4_forced_float32_ple_dtype(forward_source, module)
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
@@ -1505,6 +1587,19 @@ def create_standalone_class(
         source,
     )
 
+    if module == "Gemma4Model":
+        source = fix_gemma4_audio_feature_dtype(source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        source = fix_gemma4_forced_float32_ple_dtype(source, module)
+
+    # Append the PLE cast helper only once a call to it actually exists in the
+    # generated source (from the rewrite above, or from already-cast eager source
+    # read back through inspect.getsource). This keeps the emitted helper name in
+    # sync with the eager patch and avoids appending dead code when nothing was
+    # rewritten (drift / already-fixed upstream / flag off).
+    if "_unsloth_gemma4_ple_cast_input(" in source and \
+        "def _unsloth_gemma4_ple_cast_input" not in source:
+        source += _GEMMA4_PLE_CAST_HELPER
     return source
 
 
@@ -3454,7 +3549,7 @@ def unsloth_compile_transformers(
     # a hit lets the first training step skip Inductor codegen and Triton
     # autotuning. A miss is silent and falls back to a normal local compile;
     # the artifacts are then saved at process exit for the next run.
-    # Kill switch: UNSLOTH_MEGA_CACHE=0. See compile_cache.py.
+    # On by default on POSIX; opt-in (=1) on Windows; kill switch =0. See compile_cache.py.
     try:
         from .compile_cache import megacache_load
         # Env vars override these arguments below (and the generated forwards
