@@ -296,3 +296,179 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
                     overrides={"compile_mode": "best_effort"})
     assert state["step_ran"] and state["raised"]
     assert "falling back to eager" not in capsys.readouterr().out
+@metal_only
+def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
+    """Real-runtime contract for planned VLM training: with a qualified
+    compile decision the trainer surveys, installs a width plan, and runs
+    the compiled path over planned widths only; losses and token counts
+    match the unplanned eager run exactly (padded tails are inert), and
+    every compiled input width is an admitted endpoint."""
+    import types
+
+    import numpy as np
+    import mlx.nn as nn
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _Tok:
+        pad_token_id = 2
+
+        def encode(self, text):
+            return [int(part) for part in str(text).split()]
+
+        def convert_tokens_to_ids(self, token):
+            if isinstance(token, list):
+                return [self.convert_tokens_to_ids(item) for item in token]
+            return -1
+
+    class _Proc:
+        tokenizer = _Tok()
+        image_processor = object()
+
+        def __call__(self, text, **_kwargs):
+            width = 5 + 35 * (max(int(item) % 2 for item in text))
+            rows = [
+                ([int(item), 200] + [2] * width)[:width] for item in text
+            ]
+            return {
+                "input_ids": np.array(rows, dtype=np.int32),
+                "attention_mask": np.array(
+                    [[1] * width for _ in rows], dtype=np.int32,
+                ),
+            }
+
+    class TinyVLM(nn.Module):
+        # Real nn.Module: keep the genuine train()/state members — the
+        # compiled step threads model.state, so overriding it would leak
+        # traced parameters out of the compiled call.
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(260, 8)
+            self.proj = nn.Linear(8, 260, bias=False)
+            self._config = {"model_type": "tiny"}
+
+        def __call__(self, inputs, pixel_values=None, mask=None, **_kwargs):
+            return self.proj(self.embed(inputs))
+
+    seen_widths = []
+    original_call = TinyVLM.__call__
+
+    def recording_call(self, inputs, *args, **kwargs):
+        seen_widths.append(int(inputs.shape[1]))
+        return original_call(self, inputs, *args, **kwargs)
+
+    compiled_invocations = []
+    real_compile = mx.compile
+
+    def counting_compile(fn, **kwargs):
+        compiled = real_compile(fn, **kwargs)
+
+        def tracked(*args):
+            compiled_invocations.append(1)
+            return compiled(*args)
+
+        return tracked
+
+    def run(planned):
+        mx.random.seed(7)
+        seen_widths.clear()
+        compiled_invocations.clear()
+        plan = _create_vlm_batch_plan(
+            dataset=[{"text": str(i)} for i in range(4)],
+            processor=_Proc(),
+            config={"image_size": 16, "image_token_id": 200},
+            batch_size=1,
+            max_seq_length=8,
+        )
+        args = MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            compile=planned,
+            use_cce=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            logging_steps=1000,
+            output_dir=str(tmp_path),
+        )
+        trainer = MLXTrainer(
+            TinyVLM(),
+            types.SimpleNamespace(pad_token_id=2, eos_token_id=2),
+            [],
+            args=args,
+        )
+        trainer._is_vlm = True
+        trainer.processor = _Proc()
+        trainer._batches = plan
+        if planned:
+            enabled_decision = types.SimpleNamespace(
+                should_raise=False, enabled=True, arch="tiny",
+                reason="mocked", setting_recommendations=(),
+                fallback_allowed=True, support_state="supported_verified",
+                strict=False, policy_mode="auto",
+            )
+            monkeypatch.setattr(
+                trainer_mod, "resolve_training_compile",
+                lambda *_a, **_k: enabled_decision,
+            )
+            monkeypatch.setattr(
+                trainer_mod, "trace_compile_application",
+                lambda *_a, **_k: None,
+            )
+            monkeypatch.setattr(
+                trainer_mod, "explain_compile_support", lambda *_a, **_k: "",
+            )
+            monkeypatch.setattr(
+                trainer_mod, "get_compile_qualification",
+                lambda *_a, **_k: None,
+            )
+        trainer.save_model = lambda *_a, **_k: None
+        result = trainer.train()
+        return result, plan, list(seen_widths)
+
+    monkeypatch.setattr(TinyVLM, "__call__", recording_call)
+    monkeypatch.setattr(mx, "compile", counting_compile)
+    unplanned_result, _plan, unplanned_widths = run(planned=False)
+    unplanned_compiled_calls = len(compiled_invocations)
+    planned_result, planned_plan, planned_widths = run(planned=True)
+    planned_compiled_calls = len(compiled_invocations)
+
+    # The installed-plan run genuinely executes through mx.compile — one
+    # compiled invocation per training step — while the unplanned eager
+    # run never compiles.
+    assert unplanned_compiled_calls == 0
+    assert planned_compiled_calls == 4
+    assert planned_result["compile_enabled"] is True
+    assert unplanned_result["compile_enabled"] is False
+    assert planned_result["trained_tokens"] == (
+        unplanned_result["trained_tokens"]
+    )
+    assert planned_result["train_loss"] == pytest.approx(
+        unplanned_result["train_loss"], rel=1e-4,
+    )
+    # Every compiled input width is a planned endpoint at or above the raw
+    # width, and the planned run exposed at most the admitted variants.
+    endpoints = {
+        planned_plan._shape_plan.endpoint_for(
+            planned_plan.batch_family(index),
+            planned_plan._planned_widths[index],
+        )
+        for index in range(len(planned_plan))
+    }
+    assert set(planned_widths) == endpoints
+    assert all(
+        width >= raw
+        for width, raw in zip(
+            planned_widths,
+            (
+                planned_plan.batch_width(
+                    planned_plan.batch_index_for_visit(visit)
+                )
+                for visit in range(len(planned_widths))
+            ),
+        )
+    )
+    assert len(set(planned_widths)) <= len(set(unplanned_widths)) + 1

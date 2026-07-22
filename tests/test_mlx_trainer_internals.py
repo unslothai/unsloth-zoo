@@ -560,8 +560,12 @@ def test_text_shape_guard_dispositions_for_vlm_streaming_and_clipped_accum():
     )
 
     cases = (
-        (True, None, MLXTrainingConfig(), "vlm"),
+        # VLM with no resolved compile decision: planning (and its survey)
+        # must not run before qualification; compiled behavior unchanged.
+        (True, None, MLXTrainingConfig(), "vlm_compile_unqualified"),
         (False, iter(()), MLXTrainingConfig(), "streaming"),
+        # Compiled global-norm clipping with gradient accumulation is
+        # eligible, so the guard plans instead of declining.
         (False, None, MLXTrainingConfig(gradient_accumulation_steps=2,
                                         max_grad_norm=1.0), None),
     )

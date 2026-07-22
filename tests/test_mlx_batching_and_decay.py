@@ -730,3 +730,32 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     assert plan.batch_family(0) != plan.batch_family(1)
     with pytest.raises(RuntimeError, match="batch 0 drifted"):
         plan.check_family_drift(0, batch)
+
+
+class _WidthOnlyProcessor(_CountingProcessor):
+    """Same structure everywhere; batch width follows content — and spreads
+    far enough (5 vs 40) that the rounded planned widths stay distinct, so
+    the planner genuinely sees one family at several widths."""
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        width = 5 + 35 * (max(int(item) % 2 for item in text))
+        rows = [([int(item), 200] + [2] * width)[:width] for item in text]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(
+                [[1] * width for _ in rows], dtype=np.int32,
+            ),
+        }
+
+
+def _vlm_planner_fixtures(processor=None, rows=6):
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    return _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(rows)],
+        processor=processor or _WidthOnlyProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+    )

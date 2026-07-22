@@ -177,6 +177,8 @@ from .utils import (
     iterate_training_batches,
     create_vlm_batches,
     _create_vlm_batch_plan,
+    _finite_text_pad_width,
+    _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
@@ -757,6 +759,186 @@ def _shape_guard_report(
     )
 
 
+def _plan_single_process_vlm_shapes(
+    batches,
+    batch_iter,
+    *,
+    args,
+    total_steps,
+    distributed_world_size,
+    compile_policy,
+    compile_decision,
+    install_plan=True,
+):
+    """Plan finite VLM shapes for the single-process compiled path.
+
+    Runs only after compile qualification resolved (the descriptor survey
+    materializes every scheduled batch once, so it must not run for
+    unqualified or eager runs). Padable batches take the shared rounded
+    width policy capped at the surveyed maximum final width (post-expansion
+    widths legitimately exceed ``max_seq_length``, which is never
+    consulted), bumped off any extent of an array the pipeline does not
+    pad; batches the width survey declined participate with their exact
+    concrete families at their raw widths. A family the serializer cannot
+    prove stable enough to group (unplannable) forces eager fallback for
+    the run — grouping it could span several compile keys.
+    """
+    configured_cap = getattr(args, "compile_max_variants", None)
+    automatic = configured_cap is None
+    cap = resolve_compile_max_variants(configured_cap)
+    lazy = isinstance(batches, FiniteVLMBatchPlan)
+    if batch_iter is not None:
+        return None, _shape_guard_report(
+            "not_applicable", "streaming", cap, lazy_batches=False,
+        ), True, None
+    if compile_policy.mode == "eager":
+        return None, _shape_guard_report(
+            "not_applicable", "compile_disabled", cap, lazy_batches=lazy,
+        ), True, None
+    if distributed_world_size > 1:
+        # Coordinated multi-rank VLM planning is not wired; compiled DDP
+        # behavior is unchanged (unplanned).
+        return None, _shape_guard_report(
+            "not_applicable", "vlm_distributed", cap, lazy_batches=lazy,
+        ), True, None
+    if compile_decision is None or not getattr(
+        compile_decision, "enabled", False,
+    ):
+        return None, _shape_guard_report(
+            "not_applicable", "vlm_compile_unqualified", cap,
+            lazy_batches=lazy,
+        ), True, None
+    max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
+    if max_grad_norm > 0 and args.gradient_accumulation_steps > 1:
+        # Compilation is disabled later for this configuration; do not pay
+        # the survey (it materializes every batch) for a plan that could
+        # never be compiled.
+        return None, _shape_guard_report(
+            "not_applicable", "compile_ineligible_global_norm", cap,
+            lazy_batches=lazy,
+        ), False, None
+    compile_scope = FULL_STEP_SCOPE
+    if not isinstance(batches, FiniteVLMBatchPlan):
+        report = _shape_guard_report(
+            "eager", "unsupported_batch_plan", cap, compile_scope,
+            lazy_batches=False,
+            cap_selection="not_applicable",
+        )
+        if compile_policy.mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile requires a finite VLM batch plan."
+            )
+        return None, report, False, None
+
+    if batches.pad_token_id is None:
+        # Widening writes the tokenizer pad id into input_ids tails.
+        # Without one no endpoint above a batch's raw width can ever
+        # materialize, and padable batches share symbolic families the
+        # planner may legally bucket to wider endpoints — so no width plan
+        # can hold its materializability invariant. Known before any
+        # survey work: degrade to eager without materializing a batch.
+        report = _shape_guard_report(
+            "eager", "vlm_pad_token_unavailable", cap, compile_scope,
+            cap_selection="not_applicable",
+        )
+        if compile_policy.mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan VLM widths without "
+                "a tokenizer pad id."
+            )
+        return None, report, False, None
+
+    batches.ensure_descriptors()
+    unplannable = [
+        index
+        for index in range(len(batches))
+        if not _vlm_family_is_plannable(batches.batch_family(index))
+    ]
+    if unplannable:
+        report = _shape_guard_report(
+            "eager", "vlm_unplannable_family", cap, compile_scope,
+            cap_selection="not_applicable",
+        )
+        if compile_policy.mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan VLM batch "
+                f"{unplannable[0]}: its compile-key family is not stable "
+                "enough to group safely."
+            )
+        return None, report, False, None
+
+    forbidden = set()
+    padable_widths = []
+    for index in range(len(batches)):
+        forbidden.update(batches.batch_forbidden_widths(index))
+        if batches.batch_padable(index):
+            padable_widths.append(batches.batch_width(index))
+    surveyed_max = max(padable_widths, default=0)
+    planned_widths = []
+    for index in range(len(batches)):
+        raw_width = batches.batch_width(index)
+        if batches.batch_padable(index):
+            width = _finite_text_pad_width(
+                raw_width,
+                pad_to_multiple=32,
+                minimum_width=2,
+                max_seq_length=surveyed_max,
+            )
+            while width in forbidden:
+                width += 1
+        else:
+            width = raw_width
+        planned_widths.append(width)
+
+    total_microsteps = total_steps * args.gradient_accumulation_steps
+    event_counts = {}
+    for microstep in range(total_microsteps):
+        batch_index = batches.batch_index_for_visit(microstep)
+        key = (
+            batches.batch_family(batch_index),
+            planned_widths[batch_index],
+            phase_for_microstep(
+                compile_scope,
+                args.gradient_accumulation_steps,
+                microstep,
+            ),
+            len(batches.schedule[batch_index]),
+        )
+        event_counts[key] = event_counts.get(key, 0) + 1
+    events = tuple(
+        TextShapeEvent(
+            family=family,
+            width=width,
+            phase=phase,
+            frequency=frequency,
+            local_batch_size=batch_size,
+        )
+        for (family, width, phase, batch_size), frequency in event_counts.items()
+    )
+    frontier = None
+    if automatic:
+        frontier = build_text_shape_frontier(
+            events, compile_scope=compile_scope,
+        )
+        shape_plan = select_text_shape_padding_budget(frontier)
+    else:
+        shape_plan = plan_text_shape_buckets(
+            events,
+            cap=cap,
+            compile_scope=compile_scope,
+        )
+    if shape_plan.report.action == "eager":
+        if compile_policy.mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile finite VLM shape planning failed "
+                f"({shape_plan.report.reason})."
+            )
+        return shape_plan, shape_plan.report, False, frontier
+    if install_plan:
+        batches.set_shape_plan(shape_plan, planned_widths)
+    return shape_plan, shape_plan.report, True, frontier
+
+
 def _plan_single_process_text_shapes(
     batches,
     batch_iter,
@@ -767,6 +949,7 @@ def _plan_single_process_text_shapes(
     distributed_world_size,
     compile_policy,
     install_plan=True,
+    vlm_compile_decision=None,
 ):
     """Plan finite text shapes before optimizer or compiled-callable setup."""
 
@@ -774,9 +957,16 @@ def _plan_single_process_text_shapes(
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
     if is_vlm:
-        return None, _shape_guard_report(
-            "not_applicable", "vlm", cap, lazy_batches=False,
-        ), True, None
+        return _plan_single_process_vlm_shapes(
+            batches,
+            batch_iter,
+            args=args,
+            total_steps=total_steps,
+            distributed_world_size=distributed_world_size,
+            compile_policy=compile_policy,
+            compile_decision=vlm_compile_decision,
+            install_plan=install_plan,
+        )
     if batch_iter is not None:
         return None, _shape_guard_report(
             "not_applicable", "streaming", cap, lazy_batches=False,
@@ -2490,6 +2680,7 @@ class MLXTrainer:
                 is_vlm=is_vlm,
                 distributed_world_size=distributed_world_size,
                 compile_policy=compile_policy,
+                vlm_compile_decision=getattr(self, "_compile_decision", None),
             )
         grad_accum = args.gradient_accumulation_steps
         self._compile_shape_guard_report = _compile_shape_guard_report
@@ -3230,10 +3421,10 @@ class MLXTrainer:
                         and _compile_scope in (
                             FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE,
                         )
-                        # Text-only: phase-aware admission requires an
-                        # installed shape plan; VLM plans expose no
-                        # shape-plan interface.
-                        and isinstance(batches, FiniteTextBatchPlan)
+                        # Phase-aware admission through the shared finite-plan
+                        # protocol; a plan without an installed shape plan
+                        # (e.g. unplanned DDP VLM) materializes unpadded.
+                        and isinstance(batches, _FINITE_BATCH_PLAN_TYPES)
                     ):
                         batch_data = batches.materialize(
                             scheduled_index,

@@ -5806,6 +5806,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_widths",
         "_padable",
         "_forbidden",
+        "_shape_plan",
+        "_planned_widths",
     )
 
     def __init__(
@@ -5846,6 +5848,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._widths = None
         self._padable = None
         self._forbidden = None
+        self._shape_plan = None
+        self._planned_widths = None
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -5895,22 +5899,69 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             )
         return batch_dict
 
-    def materialize(self, index, target_width=None):
+    def set_shape_plan(self, shape_plan, planned_widths):
+        """Install an admission plan plus each batch's planned event width
+        (the rounded width the planner grouped it by; raw for declined
+        batches). The plan-owned cache is invalidated: nothing built before
+        installation may serve a planned fetch."""
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        planned_widths = tuple(
+            operator.index(width) for width in planned_widths
+        )
+        if len(planned_widths) != len(self._schedule):
+            raise ValueError(
+                "planned_widths must contain one entry per scheduled batch"
+            )
+        self._shape_plan = shape_plan
+        self._planned_widths = planned_widths
+        self._mru = None
+
+    def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
 
         The tensor-bearing cache holds exactly the most recent batch (for
         its exact requested width) so a repeated fetch (e.g. a
         compile-failure retry) is free while live scheduled inputs stay
         bounded by the current batch. ``target_width`` right-pads the
-        text-aligned arrays to an installed shape-plan endpoint; ``None``
-        preserves the historical per-batch-maximum padding byte for byte.
+        text-aligned arrays to an explicit endpoint (explicit widths keep
+        bypass authority); with an installed shape plan, ``phase`` resolves
+        the planned endpoint instead, enforces phase-aware admission, and
+        hard-fails on structural drift from the surveyed family before the
+        batch can reach a compiled call. ``None``/``None`` preserves the
+        historical per-batch-maximum padding byte for byte.
         """
         index = operator.index(index)
+        check_drift = False
+        if (
+            target_width is None
+            and phase is not None
+            and self._shape_plan is not None
+        ):
+            family = self.batch_family(index)
+            event_width = self._planned_widths[index]
+            if not self._shape_plan.allows(family, event_width, phase):
+                raise RuntimeError(
+                    "Unsloth MLX: compiled VLM batch signature was not "
+                    "admitted by the finite shape plan."
+                )
+            target_width = self._shape_plan.endpoint_for(family, event_width)
+            check_drift = True
         cached = self._mru
         if cached is not None and cached[0] == (index, target_width):
-            return cached[1]
+            _key, cached_batch, drift_checked = cached
+            # Cache identity covers shape, not provenance: a batch cached
+            # by an explicit-width fetch has not passed the structural
+            # proof, so a planned fetch must verify it before the compiled
+            # path may consume it.
+            if check_drift and not drift_checked:
+                self.check_family_drift(index, cached_batch)
+                self._mru = (_key, cached_batch, True)
+            return cached_batch
         batch_dict = self._build_batch(index, target_width=target_width)
-        self._mru = ((index, target_width), batch_dict)
+        if check_drift:
+            self.check_family_drift(index, batch_dict)
+        self._mru = ((index, target_width), batch_dict, check_drift)
         return batch_dict
 
     def __getitem__(self, index):
@@ -6001,6 +6052,14 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             "padable_batches": sum(self._padable),
         }
         return self._descriptors
+
+    @property
+    def pad_token_id(self):
+        """The tokenizer pad id planned padding would use, or None —
+        without one no batch can be widened, so width planning degrades
+        the run to eager before surveying anything."""
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        return getattr(tokenizer, "pad_token_id", None)
 
     @property
     def survey_stats(self):
