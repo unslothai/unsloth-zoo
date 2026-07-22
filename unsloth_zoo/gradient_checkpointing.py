@@ -59,11 +59,16 @@ DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable doub
 
 
 @functools.cache
-def _device_is_integrated(idx):
-    # Cached per device index (the integrated flag never changes); keyed by idx so a
-    # mid-process set_device() on a mixed APU + discrete box picks the right device.
+def _any_device_integrated():
+    # True if ANY visible CUDA/HIP device is integrated (unified memory). The visible
+    # device set is fixed for the process, so this is computed once. A single static
+    # check on purpose: an integrated device anywhere makes the global double-buffer
+    # flag pure overhead, and a mixed integrated + discrete box is vanishingly rare.
     try:
-        return bool(getattr(torch.cuda.get_device_properties(idx), "is_integrated", 0))
+        return any(
+            bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
+            for i in range(torch.cuda.device_count())
+        )
     except Exception:
         return False
 
@@ -72,15 +77,12 @@ def _double_buffer_disabled():
     # Double buffering overlaps the H2D offload copy with compute, but on unified-
     # memory devices (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to
     # hide: pure overhead (~2x slower, no memory saved), so default it off there.
-    # Env UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 always wins; gate on the live active
-    # device so a mixed box does not disable the overlap for a discrete GPU.
+    # Env UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 always wins; otherwise disable whenever
+    # any visible device is integrated.
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
-    try:
-        return _device_is_integrated(torch.cuda.current_device())
-    except Exception:
-        return False
+    return _any_device_integrated()
 
 
 @contextmanager
