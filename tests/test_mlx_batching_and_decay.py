@@ -452,3 +452,250 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
 
     # No-materialization proof lives in the fake-rank collective test, which
     # covers this single-process property strictly (poisoned class __call__).
+
+
+def test_vlm_family_invariant_against_live_mx_compile_traces():
+    """The serializer's central safety invariant checked against OBSERVED
+    mx.compile cache behavior, not assumed rules. Families are computed
+    BEFORE the compile walk, mirroring the production survey-then-compile
+    order. 'merge' pairs must share one plannable family and one trace;
+    'split' pairs (one per value-encoding rule) must produce two traces and
+    two still-plannable families; 'guard' pairs are cases MLX keys apart that
+    one family may absorb ONLY by being unplannable; leaves the compile walk
+    rejects must be unplannable too. The exhaustive adversarial matrix
+    (stateful/among-walk-varying containers, hostile metaclasses, tag-cache
+    lifetime) is retained as recorded validation evidence outside the repo."""
+    _skip_if_mlx_core_was_replaced()
+    import collections
+
+    from unsloth_zoo.mlx.utils import (
+        _vlm_batch_family as family,
+        _vlm_family_is_plannable as plannable,
+    )
+
+    ids = mx.zeros((2, 3), dtype=mx.int32)
+    Point = collections.namedtuple("Point", "a b")
+
+    class _LyingList(list):
+        def __iter__(self):
+            return iter([])
+
+    cases = [
+        ("merge", {"x": [ids, 1]}, {"x": (ids, 1)}),
+        ("merge", {"flag": True, "x": ids}, {"flag": 1, "x": ids}),
+        ("merge", {"x": ids, "t": _LyingList([1])}, {"x": ids, "t": [1]}),
+        ("split", {"x": ids, "y": 1}, {"y": 1, "x": ids}),
+        ("split", {"x": mx.zeros((2, 4), dtype=mx.int32)},
+                  {"x": mx.zeros((2, 5), dtype=mx.int32)}),
+        ("split", {"x": ids.astype(mx.int16)}, {"x": ids}),
+        ("split", {"x": ids, "y": 0.0}, {"x": ids, "y": -0.0}),
+        ("split", {"x": ids, "y": "a"}, {"x": ids, "y": "b"}),
+        ("split", {"x": ids, b"a": 0}, {"x": ids, b"b": 0}),
+        ("split", {"x": ids, (1, "k"): 0}, {"x": ids, (2, "k"): 0}),
+        ("guard", {"x": ids, "t": Point(1, 2)}, {"x": ids, "t": Point(3, 4)}),
+    ]
+    for kind, left, right in cases:
+        # Families first: production surveys before MLX ever walks the object.
+        fam_left, fam_right = family(left), family(right)
+        traces = []
+        # The probe body ignores its input: mx.compile keys on the argument
+        # walk itself, which is exactly what the family must mirror.
+        compiled = mx.compile(lambda d: (traces.append(1), mx.ones(1))[1])
+        compiled(left)
+        compiled(right)
+        same_key = len(traces) == 1
+        # The safety direction, always: a plannable shared family implies a
+        # shared compile key.
+        if fam_left == fam_right and plannable(fam_left):
+            assert same_key, (kind, left, right)
+        if kind == "merge":
+            assert same_key and fam_left == fam_right and plannable(fam_left)
+        elif kind == "split":
+            # Distinct values stay ELIGIBLE while splitting: dodging hazards
+            # by making common constants unplannable would regress every
+            # ordinary batch to eager.
+            assert not same_key and fam_left != fam_right
+            assert plannable(fam_left) and plannable(fam_right)
+        else:
+            assert not plannable(fam_left) and not plannable(fam_right)
+    # Structures the compile walk rejects can never be plannable either.
+    rejected = [
+        {"x": ids, "n": np.zeros((1,))},
+        {"x": ids, "big": 2 ** 63},
+        collections.UserDict({"x": ids}),
+    ]
+    for tree in rejected:
+        assert not plannable(family(tree))
+        with pytest.raises(Exception):
+            mx.compile(lambda d: mx.ones(1))(tree)
+    # Boundary values MLX still accepts stay plannable.
+    edge = {"x": ids, "lo": -(2 ** 63), "hi": 2 ** 63 - 1}
+    assert plannable(family(edge))
+    mx.compile(lambda d: mx.ones(1))(edge)
+    # A guarded tuple subclass never shares the plain tuple's family.
+    assert family({"t": Point(1, 2)}) != family({"t": (1, 2)})
+
+
+class _VarWidthProcessor(_CountingProcessor):
+    """Batch width follows content so different scheduled batches produce
+    genuinely distinct families."""
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        width = 3 + max(int(item) % 3 for item in text)
+        rows = [([int(item), 200] + [2] * width)[:width] for item in text]
+        masks = [[1] * width for _ in rows]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+        }
+
+
+def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
+    """ensure_descriptors() never runs at construction, stores each index's
+    OWN family (the fixture makes families differ across indices), builds
+    once per batch, invalidates rather than reuses the plan cache, is
+    idempotent with no further processor work, and reports fixed-key
+    counters."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import (
+        _create_vlm_batch_plan,
+        _vlm_batch_family,
+    )
+
+    processor = _VarWidthProcessor()
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(6)],
+        processor=processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+    )
+    assert processor.calls == 0
+    with pytest.raises(RuntimeError, match="ensure_descriptors"):
+        plan.batch_family(0)
+    cached_batch = plan.materialize(0)
+    assert processor.calls == 1 and plan._mru is not None
+    descriptors = plan.ensure_descriptors()
+    # The pre-populated cache is invalidated, not consulted: the survey
+    # rebuilt every index and holds nothing afterwards.
+    assert processor.calls == 1 + len(plan) == 4
+    assert plan._mru is None
+    assert plan.ensure_descriptors() is descriptors
+    assert processor.calls == 4
+    for index in range(len(plan)):
+        assert descriptors[index] == _vlm_batch_family(plan._build_batch(index))
+    assert len(set(descriptors)) == 2
+    assert plan.batch_family(1) == descriptors[1]
+    arrays_per_batch = sum(
+        1 for value in plan._build_batch(0).values()
+        if isinstance(value, mx.array)
+    )
+    assert plan.survey_stats == {
+        "surveyed_batches": 3,
+        "distinct_families": 2,
+        "array_leaves_max": arrays_per_batch,
+    } and arrays_per_batch >= 2
+    assert plan.materialize(0)["input_ids"].tolist() == (
+        cached_batch["input_ids"].tolist()
+    )
+
+
+def test_vlm_plan_survey_releases_each_batch_before_the_next_build(monkeypatch):
+    """One-at-a-time TENSOR ownership: every mx.array leaf of every built
+    batch is tracked by weakref, all of the previous batch's tensors are
+    already collected before the next build starts, and none survive the
+    survey."""
+    _skip_if_mlx_core_was_replaced()
+    import gc
+    import weakref
+
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _create_vlm_batch_plan
+
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(6)],
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+    )
+
+    live = []
+    inner_build = FiniteVLMBatchPlan._build_batch
+
+    def _array_leaves(node):
+        if isinstance(node, mx.array):
+            yield node
+        elif isinstance(node, dict):
+            for value in node.values():
+                yield from _array_leaves(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                yield from _array_leaves(item)
+
+    def tracked_build(self, index):
+        gc.collect()
+        assert [ref for ref in live if ref() is not None] == [], (
+            "previous survey batch's tensors still alive at next build"
+        )
+        batch = inner_build(self, index)
+        # Wrap one array in a nested container so nested leaves are bound
+        # by the tracker too, not just top-level dict values.
+        batch["nested"] = [{"probe": mx.zeros((2, 2), dtype=mx.int32)}]
+        tracked = 0
+        for leaf in _array_leaves(batch):
+            live.append(weakref.ref(leaf))
+            tracked += 1
+        assert tracked >= 3
+        return batch
+
+    monkeypatch.setattr(FiniteVLMBatchPlan, "_build_batch", tracked_build)
+    plan.ensure_descriptors()
+    gc.collect()
+    assert len(live) >= 2 * len(plan)
+    assert all(ref() is None for ref in live)
+
+
+def test_vlm_family_drift_check_fails_hard_with_location():
+    """The runtime drift seam accepts a faithful rebuild against its OWN
+    index and hard-fails on added keys, dtype drift, shape drift, key-order
+    drift, and cross-index confusion, naming the batch and the
+    divergence."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(6)],
+        processor=_VarWidthProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+    )
+    plan.ensure_descriptors()
+    batch = plan.materialize(1)
+    assert plan.check_family_drift(1, batch) is None
+    with pytest.raises(RuntimeError, match=r"batch 1 drifted.*'extra'"):
+        plan.check_family_drift(1, {**batch, "extra": 1})
+    retyped = {**batch, "input_ids": batch["input_ids"].astype(mx.int16)}
+    with pytest.raises(RuntimeError, match=r"'input_ids'.*int16"):
+        plan.check_family_drift(1, retyped)
+    narrowed = {**batch, "input_ids": batch["input_ids"][:, :-1]}
+    with pytest.raises(RuntimeError, match=r"'input_ids'"):
+        plan.check_family_drift(1, narrowed)
+    # Non-first leaves are checked too: a checker pinned to input_ids alone
+    # cannot pass.
+    other_key = next(
+        key for key, value in batch.items()
+        if key != "input_ids" and isinstance(value, mx.array)
+    )
+    remasked = {**batch, other_key: batch[other_key].astype(mx.float16)}
+    with pytest.raises(RuntimeError, match=rf"'{other_key}'.*float16"):
+        plan.check_family_drift(1, remasked)
+    reordered = dict(reversed(list(batch.items())))
+    with pytest.raises(RuntimeError, match="drifted"):
+        plan.check_family_drift(1, reordered)
+    # Families genuinely differ across these indices, so a checker pinned to
+    # the wrong descriptor cannot pass.
+    assert plan.batch_family(0) != plan.batch_family(1)
+    with pytest.raises(RuntimeError, match="batch 0 drifted"):
+        plan.check_family_drift(0, batch)

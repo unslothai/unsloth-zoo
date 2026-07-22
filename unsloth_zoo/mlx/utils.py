@@ -38,9 +38,11 @@ import numpy as np
 import os
 import sys
 import shutil
+import struct
 import tempfile
 import threading
 import warnings
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -5116,6 +5118,352 @@ class _FiniteVLMRow:
         self.checker_good = bool(checker_good)
 
 
+# The serializer's trust boundary is a genuine mlx.core at import time —
+# the same trust the trainer already places in mx.compile itself. Within
+# it, array metadata is read through descriptors captured here and
+# behaviorally validated against a probe array, so LATER patching of
+# mx.array's Python attributes (or of Dtype's string protocol, which the
+# captured-equality dtype naming below never enters) can neither hide nor
+# forge shapes/dtypes from a family. If the captures are missing or fail the
+# probe — test doubles without class descriptors, or a runtime already
+# modified before import — every array leaf degrades to unplannable
+# instead of trusting unverifiable reads. Dtype naming compares wrappers
+# against the captured singletons with the captured __eq__ (property
+# reads mint fresh wrapper objects, so identity cannot name them).
+_MX_ARRAY_TYPE = mx.array
+_MX_ARRAY_SHAPE = getattr(mx.array, "shape", None)
+_MX_ARRAY_DTYPE = getattr(mx.array, "dtype", None)
+_MX_DTYPE_TABLE = tuple(
+    (dtype_obj, dtype_name)
+    for dtype_name in (
+        "bool_", "uint8", "uint16", "uint32", "uint64",
+        "int8", "int16", "int32", "int64",
+        "float16", "float32", "float64", "bfloat16", "complex64",
+    )
+    for dtype_obj in (getattr(mx, dtype_name, None),)
+    if dtype_obj is not None
+)
+_MX_DTYPE_EQ = getattr(type(getattr(mx, "int32", None)), "__eq__", None)
+
+
+def _vlm_family_dtype_name(dtype_value):
+    """Stable name for a dtype read from an array, or None.
+
+    Dtype property reads mint fresh wrapper objects, so identity cannot
+    name them; comparison goes through the __eq__ captured at import
+    against the dtype singletons captured at import, so later patching of
+    the Dtype class (including its string protocol, which is never
+    entered) cannot forge or hide a name.
+    """
+    if _MX_DTYPE_EQ is None:
+        return None
+    for candidate, name in _MX_DTYPE_TABLE:
+        try:
+            if _MX_DTYPE_EQ(dtype_value, candidate) is True:
+                return name
+        except Exception:
+            return None
+    return None
+
+
+def _validate_mx_array_captures():
+    if _MX_ARRAY_SHAPE is None or _MX_ARRAY_DTYPE is None:
+        return False
+    try:
+        probe = mx.zeros((3, 7), dtype=mx.int16)
+        return (
+            tuple(_MX_ARRAY_SHAPE.__get__(probe, _MX_ARRAY_TYPE)) == (3, 7)
+            and _vlm_family_dtype_name(
+                _MX_ARRAY_DTYPE.__get__(probe, _MX_ARRAY_TYPE)
+            ) == "int16"
+        )
+    except Exception:
+        return False
+
+
+_MX_ARRAY_CAPTURES_VALID = _validate_mx_array_captures()
+
+
+# First-read-wins tag per type object. Entries hold the type WEAKLY: a
+# type stays cached exactly as long as instances of it can still appear in
+# a batch (instances keep their type alive), so per-batch dynamic types
+# are reclaimed instead of accumulating, while any type that can recur
+# keeps one stable tag — a surveyed family and a later drift check always
+# agree within a process. Cross-process tag equality holds only for types
+# with honest, deterministic introspection; a metaclass that varies its
+# own name per process cannot be canonicalized by any observation (such
+# families are unplannable anyway).
+_VLM_TYPE_TAG_CACHE = {}
+
+
+def _vlm_family_type_tag(node_type):
+    """First-observation type tag that survives hostile metaclasses: a
+    type whose introspection raises still classifies (as
+    "unidentifiable.type"), and a type whose introspection varies across
+    reads keeps its first observed tag for its lifetime (mx.compile would
+    trace or reject such a batch without ever reading these attributes)."""
+    entry = _VLM_TYPE_TAG_CACHE.get(id(node_type))
+    if entry is not None and entry[0]() is node_type:
+        return entry[1]
+    try:
+        tag = f"{node_type.__module__}.{node_type.__qualname__}"
+    except Exception:
+        tag = "unidentifiable.type"
+    if len(_VLM_TYPE_TAG_CACHE) >= 256:
+        for key in [
+            key
+            for key, (type_ref, _tag) in _VLM_TYPE_TAG_CACHE.items()
+            if type_ref() is None
+        ]:
+            del _VLM_TYPE_TAG_CACHE[key]
+    try:
+        _VLM_TYPE_TAG_CACHE[id(node_type)] = (weakref.ref(node_type), tag)
+    except TypeError:
+        pass
+    return tag
+
+
+def _vlm_family_encode_key(key):
+    """Encoding of one dictionary key for ``_vlm_batch_family``.
+
+    ``mx.compile`` records every key's ``__hash__()`` result. A value
+    encoding is only safe where it is guaranteed at least as fine as that
+    hash within a process, which holds exactly for the built-in types whose
+    hash is value-determined: str/bytes (randomized but value-determined),
+    int/bool, None, non-NaN floats (the bit pattern also splits the
+    ``0.0``/``-0.0`` hash collision), and plain tuples of these. Subclasses
+    can override ``__hash__`` (or ``__int__``/iteration) and typically hash
+    by identity, so any non-exact type — like NaN floats and arbitrary
+    hashable objects — would let one family span several compile keys: it
+    is tagged ``unstable_key`` and ``_vlm_family_is_plannable`` excludes
+    the whole family from shape planning.
+    """
+    key_type = type(key)
+    if key_type is bool or key_type is int:
+        return ("int", int(key))
+    if key_type is float:
+        if key != key:
+            return ("unstable_key", "float-nan")
+        return ("float", struct.pack("<d", key).hex())
+    if key_type is str:
+        return ("str", key)
+    if key_type is bytes:
+        return ("bytes", key)
+    if key is None:
+        return ("none",)
+    if key_type is tuple:
+        return ("seq",) + tuple(_vlm_family_encode_key(item) for item in key)
+    return ("unstable_key", _vlm_family_type_tag(key_type))
+
+
+def _vlm_batch_family(batch, symbolic_axes=None):
+    """Process-stable compile-key family of a prepared VLM batch pytree.
+
+    Mirrors the structure walk ``mx.compile`` uses to key its cache (mlx
+    ``python/src/transforms.cpp``), including its container asymmetry:
+    lists are read through raw C storage (``l[i]`` indexing — subclass
+    iteration overrides do not participate) while tuples are read through
+    Python iteration on the object handle (overrides DO participate); both
+    share one sequence marker. Dict entries participate in insertion order
+    via raw ``dict.items``, non-array constants participate by exact value
+    (bools as their integer values, floats by bit pattern), and genuine
+    ``mx.array`` leaves contribute rank/shape/dtype. Value encodings are
+    only used for exact built-in types, whose value determines the hash or
+    cast MLX records; a subclass constant (overridable ``__hash__`` or
+    conversion) becomes an ``unstable_const`` tag instead. Where the
+    encodings differ, this one is finer for every pytree the compile walk
+    accepts — strings and hash-stable dict keys participate by value
+    instead of process-randomized hash — so for plannable families (see
+    ``_vlm_family_is_plannable``) equal families can never reach distinct
+    compile keys, and families compare equal across processes. Structures
+    the compile walk rejects (non-dict mappings, np.ndarray and every other
+    non-``mx.array`` leaf carrying shape/dtype, unsupported leaf types) get
+    stable ``mapping``/``opaque`` tags: they can never produce a compile
+    key at all, and planning skips them.
+
+    ``symbolic_axes`` maps a leaf path (tuple of dict keys and sequence
+    positions) to the axis whose extent is replaced by the symbolic
+    ``"sequence"`` marker; unmapped arrays keep every dimension concrete and
+    therefore discriminate families exactly.
+    """
+    def encode(node, path):
+        # Dispatch on the raw runtime type: issubclass(type(node), ...)
+        # cannot be misled by a lying __class__ property, matching the
+        # PyDict_Check/PyList_Check calls the compile walk performs.
+        node_type = type(node)
+        if issubclass(node_type, dict):
+            return ("dict",) + tuple(
+                (_vlm_family_encode_key(key), encode(value, path + (key,)))
+                for key, value in dict.items(node)
+            )
+        if issubclass(node_type, Mapping):
+            tag = _vlm_family_type_tag(node_type)
+            try:
+                entries = tuple(
+                    (_vlm_family_encode_key(key), encode(value, path + (key,)))
+                    for key, value in node.items()
+                )
+            except Exception:
+                # mx.compile rejects non-dict mappings before ever reading
+                # them, so a raising items() must not break surveying; the
+                # tag alone still marks the family unplannable.
+                return ("mapping", tag, "unreadable")
+            return ("mapping", tag) + entries
+        if issubclass(node_type, (list, tuple)):
+            # transforms.cpp indexes lists raw but iterates tuples through
+            # the Python protocol. Raw list storage is read identically by
+            # both walks at any time, so every list instance is eligible.
+            # For tuples only the exact type is eligible: a subclass can
+            # route iteration through overridable descriptors that no
+            # class-attribute inspection can see past (tp_iter is what
+            # runs, not what the attribute reports), letting one walk see
+            # different items than a later compile walk.
+            if issubclass(node_type, tuple) and node_type is not tuple:
+                return ("unstable_const", _vlm_family_type_tag(node_type))
+            walk = (
+                list.__iter__(node)
+                if issubclass(node_type, list)
+                else tuple.__iter__(node)
+            )
+            return ("seq",) + tuple(
+                encode(item, path + (position,))
+                for position, item in enumerate(walk)
+            )
+        if node_type is _MX_ARRAY_TYPE:
+            # Metadata through the validated import-time descriptors — the
+            # C++ shape and dtype mx.compile keys on — and dtype naming by
+            # captured equality against the captured singleton table, so no
+            # later-patchable protocol participates.
+            # Unvalidated captures never guess: the leaf opts out instead.
+            if not _MX_ARRAY_CAPTURES_VALID:
+                return ("unstable_const", _vlm_family_type_tag(node_type))
+            shape = _MX_ARRAY_SHAPE.__get__(node, node_type)
+            dims = [operator.index(dim) for dim in shape]
+            axis = None if symbolic_axes is None else symbolic_axes.get(path)
+            if axis is not None:
+                dims[operator.index(axis)] = "sequence"
+            dtype_name = _vlm_family_dtype_name(
+                _MX_ARRAY_DTYPE.__get__(node, node_type)
+            )
+            if dtype_name is None:
+                return ("unstable_const", _vlm_family_type_tag(node_type))
+            return ("array", tuple(dims), dtype_name)
+        if node_type is bool or node_type is int:
+            # transforms.cpp casts constants to signed 64-bit; anything
+            # outside that range is rejected at trace time, never keyed.
+            if not -(2 ** 63) <= node < 2 ** 63:
+                return ("opaque", "builtins.int")
+            return ("int", int(node))
+        if node_type is float:
+            return ("float", struct.pack("<d", node).hex())
+        if node_type is str:
+            return ("str", node)
+        if node is None:
+            return ("none",)
+        if issubclass(node_type, (bool, int, float, str, _MX_ARRAY_TYPE)):
+            return ("unstable_const", _vlm_family_type_tag(node_type))
+        return ("opaque", _vlm_family_type_tag(node_type))
+
+    return encode(batch, ())
+
+
+def _vlm_family_is_plannable(family):
+    """Whether shape planning may group compiled calls by this family.
+
+    False when the family contains any component whose compile-key mapping
+    is not one-to-one-or-finer: ``unstable_key``/``unstable_const``
+    (subclass or identity-based hashing can split one family across
+    several compile keys) and the ``mapping``/``opaque`` tags (structures
+    the compile walk rejects, which can never produce a compile key).
+    Because one unplannable family can span several compile keys, it must
+    never be admitted to compiled-shape planning — not even as an exact
+    signature; runs containing such batches keep unplanned behavior
+    (eager fallback or strict error).
+    """
+    if not isinstance(family, tuple) or not family:
+        return True
+    if family[0] in ("unstable_key", "unstable_const", "mapping", "opaque"):
+        return False
+    return all(
+        _vlm_family_is_plannable(item)
+        for item in family
+        if isinstance(item, tuple)
+    )
+
+
+def _vlm_family_array_leaves(family):
+    """Number of array leaves recorded in a serialized family."""
+    if not isinstance(family, tuple) or not family:
+        return 0
+    if family[0] == "array":
+        return 1
+    return sum(_vlm_family_array_leaves(item) for item in family)
+
+
+def _vlm_family_divergence(expected, observed, path="batch"):
+    """Location and description of the first difference between two families
+    produced by ``_vlm_batch_family``, or ``None`` when they are equal."""
+    if expected == observed:
+        return None
+    if (
+        isinstance(expected, tuple)
+        and isinstance(observed, tuple)
+        and expected[:1] == observed[:1]
+        and expected[:1] and expected[0] in ("dict", "seq")
+    ):
+        kind = expected[0]
+        if len(expected) != len(observed):
+            if kind == "dict":
+                def _key_names(entries):
+                    return {
+                        repr(
+                            key[1]
+                            if key[:1] == ("str",) and len(key) == 2
+                            else key
+                        )
+                        for key, _child in entries
+                    }
+                expected_keys = _key_names(expected[1:])
+                observed_keys = _key_names(observed[1:])
+                added = sorted(observed_keys - expected_keys)
+                missing = sorted(expected_keys - observed_keys)
+                if added or missing:
+                    return (
+                        f"{path}: runtime batch "
+                        + " and ".join(
+                            part for part in (
+                                added and f"added keys {', '.join(added)}",
+                                missing and f"lost keys {', '.join(missing)}",
+                            ) if part
+                        )
+                    )
+            return (
+                f"{path}: {kind} entry count {len(expected) - 1} in the "
+                f"surveyed family vs {len(observed) - 1} at runtime"
+            )
+        for position, (exp, obs) in enumerate(zip(expected[1:], observed[1:])):
+            if kind == "dict":
+                (exp_key, exp_child), (obs_key, obs_child) = exp, obs
+                if exp_key != obs_key:
+                    return (
+                        f"{path}: key {position} is {exp_key!r} in the "
+                        f"surveyed family vs {obs_key!r} at runtime"
+                    )
+                step = (
+                    exp_key[1]
+                    if exp_key[:1] == ("str",) and len(exp_key) == 2
+                    else exp_key
+                )
+                deeper = _vlm_family_divergence(
+                    exp_child, obs_child, f"{path}[{step!r}]",
+                )
+            else:
+                deeper = _vlm_family_divergence(exp, obs, f"{path}[{position}]")
+            if deeper is not None:
+                return deeper
+    return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -5142,6 +5490,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_visit_seed",
         "_visit_epoch_cache",
         "_mru",
+        "_descriptors",
+        "_survey_stats",
     )
 
     def __init__(
@@ -5177,6 +5527,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._visit_seed = None
         self._visit_epoch_cache = None
         self._mru = None
+        self._descriptors = None
+        self._survey_stats = None
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -5201,17 +5553,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def __len__(self):
         return len(self._schedule)
 
-    def materialize(self, index):
-        """Build one batch through the complete existing VLM builder.
-
-        The tensor-bearing cache holds exactly the most recent batch so a
-        repeated fetch (e.g. a compile-failure retry) is free while live
-        scheduled inputs stay bounded by the current batch.
-        """
-        index = operator.index(index)
-        cached = self._mru
-        if cached is not None and cached[0] == index:
-            return cached[1]
+    def _build_batch(self, index):
+        """Build one batch through the complete existing VLM builder."""
         batch_items = [self._rows[i].item for i in self._schedule[index]]
         batch_dict = _build_response_masked_vlm_batch(
             batch_items,
@@ -5231,6 +5574,20 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             batch_dict = _mask_empty_vlm_padding_rows(
                 batch_dict, list(empty), processor=self._processor,
             )
+        return batch_dict
+
+    def materialize(self, index):
+        """Build one batch through the complete existing VLM builder.
+
+        The tensor-bearing cache holds exactly the most recent batch so a
+        repeated fetch (e.g. a compile-failure retry) is free while live
+        scheduled inputs stay bounded by the current batch.
+        """
+        index = operator.index(index)
+        cached = self._mru
+        if cached is not None and cached[0] == index:
+            return cached[1]
+        batch_dict = self._build_batch(index)
         self._mru = (index, batch_dict)
         return batch_dict
 
@@ -5272,6 +5629,68 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 if checked >= max_check:
                     return seen_bad, seen_good
         return seen_bad, seen_good
+
+    def ensure_descriptors(self):
+        """Survey every scheduled batch's compile-key family, once.
+
+        The plan-owned cache is invalidated up front and never repopulated
+        here, and each batch is built through the complete builder then
+        dropped before the next build, so the survey owns at most one
+        tensor-bearing batch at any moment (a later fetch simply rebuilds).
+        Repeated calls return the stored descriptors without building
+        anything.
+        """
+        if self._descriptors is not None:
+            return self._descriptors
+        self._mru = None
+        families = []
+        array_leaves_max = 0
+        for index in range(len(self._schedule)):
+            batch = self._build_batch(index)
+            family = _vlm_batch_family(batch)
+            del batch
+            families.append(family)
+            array_leaves_max = max(
+                array_leaves_max, _vlm_family_array_leaves(family),
+            )
+        self._descriptors = tuple(families)
+        self._survey_stats = {
+            "surveyed_batches": len(self._descriptors),
+            "distinct_families": len(set(self._descriptors)),
+            "array_leaves_max": array_leaves_max,
+        }
+        return self._descriptors
+
+    @property
+    def survey_stats(self):
+        """Fixed-key integer counters from the last descriptor survey."""
+        return None if self._survey_stats is None else dict(self._survey_stats)
+
+    def batch_family(self, index):
+        """Surveyed compile-key family for one scheduled batch."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch families have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return self._descriptors[operator.index(index)]
+
+    def check_family_drift(self, index, batch):
+        """Hard-fail when a materialized batch's structure leaves its
+        surveyed family. Container structure, dict keys and order, constant
+        values, and every array's rank/shape/dtype must hold on every visit;
+        value nondeterminism inside equal-shaped arrays stays undetected by
+        design."""
+        index = operator.index(index)
+        divergence = _vlm_family_divergence(
+            self.batch_family(index), _vlm_batch_family(batch),
+        )
+        if divergence is not None:
+            raise RuntimeError(
+                f"Unsloth MLX: VLM batch {index} drifted from its surveyed "
+                f"compile family ({divergence}). The data pipeline must "
+                f"produce structurally identical batches on every visit."
+            )
 
 
 
