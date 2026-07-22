@@ -42,17 +42,33 @@ DOUBLE_QUANT_REPO = "unsloth/Qwen2.5-0.5B-unsloth-bnb-4bit"
 
 
 def _real_bitsandbytes_available():
-    """True only if a real (non-stub) bitsandbytes wheel can back .dequantize()."""
-    import importlib.util
-    spec = importlib.util.find_spec("bitsandbytes")
-    if spec is None or spec.origin is None:
+    """True only if a real (non-stub) bitsandbytes wheel is installed on disk.
+
+    Resolved by spec, deliberately without importing bitsandbytes. Importing it
+    here would make this probe -- rather than the loader -- the first real bnb
+    import in the process; _dequantize_bnb_to_tempdir then purges the package
+    from sys.modules and imports it again, and bnb registers torch custom ops at
+    import time, so that second import raises "Tried to register an operator"
+    (see the note above _REAL_BITSANDBYTES_MODULES in mlx/loader.py). Leaving the
+    import to the loader keeps the tests exercising the real dequant path.
+
+    PathFinder is used instead of importlib.util.find_spec so the probe looks
+    past unsloth_zoo's bitsandbytes stub, which is injected into sys.meta_path on
+    MLX hosts and answers for the real wheel. The stub is permissive (any
+    getattr returns a no-op), so an attribute probe cannot tell the two apart and
+    would report the real wheel as present when only the stub is installed.
+    """
+    import os
+    import sys
+    from importlib.machinery import PathFinder
+
+    spec = PathFinder.find_spec("bitsandbytes", sys.path)
+    if spec is None or not spec.origin:
         return False
-    try:
-        import importlib
-        F = importlib.import_module("bitsandbytes.functional")
-        return hasattr(F, "dequantize_4bit") and hasattr(F, "QuantState")
-    except Exception:
+    if os.path.basename(spec.origin) == "bitsandbytes_stub.py":
         return False
+    # A real wheel ships bitsandbytes/functional.py, which backs .dequantize().
+    return os.path.isfile(os.path.join(os.path.dirname(spec.origin), "functional.py"))
 
 
 def _local_checkpoint_path():
