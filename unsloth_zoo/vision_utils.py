@@ -1097,8 +1097,17 @@ class UnslothVisionDataCollator:
         return image, video, video_kwarg
 
     def _extract_audio_for_example(self, example, messages):
-        feature_extractor = getattr(self.processor, "feature_extractor", None)
-        target_sr = getattr(feature_extractor, "sampling_rate", None)
+        # Read the expected sampling rate from whichever audio sub-processor the
+        # processor exposes: Qwen2-Audio and Voxtral use "feature_extractor",
+        # Granite-Speech uses "audio_processor". Without the audio_processor
+        # fallback, an audio_processor-only processor yields target_sr=None and
+        # the sampling-rate check is skipped, so a clip decoded at the wrong rate
+        # would be trained on silently instead of raising _check_audio_sampling_rate.
+        audio_sub = (
+            getattr(self.processor, "feature_extractor", None)
+            or getattr(self.processor, "audio_processor", None)
+        )
+        target_sr = getattr(audio_sub, "sampling_rate", None)
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content

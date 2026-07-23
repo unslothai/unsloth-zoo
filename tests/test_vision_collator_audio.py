@@ -146,6 +146,31 @@ def test_top_level_dict_rate_mismatch_raises():
             {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
 
 
+class _AudioProcessorProcessor:
+    # Granite-Speech shape: the audio sub-processor is "audio_processor", not
+    # "feature_extractor". Its sampling_rate must still drive the rate check.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+
+def test_audio_processor_sampling_rate_mismatch_raises():
+    # For an audio_processor-only processor the rate check must fire off
+    # audio_processor.sampling_rate; before the fallback target_sr was None and
+    # a wrong-rate clip trained silently.
+    collator = UnslothVisionDataCollator.__new__(UnslothVisionDataCollator)
+    collator.processor = _AudioProcessorProcessor()
+    collator.max_seq_length = 4
+    collator.truncation = True
+    with pytest.raises(ValueError, match="sampling_rate"):
+        collator._extract_audio_for_example(
+            {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
+    # A matching-rate clip is accepted.
+    out = collator._extract_audio_for_example(
+        {"audio": {"array": CLIP, "sampling_rate": 16000}}, [])
+    assert len(out) == 1
+
+
 def test_top_level_flat_list_is_one_clip():
     collator = make_collator()
     out = collator._extract_audio_for_example({"audio": [0.0] * 16}, [])
