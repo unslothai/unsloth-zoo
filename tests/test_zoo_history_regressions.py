@@ -152,7 +152,7 @@ def test_device_synchronize_tolerates_partial_backend():
 
 
 def test_device_type_module_has_expected_helpers():
-    """Pin the public API downstream zoo/unsloth/Studio code calls; a rename
+    """Pin the public API downstream zoo/unsloth/Unsloth code calls; a rename
     or removal here breaks consumers silently (AttributeError at train time)."""
     import unsloth_zoo.device_type as dt
 

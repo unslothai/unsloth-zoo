@@ -563,6 +563,52 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
     monkeypatch.setattr(mutils.mx, "all", torch.all)
 
 
+@pytest.mark.parametrize(
+    ("mlx_name", "hf_name"),
+    [
+        ("audio_tower.weight", "model.audio_tower.weight"),
+        ("vision_tower.weight", "model.vision_tower.weight"),
+        ("embed_audio.weight", "model.embed_audio.weight"),
+        ("embed_vision.weight", "model.embed_vision.weight"),
+    ],
+)
+def test_vlm_gguf_candidates_prefer_canonical_model_namespace(mlx_name, hf_name):
+    import unsloth_zoo.mlx.utils as mutils
+    candidates = mutils._vlm_gguf_name_candidates(mlx_name)
+    assert candidates[0] == hf_name
+    assert candidates.index(hf_name) < candidates.index(mlx_name)
+
+
+def test_vlm_rewrite_restores_namespace_with_conv1d_layout(monkeypatch):
+    import torch
+    import unsloth_zoo.mlx.utils as mutils
+
+    _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils)
+
+    class StripNamespaceAndTransposeConv1d:
+        @staticmethod
+        def sanitize(weights):
+            return {
+                name.removeprefix("model."): mutils.mx.transpose(tensor, (0, 2, 1))
+                for name, tensor in weights.items()
+            }
+
+    mlx_layout = torch.arange(2 * 3 * 4).reshape(2, 3, 4)
+    new_name, hf_layout, changed = mutils._rewrite_mlx_vlm_tensor_for_gguf(
+        "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight",
+        mlx_layout,
+        [(StripNamespaceAndTransposeConv1d, None)],
+    )
+
+    assert changed is True
+    assert new_name == "model.audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+    assert tuple(hf_layout.shape) == (2, 4, 3)
+    assert mutils._mlx_arrays_match(
+        mutils.mx.transpose(hf_layout, (0, 2, 1)),
+        mlx_layout,
+    )
+
+
 def test_vlm_rewrite_prefers_hf_alias_before_current_name(monkeypatch):
     import torch
     import unsloth_zoo.mlx.utils as mutils
@@ -621,30 +667,33 @@ def test_vlm_rewrite_handles_same_name_layout_transforms(monkeypatch):
     )
 
 
-def test_vlm_rewrite_skips_untransformable_text_tensors():
+def test_vlm_rewrite_restores_alias_without_transposing_unrelated_rank3(monkeypatch):
     import torch
     import unsloth_zoo.mlx.utils as mutils
 
     calls = 0
+    monkeypatch.setattr(mutils.mx, "transpose", pytest.fail)
 
-    class CountingSanitizer:
+    class StripModelNamespace:
         @staticmethod
         def sanitize(weights):
             nonlocal calls
             calls += 1
-            return weights
+            (name, tensor), = weights.items()
+            return {name.removeprefix("model."): tensor}
 
-    tensor = torch.zeros(2, 3)
+    tensor = torch.zeros(2, 3, 4)
     new_name, new_tensor, changed = mutils._rewrite_mlx_vlm_tensor_for_gguf(
-        "language_model.model.layers.0.mlp.gate_proj.weight",
+        "vision_tower.position_embedding",
         tensor,
-        [(CountingSanitizer, None)],
+        [(StripModelNamespace, None)],
     )
 
-    assert calls == 0
-    assert changed is False
-    assert new_name == "language_model.model.layers.0.mlp.gate_proj.weight"
+    assert calls == 1
+    assert changed is True
+    assert new_name == "model.vision_tower.position_embedding"
     assert new_tensor is tensor
+    assert not mutils._has_vlm_gguf_rewrite_candidate("language_model.weight", tensor)
 
 
 def test_mlx_arrays_match_checks_2d_tensor_values(monkeypatch):
@@ -1027,6 +1076,16 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
     def fake_save_merged_model(model, tokenizer, path, dequantize=False):
         calls["dequantize"] = dequantize
         Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "config.json").write_text(
+            json.dumps(
+                {
+                    "mtp_num_hidden_layers": 1,
+                    "unsloth_fixed_mtp": True,
+                    "num_hidden_layers": 24,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def fake_download_convert_hf_to_gguf():
         calls["scripts_dir"] = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
@@ -1036,6 +1095,9 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
 
     def fake_convert_to_gguf(**kwargs):
         calls["convert_kwargs"] = kwargs
+        calls["convert_config"] = json.loads(
+            (Path(kwargs["input_folder"]) / "config.json").read_text(encoding="utf-8")
+        )
         output = Path(
             f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf"
         )
@@ -1083,6 +1145,8 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
         llama_root / "unsloth_convert_hf_to_gguf.py"
     )
     assert calls["convert_kwargs"]["supported_text_archs"] == {"Qwen3ForCausalLM"}
+    assert calls["convert_config"]["mtp_num_hidden_layers"] == 1
+    assert calls["convert_config"]["unsloth_fixed_mtp"] is True
     assert (out / "TestModel.F16.gguf").read_bytes() == b"GGUF"
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == old_scripts_dir
 

@@ -19,6 +19,7 @@ import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
 from contextlib import contextmanager, nullcontext
 import os
+import functools
 import warnings
 import gc
 import threading
@@ -55,6 +56,33 @@ INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
+
+
+def _any_device_integrated():
+    # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
+    # static check on purpose: an integrated device anywhere makes double buffering
+    # pure overhead, and a mixed integrated + discrete box is rare.
+    try:
+        return any(
+            bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
+            for i in range(torch.cuda.device_count())
+        )
+    except Exception:
+        return False
+
+
+@functools.cache
+def _double_buffer_disabled():
+    # Cached: computed once on the first GC init (after device selection), never at
+    # import, so it does not probe the GPU before the caller picks its device. Double
+    # buffering overlaps the H2D offload copy with compute, but on unified-memory devices
+    # (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure overhead
+    # (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it; else
+    # disable when any visible device is integrated.
+    env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
+    if env is not None: return env == "1"
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    return _any_device_integrated()
 
 
 @contextmanager
@@ -427,8 +455,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     try:
         with _no_inference_mode():
             GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-        # Double buffering: try to allocate buffer B (can be disabled via env var)
-        if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
+        # Double buffering: try to allocate buffer B (auto-off on unified memory, or via env var)
+        if _double_buffer_disabled():
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
@@ -1009,7 +1037,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
             NEXT_BUFFER_SLOT[i] = 0
 
     # Reset double buffering if buffer B still exists, or try to re-allocate
-    if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
+    if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
             for i in range(len(GPU_BUFFERS_B)):
                 if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
