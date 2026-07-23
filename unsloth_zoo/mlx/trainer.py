@@ -4285,6 +4285,31 @@ class MLXKTOTrainer(MLXTrainer):
                 "Set lora_plus_ratio=0 to run KTO."
             )
 
+        # The KTO loop does not yet implement checkpoint resume, an eval loop,
+        # or distributed gradient averaging. Each of these is silently ignored
+        # by the standalone loop below, so reject them loudly rather than return
+        # a result that looks trained but ignored the caller's request. (These
+        # can be added later by mirroring MLXTrainer's paths.)
+        if resume_from_checkpoint is not None:
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer does not support resume_from_checkpoint "
+                "yet; a resumed call would restart from scratch and overwrite "
+                "the output adapters. Start a fresh run instead."
+            )
+        if self.eval_dataset is not None:
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer does not run an eval loop yet, so "
+                "eval_dataset / eval_steps / load_best_model_at_end are ignored. "
+                "Remove eval_dataset to run KTO, or evaluate separately."
+            )
+        if self.distributed_world_size > 1:
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer does not support MLX distributed "
+                "training yet; it neither shards KTO batches nor averages "
+                "gradients across ranks, so each rank would train independently. "
+                "Run KTO on a single process."
+            )
+
         batches = _build_kto_batches(self.train_dataset, self.tokenizer, args)
         if not batches:
             raise ValueError(

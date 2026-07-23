@@ -134,6 +134,31 @@ def test_kto_num_train_epochs_scales_steps(tmp_path):
 
 
 @metal_only
+def test_kto_rejects_resume_from_checkpoint(tmp_path):
+    # Resume is unimplemented; a resumed call would restart and overwrite, so
+    # it must raise rather than silently restart.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
+                            args=_config(output_dir=str(tmp_path)))
+    with pytest.raises(ValueError, match="resume_from_checkpoint"):
+        trainer.train(resume_from_checkpoint=str(tmp_path))
+
+
+@metal_only
+def test_kto_rejects_eval_dataset(tmp_path):
+    # No eval loop yet; passing eval_dataset must raise rather than silently
+    # ignore eval_steps / load_best_model_at_end.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
+                            eval_dataset=_dataset(n=4),
+                            args=_config(output_dir=str(tmp_path)))
+    with pytest.raises(ValueError, match="eval loop"):
+        trainer.train()
+
+
+@metal_only
 def test_kto_rejects_lora_plus(tmp_path):
     # LoRA+ per-leaf scaling is unimplemented on the KTO path, so setting
     # lora_plus_ratio must raise loudly rather than silently train lora_b at
