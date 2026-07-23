@@ -2597,7 +2597,13 @@ class MLXTrainer:
             model, "_unsloth_cpt_full_module_weight_keys", None) or set()
 
         def _scoped_step_ratio(name):
-            if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
+            # mlx-lm may wrap the LoRA halves in nn.Linear children, flattening
+            # lora_b to `...lora_b.weight` (the layout loader.py / utils.py
+            # already unwrap); match it too so LoRA+ scales that layout as well.
+            if use_lora_plus and (
+                name == "lora_b" or name.endswith(".lora_b")
+                or name == "lora_b.weight" or name.endswith(".lora_b.weight")
+            ):
                 return lora_plus_ratio
             if use_embedding_lr:
                 if name in _cpt_full_keys:

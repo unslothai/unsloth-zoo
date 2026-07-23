@@ -324,3 +324,61 @@ def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
         f"LoRA+ ratio did not scale the step (fix regressed): "
         f"base={base:.4f} boosted={boosted:.4f} ratio={boosted / base:.2f}"
     )
+
+
+@metal_only
+@pytest.mark.parametrize("nested", [True, False])
+def test_lora_plus_scales_layer_wrapped_lora_b_weight(tmp_path, nested):
+    """mlx-lm may wrap the LoRA halves in nn.Linear children, flattening lora_b
+    to `...lora_b.weight` (the layout loader.py / utils.py already unwrap). The
+    LoRA+ scoped rescale must scale that layout too, not only a raw `.lora_b` —
+    for both a nested (`proj.lora_b.weight`) and a root (`lora_b.weight`) key.
+    """
+    key = "proj.lora_b.weight" if nested else "lora_b.weight"
+
+    def _b_weight_norm(ratio):
+        class _WrappedLoRA(nn.Module):
+            def __init__(s):
+                super().__init__()
+                s.embed = nn.Embedding(32, 4)
+                host = nn.Module() if nested else s
+                host.lora_a = mx.random.normal((4, 8)) * 0.2   # frozen, non-zero
+                host.lora_b = nn.Linear(8, 32, bias=False)     # -> lora_b.weight
+                host.lora_b.weight = mx.zeros((32, 8))          # zero-init B
+                if nested:
+                    s.proj = host
+                s._config = {"model_type": "tiny"}
+
+            def __call__(s, input_ids):
+                host = s.proj if nested else s
+                return host.lora_b(s.embed(input_ids) @ host.lora_a)
+
+        mx.random.seed(77)
+        m = _WrappedLoRA()
+        mx.eval(m.parameters())
+        m.freeze()
+        (m.proj.lora_b if nested else m.lora_b).unfreeze(recurse=True)
+        args = MLXTrainingConfig(
+            per_device_train_batch_size=1, gradient_accumulation_steps=1,
+            max_steps=6, warmup_steps=0, learning_rate=1e-3, optim="adamw",
+            logging_steps=1, eval_steps=0, save_steps=0, max_seq_length=8,
+            output_dir=str(tmp_path / str(ratio)), compile=False,
+            compile_mode="eager", gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False, dataset_order="sequential",
+            disable_memory_limits=True, use_cce=False, lora_plus_ratio=ratio,
+            max_grad_norm=0.0, max_grad_value=0.0, max_grad_leaf_norm=0.0,
+        )
+        t = MLXTrainer(m, _NormTok(), [], args=args)
+        t._batches = _norm_batches(6)
+        t.save_model = lambda *_a, **_k: None
+        t.train()
+        w = dict(tree_flatten(t.model.trainable_parameters()))[key]
+        return float(mx.sqrt(mx.sum(w.astype(mx.float32) ** 2)).item())
+
+    base = _b_weight_norm(1.0)
+    boosted = _b_weight_norm(8.0)
+    assert base > 0.0, f"wrapped {key} never moved at ratio=1"
+    assert boosted > 3.0 * base, (
+        f"LoRA+ did not scale the wrapped {key} step: "
+        f"base={base:.4f} boosted={boosted:.4f}"
+    )
