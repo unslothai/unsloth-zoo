@@ -18,6 +18,7 @@
 
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
+from collections import OrderedDict
 from typing import Callable
 
 import mlx.core as mx
@@ -62,6 +63,7 @@ def _get_memory_budget() -> int:
 
 
 _CHUNK_BUDGET: int | None = None
+_CHUNK_PLAN_CACHE_MAX_ENTRIES = 16
 
 
 def _resolve_chunk_size(
@@ -106,6 +108,27 @@ def _resolve_chunk_size(
     # Align to 256 for Metal efficiency
     chunk_v = max(min_chunk_v, (chunk_v // 256) * 256)
     return min(chunk_v, vocab_size)
+
+
+def _normalize_label_smoothing(value) -> float:
+    """Shared domain check for every loss entry point: finite real 0<=eps<=1."""
+    import numbers
+
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(
+            f"label_smoothing must be a real number in [0, 1], got {value!r}"
+        )
+    try:
+        eps = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"label_smoothing must be a real number in [0, 1], got {value!r}"
+        )
+    if not (eps == eps and 0.0 <= eps <= 1.0):
+        raise ValueError(
+            f"label_smoothing must be a finite value in [0, 1], got {value!r}"
+        )
+    return eps
 
 
 def _apply_softcap(logits: mx.array, logit_softcap: float) -> mx.array:
@@ -523,6 +546,7 @@ def _forward_chunked_fused_finalize(
     chunk_size: int,
     forward_update_kernel: Callable | None,
     forward_update_finalize_kernel: Callable | None,
+    label_smoothing: float = 0.0,
 ) -> tuple[mx.array, mx.array]:
     hidden_compute = hidden
     weight_compute = weight
@@ -560,6 +584,8 @@ def _forward_chunked_fused_finalize(
     )
     targets = targets_raw.astype(mx.int32)
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
+    if label_smoothing > 0.0:
+        compute_bytes = 4  # smoothing casts each logits chunk to fp32
     chunk_size = _resolve_chunk_size(
         chunk_size,
         n,
@@ -569,6 +595,8 @@ def _forward_chunked_fused_finalize(
     running_max = mx.full((n,), -mx.inf, dtype=mx.float32)
     running_sum_exp = mx.zeros((n,), dtype=mx.float32)
     target_logit = mx.zeros((n,), dtype=mx.float32)
+    # HF LabelSmoother accumulates the smoothed vocabulary term in float32.
+    sum_capped = mx.zeros((n,), dtype=mx.float32) if label_smoothing > 0.0 else None
 
     if forward_update_kernel is None or forward_update_finalize_kernel is None:
         for v_start in range(0, vocab_size, chunk_size):
@@ -586,6 +614,10 @@ def _forward_chunked_fused_finalize(
                 mode=mode,
             )
             logits = _apply_softcap(logits, logit_softcap)
+            if sum_capped is not None:
+                # eps>0 always takes this python path (kernels disabled), so
+                # match the Metal kernels' float32 LSE accumulation here.
+                logits = logits.astype(mx.float32)
 
             chunk_max = mx.max(logits, axis=-1)
             chunk_sum_exp = mx.sum(mx.exp(logits - mx.expand_dims(chunk_max, -1)), axis=-1)
@@ -599,9 +631,19 @@ def _forward_chunked_fused_finalize(
             local_targets = mx.clip(targets - v_start, 0, v_end - v_start - 1)
             chunk_target = mx.take_along_axis(logits, mx.expand_dims(local_targets, -1), axis=1).squeeze(-1)
             target_logit = mx.where(in_chunk, chunk_target, target_logit)
+            if sum_capped is not None:
+                # logits is already float32 here (cast above under the same guard)
+                sum_capped = sum_capped + logits.sum(axis=-1)
 
         lse = running_max + mx.log(running_sum_exp + 1e-9)
-        loss = mx.where(valid_pre, lse - target_logit, mx.zeros_like(lse))
+        if sum_capped is not None:
+            # loss = lse - (1-eps)*target - eps*mean_v(logits): equals
+            # (1-eps)*NLL + eps*uniform smoothing (HF LabelSmoother form).
+            eps = label_smoothing
+            token_loss = lse - (1.0 - eps) * target_logit - eps * (sum_capped / vocab_size)
+        else:
+            token_loss = lse - target_logit
+        loss = mx.where(valid_pre, token_loss, mx.zeros_like(lse))
         loss = _poison_invalid_targets(loss, invalid_pre)
         lse = _poison_invalid_targets(lse, invalid_pre)
         return loss, lse
@@ -680,7 +722,11 @@ def _fallback_dlogits(
     v_end: int,
     ignore_index: int,
     logit_softcap: float,
+    label_smoothing: float = 0.0,
+    vocab_size: int = 0,
 ) -> mx.array:
+    if label_smoothing > 0.0 and vocab_size <= 0:
+        raise ValueError("vocab_size must be positive when label_smoothing > 0")
     capped = _apply_softcap(logits, logit_softcap)
     probs = mx.exp(capped - mx.expand_dims(lse, -1))
 
@@ -689,7 +735,15 @@ def _fallback_dlogits(
     valid = (targets >= v_start) & (targets < v_end) & (targets != ignore_index)
     target_mask = target_mask & mx.expand_dims(valid, -1)
 
-    d_capped = probs - target_mask.astype(mx.float32)
+    if label_smoothing > 0.0:
+        # d/dlogit_v of the smoothed loss: p_v - (1-eps)*onehot_v - eps/V.
+        d_capped = (
+            probs
+            - (1.0 - label_smoothing) * target_mask.astype(mx.float32)
+            - label_smoothing / vocab_size
+        )
+    else:
+        d_capped = probs - target_mask.astype(mx.float32)
     d_capped = d_capped * mx.expand_dims(grad_output, -1)
 
     if logit_softcap > 0.0:
@@ -716,40 +770,88 @@ def make_runtime_cce_loss_fused_finalize(
     group_size: int | None = None,
     bits: int | None = None,
     mode: str = "affine",
+    label_smoothing: float = 0.0,
 ):
+    label_smoothing = _normalize_label_smoothing(label_smoothing)
     forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set()
+    if label_smoothing > 0.0:
+        # Smoothing lives in the chunked python path; the fused Metal kernels
+        # do not carry the vocabulary-sum term. eps=0 keeps the kernel path.
+        forward_update_kernel = forward_update_finalize_kernel = dlogits_kernel = None
     use_metal_kernel = dlogits_kernel is not None
 
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
-    chunk_plan_cache: dict[
+    chunk_plan_cache: OrderedDict[
         tuple,
-        tuple[int, list[int], list[mx.array], list[mx.array]],
-    ] = {}
+        tuple[int, tuple[int, ...], tuple[mx.array, ...], tuple[mx.array, ...]],
+    ] = OrderedDict()
+    cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
+    quantized_layout = (
+        bool(quantized),
+        group_size if quantized else None,
+        bits if quantized else None,
+        mode if quantized else None,
+    )
 
     def get_chunk_plan(
         hidden: mx.array,
         weight: mx.array,
-    ) -> tuple[int, list[int], list[mx.array], list[mx.array]]:
+    ) -> tuple[int, tuple[int, ...], tuple[mx.array, ...], tuple[mx.array, ...]]:
         n_tokens = hidden.shape[0]
         vocab_size = weight.shape[0]
-        # dtype drives compute_bytes; key must include it or a bf16 plan is reused for fp32 and OOMs.
-        key = (n_tokens, vocab_size, hidden.dtype)
-        if key in chunk_plan_cache:
-            return chunk_plan_cache[key]
-
         compute_bytes = 2 if hidden.dtype in (mx.float16, mx.bfloat16) else 4
+        if label_smoothing > 0.0:
+            compute_bytes = 4  # smoothing casts each logits chunk to fp32
         resolved_chunk_size = _resolve_chunk_size(
             chunk_size,
             n_tokens,
             vocab_size,
             bytes_per_element=compute_bytes,
         )
-        starts = list(range(0, vocab_size, resolved_chunk_size))
-        start_arrays = [mx.array([v_start], dtype=mx.int32) for v_start in starts]
-        weight_start_arrays = [mx.array([v_start, 0], dtype=mx.int32) for v_start in starts]
-        chunk_plan_cache[key] = (resolved_chunk_size, starts, start_arrays, weight_start_arrays)
+        key = (
+            vocab_size,
+            resolved_chunk_size,
+            hidden.dtype,
+            quantized_layout,
+        )
+        if key in chunk_plan_cache:
+            cache_stats["hits"] += 1
+            chunk_plan_cache.move_to_end(key)
+            return chunk_plan_cache[key]
+
+        cache_stats["misses"] += 1
+        starts = tuple(range(0, vocab_size, resolved_chunk_size))
+        start_arrays = tuple(
+            mx.array([v_start], dtype=mx.int32) for v_start in starts
+        )
+        weight_start_arrays = (
+            ()
+            if quantized
+            else tuple(
+                mx.array([v_start, 0], dtype=mx.int32)
+                for v_start in starts
+            )
+        )
+        chunk_plan_cache[key] = (
+            resolved_chunk_size,
+            starts,
+            start_arrays,
+            weight_start_arrays,
+        )
+        if len(chunk_plan_cache) > _CHUNK_PLAN_CACHE_MAX_ENTRIES:
+            chunk_plan_cache.popitem(last=False)
+            cache_stats["evictions"] += 1
         return chunk_plan_cache[key]
+
+    def get_chunk_plan_cache_info():
+        return {
+            "entries": len(chunk_plan_cache),
+            "max_entries": _CHUNK_PLAN_CACHE_MAX_ENTRIES,
+            "hits": cache_stats["hits"],
+            "misses": cache_stats["misses"],
+            "evictions": cache_stats["evictions"],
+        }
 
     if quantized:
         @mx.custom_function
@@ -774,6 +876,7 @@ def make_runtime_cce_loss_fused_finalize(
                 chunk_size=get_chunk_plan(hidden, weight)[0],
                 forward_update_kernel=forward_update_kernel,
                 forward_update_finalize_kernel=forward_update_finalize_kernel,
+                label_smoothing=label_smoothing,
             )
             return losses, lse
 
@@ -848,6 +951,8 @@ def make_runtime_cce_loss_fused_finalize(
                         v_end=v_end,
                         ignore_index=ignore_index,
                         logit_softcap=logit_softcap,
+                        label_smoothing=label_smoothing,
+                        vocab_size=vocab_size,
                     ).astype(logits.dtype)
 
                 d_logits_compute = d_logits.astype(hidden_compute.dtype)
@@ -887,6 +992,7 @@ def make_runtime_cce_loss_fused_finalize(
             # during backward); zero-weight add preserves losses.
             return losses + lse * mx.array(0.0, dtype=mx.float32)
 
+        runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
         return runtime_cce_loss, use_metal_kernel
 
     @mx.custom_function
@@ -905,6 +1011,7 @@ def make_runtime_cce_loss_fused_finalize(
             chunk_size=get_chunk_plan(hidden, weight)[0],
             forward_update_kernel=forward_update_kernel,
             forward_update_finalize_kernel=forward_update_finalize_kernel,
+            label_smoothing=label_smoothing,
         )
         return losses, lse
 
@@ -970,6 +1077,8 @@ def make_runtime_cce_loss_fused_finalize(
                     v_end=v_end,
                     ignore_index=ignore_index,
                     logit_softcap=logit_softcap,
+                    label_smoothing=label_smoothing,
+                    vocab_size=vocab_size,
                 ).astype(logits.dtype)
 
             d_logits_compute = d_logits.astype(hidden_compute.dtype)
@@ -993,6 +1102,7 @@ def make_runtime_cce_loss_fused_finalize(
         # (it reads lse from custom-function outputs during backward).
         return losses + lse * mx.array(0.0, dtype=mx.float32)
 
+    runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
     return runtime_cce_loss, use_metal_kernel
 
 
@@ -1005,6 +1115,7 @@ def make_chunked_cross_entropy_loss(
     group_size: int | None = None,
     bits: int | None = None,
     mode: str = "affine",
+    label_smoothing: float = 0.0,
 ):
     """Return a standalone chunked CCE loss callable and a kernel-usage flag."""
 
@@ -1016,4 +1127,5 @@ def make_chunked_cross_entropy_loss(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        label_smoothing=label_smoothing,
     )

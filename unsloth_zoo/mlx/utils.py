@@ -25,10 +25,15 @@ and merged models (safetensors, GGUF, HuggingFace Hub).
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
+import ast
+import collections
 import copy
 import inspect
 import importlib
 import json
+import numbers
+import operator
+import textwrap
 import numpy as np
 import os
 import sys
@@ -37,10 +42,12 @@ import tempfile
 import threading
 import warnings
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 
 from .cce import _get_runtime_cce
+from .cce.runtime_cce import _normalize_label_smoothing
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
@@ -611,20 +618,295 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     return _run_hidden_stack(tm, inputs, inputs_embeds=inputs_embeds, **kwargs)
 
 
-def _get_lm_head_layer(model):
-    """Get the raw LM head layer (QuantizedLinear or Linear/Embedding).
+OutputHeadDescriptor = collections.namedtuple(
+    "OutputHeadDescriptor",
+    ["module", "path", "status", "has_additive_bias", "quantized",
+     "wrapper_type", "raw", "candidate_module", "candidate_path"],
+)
 
-    Prefers a separate lm_head (untied models like Qwen), else falls back to
-    embed_tokens (tied models like Gemma/Llama). Returns the layer object (not
-    its weight) so callers can read .weight/.scales/.biases/.group_size/.bits.
+_RAW_HEAD_TYPES = (nn.Linear, nn.QuantizedLinear, nn.Embedding, nn.QuantizedEmbedding)
+
+
+def _self_attr_chain(node):
+    """Dotted chain for an ``ast.Attribute`` rooted at the name ``self``,
+    else None (subscripts, calls, or other roots break the chain)."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id == "self":
+        return ".".join(reversed(parts))
+    return None
+
+
+def _output_accessor_chains(tree):
+    """Chains with recognized accessor syntax within a parsed body: the X of
+    ``self.X.as_linear(...)`` and ``self.X.weight.T``. Syntax-level, so
+    strings, comments, and prose can never contribute."""
+    chains = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "as_linear":
+            chain = _self_attr_chain(node.func.value)
+            if chain:
+                chains.append(chain)
+        elif isinstance(node, ast.Attribute) and node.attr == "T" \
+                and isinstance(node.value, ast.Attribute) \
+                and node.value.attr == "weight":
+            chain = _self_attr_chain(node.value.value)
+            if chain:
+                chains.append(chain)
+    return chains
+
+
+def _analyze_output_route(tm):
+    """Syntactic evidence from the analyzed forward bodies, live-resolved.
+
+    Parses ``type(tm).__call__`` (AST — strings/comments never count) plus one
+    hop of ``self.<method>()`` delegation, returning ``(accessor_modules,
+    called_module_ids, references_tie_flag)``: chains under
+    ``self.X.as_linear(...)`` / ``self.X.weight.T``; modules a self-rooted chain
+    is called on (``self.lm_head(x)``); and whether ``tie_word_embeddings`` is
+    referenced anywhere. Reachability is NOT analyzed — any recognized syntax
+    counts (dead branches included); uniqueness plus fail-closed consumers bound
+    mis-selection. Unresolvable chains contribute nothing."""
+    cls = type(tm)
+
+    def _parse(method):
+        try:
+            return ast.parse(textwrap.dedent(inspect.getsource(method)))
+        except (OSError, TypeError, AttributeError, SyntaxError):
+            return None
+
+    entry = _parse(getattr(cls, "__call__", None))
+    if entry is None:
+        return {}, set(), False
+    trees = [entry]
+    invoked = {
+        node.func.attr
+        for node in ast.walk(entry)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
+    }
+    for helper in invoked - {"__call__"}:
+        method = getattr(cls, helper, None)
+        if callable(method):
+            tree = _parse(method)
+            if tree is not None:
+                trees.append(tree)
+
+    def _resolve(chain):
+        obj = tm
+        for part in chain.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+        return obj
+
+    modules, called, references_flag = {}, set(), False
+    for tree in trees:
+        for chain in _output_accessor_chains(tree):
+            obj = _resolve(chain)
+            if obj is not None:
+                modules[id(obj)] = (chain, obj)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "tie_word_embeddings":
+                references_flag = True
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                chain = _self_attr_chain(node.func)
+                if chain:
+                    obj = _resolve(chain)
+                    if obj is not None:
+                        called.add(id(obj))
+    return modules, called, references_flag
+
+
+def _output_accessor_modules(tm):
+    """Live modules with recognized accessors in the analyzed forward bodies
+    (see ``_analyze_output_route``). Returns ``{id(module): (path, module)}``."""
+    return _analyze_output_route(tm)[0]
+
+
+def _resolve_embedding_anchor(owner, types, accessor_modules=None):
+    """(name, module) of the unique direct child whose type is exactly in
+    ``types``; None when absent, ambiguous, or not a module tree. Multiple
+    embedding candidates (Gemma-4 backbones carry a second vocab-sized
+    per-layer embedding) resolve ONLY by live accessor identity — the unique
+    candidate that IS one of the modules the output route accesses
+    (`_output_accessor_modules`). Dimensional agreement is deliberately not
+    identity evidence (metadata can be stale after a vocab resize).
+    Still-ambiguous stays None (fail closed)."""
+    children = getattr(owner, "children", None)
+    if not callable(children):
+        return None
+    found = [(n, c) for n, c in children().items() if type(c) in types]
+    if len(found) > 1 and accessor_modules:
+        found = [e for e in found if id(e[1]) in accessor_modules]
+    return found[0] if len(found) == 1 else None
+
+
+def _embedding_dims(emb):
+    """Semantic (vocab, hidden). QuantizedEmbedding packs its weight, so read
+    the stored attributes instead of the array shape."""
+    if type(emb) is nn.QuantizedEmbedding:
+        return int(emb.num_embeddings), int(emb.dims)
+    return int(emb.weight.shape[0]), int(emb.weight.shape[1])
+
+
+def _linear_semantic_dims(layer):
+    out_dim, in_dim = int(layer.weight.shape[0]), int(layer.weight.shape[1])
+    if type(layer) is nn.QuantizedLinear:
+        in_dim = in_dim * 32 // int(layer.bits)
+    return out_dim, in_dim
+
+
+def _resolve_module_path(model, path):
+    obj = model
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def describe_output_head(model):
+    """Resolve the live output head with affirmative evidence only: a True tie
+    flag, a real ``lm_head``, or (when no flag attribute exists) an embedding
+    named via a live-resolving ``.as_linear(...)`` / ``.weight.T`` accessor in
+    the analyzed forward bodies (see ``_analyze_output_route``). Missing
+    ``lm_head`` never implies tying; conflicting flags fail closed. ``path`` is
+    rooted at the argument (VLM wrappers keep the ``language_model.`` prefix);
+    at unknown status ``candidate_*`` carry the unique shape-matched alt head.
+    A True flag is corroborated against the route: if a live ``lm_head`` is
+    called there with no syntactic flag reference and no accessor for the
+    anchored embedding, it fails closed to unknown (Qwen2-MoE ships a dead
+    flag). Syntax is evidence, not proof — deeper consultation downgrades
+    conservatively to baseline; a dead reference keeps today's resolution.
     """
+    prefix = "language_model." if hasattr(model, "language_model") else ""
     tm = _get_text_model(model)
-    if hasattr(tm, "lm_head") and tm.lm_head is not None:
-        return tm.lm_head
-    backbone = getattr(tm, "model", tm)
-    if hasattr(backbone, "lm_head") and backbone.lm_head is not None:
-        return backbone.lm_head
-    return backbone.embed_tokens
+    backbone = getattr(tm, "model", None)
+    if backbone is not None:
+        emb_owner, emb_prefix = backbone, prefix + "model."
+    else:
+        emb_owner, emb_prefix = tm, prefix
+    accessor_modules, called_modules, references_flag = _analyze_output_route(tm)
+    emb_entry = _resolve_embedding_anchor(
+        emb_owner, (nn.Embedding, nn.QuantizedEmbedding),
+        accessor_modules=accessor_modules,
+    )
+
+    flags, flag_attr_present = [], False
+    # Include config: some models (e.g. VLM language stacks) carry the live
+    # tie flag only on tm.config, the same site logit_scale/softcap are read from.
+    for holder in (tm, getattr(tm, "args", None), getattr(tm, "config", None)):
+        if holder is None or not hasattr(holder, "tie_word_embeddings"):
+            continue
+        flag_attr_present = True
+        value = holder.tie_word_embeddings
+        # Mirror the forward's `if self.args.tie_word_embeddings:` truthiness for
+        # any value: from_dict does not coerce, so a config may ship the flag as
+        # an int or string, and the forward consumes it by truth value. Only a
+        # value whose truth is undefined (raises) stays unread.
+        try:
+            flags.append(bool(value))
+        except Exception:
+            pass
+    conflicting = len(set(flags)) > 1
+
+    # An uncorroborated True flag: the analyzed route calls a live lm_head
+    # at EITHER supported location (any type — a wrapped head the forward
+    # uses is just as contradictory as a raw one), shows no syntactic flag
+    # consultation, and no accessor evidence for the anchored embedding.
+    # When both routes are syntactically visible the flag plausibly selects
+    # between them through indirection the analyzer cannot see, so the flag
+    # keeps winning there. No execution-order claim is made; syntax alone
+    # fails closed (see the docstring for both residual directions).
+    live_head_ids = {
+        id(owner.lm_head)
+        for owner in (tm, backbone)
+        if owner is not None and getattr(owner, "lm_head", None) is not None
+    }
+    flag_contradicted = (
+        bool(live_head_ids & called_modules)
+        and not references_flag
+        and (emb_entry is None or id(emb_entry[1]) not in accessor_modules)
+    )
+
+    head, path, status = None, None, "unknown"
+    if conflicting:
+        pass
+    elif flags and flags[0]:
+        # A truthy tie flag routes the forward through the embedding: resolve
+        # that anchor (unless the flag is contradicted), else fail closed to
+        # unknown -- never fall through to a possibly-dead lm_head, which would
+        # train the wrong weight.
+        if emb_entry is not None and not flag_contradicted:
+            head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+    elif getattr(tm, "lm_head", None) is not None:
+        head, path, status = tm.lm_head, prefix + "lm_head", "untied"
+    elif backbone is not None and getattr(backbone, "lm_head", None) is not None:
+        head, path, status = backbone.lm_head, prefix + "model.lm_head", "untied"
+    elif not flag_attr_present and emb_entry is not None:
+        # Same structured interpretation as the anchor: tied evidence means
+        # the analyzed output-route bodies access THIS embedding module.
+        if id(emb_entry[1]) in accessor_modules:
+            head, path, status = emb_entry[1], emb_prefix + emb_entry[0], "tied"
+
+    candidate, candidate_path = None, None
+    if status == "unknown" and emb_entry is not None:
+        vocab, hidden = _embedding_dims(emb_entry[1])
+        owners = [(tm, prefix)]
+        if backbone is not None:
+            owners.append((backbone, prefix + "model."))
+        matches, seen = [], set()
+        for owner, owner_prefix in owners:
+            for name, child in (owner.children() if callable(getattr(owner, "children", None)) else {}).items():
+                if id(child) in seen:
+                    continue
+                seen.add(id(child))
+                if (type(child) in (nn.Linear, nn.QuantizedLinear)
+                        and _linear_semantic_dims(child) == (vocab, hidden)):
+                    matches.append((owner_prefix + name, child))
+        if len(matches) == 1:
+            candidate_path, candidate = matches[0]
+
+    target = head if head is not None else candidate
+    return OutputHeadDescriptor(
+        module=head,
+        path=path,
+        status=status,
+        has_additive_bias=(target is not None and "bias" in target),
+        quantized=(target is not None and hasattr(target, "scales")),
+        wrapper_type=(type(target) if target is not None else None),
+        raw=(target is not None and type(target) in _RAW_HEAD_TYPES),
+        candidate_module=candidate,
+        candidate_path=candidate_path,
+    )
+
+
+def _cce_head_ineligibility(desc):
+    """Reason fused CCE must not run for this head, or None when eligible."""
+    if desc.status == "unknown":
+        return "unresolved output-head topology"
+    if not desc.raw:
+        return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
+    if desc.has_additive_bias:
+        return "additive output-head bias"
+    return None
+
+
+def _get_lm_head_layer(model):
+    """The affirmatively resolved output head (see describe_output_head).
+
+    Raises for unknown topology: the loss factories gate on the descriptor
+    first, so reaching this without a resolved head is a caller bug.
+    """
+    desc = describe_output_head(model)
+    if desc.module is None:
+        raise ValueError(
+            "Unsloth: output-head topology is unresolved for this model; "
+            "gate on describe_output_head before requesting the head layer."
+        )
+    return desc.module
 
 
 def _is_quantized_layer(layer):
@@ -641,22 +923,237 @@ def _get_logit_softcap(model):
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
-def _is_lm_head_trainable(model):
-    """Whether the LM head weight is trainable (not frozen by LoRA).
+def _get_logit_scale(model):
+    """Get the scalar multiplier some archs apply to lm-head logits, if any.
 
-    When frozen, its CCE gradient is a wasted V x chunk_size x H matmul per
-    chunk, so callers wrap the weight with mx.stop_gradient (returns False).
+    Cohere-family models (mlx-lm ``cohere``/``cohere2``, mlx-vlm
+    ``aya_vision``/``cohere2_moe``) multiply logits by ``logit_scale`` inside
+    the forward — a step CCE bypasses and must re-apply. Returns
+    ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
+    bool/non-scalar/non-finite/out-of-range values (callers must fall back).
+    """
+    tm = _get_text_model(model)
+    # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
+    # then config (aya_vision); no upstream forward reads a direct attribute.
+    scale = None
+    if hasattr(tm, "args"):
+        scale = getattr(tm.args, "logit_scale", None)
+    if scale is None and hasattr(tm, "config"):
+        scale = getattr(tm.config, "logit_scale", None)
+    if scale is None:
+        return None, False
+    if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
+        return None, True
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError, OverflowError):
+        return None, True
+    if not np.isfinite(scale):
+        return None, True
+    if scale == 1.0:
+        return None, False
+    # Pre-scaling is validated only for moderate magnitudes; extreme scales
+    # can under/overflow before accumulation, so fail closed outside 2^-6..4.
+    if scale != 0.0 and not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
+        return None, True
+    return scale, False
+
+
+_KNOB_MISSING = object()
+
+# Knobs whose consuming forwards transform logits after the output head,
+# with lookup sites in consumer-preference order. "attr" = the live module
+# attribute (Granite/Phi3Small forwards read a constructor copy, so copy vs
+# config drift must fail closed); others read args (config for VLM wrappers).
+_HEAD_TRANSFORM_KNOBS = {
+    "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
+    "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
+    "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
+    "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
+}
+_KNOB_AUX_SITES = {
+    "embedding_multiplier": ("args", "config"),
+    "hidden_size": ("args", "config"),
+}
+
+
+def _knob_values_equal(a, b):
+    """Total equality: raising / non-boolean comparisons count as disagreement."""
+    try:
+        return a is b or bool(a == b)
+    except Exception:
+        return False
+
+
+def _knob_value(tm, name, sites):
+    """(value, conflict) from the consumer sites; ``_KNOB_MISSING`` when no
+    site defines the knob. A present ``None`` is a value, never absence."""
+    holders = {"attr": tm, "args": getattr(tm, "args", None), "config": getattr(tm, "config", None)}
+    found = [v for site in sites if holders[site] is not None
+             for v in (getattr(holders[site], name, _KNOB_MISSING),)
+             if v is not _KNOB_MISSING]
+    if not found:
+        return _KNOB_MISSING, False
+    conflict = any(not _knob_values_equal(v, found[0]) for v in found[1:])
+    return found[0], conflict
+
+
+def _validated_knob(value, source):
+    """Normalize one knob value to a finite float, or return a reason string."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None, f"{source} is not a finite real scalar"
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{source} is not a finite real scalar"
+    if not np.isfinite(value):
+        return None, f"{source} is not a finite real scalar"
+    return value, None
+
+
+def _detect_logit_softcap(model):
+    """Logit softcap from either known attr, as ``(softcap, problem)``.
+
+    ``final_logit_softcapping`` keeps its ``_get_logit_softcap`` semantics.
+    ``logits_soft_cap`` (RecurrentGemma) caps for any truthy value: None/0.0
+    mean no cap, a positive finite real caps, anything else (or both attrs
+    present) fails closed rather than dropping the cap.
+    """
+    tm = _get_text_model(model)
+    # Presence, not value: an explicitly-None legacy attr still makes the
+    # dual-attr combination unverified.
+    legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
+    if legacy is _KNOB_MISSING and hasattr(tm, "args"):
+        legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
+    alias, conflict = _knob_value(tm, "logits_soft_cap", ("args", "config"))
+    if conflict:
+        return 0.0, ("logits_soft_cap differs between its configuration "
+                     "sites")
+    if alias is not _KNOB_MISSING and legacy is not _KNOB_MISSING:
+        return 0.0, ("both final_logit_softcapping and logits_soft_cap are "
+                     "present, an unverified combination")
+    if alias is _KNOB_MISSING:
+        return _get_logit_softcap(model), None
+    if alias is None:
+        return 0.0, None  # falsy: the forward skips the cap entirely
+    value, problem = _validated_knob(alias, "logits_soft_cap")
+    if problem is not None:
+        return 0.0, problem
+    if value == 0.0:
+        return 0.0, None  # falsy: the forward skips the cap entirely
+    if value < 0:
+        return 0.0, "logits_soft_cap must be positive when set"
+    return value, None
+
+
+def _aux_knob(tm, name):
+    """A ratio's companion knob: value or a fail-closed reason string."""
+    value, conflict = _knob_value(tm, name, _KNOB_AUX_SITES[name])
+    if conflict or value is _KNOB_MISSING:
+        return None, (f"{name} is missing or inconsistent across its "
+                      "configuration sites")
+    return _validated_knob(value, name)
+
+
+def _detect_head_transform(model, head_status):
+    """Resolve known output-transform knobs to one effective logit scale.
+
+    Mirrors the scalar transforms the consuming forwards apply between the
+    output head and the returned logits. Returns ``(scale, problem)``: a
+    reason string means fall back to the eager baseline; scale None is the
+    no-op case; accepted scales obey the ``_get_logit_scale`` range.
+    ``head_status`` selects branch-conditional transforms as the forwards do.
+    """
+    tm = _get_text_model(model)
+    present = {}
+    for name, sites in _HEAD_TRANSFORM_KNOBS.items():
+        value, conflict = _knob_value(tm, name, sites)
+        if conflict:
+            return None, f"{name} is inconsistent across its configuration sites"
+        if value is not _KNOB_MISSING:
+            present[name] = value
+    if len(present) > 1:
+        return None, ("multiple output-transform knobs are present "
+                      f"({', '.join(present)}), an unverified combination")
+    if not present:
+        return None, None
+    knob, raw = next(iter(present.items()))
+    if knob == "mup_width_multiplier":
+        # Its only consumer (Phi3Small) masks dummy-token logits after the
+        # value-guarded divide: presence alone makes the tail non-scalar.
+        return None, ("mup_width_multiplier models mask logits after the "
+                      "output head, which fused CCE cannot reproduce")
+    if knob == "logit_scale":
+        # A present-None value is malformed live state (the forward would
+        # multiply logits by None); fail closed rather than run unscaled.
+        if raw is None:
+            return None, "logit_scale is present but None"
+        scale, invalid = _get_logit_scale(model)
+        if invalid:
+            return None, ("logit_scale cannot be applied by fused CCE "
+                          "(non-finite, non-scalar, or outside the "
+                          "supported range)")
+        return scale, None
+    # The remaining knobs are ratios num/den mirrored from their forwards.
+    if knob == "logits_scaling":
+        num, problem = 1.0, None
+        den, p2 = _validated_knob(raw, knob)
+    elif knob == "lm_head_multiplier":
+        if head_status != "tied":  # the untied branch applies the plain head
+            return None, None
+        num, problem = _validated_knob(raw, knob)
+        den, p2 = _aux_knob(tm, "embedding_multiplier")
+    else:  # dim_model_base: divide by hidden_size/dim_model_base pre-head
+        if head_status != "untied":  # the tied branch is a plain matmul
+            return None, None
+        num, problem = _validated_knob(raw, knob)
+        den, p2 = _aux_knob(tm, "hidden_size")
+    problem = problem or p2
+    if problem is None and den == 0.0:
+        problem = f"the {knob} configuration divides the logits by zero"
+    if problem is not None:
+        return None, problem
+    scale = num / den
+    if scale == 1.0:
+        return None, None
+    if not np.isfinite(scale) or not (2.0 ** -6 <= abs(scale) <= 2.0 ** 2):
+        return None, (f"effective logit scale {scale!r} from {knob} is "
+                      "outside the range validated for fused CCE")
+    return scale, None
+
+
+def _is_lm_head_trainable(model):
+    """Whether fused CCE should compute the output head's weight gradient.
+
+    Returns False when the head is frozen by a LoRA/adapter setup or is
+    unresolved (its gradient would be a wasted V x chunk_size x H matmul per
+    chunk, so callers wrap the weight with mx.stop_gradient); True when the
+    resolved head carries a trainable param, or when there are no adapters at
+    all (full fine-tuning). Resolution is by descriptor module identity in the
+    registered tree, not by name — a property-backed ``language_model``
+    returning ``self`` is not a registered child, and an alt-named tied
+    embedding (InternLM2 ``tok_embeddings``) is classified like any head.
     """
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     # Module-anchored so unrelated trainables containing the substring
     # "lora" are not treated as adapter state.
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
-    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped lm_head (would
+    # Drop reload-leaked base tensors INSIDE a LoRA-wrapped head (would
     # defeat the CCE memory guard) while keeping intentional trainables
     # like `lm_head.bias`. Shares the filter with save_trainable_adapters.
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
     lora_module_prefixes = tuple(f"{name}." for name in _lora_module_names if name)
     has_root_lora_module = any(name == "" for name in _lora_module_names)
+    head_module = describe_output_head(model).module
+    head_prefix = None
+    if head_module is not None:
+        for name, module in model.named_modules():
+            if module is head_module and name:
+                head_prefix = f"{name}."
+                break
+    if head_prefix is None:
+        return False
     for key in trainable:
         if key in adapter_keys:
             continue
@@ -664,21 +1161,12 @@ def _is_lm_head_trainable(model):
             key, lora_module_prefixes, has_root_lora_module,
         ):
             continue
-        # Segment-match (not substring) so e.g.
-        # `decoder.not_lm_head_router.weight` is not classified as lm_head.
-        segments = key.split(".")
-        is_lm_head_param = "lm_head" in segments
-        is_embed_tokens_weight = (
-            len(segments) >= 2
-            and segments[-2] == "embed_tokens"
-            and segments[-1] == "weight"
-        )
-        if is_lm_head_param or is_embed_tokens_weight:
+        if key.startswith(head_prefix):
             return True
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
-def make_cce_loss_fn(model):
+def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
     CCE computes loss directly from hidden states and the LM head weight,
@@ -688,39 +1176,57 @@ def make_cce_loss_fn(model):
     With labels, uses labels[:,1:] as targets and (targets != -100) as mask.
     The returned function has a ``_unsloth_cce_backend`` attribute for logging.
     """
-    softcap = _get_logit_softcap(model)
+    label_smoothing = _normalize_label_smoothing(label_smoothing)
+    # Topology first (mirrors the VLM factory), then head eligibility, then
+    # scale validation — no positive CCE notice may precede a fallback decision.
+    # Backboneless models (e.g. a stack not exposed as `.model` or as direct
+    # embed_tokens/layers/norm attributes) cannot yield pre-head hidden states,
+    # so the full model forward is the only faithful loss.
+    tm = _get_text_model(model)
+    if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
+        print("Unsloth: text model does not expose a separable hidden-state "
+              "backbone for CCE; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+    head_desc = describe_output_head(model)
+    _ineligible = _cce_head_ineligibility(head_desc)
+    if _ineligible is not None:
+        print(f"Unsloth: fused CCE cannot faithfully use this model's output "
+              f"head ({_ineligible}); falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+    logit_scale, _transform_problem = _detect_head_transform(model, head_desc.status)
+    if _transform_problem is not None:
+        print(f"Unsloth: {_transform_problem}; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+
+    softcap, _softcap_problem = _detect_logit_softcap(model)
+    if _softcap_problem is not None:
+        print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
-    lm_layer = _get_lm_head_layer(model)
+    lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
 
-    _has_wrapper = hasattr(model, "language_model")
-    tm = _get_text_model(model)
-    backbone = getattr(tm, "model", None)
-    _has_lm_head = (
-        (hasattr(tm, "lm_head") and tm.lm_head is not None)
-        or (backbone is not None and hasattr(backbone, "lm_head") and backbone.lm_head is not None)
-    )
+    _head_path = head_desc.path
 
     def _get_backbone(model):
         """Get backbone (for hidden states) from the live model tree."""
         return _forward_text_hidden_states
 
     def _get_lm_weight_layer(model):
-        """Get LM head or embed_tokens layer from the live model tree."""
-        if _has_wrapper:
-            tm = model.language_model
-        else:
-            tm = model
-        if _has_lm_head:
-            if hasattr(tm, "lm_head") and tm.lm_head is not None:
-                return tm.lm_head
-            backbone = getattr(tm, "model", tm)
-            if hasattr(backbone, "lm_head") and backbone.lm_head is not None:
-                return backbone.lm_head
-        backbone = getattr(tm, "model", tm)
-        return backbone.embed_tokens
+        """Re-resolve the head from the live model tree by its descriptor path."""
+        return _resolve_module_path(model, _head_path)
 
     if use_quantized:
         # Backstop: quantized CCE backward zeros the weight gradient
@@ -752,6 +1258,7 @@ def make_cce_loss_fn(model):
             group_size=group_size,
             bits=bits,
             mode=quant_mode,
+            label_smoothing=label_smoothing,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -780,6 +1287,11 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # (h * s) @ W equals s * (h @ W) per vocab chunk, so softcap
+                # and the CCE backward see the model's own scaled logits while
+                # cached kernels stay scale-independent.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -792,6 +1304,7 @@ def make_cce_loss_fn(model):
         rt_cce = _get_runtime_cce(
             ignore_index=-100,
             logit_softcap=softcap,
+            label_smoothing=label_smoothing,
         )
 
         def loss_fn(model, batch, lengths, labels=None):
@@ -816,6 +1329,9 @@ def make_cce_loss_fn(model):
             masked_targets = mx.where(mask, targets, ignore)
             ntoks = mask.sum()
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # Same pre-scaling identity as the quantized branch above.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -825,14 +1341,29 @@ def make_cce_loss_fn(model):
     return loss_fn
 
 
-def make_baseline_loss_fn():
+def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
     Used when use_cce=False. Returns a function
     (model, batch, lengths, labels=None) -> (loss, ntoks). With labels, uses
-    labels[:,1:] and (targets != -100) as mask. The labels=None branch is
-    byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
+    labels[:,1:] and (targets != -100) as mask. With label_smoothing=0 the
+    labels=None branch is byte-identical to ``mlx_lm.tuner.trainer.default_loss``.
     """
+    eps = _normalize_label_smoothing(label_smoothing)
+    if eps > 0.0:
+
+        def _token_ce(logits, targets):
+            # HF LabelSmoother form: lse - (1-eps)*target - eps*mean_v, with
+            # the smoothed vocabulary term reduced in float32.
+            logits32 = logits.astype(mx.float32)
+            lse = mx.logsumexp(logits32, axis=-1)
+            tgt = mx.take_along_axis(
+                logits32, mx.expand_dims(targets, -1), axis=-1
+            ).squeeze(-1)
+            return lse - (1.0 - eps) * tgt - eps * logits32.mean(axis=-1)
+    else:
+        _token_ce = nn.losses.cross_entropy
+
     def loss_fn(model, batch, lengths, labels=None):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
@@ -842,7 +1373,7 @@ def make_baseline_loss_fn():
             logits = model(inputs)
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
-            ce = nn.losses.cross_entropy(logits, targets) * mask
+            ce = _token_ce(logits, targets) * mask
             ntoks = mask.sum()
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
@@ -865,7 +1396,7 @@ def make_baseline_loss_fn():
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         return loss, ntoks
@@ -2105,6 +2636,15 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     assistant_token_id > 0 enables completion-only training (mask tokens before
     the first occurrence). Returns a function (model, batch_dict) -> (loss, ntoks).
     """
+    def _marked_vlm_baseline():
+        loss_fn = make_vlm_baseline_loss_fn(
+            model,
+            assistant_token_id=assistant_token_id,
+            ignore_token_ids=ignore_token_ids,
+        )
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        return loss_fn
+
     if not hasattr(model, "get_input_embeddings"):
         import warnings
         warnings.warn(
@@ -2112,11 +2652,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(
-            model,
-            assistant_token_id=assistant_token_id,
-            ignore_token_ids=ignore_token_ids,
-        )
+        return _marked_vlm_baseline()
 
     tm = _get_text_model(model)
     if getattr(tm, "model", None) is None and not _has_direct_hidden_stack(model):
@@ -2126,15 +2662,27 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
-        return make_vlm_baseline_loss_fn(
-            model,
-            assistant_token_id=assistant_token_id,
-            ignore_token_ids=ignore_token_ids,
-        )
+        return _marked_vlm_baseline()
 
-    softcap = _get_logit_softcap(model)
-    lm_layer = _get_lm_head_layer(model)
+    head_desc = describe_output_head(model)
+    _ineligible = _cce_head_ineligibility(head_desc)
+    if _ineligible is not None:
+        print(f"Unsloth: fused CCE cannot faithfully use this model's output "
+              f"head ({_ineligible}); falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+
+    logit_scale, _transform_problem = _detect_head_transform(model, head_desc.status)
+    if _transform_problem is not None:
+        print(f"Unsloth: {_transform_problem}; falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+
+    softcap, _softcap_problem = _detect_logit_softcap(model)
+    if _softcap_problem is not None:
+        print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
+        return _marked_vlm_baseline()
+    lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
+    _head_path = head_desc.path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
     _skip_weight_grad = not _is_lm_head_trainable(model)
 
@@ -2178,7 +2726,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            lm_head = _get_lm_head_layer(model)
+            lm_head = _resolve_module_path(model, _head_path)
             w = lm_head.weight
             sc = lm_head.scales
             bi = getattr(lm_head, "biases", None)
@@ -2188,6 +2736,10 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             # gradients (see runtime_cce.py VJP), so stop_gradient is
             # redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # (h * s) @ W equals s * (h @ W) per vocab chunk (Aya Vision,
+                # Cohere2-MoE apply logit_scale in their forward tails).
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -2205,10 +2757,13 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = _get_lm_head_layer(model).weight
+            w = _resolve_module_path(model, _head_path).weight
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+            if logit_scale is not None:
+                # Same pre-scaling identity as the quantized branch above.
+                hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
@@ -3371,6 +3926,328 @@ def _labeled_row_has_supervision(labels, max_seq_length):
     return any(int(x) != -100 for x in labels[1:max_seq_length])
 
 
+@dataclass(frozen=True)
+class _FiniteTextRow:
+    input_ids: tuple
+    offset: int = 0
+    labels: tuple | None = None
+
+
+def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
+                           max_seq_length):
+    """Shared finite text pad-width policy.
+
+    Order of operations is observable and fixed: optional
+    ``1 + pad_to_multiple * ceil(raw_width / pad_to_multiple)`` round-up
+    (identity when the multiple is zero), then minimum width, then the
+    ``max_seq_length`` cap.
+    """
+    width = int(raw_width)
+    if pad_to_multiple:
+        width = 1 + pad_to_multiple * (
+            (width + pad_to_multiple - 1) // pad_to_multiple
+        )
+    if width < minimum_width:
+        width = minimum_width
+    return min(int(max_seq_length), width)
+
+
+class FiniteTextBatchPlan:
+    """CPU-backed finite text schedule with on-demand MLX materialization."""
+
+    __slots__ = (
+        "_rows",
+        "_schedule",
+        "_widths",
+        "max_seq_length",
+        "pad_id",
+        "minimum_width",
+        "pad_to_multiple",
+        "label_dtype",
+        "_shape_plan",
+        "_visit_policy",
+        "_visit_seed",
+        "_visit_epoch_cache",
+    )
+
+    _VISIT_POLICIES = ("identity", "epoch_permute")
+
+    def __init__(
+        self,
+        rows,
+        schedule,
+        *,
+        max_seq_length,
+        pad_id,
+        minimum_width=1,
+        pad_to_multiple=0,
+        widths=None,
+        label_dtype=np.int64,
+        visit_policy="identity",
+        visit_seed=None,
+    ):
+        self._rows = tuple(rows)
+        self._schedule = tuple(tuple(batch) for batch in schedule)
+        self._widths = None if widths is None else tuple(int(x) for x in widths)
+        self.max_seq_length = int(max_seq_length)
+        self.pad_id = int(pad_id)
+        self.minimum_width = int(minimum_width)
+        self.pad_to_multiple = int(pad_to_multiple)
+        self.label_dtype = np.dtype(label_dtype)
+        self._shape_plan = None
+        self._visit_policy = str(visit_policy)
+        # Normalized eagerly so visits never depend on ambient RNG state and a
+        # reconstructed plan (fresh-process resume) derives identical visits.
+        self._visit_seed = (
+            None if self._visit_policy == "identity"
+            else _normalize_seed(visit_seed)
+        )
+        self._visit_epoch_cache = None
+        if self.max_seq_length < 1:
+            raise ValueError("max_seq_length must be positive")
+        if self.minimum_width < 0:
+            raise ValueError("minimum_width must be non-negative")
+        if self.pad_to_multiple < 0:
+            raise ValueError("pad_to_multiple must be non-negative")
+        if self._widths is not None and len(self._widths) != len(self._schedule):
+            raise ValueError("widths must contain one entry per scheduled batch")
+        if self._visit_policy not in self._VISIT_POLICIES:
+            raise ValueError(
+                f"visit_policy must be one of {self._VISIT_POLICIES}, "
+                f"got {visit_policy!r}"
+            )
+
+    @property
+    def rows(self):
+        return self._rows
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    @property
+    def widths(self):
+        return self._widths
+
+    def __len__(self):
+        return len(self._schedule)
+
+    @property
+    def visit_policy(self):
+        return self._visit_policy
+
+    def batch_index_for_visit(self, absolute_visit):
+        """Map an absolute batch visit to one stored schedule index.
+
+        Identity plans replay the stored schedule cyclically (the historical
+        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
+        order for epoch 0, then visit a deterministic permutation of the same
+        batch multiset in every later epoch, derived only from the normalized
+        seed and the epoch — never from ambient RNG state.
+        """
+        count = len(self._schedule)
+        if count == 0:
+            raise ValueError("cannot resolve a visit on an empty schedule")
+        # operator.index rejects fractional/np-float visits instead of
+        # silently truncating them onto a neighboring visit.
+        visit = operator.index(absolute_visit)
+        if visit < 0:
+            raise ValueError("absolute_visit must be non-negative")
+        epoch, position = divmod(visit, count)
+        if self._visit_policy != "epoch_permute" or epoch == 0:
+            return position
+        cached = self._visit_epoch_cache
+        if cached is None or cached[0] != epoch:
+            cached = (epoch, self._build_visit_permutation(epoch))
+            self._visit_epoch_cache = cached
+        return cached[1][position]
+
+    def _build_visit_permutation(self, epoch):
+        """One O(len) deterministic permutation build per epoch transition."""
+        rng = np.random.RandomState(
+            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
+        )
+        return tuple(
+            int(index) for index in rng.permutation(len(self._schedule))
+        )
+
+    def batch_width(self, index):
+        # Explicit widths are authoritative; skip the per-row length scan
+        # (constructor validation keeps widths/schedule index-aligned).
+        if self._widths is not None:
+            return self._widths[int(index)]
+        batch_indices = self._schedule[index]
+        lengths = [
+            0
+            if row_index is None
+            else min(
+                len(self._rows[int(row_index)].input_ids),
+                self.max_seq_length,
+            )
+            for row_index in batch_indices
+        ]
+        return _finite_text_pad_width(
+            max(lengths, default=0),
+            pad_to_multiple=self.pad_to_multiple,
+            minimum_width=self.minimum_width,
+            max_seq_length=self.max_seq_length,
+        )
+
+    def batch_family(self, index):
+        batch_indices = self._schedule[index]
+        real_rows = [
+            self._rows[int(row_index)]
+            for row_index in batch_indices
+            if row_index is not None
+        ]
+        has_labels = bool(
+            (real_rows and real_rows[0].labels is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].labels is not None
+            )
+        )
+        batch_size = len(batch_indices)
+        return (
+            "text_tuple_3",
+            ((batch_size, "sequence"), "int32"),
+            ((batch_size, 2), "int32"),
+            (
+                ((batch_size, "sequence"), self.label_dtype.name)
+                if has_labels else None
+            ),
+        )
+
+    def set_shape_plan(self, shape_plan):
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        self._shape_plan = shape_plan
+
+    def materialize(self, index, *, phase=None):
+        batch_indices = self._schedule[index]
+        selected = [
+            None if row_index is None else self._rows[int(row_index)]
+            for row_index in batch_indices
+        ]
+        real_rows = [row for row in selected if row is not None]
+        has_labels = bool(
+            (real_rows and real_rows[0].labels is not None)
+            or (
+                not real_rows
+                and self._rows
+                and self._rows[0].labels is not None
+            )
+        )
+        if any((row.labels is not None) != has_labels for row in real_rows):
+            raise ValueError(
+                "Unsloth MLX: labeled and unlabeled text rows cannot share a batch."
+            )
+
+        lengths = [
+            0 if row is None else min(len(row.input_ids), self.max_seq_length)
+            for row in selected
+        ]
+        raw_width = self.batch_width(index)
+        width = raw_width
+        if self._shape_plan is not None and phase is not None:
+            family = self.batch_family(index)
+            width = self._shape_plan.endpoint_for(family, raw_width)
+            if not self._shape_plan.allows(
+                family, raw_width, phase,
+            ):
+                raise RuntimeError(
+                    "Unsloth MLX: compiled text batch signature was not "
+                    "admitted by the finite shape plan."
+                )
+        batch_ids = np.full(
+            (len(selected), width), self.pad_id, dtype=np.int32,
+        )
+        batch_labels = (
+            np.full((len(selected), width), -100, dtype=self.label_dtype)
+            if has_labels else None
+        )
+        lengths_info = np.zeros((len(selected), 2), dtype=np.int32)
+
+        for row_index, (row, length) in enumerate(zip(selected, lengths)):
+            if row is None:
+                continue
+            lengths_info[row_index] = (int(row.offset), length)
+            batch_ids[row_index, :length] = row.input_ids[:length]
+            if batch_labels is not None:
+                batch_labels[row_index, :length] = row.labels[:length]
+
+        return (
+            mx.array(batch_ids),
+            mx.array(lengths_info),
+            mx.array(batch_labels) if batch_labels is not None else None,
+        )
+
+    def __getitem__(self, index):
+        return self.materialize(index)
+
+    def materialize_all(self):
+        batches = [self[index] for index in range(len(self))]
+        mx.eval(
+            [batch for batch, _lengths, _labels in batches]
+            + [lengths for _batch, lengths, _labels in batches]
+            + [labels for _batch, _lengths, labels in batches if labels is not None]
+        )
+        return batches
+
+
+def _finite_text_rows(tokenized, *, with_offsets=False):
+    rows = []
+    for item in tokenized:
+        if with_offsets:
+            input_ids, offset = item
+            labels = None
+        else:
+            input_ids, labels = item
+            offset = 0
+        rows.append(
+            _FiniteTextRow(
+                tuple(int(token) for token in input_ids),
+                int(offset),
+                None if labels is None else tuple(int(token) for token in labels),
+            )
+        )
+    return tuple(rows)
+
+
+def _shuffled_full_batch_schedule(
+    row_count,
+    batch_size,
+    *,
+    sort_key,
+    num_batches,
+    seed,
+):
+    if row_count < batch_size:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size}"
+            f" examples but only has {row_count}."
+        )
+    indices = sorted(range(row_count), key=sort_key)
+    groups = [
+        tuple(indices[start : start + batch_size])
+        for start in range(0, row_count - batch_size + 1, batch_size)
+    ]
+    # Plan-local RNG through _normalize_seed: same permutation stream as the
+    # historical np.random.seed(int(seed)) global path for explicit seeds,
+    # while ``None`` (and the default creator's previously ambient ``0``) are
+    # canonicalized so fresh-process resume can reconstruct the schedule.
+    rng = np.random.RandomState(_normalize_seed(seed))
+    schedule = []
+    while True:
+        for group_index in rng.permutation(len(groups)):
+            schedule.append(groups[int(group_index)])
+            if num_batches is not None and len(schedule) >= num_batches:
+                return tuple(schedule)
+        if num_batches is None:
+            return tuple(schedule)
+
+
 def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
     """Pad pretokenized ids plus optional labels for one MLX text batch."""
     lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
@@ -3401,29 +4278,42 @@ def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
     return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
 
 
+def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
+                                num_batches=None, seed=42, pad_id=0):
+    """Plan pretokenized rows with mlx-lm's sorting and shuffle contract."""
+    tokenized = [
+        row for row in tokenized
+        if _labeled_row_has_supervision(row[1], max_seq_length)
+    ]
+    return FiniteTextBatchPlan(
+        _finite_text_rows(tokenized),
+        _shuffled_full_batch_schedule(
+            len(tokenized),
+            batch_size,
+            sort_key=lambda index: len(tokenized[index][0]),
+            num_batches=num_batches,
+            seed=seed,
+        ),
+        max_seq_length=max_seq_length,
+        pad_id=pad_id,
+        # One reusable shuffled cycle: eligible for epoch-permuted visits.
+        # Horizon-expanded/truncated schedules replay stored order (identity).
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
+    )
+
+
 def _create_tokenized_text_batches(tokenized, batch_size, max_seq_length,
                                    num_batches=None, seed=42, pad_id=0):
     """Batch pretokenized text rows with mlx-lm's sorting and shuffle contract."""
-    batch_iter = _iterate_tokenized_text_batches(
+    return _create_tokenized_text_plan(
         tokenized,
         batch_size,
         max_seq_length,
+        num_batches=num_batches,
         seed=seed,
-        loop=(num_batches is not None),
         pad_id=pad_id,
-    )
-    batch_pairs = []
-    for batch_pair in batch_iter:
-        batch_pairs.append(batch_pair)
-        if num_batches is not None and len(batch_pairs) >= num_batches:
-            break
-
-    mx.eval(
-        [b for b, lengths, labels in batch_pairs]
-        + [lengths for _, lengths, labels in batch_pairs]
-        + [labels for _, lengths, labels in batch_pairs if labels is not None]
-    )
-    return batch_pairs
+    ).materialize_all()
 
 
 def _create_labeled_text_batches(tokenized, batch_size, max_seq_length,
@@ -4611,13 +5501,50 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     )
 
 
-def create_batches(dataset, tokenizer, batch_size, max_seq_length,
-                   num_batches=None, seed=42, dataset_text_field="text",
-                   formatting_func=None, chat_template=None,
-                   model_name=None, model_type=None, append_eos=True,
-                   completion_only_loss=None, assistant_only_loss=False,
-                   comm_group=None, distributed_pad_mode="cycle"):
-    """Pre-tokenize and batch a HuggingFace dataset for MLX training.
+def _create_default_text_plan(
+    dataset,
+    batch_size,
+    max_seq_length,
+    *,
+    num_batches=None,
+    seed=42,
+):
+    """Build the CPU equivalent of mlx-lm's finite text batch schedule."""
+    schedule = _shuffled_full_batch_schedule(
+        len(dataset),
+        batch_size,
+        sort_key=dataset.itemlen,
+        num_batches=num_batches,
+        seed=seed,
+    )
+    rows = _finite_text_rows(
+        [dataset[index] for index in range(len(dataset))],
+        with_offsets=True,
+    )
+    return FiniteTextBatchPlan(
+        rows,
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=0,
+        # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) so the
+        # default text path keeps mlx-lm's causal-shift contract and bounded
+        # signatures, like the distributed/streaming builders.
+        minimum_width=2,
+        pad_to_multiple=32,
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
+    )
+
+
+def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
+                            num_batches=None, seed=42,
+                            dataset_text_field="text", formatting_func=None,
+                            chat_template=None, model_name=None,
+                            model_type=None, append_eos=True,
+                            completion_only_loss=None,
+                            assistant_only_loss=False, comm_group=None,
+                            distributed_pad_mode="cycle"):
+    """Build a finite CPU-backed text batch plan.
 
     Uses iterate_batches from mlx_lm for efficient dynamic-padding batching:
     samples are sorted by length, grouped into batches, and padded to the
@@ -4632,13 +5559,9 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     then tail global batches are padded so every rank yields the same number
     of local batches.
 
-    Returns:
-        List of (batch, lengths) tuples, where batch has shape
-        (batch_size, padded_length) and lengths has shape (batch_size, 2)
-        with [offset, length] per sequence (from iterate_batches).
+    Public callers use :func:`create_batches`, which eagerly materializes this
+    plan for compatibility. Finite training retains the plan and indexes it.
     """
-    from mlx_lm.tuner.trainer import iterate_batches
-
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
@@ -4646,7 +5569,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
         assistant_only_loss=assistant_only_loss,
     )
     if saw_pretokenized:
-        return _create_tokenized_text_batches(
+        return _create_tokenized_text_plan(
             tokenized,
             batch_size,
             max_seq_length,
@@ -4676,7 +5599,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             assistant_only_loss=assistant_only_loss,
         )
         if tokenized:
-            return _create_labeled_text_batches(
+            return _create_tokenized_text_plan(
                 tokenized,
                 batch_size,
                 max_seq_length,
@@ -4713,7 +5636,7 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
     )
 
     if _distributed_rank_size(comm_group)[1] > 1:
-        batch_pairs = _create_distributed_text_batches(
+        return _create_distributed_text_plan(
             ds, batch_size, max_seq_length,
             num_batches=num_batches,
             seed=seed,
@@ -4721,24 +5644,40 @@ def create_batches(dataset, tokenizer, batch_size, max_seq_length,
             distributed_pad_mode=distributed_pad_mode,
             tokenizer=tokenizer,
         )
-    else:
-        batch_pairs = []
-        for batch, lengths_info in iterate_batches(
-            ds, batch_size, max_seq_length,
-            loop=(num_batches is not None),
-            seed=seed,
-        ):
-            max_length = int(mx.max(lengths_info[:, 1]).item())
-            batch = batch[:, :max_length]
-            batch_pairs.append((batch, lengths_info, None))
-            if num_batches is not None and len(batch_pairs) >= num_batches:
-                break
-
-    mx.eval(
-        [b for b, lengths, _ in batch_pairs]
-        + [lengths for _, lengths, _ in batch_pairs]
+    return _create_default_text_plan(
+        ds,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
     )
-    return batch_pairs
+
+
+def create_batches(dataset, tokenizer, batch_size, max_seq_length,
+                   num_batches=None, seed=42, dataset_text_field="text",
+                   formatting_func=None, chat_template=None,
+                   model_name=None, model_type=None, append_eos=True,
+                   completion_only_loss=None, assistant_only_loss=False,
+                   comm_group=None, distributed_pad_mode="cycle"):
+    """Pre-tokenize and eagerly batch a HuggingFace dataset for MLX."""
+    return _create_text_batch_plan(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+        comm_group=comm_group,
+        distributed_pad_mode=distributed_pad_mode,
+    ).materialize_all()
 
 
 def _distributed_rank_size(comm_group=None):
@@ -4836,9 +5775,12 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    pad_to = 32
-    max_length = max(2, 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to))
-    max_length = min(max_length, max_seq_length)
+    max_length = _finite_text_pad_width(
+        max(lengths),
+        pad_to_multiple=32,
+        minimum_width=2,
+        max_seq_length=max_seq_length,
+    )
     batch_ids = []
     truncated_lengths = []
     for ids, length in zip(batch, lengths):
@@ -4879,7 +5821,7 @@ def _mask_empty_vlm_padding_rows(batch_dict, empty_rows, processor=None):
     return batch_dict
 
 
-def _create_distributed_text_batches(
+def _create_distributed_text_plan(
     dataset,
     batch_size,
     max_seq_length,
@@ -4916,7 +5858,7 @@ def _create_distributed_text_batches(
     ]
     rng = np.random.RandomState(_normalize_seed(seed))
 
-    batch_pairs = []
+    schedule = []
     while True:
         indices = rng.permutation(len(batch_idx))
         for i in indices:
@@ -4929,19 +5871,54 @@ def _create_distributed_text_batches(
             )
             if not local_idx:
                 continue
-            batch = [None if j is None else dataset[j] for j in local_idx]
-            batch_pairs.append(
-                _make_text_batch_from_items(
-                    batch,
-                    tokenizer=tokenizer,
-                    max_seq_length=max_seq_length,
-                )
-            )
-            if num_batches is not None and len(batch_pairs) >= num_batches:
-                return batch_pairs
+            schedule.append(tuple(local_idx))
+            if num_batches is not None and len(schedule) >= num_batches:
+                break
+        if num_batches is not None and len(schedule) >= num_batches:
+            break
         if num_batches is None:
             break
-    return batch_pairs
+
+    rows = _finite_text_rows(
+        [dataset[index] for index in range(len(dataset))],
+        with_offsets=True,
+    )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return FiniteTextBatchPlan(
+        rows,
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=0 if pad_id is None else int(pad_id),
+        minimum_width=2,
+        pad_to_multiple=32,
+        # Same normalized seed on every rank keeps DDP visit vectors aligned.
+        visit_policy="epoch_permute" if num_batches is None else "identity",
+        visit_seed=seed,
+    )
+
+
+def _create_distributed_text_batches(
+    dataset,
+    batch_size,
+    max_seq_length,
+    *,
+    num_batches=None,
+    seed=42,
+    comm_group=None,
+    distributed_pad_mode="cycle",
+    tokenizer=None,
+):
+    """Eager compatibility wrapper for distributed text batching."""
+    return _create_distributed_text_plan(
+        dataset,
+        batch_size,
+        max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        comm_group=comm_group,
+        distributed_pad_mode=distributed_pad_mode,
+        tokenizer=tokenizer,
+    ).materialize_all()
 
 
 def _torch_randperm_order(length, seed):
@@ -4957,15 +5934,26 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
-def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
-                           num_batches=None, seed=None, dataset_order="sequential",
-                           dataset_text_field="text",
-                           formatting_func=None, chat_template=None,
-                           model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True,
-                           completion_only_loss=None, assistant_only_loss=False,
-                           comm_group=None):
-    """Create text batches with an explicit dataset order.
+def _create_ordered_text_plan(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    num_batches=None,
+    seed=None,
+    dataset_order="sequential",
+    dataset_text_field="text",
+    formatting_func=None,
+    chat_template=None,
+    model_name=None,
+    model_type=None,
+    num_epochs=None,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+    comm_group=None,
+):
+    """Plan text batches with an explicit dataset order.
 
     Unsloth uses this to mirror CUDA's effective sampler stream without
     changing generic mlx-lm batching behavior.
@@ -5066,7 +6054,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
 
-    batch_pairs = []
+    schedule = []
     epoch = 0
     order = make_order(epoch)
     order_pos = 0
@@ -5076,7 +6064,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         len(tokenized) * (1 if num_epochs is None else int(num_epochs))
         if num_batches is None else None
     )
-    while num_batches is None or len(batch_pairs) < num_batches:
+    while num_batches is None or len(schedule) < num_batches:
         # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
         # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
         if order_pos >= len(order):
@@ -5106,36 +6094,56 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         )
         if not chunk:
             break
-        batch_items = [tokenized[i] for i in chunk]
-
-        max_length = max(len(item[0] if labeled else item) for item in batch_items)
-        # mlx-lm iterate_batches pad convention; raw 0 only if no pad_token_id.
-        _pad_id = getattr(tokenizer, "pad_token_id", None)
-        if _pad_id is None:
-            _pad_id = 0
-        _pad_id = int(_pad_id)
-        if labeled:
-            batch_pairs.append(
-                _create_labeled_text_batch(batch_items, max_seq_length, pad_id=_pad_id)
-            )
-        else:
-            batch_ids = []
-            lengths = []
-            for ids in batch_items:
-                length = len(ids)
-                batch_ids.append(ids + [_pad_id] * (max_length - length))
-                lengths.append([0, length])
-            batch_pairs.append((mx.array(batch_ids), mx.array(lengths), None))
+        schedule.append(tuple(chunk))
 
         if num_batches is None and target_items is not None and seen >= target_items:
             break
 
-    mx.eval(
-        [b for b, lengths, _ in batch_pairs]
-        + [lengths for _, lengths, _ in batch_pairs]
-        + [labels for _, _, labels in batch_pairs if labels is not None]
+    if labeled:
+        rows = _finite_text_rows(tokenized)
+    else:
+        rows = tuple(
+            _FiniteTextRow(tuple(int(token) for token in input_ids))
+            for input_ids in tokenized
+        )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    return FiniteTextBatchPlan(
+        rows,
+        schedule,
+        max_seq_length=max_seq_length,
+        pad_id=0 if pad_id is None else int(pad_id),
+        minimum_width=2,
     )
-    return batch_pairs
+
+
+def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
+                           num_batches=None, seed=None, dataset_order="sequential",
+                           dataset_text_field="text",
+                           formatting_func=None, chat_template=None,
+                           model_name=None, model_type=None,
+                           num_epochs=None, append_eos=True,
+                           completion_only_loss=None, assistant_only_loss=False,
+                           comm_group=None):
+    """Eagerly create text batches with an explicit dataset order."""
+    return _create_ordered_text_plan(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        num_batches=num_batches,
+        seed=seed,
+        dataset_order=dataset_order,
+        dataset_text_field=dataset_text_field,
+        formatting_func=formatting_func,
+        chat_template=chat_template,
+        model_name=model_name,
+        model_type=model_type,
+        num_epochs=num_epochs,
+        append_eos=append_eos,
+        completion_only_loss=completion_only_loss,
+        assistant_only_loss=assistant_only_loss,
+        comm_group=comm_group,
+    ).materialize_all()
 
 
 def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",

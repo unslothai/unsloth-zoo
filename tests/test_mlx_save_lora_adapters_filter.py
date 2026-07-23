@@ -1192,7 +1192,7 @@ def test_enrich_stamps_fine_tune_type_dora_when_dora_modules_present():
     assert cfg.get("fine_tune_type") == "dora", cfg
 
 
-def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head():
+def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head(monkeypatch):
     # After reload, mlx-lm wrappers may leak the inner base .weight as
     # trainable. For a LoRA-wrapped lm_head the leaked lm_head.weight is
     # not real user intent; treating it as trainable defeats the CCE
@@ -1223,8 +1223,18 @@ def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head():
             yield "lm_head", self._lm
 
     # lm_head.weight under a LoRA-wrapped lm_head must be filtered out;
-    # the trainable check should return False (LoRA-only training).
-    assert _is_lm_head_trainable(_Model()) is False
+    # the trainable check should return False (LoRA-only training). The
+    # descriptor is stubbed to resolve this head so the leaked-base filter
+    # is actually on the decision path (an unresolved head would return
+    # False before reaching it, making this test vacuous).
+    import unsloth_zoo.mlx.utils as _U
+
+    model = _Model()
+    monkeypatch.setattr(
+        _U, "describe_output_head",
+        lambda m: type("_Desc", (), {"module": model._lm})(),
+    )
+    assert _is_lm_head_trainable(model) is False
 
 
 def test_push_lora_adapters_uses_allow_patterns_to_avoid_stale_uploads(
