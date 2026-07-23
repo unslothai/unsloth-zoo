@@ -220,6 +220,55 @@ def test_finfo_and_dtype_kinds():
     assert mx.issubdtype(mx.int32, mx.integer) is True
 
 
+def test_module_children_preserves_direct_child_tree():
+    import mlx.nn as nn
+
+    class PropertyModule(nn.Module):
+        @property
+        def virtual(self):
+            return self
+
+    model = nn.Module()
+    model.direct = nn.Module()
+    model.alias = model.direct
+    model.layers = [nn.Module(), object()]
+    model.named = {
+        "leaf": nn.Module(),
+        "nested": [nn.Module(), 1],
+        "tupled": (nn.Module(),),
+    }
+    model.tupled = (nn.Module(),)
+    model.loop = model
+
+    children = model.children()
+    assert children["direct"] is model.direct
+    assert children["alias"] is model.direct
+    assert children["layers"] == [model.layers[0], {}]
+    assert children["named"] == {
+        "leaf": model.named["leaf"],
+        "nested": [model.named["nested"][0], {}],
+        "tupled": {},
+    }
+    assert "tupled" not in children and children["loop"] is model
+    assert "direct" in model and "virtual" not in PropertyModule()
+    linear, embedding = nn.Linear(2, 2, bias=False), nn.Embedding(2, 2)
+    linear.extra = model.direct
+    assert "weight" in linear and "weight" in embedding and "extra" in linear
+    linear.weight = embedding.weight = None
+    assert "weight" not in linear and "weight" not in embedding
+    linear.weight = embedding.weight = torch.ones(2, 2)
+    linear.bias = torch.zeros(2)
+    assert "weight" in linear and "weight" in embedding and "bias" in linear
+    assert linear.weight.requires_grad and embedding.weight.requires_grad
+    assert linear.bias.requires_grad
+    quantized = nn.QuantizedLinear(2, 2, bias=False)
+    quantized.weight = torch.zeros(2, 2)
+    assert "weight" in quantized
+    assert [name for name, _ in model.named_modules()] == [
+        "", "direct", "layers.0", "named.leaf", "tupled.0",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 4. Tree utils round-trip.
 # ---------------------------------------------------------------------------
