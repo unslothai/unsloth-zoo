@@ -146,6 +146,31 @@ def test_top_level_dict_rate_mismatch_raises():
             {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
 
 
+class _AudioProcessorProcessor:
+    # Granite-Speech shape: the audio sub-processor is "audio_processor", not
+    # "feature_extractor". Its sampling_rate must still drive the rate check.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+
+def test_audio_processor_sampling_rate_mismatch_raises():
+    # For an audio_processor-only processor the rate check must fire off
+    # audio_processor.sampling_rate; before the fallback target_sr was None and
+    # a wrong-rate clip trained silently.
+    collator = UnslothVisionDataCollator.__new__(UnslothVisionDataCollator)
+    collator.processor = _AudioProcessorProcessor()
+    collator.max_seq_length = 4
+    collator.truncation = True
+    with pytest.raises(ValueError, match="sampling_rate"):
+        collator._extract_audio_for_example(
+            {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
+    # A matching-rate clip is accepted.
+    out = collator._extract_audio_for_example(
+        {"audio": {"array": CLIP, "sampling_rate": 16000}}, [])
+    assert len(out) == 1
+
+
 def test_top_level_flat_list_is_one_clip():
     collator = make_collator()
     out = collator._extract_audio_for_example({"audio": [0.0] * 16}, [])
@@ -589,6 +614,186 @@ def test_userdict_audio_payload_resolves():
     )
     assert len(clips) == 1
     np.testing.assert_allclose(clips[0], DECODED)
+
+
+# ---------------------------------------------------------------------------
+# Constructor gate: audio-only processors (unslothai/unsloth-zoo#757)
+#
+# UnslothVisionDataCollator.__init__ used to hard-require image_processor, so
+# audio-only processors (Qwen2-Audio, Voxtral, Granite-Speech: a feature_extractor
+# but no image_processor) could not be constructed at all. The gate now admits
+# any image- OR audio-capable processor and rejects only a bare text tokenizer.
+# The audio content handling and <|audio|>/<|AUDIO|> masking downstream already
+# landed in #723 / #917; this only unblocks construction.
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+class _ChatTemplateMixin:
+    # Minimal apply_chat_template: renders text parts, ignores modality parts.
+    # Accepts the {"type": "image"} probe __init__ runs without raising.
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        out = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                out.append(content)
+            else:
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        out.append(part.get("text", ""))
+        return " ".join(out)
+
+
+class _AudioOnlyProcessor(_ChatTemplateMixin):
+    # feature_extractor present, NO image_processor -> the audio-only case.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+
+
+class _VisionProcessor(_ChatTemplateMixin):
+    # image_processor present -> gate must behave exactly as before.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.image_processor = object()
+
+
+class _AudioProcessorAttrProcessor(_ChatTemplateMixin):
+    # Granite-Speech shape: transformers names the audio sub-processor
+    # "audio_processor", not "feature_extractor" (see that model's processor
+    # .attributes). No image_processor either, so a gate that only knows
+    # feature_extractor rejects an audio model it is meant to support.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+
+class _NoneImageProcessor(_ChatTemplateMixin):
+    # Defines image_processor but leaves it None: hasattr() is True while there
+    # is no usable processor, so the gate must look at the value, not the name.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.image_processor = None
+
+
+class _TextOnlyProcessor(_ChatTemplateMixin):
+    # Neither image_processor nor feature_extractor -> must still be rejected.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+
+
+def _stub_model():
+    # __init__ reads config (dtype + optional vision_config, both guarded) and,
+    # on transformers builds without config.torch_dtype, the embedding dtype.
+    emb = SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32))
+    return SimpleNamespace(
+        config=SimpleNamespace(torch_dtype="float32"),
+        get_input_embeddings=lambda: emb,
+    )
+
+
+def test_audio_only_processor_constructs():
+    # The fix: an audio-only processor no longer raises at construction.
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_AudioOnlyProcessor())
+    assert collator.processor.__class__.__name__ == "_AudioOnlyProcessor"
+    # Masking wiring is intact: the audio placeholder is in the padding ids.
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+    assert PAD_ID in collator.padding_token_ids.tolist()
+
+
+def test_audio_processor_attribute_processor_constructs():
+    # Granite-Speech exposes "audio_processor" instead of "feature_extractor";
+    # it must be accepted like any other audio-only processor.
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_AudioProcessorAttrProcessor(),
+    )
+    assert collator.processor.__class__.__name__ == "_AudioProcessorAttrProcessor"
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+
+
+def test_none_image_processor_still_rejected():
+    # hasattr() is True here but the attribute is None, so this is really a
+    # text-only processor and must not slip through the gate.
+    with pytest.raises(TypeError, match="image or audio processor"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_NoneImageProcessor())
+
+
+def test_text_only_processor_still_rejected():
+    with pytest.raises(TypeError, match="image or audio processor"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_TextOnlyProcessor())
+
+
+def test_vision_processor_still_constructs():
+    # Vision path is byte-identical: image_processor present -> gate not triggered.
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_VisionProcessor())
+    assert hasattr(collator.processor, "image_processor")
+
+
+class _RoundTripAudioProcessor(_AudioOnlyProcessor):
+    # Stands in for a real audio processor's __call__: emits a batch with the
+    # audio placeholder + pad tokens and passthrough input_features, so the
+    # collator's label masking can be exercised hermetically (no audio deps).
+    def __call__(self, text=None, audio=None, padding=None, return_tensors=None,
+                 add_special_tokens=None, **kwargs):
+        # [pad, <|audio|>, <|audio|>, real, real] for one example.
+        input_ids = torch.tensor([[PAD_ID, AUDIO_ID, AUDIO_ID, 5, 6]])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.tensor([[0, 1, 1, 1, 1]]),
+            "input_features": torch.zeros(1, 128, 3000),
+            "feature_attention_mask": torch.ones(1, 3000),
+        }
+
+
+def test_audio_only_collator_masks_audio_and_pad_tokens():
+    # Hermetic round-trip: construct audio-only, run __call__, verify the audio
+    # placeholder and pad tokens are masked out of labels while real tokens stay.
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_RoundTripAudioProcessor())
+    example = {"messages": [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": CLIP}, {"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]}
+    batch = collator([example])
+    assert "input_features" in batch and tuple(batch["input_features"].shape) == (1, 128, 3000)
+    labels = batch["labels"][0].tolist()
+    ids = batch["input_ids"][0].tolist()
+    for tok, lab in zip(ids, labels):
+        if tok in (AUDIO_ID, PAD_ID):
+            assert lab == -100, f"token {tok} should be masked"
+        else:
+            assert lab == tok, f"real token {tok} should be kept"
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen2-Audio-7B-Instruct"])
+def test_real_audio_processor_constructs_and_round_trips(model_id):
+    # Full-fidelity check against a REAL audio processor. Skips in CI when
+    # transformers / the processor download / soundfile are unavailable.
+    transformers = pytest.importorskip("transformers")
+    try:
+        proc = transformers.AutoProcessor.from_pretrained(model_id)
+    except Exception as e:  # offline, gated, or missing deps
+        pytest.skip(f"real processor unavailable: {e}")
+    assert not hasattr(proc, "image_processor")
+    assert getattr(proc, "feature_extractor", None) is not None
+
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc, max_seq_length=512)
+    wav = np.sin(np.linspace(0, 220 * 2 * np.pi, 16000)).astype(np.float32)
+    example = {"messages": [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": wav}, {"type": "text", "text": "Transcribe."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "la la la"}]},
+    ]}
+    batch = collator([example])
+    assert "input_features" in batch
+    audio_id = proc.tokenizer.convert_tokens_to_ids("<|AUDIO|>")
+    ids, labels = batch["input_ids"], batch["labels"]
+    n_audio = int((ids == audio_id).sum())
+    assert n_audio > 0
+    assert int(((ids == audio_id) & (labels == -100)).sum()) == n_audio
+    assert int((labels != -100).sum()) > 0  # real assistant tokens survive
 
 
 def test_real_unpatched_decoder_decodes_in_fresh_process():

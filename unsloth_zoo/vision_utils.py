@@ -777,8 +777,22 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor"):
-            raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        # Accept image processors, audio-only processors, and combined
+        # vision+audio processors. Reject only a bare text tokenizer.
+        # Audio processors do not agree on one attribute name: Qwen2-Audio and
+        # Voxtral expose "feature_extractor", while Granite-Speech exposes
+        # "audio_processor" (see each model's processor .attributes in
+        # transformers), so both spellings are accepted here. getattr(...) is
+        # None rather than hasattr so a processor that defines the attribute and
+        # sets it to None is treated as not having it.
+        if (
+            getattr(processor, "image_processor", None) is None
+            and getattr(processor, "feature_extractor", None) is None
+            and getattr(processor, "audio_processor", None) is None
+        ):
+            raise TypeError(
+                "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
+            )
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
@@ -1083,8 +1097,17 @@ class UnslothVisionDataCollator:
         return image, video, video_kwarg
 
     def _extract_audio_for_example(self, example, messages):
-        feature_extractor = getattr(self.processor, "feature_extractor", None)
-        target_sr = getattr(feature_extractor, "sampling_rate", None)
+        # Read the expected sampling rate from whichever audio sub-processor the
+        # processor exposes: Qwen2-Audio and Voxtral use "feature_extractor",
+        # Granite-Speech uses "audio_processor". Without the audio_processor
+        # fallback, an audio_processor-only processor yields target_sr=None and
+        # the sampling-rate check is skipped, so a clip decoded at the wrong rate
+        # would be trained on silently instead of raising _check_audio_sampling_rate.
+        audio_sub = (
+            getattr(self.processor, "feature_extractor", None)
+            or getattr(self.processor, "audio_processor", None)
+        )
+        target_sr = getattr(audio_sub, "sampling_rate", None)
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
