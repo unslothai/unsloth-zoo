@@ -116,6 +116,39 @@ def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
 
 
 @metal_only
+def test_kto_num_train_epochs_scales_steps(tmp_path):
+    # max_steps unset + num_train_epochs=2: optimizer steps =
+    # (len(batches) * epochs) // grad_accum. 8 examples / batch 4 = 2 batches,
+    # grad_accum=1, epochs=2 -> 4 steps. One epoch would be 2, so this pins that
+    # num_train_epochs is honored instead of silently running a single pass.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(
+        model=model, tokenizer=tok, train_dataset=_dataset(n=8),
+        args=_config(output_dir=str(tmp_path), max_steps=0,
+                     gradient_accumulation_steps=1, num_train_epochs=2),
+    )
+    output = trainer.train()
+    assert output["total_train_steps"] == 4, output["total_train_steps"]
+    assert output.global_step == 4
+
+
+@metal_only
+def test_kto_rejects_lora_plus(tmp_path):
+    # LoRA+ per-leaf scaling is unimplemented on the KTO path, so setting
+    # lora_plus_ratio must raise loudly rather than silently train lora_b at
+    # the wrong learning rate.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(
+        model=model, tokenizer=tok, train_dataset=_dataset(),
+        args=_config(output_dir=str(tmp_path), lora_plus_ratio=16.0),
+    )
+    with pytest.raises(ValueError, match="lora_plus_ratio"):
+        trainer.train()
+
+
+@metal_only
 def test_kto_saves_adapters_at_end(tmp_path):
     # save_steps defaults to 0 (save at end); train() must leave adapters on
     # disk, not only in memory, matching MLXTrainer.

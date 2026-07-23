@@ -4274,6 +4274,17 @@ class MLXKTOTrainer(MLXTrainer):
                 "adapter-disabled forward (there is no separate reference copy)."
             )
 
+        # LoRA+ needs per-leaf gradient scaling (a higher LR on lora_b), which
+        # the base trainer weaves into its update path but this KTO loop does
+        # not implement. Rather than silently train lora_b at the wrong LR,
+        # reject the option loudly; KTO LoRA+ can be added later.
+        if float(getattr(args, "lora_plus_ratio", 0.0) or 0.0) > 0:
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer does not support lora_plus_ratio yet "
+                "(LoRA+ per-leaf scaling is unimplemented on the KTO path). "
+                "Set lora_plus_ratio=0 to run KTO."
+            )
+
         batches = _build_kto_batches(self.train_dataset, self.tokenizer, args)
         if not batches:
             raise ValueError(
@@ -4281,15 +4292,16 @@ class MLXKTOTrainer(MLXTrainer):
                 "non-empty completions per batch)."
             )
 
-        # total_steps counts optimizer steps. When max_steps is unset, one pass
-        # over the data is len(batches) // grad_accum optimizer steps (matching
-        # MLXTrainer); at least 1 so a run with fewer batches than grad_accum
-        # still takes a (short) step.
+        # total_steps counts optimizer steps. When max_steps is unset it is
+        # num_train_epochs passes over the data // grad_accum (matching
+        # MLXTrainer, which multiplies by num_train_epochs); at least 1 so a run
+        # with fewer batches than grad_accum still takes a (short) step.
         grad_accum = max(int(args.gradient_accumulation_steps), 1)
         if args.max_steps and args.max_steps > 0:
             total_steps = args.max_steps
         else:
-            total_steps = max(len(batches) // grad_accum, 1)
+            epochs = max(int(getattr(args, "num_train_epochs", 1) or 1), 1)
+            total_steps = max((len(batches) * epochs) // grad_accum, 1)
         optimizer = self._build_optimizer(total_steps)
         (max_grad_norm, max_grad_value, max_grad_leaf_norm,
          _clip_mode) = _resolve_mlx_grad_clipping(args)
@@ -4373,6 +4385,11 @@ class MLXKTOTrainer(MLXTrainer):
                     continue
 
                 grad = acc_grad
+                # Install this step's scheduled LR before the decay helpers:
+                # _apply_manual_weight_decay reads optimizer.learning_rate, so
+                # setting the LR afterwards would decouple decay using the
+                # previous step's LR (the base trainer sets the LR first).
+                self._set_optimizer_lr_for_step(optimizer, step)
                 if max_grad_norm > 0:
                     grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
                 if max_grad_value is not None and max_grad_value > 0:
@@ -4381,7 +4398,6 @@ class MLXKTOTrainer(MLXTrainer):
                     grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
                 grad = self._apply_coupled_weight_decay(model, grad)
                 self._apply_manual_weight_decay(model, optimizer, grad)
-                self._set_optimizer_lr_for_step(optimizer, step)
                 optimizer.update(model, grad)
                 mx.eval(model.parameters(), optimizer.state)
 
