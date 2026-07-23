@@ -106,6 +106,7 @@ jobs:
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_mlx_finetune_last_n_layers.py \
+            tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
             -v
 

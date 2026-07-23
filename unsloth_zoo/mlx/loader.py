@@ -2148,16 +2148,30 @@ def _reject_unsupported_hf_quantization_fields(config_dict):
     allowed_defaults = {
         "bnb_4bit_compute_dtype": ("float32", None),
         "bnb_4bit_quant_type": ("fp4", None),
-        "bnb_4bit_use_double_quant": (False, None),
         "bnb_4bit_quant_storage": ("uint8", None),
         "llm_int8_threshold": (6.0, None),
         "llm_int8_skip_modules": (None, [], {}),
         "llm_int8_enable_fp32_cpu_offload": (False, None),
         "llm_int8_has_fp16_weight": (False, None),
     }
+    # bnb_4bit_use_double_quant is intentionally NOT rejected outright: nested
+    # (double-quantized) checkpoints load via the bnb dequant path, which
+    # reconstructs the nested absmax exactly, and as an explicit kwarg it is
+    # advisory only (MLX applies its own affine quantization). The value is
+    # still type-checked here, so a malformed spelling (e.g. the string "true")
+    # fails loud instead of being silently ignored -- accepting the field must
+    # not mean accepting anything at all. Every other bnb-specific field below
+    # still fails loud so users are not silently misconfigured.
+    double_quant = config_dict.get("bnb_4bit_use_double_quant", None)
+    if double_quant is not None and not isinstance(double_quant, bool):
+        raise ValueError(
+            "Unsloth: bnb_4bit_use_double_quant must be a bool (True or False), "
+            f"got {double_quant!r}. Nested/double-quantized checkpoints are "
+            "supported on the MLX path; only this value is invalid."
+        )
     for key in (
         "bnb_4bit_compute_dtype", "bnb_4bit_quant_type",
-        "bnb_4bit_use_double_quant", "bnb_4bit_quant_storage",
+        "bnb_4bit_quant_storage",
         "llm_int8_threshold", "llm_int8_skip_modules",
         "llm_int8_enable_fp32_cpu_offload", "llm_int8_has_fp16_weight",
     ):
@@ -3343,9 +3357,11 @@ def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     scaled = groups / denom
     indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
     # Only simulate the nested (double-quantized) absmax when double quant is
-    # requested. The accepted BitsAndBytesConfig path rejects
-    # bnb_4bit_use_double_quant=True, and CUDA bitsandbytes dequantizes plain
-    # NF4 with the raw absmax, so default NF4 must keep un-nested scales.
+    # requested. This use_double_quant branch is a dead diagnostic path: real
+    # double-quant checkpoints are reconstructed by bitsandbytes' own
+    # .dequantize() on the bnb load path, not here. CUDA bitsandbytes
+    # dequantizes plain NF4 with the raw absmax, so default NF4 must keep
+    # un-nested scales.
     if use_double_quant:
         absmax = _bnb_nested_absmax(absmax.reshape((-1,))).reshape((-1, 1))
     dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
