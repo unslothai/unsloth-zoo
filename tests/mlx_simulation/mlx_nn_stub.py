@@ -143,6 +143,32 @@ class Module:
                         sub_prefix = f"{prefix}.{attr_name}.{k}" if prefix else f"{attr_name}.{k}"
                         yield from item.named_modules(sub_prefix)
 
+    def __contains__(self, key):
+        """MLX's Module derives from dict, so ``"bias" in module`` is valid on
+        any module and checks the parameter/child entry. Mirror that here by
+        answering for tensor- or Module-valued attributes; subclasses whose
+        parameters live on a wrapped torch module (Linear) override this."""
+        value = getattr(self, key, None)
+        return isinstance(value, (torch.Tensor, Module))
+
+    def children(self):
+        """Direct sub-structure keyed by attribute name, mirroring MLX's
+        ``Module.children()``: Module-valued attributes map to the Module,
+        list/dict containers of Modules map to the container itself (MLX
+        returns the nested structure; consumers type-check the values, so
+        containers fall through their exact-type filters unchanged)."""
+        out = {}
+        for attr_name, attr_val in vars(self).items():
+            if isinstance(attr_val, Module):
+                out[attr_name] = attr_val
+            elif isinstance(attr_val, (list, tuple)):
+                if any(isinstance(item, Module) for item in attr_val):
+                    out[attr_name] = attr_val
+            elif isinstance(attr_val, dict):
+                if any(isinstance(item, Module) for item in attr_val.values()):
+                    out[attr_name] = attr_val
+        return out
+
     def freeze(self, *, recurse=True, keys=None):
         return self
 
