@@ -7657,6 +7657,14 @@ _MODEL_WEIGHT_SUFFIXES = (
     ".pth",
 )
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+# AutoGPTQ ships quantize_config.json; AutoAWQ ships quant_config.json. Both
+# describe the packed .qweight/.qzeros layout of the *source* repo. A merged
+# save always emits MLX-format weights (dense fp16 or MLX affine, never the
+# AutoGPTQ/AutoAWQ packing), so copying these sidecars from a GPTQ/AWQ source
+# would leave a stale packed-quant descriptor next to unpacked weights and let a
+# downstream loader mis-detect the export as still packed (mirrors the dense
+# checkpoint strip in loader._is_dropped_dequant_sidecar).
+_PACKED_QUANT_SIDECARS = frozenset({"quantize_config.json", "quant_config.json"})
 
 
 def _copy_source_sidecars(src_path, path):
@@ -7671,6 +7679,8 @@ def _copy_source_sidecars(src_path, path):
             continue
         name = source.name
         if name in _CORE_SAVE_FILENAMES:
+            continue
+        if name in _PACKED_QUANT_SIDECARS:
             continue
         if name.startswith("model-") or name.startswith("pytorch_model"):
             continue
