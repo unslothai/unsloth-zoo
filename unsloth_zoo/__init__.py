@@ -390,7 +390,9 @@ if not _SKIP_GPU_INIT:
         _alloc_key = "PYTORCH_ALLOC_CONF" if IS_TORCH_2_10_OR_NEWER else "PYTORCH_CUDA_ALLOC_CONF"
         # Promotion above can re-add expandable_segments (only cleaned for standby/ROCm); strip it.
         remove_expandable_segments(_alloc_key)
-        if os.environ.get(_alloc_key, "").strip() == "":
+        # Only fill when absent. An explicit empty value is a user opt-out
+        # (gradient_checkpointing.py advises PYTORCH_CUDA_ALLOC_CONF="").
+        if _alloc_key not in os.environ:
             os.environ[_alloc_key] = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
         del _alloc_key
 

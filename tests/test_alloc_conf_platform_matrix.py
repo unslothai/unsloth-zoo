@@ -45,7 +45,18 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _CHILD = textwrap.dedent(
     """
-    import os, json, importlib.metadata as _m
+    import os, sys, types, json, importlib.metadata as _m, importlib.util, importlib.machinery
+    # unsloth_zoo.__init__ requires find_spec("unsloth"); stub it so this fresh
+    # subprocess is self-contained even when unsloth is not installed.
+    try:
+        _has_unsloth = importlib.util.find_spec("unsloth") is not None
+    except Exception:
+        _has_unsloth = False
+    if not _has_unsloth:
+        _u = types.ModuleType("unsloth")
+        _u.__spec__ = importlib.machinery.ModuleSpec("unsloth", loader=None)
+        _u.__path__ = []
+        sys.modules["unsloth"] = _u
     _real = _m.version
     _fake_torch = os.environ.pop("_FAKE_TORCH_VERSION", "") or None
     def _version(name, *a, **k):
@@ -60,15 +71,14 @@ _CHILD = textwrap.dedent(
     # DEVICE_TYPE / is_hip (which gate the fallback) are what the block reads.
     _fake_dev = os.environ.pop("_FAKE_DEVICE", "") or None
     if _fake_dev:
-        import sys as _sys, types as _types
-        _dt = _types.ModuleType("unsloth_zoo.device_type")
+        _dt = types.ModuleType("unsloth_zoo.device_type")
         _dt.is_hip = lambda: _fake_dev == "hip"
         _dt.get_device_type = lambda: _fake_dev
         _dt.DEVICE_TYPE = _fake_dev
         _dt.DEVICE_TYPE_TORCH = "cuda"
         _dt.DEVICE_COUNT = 1
         _dt.ALLOW_PREQUANTIZED_MODELS = True
-        _sys.modules["unsloth_zoo.device_type"] = _dt
+        sys.modules["unsloth_zoo.device_type"] = _dt
     import unsloth_zoo  # runs the import-time allocator block
     print("RESULT:" + json.dumps(
         {k: os.environ.get(k) for k in
@@ -85,6 +95,7 @@ def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
     env = {k: v for k, v in os.environ.items() if k not in _WIPE and k != "_FAKE_TORCH_VERSION"}
     env["_FAKE_TORCH_VERSION"] = torch_version
     env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", "0")
+    env.setdefault("UNSLOTH_ALLOW_CPU", "1")   # import unsloth_zoo without a real GPU
     env["PYTHONPATH"] = _REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     if wsl:
         env["WSL_DISTRO_NAME"] = "Ubuntu"
@@ -207,6 +218,18 @@ class TestUserPrecedence:
         conf = _conf(torch_version="2.10.0", wsl=True,
                      preset={"PYTORCH_ALLOC_CONF": "expandable_segments:True"})
         assert conf["PYTORCH_ALLOC_CONF"] == ROUNDUP, conf
+
+    def test_explicit_empty_preserved_2_10(self):
+        # An explicit empty value is a user opt-out (gradient_checkpointing.py
+        # advises it); do not overwrite it with the roundup fallback.
+        conf = _conf(torch_version="2.10.0", wsl=True,
+                     preset={"PYTORCH_ALLOC_CONF": ""})
+        assert conf["PYTORCH_ALLOC_CONF"] == "", conf
+
+    def test_explicit_empty_legacy_preserved_2_9(self):
+        conf = _conf(torch_version="2.9.1", wsl=True,
+                     preset={"PYTORCH_CUDA_ALLOC_CONF": ""})
+        assert conf["PYTORCH_CUDA_ALLOC_CONF"] == "", conf
 
 
 # --- opt-out and vLLM standby ----------------------------------------------
