@@ -201,6 +201,7 @@ from .utils import (
     _get_text_model,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
+    _safe_token_denominator,
 )
 from .compile import (
     build_compile_policy,
@@ -608,7 +609,7 @@ class MLXTrainingConfig:
     eval_steps: int = 0  # 0 = disabled
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
-    greater_is_better: bool = False
+    greater_is_better: bool | None = None  # None: infer direction from the metric name (HF parity)
     early_stopping_patience: int = 0  # 0 = disabled
     neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
 
@@ -970,6 +971,18 @@ class MLXTrainer:
         bare name ("loss") gets the eval_ prefix eval metric keys carry."""
         name = getattr(self.args, "metric_for_best_model", None) or "eval_loss"
         return name if name.startswith("eval_") else f"eval_{name}"
+
+    def _resolved_greater_is_better(self):
+        """greater_is_better with HF-style inference when left unset (None):
+        metrics ending in loss/perplexity are lower-is-better, everything else
+        (e.g. mean_token_accuracy) is higher-is-better. An explicit True/False
+        always wins. Mirrors transformers TrainingArguments, so exposing an
+        accuracy metric for metric_for_best_model does not silently minimize it."""
+        explicit = getattr(self.args, "greater_is_better", None)
+        if explicit is not None:
+            return bool(explicit)
+        name = self._resolved_best_metric_name().lower()
+        return not (name.endswith("loss") or name.endswith("perplexity"))
 
     def _train_dataset_for_batches(self):
         """Return the internal dataset used for MLX batch construction."""
@@ -1776,10 +1789,11 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
-    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
+    def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False, want_accuracy=False):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        correct_total = None
         iterator = iter(eval_batches)
 
         while True:
@@ -1796,16 +1810,41 @@ class MLXTrainer:
             if not failed and not self.stop_requested:
                 try:
                     if is_vlm:
-                        loss, ntoks = loss_fn(self.model, batch_data)
+                        if want_accuracy:
+                            loss, ntoks, c = loss_fn(
+                                self.model, batch_data, return_correct=True,
+                            )
+                        else:
+                            loss, ntoks = loss_fn(self.model, batch_data)
+                            c = None
                     else:
                         batch, lengths, labels = batch_data
-                        loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                        if want_accuracy:
+                            loss, ntoks, c = loss_fn(
+                                self.model, batch, lengths, labels,
+                                return_correct=True,
+                            )
+                        else:
+                            loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                            c = None
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
                     # distributed all-sum. mx.where never selects the NaN branch.
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
-                    mx.eval(all_losses, ntokens)
+                    if c is not None:
+                        correct_total = (
+                            c if correct_total is None else correct_total + c
+                        )
+                    # Materialize the accuracy numerator with the loss and token
+                    # totals. Leaving correct_total lazy keeps every batch's
+                    # argmax(logits) graph alive until the final metric, so eval
+                    # memory would grow with the whole eval set (unlike the loss
+                    # and token totals, which are evaluated each batch).
+                    if correct_total is None:
+                        mx.eval(all_losses, ntokens)
+                    else:
+                        mx.eval(all_losses, ntokens, correct_total)
                 except Exception as exc:
                     failed = True
                     error = exc
@@ -1819,7 +1858,7 @@ class MLXTrainer:
             if should_stop:
                 break
 
-        return all_losses, ntokens
+        return all_losses, ntokens, correct_total
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
@@ -1829,18 +1868,29 @@ class MLXTrainer:
         """
         self.model.eval()
         metrics = {}
+        correct_total = None
         if isinstance(eval_batches, dict):
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
             for split_name, split_batches in eval_batches.items():
-                split_losses, split_tokens = self._evaluate_batch_totals(
-                    split_batches, loss_fn, is_vlm=is_vlm,
+                split_losses, split_tokens, split_correct = self._evaluate_batch_totals(
+                    split_batches, loss_fn, is_vlm=is_vlm, want_accuracy=True,
                 )
                 split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
                 split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
                 all_losses += split_losses
                 ntokens += split_tokens
-                mx.eval(all_losses, ntokens)
+                # Accumulate the raw (pre-reduce) accuracy numerator across
+                # splits; it is rank-reduced once after the loop, so dict eval
+                # reports eval_mean_token_accuracy like the single-stream path.
+                if split_correct is not None:
+                    correct_total = (
+                        split_correct if correct_total is None
+                        else correct_total + split_correct
+                    )
+                    mx.eval(all_losses, ntokens, correct_total)
+                else:
+                    mx.eval(all_losses, ntokens)
                 split_loss = (
                     (split_losses / split_tokens).item()
                     if split_tokens.item() > 0 else 0.0
@@ -1852,17 +1902,44 @@ class MLXTrainer:
                 if self._distributed_should_stop():
                     break
         else:
-            all_losses, ntokens = self._evaluate_batch_totals(
-                eval_batches, loss_fn, is_vlm=is_vlm,
+            all_losses, ntokens, correct_total = self._evaluate_batch_totals(
+                eval_batches, loss_fn, is_vlm=is_vlm, want_accuracy=True,
             )
             all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
             ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
+        # DDP: reduce the token-accuracy numerator across ranks before dividing.
+        # ntokens above is already the global token denominator, so both
+        # correct_total and its denominator are rank-summed. The decision to run
+        # this collective must be identical on every rank: correct_total is None
+        # on a rank that produced no numerator (e.g. an external stop set
+        # stop_requested before its first eval batch, so it skipped every
+        # compute while peers accumulated a real numerator). Gating the all_sum
+        # on the per-rank `correct_total is not None` would let only the peers
+        # call it and deadlock DDP. Reduce a rank-wide "any rank has a numerator"
+        # flag first (an unconditional collective), then have every rank
+        # all-sum, so a None rank contributes zero and the collective stays in
+        # lockstep. Shared by both the dict and single-stream paths.
+        if self._distributed_any_flag(correct_total is not None):
+            numerator = (
+                mx.array(0.0, dtype=mx.float32)
+                if correct_total is None
+                else correct_total.astype(mx.float32)
+            )
+            correct_total = self._distributed_all_sum(numerator, stream=mx.cpu)
+        else:
+            correct_total = None
 
         self.model.train()
         avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
         perplexity = math.exp(min(avg_loss, 100))
         metrics["eval_loss"] = avg_loss
         metrics["eval_perplexity"] = perplexity
+        if correct_total is not None:
+            token_denominator = _safe_token_denominator(ntokens)
+            mx.eval(correct_total, token_denominator)
+            metrics["eval_mean_token_accuracy"] = (
+                correct_total / token_denominator
+            ).item()
         self._last_eval_metrics = metrics
         return avg_loss, perplexity
 
@@ -3479,7 +3556,7 @@ class MLXTrainer:
                             f"metrics; available: {sorted(_em)}"
                         )
                     _cur = _em[_metric_name]
-                    _greater = bool(getattr(args, "greater_is_better", False))
+                    _greater = self._resolved_greater_is_better()
                     _improved = (
                         _cur == _cur  # reject NaN: a diverged eval must never become "best"
                         and (
