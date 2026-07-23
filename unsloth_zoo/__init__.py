@@ -224,12 +224,15 @@ if not _SKIP_GPU_INIT:
     torch_version = str(re.match(r"[0-9\.]{3,}", torch_version_raw).group(0)).split(".")
     major_torch, minor_torch = torch_version[0], torch_version[1]
     major_torch, minor_torch = int(major_torch), int(minor_torch)
-    IS_TORCH_2_9_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 9)
+    # Unified PYTORCH_ALLOC_CONF is only read from torch 2.10; <= 2.9.x reads the legacy vars.
+    IS_TORCH_2_10_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 10)
     IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
+    # expandable_segments is unsupported on Windows/WSL.
+    IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
 
     # Reduce VRAM fragmentation and optimize memory pinning
     if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
-        if IS_TORCH_2_9_OR_NEWER:
+        if IS_TORCH_2_10_OR_NEWER:
             if "PYTORCH_ALLOC_CONF" not in os.environ:
                 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         else:
@@ -296,16 +299,12 @@ if not _SKIP_GPU_INIT:
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
         delete_key("PYTORCH_HIP_ALLOC_CONF")
         delete_key("PYTORCH_ALLOC_CONF")
-    elif bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
-        # Expandable segments does NOT work on WSL
-        delete_key("PYTORCH_CUDA_ALLOC_CONF")
-        delete_key("PYTORCH_HIP_ALLOC_CONF")
-        delete_key("PYTORCH_ALLOC_CONF")
-    elif os.name == 'nt':
-        # Expandable segments does NOT work on Windows
-        delete_key("PYTORCH_CUDA_ALLOC_CONF")
-        delete_key("PYTORCH_HIP_ALLOC_CONF")
-        delete_key("PYTORCH_ALLOC_CONF")
+    elif IS_WSL_OR_WINDOWS:
+        # Strip unsupported expandable_segments but keep other user config; a
+        # roundup fallback is applied below (unslothai/unsloth#7203).
+        remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
     # IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
     # HIP allocator settings can be read during torch initialization.
@@ -340,8 +339,8 @@ if not _SKIP_GPU_INIT:
     )
     IS_HIP_RUNTIME = (DEVICE_TYPE == "hip") or bool(is_hip())
 
-    # Torch >= 2.9 uses PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
-    if IS_TORCH_2_9_OR_NEWER:
+    # Torch >= 2.10 reads PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
+    if IS_TORCH_2_10_OR_NEWER:
         # Preserve explicit legacy allocator settings when user did not directly set PYTORCH_ALLOC_CONF.
         if not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF:
             promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
@@ -357,8 +356,8 @@ if not _SKIP_GPU_INIT:
 
     # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
     if IS_HIP_RUNTIME:
-        if IS_TORCH_2_9_OR_NEWER:
-            # PyTorch >= 2.9 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
+        if IS_TORCH_2_10_OR_NEWER:
+            # PyTorch >= 2.10 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
             remove_expandable_segments("PYTORCH_ALLOC_CONF")
             delete_key("PYTORCH_CUDA_ALLOC_CONF")
             delete_key("PYTORCH_HIP_ALLOC_CONF")
@@ -373,9 +372,27 @@ if not _SKIP_GPU_INIT:
             remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
             remove_expandable_segments("PYTORCH_ALLOC_CONF")
             delete_key("PYTORCH_CUDA_ALLOC_CONF")
-    elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not IS_TORCH_2_9_OR_NEWER:
+    elif DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME and not IS_TORCH_2_10_OR_NEWER:
         delete_key("PYTORCH_HIP_ALLOC_CONF")
         delete_key("PYTORCH_ALLOC_CONF")
+
+    # Windows/WSL lack expandable_segments, so the branches above leave long context
+    # training with no fragmentation mitigation (cudaMalloc retry storms / OOM). Give
+    # NVIDIA CUDA a roundup_power2_divisions fallback instead (unslothai/unsloth#7203).
+    if (
+        IS_WSL_OR_WINDOWS
+        and DEVICE_TYPE == "cuda" and not IS_HIP_RUNTIME
+        and os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0"
+        and os.environ.get("UNSLOTH_DISABLE_ALLOC_FALLBACK", "0") == "0"
+        and not (major_torch == 2 and minor_torch < 2)
+    ):
+        # torch <= 2.9.x reads the legacy var; >= 2.10 reads the unified one.
+        _alloc_key = "PYTORCH_ALLOC_CONF" if IS_TORCH_2_10_OR_NEWER else "PYTORCH_CUDA_ALLOC_CONF"
+        # Promotion above can re-add expandable_segments (only cleaned for standby/ROCm); strip it.
+        remove_expandable_segments(_alloc_key)
+        if os.environ.get(_alloc_key, "").strip() == "":
+            os.environ[_alloc_key] = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
+        del _alloc_key
 
     # CCE fails on Torch 2.8 and above
     # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
@@ -431,7 +448,7 @@ if not _SKIP_GPU_INIT:
                     except Exception: pass  # best-effort; some builds lack the setter
                 del _pref
         del _torch, _rocm_arch, _sys, _user_blas, _user_wants_lt
-    del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_9_OR_NEWER, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
+    del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_10_OR_NEWER, IS_WSL_OR_WINDOWS, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
     del clean_expandable_segments_value
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
