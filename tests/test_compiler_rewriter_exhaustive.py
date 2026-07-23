@@ -115,6 +115,46 @@ def test_compiler_higher_precision_softmax_idempotency_lookahead():
         )
 
 
+def test_compiler_forwarding_parameters_follow_emitted_definition():
+    """compiler.py:create_new_function: generated wrapper calls must use the
+    emitted wrapper signature, not a decorator-relaxed ``*args`` signature."""
+    import ast
+    import inspect
+    import textwrap
+    from pathlib import Path
+
+    compiler_path = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "compiler.py"
+    tree = ast.parse(compiler_path.read_text(encoding="utf-8"))
+    wanted = {
+        "_build_forwarding_parameters",
+        "_build_forwarding_parameters_from_definition",
+    }
+    helper_nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    namespace = {"ast": ast, "inspect": inspect, "textwrap": textwrap}
+    exec(compile(ast.Module(body=helper_nodes, type_ignores=[]), str(compiler_path), "exec"), namespace)
+    build = namespace["_build_forwarding_parameters_from_definition"]
+    definition = """
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            cache_params: Cache | None = None,
+            attention_mask: torch.Tensor | None = None,
+            **kwargs: Unpack[TransformersKwargs],
+        ):
+    """
+
+    parameters = build(definition)
+
+    assert "*args" not in parameters
+    assert parameters == (
+        "self, hidden_states=hidden_states, cache_params=cache_params, "
+        "attention_mask=attention_mask, **kwargs"
+    )
+
+
 def test_compiler_fix_rotary_embedding_cos_to_dtype_pattern():
     """compiler.py:510-517 fix_rotary_embedding_dtype (UNSLOTH_FORCE_CUSTOM_DTYPE
     -gated): pin that some rotary cos/sin cast site exists."""
