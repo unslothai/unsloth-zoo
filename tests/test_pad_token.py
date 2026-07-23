@@ -189,6 +189,48 @@ def test_whisper_does_not_use_config_pad_when_it_equals_eos():
         fix_pad_token(tok, model_config=cfg)
 
 
+def test_whisper_does_not_use_config_pad_when_it_is_in_eos_list():
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": "whisper",
+            "vocab_size": 51866,
+            "pad_token_id": 50256,
+            "eos_token_id": [50257, 50256],
+        },
+    )()
+
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)
+
+
+def test_whisper_non_string_model_type_uses_generic_fallback():
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": ["whisper"],
+            "vocab_size": 51866,
+            "pad_token_id": 50256,
+            "eos_token_id": 50257,
+        },
+    )()
+
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)
+
+
 def test_missing_pad_picks_reserved():
     tok = FakeTokenizer({"<|eot_id|>": 1, "<|reserved_special_token_0|>": 5},
                         pad_token=None, eos_token="<|eot_id|>")

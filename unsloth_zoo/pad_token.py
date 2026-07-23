@@ -130,7 +130,8 @@ def _try_whisper_config_pad(inner, cfg, reason, vocab_size):
     """Use Whisper's existing config-declared pad token when it is safe."""
     if reason != "equals_eos" or cfg is None:
         return None
-    if (getattr(cfg, "model_type", "") or "").lower() != "whisper":
+    model_type = getattr(cfg, "model_type", "")
+    if not isinstance(model_type, str) or model_type.lower() != "whisper":
         return None
 
     pad_token_id = getattr(cfg, "pad_token_id", None)
@@ -139,14 +140,17 @@ def _try_whisper_config_pad(inner, cfg, reason, vocab_size):
     if vocab_size is None or pad_token_id >= vocab_size:
         return None
 
-    eos_token_ids = {
-        token_id
-        for token_id in (
-            getattr(cfg, "eos_token_id", None),
-            getattr(inner, "eos_token_id", None),
-        )
-        if isinstance(token_id, int)
-    }
+    eos_token_ids = set()
+    for eos_token_id in (
+        getattr(cfg, "eos_token_id", None),
+        getattr(inner, "eos_token_id", None),
+    ):
+        if isinstance(eos_token_id, int):
+            eos_token_ids.add(eos_token_id)
+        elif isinstance(eos_token_id, (list, tuple, set)):
+            eos_token_ids.update(
+                token_id for token_id in eos_token_id if isinstance(token_id, int)
+            )
     if pad_token_id in eos_token_ids:
         return None
 
