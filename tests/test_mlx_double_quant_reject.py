@@ -39,12 +39,21 @@ def _reject():
 @pytest.mark.parametrize("cfg", [
     {"bnb_4bit_use_double_quant": True},
     {"bnb_4bit_use_double_quant": False},
+    {"bnb_4bit_use_double_quant": None},           # absent-equivalent, accepted
     {"bnb_4bit_quant_type": "fp4", "bnb_4bit_use_double_quant": True},
     {"load_in_4bit": True, "bnb_4bit_use_double_quant": True},
 ])
 def test_double_quant_is_accepted(cfg):
-    """double_quant (True or False) no longer triggers rejection."""
+    """double_quant (True, False, or None) no longer triggers rejection."""
     _reject()(cfg)  # must not raise
+
+
+@pytest.mark.parametrize("bad_value", ["true", "false", 0, 1, 1.0, [], {"x": 1}])
+def test_non_bool_double_quant_fails_loud(bad_value):
+    """A non-bool value raises loud and names the field (0/1 are ints, not bools)."""
+    with pytest.raises(ValueError) as exc:
+        _reject()({"bnb_4bit_use_double_quant": bad_value})
+    assert "bnb_4bit_use_double_quant" in str(exc.value)
 
 
 def test_double_quant_not_in_error_message():
