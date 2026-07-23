@@ -552,7 +552,7 @@ def test_ddp_text_shape_preparation_failure_is_coordinated_before_setup():
     ]
 
 
-def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged():
+def test_text_shape_guard_dispositions_for_vlm_streaming_and_clipped_accum():
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (
         MLXTrainingConfig,
@@ -560,21 +560,12 @@ def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged(
     )
 
     cases = (
-        (True, None, MLXTrainingConfig(), "vlm", True),
-        (False, iter(()), MLXTrainingConfig(), "streaming", True),
-        (
-            False,
-            None,
-            MLXTrainingConfig(
-                gradient_accumulation_steps=2,
-                max_grad_norm=1.0,
-                compile_max_variants=1,
-            ),
-            "compile_ineligible_global_norm",
-            False,
-        ),
+        (True, None, MLXTrainingConfig(), "vlm"),
+        (False, iter(()), MLXTrainingConfig(), "streaming"),
+        (False, None, MLXTrainingConfig(gradient_accumulation_steps=2,
+                                        max_grad_norm=1.0), None),
     )
-    for is_vlm, batch_iter, args, reason, allowed in cases:
+    for is_vlm, batch_iter, args, reason in cases:
         batches = _make_shape_guard_text_plan((10, 30), labeled=False)
         shape_plan, report, compile_allowed, _ = _plan_single_process_text_shapes(
             batches,
@@ -585,10 +576,13 @@ def test_text_shape_guard_leaves_vlm_streaming_and_ineligible_compile_unchanged(
             distributed_world_size=1,
             compile_policy=build_compile_policy(args=args),
         )
-        assert shape_plan is None
-        assert (report.action, report.reason) == ("not_applicable", reason)
-        assert compile_allowed is allowed
-        assert batches[0][0].shape == (1, 10)
+        assert compile_allowed is True
+        if reason is None:
+            assert shape_plan is not None
+        else:
+            assert shape_plan is None
+            assert (report.action, report.reason) == ("not_applicable", reason)
+            assert batches[0][0].shape == (1, 10)
 
 
 def test_ddp_text_shape_guard_uses_local_phases_and_rank_local_endpoints():
@@ -1251,13 +1245,12 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
 def test_global_norm_clip_reduces_in_float32():
     import inspect
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32
+    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
 
-    source = inspect.getsource(_clip_grad_norm_fp32)
-
-    assert "g.astype(mx.float32)" in source
-    assert "scale.astype(g.dtype)" in source
-    assert "tree_reduce" in source
+    norm_source = inspect.getsource(_global_grad_norm_fp32)
+    assert "g.astype(mx.float32)" in norm_source
+    assert "tree_reduce" in norm_source
+    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
 
 
 @pytest.mark.parametrize(
