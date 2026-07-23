@@ -134,6 +134,21 @@ def test_kto_num_train_epochs_scales_steps(tmp_path):
 
 
 @metal_only
+def test_kto_resets_run_state_between_train_calls(tmp_path):
+    # Re-running the same trainer must not accumulate stale loss/KL history, or
+    # the MLXTrainOutput mean would blend the two runs.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
+                            args=_config(output_dir=str(tmp_path), max_steps=3))
+    trainer.train()
+    assert len(trainer._train_loss_history) == 3
+    trainer.train()
+    assert len(trainer._train_loss_history) == 3, "history should reset, not append"
+    assert len(trainer._kl_history) == 3
+
+
+@metal_only
 def test_kto_rejects_resume_from_checkpoint(tmp_path):
     # Resume is unimplemented; a resumed call would restart and overwrite, so
     # it must raise rather than silently restart.

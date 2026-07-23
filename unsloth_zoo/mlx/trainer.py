@@ -4358,6 +4358,19 @@ class MLXKTOTrainer(MLXTrainer):
         # SFT: the KTO loss is a per-example preference objective, not a
         # per-token mean, so each micro-batch contributes equally. grad_accum is
         # resolved above (it also sets total_steps).
+
+        # Enter training mode so training-gated modules (e.g. LoRA dropout) are
+        # active, in case the model was left in eval mode by a prior
+        # generation/evaluation. The reference forward disables adapters by
+        # scale, not by eval mode, so this does not affect it.
+        model.train()
+        # Reset per-run metric state so re-running the same trainer instance
+        # does not average this run's loss/KL against the previous run's
+        # (train() reports the mean over _train_loss_history).
+        self._train_loss_history = []
+        self._kl_history = []
+        self._global_step = 0
+
         step = 0
         micro = 0            # micro-batches accumulated in the current window
         acc_grad = None      # running mean of the window's gradients
