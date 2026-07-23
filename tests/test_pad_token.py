@@ -65,6 +65,14 @@ class FakeTokenizer:
         ids = [self._vocab[text]] if text in self._vocab else [0, 1]
         return type("Enc", (), {"input_ids": ids})()
 
+    def convert_ids_to_tokens(self, token_id):
+        return next(
+            (token for token, index in self._vocab.items() if index == token_id), None
+        )
+
+    def convert_tokens_to_ids(self, token):
+        return self._vocab.get(token)
+
     def add_special_tokens(self, mapping):
         tok = mapping["pad_token"]
         if tok not in self._vocab:
@@ -120,6 +128,65 @@ def test_pad_equals_eos_picks_distinct_reserved():
     res = fix_pad_token(tok)
     assert res["reason"] == "equals_eos" and tok.pad_token == "<pad>"
     assert tok.pad_token != tok.eos_token
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_whisper_uses_existing_config_pad_token(wrapped):
+    # Whisper large-v3's tokenizer aliases pad/eos/unk to 50257 while its model
+    # config declares the existing empty token at 50256 as pad. Align to the
+    # config without adding a random token or resizing the vocabulary.
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    tok.unk_token = "<|endoftext|>"
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": "whisper",
+            "vocab_size": 51866,
+            "pad_token_id": 50256,
+            "eos_token_id": 50257,
+        },
+    )()
+    tokenizer = type("Processor", (), {"tokenizer": tok})() if wrapped else tok
+
+    res = fix_pad_token(tokenizer, model_config=cfg)
+
+    assert res == {
+        "changed": True,
+        "reason": "equals_eos",
+        "old_pad": "<|endoftext|>",
+        "new_pad": "",
+        "added": False,
+    }
+    assert tok.pad_token == ""
+    assert tok.pad_token_id == cfg.pad_token_id
+    assert tok.pad_token_id != tok.eos_token_id
+    assert len(tok.get_vocab()) == 2
+
+
+def test_whisper_does_not_use_config_pad_when_it_equals_eos():
+    tok = FakeTokenizer(
+        {"<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": "whisper",
+            "vocab_size": 51866,
+            "pad_token_id": 50257,
+            "eos_token_id": 50257,
+        },
+    )()
+
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)
 
 
 def test_missing_pad_picks_reserved():

@@ -126,6 +126,58 @@ def _classify_bad_pad(inner, vocab_size):
     return None
 
 
+def _try_whisper_config_pad(inner, cfg, reason, vocab_size):
+    """Use Whisper's existing config-declared pad token when it is safe."""
+    if reason != "equals_eos" or cfg is None:
+        return None
+    if (getattr(cfg, "model_type", "") or "").lower() != "whisper":
+        return None
+
+    pad_token_id = getattr(cfg, "pad_token_id", None)
+    if not isinstance(pad_token_id, int) or pad_token_id < 0:
+        return None
+    if vocab_size is None or pad_token_id >= vocab_size:
+        return None
+
+    eos_token_ids = {
+        token_id
+        for token_id in (
+            getattr(cfg, "eos_token_id", None),
+            getattr(inner, "eos_token_id", None),
+        )
+        if isinstance(token_id, int)
+    }
+    if pad_token_id in eos_token_ids:
+        return None
+
+    convert_ids_to_tokens = getattr(inner, "convert_ids_to_tokens", None)
+    convert_tokens_to_ids = getattr(inner, "convert_tokens_to_ids", None)
+    if not callable(convert_ids_to_tokens) or not callable(convert_tokens_to_ids):
+        return None
+    try:
+        candidate = convert_ids_to_tokens(pad_token_id)
+        # Whisper large-v3 reserves an existing empty token at config pad id 50256.
+        # Keep this repair narrow instead of promoting an arbitrary model token.
+        if candidate != "" or convert_tokens_to_ids(candidate) != pad_token_id:
+            return None
+    except Exception:
+        return None
+
+    old_pad = getattr(inner, "pad_token", None)
+    try:
+        inner.pad_token = candidate
+        if getattr(inner, "pad_token_id", None) != pad_token_id:
+            inner.pad_token = old_pad
+            return None
+    except Exception:
+        try:
+            inner.pad_token = old_pad
+        except Exception:
+            pass
+        return None
+    return candidate
+
+
 def _single_token_id(inner, token, vocab_size):
     """Return token's id if it encodes to exactly one in-vocab id, else None."""
     try:
@@ -221,6 +273,23 @@ def fix_pad_token(
         return result
     result["reason"] = reason
     result["old_pad"] = getattr(inner, "pad_token", None)
+
+    whisper_pad = _try_whisper_config_pad(inner, cfg, reason, vocab_size)
+    if whisper_pad is not None:
+        result.update(changed=True, new_pad=whisper_pad, added=False)
+        pad_token_id = getattr(inner, "pad_token_id", None)
+        if model is not None:
+            model_cfg = getattr(model, "config", None)
+            if model_cfg is not None:
+                model_cfg.update({"pad_token_id": pad_token_id})
+            if getattr(model, "generation_config", None) is not None:
+                model.generation_config.update(pad_token_id=pad_token_id)
+        name = _display_name(model, model_config, inner)
+        print(
+            f"Unsloth: {name} had a bad pad_token ({result['old_pad']}). "
+            f"Using model config pad_token_id = {pad_token_id} ({whisper_pad!r})."
+        )
+        return result
 
     new_pad = _find_reserved_pad(inner, eos_token, vocab_size)
     if new_pad is None:
