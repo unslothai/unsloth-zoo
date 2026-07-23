@@ -2542,6 +2542,7 @@ def test_qwen3_vl_training_compile_verified():
 
 
 def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
+    import mlx.core as mx
     import unsloth_zoo.mlx.compile as mc
     upstream = lambda self, input_ids=None, pixel_values=None, **kwargs: "upstream"
     replacement = lambda self, input_ids=None, pixel_values=None, **kwargs: "replacement"
@@ -2552,6 +2553,8 @@ def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
     batched = types.SimpleNamespace(VisionModel=type("V", (), {"_forward_same_grid_batch": lambda self: None}))
     assert mc._paddleocr_vl_has_batched_vision(batched)
     assert mc._gemma3n_language_contract(len) is None
+    assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=700, _idx=188)]) == 700
+    assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=mx.array([650, 700]), _idx=188)]) == 700
 
 
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
