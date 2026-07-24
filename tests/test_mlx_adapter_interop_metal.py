@@ -52,7 +52,8 @@ def base_dir(tmp_path_factory):
     return str(path)
 
 
-def _make_peft_adapter(base_dir, out, dtype=torch.float32, **lora_kwargs):
+def _make_peft_adapter(base_dir, out, dtype=torch.float32,
+                       save_embedding_layers=False, mutate=None, **lora_kwargs):
     model = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=dtype)
     kwargs = dict(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"])
     kwargs.update(lora_kwargs)
@@ -60,13 +61,16 @@ def _make_peft_adapter(base_dir, out, dtype=torch.float32, **lora_kwargs):
     torch.manual_seed(7)
     with torch.no_grad():
         for name, param in wrapped.named_parameters():
-            if "lora_B" in name:
+            if "lora_B" in name or "lora_embedding_A" in name:
                 param.copy_(torch.randn_like(param) * 0.05)
             if "lora_" in name:
                 # peft autocasts adapter params to fp32; force the dtype so
                 # bf16 runs exercise real bf16 tensors.
                 param.data = param.data.to(dtype)
-    wrapped.save_pretrained(out, save_embedding_layers=False)
+    if mutate is not None:
+        with torch.no_grad():
+            mutate(wrapped)
+    wrapped.save_pretrained(out, save_embedding_layers=save_embedding_layers)
     cfg_path = os.path.join(out, "adapter_config.json")
     cfg = json.load(open(cfg_path))
     cfg["base_model_name_or_path"] = base_dir
@@ -102,7 +106,6 @@ def test_format_detection_and_fresh_destination(tmp_path, base_dir):
 
 
 @pytest.mark.parametrize("field,value,match", [
-    ("modules_to_save", ["lm_head"], "modules_to_save"),
     ("target_parameters", ["experts.gate_up_proj"], "expert-parameter"),
     ("alora_invocation_tokens", [1, 2], "aLoRA"),
     ("bias", "all", "bias"),
@@ -417,10 +420,16 @@ def test_save_lora_adapters_peft_format(tmp_path, base_dir):
     np.testing.assert_allclose(
         _peft_logits(reexported), _mlx_logits(model), atol=5e-3,
     )
+    # base_weights_source is inert for a linear-only adapter: no embedding
+    # targets means nothing to source.
     from unsloth_zoo.saving_utils import export_peft_adapter
-    with pytest.raises(ValueError, match="base_weights_source"):
-        export_peft_adapter(str(tmp_path / "m"), str(tmp_path / "n"),
-                            base_weights_source=object())
+    mlx_dir = str(tmp_path / "mlx")
+    save_lora_adapters(model, mlx_dir)
+    sourced = str(tmp_path / "sourced")
+    export_peft_adapter(mlx_dir, sourced, base_weights_source=base_dir)
+    assert set(st_load_file(os.path.join(sourced, PEFT_WEIGHTS_FILE))) == set(
+        st_load_file(os.path.join(out, PEFT_WEIGHTS_FILE))
+    )
 
 
 def test_peft_export_includes_lm_head_on_mirrored_layout(tmp_path, base_dir):
@@ -631,3 +640,153 @@ def test_mixed_lora_dora_save_refused(tmp_path, base_dir):
     for saver in (save_lora_adapters, save_trainable_adapters):
         with pytest.raises(ValueError, match="mixes plain-LoRA and DoRA"):
             saver(model, str(tmp_path / "x"))
+
+
+def test_embedding_lora_genuine_roundtrip(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    wrapped, _ = _make_peft_adapter(
+        base_dir, peft_dir, target_modules=["q_proj", "embed_tokens"],
+        save_embedding_layers="auto",
+    )
+    assert "base_model.model.model.embed_tokens.base_layer.weight" in st_load_file(
+        os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
+    )
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    model, _ = FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
+    emb = dict(model.named_modules())["model.embed_tokens"]
+    assert hasattr(emb, "lora_a") and type(emb).__name__ == "LoRAEmbedding"
+    # The auto-saved base embedding is value-equal here: verified and skipped.
+    assert getattr(model, "_unsloth_full_state_modules", {}) == {}
+    np.testing.assert_allclose(_mlx_logits(model), _peft_logits(wrapped), atol=5e-3)
+
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    out_peft = str(tmp_path / "reexport")
+    save_lora_adapters(model, out_peft, adapter_format="peft")
+    keys = set(st_load_file(os.path.join(out_peft, PEFT_WEIGHTS_FILE)))
+    assert "base_model.model.model.embed_tokens.lora_embedding_A" in keys
+    # No base_weights_source: the auto-saved embedding weights are omitted.
+    assert not any("base_layer" in k for k in keys)
+    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
+    reloaded = peft.PeftModel.from_pretrained(base, out_peft)
+    np.testing.assert_allclose(_peft_logits(reloaded), _peft_logits(wrapped), atol=5e-3)
+
+    # The standalone-converted directory reloads and agrees (its full
+    # state binds under the reload wrappers' inner paths).
+    conv = str(tmp_path / "converted")
+    convert_peft_dir_to_mlx(
+        peft_dir, conv, json.load(open(os.path.join(base_dir, "config.json"))),
+    )
+    mconv, _ = FastMLXModel.from_pretrained(conv, load_in_4bit=False, max_seq_length=64)
+    np.testing.assert_allclose(_mlx_logits(mconv), _peft_logits(wrapped), atol=5e-3)
+
+    # Studio-style emission: source the embedding weights from the base dir.
+    from unsloth_zoo.saving_utils import export_peft_adapter
+    mlx_dir = str(tmp_path / "mlx")
+    save_lora_adapters(model, mlx_dir)
+    sourced = str(tmp_path / "sourced")
+    export_peft_adapter(
+        mlx_dir, sourced, module_types={"model.embed_tokens": "embedding"},
+        base_weights_source=base_dir,
+    )
+    st = st_load_file(os.path.join(sourced, PEFT_WEIGHTS_FILE))
+    torch.testing.assert_close(
+        st["base_model.model.model.embed_tokens.base_layer.weight"],
+        base.get_input_embeddings().weight,
+    )
+
+
+def test_full_state_modules_lifecycle(tmp_path, base_dir):
+    def _mutate(pm):
+        dict(pm.named_modules())["base_model.model.lm_head"].modules_to_save[
+            "default"
+        ].weight += 0.01
+        pm.get_input_embeddings().weight += 0.02
+    peft_dir = str(tmp_path / "peft")
+    wrapped, _ = _make_peft_adapter(
+        base_dir, peft_dir, modules_to_save=["lm_head"],
+        save_embedding_layers=True, mutate=_mutate,
+    )
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    model, _ = FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
+    assert model._unsloth_full_state_modules == {
+        "lm_head": "modules_to_save", "model.embed_tokens": "embedding_auto",
+    }
+    mods = dict(model.named_modules())
+    emb_live = mods["model.embed_tokens"].weight
+    # Applied exactly, up to the loader's own base-dtype cast.
+    assert mx.array_equal(
+        emb_live,
+        mx.array(
+            wrapped.get_input_embeddings().weight.detach().numpy()
+        ).astype(emb_live.dtype),
+    )
+    np.testing.assert_allclose(_mlx_logits(model), _peft_logits(wrapped), atol=5e-3)
+    # modules_to_save is trainable, the replaced embedding is not.
+    from mlx.utils import tree_flatten
+    trainable = dict(tree_flatten(model.trainable_parameters()))
+    assert "lm_head.weight" in trainable
+    assert "model.embed_tokens.weight" not in trainable
+
+    import mlx.optimizers as optim
+    lm_before = mx.array(mods["lm_head"].weight)
+    emb_before = mx.array(mods["model.embed_tokens"].weight)
+    def loss_fn(m):
+        logits = m(mx.array([IDS]))
+        logits = logits.logits if hasattr(logits, "logits") else logits
+        return nn.losses.cross_entropy(logits, mx.array([IDS[1:] + [2]])).mean()
+    _, grads = nn.value_and_grad(model, loss_fn)(model)
+    optim.AdamW(learning_rate=1e-2).update(model, grads)
+    mx.eval(model.parameters())
+    assert not mx.array_equal(mods["lm_head"].weight, lm_before)
+    assert mx.array_equal(mods["model.embed_tokens"].weight, emb_before)
+
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    mlx_dir = str(tmp_path / "mlx")
+    save_lora_adapters(model, mlx_dir)
+    cfg = json.load(open(os.path.join(mlx_dir, "adapter_config.json")))
+    assert cfg["full_state_modules"] == model._unsloth_full_state_modules
+    model2, _ = FastMLXModel.from_pretrained(mlx_dir, load_in_4bit=False, max_seq_length=64)
+    mods2 = dict(model2.named_modules())
+    assert mx.array_equal(mods2["lm_head"].weight, mods["lm_head"].weight)
+    assert mx.array_equal(mods2["model.embed_tokens"].weight, emb_before)
+    assert model2._unsloth_full_state_modules == model._unsloth_full_state_modules
+    tr2 = dict(tree_flatten(model2.trainable_parameters()))
+    assert "lm_head.weight" in tr2
+    assert "model.embed_tokens.weight" not in tr2
+
+    exported = str(tmp_path / "exported")
+    save_lora_adapters(model2, exported, adapter_format="peft")
+    ecfg = json.load(open(os.path.join(exported, "adapter_config.json")))
+    # Reconstructed from origin tags: only the modules_to_save entry.
+    assert ecfg["modules_to_save"] == ["lm_head"]
+    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
+    reloaded = peft.PeftModel.from_pretrained(base, exported, is_trainable=True)
+    m2s_param = dict(reloaded.named_parameters())[
+        "base_model.model.lm_head.modules_to_save.default.weight"
+    ]
+    assert m2s_param.requires_grad
+    np.testing.assert_allclose(
+        m2s_param.detach().numpy(),
+        np.array(mods["lm_head"].weight.astype(mx.float32)), atol=0,
+    )
+    np.testing.assert_allclose(
+        reloaded.get_input_embeddings().weight.detach().to(torch.float32).numpy(),
+        np.array(emb_before.astype(mx.float32)), atol=0,
+    )
+
+
+def test_full_state_shape_mismatch_rejected(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(
+        base_dir, peft_dir, modules_to_save=["lm_head"],
+        mutate=lambda pm: None,
+    )
+    wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
+    tensors = st_load_file(wf)
+    key = "base_model.model.lm_head.weight"
+    tensors[key] = torch.cat([tensors[key], tensors[key][:4]], dim=0)
+    from safetensors.torch import save_file as _st_save
+    _st_save(tensors, wf)
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    with pytest.raises(Exception, match="shape mismatch"):
+        FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
