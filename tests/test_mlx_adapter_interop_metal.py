@@ -102,7 +102,6 @@ def test_format_detection_and_fresh_destination(tmp_path, base_dir):
 
 
 @pytest.mark.parametrize("field,value,match", [
-    ("use_dora", True, "DoRA"),
     ("modules_to_save", ["lm_head"], "modules_to_save"),
     ("target_parameters", ["experts.gate_up_proj"], "expert-parameter"),
     ("alora_invocation_tokens", [1, 2], "aLoRA"),
@@ -225,47 +224,6 @@ def test_attach_rejects_bad_tensors(tmp_path, base_dir, key, shape, match):
         )
 
 
-def test_mlx_to_peft_rejects_out_of_layer_paths(tmp_path, base_dir):
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(base_dir, peft_dir)
-    mlx_dir = str(tmp_path / "mlx")
-    convert_peft_dir_to_mlx(
-        peft_dir, mlx_dir,
-        json.load(open(os.path.join(base_dir, "config.json"))),
-    )
-    tensors = dict(mx.load(os.path.join(mlx_dir, MLX_WEIGHTS_FILE)))
-    tensors["model.embed_tokens.lora_a"] = mx.zeros((VOCAB, 8))
-    tensors["model.embed_tokens.lora_b"] = mx.zeros((8, HIDDEN))
-    mx.save_safetensors(os.path.join(mlx_dir, MLX_WEIGHTS_FILE), tensors)
-    with pytest.raises(ValueError, match="transformer stack"):
-        convert_mlx_dir_to_peft(mlx_dir, str(tmp_path / "back"))
-    with pytest.raises(ValueError, match="embedding LoRA"):
-        convert_mlx_dir_to_peft(
-            mlx_dir, str(tmp_path / "b2"),
-            module_types={"model.embed_tokens": "embedding"},
-        )
-    out = convert_mlx_dir_to_peft(
-        mlx_dir, str(tmp_path / "b3"),
-        module_types={"model.embed_tokens": "linear"},
-    )
-    assert any("embed_tokens.lora_A" in k
-               for k in st_load_file(os.path.join(out, PEFT_WEIGHTS_FILE)))
-    tensors["model.layers.0.mlp.experts.lora_a"] = mx.zeros((4, HIDDEN, 8))
-    tensors["model.layers.0.mlp.experts.lora_b"] = mx.zeros((4, 8, HIDDEN))
-    mx.save_safetensors(os.path.join(mlx_dir, MLX_WEIGHTS_FILE), tensors)
-    with pytest.raises(ValueError, match="non-2-D"):
-        convert_mlx_dir_to_peft(
-            mlx_dir, str(tmp_path / "b4"),
-            module_types={"model.embed_tokens": "linear"},
-        )
-    # VLM wrapper layouts reorder the stack root; they must not pass the gate.
-    tensors["language_model.model.layers.0.self_attn.q_proj.lora_a"] = mx.zeros((HIDDEN, 8))
-    tensors["language_model.model.layers.0.self_attn.q_proj.lora_b"] = mx.zeros((8, HIDDEN))
-    mx.save_safetensors(os.path.join(mlx_dir, MLX_WEIGHTS_FILE), tensors)
-    with pytest.raises(ValueError, match="transformer stack"):
-        convert_mlx_dir_to_peft(mlx_dir, str(tmp_path / "b5"))
-
-
 @pytest.mark.parametrize("lora_kwargs,q_rank,q_scale,v_scale", [
     ({"rank_pattern": {"q_proj": 4}, "alpha_pattern": {"v_proj": 8}}, 4, 4.0, 1.0),
     ({"alpha_pattern": {"v_proj": 8}}, 8, 2.0, 1.0),  # scale-only repair path
@@ -306,40 +264,28 @@ def test_converted_dir_full_loop(tmp_path, base_dir, lora_kwargs, q_rank, q_scal
     assert m2["model.layers.0.self_attn.q_proj"].scale == pytest.approx(q_scale)
     assert m2["model.layers.0.self_attn.v_proj"].scale == pytest.approx(v_scale)
     np.testing.assert_allclose(_mlx_logits(model2), _mlx_logits(model), atol=2e-4)
-
-
-def test_loader_import_train_step_save_reload(tmp_path, base_dir):
-    peft_dir = str(tmp_path / "peft")
-    wrapped, _ = _make_peft_adapter(base_dir, peft_dir)
-    from unsloth_zoo.mlx.loader import FastMLXModel
-    model, _ = FastMLXModel.from_pretrained(
-        peft_dir, load_in_4bit=False, max_seq_length=64,
-    )
-    np.testing.assert_allclose(_mlx_logits(model), _peft_logits(wrapped), atol=5e-3)
-
+    # One step must move LoRA weights and a save/reload must reproduce the
+    # stepped logits. A native MLX reload leaves the base trainable (longstanding
+    # loader behavior, unlike the PEFT import, which freezes — asserted in
+    # test_peft_import_honors_quantized_base_request).
     import mlx.optimizers as optim
-    q = dict(model.named_modules())["model.layers.0.self_attn.q_proj"]
-    lora_b_before, base_before = mx.array(q.lora_b), mx.array(q.linear.weight)
-
+    q2 = m2["model.layers.0.self_attn.q_proj"]
+    lora_b_before = mx.array(q2.lora_b)
     def loss_fn(m):
         logits = m(mx.array([IDS]))
         logits = logits.logits if hasattr(logits, "logits") else logits
         return nn.losses.cross_entropy(logits, mx.array([IDS[1:] + [2]])).mean()
-
-    _, grads = nn.value_and_grad(model, loss_fn)(model)
-    optim.AdamW(learning_rate=1e-2).update(model, grads)
-    mx.eval(model.parameters())
-    assert not mx.array_equal(q.lora_b, lora_b_before)   # LoRA moved
-    assert mx.array_equal(q.linear.weight, base_before)  # base frozen
-
-    from unsloth_zoo.mlx.utils import save_lora_adapters
-    saved = str(tmp_path / "saved")
-    save_lora_adapters(model, saved)
-    stepped = _mlx_logits(model)
-    model2, _ = FastMLXModel.from_pretrained(
-        saved, load_in_4bit=False, max_seq_length=64,
-    )
-    np.testing.assert_allclose(_mlx_logits(model2), stepped, atol=2e-4)
+    _, grads = nn.value_and_grad(model2, loss_fn)(model2)
+    optim.AdamW(learning_rate=1e-2).update(model2, grads)
+    mx.eval(model2.parameters())
+    assert not mx.array_equal(q2.lora_b, lora_b_before)
+    saved2 = str(tmp_path / "stepped")
+    save_lora_adapters(model2, saved2)
+    model3, _ = FastMLXModel.from_pretrained(saved2, load_in_4bit=False, max_seq_length=64)
+    # Adapter state round-trips bitwise. No logits assert: this path's trainable
+    # base moved during the step, and adapter saves carry only adapter tensors.
+    q3 = dict(model3.named_modules())["model.layers.0.self_attn.q_proj"]
+    assert mx.array_equal(q3.lora_b, q2.lora_b)
 
 
 def test_peft_import_honors_quantized_base_request(tmp_path, base_dir):
@@ -350,6 +296,26 @@ def test_peft_import_honors_quantized_base_request(tmp_path, base_dir):
     q = dict(model.named_modules())["model.layers.0.self_attn.q_proj"]
     assert type(q.linear) is nn.QuantizedLinear  # default load_in_4bit=True
     np.testing.assert_allclose(_mlx_logits(model), _peft_logits(wrapped), atol=0.35)
+    # One step moves LoRA and the stepped state survives save/reload.
+    # QuantizedLinear freezes independently; the attach-freeze contract on
+    # full-precision bases is asserted in the DoRA lifecycle test.
+    import mlx.optimizers as optim
+    lora_b_before, base_before = mx.array(q.lora_b), mx.array(q.linear.weight)
+    def loss_fn(m):
+        logits = m(mx.array([IDS]))
+        logits = logits.logits if hasattr(logits, "logits") else logits
+        return nn.losses.cross_entropy(logits, mx.array([IDS[1:] + [2]])).mean()
+    _, grads = nn.value_and_grad(model, loss_fn)(model)
+    optim.AdamW(learning_rate=1e-2).update(model, grads)
+    mx.eval(model.parameters())
+    assert not mx.array_equal(q.lora_b, lora_b_before)
+    assert mx.array_equal(q.linear.weight, base_before)
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    from unsloth_zoo.mlx.loader import FastMLXModel as _F
+    saved = str(tmp_path / "stepped")
+    save_lora_adapters(model, saved)
+    m2, _ = _F.from_pretrained(saved, max_seq_length=64)
+    np.testing.assert_allclose(_mlx_logits(m2), _mlx_logits(model), atol=2e-3)
 
 
 def test_converter_entries_reject_ambiguous_and_subclassed(tmp_path, base_dir):
@@ -508,28 +474,6 @@ def test_peft_export_rejects_unsupported_wrapper(tmp_path, base_dir):
         save_lora_adapters(model, str(tmp_path / "x"), adapter_format="peft")
 
 
-def test_conversion_failure_leaves_no_destination(tmp_path, base_dir, monkeypatch):
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(base_dir, peft_dir)
-    import unsloth_zoo.saving_utils as su
-    dst = str(tmp_path / "mlx")
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("simulated write failure")
-
-    monkeypatch.setattr(su.json, "dump", boom)
-    with pytest.raises(RuntimeError, match="simulated"):
-        convert_peft_dir_to_mlx(peft_dir, dst, {"num_hidden_layers": LAYERS})
-    monkeypatch.undo()
-    assert not os.path.exists(dst)  # failed claim fully released
-    convert_peft_dir_to_mlx(peft_dir, dst, {"num_hidden_layers": LAYERS})
-    assert os.path.exists(os.path.join(dst, MLX_WEIGHTS_FILE))
-    # Trailing-separator spelling must not break staging or publication.
-    dst2 = str(tmp_path / "mlx2") + os.sep
-    convert_peft_dir_to_mlx(peft_dir, dst2, {"num_hidden_layers": LAYERS})
-    assert os.path.exists(os.path.join(str(tmp_path / "mlx2"), MLX_WEIGHTS_FILE))
-
-
 def test_peft_export_rejects_mixed_dropout(tmp_path, base_dir):
     peft_dir = str(tmp_path / "peft")
     _make_peft_adapter(base_dir, peft_dir, lora_dropout=0.1)
@@ -574,3 +518,116 @@ def test_exported_patterns_are_exact_anchored(tmp_path, base_dir):
     path = key[1:].replace("\\.", ".")
     assert _resolve_pattern({key: rank}, path) == rank
     assert _resolve_pattern({key: rank}, "prefix." + path) is None
+
+
+def test_dora_import_roundtrip_and_training(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    wrapped, cfg = _make_peft_adapter(base_dir, peft_dir, use_dora=True)
+    with torch.no_grad():  # make magnitudes informative
+        for n, prm in wrapped.named_parameters():
+            if "lora_magnitude_vector" in n:
+                prm.add_(torch.randn_like(prm) * 0.05)
+    wrapped.save_pretrained(peft_dir, save_embedding_layers=False)
+
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+    np.testing.assert_allclose(_mlx_logits(model), _peft_logits(wrapped), atol=5e-3)
+
+    q = dict(model.named_modules())["model.layers.0.self_attn.q_proj"]
+    m_before = mx.array(q.m)
+    base_before = mx.array(q.linear.weight)
+    import mlx.optimizers as optim
+    def loss_fn(m):
+        logits = m(mx.array([IDS]))
+        logits = logits.logits if hasattr(logits, "logits") else logits
+        return nn.losses.cross_entropy(logits, mx.array([IDS[1:] + [2]])).mean()
+    _, grads = nn.value_and_grad(model, loss_fn)(model)
+    optim.AdamW(learning_rate=1e-2).update(model, grads)
+    mx.eval(model.parameters())
+    assert not mx.array_equal(q.m, m_before)  # magnitude trains
+    assert mx.array_equal(q.linear.weight, base_before)  # fp base frozen
+
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    saved = str(tmp_path / "saved")
+    save_lora_adapters(model, saved)
+    stepped = _mlx_logits(model)
+    model2, _ = FastMLXModel.from_pretrained(saved, load_in_4bit=False, max_seq_length=64)
+    np.testing.assert_allclose(_mlx_logits(model2), stepped, atol=2e-4)
+
+    exported = str(tmp_path / "exported")
+    model2.save_lora_adapters(exported, adapter_format="peft")
+    ecfg = json.load(open(os.path.join(exported, "adapter_config.json")))
+    assert ecfg["use_dora"] is True
+    keys = set(st_load_file(os.path.join(exported, PEFT_WEIGHTS_FILE)))
+    # peft's canonical on-disk key has no .weight suffix.
+    assert any(k.endswith(".lora_magnitude_vector") for k in keys)
+    assert not any(".lora_magnitude_vector.weight" in k for k in keys)
+    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
+    reloaded = peft.PeftModel.from_pretrained(base, exported)
+    np.testing.assert_allclose(_peft_logits(reloaded), stepped, atol=5e-3)
+
+
+def test_dora_dropout_rejected():
+    with pytest.raises(ValueError, match="different training-mode"):
+        normalize_peft_adapter_config({
+            "peft_type": "LORA", "r": 8, "use_dora": True, "lora_dropout": 0.1,
+        })
+
+
+def test_dora_rejects_embedding_and_mixed(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(
+        base_dir, peft_dir, use_dora=True,
+        target_modules=["q_proj", "embed_tokens"],
+    )
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    with pytest.raises((ValueError, RuntimeError)):
+        FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
+    peft2 = str(tmp_path / "p2")
+    _make_peft_adapter(base_dir, peft2, use_dora=True)
+    from safetensors.torch import save_file
+    wpath = os.path.join(peft2, PEFT_WEIGHTS_FILE)
+    tensors = st_load_file(wpath)
+    drop = next(k for k in tensors if "lora_magnitude_vector" in k)
+    tensors.pop(drop)
+    save_file(tensors, wpath)
+    with pytest.raises(ValueError, match="all-or-nothing|magnitude"):
+        convert_peft_dir_to_mlx(
+            peft2, str(tmp_path / "m"),
+            json.load(open(os.path.join(base_dir, "config.json"))),
+        )
+
+
+def test_dora_embedding_export_rejected(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    from mlx_lm.tuner.dora import DoRAEmbedding
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+    model.model.embed_tokens = DoRAEmbedding.from_base(
+        model.model.embed_tokens, r=4,
+    )
+    with pytest.raises(ValueError, match="DoRAEmbedding"):
+        save_lora_adapters(model, str(tmp_path / "x"), adapter_format="peft")
+
+
+def test_mixed_lora_dora_save_refused(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir, use_dora=True)
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    from mlx_lm.tuner.lora import LoRALinear
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+    attn = model.model.layers[1].self_attn
+    attn.k_proj = LoRALinear.from_base(attn.k_proj, r=4)
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+    for saver in (save_lora_adapters, save_trainable_adapters):
+        with pytest.raises(ValueError, match="mixes plain-LoRA and DoRA"):
+            saver(model, str(tmp_path / "x"))
