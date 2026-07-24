@@ -1131,8 +1131,11 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
         if field.init and field.name not in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
     ]
     legacy_values = [getattr(MLXTrainingConfig(), field.name) for field in legacy_fields]
-    legacy_values[[field.name for field in legacy_fields].index("warmup_ratio")] = 0.1
-    legacy_values[-1] = (128, 256)
+    _legacy_names = [field.name for field in legacy_fields]
+    legacy_values[_legacy_names.index("warmup_ratio")] = 0.1
+    # image_size is an object field; set it by name (the optional-copy fields
+    # are the trailing suffix, so image_size is no longer the last legacy field).
+    legacy_values[_legacy_names.index("image_size")] = (128, 256)
     copied_ratio_trainer.args = MLXTrainingConfig(*legacy_values)
     assert copied_ratio_trainer.args.image_size == (128, 256)
     assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10

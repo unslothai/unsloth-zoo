@@ -738,8 +738,6 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",
     "streaming_prefetch_batches",
-    "label_smoothing_factor",
-    "report_grad_norm",
 )
 
 
@@ -833,17 +831,8 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
-    max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
-    # Lazy default-order text streams: pool this many global micro-batches,
-    # length-sort, emit seeded-permuted batches. 1 = exact source order (prior
-    # behavior). Memory scales with world size; the DDP owner also retains one
-    # pass-long cycle-padding batch (documented bound W + 1).
-    streaming_text_length_window_batches: int = 8
-    # Lazy text streams: prepare up to this many batches ahead on a producer
-    # thread (0 = synchronous, the default; single-process only; host-valued
-    # rows required). Retention adds the queued batches to the window bound.
-    streaming_prefetch_batches: int = 0
-    # Appended last: the initializer binds positional args by field order.
+    # Appended by main after image_size; kept before this branch's streaming
+    # fields so a positional copy from a main config still maps correctly.
     label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
     # Opt-in true global grad-norm reporting when global-norm clipping is off.
@@ -860,6 +849,20 @@ class MLXTrainingConfig:
     # DDP reduction, and the LoRA+/embedding-LR ratios; before any clipping or
     # weight decay.
     report_grad_norm: bool = False
+
+    # This branch's lazy-streaming fields, appended LAST after every pre-existing
+    # (including main-appended) field, so positional copies from older configs
+    # keep mapping correctly. Listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
+    max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
+    # Lazy default-order text streams: pool this many global micro-batches,
+    # length-sort, emit seeded-permuted batches. 1 = exact source order (prior
+    # behavior). Memory scales with world size; the DDP owner also retains one
+    # pass-long cycle-padding batch (documented bound W + 1).
+    streaming_text_length_window_batches: int = 8
+    # Lazy text streams: prepare up to this many batches ahead on a producer
+    # thread (0 = synchronous, the default; single-process only; host-valued
+    # rows required). Retention adds the queued batches to the window bound.
+    streaming_prefetch_batches: int = 0
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -903,8 +906,14 @@ class MLXTrainingConfig:
         # warmup_steps would override a non-default warmup_ratio. Tolerate every
         # field appended since: the positional optional-copy fields plus the
         # later scalar additions.
+        # Every field appended after configs began round-tripping: this branch's
+        # streaming suffix plus the earlier scalar additions (compile_max_variants
+        # is mid-order; label_smoothing_factor / report_grad_norm precede the
+        # streaming suffix). A legacy dump missing any of them is still a copy.
         _appended_fields = set(_MLX_CONFIG_OPTIONAL_COPY_FIELDS) | {
-            "compile_max_variants",  # appended mid-order, not a positional suffix
+            "compile_max_variants",
+            "label_smoothing_factor",
+            "report_grad_norm",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
