@@ -18,7 +18,8 @@
 A wrong/missing pad_token breaks training: pad == eos makes the loss ignore real
 pad positions (the model never learns to stop). `fix_pad_token` heals such
 tokenizers by picking a reserved pad-like token already in the vocab; if none
-exists it adds one. It is a no-op for an already valid, distinct pad_token.
+exists it reuses the model config's own declared pad id, and only if that is
+unusable does it add a new token. It is a no-op for an already valid, distinct pad_token.
 
 Any "*pad*"-named token (e.g. <|vision_pad|>, <|fim_pad|>, [PAD]) is a valid pad and
 is kept as-is. Qwen3 text models share Qwen3-VL's vocab and ship
@@ -102,11 +103,32 @@ def _display_name(model, model_config, inner):
     return "Model"
 
 
+def _eos_id_set(*values):
+    """Collect EOS ids from scalar and list/tuple/set/frozenset forms into one flat set.
+
+    `bool` is excluded (it subclasses int, but True/False are never real token ids).
+    Used to reject replacement-pad candidates whose id is really an EOS. Callers pass the
+    tokenizer's and the model config's eos, each of which may be a multi-EOS list. It does
+    NOT take the generation_config stop list: a valid pad (e.g. Qwen's <|endoftext|>)
+    legitimately appears there, so that list must not drive pad decisions.
+    """
+    ids = set()
+    for value in values:
+        if type(value) is int:
+            ids.add(value)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            ids.update(v for v in value if type(v) is int)
+    return ids
+
+
 def _classify_bad_pad(inner, vocab_size):
     """Return a reason string if the current pad_token is bad, else None.
 
     A pad-named token (e.g. <|vision_pad|>) is valid; only missing, eos-collision
-    and out-of-range pads are healed.
+    and out-of-range pads are healed. Only the tokenizer's OWN eos defines a bad pad:
+    a token that also appears in a model/generation multi-EOS stop list (e.g. Qwen pads
+    with <|endoftext|>, which is also a secondary generation stop id) is still a valid,
+    distinct pad and must be left alone.
     """
     if not hasattr(inner, "pad_token"):
         return None
@@ -126,8 +148,59 @@ def _classify_bad_pad(inner, vocab_size):
     return None
 
 
-def _single_token_id(inner, token, vocab_size):
-    """Return token's id if it encodes to exactly one in-vocab id, else None."""
+def _config_declared_pad(inner, cfg, eos_token_ids, vocab_size):
+    """Reuse the model config's own declared pad_token_id, as a last resort before
+    synthesizing a brand-new token.
+
+    Some shipped tokenizers alias pad to eos (or leave pad out of range) even though the
+    model config already declares a valid, distinct pad id pointing at an existing token.
+    Whisper-large-v3 is the canonical case (config pad 50256 -> the existing empty token,
+    while the tokenizer reports pad == eos == 50257), but the pattern is not Whisper
+    specific, so this stays model-type agnostic. Honoring that declared id avoids adding a
+    token and resizing embeddings. Guards: the id must be a real int (not bool), in vocab,
+    distinct from every known EOS id, and round-trip cleanly through the tokenizer. Runs
+    only after the reserved-token search fails, so it never overrides a pad-named choice
+    for an already-working model.
+    """
+    if cfg is None:
+        return None
+    pad_token_id = getattr(cfg, "pad_token_id", None)
+    if type(pad_token_id) is not int or pad_token_id < 0:
+        return None
+    if vocab_size is not None and pad_token_id >= vocab_size:
+        return None
+    if pad_token_id in eos_token_ids:
+        return None
+
+    convert_ids_to_tokens = getattr(inner, "convert_ids_to_tokens", None)
+    convert_tokens_to_ids = getattr(inner, "convert_tokens_to_ids", None)
+    if not callable(convert_ids_to_tokens) or not callable(convert_tokens_to_ids):
+        return None
+    try:
+        candidate = convert_ids_to_tokens(pad_token_id)
+        # Require a clean round-trip so we never promote an unknown / unstable id.
+        if candidate is None or convert_tokens_to_ids(candidate) != pad_token_id:
+            return None
+    except Exception:
+        return None
+
+    old_pad = getattr(inner, "pad_token", None)
+    try:
+        inner.pad_token = candidate
+        if getattr(inner, "pad_token_id", None) != pad_token_id:
+            inner.pad_token = old_pad
+            return None
+    except Exception:
+        try:
+            inner.pad_token = old_pad
+        except Exception:
+            pass
+        return None
+    return candidate
+
+
+def _single_token_id(inner, token, vocab_size, eos_token_ids=frozenset()):
+    """Return token's id if it encodes to exactly one in-vocab, non-EOS id, else None."""
     try:
         ids = inner(token, add_special_tokens=False).input_ids
     except Exception:
@@ -137,10 +210,12 @@ def _single_token_id(inner, token, vocab_size):
     token_id = ids[0]
     if vocab_size is not None and token_id >= vocab_size:
         return None
+    if token_id in eos_token_ids:
+        return None
     return token_id
 
 
-def _find_reserved_pad(inner, eos_token, vocab_size):
+def _find_reserved_pad(inner, eos_token, vocab_size, eos_token_ids=frozenset()):
     """Pick the best reserved/pad-named token already in the vocab, or None."""
     try:
         added = [_token_content(t) for t in inner.added_tokens_decoder.values()]
@@ -162,7 +237,7 @@ def _find_reserved_pad(inner, eos_token, vocab_size):
         for candidate in ordered:
             if candidate == eos_token:
                 continue
-            if _single_token_id(inner, candidate, vocab_size) is not None:
+            if _single_token_id(inner, candidate, vocab_size, eos_token_ids) is not None:
                 return candidate
 
     # Last resort: any pad sentinel (a bracketed "*pad*" token such as <|fim_pad|>)
@@ -172,17 +247,17 @@ def _find_reserved_pad(inner, eos_token, vocab_size):
     for candidate in added:
         if candidate == eos_token or not _is_pad_named(candidate):
             continue
-        if _single_token_id(inner, candidate, vocab_size) is not None:
+        if _single_token_id(inner, candidate, vocab_size, eos_token_ids) is not None:
             return candidate
     return None
 
 
-def _unk_fallback(inner, eos_token, vocab_size):
+def _unk_fallback(inner, eos_token, vocab_size, eos_token_ids=frozenset()):
     """Last-resort existing-token pad: reuse unk_token (Llama-2 style), or None."""
     unk = getattr(inner, "unk_token", None)
     if not unk or unk == eos_token:
         return None
-    if _single_token_id(inner, unk, vocab_size) is not None:
+    if _single_token_id(inner, unk, vocab_size, eos_token_ids) is not None:
         return unk
     return None
 
@@ -198,8 +273,10 @@ def fix_pad_token(
     """Heal a bad/missing pad_token in place.
 
     Returns a result dict: {changed, reason, old_pad, new_pad, added}. No-op (and
-    `changed=False`) when the pad_token is already valid and distinct from eos.
-    With `allow_add=False` (tokenizer-only callers with no model to resize) a brand
+    `changed=False`) when the pad_token is already valid and distinct from eos. Repair
+    order: an existing reserved/pad-named token, then the tokenizer's unk, then the model
+    config's own declared pad id (reused, no resize), and only if all fail a brand-new
+    token. With `allow_add=False` (tokenizer-only callers with no model to resize) a brand
     new pad token is never added; repair is deferred to the model-aware call.
     `is_vision_model` is accepted for API compatibility but unused: any pad-named
     token is a valid pad regardless of modality.
@@ -214,7 +291,19 @@ def fix_pad_token(
 
     cfg = model_config if model_config is not None else getattr(model, "config", None)
     vocab_size = getattr(cfg, "vocab_size", None)
+    if type(vocab_size) is not int:
+        # A malformed (e.g. string) vocab_size must not crash a later `id >= vocab_size`
+        # comparison; treat it as unknown and skip range checks.
+        vocab_size = None
     eos_token = getattr(inner, "eos_token", None)
+    # EOS ids used to reject a replacement pad that would alias an EOS: the tokenizer's own
+    # and the model config's (each a scalar or a multi-EOS list). Deliberately NOT the
+    # generation_config stop list, which legitimately lists a valid pad (Qwen's
+    # <|endoftext|>) and must not drive pad selection.
+    eos_token_ids = _eos_id_set(
+        getattr(inner, "eos_token_id", None),
+        getattr(cfg, "eos_token_id", None),
+    )
 
     reason = _classify_bad_pad(inner, vocab_size)
     if reason is None:
@@ -222,11 +311,32 @@ def fix_pad_token(
     result["reason"] = reason
     result["old_pad"] = getattr(inner, "pad_token", None)
 
-    new_pad = _find_reserved_pad(inner, eos_token, vocab_size)
+    new_pad = _find_reserved_pad(inner, eos_token, vocab_size, eos_token_ids)
     if new_pad is None:
-        new_pad = _unk_fallback(inner, eos_token, vocab_size)
-    added = False
+        new_pad = _unk_fallback(inner, eos_token, vocab_size, eos_token_ids)
 
+    if new_pad is None:
+        # Before synthesizing a token and resizing embeddings, honor the model config's
+        # own declared pad id when it is safe (Whisper-large-v3 and any similarly
+        # misconfigured tokenizer). This reuses an existing token, so no resize.
+        config_pad = _config_declared_pad(inner, cfg, eos_token_ids, vocab_size)
+        if config_pad is not None:
+            result.update(changed=True, new_pad=config_pad, added=False)
+            pad_token_id = getattr(inner, "pad_token_id", None)
+            if model is not None:
+                model_cfg = getattr(model, "config", None)
+                if model_cfg is not None:
+                    model_cfg.update({"pad_token_id": pad_token_id})
+                if getattr(model, "generation_config", None) is not None:
+                    model.generation_config.update(pad_token_id=pad_token_id)
+            name = _display_name(model, model_config, inner)
+            print(
+                f"Unsloth: {name} had a bad pad_token ({result['old_pad']}). "
+                f"Using model config pad_token_id = {pad_token_id} ({config_pad!r})."
+            )
+            return result
+
+    added = False
     if new_pad is None:
         if not allow_add:
             # No model here to resize embeddings; let the model-aware call repair.
