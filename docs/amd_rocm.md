@@ -7,11 +7,9 @@ on Linux, WSL, and Windows via ROCm.
 
 **Linux / WSL:**
 
-The `download.pytorch.org/whl/` index may not carry a wheel for every ROCm minor version.
-Use the version resolver in `unsloth_zoo/device_type.py` (which checks available indices
-and falls back to the nearest supported version), or check the
-[PyTorch ROCm wheel index list](https://download.pytorch.org/whl/) directly for an
-available `rocmX.Y` entry that matches your installed ROCm.
+Not every ROCm minor version has a corresponding PyTorch wheel. Check the
+[PyTorch ROCm wheel index list](https://download.pytorch.org/whl/) for an available
+`rocmX.Y` entry that matches your installed ROCm version.
 
 Install `torch`, `torchvision`, and `torchaudio` together from the ROCm index so all
 three come from the same ROCm build (mixing ROCm and default-PyPI wheels causes
@@ -43,9 +41,10 @@ ROCm 6.2, TinyLlama-1.1B, LoRA r=16, batch=4, seq=512, bfloat16).
 ### 1. Use SDPA attention (most important)
 
 ```python
+# Works with any model; benchmarks above used TinyLlama-1.1B
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Meta-Llama-3-8B",
-    attn_implementation = "sdpa",   # recommended on ROCm
+    model_name = "unsloth/Meta-Llama-3-8B",  # replace with your model
+    attn_implementation = "sdpa",             # recommended on ROCm
 )
 ```
 
@@ -189,14 +188,20 @@ Notes:
   default to disabled; see `unsloth_zoo/compile_cache.py`).
 - On torch < 2.7, Mega-cache is not available; the one-time compile cost is paid
   on every new process.
-- **Directory trust requirements (POSIX):** The cache path and all its parent
-  directories must be owned by the current user and must not be group- or
-  world-writable. If the check fails, Mega-cache is silently disabled. Recommended
-  setup:
+- **Directory trust requirements (POSIX):** Only the cache directory itself must
+  be owned by the current user. Parent directories are accepted if they are not
+  group- or world-writable, OR if they are sticky and owned by root or the current
+  user (like `/tmp`). If the check fails, Mega-cache is silently disabled.
+  A user-owned directory under `~/.cache` satisfies all requirements:
   ```bash
   mkdir -p ~/.cache/unsloth/mega_cache
   chmod 700 ~/.cache/unsloth/mega_cache
   export UNSLOTH_MEGA_CACHE_DIR=~/.cache/unsloth/mega_cache
+  ```
+  Shared-volume paths (e.g. `/shared/cache`) may fail if the parent is
+  group-writable and not sticky. Check with:
+  ```bash
+  ls -ld /shared/cache  # must show owner=you, no g+w or o+w unless sticky
   ```
 
 ---
