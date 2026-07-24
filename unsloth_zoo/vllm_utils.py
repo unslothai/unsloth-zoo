@@ -2819,7 +2819,7 @@ def prepare_vllm_lora_loading(model):
         vllm_loras_B .append((v_layer.self_attn.o_proj.lora_b_stacked[0], so,))
 
         model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
-        model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
+        model_loras_A.append(m_layer.mlp.  up_proj.lora_A.default.weight)
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
 
@@ -2828,7 +2828,7 @@ def prepare_vllm_lora_loading(model):
         sg = None if sg == 1.0 else sg
         su = None if su == 1.0 else su
         model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
-        model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
+        model_loras_B.append( m_layer.mlp.  up_proj.lora_B.default.weight)
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg,))
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su,))
 
@@ -2870,6 +2870,18 @@ def load_lora_directly(model):
 
     # Must also scale B with scaling since vLLM does this
     for model_lora_B, (vllm_lora_B, s) in zip(model_loras_B, vllm_loras_B):
+        if s is not None and vllm_lora_B.data_ptr() == model_lora_B.data_ptr():
+            # Zero-copy slot: the vLLM buffer ALIASES the training tensor. copy_ is
+            # then a self-copy no-op and the in-place scale compounds s onto the
+            # TRAINING weights on every load (x s^8 per optimizer step observed),
+            # rotting rollouts into gibberish. No scaling scheme is correct on a
+            # shared buffer, so hard-require s == 1 instead of corrupting silently.
+            raise RuntimeError(
+                "Unsloth Zoo: vLLM LoRA-B slot aliases the training tensor while "
+                f"lora scaling == {s} != 1. In-place scaling would corrupt the "
+                "training weights (compounds every load). Set lora_alpha == "
+                "lora_rank (and rescale learning_rate to compensate)."
+            )
         vllm_lora_B.copy_(model_lora_B, non_blocking = True)
         if s is not None: vllm_lora_B *= s
     pass
