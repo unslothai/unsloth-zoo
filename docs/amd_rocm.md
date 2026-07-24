@@ -21,13 +21,16 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install unsloth
 ```
 
-**Windows (native ROCm):**
+**Windows (native ROCm) — inference only:**
 AMD provides ROCm-enabled PyTorch wheels for Windows via the TheRock project.
 Follow the [AMD ROCm Windows installation guide](https://rocm.docs.amd.com/en/latest/install/windows.html)
-to install the correct wheel for your GPU and ROCm version, then:
-```bash
-pip install unsloth
-```
+to install the correct wheel for your GPU and ROCm version.
+
+> **Note:** Unsloth training on native Windows ROCm is not yet supported.
+> The `triton-windows` package in `pyproject.toml` requires CUDA 12 and is not
+> AMD-compatible. Training requires Linux or WSL where the standard `triton>=3.0.0`
+> wheel supports ROCm. For inference on Windows, follow the
+> [AMD ROCm Windows guide](https://rocm.docs.amd.com/en/latest/install/windows.html).
 
 Then train exactly as you would on NVIDIA - no code changes needed.
 
@@ -55,20 +58,22 @@ which delivers flash_attention_2-level performance with zero extra packages.
 For inputs with unsupported dtypes or mask shapes, SDPA may fall back to a
 math or memory-efficient implementation with different performance characteristics.
 
-Inference benchmark (MI325X, TinyLlama-1.1B, batch=1, seq=512, bfloat16):
+Prefill throughput benchmark (MI325X, TinyLlama-1.1B, batch=1,
+512-token input, single forward pass, bfloat16 — not autoregressive decode):
 
 | Implementation | Throughput     | VRAM    |
 |----------------|----------------|---------|
 | sdpa           | 108,505 tok/s  | 2.22 GB |
 | eager          | 78,914 tok/s   | 2.45 GB |
 
-SDPA is +37% faster and uses 9% less VRAM than eager for this benchmark workload.
+SDPA prefill is +37% faster and uses 9% less VRAM than eager for this benchmark.
+These figures measure a single forward pass over the full input — not token-by-token
+autoregressive generation, which has much lower throughput for both backends.
 
 At longer sequence lengths, SDPA's memory advantage grows. In the training benchmark
-(TinyLlama-1.1B, batch=4, bfloat16), SDPA gives +41% throughput at seq=2048 and
-eager runs out of memory approximately 3x sooner. The crossover point depends on
-model size, batch size, and dtype — smaller models or single-batch inference at
-the same length may still fit with eager.
+(TinyLlama-1.1B, batch=4, bfloat16), SDPA gives +41% prefill throughput at seq=2048
+and eager runs out of memory approximately 3x sooner. The crossover depends on
+model size, batch size, and dtype.
 
 ### 2. Scale batch size - AMD GPUs have large VRAM
 
