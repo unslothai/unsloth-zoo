@@ -320,7 +320,7 @@ pass
 
 def get_recommended_attn_implementation():
     """
-    Return the recommended attention implementation for the current device.
+    Return the device-level attention preference for the current device.
 
     On AMD ROCm, PyTorch SDPA routes to MIOpen's fused attention kernel, which
     is functionally equivalent to flash_attention_2 and available with zero extra
@@ -329,9 +329,16 @@ def get_recommended_attn_implementation():
     effectively required: eager OOMs approximately 3x sooner due to the O(n^2)
     attention matrix.
 
-    On NVIDIA and other devices the default upstream behaviour is preserved.
+    **Important:** This returns a device-level *preference*, not a directive.
+    Callers must validate that the specific model supports SDPA before passing
+    this value as `attn_implementation`.  Some models (e.g. Pixtral, Mistral 3)
+    do not support SDPA and must use "eager"; passing "sdpa" to them will raise
+    an error during model loading.  Check `_supports_sdpa` or
+    `ALL_ATTENTION_FUNCTIONS` on the model config before applying this preference.
 
-    Returns: "sdpa" on AMD ROCm, None on all other devices (caller keeps default).
+    On NVIDIA and other devices returns None (caller keeps its own default).
+
+    Returns: "sdpa" on AMD ROCm, None on all other devices.
     """
     if is_hip():
         return "sdpa"
@@ -387,9 +394,13 @@ def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None
         free_vram_gb = free_bytes / (1024 ** 3)
         if free_vram_gb < 20:
             return  # VRAM already mostly consumed — don't recommend larger batch
-        # Suggest a batch size that uses roughly 30% of free VRAM,
-        # capped at 16 to stay conservative.
-        suggested = min(16, max(8, int(free_vram_gb / 8)))
+        # Suggest a batch size that uses roughly 1/8 of free VRAM, capped at 16.
+        # No unconditional floor: if the estimate does not strictly exceed the
+        # current batch_size, the workload's per-batch memory cost is already
+        # substantial relative to free VRAM and we stay silent.
+        suggested = min(16, int(free_vram_gb / 8))
+        if suggested <= batch_size:
+            return  # Computed suggestion doesn't improve on current batch — skip
         _AMD_VRAM_ADVISORY_EMITTED = True
         msg = (
             f"Unsloth [AMD ROCm]: batch_size={batch_size} with {free_vram_gb:.0f} GB "
