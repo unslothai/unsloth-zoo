@@ -13008,14 +13008,119 @@ def load_trainer_state(path):
         return json.load(f)
 
 
-def save_lora_adapters(model, path, adapter_config=None):
+def _lora_module_types(model):
+    """Map LoRA-wrapped module paths to 'linear' / 'embedding', but only where
+    the live tree demonstrates the Hugging Face identity an oracle entry
+    asserts (module type AND an identical dotted path). The tree proves the
+    type, not the path — mlx-lm renames GPT-2-style roots — so out-of-stack
+    entries are emitted only when every wrapped path is either inside the
+    HF-mirroring `model.layers.N.` layout or one of the root-level names that
+    layout mirrors (lm_head, model.embed_tokens), and then only for those
+    roots. Everything else stays unasserted and the converter's named
+    rejection stands."""
+    from mlx_lm.tuner.lora import LoRALinear
+    try:
+        from mlx_lm.tuner.lora import LoRAEmbedding
+    except ImportError:
+        LoRAEmbedding = None
+    wrapped = {}
+    for name, module in model.named_modules():
+        if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
+            continue
+        base_linear = getattr(module, "linear", None)
+        base_embedding = getattr(module, "embedding", None)
+        # Exact stock types only: a custom wrapper or base can carry gating
+        # or rescaling that plain PEFT LoRA cannot express.
+        if (
+            LoRAEmbedding is not None
+            and type(module) is LoRAEmbedding
+            and type(base_embedding) in (nn.Embedding, nn.QuantizedEmbedding)
+        ):
+            wrapped[name] = "embedding"
+        elif type(module) is LoRALinear and type(base_linear) in (
+            nn.Linear, nn.QuantizedLinear,
+        ):
+            wrapped[name] = "linear"
+        elif type(module) is LoRALinear or (
+            LoRAEmbedding is not None and type(module) is LoRAEmbedding
+        ):
+            # Name the base class — the actual reason for refusal.
+            _base = base_linear if base_linear is not None else base_embedding
+            wrapped[name] = (
+                f"unsupported:{type(module).__name__} wrapping "
+                f"{type(_base).__name__}"
+            )
+        else:
+            # Record it so callers refuse, rather than let an in-stack path
+            # slip through the converter's layout gate as linear.
+            wrapped[name] = f"unsupported:{type(module).__name__}"
+    in_stack = re.compile(r"^model\.layers\.\d+\.")
+    unsupported = {
+        n: t.split(":", 1)[1]
+        for n, t in wrapped.items() if t.startswith("unsupported:")
+    }
+    supported = {
+        n: t for n, t in wrapped.items() if not t.startswith("unsupported:")
+    }
+    mirrored_layout = supported and not unsupported and all(
+        in_stack.match(name) or name == "lm_head" for name in supported
+    )
+    if not mirrored_layout:
+        supported = {n: t for n, t in supported.items() if in_stack.match(n)}
+    return supported, unsupported
+
+
+def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
     """Save LoRA adapter weights (lora_a / lora_b only) to disk.
 
     Args:
         model: MLX model with LoRA-wrapped modules.
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
+        adapter_format: "mlx" (default: the native MLX artifact) or "peft"
+            (standard Hugging Face layout). Uniform plain-LoRA exports load in
+            transformers, PEFT, and vLLM; per-module rank/alpha patterns are
+            transformers/PEFT-only, since vLLM applies one global rank/alpha.
+            The live module tree supplies the linear-vs-embedding oracle where
+            the layout demonstrably mirrors Hugging Face.
     """
+    if adapter_format not in ("mlx", "peft"):
+        raise ValueError(
+            f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
+            "'mlx' or 'peft'."
+        )
+    if adapter_format == "peft":
+        # Refuse by name BEFORE collecting tensors: stacked-factor wrappers
+        # (e.g. switch experts) would otherwise fail as a generic no-tensors error.
+        module_types, unsupported = _lora_module_types(model)
+        if unsupported:
+            preview = "; ".join(
+                f"{n} ({t})" for n, t in list(unsupported.items())[:5]
+            )
+            raise ValueError(
+                "Unsloth MLX: this model carries LoRA wrappers that plain "
+                f"PEFT format cannot represent ({preview}); PEFT export is "
+                "not possible for it."
+            )
+        # PEFT has no per-module dropout; a mixed-dropout model would
+        # silently train differently after export.
+        _dropouts = set()
+        for _name, _module in model.named_modules():
+            if _name in module_types:
+                _d = getattr(_module, "dropout", None)
+                # mlx nn.Dropout keeps 1-p internally; older builds exposed p.
+                _p = getattr(_d, "p", None)
+                if _p is None and hasattr(_d, "_p_1"):
+                    _p = 1.0 - float(_d._p_1)
+                if _p is not None:
+                    _dropouts.add(round(float(_p), 6))
+        if len(_dropouts) > 1:
+            raise ValueError(
+                "Unsloth MLX: modules carry different lora_dropout values "
+                f"({sorted(_dropouts)}); PEFT format has no per-module "
+                "dropout, so exporting would silently change training "
+                "behavior. Unify dropout before exporting."
+            )
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     if not adapter_tensors:
         raise ValueError(
@@ -13024,9 +13129,24 @@ def save_lora_adapters(model, path, adapter_config=None):
             "merged. Use save_trainable_adapters() to checkpoint non-LoRA "
             "trainable state instead."
         )
-    _save_adapter_artifacts(
-        model, path, adapter_tensors, adapter_config=adapter_config
-    )
+    if adapter_format == "mlx":
+        _save_adapter_artifacts(
+            model, path, adapter_tensors, adapter_config=adapter_config
+        )
+        return
+    # PEFT: write the canonical mlx artifact to scratch, then convert with the
+    # model-derived type oracle — one conversion implementation, one validation.
+    import tempfile
+    from unsloth_zoo.saving_utils import convert_mlx_dir_to_peft
+    scratch = tempfile.mkdtemp(prefix="unsloth_mlx_adapter_")
+    scratch_dir = os.path.join(scratch, "mlx")
+    try:
+        _save_adapter_artifacts(
+            model, scratch_dir, adapter_tensors, adapter_config=adapter_config
+        )
+        convert_mlx_dir_to_peft(scratch_dir, path, module_types=module_types)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _infer_snapshot_commit(path):

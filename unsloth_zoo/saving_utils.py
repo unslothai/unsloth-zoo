@@ -15,7 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
+import uuid
 __all__ = [
+    "export_peft_adapter",
+    "convert_peft_dir_to_mlx",
+    "convert_mlx_dir_to_peft",
+    "detect_adapter_format",
     "create_huggingface_repo",
     "merge_and_dequantize_lora",
     "merge_and_overwrite_lora",
@@ -6320,14 +6325,10 @@ def _raise_rejected(rejected, where):
     )
 
 
-def _require_fresh_dir(dst):
-    # mkdir is the lock: exactly one caller can create the directory, so
-    # racing conversions cannot interleave into one destination. Accepting
-    # a pre-existing empty directory would reopen that race (created-but-
-    # not-yet-written looks identical to empty), so it is refused too.
-    try:
-        os.makedirs(dst)
-    except FileExistsError:
+def _require_fresh_destination(dst):
+    # Early refusal including dangling symlinks; the atomic publish rename at
+    # the end of conversion makes the claim final.
+    if os.path.lexists(dst):
         raise ValueError(
             f"Unsloth MLX: destination {dst!r} already exists. Adapter "
             "conversion creates its own fresh directory so two formats can "
@@ -6414,12 +6415,44 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
             "copy needs Unsloth to load (stock mlx-lm assumes one global "
             "rank/scale)."
         )
-    # Claim the destination only after everything above validated, so a
-    # refused conversion never leaves a half-written directory behind.
-    _require_fresh_dir(dst)
-    save_file(os.path.join(dst, MLX_WEIGHTS_FILE), out)
-    with open(os.path.join(dst, "adapter_config.json"), "w") as f:
-        json.dump(mlx_cfg, f, indent=2, sort_keys=True)
+    # Destination contract: the complete artifact is staged in a unique sibling
+    # directory and published by ONE atomic rename, so readers never observe a
+    # partial adapter: a crash leaves either nothing at dst or the complete
+    # artifact, never a half-written one. Claim-first designs
+    # were tried and rejected: a kill between claim and publish strands a
+    # partial destination that blocks retries. The rename refuses a concurrently
+    # created non-empty dst (ENOTEMPTY), so content is never replaced and
+    # formats never mix; the residual — adopting a ZERO-DATA entry (empty
+    # directory or bare symlink) created in the race window — is accepted, since
+    # two uncoordinated writers on one path are outside the contract under any
+    # protocol. dst is refused by the caller's spelling BEFORE resolving so a
+    # pre-planted dangling symlink is rejected rather than followed (trailing
+    # separators are stripped first — lexists("link/") follows the terminal
+    # symlink); resolution only normalizes parents, and the resolved path is
+    # re-checked in case a parent symlink retargeted it.
+    dst = os.fspath(dst)
+    _require_fresh_destination(dst.rstrip(os.sep) or dst)
+    dst = os.path.realpath(dst)
+    _require_fresh_destination(dst)
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    _tmp = f"{dst}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    _tmp_created = False
+    try:
+        os.makedirs(_tmp)
+        _tmp_created = True
+        save_file(os.path.join(_tmp, MLX_WEIGHTS_FILE), out)
+        with open(os.path.join(_tmp, "adapter_config.json"), "w") as f:
+            json.dump(mlx_cfg, f, indent=2, sort_keys=True)
+        try:
+            os.rename(_tmp, dst)
+        except OSError as exc:
+            raise ValueError(
+                f"Unsloth MLX: destination {dst!r} appeared concurrently "
+                "and is not empty; refusing to mix adapter artifacts."
+            ) from exc
+    finally:
+        if _tmp_created:
+            shutil.rmtree(_tmp, ignore_errors=True)
     return dst
 
 
@@ -6454,6 +6487,12 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
             f"Unsloth MLX: fine_tune_type={cfg.get('fine_tune_type')!r} "
             "adapters cannot be exported to PEFT format yet; only plain "
             "LoRA is supported."
+        )
+    if cfg.get("full_state_modules"):
+        raise ValueError(
+            "Unsloth MLX: this adapter carries full-module state "
+            "(full_state_modules); it cannot be represented as plain "
+            "linear LoRA and PEFT export does not support it yet."
         )
     tensors = load_file(os.path.join(src, MLX_WEIGHTS_FILE))
     pairs = {}
@@ -6531,12 +6570,17 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
         ranks[path] = rank
         scale = float(scale_map.get(path, global_scale))
         alphas[path] = scale * rank
-    ref_path = next(iter(sorted(ranks)))
+    # Modal values minimize pattern entries; peft's matcher
+    # re.match(r"(.*\.)?(key)$", name) is ^-anchored, giving exact-path
+    # semantics so overlapping dotted suffixes cannot shadow.
+    from collections import Counter
+    ref_rank = Counter(ranks.values()).most_common(1)[0][0]
+    ref_alpha = Counter(alphas.values()).most_common(1)[0][0]
     peft_cfg = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "r": ranks[ref_path],
-        "lora_alpha": alphas[ref_path],
+        "r": ref_rank,
+        "lora_alpha": ref_alpha,
         "lora_dropout": dropout,
         "bias": "none",
         "use_rslora": False,
@@ -6552,15 +6596,56 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
         peft_cfg["revision"] = revision
     if len(set(ranks.values())) > 1:
         peft_cfg["rank_pattern"] = {
-            re.escape(p): r for p, r in ranks.items() if r != peft_cfg["r"]
+            "^" + re.escape(p): r for p, r in ranks.items()
+            if r != peft_cfg["r"]
         }
     if len(set(alphas.values())) > 1:
         peft_cfg["alpha_pattern"] = {
-            re.escape(p): a for p, a in alphas.items()
+            "^" + re.escape(p): a for p, a in alphas.items()
             if a != peft_cfg["lora_alpha"]
         }
-    _require_fresh_dir(dst)
-    save_file(os.path.join(dst, PEFT_WEIGHTS_FILE), out)
-    with open(os.path.join(dst, "adapter_config.json"), "w") as f:
-        json.dump(peft_cfg, f, indent=2, sort_keys=True)
+    # Same stage-then-atomic-rename destination contract as
+    # convert_peft_dir_to_mlx; see the note there.
+    dst = os.fspath(dst)
+    _require_fresh_destination(dst.rstrip(os.sep) or dst)
+    dst = os.path.realpath(dst)
+    _require_fresh_destination(dst)
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    _tmp = f"{dst}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    _tmp_created = False
+    try:
+        os.makedirs(_tmp)
+        _tmp_created = True
+        save_file(os.path.join(_tmp, PEFT_WEIGHTS_FILE), out)
+        with open(os.path.join(_tmp, "adapter_config.json"), "w") as f:
+            json.dump(peft_cfg, f, indent=2, sort_keys=True)
+        try:
+            os.rename(_tmp, dst)
+        except OSError as exc:
+            raise ValueError(
+                f"Unsloth MLX: destination {dst!r} appeared concurrently "
+                "and is not empty; refusing to mix adapter artifacts."
+            ) from exc
+    finally:
+        if _tmp_created:
+            shutil.rmtree(_tmp, ignore_errors=True)
     return dst
+
+
+def export_peft_adapter(src, dst, *, base_config=None, module_types=None,
+                        base_weights_source=None):
+    """Public wrapper: convert an mlx-lm adapter directory to PEFT format.
+
+    ``module_types`` follows convert_mlx_dir_to_peft. ``base_config`` is
+    accepted for signature parity with the import direction; this direction
+    derives everything it needs from the adapter itself. ``base_weights_source``
+    is reserved for emitting PEFT-convention full embedding weights; passing
+    it is refused until full-weight module state is supported end to end.
+    """
+    if base_weights_source is not None:
+        raise ValueError(
+            "Unsloth MLX: base_weights_source is not supported yet; "
+            "embedding/full-weight emission lands with modules_to_save "
+            "support."
+        )
+    return convert_mlx_dir_to_peft(src, dst, module_types=module_types)

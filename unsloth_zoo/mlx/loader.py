@@ -5904,7 +5904,14 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                      quantization_method=quantization_method, **kwargs)
 
 
-def _mlx_save_lora_adapters(self, path, adapter_config=None):
+def _mlx_save_lora_adapters(self, path, adapter_config=None, adapter_format="mlx"):
+    # Validate before routing: the trainable-tensor writer takes no
+    # adapter_format, so an unrecognized value would silently write MLX.
+    if adapter_format not in ("mlx", "peft"):
+        raise ValueError(
+            f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
+            "'mlx' or 'peft'."
+        )
     import mlx.utils as _mu
     from .utils import (
         save_lora_adapters, save_trainable_adapters,
@@ -5920,18 +5927,52 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None):
     _lora_names = [name for name, _ in iter_mlx_lora_modules(self)]
     _lora_prefixes = tuple(f"{name}." for name in _lora_names if name)
     _root_lora = any(name == "" for name in _lora_names)
+    # modules_to_save is trainable BY CONTRACT and representable in both
+    # formats, so it is not CPT evidence. embedding_auto is frozen by contract,
+    # so a trainable one means continued pretraining unfroze it and it counts.
+    _fs_paths = frozenset(
+        path
+        for path, origin in (
+            getattr(self, "_unsloth_full_state_modules", None) or {}
+        ).items()
+        if origin == "modules_to_save"
+    )
+
+    def _is_adapter_full_state(key):
+        owner = key.rsplit(".", 1)[0]
+        if owner in _fs_paths:
+            return True
+        # LoRA wrappers keep the base under an inner path; strip that only
+        # when the exact path is not itself recorded.
+        for _inner in (".embedding", ".linear"):
+            if owner.endswith(_inner) and owner[: -len(_inner)] in _fs_paths:
+                return True
+        return False
     # A tree nothing froze reports EVERY parameter trainable, which is not CPT
     # evidence: keep the LoRA-only writer. The wrapped-base filter matches
     # MLXTrainer.save_model, so a reload-leaked q_proj.weight does not count.
     _has_full_module = len(_trainable) < len(_all) and any(
         k not in _lora
         and not _is_base_tensor_inside_lora_module(k, _lora_prefixes, _root_lora)
+        and not _is_adapter_full_state(k)
         for k in _trainable
     )
     if _has_full_module:
+        if adapter_format == "peft":
+            # The writer emits full module weights only the MLX artifact
+            # describes; PEFT would need each declared as modules_to_save,
+            # which this checkpoint does not record.
+            raise ValueError(
+                "Unsloth MLX: this checkpoint trains full modules "
+                "(continued pretraining), which the PEFT adapter format "
+                "cannot represent here. Export the MLX adapter, or merge "
+                "the model and export the merged weights."
+            )
         save_trainable_adapters(self, path, adapter_config=adapter_config)
     else:
-        save_lora_adapters(self, path, adapter_config=adapter_config)
+        save_lora_adapters(
+            self, path, adapter_config=adapter_config, adapter_format=adapter_format,
+        )
 
 
 def _mlx_prompt_to_ids(prompt):

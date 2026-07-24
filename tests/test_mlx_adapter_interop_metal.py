@@ -63,11 +63,10 @@ def _make_peft_adapter(base_dir, out, dtype=torch.float32, **lora_kwargs):
             if "lora_B" in name:
                 param.copy_(torch.randn_like(param) * 0.05)
             if "lora_" in name:
-                # peft autocasts adapter params to fp32 regardless of the
-                # base dtype; force the requested dtype so bf16 runs test
-                # bf16 tensors rather than fp32 twice.
+                # peft autocasts adapter params to fp32; force the dtype so
+                # bf16 runs exercise real bf16 tensors.
                 param.data = param.data.to(dtype)
-    wrapped.save_pretrained(out)
+    wrapped.save_pretrained(out, save_embedding_layers=False)
     cfg_path = os.path.join(out, "adapter_config.json")
     cfg = json.load(open(cfg_path))
     cfg["base_model_name_or_path"] = base_dir
@@ -139,8 +138,9 @@ def test_roundtrip_bitwise_with_revision_and_nested_layers(tmp_path, base_dir, d
     cfg["revision"] = "deadbeef"
     json.dump(cfg, open(os.path.join(peft_dir, "adapter_config.json"), "w"))
     mlx_dir, back_dir = str(tmp_path / "mlx"), str(tmp_path / "back")
+    # Path-typed destination must keep working (os.PathLike contract).
     convert_peft_dir_to_mlx(
-        peft_dir, mlx_dir, {"text_config": {"num_hidden_layers": LAYERS}}
+        peft_dir, tmp_path / "mlx", {"text_config": {"num_hidden_layers": LAYERS}}
     )
     mlx_cfg = json.load(open(os.path.join(mlx_dir, "adapter_config.json")))
     assert mlx_cfg["num_layers"] == LAYERS
@@ -432,3 +432,145 @@ def test_converters_torch_fallback_without_mlx(tmp_path, base_dir, monkeypatch, 
     for key in orig:
         assert orig[key].dtype == back[key].dtype, key
         assert torch.equal(orig[key], back[key]), key
+
+
+def test_save_lora_adapters_peft_format(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    wrapped, _ = _make_peft_adapter(base_dir, peft_dir)
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+    with pytest.raises(ValueError, match="adapter_format"):
+        save_lora_adapters(model, str(tmp_path / "x"), adapter_format="bogus")
+    out = str(tmp_path / "exported")
+    model.save_lora_adapters(out, adapter_format="peft")  # bound method
+    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
+    reexported = peft.PeftModel.from_pretrained(base, out)
+    np.testing.assert_allclose(
+        _peft_logits(reexported), _mlx_logits(model), atol=5e-3,
+    )
+    from unsloth_zoo.saving_utils import export_peft_adapter
+    with pytest.raises(ValueError, match="base_weights_source"):
+        export_peft_adapter(str(tmp_path / "m"), str(tmp_path / "n"),
+                            base_weights_source=object())
+
+
+def test_peft_export_includes_lm_head_on_mirrored_layout(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    wrapped, _ = _make_peft_adapter(
+        base_dir, peft_dir, target_modules=["q_proj", "lm_head"],
+        rank_pattern={"q_proj": 4},
+    )
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+    out = str(tmp_path / "exported")
+    save_lora_adapters(model, out, adapter_format="peft")
+    keys = set(st_load_file(os.path.join(out, PEFT_WEIGHTS_FILE)))
+    assert any("lm_head.lora_A" in k for k in keys)
+    exported_cfg_text = open(os.path.join(out, "adapter_config.json")).read()
+    assert "rank_pattern" in exported_cfg_text
+    assert "unsloth_mlx" not in exported_cfg_text  # no zoo-internal leaks
+    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
+    reexported = peft.PeftModel.from_pretrained(base, out)
+    # An lm_head adapter amplifies the zoo loader's bf16 base rounding at
+    # the output layer; allow slightly more than the in-stack cases.
+    np.testing.assert_allclose(
+        _peft_logits(reexported), _mlx_logits(model), atol=8e-3,
+    )
+
+
+def test_peft_export_rejects_unsupported_wrapper(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+
+    class _FusedWrap(nn.Module):
+        # Plain factors AND a stock .linear base: the wrapper type itself
+        # is what makes the semantics non-plain.
+        def __init__(self, inner):
+            super().__init__()
+            self.lora_a = inner.lora_a
+            self.lora_b = inner.lora_b
+            self.linear = inner.linear
+
+    layers = model.model.layers
+    layers[0].self_attn.q_proj = _FusedWrap(layers[0].self_attn.q_proj)
+    with pytest.raises(ValueError, match="_FusedWrap"):
+        save_lora_adapters(model, str(tmp_path / "x"), adapter_format="peft")
+
+
+def test_conversion_failure_leaves_no_destination(tmp_path, base_dir, monkeypatch):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    import unsloth_zoo.saving_utils as su
+    dst = str(tmp_path / "mlx")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(su.json, "dump", boom)
+    with pytest.raises(RuntimeError, match="simulated"):
+        convert_peft_dir_to_mlx(peft_dir, dst, {"num_hidden_layers": LAYERS})
+    monkeypatch.undo()
+    assert not os.path.exists(dst)  # failed claim fully released
+    convert_peft_dir_to_mlx(peft_dir, dst, {"num_hidden_layers": LAYERS})
+    assert os.path.exists(os.path.join(dst, MLX_WEIGHTS_FILE))
+    # Trailing-separator spelling must not break staging or publication.
+    dst2 = str(tmp_path / "mlx2") + os.sep
+    convert_peft_dir_to_mlx(peft_dir, dst2, {"num_hidden_layers": LAYERS})
+    assert os.path.exists(os.path.join(str(tmp_path / "mlx2"), MLX_WEIGHTS_FILE))
+
+
+def test_peft_export_rejects_mixed_dropout(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir, lora_dropout=0.1)
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    model, _ = FastMLXModel.from_pretrained(
+        peft_dir, load_in_4bit=False, max_seq_length=64,
+    )
+    modules = dict(model.named_modules())
+    modules["model.layers.0.self_attn.q_proj"].dropout = nn.Dropout(p=0.4)
+    with pytest.raises(ValueError, match="different lora_dropout"):
+        save_lora_adapters(model, str(tmp_path / "x"), adapter_format="peft")
+
+
+def test_dangling_symlink_destination_refused(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "missing-target")
+    for spelling in (str(link), str(link) + os.sep):
+        with pytest.raises(ValueError, match="already exists"):
+            convert_peft_dir_to_mlx(
+                peft_dir, spelling, {"num_hidden_layers": LAYERS}
+            )
+    assert not (tmp_path / "missing-target").exists()
+
+
+def test_exported_patterns_are_exact_anchored(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir, rank_pattern={"q_proj": 4})
+    mlx_dir, back = str(tmp_path / "m"), str(tmp_path / "b")
+    convert_peft_dir_to_mlx(
+        peft_dir, mlx_dir,
+        json.load(open(os.path.join(base_dir, "config.json"))),
+    )
+    convert_mlx_dir_to_peft(mlx_dir, back)
+    cfg = json.load(open(os.path.join(back, "adapter_config.json")))
+    pattern = cfg["rank_pattern"]
+    assert pattern and all(k.startswith("^") for k in pattern)
+    key, rank = next(iter(sorted(pattern.items())))
+    # Exact under peft's matcher: hits its own path, never a dotted suffix.
+    path = key[1:].replace("\\.", ".")
+    assert _resolve_pattern({key: rank}, path) == rank
+    assert _resolve_pattern({key: rank}, "prefix." + path) is None
