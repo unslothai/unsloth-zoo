@@ -11,11 +11,15 @@ The `download.pytorch.org/whl/` index may not carry a wheel for every ROCm minor
 Use the version resolver in `unsloth_zoo/device_type.py` (which checks available indices
 and falls back to the nearest supported version), or check the
 [PyTorch ROCm wheel index list](https://download.pytorch.org/whl/) directly for an
-available `rocmX.Y` entry that matches your installed ROCm:
+available `rocmX.Y` entry that matches your installed ROCm.
+
+Install `torch`, `torchvision`, and `torchaudio` together from the ROCm index so all
+three come from the same ROCm build (mixing ROCm and default-PyPI wheels causes
+incompatible-import errors, especially for multimodal workloads):
 
 ```bash
 # Example for ROCm 6.2; substitute the nearest available index for your ROCm version
-pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
 pip install unsloth
 ```
 
@@ -149,6 +153,7 @@ throughput has plateaued (step 20+ in the benchmark above).
 ROCm and Unsloth each have their own compilation artifacts. Set both to avoid
 recompilation costs on every restart:
 
+**Linux / WSL:**
 ```bash
 # MIOpen compiled kernel binaries (HIP kernel compilation cost)
 export MIOPEN_CUSTOM_CACHE_DIR=/path/to/persistent/miopen_cache
@@ -157,8 +162,17 @@ export MIOPEN_CUSTOM_CACHE_DIR=/path/to/persistent/miopen_cache
 export MIOPEN_USER_DB_PATH=/path/to/persistent/miopen_userdb
 
 # Unsloth Mega-cache: persists Dynamo/AOTAutograd/Inductor/Triton artifacts
-# (torch >= 2.7 required; see unsloth_zoo/compile_cache.py)
+# (torch >= 2.7 required; enabled by default on POSIX)
 export UNSLOTH_MEGA_CACHE_DIR=/path/to/persistent/unsloth_mega_cache
+```
+
+**Windows (native ROCm):**
+```powershell
+$env:MIOPEN_CUSTOM_CACHE_DIR = "C:\path\to\persistent\miopen_cache"
+$env:MIOPEN_USER_DB_PATH     = "C:\path\to\persistent\miopen_userdb"
+# Mega-cache defaults to DISABLED on non-POSIX — must opt in explicitly
+$env:UNSLOTH_MEGA_CACHE      = "1"
+$env:UNSLOTH_MEGA_CACHE_DIR  = "C:\path\to\persistent\unsloth_mega_cache"
 ```
 
 Notes:
@@ -167,6 +181,9 @@ Notes:
 - `TORCHINDUCTOR_CACHE_DIR` is cleared internally by Unsloth's compile setup
   (`patch_torch_compile` in `patching_utils.py`). Use `UNSLOTH_MEGA_CACHE_DIR`
   instead to persist Inductor/AOTAutograd/Triton artifacts across runs (torch >= 2.7).
+- On Linux/WSL, Mega-cache is enabled by default when `UNSLOTH_MEGA_CACHE_DIR` is set.
+  On Windows, you must also set `UNSLOTH_MEGA_CACHE=1` to opt in (non-POSIX platforms
+  default to disabled; see `unsloth_zoo/compile_cache.py`).
 - On torch < 2.7, Mega-cache is not available; the one-time compile cost is paid
   on every new process.
 
@@ -199,11 +216,12 @@ FlashInfer requires NVIDIA nvcc and is automatically skipped on ROCm. No action 
 
 See section 6 for how to persist MIOpen and Unsloth compilation artifacts.
 
-**UNSLOTH_IS_PRESENT error**
+**ImportError: unsloth package not found**
 
-If running unsloth-zoo directly without the unsloth package installed:
+`unsloth_zoo` requires the `unsloth` package to be installed. The env var
+`UNSLOTH_IS_PRESENT` does not bypass this check — install `unsloth` directly:
 ```bash
-export UNSLOTH_IS_PRESENT=1
+pip install unsloth
 ```
 
 ---
