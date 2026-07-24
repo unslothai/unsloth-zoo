@@ -45,8 +45,12 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 )
 ```
 
-PyTorch SDPA routes to MIOpen fused attention on ROCm - functionally equivalent
-to flash_attention_2 with zero extra packages.
+PyTorch SDPA is a dispatcher that selects the best available kernel for the
+given inputs. On ROCm with the benchmark inputs (bfloat16, standard head dimensions,
+no custom attention mask), SDPA dispatches to MIOpen's fused attention kernel,
+which delivers flash_attention_2-level performance with zero extra packages.
+For inputs with unsupported dtypes or mask shapes, SDPA may fall back to a
+math or memory-efficient implementation with different performance characteristics.
 
 Benchmark results (MI325X, TinyLlama-1.1B, inference):
 
@@ -152,14 +156,19 @@ export MIOPEN_CUSTOM_CACHE_DIR=/path/to/persistent/miopen_cache
 # MIOpen performance tuning database (separate from kernel binaries)
 export MIOPEN_USER_DB_PATH=/path/to/persistent/miopen_userdb
 
-# Torch/Inductor/Triton artifacts (Dynamo tracing, AOTAutograd, Inductor codegen)
-# See: unsloth_zoo/compile_cache.py (Mega-cache, torch >= 2.7)
-export TORCHINDUCTOR_CACHE_DIR=/path/to/persistent/torchinductor_cache
+# Unsloth Mega-cache: persists Dynamo/AOTAutograd/Inductor/Triton artifacts
+# (torch >= 2.7 required; see unsloth_zoo/compile_cache.py)
+export UNSLOTH_MEGA_CACHE_DIR=/path/to/persistent/unsloth_mega_cache
 ```
 
-Note: `MIOPEN_USER_DB_PATH` alone does not avoid kernel recompilation — set
-`MIOPEN_CUSTOM_CACHE_DIR` for that. The Unsloth Mega-cache (torch >= 2.7)
-persists Inductor/AOTAutograd/Triton artifacts separately from MIOpen.
+Notes:
+- `MIOPEN_USER_DB_PATH` alone does not avoid kernel recompilation — set
+  `MIOPEN_CUSTOM_CACHE_DIR` for that.
+- `TORCHINDUCTOR_CACHE_DIR` is cleared internally by Unsloth's compile setup
+  (`patch_torch_compile` in `patching_utils.py`). Use `UNSLOTH_MEGA_CACHE_DIR`
+  instead to persist Inductor/AOTAutograd/Triton artifacts across runs (torch >= 2.7).
+- On torch < 2.7, Mega-cache is not available; the one-time compile cost is paid
+  on every new process.
 
 ---
 
