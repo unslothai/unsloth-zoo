@@ -339,38 +339,61 @@ def get_recommended_attn_implementation():
 pass
 
 
-def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None):
+# Module-level sentinel: emit the VRAM advisory at most once per process.
+_AMD_VRAM_ADVISORY_EMITTED = False
+
+
+def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None):
     """
     Warn when batch_size is likely under-utilizing a large AMD GPU.
 
     AMD Instinct MI300X/MI325X GPUs have 192-256 GB HBM3/HBM3e.  At the default
     batch_size=4 with seq_len=512, a 1B-parameter LoRA training run uses roughly
-    6-12 GB — less than 5% of available VRAM.  Throughput scales almost linearly
-    with batch size up to memory saturation; batch=16 gives ~+51% throughput over
-    batch=4 with no other changes.
+    6-12 GB of VRAM.  Throughput scales almost linearly with batch size up to
+    memory saturation; batch=16 gives ~+51% throughput over batch=4 with no other
+    changes (benchmark: MI325X, LoRA r=16, seq=512, bfloat16).
 
-    This function emits a one-time advisory when on AMD ROCm with >= 128 GB VRAM
-    and batch_size <= 4.  It never raises; it is safe to call unconditionally.
+    The advisory is emitted at most once per process (module-level guard), so
+    repeated calls from trainer setup loops do not spam logs.
+
+    The recommendation is based on the amount of *free* VRAM on the active device
+    rather than total device capacity, so it correctly stays silent when a large
+    model or long context has already consumed most of the GPU memory.
 
     Args:
         batch_size: per-device training batch size.
-        seq_len:    training sequence length (used to estimate VRAM per sample).
+        seq_len:    training sequence length (for context in the message).
         log_fn:     callable(str) for the warning; defaults to print().
+        device:     torch device index or None (defaults to current CUDA device).
     """
+    global _AMD_VRAM_ADVISORY_EMITTED
+    if _AMD_VRAM_ADVISORY_EMITTED:
+        return  # Already warned this process — stay silent on repeated calls
     if not is_hip():
         return
     if not torch.cuda.is_available():
         return
     try:
-        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        # Use the caller's active device, not always device 0
+        if device is None:
+            device = torch.cuda.current_device()
+        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
         if total_vram_gb < 128:
             return  # Not a data-center GPU — advice doesn't apply
         if batch_size > 4:
             return  # Already using a reasonable batch size
-        suggested = min(16, int(total_vram_gb / 16))
+        # Use free VRAM, not total: if a large model is loaded, don't suggest OOM batch
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        free_vram_gb = free_bytes / (1024 ** 3)
+        if free_vram_gb < 20:
+            return  # VRAM already mostly consumed — don't recommend larger batch
+        # Suggest a batch size that uses roughly 30% of free VRAM,
+        # capped at 16 to stay conservative.
+        suggested = min(16, max(8, int(free_vram_gb / 8)))
+        _AMD_VRAM_ADVISORY_EMITTED = True
         msg = (
-            f"Unsloth [AMD ROCm]: batch_size={batch_size} uses <5% of your "
-            f"{total_vram_gb:.0f} GB GPU VRAM.  "
+            f"Unsloth [AMD ROCm]: batch_size={batch_size} with {free_vram_gb:.0f} GB "
+            f"free VRAM on your {total_vram_gb:.0f} GB GPU.  "
             f"Try --per_device_train_batch_size={suggested} for ~+50% throughput "
             f"(benchmark: MI325X, LoRA, seq={seq_len})."
         )
