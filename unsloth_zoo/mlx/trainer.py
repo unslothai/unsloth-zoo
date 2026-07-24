@@ -63,6 +63,43 @@ def _mlx_distributed_backend_from_env():
     return None
 
 
+def _mlx_rank0_resolve_int(comm_group, resolver, context):
+    """Resolve source metadata on rank 0 and synchronize its value or failure."""
+    rank, world_size = _distributed_rank_size(comm_group)
+    if world_size <= 1:
+        return int(resolver())
+
+    status = 0
+    value = 0
+    owner_error = None
+    if rank == 0:
+        try:
+            value = int(resolver())
+            status = 1
+        except BaseException as exc:
+            # Synchronize the failure (KeyboardInterrupt/SystemExit included)
+            # before it propagates: peers are already blocking in the metadata
+            # collective and would hang if rank 0 unwound past it silently.
+            # The original error is re-raised on rank 0 below.
+            owner_error = exc
+            status = -1
+    metadata = mx.array(
+        [status, value] if rank == 0 else [0, 0], dtype=mx.int64,
+    )
+    metadata = mx.distributed.all_sum(metadata, group=comm_group)
+    mx.eval(metadata)
+    status, value = (int(item) for item in metadata.tolist())
+    if status < 0:
+        if owner_error is not None:
+            raise owner_error
+        raise RuntimeError(f"Unsloth MLX: rank 0 failed while {context}.")
+    if status != 1:
+        raise RuntimeError(
+            f"Unsloth MLX: invalid rank-0 metadata status while {context}."
+        )
+    return value
+
+
 class MLXTrainOutput(dict):
     """Dict-compatible train() result with HF Trainer-style attributes."""
 
@@ -163,6 +200,131 @@ class _MLXTokenizedDatasetView:
         return item
 
 
+def _mlx_stream_declares_infinite(dataset):
+    """Recognize explicit/common infinite iterable declarations without probing."""
+    dataset = getattr(dataset, "_mlx_source_dataset", dataset)
+    if bool(getattr(dataset, "_unsloth_mlx_infinite", False)):
+        return True
+
+    def _is_infinite(ex_iterable, seen):
+        if ex_iterable is None or id(ex_iterable) in seen:
+            return False
+        seen = seen | {id(ex_iterable)}
+        kind = type(ex_iterable).__name__
+        if kind == "TakeExamplesIterable":
+            return False
+        if (
+            kind == "RepeatExamplesIterable"
+            and getattr(ex_iterable, "num_times", 0) is None
+        ):
+            return True
+        # These are private datasets internals: read them defensively so a
+        # rename in a future release degrades detection (the stream just
+        # is not recognized as infinite) instead of failing eval for every
+        # stream whose wrapper class matches by name.
+        if kind == "VerticallyConcatenatedMultiSourcesExamplesIterable":
+            # Sequential concat runs children one after another, so it never
+            # ends if ANY child is infinite.
+            return any(
+                _is_infinite(child, seen)
+                for child in getattr(ex_iterable, "ex_iterables", ())
+            )
+        if kind == "HorizontallyConcatenatedMultiSourcesExamplesIterable":
+            # Column-wise concat advances children in lockstep and ends with
+            # the shortest, so it is infinite only if EVERY child is.
+            children = getattr(ex_iterable, "ex_iterables", ())
+            return bool(children) and all(
+                _is_infinite(child, seen) for child in children
+            )
+        if kind in (
+            "CyclingMultiSourcesExamplesIterable",
+            "RandomlyCyclingMultiSourcesExamplesIterable",
+        ):
+            children = getattr(ex_iterable, "ex_iterables", ())
+            probabilities = getattr(ex_iterable, "probabilities", None)
+            stopping_strategy = getattr(ex_iterable, "stopping_strategy", "")
+            if probabilities is not None:
+                if (
+                    stopping_strategy.startswith("all_exhausted")
+                    and any(probability <= 0 for probability in probabilities)
+                ):
+                    return True
+                children = [
+                    child for child, probability in zip(children, probabilities)
+                    if probability > 0
+                ]
+            infinite = [_is_infinite(child, seen) for child in children]
+            return (
+                any(infinite)
+                if stopping_strategy.startswith("all_exhausted")
+                else bool(infinite) and all(infinite)
+            )
+        return _is_infinite(getattr(ex_iterable, "ex_iterable", None), seen)
+
+    ex_iterable = getattr(dataset, "_ex_iterable", None)
+    seen = set()
+    return _is_infinite(ex_iterable, seen)
+
+
+class _MLXLazyEvalBatchView:
+    """Restartable eval batch surface that constructs one lazy pass per use."""
+
+    def __init__(self, dataset, factory, max_batches=None, comm_group=None):
+        self._dataset = dataset
+        self._factory = factory
+        self._max_batches = max_batches
+        self._comm_group = comm_group
+
+    def __iter__(self):
+        declared_infinite = False
+        if self._max_batches is None:
+            declared_infinite = bool(_mlx_rank0_resolve_int(
+                self._comm_group,
+                lambda: _mlx_stream_declares_infinite(self._dataset),
+                "checking whether the streaming eval source is infinite",
+            ))
+        if declared_infinite:
+            raise ValueError(
+                "Unsloth MLX: an infinite streaming eval_dataset must set "
+                "max_eval_batches to a positive value (or apply dataset.take) "
+                "so evaluation has an explicit boundary."
+            )
+        iterator = iter(self._factory())
+        try:
+            if self._max_batches is None:
+                yield from iterator
+                return
+            for _ in range(self._max_batches):
+                try:
+                    yield next(iterator)
+                except StopIteration:
+                    return
+        finally:
+            # max_eval_batches truncation (and early consumer exits) must
+            # release the lazy pass's owned source cursors deterministically.
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
+
+def _mlx_declared_iterable_length(dataset):
+    """Return a declared source length without probing a truly unsized source."""
+    source = getattr(dataset, "_mlx_source_dataset", dataset)
+    if not any("__len__" in cls.__dict__ for cls in type(source).__mro__):
+        return None
+    try:
+        length = len(source)
+    except (TypeError, AttributeError) as exc:
+        raise ValueError(
+            "Unsloth MLX: num_train_epochs requires a streaming text source "
+            "whose declared __len__ returns the exact source row count. Use "
+            "max_steps for a truly unsized iterable."
+        ) from exc
+    if length < 0:
+        raise ValueError("Unsloth MLX: iterable dataset length cannot be negative.")
+    return int(length)
+
+
 from .utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
@@ -175,6 +337,11 @@ from .utils import (
     _normalize_label_smoothing,
     create_batches,
     iterate_training_batches,
+    _validate_streaming_length_window,
+    _validate_streaming_prefetch,
+    _is_mlx_lazy_text_source,
+    _vlm_has_sized_index_space,
+    _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
@@ -199,6 +366,7 @@ from .utils import (
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
+    _distributed_rank_size,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
 )
@@ -563,6 +731,16 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
               f"(save_total_limit={save_total_limit})")
 
 
+# Fields added after the original public MLXTrainingConfig surface. They must
+# stay a suffix of the declaration order (append new ones at the end and list
+# them here) so positional copies from older configs keep mapping correctly.
+_MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
+    "max_eval_batches",
+    "streaming_text_length_window_batches",
+    "streaming_prefetch_batches",
+)
+
+
 @dataclass
 class MLXTrainingConfig:
     """Training configuration mirroring SFTConfig / TrainingArguments field names."""
@@ -635,7 +813,7 @@ class MLXTrainingConfig:
     compile_auto_tune: bool = True
     compile_trace: bool = True
     gradient_checkpointing: bool = True
-    streaming: bool = False  # Use streaming iterator instead of materializing batches
+    streaming: bool = False  # Lazily consume unsized text/VLM sources
     dataset_order: str = "default"  # "default", "sequential", or "torch_randperm"
     preserve_dataset_order: bool = False  # Match Unsloth CUDA SequentialSampler order
     memory_limit_gb: float | None = None  # None = auto Metal guard (~85% of recommended working set); <= 0 disables
@@ -653,7 +831,8 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
-    # Appended last: the initializer binds positional args by field order.
+    # Appended by main after image_size; kept before this branch's streaming
+    # fields so a positional copy from a main config still maps correctly.
     label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
     # Opt-in true global grad-norm reporting when global-norm clipping is off.
@@ -670,6 +849,20 @@ class MLXTrainingConfig:
     # DDP reduction, and the LoRA+/embedding-LR ratios; before any clipping or
     # weight decay.
     report_grad_norm: bool = False
+
+    # This branch's lazy-streaming fields, appended LAST after every pre-existing
+    # (including main-appended) field, so positional copies from older configs
+    # keep mapping correctly. Listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
+    max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
+    # Lazy default-order text streams: pool this many global micro-batches,
+    # length-sort, emit seeded-permuted batches. 1 = exact source order (prior
+    # behavior). Memory scales with world size; the DDP owner also retains one
+    # pass-long cycle-padding batch (documented bound W + 1).
+    streaming_text_length_window_batches: int = 8
+    # Lazy text streams: prepare up to this many batches ahead on a producer
+    # thread (0 = synchronous, the default; single-process only; host-valued
+    # rows required). Retention adds the queued batches to the window bound.
+    streaming_prefetch_batches: int = 0
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -707,11 +900,21 @@ class MLXTrainingConfig:
 
         warmup_steps_default = type(self).warmup_steps
         warmup_ratio_default = type(self).warmup_ratio
-        # Fields appended after configs began round-tripping through
-        # full-field dict dumps. A legacy dump predating them is still a
-        # wholesale copy and must be detected as one, or its copied default
-        # warmup_steps would override a non-default warmup_ratio.
-        _appended_fields = {"compile_max_variants", "report_grad_norm"}
+        # A config copied field-by-field (or round-tripped through a full-field
+        # dump) from an older Unsloth may omit fields added later; treat such
+        # copies as wholesale copies for warmup semantics, or a copied default
+        # warmup_steps would override a non-default warmup_ratio. Tolerate every
+        # field appended since: the positional optional-copy fields plus the
+        # later scalar additions.
+        # Every field appended after configs began round-tripping: this branch's
+        # streaming suffix plus the earlier scalar additions (compile_max_variants
+        # is mid-order; label_smoothing_factor / report_grad_norm precede the
+        # streaming suffix). A legacy dump missing any of them is still a copy.
+        _appended_fields = set(_MLX_CONFIG_OPTIONAL_COPY_FIELDS) | {
+            "compile_max_variants",
+            "label_smoothing_factor",
+            "report_grad_norm",
+        }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
         copied_default_warmup_with_ratio = (
@@ -916,6 +1119,34 @@ class MLXTrainer:
             self.args.packing = False
 
         if (
+            not self._is_vlm
+            and self.train_dataset is not None
+            and self.tokenizer is not None
+            and self.args.streaming
+            and _is_mlx_lazy_text_source(self.train_dataset)
+        ):
+            config = getattr(self.model, "_config", {})
+            model_type = config.get("model_type") if isinstance(config, dict) else None
+            self.tokenizer = normalize_mlx_chat_template(
+                self.tokenizer,
+                chat_template=getattr(self.args, "chat_template", None),
+                model_name=getattr(self.model, "_hf_repo", None),
+                model_type=model_type,
+                is_vlm=False,
+                strict=False,
+            )
+            self.train_dataset = _MLXIterableTokenizedDatasetView(
+                self.train_dataset,
+                self.tokenizer,
+                dataset_text_field=self.args.dataset_text_field,
+                formatting_func=self.formatting_func,
+                append_eos=bool(getattr(self.args, "append_eos", True)),
+                completion_only_loss=_text_completion_only_loss_arg(self.args),
+                assistant_only_loss=_text_assistant_only_loss_arg(self.args),
+                max_seq_length=self.args.max_seq_length,
+            )
+            self._mlx_train_dataset_for_batches = self.train_dataset
+        elif (
             not self._is_vlm
             and self.train_dataset is not None
             and self.tokenizer is not None
@@ -1339,6 +1570,12 @@ class MLXTrainer:
         """Abort this rank after a rank-wide failure consensus."""
         if not failed_any:
             return
+        if exc is not None and not isinstance(exc, Exception):
+            # Interrupts (KeyboardInterrupt/SystemExit) were captured only so
+            # this rank could join the consensus; re-raise them unwrapped and
+            # without mutating trainer state, so a reused trainer does not
+            # inherit a stop request from an interrupt.
+            raise exc
         self.stop_requested = True
         if exc is not None:
             raise RuntimeError(
@@ -1799,6 +2036,14 @@ class MLXTrainer:
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        # A stop requested before evaluation (e.g. a step callback firing on an
+        # eval step) must abort before the first pull: an unsized source's next
+        # row can block, so cancellation could otherwise never take effect. The
+        # check is rank-synchronized, so peers return together instead of
+        # diverging at the in-loop status collective.
+        should_stop, _ = self._distributed_eval_status()
+        if should_stop:
+            return all_losses, ntokens
         iterator = iter(eval_batches)
 
         while True:
@@ -1808,7 +2053,9 @@ class MLXTrainer:
                 batch_data = next(iterator)
             except StopIteration:
                 break
-            except Exception as exc:
+            except BaseException as exc:
+                # Interrupts included: every rank must reach the eval status
+                # collective below, or the surviving ranks hang in it.
                 failed = True
                 error = exc
 
@@ -1825,7 +2072,7 @@ class MLXTrainer:
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
                     mx.eval(all_losses, ntokens)
-                except Exception as exc:
+                except BaseException as exc:
                     failed = True
                     error = exc
 
@@ -1839,6 +2086,76 @@ class MLXTrainer:
                 break
 
         return all_losses, ntokens
+
+    def _create_text_eval_batches(
+        self,
+        eval_dataset,
+        eval_batch_size,
+        completion_only_loss,
+        assistant_only_loss,
+    ):
+        """Build eager or one-pass lazy text evaluation batches."""
+        args = self.args
+        config = getattr(self.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        eval_tokenizer = getattr(
+            self, "_mlx_response_mask_tokenizer", self.tokenizer,
+        )
+        common = dict(
+            dataset=eval_dataset,
+            tokenizer=eval_tokenizer,
+            batch_size=eval_batch_size,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            dataset_text_field=args.dataset_text_field,
+            formatting_func=self.formatting_func,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(self.model, "_hf_repo", None),
+            model_type=model_type,
+            append_eos=bool(getattr(args, "append_eos", True)),
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+        )
+        if args.streaming and _is_mlx_lazy_text_source(eval_dataset):
+            max_batches = getattr(args, "max_eval_batches", None)
+            if max_batches is not None:
+                # Reject rather than truncate non-integral values (1.9, True):
+                # silent coercion would change how much eval data is scored.
+                coerced = None
+                if not isinstance(max_batches, bool):
+                    try:
+                        coerced = int(max_batches)
+                    except (TypeError, ValueError):
+                        coerced = None
+                if coerced is None or coerced != max_batches or coerced <= 0:
+                    raise ValueError(
+                        "Unsloth MLX: max_eval_batches must be a positive "
+                        "integer when provided."
+                    )
+                max_batches = coerced
+
+            def _factory():
+                return iterate_training_batches(
+                    **common,
+                    response_mask_fn=getattr(self, "_mlx_response_mask_fn", None),
+                    dataset_order="sequential",
+                    comm_group=self.distributed_world,
+                    require_replayable=True,
+                    repeat=False,
+                    distributed_pad_mode="empty",
+                )
+
+            return _MLXLazyEvalBatchView(
+                eval_dataset,
+                _factory,
+                max_batches=max_batches,
+                comm_group=self.distributed_world,
+            )
+        return create_batches(
+            **common,
+            comm_group=self.distributed_world,
+            distributed_pad_mode="empty",
+        )
 
     def _evaluate(self, eval_batches, loss_fn, is_vlm=False):
         """Run evaluation loop.
@@ -2136,10 +2453,90 @@ class MLXTrainer:
         self._neftune_emb = None
         self._neftune_base_cls = None
 
+    def _close_active_batch_iterator(self):
+        """Best-effort release of an iterator owned by the training run."""
+        batch_iter = getattr(self, "_active_batch_iter", None)
+        self._active_batch_iter = None
+        # Normal, failed, and interrupted exits all pass through here: close the
+        # producer and persist a live orphan so the next run's gate sees it.
+        control = getattr(self, "_mlx_prefetch_control", None)
+        prefetcher = control.get("prefetcher") if control else None
+        try:
+            close = getattr(batch_iter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    # An ordinary cleanup error must not mask the training error
+                    # already in flight or diverge ranks after a final
+                    # collective. A propagating signal is honored (see finally).
+                    pass
+            if prefetcher is not None:
+                try:
+                    prefetcher.close()
+                except Exception:
+                    pass
+        finally:
+            if prefetcher is not None:
+                # close() marks a conservative orphan before doing anything, so
+                # a not-clean close OR a propagating interrupt leaves
+                # orphaned=True; persist it either way (a clean, drained close
+                # clears the flag). The next run's gate drains and clears it.
+                if prefetcher.orphaned:
+                    self._mlx_prefetch_orphan = prefetcher
+                if control is not None:
+                    control["prefetcher"] = None
+
+
+    def _quiesce_prefetcher_for_save(self, terminal=False):
+        """Make serialization exclusive over shared preprocessing objects.
+
+        ``terminal=True`` (end of training) closes the producer for good;
+        otherwise an active producer is PAUSED and returned so the caller can
+        resume it after the save. Live persisted orphans always refuse.
+        """
+        orphan = getattr(self, "_mlx_prefetch_orphan", None)
+        if orphan is not None:
+            if orphan.orphan_alive():
+                raise RuntimeError(
+                    "Unsloth MLX: a prefetch producer is still blocked inside "
+                    "its source and shares this trainer's tokenizer; refusing "
+                    "to serialize concurrently. Wait for the thread to "
+                    "terminate, then call save_model() again."
+                )
+            # Terminated orphan: close() drains its queued batches (device
+            # tensors for opaque VLM outputs) before this save, rather than
+            # relying on the reference drop to eventually free them.
+            orphan.close()
+            self._mlx_prefetch_orphan = None
+        control = getattr(self, "_mlx_prefetch_control", None)
+        prefetcher = control.get("prefetcher") if control else None
+        if prefetcher is None:
+            return None
+        if not terminal:
+            prefetcher.quiesce()
+            return prefetcher
+        # Gate on close()'s return, not a fresh orphan_alive() read: close()
+        # drained the queue iff it reports clean, so this cannot proceed to
+        # save with staged batches (device tensors) still queued.
+        if not prefetcher.close():
+            self._mlx_prefetch_orphan = prefetcher
+            control["prefetcher"] = None
+            raise RuntimeError(
+                "Unsloth MLX: the prefetch producer is blocked inside its "
+                "source and shares this trainer's tokenizer; refusing to "
+                "serialize concurrently. Wait for the thread to terminate, "
+                "then call save_model() again."
+            )
+        # Terminal close succeeded: drop the control reference so the ensuing
+        # save_model() wrapper gate is a no-op (no quiesce/resume re-entry).
+        control["prefetcher"] = None
+        return None
 
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
+        self._close_active_batch_iterator()
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
@@ -2149,6 +2546,10 @@ class MLXTrainer:
         if (
             hasattr(self, "_batches")
             and not getattr(self, "_is_vlm", False)
+            and not (
+                getattr(self.args, "streaming", False)
+                and self._batches is None
+            )
         ):
             preflight_error = None
             try:
@@ -2337,6 +2738,7 @@ class MLXTrainer:
                 self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
+            self._close_active_batch_iterator()
             _handles = getattr(self, "_report_to_handles", (None, None))
             _wb, _tb = _handles
             if _tb is not None:
@@ -2448,6 +2850,44 @@ class MLXTrainer:
                 loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
                 _main_print("Unsloth: Using standard cross-entropy loss.")
 
+        # Prepare data, determine total_steps first. Keep any prebuilt flag
+        # from train_on_responses_only; _prepare_data returns self._batches
+        # early and never re-derives it for the completion-only text path.
+        previous_orphan = getattr(self, "_mlx_prefetch_orphan", None)
+        if previous_orphan is not None:
+            if previous_orphan.orphan_alive():
+                raise RuntimeError(
+                    "Unsloth MLX: a previous prefetch producer is still "
+                    "blocked inside its source and shares this trainer's "
+                    "preprocessing objects. Wait for that thread to terminate "
+                    "before training with this trainer again."
+                )
+            # Terminated orphan: close() drains its queued batches before the
+            # reference is dropped, releasing them deterministically.
+            previous_orphan.close()
+            self._mlx_prefetch_orphan = None
+        self._mlx_resume_step_for_prefetch = 0
+        self._mlx_resume_state_cache = None
+        _wants_prefetch = bool(
+            _validate_streaming_prefetch(
+                getattr(self.args, "streaming_prefetch_batches", 0)
+            )
+            and self.distributed_world_size == 1
+            and getattr(self.args, "streaming", False)
+        )
+        if _wants_prefetch and getattr(self, "_resume_from_checkpoint", None):
+            # Single authority: the same validated load feeds the producer skip
+            # now and the scalar restoration later (world size is 1 here, so no
+            # duplicated distributed collectives). Failures stay hard.
+            _early_resume = self._validate_distributed_resume_checkpoint(
+                self._resume_from_checkpoint
+            )
+            if _early_resume:
+                _early_state = load_trainer_state(_early_resume)
+                self._mlx_resume_state_cache = (_early_resume, _early_state)
+                self._mlx_resume_step_for_prefetch = int(
+                    _early_state.get("global_step", 0)
+                )
         compile_policy = build_compile_policy(args=args)
         preflight = getattr(self, "_text_shape_guard_preflight", None)
         if preflight is not None:
@@ -2463,14 +2903,29 @@ class MLXTrainer:
             if self._batches is None:
                 self._prepared_batches_include_epochs = False
             batches, batch_iter = self._prepare_data(is_vlm)
-            total_steps = _resolve_training_steps(
-                args,
-                batches,
-                batch_iter,
-                includes_epochs=getattr(
-                    self, "_prepared_batches_include_epochs", False,
-                ),
-            )
+            _stream_epochs = getattr(self, "_streaming_epoch_batch_count", None)
+            if (
+                batches is None
+                and _stream_epochs is not None
+                and args.max_steps <= 0
+                and args.num_train_epochs > 0
+            ):
+                # Declared-length streaming epochs: total micro-batches come
+                # from the per-pass trainable-row count. The finite-plan step
+                # resolver rejects streaming + num_train_epochs, so resolve it
+                # here for the streaming path.
+                total_steps = max(1, (
+                    _stream_epochs * args.num_train_epochs
+                ) // args.gradient_accumulation_steps)
+            else:
+                total_steps = _resolve_training_steps(
+                    args,
+                    batches,
+                    batch_iter,
+                    includes_epochs=getattr(
+                        self, "_prepared_batches_include_epochs", False,
+                    ),
+                )
             (
                 _,
                 _compile_shape_guard_report,
@@ -2485,6 +2940,13 @@ class MLXTrainer:
                 distributed_world_size=distributed_world_size,
                 compile_policy=compile_policy,
             )
+        # Prefetch wiring is shared by both the preflight and prepared paths:
+        # batch_iter is the streaming producer when active, None otherwise.
+        _prefetch_active = bool(
+            getattr(self, "_mlx_prefetch_control", None)
+            and self._mlx_prefetch_control.get("eligible")
+        )
+        self._active_batch_iter = batch_iter
         grad_accum = args.gradient_accumulation_steps
         self._compile_shape_guard_report = _compile_shape_guard_report
 
@@ -2519,7 +2981,12 @@ class MLXTrainer:
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
                 #    pre-fix checkpoints (which lack these keys) resumable.
-                ts = load_trainer_state(_resume_from)
+                _cached = getattr(self, "_mlx_resume_state_cache", None)
+                ts = (
+                    _cached[1]
+                    if _cached is not None and _cached[0] == _resume_from
+                    else load_trainer_state(_resume_from)
+                )
                 _resume_step = int(ts.get("global_step", 0))
                 # Seed the live step counter from the checkpoint so a no-op
                 # resume (checkpoint already at max_steps, loop body never runs)
@@ -2913,15 +3380,32 @@ class MLXTrainer:
                 )
                 _compiled_local_grad_step = None
                 _compile_setup_error = None
+                _compile_setup_abort = None
                 try:
                     _compiled_local_grad_step = mx.compile(
                         _local_grad_step,
                         inputs=_compile_state,
                         outputs=_compile_state,
                     )
-                except Exception as e:
-                    _compile_setup_error = e
-                if self._distributed_any_flag(_compile_setup_error is not None):
+                except BaseException as e:
+                    # Ordinary failures keep the eager-fallback path; an
+                    # interrupt must abort through the consensus instead of
+                    # silently downgrading the run to eager mode.
+                    if isinstance(e, Exception):
+                        _compile_setup_error = e
+                    else:
+                        _compile_setup_abort = e
+                _setup_base = distributed_world_size + 1
+                _setup_status = self._distributed_status_mask(
+                    (1 if _compile_setup_error is not None else 0)
+                    + _setup_base * (1 if _compile_setup_abort is not None else 0)
+                )
+                self._raise_distributed_failure_from_any(
+                    (_setup_status // _setup_base) > 0,
+                    "compile setup",
+                    _compile_setup_abort,
+                )
+                if (_setup_status % _setup_base) > 0:
                     if not _compile_fallback_allowed():
                         _strict_compile_error(
                             _compile_setup_error,
@@ -2994,8 +3478,15 @@ class MLXTrainer:
                 eval_batches = _labeled_eval
             else:
                 def _create_eval_batches(eval_dataset):
-                    """Materialize eval batches for one dataset split."""
+                    """Build evaluation batches for one dataset split."""
                     if is_vlm:
+                        if not _vlm_has_sized_index_space(eval_dataset):
+                            raise ValueError(
+                                "Unsloth MLX VLM: unsized streaming eval "
+                                "datasets are not supported yet. Provide a "
+                                "sized (__len__ + __getitem__) eval dataset; "
+                                "lazy VLM evaluation is a planned follow-up."
+                            )
                         processor = self._resolve_vlm_processor()
                         config = getattr(self.model, "_config", {})
                         _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
@@ -3013,26 +3504,11 @@ class MLXTrainer:
                             comm_group=self.distributed_world,
                             distributed_pad_mode="empty",
                         )
-                    return create_batches(
-                        dataset=eval_dataset,
-                        tokenizer=self.tokenizer,
-                        batch_size=eval_batch_size,
-                        max_seq_length=args.max_seq_length,
-                        seed=args.seed,
-                        dataset_text_field=args.dataset_text_field,
-                        formatting_func=self.formatting_func,
-                        chat_template=getattr(args, "chat_template", None),
-                        model_name=getattr(self.model, "_hf_repo", None),
-                        model_type=(
-                            getattr(self.model, "_config", {}).get("model_type")
-                            if isinstance(getattr(self.model, "_config", {}), dict)
-                            else None
-                        ),
-                        append_eos=bool(getattr(args, "append_eos", True)),
-                        completion_only_loss=text_completion_only_loss,
-                        assistant_only_loss=text_assistant_only_loss,
-                        comm_group=self.distributed_world,
-                        distributed_pad_mode="empty",
+                    return self._create_text_eval_batches(
+                        eval_dataset,
+                        eval_batch_size,
+                        text_completion_only_loss,
+                        text_assistant_only_loss,
                     )
 
                 if isinstance(self.eval_dataset, dict):
@@ -3043,14 +3519,27 @@ class MLXTrainer:
                 else:
                     eval_batches = _create_eval_batches(self.eval_dataset)
             if eval_batches:
-                eval_batch_count = (
-                    sum(len(value) for value in eval_batches.values())
-                    if isinstance(eval_batches, dict) else len(eval_batches)
+                lazy_eval = isinstance(eval_batches, _MLXLazyEvalBatchView) or (
+                    isinstance(eval_batches, dict)
+                    and any(
+                        isinstance(value, _MLXLazyEvalBatchView)
+                        for value in eval_batches.values()
+                    )
                 )
-                _main_print(
-                    f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                    f"({eval_batch_count} eval batches)."
-                )
+                if lazy_eval:
+                    _main_print(
+                        f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                        "(lazy text batches)."
+                    )
+                else:
+                    eval_batch_count = (
+                        sum(len(value) for value in eval_batches.values())
+                        if isinstance(eval_batches, dict) else len(eval_batches)
+                    )
+                    _main_print(
+                        f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                        f"({eval_batch_count} eval batches)."
+                    )
 
         features = []
         if is_vlm:
@@ -3108,16 +3597,27 @@ class MLXTrainer:
         # The seed is the same and create_batches/iterate_*_batches is
         # deterministic, so consuming N batches gives us the same data
         # ordering the killed run would have produced.
-        if _resume_step > 0 and batch_iter is not None:
+        if _resume_step > 0 and batch_iter is not None and not _prefetch_active:
             for _ in range(_resume_step * grad_accum):
+                fast_forward_error = None
                 try:
                     next(batch_iter)
                 except StopIteration:
-                    raise RuntimeError(
+                    fast_forward_error = RuntimeError(
                         f"Unsloth: streaming dataset exhausted while "
                         f"fast-forwarding to resume step {_resume_step}. "
                         f"Dataset may be shorter than the killed run consumed."
-                    ) from None
+                    )
+                except BaseException as e:
+                    fast_forward_error = e
+                if distributed_world_size > 1:
+                    self._raise_distributed_failure(
+                        fast_forward_error is not None,
+                        "fast-forwarding training batch",
+                        fast_forward_error,
+                    )
+                elif fast_forward_error is not None:
+                    raise fast_forward_error
 
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""
@@ -3143,7 +3643,7 @@ class MLXTrainer:
             try:
                 result = step_fn(batch_data, prev_state, do_update)
                 _eval_local_result(result)
-            except Exception as e:
+            except BaseException as e:
                 if isinstance(e, _DDPCompiledLocalGradError):
                     compile_error = e
                 else:
@@ -3186,7 +3686,7 @@ class MLXTrainer:
                 try:
                     result = step_fn(batch_data, prev_state, do_update)
                     _eval_local_result(result)
-                except Exception as e:
+                except BaseException as e:
                     local_error = e
                 self._raise_distributed_failure(
                     local_error is not None,
@@ -3237,7 +3737,7 @@ class MLXTrainer:
                     else:
                         batch_data = batches[scheduled_index]
                     batch_idx += 1
-            except Exception as e:
+            except BaseException as e:
                 batch_error = e
             if distributed_world_size > 1:
                 self._raise_distributed_failure(
@@ -3409,8 +3909,18 @@ class MLXTrainer:
             # Eval
             if (eval_batches and args.eval_steps > 0
                     and current_step % args.eval_steps == 0):
-                val_loss, ppl = self._evaluate(
-                    eval_batches, loss_fn, is_vlm=is_vlm)
+                _pf = (
+                    self._mlx_prefetch_control.get("prefetcher")
+                    if getattr(self, "_mlx_prefetch_control", None) else None
+                )
+                if _pf is not None:
+                    _pf.quiesce()
+                try:
+                    val_loss, ppl = self._evaluate(
+                        eval_batches, loss_fn, is_vlm=is_vlm)
+                finally:
+                    if _pf is not None:
+                        _pf.resume()
                 model.train()
                 _main_print(
                     f"  Eval  {current_step}/{total_steps} | "
@@ -3471,7 +3981,7 @@ class MLXTrainer:
                                 save_trainable_adapters(model, f"{args.output_dir}/best")
                             except ValueError as e:
                                 print(f"  Unsloth: skipped best-model save ({e})")
-                            except Exception as e:
+                            except BaseException as e:
                                 best_save_error = e
                         self._raise_distributed_failure(
                             best_save_error is not None,
@@ -3535,7 +4045,7 @@ class MLXTrainer:
                                     args.output_dir,
                                     args.save_total_limit,
                                 )
-                    except Exception as e:
+                    except BaseException as e:
                         checkpoint_error = e
                 self._raise_distributed_failure(
                     checkpoint_error is not None,
@@ -3552,6 +4062,7 @@ class MLXTrainer:
         # Report the step actually reached, which is < total_steps after an
         # early stop (self._global_step == total_steps on a full run).
         completed_steps = self._global_step
+
         _main_print(
             f"\nUnsloth: Training complete! "
             f"Avg loss: {avg_loss:.4f} | "
@@ -3561,6 +4072,7 @@ class MLXTrainer:
         )
 
         # load_best_model_at_end: restore best adapters before the final save.
+        restore_abort = None
         if getattr(args, "load_best_model_at_end", False) and self._best_step is not None:
             _best_path = f"{args.output_dir}/best/adapters.safetensors"
             if os.path.exists(_best_path):
@@ -3572,6 +4084,16 @@ class MLXTrainer:
                     )
                 except Exception as e:
                     _main_print(f"Unsloth: failed to restore best model ({e}).")
+                except BaseException as e:
+                    # Ordinary restore failures stay log-and-continue, but an
+                    # interrupt must reach the consensus below before the
+                    # diagnostics collective, or peers hang in it.
+                    restore_abort = e
+        self._raise_distributed_failure(
+            restore_abort is not None,
+            "best-model restore",
+            restore_abort,
+        )
 
         distributed_diagnostics = self._distributed_training_diagnostics(
             total_time=total_time,
@@ -3584,10 +4106,11 @@ class MLXTrainer:
         final_save_error = None
         if is_main_process:
             try:
+                self._quiesce_prefetcher_for_save(terminal=True)
                 self.save_model()
             except ValueError as e:
                 _main_print(f"Unsloth: skipped final save ({e})")
-            except Exception as e:
+            except BaseException as e:
                 final_save_error = e
             else:
                 _main_print(f"Unsloth: Saved final adapters to {args.output_dir}")
@@ -3676,6 +4199,7 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
+        self._streaming_epoch_batch_count = None
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
         model_type = config.get("model_type") if isinstance(config, dict) else None
@@ -3727,6 +4251,66 @@ class MLXTrainer:
                 else None
             )
             if args.streaming:
+                vlm_prefetch_depth = _validate_streaming_prefetch(
+                    getattr(args, "streaming_prefetch_batches", 0)
+                )
+                if vlm_prefetch_depth and self.distributed_world_size > 1:
+                    if not getattr(self, "_mlx_prefetch_ddp_notice", False):
+                        self._mlx_prefetch_ddp_notice = True
+                        if getattr(self, "_distributed_is_main_process", True):
+                            print(
+                                "Unsloth: streaming_prefetch_batches is "
+                                "single-process only; continuing "
+                                "synchronously under DDP."
+                            )
+                    vlm_prefetch_depth = 0
+                vlm_lazy = not _vlm_has_sized_index_space(train_dataset)
+                if vlm_lazy and self.distributed_world_size > 1:
+                    raise ValueError(
+                        "Unsloth MLX VLM: DDP training with an unsized "
+                        "streaming VLM source is not supported (every rank "
+                        "would re-consume the global stream). Use a sized "
+                        "dataset or single-process training; rank-owned lazy "
+                        "VLM dispatch is a planned follow-up."
+                    )
+                vlm_require_replayable = bool(
+                    getattr(self, "_resume_from_checkpoint", None)
+                )
+                vlm_expected_rows = None
+                if vlm_lazy and args.max_steps <= 0 and args.num_train_epochs > 0:
+                    declared = _mlx_declared_iterable_length(train_dataset)
+                    if declared is None:
+                        raise ValueError(
+                            "Unsloth MLX VLM: num_train_epochs requires a "
+                            "streaming iterable with an explicit reliable "
+                            "__len__. Use max_steps for an unsized source."
+                        )
+                    if declared == 0:
+                        raise ValueError(
+                            "Unsloth MLX VLM: streaming iterable declares zero rows."
+                        )
+                    self._streaming_epoch_batch_count = math.ceil(
+                        declared / args.per_device_train_batch_size
+                    )
+                    if (
+                        self._streaming_epoch_batch_count
+                        % args.gradient_accumulation_steps
+                    ):
+                        raise ValueError(
+                            "Unsloth MLX: streaming num_train_epochs requires "
+                            "the total epoch micro-batches to be divisible by "
+                            "gradient_accumulation_steps. Use max_steps or "
+                            "adjust the accumulation factor."
+                        )
+                    vlm_expected_rows = declared
+                    vlm_require_replayable = True
+                self._mlx_prefetch_control = {
+                    "eligible": bool(vlm_prefetch_depth and vlm_lazy),
+                }
+                vlm_resume_skip = (
+                    int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
+                    * args.gradient_accumulation_steps
+                )
                 return None, iterate_vlm_training_batches(
                     dataset=train_dataset,
                     processor=processor,
@@ -3740,6 +4324,14 @@ class MLXTrainer:
                     dataset_order=vlm_dataset_order,
                     completion_only_loss=text_completion_only_loss,
                     comm_group=comm_group,
+                    require_replayable=vlm_require_replayable,
+                    expected_rows_per_pass=vlm_expected_rows,
+                    prefetch_batches=vlm_prefetch_depth if vlm_lazy else 0,
+                    prefetch_skip_batches=(
+                        vlm_resume_skip
+                        if vlm_prefetch_depth and vlm_lazy else 0
+                    ),
+                    prefetch_control=self._mlx_prefetch_control,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -3774,6 +4366,79 @@ class MLXTrainer:
                     if getattr(args, "preserve_dataset_order", False)
                     else getattr(args, "dataset_order", "default")
                 )
+                expected_rows_per_pass = None
+                require_replayable = bool(
+                    getattr(self, "_resume_from_checkpoint", None)
+                )
+                response_mask_fn = getattr(
+                    train_dataset, "_response_mask_fn", None,
+                ) or getattr(self, "_mlx_response_mask_fn", None)
+                if (
+                    _is_mlx_lazy_text_source(train_dataset)
+                    and args.max_steps <= 0
+                    and args.num_train_epochs > 0
+                ):
+                    def _resolve_source_length():
+                        length = _mlx_declared_iterable_length(train_dataset)
+                        return -1 if length is None else length
+
+                    source_length = _mlx_rank0_resolve_int(
+                        comm_group,
+                        _resolve_source_length,
+                        "resolving the streaming text source length",
+                    )
+                    if source_length < 0:
+                        raise ValueError(
+                            "Unsloth MLX: num_train_epochs requires a streaming "
+                            "text iterable with an explicit reliable __len__. Use "
+                            "max_steps for an unsized source."
+                        )
+                    if source_length == 0:
+                        raise ValueError(
+                            "Unsloth MLX: streaming text iterable declares zero rows."
+                        )
+                    global_batch_size = (
+                        args.per_device_train_batch_size
+                        * self.distributed_world_size
+                    )
+                    self._streaming_epoch_batch_count = math.ceil(
+                        source_length / global_batch_size
+                    )
+                    if (
+                        self._streaming_epoch_batch_count
+                        % args.gradient_accumulation_steps
+                    ):
+                        raise ValueError(
+                            "Unsloth MLX: streaming num_train_epochs requires "
+                            "the total epoch micro-batches to be divisible by "
+                            "gradient_accumulation_steps. Use max_steps or "
+                            "adjust the accumulation factor."
+                        )
+                    expected_rows_per_pass = source_length
+                    require_replayable = True
+                prefetch_depth = _validate_streaming_prefetch(
+                    getattr(args, "streaming_prefetch_batches", 0)
+                )
+                if prefetch_depth and self.distributed_world_size > 1:
+                    if not getattr(self, "_mlx_prefetch_ddp_notice", False):
+                        self._mlx_prefetch_ddp_notice = True
+                        if getattr(self, "_distributed_is_main_process", True):
+                            print(
+                                "Unsloth: streaming_prefetch_batches is "
+                                "single-process only; continuing "
+                                "synchronously under DDP."
+                            )
+                    prefetch_depth = 0
+                self._mlx_prefetch_control = {
+                    "eligible": bool(
+                        prefetch_depth
+                        and _is_mlx_lazy_text_source(train_dataset)
+                    ),
+                }
+                resume_skip = (
+                    int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
+                    * args.gradient_accumulation_steps
+                )
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -3788,8 +4453,19 @@ class MLXTrainer:
                     append_eos=bool(getattr(args, "append_eos", True)),
                     completion_only_loss=text_completion_only_loss,
                     assistant_only_loss=text_assistant_only_loss,
+                    response_mask_fn=response_mask_fn,
                     dataset_order=text_dataset_order,
                     comm_group=comm_group,
+                    require_replayable=require_replayable,
+                    expected_rows_per_pass=expected_rows_per_pass,
+                    length_window_batches=_validate_streaming_length_window(
+                        getattr(
+                            args, "streaming_text_length_window_batches", 8,
+                        )
+                    ),
+                    prefetch_batches=prefetch_depth,
+                    prefetch_skip_batches=resume_skip if prefetch_depth else 0,
+                    prefetch_control=self._mlx_prefetch_control,
                 )
             else:
                 batch_kwargs = dict(
@@ -3834,6 +4510,17 @@ class MLXTrainer:
 
     def save_model(self, output_dir=None):
         """Save LoRA adapters or full merged model (if no LoRA)."""
+        paused_prefetcher = self._quiesce_prefetcher_for_save()
+        try:
+            return self._save_model_impl(output_dir)
+        finally:
+            # A mid-training save (e.g. from a step callback) pauses the
+            # producer for exclusivity and resumes it; only the end-of-training
+            # path closes it terminally.
+            if paused_prefetcher is not None:
+                paused_prefetcher.resume()
+
+    def _save_model_impl(self, output_dir=None):
         from .utils import (
             _coerce_mlx_lora_scale,
             _get_mlx_dropout_probability,
@@ -4319,6 +5006,81 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
         )
 
 
+def _prepare_response_labeled_eval_batches(
+    trainer,
+    tokenizer,
+    mask_fn,
+    *,
+    sized_only=False,
+):
+    """Prepare response-masked text eval batches, optionally only when sized."""
+    if trainer.eval_dataset is None:
+        return False
+    eval_datasets = (
+        list(trainer.eval_dataset.values())
+        if isinstance(trainer.eval_dataset, dict)
+        else [trainer.eval_dataset]
+    )
+    lazy_splits = [
+        _is_mlx_lazy_text_source(dataset) for dataset in eval_datasets
+    ]
+    if sized_only and all(lazy_splits):
+        return False
+
+    args = trainer.args
+    eval_batch_size = (
+        getattr(args, "per_device_eval_batch_size", None)
+        or args.per_device_train_batch_size
+    )
+    comm_group = getattr(trainer, "distributed_world", None)
+
+    def _create(eval_dataset):
+        batches, response_masked_dataset = _create_labeled_batches(
+            dataset=eval_dataset,
+            tokenizer=tokenizer,
+            mask_fn=mask_fn,
+            batch_size=eval_batch_size,
+            max_seq_length=args.max_seq_length,
+            formatting_func=trainer.formatting_func,
+            dataset_text_field=args.dataset_text_field,
+            seed=args.seed,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(trainer.model, "_hf_repo", None),
+            model_type=(
+                getattr(trainer.model, "_config", {}).get("model_type")
+                if isinstance(getattr(trainer.model, "_config", {}), dict)
+                else None
+            ),
+            append_eos=bool(getattr(args, "append_eos", True)),
+            dataset_order=getattr(args, "dataset_order", "default"),
+            preserve_dataset_order=bool(
+                getattr(args, "preserve_dataset_order", False)
+            ),
+            return_dataset=True,
+            comm_group=comm_group,
+            distributed_pad_mode="empty",
+        )
+        return batches, response_masked_dataset
+
+    if isinstance(trainer.eval_dataset, dict):
+        if sized_only and any(lazy_splits):
+            for key, value in trainer.eval_dataset.items():
+                if _is_mlx_lazy_text_source(value):
+                    continue
+                _unused_batches, split_dataset = _create(value)
+                trainer.eval_dataset[key] = split_dataset
+            return False
+        eval_batches = {}
+        for key, value in trainer.eval_dataset.items():
+            split_batches, split_dataset = _create(value)
+            eval_batches[key] = split_batches
+            trainer.eval_dataset[key] = split_dataset
+    else:
+        eval_batches, trainer.eval_dataset = _create(trainer.eval_dataset)
+    trainer._eval_batches_labeled = eval_batches
+    return True
+
+
 def train_on_responses_only(
     trainer,
     instruction_part=None,
@@ -4365,6 +5127,37 @@ def train_on_responses_only(
 
     # Callable HF tokenizer for token matching and text batch encoding.
     _tokenizer = _resolve_response_mask_tokenizer(_source)
+    _lazy_text_eval = False
+    eval_dataset = getattr(trainer, "eval_dataset", None)
+    if eval_dataset is not None:
+        eval_datasets = (
+            eval_dataset.values()
+            if isinstance(eval_dataset, dict)
+            else (eval_dataset,)
+        )
+        _lazy_text_eval = any(
+            _is_mlx_lazy_text_source(dataset) for dataset in eval_datasets
+        )
+    if (
+        not return_function
+        and trainer is not None
+        and not trainer._is_vlm
+        and trainer.args.streaming
+        and (
+            _is_mlx_lazy_text_source(trainer._train_dataset_for_batches())
+            or _lazy_text_eval
+        )
+    ):
+        config = getattr(trainer.model, "_config", {})
+        model_type = config.get("model_type") if isinstance(config, dict) else None
+        _tokenizer = normalize_mlx_chat_template(
+            _tokenizer,
+            chat_template=getattr(trainer.args, "chat_template", None),
+            model_name=getattr(trainer.model, "_hf_repo", None),
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
 
     # Omitted markers -> auto-detect from the right chat template (see helper).
     if instruction_part is None and response_part is None:
@@ -4400,8 +5193,40 @@ def train_on_responses_only(
         trainer._vlm_response_mask_fn = mask_fn
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
-        # Text path: tokenize, mask, and create batches now
         args = trainer.args
+        train_dataset = trainer._train_dataset_for_batches()
+        if args.streaming:
+            trainer._mlx_response_mask_fn = mask_fn
+            trainer._mlx_response_mask_tokenizer = _tokenizer
+        if args.streaming and _is_mlx_lazy_text_source(train_dataset):
+            if not isinstance(train_dataset, _MLXIterableTokenizedDatasetView):
+                train_dataset = _MLXIterableTokenizedDatasetView(
+                    train_dataset,
+                    _tokenizer,
+                    dataset_text_field=args.dataset_text_field,
+                    formatting_func=trainer.formatting_func,
+                    append_eos=bool(getattr(args, "append_eos", True)),
+                    completion_only_loss=_text_completion_only_loss_arg(args),
+                    assistant_only_loss=_text_assistant_only_loss_arg(args),
+                    max_seq_length=args.max_seq_length,
+                )
+                trainer.train_dataset = train_dataset
+                trainer._mlx_train_dataset_for_batches = train_dataset
+            else:
+                train_dataset.set_tokenizer(_tokenizer)
+            train_dataset.set_response_mask(mask_fn)
+            trainer._batches = None
+            trainer._eval_batches_labeled = None
+            _prepare_response_labeled_eval_batches(
+                trainer,
+                _tokenizer,
+                mask_fn,
+                sized_only=True,
+            )
+            print("Unsloth: train_on_responses_only enabled (lazy text mode).")
+            return trainer
+
+        # Eager/sized text path: tokenize, mask, and create batches now.
         total_batches_needed = (
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
@@ -4414,7 +5239,6 @@ def train_on_responses_only(
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
-        train_dataset = trainer._train_dataset_for_batches()
         comm_group = getattr(trainer, "distributed_world", None)
         batches, response_masked_dataset = _create_labeled_batches(
             dataset=train_dataset,
@@ -4456,53 +5280,12 @@ def train_on_responses_only(
         )
         trainer._batches = batches
 
-        # Process eval dataset too
-        if trainer.eval_dataset is not None:
-            eval_batch_size = (
-                getattr(args, "per_device_eval_batch_size", None)
-                or args.per_device_train_batch_size
-            )
-
-            def _create_labeled_eval_batches(eval_dataset):
-                """Build response-masked eval batches for one dataset split."""
-                batches, response_masked_dataset = _create_labeled_batches(
-                    dataset=eval_dataset,
-                    tokenizer=_tokenizer,
-                    mask_fn=mask_fn,
-                    batch_size=eval_batch_size,
-                    max_seq_length=args.max_seq_length,
-                    formatting_func=trainer.formatting_func,
-                    dataset_text_field=args.dataset_text_field,
-                    seed=args.seed,
-                    chat_template=getattr(args, "chat_template", None),
-                    model_name=getattr(trainer.model, "_hf_repo", None),
-                    model_type=(
-                        getattr(trainer.model, "_config", {}).get("model_type")
-                        if isinstance(getattr(trainer.model, "_config", {}), dict)
-                        else None
-                    ),
-                    append_eos=bool(getattr(args, "append_eos", True)),
-                    dataset_order=getattr(args, "dataset_order", "default"),
-                    preserve_dataset_order=bool(
-                        getattr(args, "preserve_dataset_order", False)
-                    ),
-                    return_dataset=True,
-                    comm_group=comm_group,
-                    distributed_pad_mode="empty",
-                )
-                return batches, response_masked_dataset
-
-            if isinstance(trainer.eval_dataset, dict):
-                eval_batches = {}
-                for key, value in trainer.eval_dataset.items():
-                    split_batches, split_dataset = _create_labeled_eval_batches(value)
-                    eval_batches[key] = split_batches
-                    trainer.eval_dataset[key] = split_dataset
-            else:
-                eval_batches, trainer.eval_dataset = _create_labeled_eval_batches(
-                    trainer.eval_dataset
-                )
-            trainer._eval_batches_labeled = eval_batches
+        _prepare_response_labeled_eval_batches(
+            trainer,
+            _tokenizer,
+            mask_fn,
+            sized_only=bool(args.streaming),
+        )
 
         print(f"Unsloth: train_on_responses_only enabled "
               f"({len(batches)} batches prepared).")

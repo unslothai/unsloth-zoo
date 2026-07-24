@@ -160,6 +160,16 @@ class _ConversationalPromptCompletionProcessor:
         }
 
 
+def _finalized_collate(*args, **kwargs):
+    """Direct-collate tests exercise the production staged+finalize composition."""
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch, _finalize_vlm_batch
+    result = _collate_vlm_batch(*args, **kwargs)
+    if isinstance(result, tuple):
+        staged, is_pc = result
+        return _finalize_vlm_batch(staged), is_pc
+    return _finalize_vlm_batch(result)
+
+
 def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
     from unsloth_zoo.mlx.utils import (
         _collate_vlm_batch,
@@ -171,7 +181,7 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         processor=processor,
         config={"image_token_id": 200},
     )
-    batch = _collate_vlm_batch(
+    batch = _finalized_collate(
         [{"text": "first"}, {"text": "second"}],
         processor,
         max_seq_length=8,
@@ -425,13 +435,13 @@ def test_vlm_prompt_completion_skips_response_mask_like_cuda():
 def test_vlm_prompt_completion_honors_completion_only_loss_false():
     from unsloth_zoo.mlx.utils import _collate_vlm_batch
 
-    default_batch = _collate_vlm_batch(
+    default_batch = _finalized_collate(
         [{"prompt": "prompt", "completion": "completion"}],
         _PromptCompletionProcessor(),
         max_seq_length=8,
         image_size=16,
     )
-    batch = _collate_vlm_batch(
+    batch = _finalized_collate(
         [{"prompt": "prompt", "completion": "completion"}],
         _PromptCompletionProcessor(),
         max_seq_length=8,
@@ -447,7 +457,7 @@ def test_vlm_prompt_completion_conversational_uses_cuda_prompt_split():
     from unsloth_zoo.mlx.utils import _collate_vlm_batch
 
     processor = _ConversationalPromptCompletionProcessor()
-    batch = _collate_vlm_batch(
+    batch = _finalized_collate(
         [{
             "prompt": [{"role": "user", "content": [{"type": "text", "text": "Q"}]}],
             "completion": [{"role": "assistant", "content": [{"type": "text", "text": "A"}]}],
@@ -465,7 +475,7 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     from unsloth_zoo.mlx.utils import _collate_vlm_batch
 
     processor = _ConversationalPromptCompletionProcessor()
-    _collate_vlm_batch(
+    _finalized_collate(
         [{
             "image": "top-level",
             "prompt": [{
@@ -915,3 +925,470 @@ def test_gemma3_vlm_hidden_stack_uses_image_mask_and_embed_scale():
     assert mx.allclose(out, mx.full((1, 4, 4), 2.0))
     assert mx.allclose(layer.seen_h, mx.full((1, 4, 4), 2.0))
     assert layer.seen_mask[0, 0].tolist()[1] == [True, True, True, False]
+
+
+class _LifecycleVLMRows:
+    """Unsized replayable VLM source with consumption/epoch instrumentation."""
+
+    def __init__(self, count=6):
+        self.count, self.pulls, self.epochs = count, 0, []
+
+    def set_epoch(self, epoch):
+        self.epochs.append(epoch)
+
+    def __iter__(self):
+        def _gen():
+            for i in range(self.count):
+                self.pulls += 1
+                yield {"text": str(101 + i)}
+        return _gen()
+
+
+def _lazy_vlm(dataset, **kwargs):
+    from unsloth_zoo.mlx.utils import iterate_vlm_training_batches
+    options = dict(processor=_FakeProcessor(), config={}, batch_size=2, max_seq_length=8)
+    return iterate_vlm_training_batches(dataset=dataset, **(options | kwargs))
+
+
+def test_vlm_lazy_lifecycle_replay_oneshot_and_fast_forward():
+    source = _LifecycleVLMRows(6)
+    stream = _lazy_vlm(source)
+    assert source.pulls == 0 and source.epochs == []      # construction-lazy
+    first = next(stream)["input_ids"].tolist()
+    assert source.pulls == 2 and source.epochs == [0]     # bounded first yield
+    for _ in range(2):
+        next(stream)
+    assert next(stream)["input_ids"].tolist() == first    # replay restart
+    assert source.epochs == [0, 1]
+
+    rows = [{"text": str(101 + i)} for i in range(4)]
+    one_shot = _lazy_vlm(iter(list(rows)))
+    for _ in range(2):
+        next(one_shot)
+    with pytest.raises(RuntimeError, match="one-shot"):
+        next(one_shot)
+
+    consumed = []
+    def counting():
+        for row in rows:
+            consumed.append(row)
+            yield row
+    with pytest.raises(RuntimeError, match="replayable"):
+        next(_lazy_vlm(counting(), require_replayable=True))
+    assert consumed == []                                  # rejected pre-consumption
+
+    steady = _lazy_vlm(_LifecycleVLMRows(6))
+    uninterrupted = [next(steady)["input_ids"].tolist() for _ in range(5)]
+    resumed = _lazy_vlm(_LifecycleVLMRows(6), require_replayable=True)
+    for _ in range(4):
+        next(resumed)
+    assert next(resumed)["input_ids"].tolist() == uninterrupted[4]
+
+
+def test_vlm_lazy_declared_epochs_and_pre_consumption_rejections():
+    exact = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=4)
+    seen = [next(exact)["input_ids"].tolist() for _ in range(4)]
+    assert seen[0] == seen[2]                              # deferred final + replay
+
+    overrun, emitted = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=3), []
+    with pytest.raises(ValueError, match="declared length"):
+        while True:
+            emitted.append(next(overrun))
+    assert len(emitted) == 1                               # deferred final withheld
+
+    underrun = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=5)
+    for _ in range(2):
+        next(underrun)
+    with pytest.raises(ValueError, match="declared length"):
+        next(underrun)
+
+    def mask_fn(batch):
+        return {"labels": [[-100] * len(r) if r[0] == 101 else list(r)
+                           for r in batch["input_ids"]]}
+    filtered = _lazy_vlm(_LifecycleVLMRows(4), expected_rows_per_pass=4,
+                         processor=_ResponseMaskFilteringProcessor(),
+                         response_mask_fn=mask_fn)
+    with pytest.raises(ValueError, match="exactly one trainable"):
+        for _ in range(4):
+            next(filtered)
+
+    class FakeWorld:
+        def rank(self): return 0
+        def size(self): return 2
+    ddp_probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="DDP training"):
+        next(_lazy_vlm(ddp_probe, comm_group=FakeWorld()))
+    assert ddp_probe.pulls == 0 and ddp_probe.epochs == []
+    with pytest.raises(ValueError, match="torch_randperm"):
+        next(_lazy_vlm(_LifecycleVLMRows(4), dataset_order="torch_randperm"))
+
+
+def test_vlm_sized_index_routing_guard_and_cleanup():
+    from unsloth_zoo.mlx.utils import create_vlm_batches, iterate_vlm_training_batches
+
+    class SizedIterableMap:
+        """Map-style dataset that ALSO iterates (must stay on the sized path)."""
+        def __init__(self):
+            self.rows = [{"text": str(101 + i)} for i in range(4)]
+        def __len__(self): return len(self.rows)
+        def __getitem__(self, idx): return self.rows[idx]
+        def __iter__(self): return iter(self.rows)
+
+
+    # Trainer seam: a sized iterable-map hybrid must pass the DDP gate and
+    # batch via the sized path...
+    sized_trainer = _vlm_trainer_shell_for(world_size=2, dataset=SizedIterableMap())
+    _batches, sized_stream = sized_trainer._prepare_data(is_vlm=True)
+    assert next(sized_stream)["input_ids"].shape[0] == 1
+    knob_trainer = _vlm_trainer_shell_for(world_size=1, dataset=SizedIterableMap())
+    knob_trainer.args.streaming_prefetch_batches = 1
+    _b2, s2 = knob_trainer._prepare_data(is_vlm=True)  # notice path must not crash
+    assert next(s2)["input_ids"].shape[0] == 1
+    # ...while a genuinely unsized source is rejected before consumption.
+    lazy_probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="DDP training"):
+        _vlm_trainer_shell_for(world_size=2, dataset=lazy_probe)._prepare_data(is_vlm=True)
+    assert lazy_probe.pulls == 0 and lazy_probe.epochs == []
+
+    with pytest.raises(ValueError, match="__len__ and __getitem__"):
+        create_vlm_batches(dataset=_LifecycleVLMRows(4), processor=_FakeProcessor(),
+                           config={}, batch_size=2, max_seq_length=8)
+
+    class LenOnlyRows(_LifecycleVLMRows):
+        def __len__(self): return self.count
+    assert next(_lazy_vlm(LenOnlyRows(4)))["input_ids"].shape[0] == 2
+
+    import torch.utils.data as tud
+    class TorchStyleRows(_LifecycleVLMRows, tud.IterableDataset):
+        def __init__(self): _LifecycleVLMRows.__init__(self, 4)
+        def __len__(self): return self.count
+    assert next(_lazy_vlm(TorchStyleRows()))["input_ids"].shape[0] == 2
+
+    class GetattrProxyRows(_LifecycleVLMRows):
+        """Instance __getattr__ proxies must not classify as sized."""
+        def __len__(self): return self.count
+        def __getattr__(self, name):
+            if name == "__getitem__":
+                return lambda idx: {"text": "999"}
+            raise AttributeError(name)
+    proxied = GetattrProxyRows(4)
+    assert next(_lazy_vlm(proxied))["input_ids"].shape[0] == 2
+    assert proxied.pulls == 2                              # iterated, not indexed
+
+    closed = []
+    class RecordingCursor:
+        def __init__(self, name, rows, explode_on_close=False):
+            self._name, self._rows, self._explode = name, iter(rows), explode_on_close
+        def __iter__(self): return self
+        def __next__(self): return next(self._rows)
+        def close(self):
+            closed.append(self._name)
+            if self._explode:
+                raise RuntimeError("close exploded")
+    class ClosingRows:
+        def __init__(self): self.handed = 0
+        def __iter__(self):
+            self.handed += 1
+            name = "serving" if self.handed == 1 else "cached"
+            return RecordingCursor(name, [{"text": "101"}, {"text": "boom"}],
+                                   explode_on_close=(name == "serving"))
+    class ExplodingProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            if any("boom" in str(item) for item in text):
+                raise RuntimeError("processor exploded")
+            return super().__call__(text, **kwargs)
+    stream = _lazy_vlm(ClosingRows(), processor=ExplodingProcessor(), batch_size=1,
+                       require_replayable=True)
+    next(stream)
+    with pytest.raises(RuntimeError, match="processor exploded"):
+        next(stream)
+    stream.close()
+    assert sorted(closed) == ["cached", "serving"]         # both closed, error kept
+
+
+def test_vlm_host_label_authority_and_staged_finalize():
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (
+        _HostStagedVLMBatch, _collate_vlm_batch, _finalize_vlm_batch,
+        _stage_vlm_label_mask_np, _vlm_inputs_host_valued,
+        _RAW_INPUT_IDS_FOR_LABELS,
+    )
+
+    # Placement authority: ignore ids, attention zeros, existing -100s; float
+    # comparisons mirror the finalized float32/int32 narrowing.
+    mask = _stage_vlm_label_mask_np(
+        {"input_ids": np.array([[101, 200, 2, 7]]),
+         "attention_mask": np.array([[1, 1, 0, 1]])},
+        ignore_token_ids=[200])
+    assert mask.tolist() == [[False, True, True, False]]
+    fractional = _stage_vlm_label_mask_np(
+        {"input_ids": [[7, 8, 9]], "attention_mask": [[1, 0.5, 0.99999999]]})
+    assert fractional.tolist() == [[False, True, False]]
+
+    # Float/exotic token-id streams never stage: they route to the bit-exact
+    # legacy path (sync) and reject in producer modes.
+    from unsloth_zoo.mlx.utils import _vlm_ids_integer_host
+    assert _vlm_ids_integer_host({"input_ids": np.array([[1, 2]])}) is True
+    assert _vlm_ids_integer_host(
+        {"input_ids": np.array([[1.0, 2.0]], dtype=np.float64)}) is False
+    assert _vlm_ids_integer_host({"input_ids": [[1, 2.5]]}) is False
+    assert _vlm_ids_integer_host({"input_ids": [[1, True]]}) is False
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch(
+            [{"text": "101", "images": [mx.array([1.0])]}],
+            _FakeProcessor(), 8, None, reject_mlx_valued=True)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch(
+            [{"text": "101"}], _FakeProcessor(), 8, None,
+            reject_mlx_valued=True,
+            formatting_func=lambda item: {
+                "text": item["text"], "images": [mx.array([1.0])],
+            })
+    class FloatProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            out["input_ids"] = np.asarray(out["input_ids"], dtype=np.float32)
+            return out
+    floaty = _collate_vlm_batch([{"text": "101"}], FloatProcessor(), 8, None)
+    assert floaty.prefinalized is not None  # sync legacy route
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch([{"text": "101"}], FloatProcessor(), 8, None,
+                           reject_mlx_valued=True)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _collate_vlm_batch(
+            [{"prompt": "101", "completion": "102"}], FloatProcessor(), 8,
+            None, reject_mlx_valued=True)
+
+    # Finalized values ride the SAME converted ids as legacy (dtype/keys/carrier
+    # by construction), incl. the P/C completion-branch int64 widening.
+    plain = _finalized_collate([{"text": "101"}], _FakeProcessor(), 8, None)
+    assert plain["labels"].dtype == plain["input_ids"].dtype
+    assert _RAW_INPUT_IDS_FOR_LABELS not in plain
+    pc = _finalized_collate(
+        [{"prompt": "101", "completion": "102"}], _FakeProcessor(), 8, None)
+    assert pc["labels"].dtype == mx.int64  # legacy completion branch widens
+    off = _finalized_collate(
+        [{"prompt": "101", "completion": "102"}], _FakeProcessor(), 8, None,
+        completion_only_loss=False)
+    assert off["labels"].dtype == off["input_ids"].dtype
+
+    # MLX-returning processors flag host_valued=False (prefetch contract),
+    # including nested mappings; reject mode raises BEFORE any conversion.
+    assert _vlm_inputs_host_valued(
+        {"input_ids": np.array([[1]])}) is True
+    assert _vlm_inputs_host_valued(
+        {"pixel_values": {"tensor": mx.array([1])}}) is False
+
+    class MxProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            return {k: mx.array(v) for k, v in out.items()}
+    # Processor-owned MLX outputs (mlx-vlm wrappers) stage OPAQUELY in
+    # producer mode: labels defer to the consumer-side finalizer.
+    opaque = _collate_vlm_batch([{"text": "101"}], MxProcessor(), 8, None,
+                                reject_mlx_valued=True)
+    assert opaque.host_valued is False and opaque.label_mask is None
+    finalized_opaque = _finalize_vlm_batch(opaque)
+    assert "labels" in finalized_opaque
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch as _brm
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        _brm([{"text": "101"}], _FakeProcessor(), {}, 8, None,
+             response_mask_fn=lambda b: {"labels": b["input_ids"]},
+             yield_host_staged=True)
+    # Zero-touch iterator rejection: no set_epoch, no pull, no processor call.
+    from unsloth_zoo.mlx.utils import _iterate_lazy_vlm_training_batches
+    probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        next(_iterate_lazy_vlm_training_batches(
+            probe, _FakeProcessor(), {}, 2, 8,
+            response_mask_fn=lambda b: {"labels": b["input_ids"]},
+            yield_host_staged=True))
+    assert probe.pulls == 0 and probe.epochs == []
+
+    # Routed value-carrying closures finalize through the verbatim legacy
+    # pipeline: custom values (777) and identity-closure dtype both match.
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
+    def _value_closure(mask_batch):
+        width = len(mask_batch["input_ids"][0])
+        return {"labels": [[-100, 777] + [-100] * (width - 2)]}
+    routed = _build_response_masked_vlm_batch(
+        [{"text": "101"}], _FakeProcessor(), {}, 8, None,
+        response_mask_fn=_value_closure,
+    )
+    assert routed["labels"].tolist()[0][1] == 777  # custom value preserved
+    assert routed["labels"].dtype == mx.int64  # legacy value-pipeline dtype
+
+    # The raw wide-id carrier survives finalize for the legacy closure: an
+    # identity closure sees the invalid uint32 id, not a wrapped -100.
+    class WideProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            ids = np.asarray(out["input_ids"], dtype=np.uint32)
+            ids[0, 0] = np.uint32(2**32 - 100)
+            out["input_ids"] = ids
+            return out
+    seen = {}
+    def identity_closure(mask_batch):
+        seen["first"] = int(mask_batch["input_ids"][0][0])
+        return {"labels": [list(row) for row in mask_batch["input_ids"]]}
+    _build_response_masked_vlm_batch(
+        [{"text": "101"}], WideProcessor(), {}, 8, None,
+        response_mask_fn=identity_closure)
+    assert seen["first"] == 2**32 - 100
+
+
+def _vlm_trainer_shell_for(dataset, world_size=1, prefetch=0):
+    import types as _types
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        per_device_train_batch_size=1, max_seq_length=8, streaming=True,
+        streaming_prefetch_batches=prefetch,
+    )
+    trainer.model = _types.SimpleNamespace(_config={})
+    trainer.tokenizer = _FakeProcessor()
+    trainer.processor = trainer.tokenizer
+    trainer.train_dataset = dataset
+    trainer.formatting_func = None
+    trainer._batches = None
+    trainer._distributed_initialized = True
+    trainer._distributed_world = None
+    trainer._distributed_world_size = world_size
+    return trainer
+
+
+def test_vlm_prefetch_identity_laziness_and_masked_rejection():
+    from unsloth_zoo.mlx.utils import iterate_vlm_training_batches
+
+    class ContentProcessor(_FakeProcessor):
+        """Encodes each row's text so batch content tracks source order."""
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            ids = np.asarray(out["input_ids"]).copy()
+            for row, value in enumerate(text):
+                ids[row, 0] = int(str(value).split()[0])
+            out["input_ids"] = ids
+            return out
+
+    def stream(source, **kwargs):
+        return iterate_vlm_training_batches(
+            dataset=source, processor=ContentProcessor(), config={},
+            batch_size=2, max_seq_length=8, **kwargs)
+
+    sync = [b["input_ids"].tolist()
+            for b in (lambda it: [next(it) for _ in range(4)])(
+                iter(stream(_LifecycleVLMRows(6))))]
+    assert sync[0] != sync[1]  # content varies with source rows
+    control = {}
+    prefetched_iter = iter(stream(_LifecycleVLMRows(6), prefetch_batches=2,
+                                  prefetch_control=control))
+    prefetched = [next(prefetched_iter)["input_ids"].tolist() for _ in range(4)]
+    assert prefetched == sync  # bit-for-bit consumer-visible sequence
+    assert control["prefetcher"].close()
+
+    # Trainer wiring: eligibility, control registration, and cleanup.
+    shell_probe = _LifecycleVLMRows(6)
+    trainer = _vlm_trainer_shell_for(shell_probe, prefetch=2)
+    _b, shell_stream = trainer._prepare_data(is_vlm=True)
+    assert trainer._mlx_prefetch_control.get("eligible") is True
+    assert next(iter(shell_stream))["input_ids"].shape[0] == 1
+    shell_pf = trainer._mlx_prefetch_control.get("prefetcher")
+    assert shell_pf is not None
+    trainer._active_batch_iter = shell_stream
+    trainer._close_active_batch_iterator()
+    assert trainer._mlx_prefetch_control.get("prefetcher") is None
+
+    probe = _LifecycleVLMRows(6)
+    lazy = iter(stream(probe, prefetch_batches=2))
+    assert probe.pulls == 0  # construction-lazy at P>0
+    next(lazy)
+    assert probe.pulls >= 2
+
+    masked_probe = _LifecycleVLMRows(4)
+    with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+        next(iter(stream(masked_probe, prefetch_batches=1,
+                         response_mask_fn=lambda b: {"labels": b["input_ids"]})))
+    assert masked_probe.pulls == 0 and masked_probe.epochs == []
+
+
+def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
+    """Lazy processor-owned MLX graphs must cross the prefetch boundary.
+
+    Regression: without the producer-side materialization barrier, consumer
+    evaluation raises "There is no Stream ... in current thread". Label
+    decisions for both opaque routes (plain-SFT and prompt/completion) must
+    run on the consumer thread only.
+    """
+    import threading
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx import utils as U
+
+    class LazyMxProcessor(_FakeProcessor):
+        def __call__(self, text, **kwargs):
+            out = super().__call__(text, **kwargs)
+            rows, width = np.asarray(out["input_ids"]).shape
+            return {
+                "input_ids": mx.broadcast_to(mx.arange(1, width + 1), (rows, width)),
+                "attention_mask": mx.broadcast_to(mx.array(1), (rows, width)),
+            }
+
+    label_threads = []
+    legacy_masks = U._apply_vlm_label_masks
+
+    def _spy(*args, **kwargs):
+        label_threads.append(threading.current_thread())
+        return legacy_masks(*args, **kwargs)
+
+    monkeypatch.setattr(U, "_apply_vlm_label_masks", _spy)
+
+    def stream(source, **kwargs):
+        kwargs.setdefault("batch_size", 2)
+        return U.iterate_vlm_training_batches(
+            dataset=source, processor=LazyMxProcessor(), config={},
+            max_seq_length=8, **kwargs)
+
+    it = iter(stream(_LifecycleVLMRows(4), prefetch_batches=1))
+    batch = next(it)
+    mx.eval(batch["input_ids"], batch["labels"])  # consumer-side evaluation
+    assert np.asarray(batch["input_ids"]).tolist() == [[1, 2, 3, 4, 5]] * 2
+    it.close()
+
+    class _PCRows:  # replayable UNSIZED source: the pc_opaque producer runs
+        def __iter__(self):
+            return iter([{"prompt": "101", "completion": "102"},
+                         {"prompt": "103", "completion": "104"}])
+
+    def take(iterator, count):
+        taken = []
+        for _ in range(count):
+            b = next(iterator)
+            taken.append((np.asarray(b["input_ids"]).tolist(),
+                          np.asarray(b["labels"]).tolist(), b["labels"].dtype))
+        return taken
+
+    for pc_loss in (None, False):
+        sync_seq = take(iter(stream(
+            _PCRows(), batch_size=1, completion_only_loss=pc_loss)), 2)
+        pf_it = iter(stream(_PCRows(), batch_size=1, prefetch_batches=1,
+                            completion_only_loss=pc_loss))
+        assert take(pf_it, 2) == sync_seq  # parity incl. label dtypes
+        pf_it.close()
+    assert label_threads and set(label_threads) == {threading.main_thread()}
+
+    # pc_opaque carries tokenizer-derived data, never the live processor:
+    # finalize must succeed after the tokenizer is torn down.
+    class _PoisonedTokenizer:
+        def __getattr__(self, name):
+            raise AssertionError(f"finalize dereferenced tokenizer.{name}")
+
+    proc = LazyMxProcessor()
+    staged = U._collate_vlm_prompt_completion_batch(
+        [{"prompt": "101", "completion": "102"}], proc, 8, None,
+        reject_mlx_valued=True)
+    assert staged.pc_opaque is not None
+    proc.tokenizer = _PoisonedTokenizer()
+    poisoned = U._finalize_vlm_batch(staged)
+    assert np.asarray(poisoned["input_ids"]).tolist() == sync_seq[0][0]

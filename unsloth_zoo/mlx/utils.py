@@ -39,9 +39,11 @@ import os
 import sys
 import shutil
 import tempfile
+import queue as _queue_module
 import threading
+import time
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1543,6 +1545,193 @@ def _normalize_cce_label_dtype(labels):
     return labels
 
 
+def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
+    """Host-side label-mask AUTHORITY for VLM batches: placement only.
+
+    Decides WHICH positions are ignored (ignore tokens, attention zeros, and
+    positions a response/completion mask already set to -100). Label VALUES
+    and dtypes are assembled at finalize time from the SAME converted ids the
+    legacy path used, so coercion parity holds by construction — including
+    legacy's conversion-time rejections. Float comparisons mirror MLX's
+    effective float32 narrowing so placement matches the finalized tensors.
+    """
+    if labels is None:
+        labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
+        if labels is None:
+            labels = inputs["input_ids"]
+    if isinstance(labels, np.ndarray):
+        values = labels
+    elif hasattr(labels, "tolist"):
+        try:
+            values = np.asarray(labels)  # dtype-preserving (torch fp16 etc.)
+        except (TypeError, ValueError):
+            values = np.asarray(labels.tolist())
+    else:
+        values = np.asarray(labels)
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if values.dtype == np.float64:
+        values = values.astype(np.float32)
+    if np.issubdtype(values.dtype, np.integer):
+        # Compare on the SAME normalized representation finalize uses for the
+        # label base (wide unsigned ids become their int64 sentinels first).
+        values = _normalize_numpy_cce_labels(values)
+    mask = values == -100
+    if ignore_token_ids:
+        compare = np.asarray(list(ignore_token_ids))
+        if np.issubdtype(values.dtype, np.floating):
+            compare = compare.astype(values.dtype)  # mirror mx scalar narrowing
+        mask = mask | np.isin(values, compare)
+    attention = inputs.get("attention_mask")
+    if attention is not None:
+        attention_np = (
+            attention if isinstance(attention, np.ndarray)
+            else np.asarray(
+                attention.tolist() if hasattr(attention, "tolist")
+                else attention
+            )
+        )
+        if attention_np.ndim == 1:
+            attention_np = attention_np.reshape(1, -1)
+        if attention_np.dtype == np.float64:
+            attention_np = attention_np.astype(np.float32)
+        mask = mask | (attention_np.astype(np.int32) == 0)
+    return mask
+
+def _reject_mlx_valued_vlm(context):
+    raise ValueError(
+        f"Unsloth MLX VLM: {context} produced MLX-array values; the prefetch "
+        "producer must not convert MLX values off the consumer thread. Use "
+        "streaming_prefetch_batches=0 for this stream."
+    )
+
+
+def _reject_non_integer_host_vlm_ids(context):
+    raise ValueError(
+        f"Unsloth MLX VLM: {context} produced non-integer host token ids, "
+        "which need the synchronous legacy conversion path. Use "
+        "streaming_prefetch_batches=0 for this stream."
+    )
+
+
+def _vlm_ids_integer_host(inputs):
+    """True when label-bearing ids are integer host values (the staged case).
+
+    Real processors emit integer token ids; float or exotic-dtype ids (fp16,
+    bf16, float64 probes) route to the bit-exact legacy path instead of a
+    numpy re-implementation of MLX float semantics.
+    """
+    ids = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
+    if ids is None:
+        ids = inputs.get("input_ids")
+    if isinstance(ids, np.ndarray):
+        return np.issubdtype(ids.dtype, np.integer)
+    if isinstance(ids, (list, tuple)):
+        def _all_integer_leaves(value):
+            if isinstance(value, (list, tuple)):
+                return all(_all_integer_leaves(element) for element in value)
+            return (
+                isinstance(value, (int, np.integer))
+                and not isinstance(value, bool)
+            )
+        return _all_integer_leaves(ids)
+    try:
+        arr = np.asarray(ids)
+    except (TypeError, ValueError):
+        return False
+    return np.issubdtype(arr.dtype, np.integer)
+
+
+def _vlm_inputs_host_valued(inputs):
+    """False when any processor output field arrived as an MLX array."""
+    return not any(_contains_mlx_values(value) for value in inputs.values())
+
+
+class _HostStagedVLMBatch:
+    """Host-side VLM batch: processor fields + decided labels, pre-MLX.
+
+    ``prefinalized`` carries an already-MLX legacy batch for MLX-valued
+    processor outputs (``host_valued=False``) in synchronous mode. In
+    producer mode, MLX-valued PROCESSOR outputs stage opaquely instead —
+    materialized producer-side first, because lazy MLX graphs cannot cross
+    threads: plain-SFT payloads ride ``inputs`` with ``label_mask=None``;
+    prompt/completion payloads ride ``pc_opaque`` with the combine deferred
+    to the consumer finalizer.
+    """
+
+    __slots__ = ("inputs", "label_mask", "widen_labels_int64", "host_valued",
+                 "ignore_token_ids", "config", "prefinalized", "pc_opaque")
+
+    def __init__(self, inputs, label_mask, host_valued=True,
+                 ignore_token_ids=None, config=None, prefinalized=None,
+                 widen_labels_int64=False, pc_opaque=None):
+        self.inputs = inputs
+        self.label_mask = label_mask
+        self.host_valued = host_valued
+        self.ignore_token_ids = ignore_token_ids
+        self.config = config
+        self.prefinalized = prefinalized
+        self.widen_labels_int64 = widen_labels_int64
+        self.pc_opaque = pc_opaque
+
+
+def _finalize_vlm_batch(staged, keep_raw_carrier=False):
+    """The single consumer-thread point converting staged VLM batches to MLX.
+
+    For host-staged batches every semantic label decision already happened
+    host-side; only conversion and compile preparation run here. Opaque
+    processor-owned payloads (plain-SFT with ``label_mask=None``, and
+    ``pc_opaque`` prompt/completion carriers) instead run their combine and
+    legacy label decisions here on the consumer thread — the producer only
+    materialized and transported them.
+    """
+    if staged.prefinalized is not None:
+        return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
+    if staged.pc_opaque is not None:
+        (prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
+         completion_only_loss) = staged.pc_opaque
+        inner = _combine_vlm_prompt_completion_inputs(
+            prompt_inputs, completion_inputs, flush_side, pad_id,
+            max_seq_length,
+            ignore_token_ids=staged.ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+        )
+        inner.config = staged.config
+        return _finalize_vlm_batch(inner, keep_raw_carrier=keep_raw_carrier)
+    batch = _to_mx_vlm_batch(staged.inputs)
+    if staged.label_mask is None:
+        # Opaque processor outputs (the processor itself returned MLX arrays,
+        # e.g. mlx-vlm wrappers): label semantics run the legacy path here on
+        # the consumer thread. Producer-side, Unsloth only ran the permitted
+        # materialization barrier over the processor's own pending graphs —
+        # no new MLX computation or value transform touched the payload.
+        batch["labels"] = _apply_vlm_label_masks(
+            batch, ignore_token_ids=staged.ignore_token_ids,
+        )
+        batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+        return _prepare_vlm_batch_for_compile(batch, staged.config)
+    if staged.label_mask is not None:
+        # Values ride the SAME converted ids the legacy path used; only the
+        # host-decided placement differs from raw ids. Conversion-time errors
+        # therefore match legacy exactly.
+        raw = (
+            batch.get(_RAW_INPUT_IDS_FOR_LABELS)
+            if keep_raw_carrier
+            else batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+        )
+        base = _normalize_cce_label_dtype(
+            raw if raw is not None else batch["input_ids"]
+        )
+        ignore = mx.array(-100, dtype=base.dtype)
+        labels = mx.where(mx.array(staged.label_mask), ignore, base)
+        if staged.widen_labels_int64:
+            labels = mx.array(
+                np.asarray(labels.tolist(), dtype=np.int64)
+            )  # legacy completion-branch coercion, verbatim
+        batch["labels"] = labels
+    return _prepare_vlm_batch_for_compile(batch, staged.config)
+
+
 def _mask_label_token_ids(targets, ignore_token_ids, ignore_index=-100):
     if not ignore_token_ids:
         return targets
@@ -2949,7 +3138,64 @@ def normalize_vlm_processor_chat_template(
     )
 
 
-def encode_mlx_text(tokenizer, text):
+def _contains_mlx_values(value):
+    if isinstance(value, mx.array):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_contains_mlx_values(element) for element in value)
+    if isinstance(value, Mapping):
+        return any(_contains_mlx_values(element) for element in value.values())
+    return False
+
+
+def _collect_mlx_values(value, out):
+    if isinstance(value, mx.array):
+        out.append(value)
+    elif isinstance(value, (list, tuple)):
+        for element in value:
+            _collect_mlx_values(element, out)
+    elif isinstance(value, Mapping):
+        for element in value.values():
+            _collect_mlx_values(element, out)
+
+
+def _materialize_mlx_values(*trees):
+    """Force pending MLX graphs on the thread that created them.
+
+    Lazy MLX arrays cannot be evaluated from another thread, so opaque
+    processor-owned payloads must cross the prefetch boundary materialized.
+    This completes computation the processor already issued on this thread;
+    Unsloth still introduces no new MLX computation off the consumer thread.
+    """
+    arrays = []
+    for tree in trees:
+        _collect_mlx_values(tree, arrays)
+    if arrays:
+        mx.eval(*arrays)
+
+
+def _reject_mlx_valued_text(context):
+    raise ValueError(
+        f"Unsloth MLX text: {context} carried MLX-array values; the prefetch "
+        "producer must not convert MLX values off the consumer thread. Use "
+        "streaming_prefetch_batches=0 for this stream."
+    )
+
+
+def _guard_host_token_output(value, state, context):
+    """Record/reject an MLX-valued tokenizer or template output pre-conversion."""
+    if state is not None and _contains_mlx_values(value):
+        if state.get("reject_mlx_valued"):
+            raise ValueError(
+                f"Unsloth MLX: {context} returned an MLX array; the prefetch "
+                "producer must not convert MLX values off the consumer "
+                "thread. Use streaming_prefetch_batches=0."
+            )
+        state["host_valued"] = False
+    return value
+
+
+def encode_mlx_text(tokenizer, text, state=None):
     """Tokenize text while mirroring Unsloth's double-BOS guard."""
     add_special_tokens = True
     bos_token = getattr(tokenizer, "bos_token", None)
@@ -2957,9 +3203,10 @@ def encode_mlx_text(tokenizer, text):
         add_special_tokens = False
 
     try:
-        return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        encoded = tokenizer.encode(text, add_special_tokens=add_special_tokens)
     except TypeError:
-        return tokenizer.encode(text)
+        encoded = tokenizer.encode(text)
+    return _guard_host_token_output(encoded, state, "the tokenizer")
 
 
 def _raise_mlx_chat_template_error(target, *, is_vlm=False):
@@ -3406,10 +3653,11 @@ def _looks_like_mlx_chat_value(value):
     )
 
 
-def _flatten_mlx_chat_template_ids(value):
+def _flatten_mlx_chat_template_ids(value, state=None):
     """Flatten tokenizer chat-template output to a single token-id list."""
     if isinstance(value, Mapping):
         value = value["input_ids"]
+    value = _guard_host_token_output(value, state, "the chat template")
     if hasattr(value, "tolist"):
         value = value.tolist()
     if len(value) > 0 and isinstance(value[0], list):
@@ -3417,10 +3665,11 @@ def _flatten_mlx_chat_template_ids(value):
     return list(value)
 
 
-def _flatten_mlx_chat_template_field(value, field_name):
+def _flatten_mlx_chat_template_field(value, field_name, state=None):
     """Flatten one field from tokenizer chat-template output."""
     if isinstance(value, Mapping):
         value = value[field_name]
+    value = _guard_host_token_output(value, state, "the chat template")
     if hasattr(value, "tolist"):
         value = value.tolist()
     if len(value) > 0 and isinstance(value[0], list):
@@ -3428,20 +3677,22 @@ def _flatten_mlx_chat_template_field(value, field_name):
     return list(value)
 
 
-def _apply_mlx_chat_template_ids(tokenizer, messages, **kwargs):
+def _apply_mlx_chat_template_ids(tokenizer, messages, _unsloth_state=None, /, **kwargs):
     """Tokenize messages through apply_chat_template with a HF-compatible fallback."""
     try:
         return _flatten_mlx_chat_template_ids(
-            tokenizer.apply_chat_template(messages, **kwargs)
+            tokenizer.apply_chat_template(messages, **kwargs),
+            state=_unsloth_state,
         )
     except TypeError:
         kwargs.pop("return_dict", None)
         return _flatten_mlx_chat_template_ids(
-            tokenizer.apply_chat_template(messages, **kwargs)
+            tokenizer.apply_chat_template(messages, **kwargs),
+            state=_unsloth_state,
         )
 
 
-def _apply_mlx_chat_template_dict(tokenizer, messages, **kwargs):
+def _apply_mlx_chat_template_dict(tokenizer, messages, _unsloth_state=None, /, **kwargs):
     """Tokenize messages through apply_chat_template and preserve returned masks."""
     try:
         value = tokenizer.apply_chat_template(messages, **kwargs)
@@ -3451,9 +3702,12 @@ def _apply_mlx_chat_template_dict(tokenizer, messages, **kwargs):
         kwargs.pop("return_assistant_tokens_mask", None)
         kwargs.pop("return_dict", None)
         value = tokenizer.apply_chat_template(messages, **kwargs)
-    if isinstance(value, Mapping):
-        return value
-    return {"input_ids": value}
+    if not isinstance(value, Mapping):
+        value = {"input_ids": value}
+    if _unsloth_state is not None:
+        for field_value in value.values():
+            _guard_host_token_output(field_value, _unsloth_state, "the chat template")
+    return value
 
 
 def _apply_mlx_text_label_masks(input_ids, *, completion_mask=None, assistant_mask=None):
@@ -3537,6 +3791,7 @@ def _tokenize_mlx_conversational_prompt_completion(
     chat_template_kwargs=None,
     assistant_only_loss=False,
     completion_only_loss=None,
+    state=None,
 ):
     """Tokenize conversational prompt/completion rows using TRL's split."""
     prompt_messages = _normalize_mlx_messages(prompt, is_vlm=False)
@@ -3545,6 +3800,7 @@ def _tokenize_mlx_conversational_prompt_completion(
     prompt_ids = _apply_mlx_chat_template_ids(
         tokenizer,
         prompt_messages,
+        state,
         tokenize=True,
         add_generation_prompt=True,
         tools=tools,
@@ -3553,6 +3809,7 @@ def _tokenize_mlx_conversational_prompt_completion(
     prompt_completion_processed = _apply_mlx_chat_template_dict(
         tokenizer,
         prompt_messages + completion_messages,
+        state,
         tokenize=True,
         return_dict=True,
         return_assistant_tokens_mask=bool(assistant_only_loss),
@@ -3560,12 +3817,12 @@ def _tokenize_mlx_conversational_prompt_completion(
         **template_kwargs,
     )
     input_ids = _flatten_mlx_chat_template_field(
-        prompt_completion_processed, "input_ids"
+        prompt_completion_processed, "input_ids", state=state,
     )
     assistant_mask = None
     if "assistant_masks" in prompt_completion_processed:
         assistant_mask = _flatten_mlx_chat_template_field(
-            prompt_completion_processed, "assistant_masks"
+            prompt_completion_processed, "assistant_masks", state=state,
         )
         _validate_mlx_assistant_mask(
             input_ids, assistant_mask, source="conversational"
@@ -3591,10 +3848,11 @@ def _tokenize_mlx_prompt_completion(
     *,
     append_eos=True,
     completion_only_loss=None,
+    state=None,
 ):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
-    prompt_ids = list(encode_mlx_text(tokenizer, prompt))
-    input_ids = list(encode_mlx_text(tokenizer, prompt + completion))
+    prompt_ids = list(encode_mlx_text(tokenizer, prompt, state=state))
+    input_ids = list(encode_mlx_text(tokenizer, prompt + completion, state=state))
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
         prompt_ids,
@@ -3646,6 +3904,7 @@ def _tokenize_mlx_prompt_completion_row(
     append_eos=True,
     completion_only_loss=None,
     assistant_only_loss=False,
+    state=None,
 ):
     """Tokenize one text prompt/completion row, including conversational rows."""
     if not isinstance(item, dict) or "prompt" not in item or "completion" not in item:
@@ -3661,6 +3920,7 @@ def _tokenize_mlx_prompt_completion_row(
             chat_template_kwargs=item.get("chat_template_kwargs"),
             assistant_only_loss=assistant_only_loss,
             completion_only_loss=completion_only_loss,
+            state=state,
         )
     pair = _render_mlx_prompt_completion_texts(
         tokenizer,
@@ -3676,10 +3936,11 @@ def _tokenize_mlx_prompt_completion_row(
         pair[1],
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
+        state=state,
     )
 
 
-def _tokenize_mlx_assistant_messages_row(tokenizer, item):
+def _tokenize_mlx_assistant_messages_row(tokenizer, item, state=None):
     """Tokenize one conversational row with chat-template assistant masks."""
     messages = (
         item if _looks_like_mlx_chat_messages(item)
@@ -3697,16 +3958,17 @@ def _tokenize_mlx_assistant_messages_row(tokenizer, item):
     processed = _apply_mlx_chat_template_dict(
         tokenizer,
         messages,
+        state,
         return_dict=True,
         tokenize=True,
         return_assistant_tokens_mask=True,
         tools=item.get("tools") if isinstance(item, Mapping) else None,
         **template_kwargs,
     )
-    input_ids = _flatten_mlx_chat_template_field(processed, "input_ids")
+    input_ids = _flatten_mlx_chat_template_field(processed, "input_ids", state=state)
     assistant_mask = None
     if "assistant_masks" in processed:
-        assistant_mask = _flatten_mlx_chat_template_field(processed, "assistant_masks")
+        assistant_mask = _flatten_mlx_chat_template_field(processed, "assistant_masks", state=state)
         _validate_mlx_assistant_mask(input_ids, assistant_mask, source="text")
     else:
         _validate_mlx_assistant_mask(input_ids, [0] * len(input_ids), source="text")
@@ -3755,8 +4017,23 @@ def _prepare_labeled_text_dataset(
     return formatted
 
 
-def _coerce_mlx_token_list(value, field_name):
-    """Convert one token-id field from a pretokenized row to a Python list."""
+def _coerce_mlx_token_list(value, field_name, state=None):
+    """Convert one token-id field from a pretokenized row to a Python list.
+
+    When ``state`` is provided and the value arrived as an MLX array, the
+    stream is marked ``host_valued=False`` BEFORE conversion — the conversion
+    itself is MLX work, which the prefetch producer must reject rather than
+    perform off the consumer thread.
+    """
+    if state is not None and _contains_mlx_values(value):
+        if state.get("reject_mlx_valued"):
+            raise ValueError(
+                f"Unsloth MLX: pretokenized '{field_name}' is an MLX array; "
+                "the prefetch producer must not convert MLX values off the "
+                "consumer thread. Use streaming_prefetch_batches=0 "
+                "(synchronous mode) for MLX-valued rows."
+            )
+        state["host_valued"] = False
     if hasattr(value, "tolist"):
         value = value.tolist()
     if not isinstance(value, (list, tuple)):
@@ -3805,15 +4082,16 @@ def _tokenize_mlx_pretokenized_row(
     *,
     completion_only_loss=None,
     assistant_only_loss=False,
+    state=None,
 ):
     """Read input_ids plus optional labels/completion_mask from one text row."""
     if not isinstance(item, Mapping) or "input_ids" not in item:
         return None
 
-    input_ids = _coerce_mlx_token_list(item["input_ids"], "input_ids")
+    input_ids = _coerce_mlx_token_list(item["input_ids"], "input_ids", state=state)
     labels = None
     if item.get("labels") is not None:
-        labels = _coerce_mlx_token_list(item["labels"], "labels")
+        labels = _coerce_mlx_token_list(item["labels"], "labels", state=state)
         if len(labels) != len(input_ids):
             raise ValueError(
                 "Unsloth MLX: pretokenized 'labels' must match 'input_ids' length."
@@ -3821,7 +4099,7 @@ def _tokenize_mlx_pretokenized_row(
 
     if completion_only_loss is True and item.get("completion_mask") is not None:
         completion_mask = _coerce_mlx_token_list(
-            item["completion_mask"], "completion_mask"
+            item["completion_mask"], "completion_mask", state=state,
         )
         if len(completion_mask) != len(input_ids):
             raise ValueError(
@@ -3844,7 +4122,7 @@ def _tokenize_mlx_pretokenized_row(
     # Match TRL's collator: pretokenized assistant_masks are labels metadata.
     if assistant_masks is not None:
         assistant_mask = _coerce_mlx_token_list(
-            assistant_masks, "assistant_masks"
+            assistant_masks, "assistant_masks", state=state,
         )
         if len(assistant_mask) != len(input_ids):
             raise ValueError(
@@ -3918,12 +4196,253 @@ def _ensure_reiterable_text_dataset(dataset):
     return list(dataset)
 
 
+def _is_mlx_lazy_text_source(dataset):
+    """Return whether streaming text must avoid map-style source operations."""
+    try:
+        from datasets import Dataset as HFDataset
+        from datasets import IterableDataset as HFIterableDataset
+    except ImportError:
+        pass
+    else:
+        if isinstance(dataset, HFIterableDataset):
+            return True
+        if isinstance(dataset, HFDataset):
+            return False
+    if isinstance(dataset, Sequence):
+        return False
+    if isinstance(dataset, Iterator):
+        return True
+    source_mro = type(dataset).__mro__
+    # Explicit iteration wins over custom size/index methods: guarded streams
+    # may expose advisory or deliberately unusable map-style operations that
+    # must not be probed merely to decide whether streaming is safe.
+    if any("__iter__" in cls.__dict__ for cls in source_mro):
+        return True
+    # Python's sequence-iteration fallback accepts __getitem__ without
+    # __iter__. Preserve classes declaring both map-style protocols without
+    # probing either operation; getitem-only fallback iterables remain lazy.
+    has_getitem = any("__getitem__" in cls.__dict__ for cls in source_mro)
+    has_len = any("__len__" in cls.__dict__ for cls in source_mro)
+    return has_getitem and not has_len
+
+
+def _is_mlx_hf_iterable_text_source(dataset):
+    """Return whether Hugging Face defines this source as replayable.
+
+    Detected through ``sys.modules`` so classification never imports
+    ``datasets``: if the package was never imported, no instance can exist.
+    """
+    hf_datasets = sys.modules.get("datasets")
+    hf_iterable = getattr(hf_datasets, "IterableDataset", None)
+    return hf_iterable is not None and isinstance(dataset, hf_iterable)
+
+
+def _mlx_lazy_text_source(dataset):
+    """Return the raw source beneath an MLX prepared iterable view."""
+    return getattr(dataset, "_mlx_source_dataset", dataset)
+
+
+class _MLXIterableTokenizedDatasetView:
+    """Iterable-only public view over MLX's lazy text normalization pipeline.
+
+    The view deliberately has no ``__len__`` or ``__getitem__``. It preserves
+    the source's replay/one-shot behavior and forwards epoch changes without
+    consuming a row during construction.
+    """
+
+    _INVALIDATED_SOURCE_METADATA = frozenset((
+        "column_names", "features", "info", "num_columns", "supervised_keys",
+    ))
+
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        *,
+        dataset_text_field="text",
+        formatting_func=None,
+        append_eos=True,
+        completion_only_loss=None,
+        assistant_only_loss=False,
+        max_seq_length=None,
+        response_mask_fn=None,
+    ):
+        self._mlx_source_dataset = dataset
+        self._tokenizer = tokenizer
+        self._dataset_text_field = dataset_text_field
+        self._formatting_func = formatting_func
+        self._append_eos = append_eos
+        self._completion_only_loss = completion_only_loss
+        self._assistant_only_loss = assistant_only_loss
+        self._max_seq_length = max_seq_length
+        self._response_mask_fn = response_mask_fn
+
+    def __getattr__(self, name):
+        """Lazily expose public metadata and cursor state, not raw transforms."""
+        if name.startswith("_") or name in self._INVALIDATED_SOURCE_METADATA:
+            raise AttributeError(name)
+        value = getattr(self._mlx_source_dataset, name)
+        if callable(value):
+            raise AttributeError(name)
+        return value
+
+    def set_epoch(self, epoch):
+        set_epoch = getattr(self._mlx_source_dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
+    def set_response_mask(self, mask_fn):
+        self._response_mask_fn = mask_fn
+
+    def set_tokenizer(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def _iter_tokenized_rows(
+        self, dataset=None, *, state=None, include_source=False,
+    ):
+        source = self._mlx_source_dataset if dataset is None else dataset
+        return _iter_lazy_tokenized_text_rows(
+            source,
+            self._tokenizer,
+            dataset_text_field=self._dataset_text_field,
+            formatting_func=self._formatting_func,
+            append_eos=self._append_eos,
+            completion_only_loss=self._completion_only_loss,
+            assistant_only_loss=self._assistant_only_loss,
+            max_seq_length=self._max_seq_length,
+            response_mask_fn=self._response_mask_fn,
+            state=state,
+            include_source=include_source,
+        )
+
+    def __iter__(self):
+        for source, input_ids, labels in self._iter_tokenized_rows(
+            include_source=True,
+        ):
+            row = dict(source) if isinstance(source, Mapping) else {}
+            row["input_ids"] = list(input_ids)
+            row.pop("labels", None)
+            if labels is not None:
+                row["labels"] = list(labels)
+            if isinstance(source, Mapping) and "input_ids" in source:
+                for field in ("completion_mask", "assistant_masks"):
+                    mask = row.get(field)
+                    if hasattr(mask, "tolist"):
+                        mask = mask.tolist()
+                    if isinstance(mask, (list, tuple)) and (
+                        not mask or not isinstance(mask[0], (list, tuple))
+                    ):
+                        row[field] = list(mask)[:len(input_ids)]
+            yield row
+
+
 def _labeled_row_has_supervision(labels, max_seq_length):
     # Keep rows with a supervised token in labels[1:max_seq_length] (causal shift,
     # length-capped); an all-masked batch aborts training. labels=None always kept.
     if labels is None:
         return True
     return any(int(x) != -100 for x in labels[1:max_seq_length])
+
+
+class _HostStagedTextBatch:
+    """Host-side (python/numpy) text batch awaiting MLX finalization.
+
+    ``host_valued`` is False when any staged field arrived as an MLX array;
+    synchronous mode accepts such rows unchanged, while the prefetch producer
+    must reject them via the FIFO envelope.
+    """
+
+    __slots__ = ("ids", "lengths_info", "labels", "host_valued")
+
+    def __init__(self, ids, lengths_info, labels, host_valued=True):
+        self.ids = ids
+        self.lengths_info = lengths_info
+        self.labels = labels
+        self.host_valued = host_valued
+
+
+def _is_host_valued_field(value):
+    return not _contains_mlx_values(value)
+
+
+def _finalize_text_batch(staged):
+    """The single point where staged text batches become MLX arrays."""
+    labels_array = (
+        mx.array(staged.labels) if staged.labels is not None else None
+    )
+    return mx.array(staged.ids), mx.array(staged.lengths_info), labels_array
+
+
+def _stage_tokenized_text_batch(
+    batch_items,
+    max_seq_length,
+    pad_id=0,
+    labels_expected=None,
+    host_valued=None,
+):
+    """Host staging of one pretokenized text batch (no MLX work).
+
+    ``host_valued=None`` computes the flag from the items; the lazy pipeline
+    passes the stream-level flag recorded at row normalization, where MLX
+    origin is still visible (rows are lists by the time they reach staging).
+    """
+    valid_items = [item for item in batch_items if item is not None]
+    lengths = [
+        0 if item is None else min(len(item[0]), max_seq_length)
+        for item in batch_items
+    ]
+    max_length = max(lengths)
+    if max_length == 0:
+        max_length = min(2, max_seq_length)
+    batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
+    has_labels = (
+        valid_items[0][1] is not None
+        if valid_items else bool(labels_expected)
+    )
+    if any(
+        (labels is not None) != has_labels
+        for ids, labels in valid_items
+    ):
+        raise ValueError(
+            "Unsloth MLX: pretokenized rows with labels/completion_mask must "
+            "not be batched with rows that do not provide labels."
+        )
+    if host_valued is None:
+        host_valued = all(
+            _is_host_valued_field(item[0])
+            and (item[1] is None or _is_host_valued_field(item[1]))
+            for item in valid_items
+        )
+    batch_labels = (
+        np.full((len(batch_items), max_length), -100, dtype=np.int64)
+        if has_labels else None
+    )
+    for row_idx, item in enumerate(batch_items):
+        if item is None:
+            continue
+        ids, labels = item
+        length = lengths[row_idx]
+        batch_ids[row_idx, :length] = ids[:length]
+        if batch_labels is not None:
+            batch_labels[row_idx, :length] = labels[:length]
+    lengths_info = [[0, length] for length in lengths]
+    return _HostStagedTextBatch(batch_ids, lengths_info, batch_labels, host_valued)
+
+
+def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0,
+                                 labels_expected=None):
+    """Pad pretokenized ids plus optional labels for one MLX text batch."""
+    # host_valued=True skips the recursive provenance scan: this wrapper
+    # finalizes immediately, so the flag is never consumed.
+    return _finalize_text_batch(_stage_tokenized_text_batch(
+        batch_items, max_seq_length, pad_id=pad_id,
+        labels_expected=labels_expected, host_valued=True,
+    ))
+
+
+def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
+    """Pad token ids and labels for one labeled MLX text batch."""
+    return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
 
 
 @dataclass(frozen=True)
@@ -4246,36 +4765,6 @@ def _shuffled_full_batch_schedule(
                 return tuple(schedule)
         if num_batches is None:
             return tuple(schedule)
-
-
-def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0):
-    """Pad pretokenized ids plus optional labels for one MLX text batch."""
-    lengths = [min(len(ids), max_seq_length) for ids, _labels in batch_items]
-    max_length = max(lengths)
-    batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
-    has_labels = batch_items[0][1] is not None
-    if any((labels is not None) != has_labels for _ids, labels in batch_items):
-        raise ValueError(
-            "Unsloth MLX: pretokenized rows with labels/completion_mask must "
-            "not be batched with rows that do not provide labels."
-        )
-    batch_labels = (
-        np.full((len(batch_items), max_length), -100, dtype=np.int64)
-        if has_labels else None
-    )
-    for row_idx, (ids, labels) in enumerate(batch_items):
-        length = lengths[row_idx]
-        batch_ids[row_idx, :length] = ids[:length]
-        if batch_labels is not None:
-            batch_labels[row_idx, :length] = labels[:length]
-    lengths_info = [[0, length] for length in lengths]
-    labels_array = mx.array(batch_labels) if batch_labels is not None else None
-    return mx.array(batch_ids), mx.array(lengths_info), labels_array
-
-
-def _create_labeled_text_batch(batch_items, max_seq_length, pad_id=0):
-    """Pad token ids and labels for one labeled MLX text batch."""
-    return _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=pad_id)
 
 
 def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
@@ -4788,6 +5277,7 @@ def _collate_vlm_prompt_completion_batch(
     image_size,
     ignore_token_ids=None,
     completion_only_loss=None,
+    reject_mlx_valued=False,
 ):
     prompt_texts = []
     completion_texts = []
@@ -4851,6 +5341,54 @@ def _collate_vlm_prompt_completion_batch(
         padding_side="right",
     )
 
+    pc_host_valued = (
+        _vlm_inputs_host_valued(prompt_inputs)
+        and _vlm_inputs_host_valued(completion_inputs)
+    )
+    # Snapshot the tokenizer-derived collation scalars while this thread
+    # still exclusively owns the processor; the carrier transports data, not
+    # the live processor, so the consumer never dereferences it.
+    flush_side = _vlm_tokenizer_padding_side(processor)
+    pad_id = _vlm_pad_token_id(processor)
+    if not pc_host_valued and reject_mlx_valued:
+        # Processor-owned MLX outputs: materialize their pending graphs on
+        # this thread (lazy arrays cannot cross the thread boundary) and
+        # defer the combine + label decisions to the consumer finalizer.
+        _materialize_mlx_values(prompt_inputs, completion_inputs)
+        return _HostStagedVLMBatch(
+            None, None, host_valued=False,
+            ignore_token_ids=ignore_token_ids,
+            pc_opaque=(prompt_inputs, completion_inputs, flush_side, pad_id,
+                       max_seq_length, completion_only_loss),
+        )
+    return _combine_vlm_prompt_completion_inputs(
+        prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
+        ignore_token_ids=ignore_token_ids,
+        completion_only_loss=completion_only_loss,
+        reject_mlx_valued=reject_mlx_valued,
+    )
+
+
+def _combine_vlm_prompt_completion_inputs(
+    prompt_inputs,
+    completion_inputs,
+    flush_side,
+    pad_id,
+    max_seq_length,
+    ignore_token_ids=None,
+    completion_only_loss=None,
+    reject_mlx_valued=False,
+):
+    """Concatenate prompt/completion processor outputs into one staged batch.
+
+    Runs on the collating thread for host-valued outputs and on the consumer
+    thread (via the ``pc_opaque`` carrier) for MLX-valued outputs. Takes the
+    tokenizer-derived collation scalars, never the processor itself.
+    """
+    pc_host_valued = (
+        _vlm_inputs_host_valued(prompt_inputs)
+        and _vlm_inputs_host_valued(completion_inputs)
+    )
     p_ids = _as_numpy_vlm_field(prompt_inputs, "input_ids")
     c_ids = _as_numpy_vlm_field(completion_inputs, "input_ids")
     p_mask = _as_numpy_vlm_field(prompt_inputs, "attention_mask")
@@ -4866,8 +5404,6 @@ def _collate_vlm_prompt_completion_batch(
     if token_type_key is not None:
         extras[token_type_key] = token_type_ids
 
-    flush_side = _vlm_tokenizer_padding_side(processor)
-    pad_id = _vlm_pad_token_id(processor)
     input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
         input_ids, attention_mask, flush_side, pad_id, extras,
     )
@@ -4880,21 +5416,41 @@ def _collate_vlm_prompt_completion_batch(
     combined_inputs["attention_mask"] = attention_mask
     if token_type_key is not None:
         combined_inputs[token_type_key] = extras[token_type_key]
+    completion_only_loss_enabled = (
+        True if completion_only_loss is None else bool(completion_only_loss)
+    )
+    if pc_host_valued and _vlm_ids_integer_host(combined_inputs):
+        label_mask = _stage_vlm_label_mask_np(
+            combined_inputs, ignore_token_ids=ignore_token_ids,
+        )
+        if completion_only_loss_enabled:
+            label_mask = label_mask | (
+                np.asarray(extras["completion_mask"]) == 0
+            )
+        return _HostStagedVLMBatch(
+            combined_inputs, label_mask, ignore_token_ids=ignore_token_ids,
+            widen_labels_int64=completion_only_loss_enabled,
+        )
+    if reject_mlx_valued:
+        # Non-stageable producer batches (float/exotic ids) must never reach
+        # MLX conversion off the consumer thread.
+        _reject_non_integer_host_vlm_ids("the processor")
     batch = _to_mx_vlm_batch(combined_inputs)
     batch["labels"] = _apply_vlm_label_masks(
-        batch,
-        ignore_token_ids=ignore_token_ids,
+        batch, ignore_token_ids=ignore_token_ids,
     )
-
-    completion_only_loss_enabled = True if completion_only_loss is None else bool(completion_only_loss)
     if completion_only_loss_enabled:
-        labels_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
-        labels_np[np.asarray(extras["completion_mask"]) == 0] = -100
-        batch["labels"] = mx.array(labels_np)
-    return batch
+        legacy_np = np.asarray(batch["labels"].tolist(), dtype=np.int64)
+        legacy_np[np.asarray(extras["completion_mask"]) == 0] = -100
+        batch["labels"] = mx.array(legacy_np)
+    return _HostStagedVLMBatch(
+        None, None, host_valued=False,
+        ignore_token_ids=ignore_token_ids, prefinalized=batch,
+    )
 
 
 def _collate_vlm_batch(items, processor, max_seq_length, image_size,
+                       reject_mlx_valued=False,
                        formatting_func=None, ignore_token_ids=None,
                        completion_only_loss=None,
                        return_prompt_completion=False):
@@ -4905,10 +5461,17 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     tokenization + image processing + padding.
     """
     normalize_vlm_processor_chat_template(processor, strict=False)
+    if reject_mlx_valued and any(_contains_mlx_values(item) for item in items):
+        # Source rows carrying MLX arrays (e.g. mx image tensors) must reject
+        # before formatting or the processor touches them off-thread.
+        _reject_mlx_valued_vlm("the dataset row")
     formatted_items = []
     for item in items:
         if formatting_func is not None:
             item = formatting_func(item)
+            if reject_mlx_valued and _contains_mlx_values(item):
+                # Formatters can introduce MLX values after the row-level scan.
+                _reject_mlx_valued_vlm("the formatting function")
         formatted_items.append(item)
 
     if (
@@ -4921,6 +5484,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             formatted_items, processor, max_seq_length, image_size,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            reject_mlx_valued=reject_mlx_valued,
         )
         return (batch, True) if return_prompt_completion else batch
 
@@ -4950,12 +5514,40 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         processor, all_texts, all_images, max_seq_length,
         suffixes=all_suffixes,
     )
-    batch = _to_mx_vlm_batch(inputs)
-    batch["labels"] = _apply_vlm_label_masks(
-        batch,
-        ignore_token_ids=ignore_token_ids,
-    )
-    return (batch, False) if return_prompt_completion else batch
+    if _vlm_inputs_host_valued(inputs) and _vlm_ids_integer_host(inputs):
+        label_mask = _stage_vlm_label_mask_np(
+            inputs, ignore_token_ids=ignore_token_ids,
+        )
+        staged = _HostStagedVLMBatch(
+            inputs, label_mask, ignore_token_ids=ignore_token_ids,
+        )
+    elif reject_mlx_valued and not _vlm_inputs_host_valued(inputs):
+        # The PROCESSOR itself emitted MLX arrays (mlx-vlm wrappers do this
+        # regardless of return_tensors): materialize its pending graphs on
+        # this thread (lazy arrays cannot cross the thread boundary), carry
+        # the payload through otherwise untouched, and decide labels at
+        # finalize. Unsloth issues no new MLX computation producer-side.
+        _materialize_mlx_values(inputs)
+        staged = _HostStagedVLMBatch(
+            inputs, None, host_valued=False,
+            ignore_token_ids=ignore_token_ids,
+        )
+    elif reject_mlx_valued:
+        # Host-valued but non-integer ids: legacy conversion would run
+        # producer-side, so reject with the synchronous remedy.
+        _reject_non_integer_host_vlm_ids("the processor")
+    else:
+        # MLX-valued processor outputs: legacy synchronous label path, wrapped
+        # so the single finalizer stays the only exit to the trainer.
+        batch = _to_mx_vlm_batch(inputs)
+        batch["labels"] = _apply_vlm_label_masks(
+            batch, ignore_token_ids=ignore_token_ids,
+        )
+        staged = _HostStagedVLMBatch(
+            None, None, host_valued=False,
+            ignore_token_ids=ignore_token_ids, prefinalized=batch,
+        )
+    return (staged, False) if return_prompt_completion else staged
 
 
 def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None):
@@ -4999,6 +5591,14 @@ def _apply_response_mask_to_vlm_batch(batch_dict, mask_fn, ignore_token_ids=None
 
 def _vlm_trainable_label_rows(batch_dict):
     """Return per-row trainability from VLM labels after response masking."""
+    if isinstance(batch_dict, _HostStagedVLMBatch):
+        if batch_dict.prefinalized is not None:
+            return _vlm_trainable_label_rows(batch_dict.prefinalized)
+        mask = batch_dict.label_mask
+        if mask is None:
+            return None
+        mask_np = mask if mask.ndim > 1 else mask.reshape(1, -1)
+        return [bool(np.any(~row[1:])) for row in mask_np]
     labels = batch_dict.get("labels")
     if labels is None:
         return None
@@ -5020,22 +5620,51 @@ def _build_response_masked_vlm_batch(
     ignore_token_ids=None,
     completion_only_loss=None,
     return_prompt_completion=False,
+    yield_host_staged=False,
+    reject_mlx_valued=False,
 ):
-    """Collate VLM rows and apply the CUDA response-mask closure."""
-    batch_dict, is_prompt_completion = _collate_vlm_batch(
+    """Collate VLM rows and apply the CUDA response-mask closure.
+
+    Plain-SFT and prompt/completion streams stage host-side and exit through
+    the single ``_finalize_vlm_batch`` call (``yield_host_staged`` defers it
+    for the prefetch producer). Response-masked streams run the verbatim
+    legacy consumer-side order and are rejected in producer modes.
+    """
+    staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
+        reject_mlx_valued=reject_mlx_valued,
         formatting_func=formatting_func,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
         return_prompt_completion=True,
     )
-    batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
+    staged.config = config
     if response_mask_fn is not None and not is_prompt_completion:
+        # Closure semantics are DEFINED on the converted, compile-prepared
+        # tensors (image-token expansion shifts positions), so response
+        # masking is consumer-side by nature and runs the verbatim legacy
+        # order. Producer-destined staging therefore cannot cover it.
+        if yield_host_staged:
+            raise ValueError(
+                "Unsloth MLX VLM: train_on_responses_only streams are not "
+                "covered by the prefetch producer yet; use "
+                "streaming_prefetch_batches=0 for response-masked VLM "
+                "streams."
+            )
+        batch_dict = _finalize_vlm_batch(staged, keep_raw_carrier=True)
         batch_dict = _apply_response_mask_to_vlm_batch(
             batch_dict,
             response_mask_fn,
             ignore_token_ids=ignore_token_ids,
         )
+        if return_prompt_completion:
+            return batch_dict, is_prompt_completion
+        return batch_dict
+    if yield_host_staged:
+        if return_prompt_completion:
+            return staged, is_prompt_completion
+        return staged
+    batch_dict = _finalize_vlm_batch(staged)
     if return_prompt_completion:
         return batch_dict, is_prompt_completion
     return batch_dict
@@ -5100,6 +5729,14 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     resize images → processor(text, images, padding=True) → uniform batches.
     """
     import numpy as np
+
+    if not _vlm_has_sized_index_space(dataset):
+        raise ValueError(
+            "Unsloth MLX VLM: this path requires a sized dataset exposing "
+            "__len__ and __getitem__. Unsized/streaming VLM sources are only "
+            "supported for training with streaming=True; unsized VLM "
+            "evaluation is a planned follow-up."
+        )
 
     image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
@@ -5224,13 +5861,275 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     return batch_list
 
 
+
+def _vlm_has_sized_index_space(dataset):
+    """True when the VLM batcher can index the dataset (`__len__` + `__getitem__`).
+
+    Both protocols must be declared on the TYPE (instance `__getattr__` proxies
+    do not make an object subscriptable), and known iterable-only bases are
+    excluded even when they inherit a raising `__getitem__` (torch
+    `IterableDataset`) or declare stream topology (HF iterables). Everything
+    else streams lazily; the sized path's permutations and response-mask
+    pre-scan require real indexing.
+    """
+    cls = type(dataset)
+    if not callable(getattr(cls, "__len__", None)):
+        return False
+    if not callable(getattr(cls, "__getitem__", None)):
+        return False
+    if _is_mlx_hf_iterable_text_source(dataset):
+        return False
+    torch_data = sys.modules.get("torch.utils.data")
+    torch_iterable = getattr(torch_data, "IterableDataset", None)
+    if torch_iterable is not None and isinstance(dataset, torch_iterable):
+        return False
+    return True
+
+
+def _iterate_lazy_vlm_training_batches(
+    dataset, processor, config, batch_size, max_seq_length, *,
+    response_mask_fn=None, formatting_func=None, dataset_order="default",
+    completion_only_loss=None, image_size=None, comm_group=None,
+    require_replayable=False, expected_rows_per_pass=None,
+    ignore_token_ids=None, yield_host_staged=False, reject_mlx_valued=False,
+    should_stop=None,
+):
+    """Unsized VLM batches under the lazy text-stream lifecycle contracts.
+
+    Single-process only: the previous every-rank consumption of the global
+    stream is intentionally removed, and rank-owned dispatch of ragged VLM
+    tensors is a planned follow-up. Per-row trainability filtering, label
+    masking, and collation reuse the sized-path helpers unchanged.
+    """
+    if (yield_host_staged or reject_mlx_valued) and response_mask_fn is not None:
+        # Zero-touch rejection: no set_epoch, no iterator, no source pull.
+        raise ValueError(
+            "Unsloth MLX VLM: train_on_responses_only streams are not "
+            "covered by the prefetch producer yet; use "
+            "streaming_prefetch_batches=0 for response-masked VLM streams."
+        )
+    if _distributed_rank_size(comm_group)[1] > 1:
+        raise ValueError(
+            "Unsloth MLX VLM: DDP training with an unsized streaming VLM "
+            "source is not supported (every rank would re-consume the global "
+            "stream). Use a sized dataset or single-process training; "
+            "rank-owned lazy VLM dispatch is a planned follow-up."
+        )
+    if dataset_order == "torch_randperm":
+        raise ValueError(
+            "Unsloth MLX VLM: preserve_dataset_order / "
+            "dataset_order='torch_randperm' requires a sized "
+            "(`__len__`) dataset."
+        )
+    if dataset_order not in (None, "default", "sequential"):
+        raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
+
+    def _build_batch(items, batch_formatting_func):
+        return _build_response_masked_vlm_batch(
+            items, processor, config, max_seq_length, image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=batch_formatting_func,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+            yield_host_staged=yield_host_staged,
+            reject_mlx_valued=reject_mlx_valued,
+        )
+
+    def _filter_stream_item(item):
+        """Return a formatted trainable streaming row, or None to skip it.
+
+        Synchronous response-masked filtering finalizes and runs the legacy
+        closure (consumer thread); producer modes reject before reaching here.
+        """
+        if response_mask_fn is None:
+            return item
+        if yield_host_staged or reject_mlx_valued:
+            # Producer-destined streams cannot run the consumer-side closure.
+            raise ValueError(
+                "Unsloth MLX VLM: train_on_responses_only streams are not "
+                "covered by the prefetch producer yet; use "
+                "streaming_prefetch_batches=0 for response-masked VLM "
+                "streams."
+            )
+        if formatting_func is not None:
+            item = formatting_func(item)
+        batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
+            [item], processor, config, max_seq_length, image_size,
+            response_mask_fn=response_mask_fn,
+            formatting_func=None,
+            ignore_token_ids=ignore_token_ids,
+            completion_only_loss=completion_only_loss,
+            return_prompt_completion=True,
+        )
+        if is_prompt_completion:
+            return item
+        valid_rows = _vlm_trainable_label_rows(batch_dict)
+        if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
+            return None
+        return item
+
+    batch_formatting_func = None if response_mask_fn is not None else formatting_func
+    source_dataset = _mlx_lazy_text_source(dataset)
+    set_epoch = getattr(source_dataset, "set_epoch", None)
+
+    def _set_epoch(value):
+        if callable(set_epoch):
+            set_epoch(value)
+
+    def _resume_replay_error():
+        return RuntimeError(
+            "Unsloth MLX VLM: this operation requires a replayable iterable "
+            "source; a one-shot iterator cannot be replayed deterministically."
+        )
+
+    def _exhaustion_error():
+        return RuntimeError(
+            "Unsloth MLX VLM: one-shot streaming source is exhausted and "
+            "cannot be replayed. Use a replayable iterable or reduce max_steps."
+        )
+
+    if require_replayable and isinstance(source_dataset, Iterator):
+        raise _resume_replay_error()
+
+    _set_epoch(0)
+    current_iterator = iter(source_dataset)
+    cached_next_iterator = None
+    epoch = 0
+    try:
+        replayable, cached_next_iterator = _probe_lazy_replayability(
+            source_dataset, current_iterator, set_epoch,
+            require_replayable, _resume_replay_error,
+        )
+        while True:
+            pending = []
+            deferred_final = None
+            yielded = False
+            source_rows_seen = 0
+            prepared_rows_seen = 0
+            source_iter = iter(current_iterator)
+            while True:
+                if should_stop is not None and should_stop():
+                    return
+                try:
+                    item = next(source_iter)
+                except StopIteration:
+                    break
+                if should_stop is not None and should_stop():
+                    return  # stop arrived during the blocking pull
+                source_rows_seen += 1
+                item = _filter_stream_item(item)
+                if item is None:
+                    if expected_rows_per_pass is not None:
+                        raise ValueError(
+                            "Unsloth MLX VLM: epoch training requires exactly "
+                            "one trainable row per declared source row. Use "
+                            "max_steps when rows are filtered."
+                        )
+                    continue
+                prepared_rows_seen += 1
+                if (
+                    expected_rows_per_pass is not None
+                    and source_rows_seen > expected_rows_per_pass
+                ):
+                    raise ValueError(
+                        "Unsloth MLX VLM: the streaming source's declared "
+                        "length does not match one trainable row per source "
+                        "row. Use max_steps for filtered or expanding streams."
+                    )
+                pending.append(item)
+                if len(pending) < batch_size:
+                    continue
+                if (
+                    expected_rows_per_pass is not None
+                    and prepared_rows_seen == expected_rows_per_pass
+                ):
+                    deferred_final = pending
+                    pending = []
+                    continue
+                yielded = True
+                yield _build_batch(pending, batch_formatting_func)
+                pending = []
+
+            if should_stop is not None and should_stop():
+                return  # skip pass-end validation and flush on cooperative stop
+            if expected_rows_per_pass is not None and (
+                source_rows_seen != expected_rows_per_pass
+                or prepared_rows_seen != expected_rows_per_pass
+            ):
+                raise ValueError(
+                    "Unsloth MLX VLM: the streaming source's declared length "
+                    "does not match one trainable row per source row. Use "
+                    "max_steps for filtered or expanding streams."
+                )
+            if deferred_final is not None:
+                yielded = True
+                yield _build_batch(deferred_final, batch_formatting_func)
+                deferred_final = None
+            if pending:
+                yielded = True
+                yield _build_batch(pending, batch_formatting_func)
+                pending = []
+
+            exhausted_iterator = current_iterator
+            current_iterator = None
+            _close_mlx_owned_iterator(exhausted_iterator)
+            if not yielded:
+                raise ValueError(
+                    "Unsloth MLX VLM: streaming dataset produced no trainable rows."
+                )
+            if replayable is False:
+                raise _exhaustion_error()
+            epoch += 1
+            _set_epoch(epoch)
+            if cached_next_iterator is not None:
+                current_iterator = cached_next_iterator
+                cached_next_iterator = None
+                del exhausted_iterator
+                continue
+            try:
+                candidate = iter(source_dataset)
+            except Exception as exc:
+                if replayable is True:
+                    raise RuntimeError(
+                        "Unsloth MLX VLM: replayable streaming source failed "
+                        f"to create an iterator for epoch {epoch}: {exc}"
+                    ) from exc
+                raise _exhaustion_error() from exc
+            if candidate is exhausted_iterator:
+                raise _exhaustion_error()
+            current_iterator = candidate
+            replayable = True
+            del exhausted_iterator
+    finally:
+        active_iterator = current_iterator
+        current_iterator = None
+        replay_iterator = cached_next_iterator
+        cached_next_iterator = None
+        cleanup_iterators = (
+            (active_iterator,)
+            if replay_iterator is active_iterator
+            else (active_iterator, replay_iterator)
+        )
+        # A processor/cardinality error may already be unwinding; attempt every
+        # owned cursor without replacing that primary failure.
+        for iterator in cleanup_iterators:
+            try:
+                _close_mlx_owned_iterator(iterator)
+            except Exception:
+                pass
+
 def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   max_seq_length, seed=42,
                                   response_mask_fn=None,
                                   formatting_func=None,
                                   dataset_order="default",
                                   completion_only_loss=None,
-                                  image_size=None, comm_group=None):
+                                  image_size=None, comm_group=None,
+                                  require_replayable=False,
+                                  expected_rows_per_pass=None,
+                                  prefetch_batches=0,
+                                  prefetch_skip_batches=0,
+                                  prefetch_control=None):
     """Streaming VLM batch generator using processor directly.
 
     Yields batch dicts with input_ids, pixel_values, attention_mask,
@@ -5257,7 +6156,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             completion_only_loss=completion_only_loss,
         )
 
-    if hasattr(dataset, "__len__"):
+    if _vlm_has_sized_index_space(dataset):
         if len(dataset) <= 0:
             raise ValueError("Unsloth MLX VLM: streaming dataset produced no rows.")
         base_indices = list(range(len(dataset)))
@@ -5340,75 +6239,54 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                     )
             epoch += 1
     else:
-        # Streaming has no index space to permute; torch_randperm needs sized epochs.
-        if dataset_order == "torch_randperm":
-            raise ValueError(
-                "Unsloth MLX VLM: preserve_dataset_order / "
-                "dataset_order='torch_randperm' requires a sized "
-                "(`__len__`) dataset."
+        prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
+        if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
+            # The shared prefetch producer generalizes over host-staged
+            # batches; the VLM finalizer converts on the consumer thread.
+            # Response-masked streams reject at the iterator entry
+            # (zero-touch).
+            prefetcher = _LazyTextPrefetcher(
+                None,
+                prefetch_depth,
+                skip_batches=prefetch_skip_batches,
+                finalize=_finalize_vlm_batch,
             )
-        if dataset_order not in (None, "default", "sequential"):
-            raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
-        def _filter_stream_item(item):
-            """Return a formatted trainable streaming row, or None to skip it."""
-            if response_mask_fn is None:
-                return item
-            if formatting_func is not None:
-                item = formatting_func(item)
-            batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
-                [item],
-                processor,
-                config,
-                max_seq_length,
-                image_size,
-                response_mask_fn=response_mask_fn,
-                formatting_func=None,
-                ignore_token_ids=ignore_token_ids,
-                completion_only_loss=completion_only_loss,
-                return_prompt_completion=True,
+            prefetcher._make_iterator = (
+                lambda pf=prefetcher: _iterate_lazy_vlm_training_batches(
+                    dataset, processor, config, batch_size, max_seq_length,
+                    response_mask_fn=response_mask_fn,
+                    formatting_func=formatting_func,
+                    dataset_order=dataset_order,
+                    completion_only_loss=completion_only_loss,
+                    image_size=image_size,
+                    comm_group=None,
+                    require_replayable=require_replayable,
+                    expected_rows_per_pass=expected_rows_per_pass,
+                    ignore_token_ids=ignore_token_ids,
+                    yield_host_staged=True,
+                    reject_mlx_valued=True,
+                    should_stop=pf._stop.is_set,
+                )
             )
-            if is_prompt_completion:
-                return item
-            valid_rows = _vlm_trainable_label_rows(batch_dict)
-            if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
-                return None
-            return item
-
-        batch_formatting_func = None if response_mask_fn is not None else formatting_func
-        while True:
-            pending = []
-            yielded = False
-            for item in dataset:
-                item = _filter_stream_item(item)
-                if item is None:
-                    continue
-                pending.append(item)
-                if len(pending) >= global_batch_size:
-                    local_items = _rank_slice_distributed_batch(
-                        pending,
-                        batch_size,
-                        comm_group=comm_group,
-                        pad_source=pending,
-                    )
-                    if local_items:
-                        yielded = True
-                        yield _build_batch(local_items, batch_formatting_func)
-                    pending = []
-            if pending:
-                local_items = _rank_slice_distributed_batch(
-                    pending,
-                    batch_size,
-                    comm_group=comm_group,
-                    pad_source=pending,
-                )
-                if local_items:
-                    yielded = True
-                    yield _build_batch(local_items, batch_formatting_func)
-            if not yielded:
-                raise ValueError(
-                    "Unsloth MLX VLM: streaming dataset produced no rows. "
-                    "If resuming, use a replayable iterable rather than a one-shot iterator."
-                )
+            if prefetch_control is not None:
+                prefetch_control["prefetcher"] = prefetcher
+            try:
+                yield from prefetcher
+            finally:
+                prefetcher.close()
+            return
+        yield from _iterate_lazy_vlm_training_batches(
+            dataset, processor, config, batch_size, max_seq_length,
+            response_mask_fn=response_mask_fn,
+            formatting_func=formatting_func,
+            dataset_order=dataset_order,
+            completion_only_loss=completion_only_loss,
+            image_size=image_size,
+            comm_group=comm_group,
+            require_replayable=require_replayable,
+            expected_rows_per_pass=expected_rows_per_pass,
+            ignore_token_ids=ignore_token_ids,
+        )
 
 
 def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
@@ -5743,6 +6621,13 @@ def _rank_slice_distributed_batch(
 
 
 def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
+    """Tokenize raw rows and pad to the mlx-lm rule (finalized MLX batch)."""
+    return _finalize_text_batch(
+        _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length)
+    )
+
+
+def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_valued=True):
     """Build a text training batch from tokenized items."""
     valid_items = [item for item in batch_items if item is not None]
     with_offsets = bool(
@@ -5790,10 +6675,11 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
             list(ids)[:truncated_length]
             + [pad_id] * (max_length - truncated_length)
         )
-    return (
-        mx.array(np.asarray(batch_ids, dtype=np.int32)),
-        mx.array(np.asarray(list(zip(offsets, truncated_lengths)), dtype=np.int32)),
+    return _HostStagedTextBatch(
+        np.asarray(batch_ids, dtype=np.int32),
+        np.asarray(list(zip(offsets, truncated_lengths)), dtype=np.int32),
         None,
+        host_valued,
     )
 
 
@@ -6169,6 +7055,1307 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
                 yield (ids, 0)
 
 
+def _apply_mlx_response_mask_to_text_row(input_ids, labels, mask_fn, state=None):
+    """Apply the CUDA response-marker closure to one tokenized text row."""
+    mask_batch = {"input_ids": [list(input_ids)]}
+    if labels is not None:
+        # The shared CUDA closure accepts tensor-like labels with ``tolist``.
+        mask_batch["labels"] = np.asarray([labels], dtype=np.int64)
+    result = mask_fn(mask_batch)
+    masked = result.get("labels") if isinstance(result, Mapping) else None
+    if isinstance(masked, mx.array) and state is not None:
+        if state.get("reject_mlx_valued"):
+            raise ValueError(
+                "Unsloth MLX: the response mask returned an MLX array; the "
+                "prefetch producer must not convert MLX values off the "
+                "consumer thread. Use streaming_prefetch_batches=0."
+            )
+        state["host_valued"] = False
+    if hasattr(masked, "tolist"):
+        masked = masked.tolist()
+    if not isinstance(masked, (list, tuple)) or len(masked) != 1:
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only masking must return one "
+            "labels row for each input_ids row."
+        )
+    masked = _coerce_mlx_token_list(masked[0], "labels", state=state)
+    if len(masked) != len(input_ids):
+        raise ValueError(
+            "Unsloth MLX: train_on_responses_only labels must match "
+            "input_ids length."
+        )
+    return list(input_ids), masked
+
+
+def _iter_lazy_tokenized_text_rows(
+    dataset,
+    tokenizer,
+    *,
+    dataset_text_field="text",
+    formatting_func=None,
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+    max_seq_length=None,
+    response_mask_fn=None,
+    state=None,
+    include_source=False,
+):
+    """Normalize an unsized source one row at a time and lock its schema."""
+    state = {} if state is None else state
+    reject_rows = bool(state.get("reject_mlx_valued"))
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    saw_usable_this_pass = False
+    completion_labels_seen_this_pass = False
+
+    def _output(source, input_ids, labels):
+        if include_source:
+            return source, input_ids, labels
+        return input_ids, labels
+
+    if completion_only_loss is not None:
+        state.setdefault(
+            "pretokenized_completion_only_loss",
+            completion_only_loss,
+        )
+
+    def _require_assistant_conversation(row):
+        if assistant_only_loss and not _is_mlx_sft_conversational_row(row):
+            raise ValueError(
+                "You set `assistant_only_loss=True`, but the dataset is not "
+                "conversational. This option is only supported for "
+                "conversational datasets."
+            )
+
+    def _validate_state(kind, labels, *, usable=True, completion_mode=False):
+        nonlocal saw_usable_this_pass, completion_labels_seen_this_pass
+        schema = state.get("schema")
+        has_labels = labels is not None
+        label_state = state.get("label_state")
+        validate_locked_state = usable or saw_usable_this_pass
+        if validate_locked_state and schema is not None and schema != kind:
+            raise ValueError(
+                "Unsloth MLX: pretokenized text rows with 'input_ids' cannot "
+                "be mixed with rows that need text formatting/tokenization."
+            )
+        if (
+            validate_locked_state
+            and label_state is not None
+            and label_state != has_labels
+        ):
+            raise ValueError(
+                "Unsloth MLX: streaming text rows with labels or masks must "
+                "not be mixed with rows that do not provide labels."
+            )
+        if completion_mode is True:
+            if has_labels:
+                completion_labels_seen_this_pass = True
+            elif completion_labels_seen_this_pass:
+                raise ValueError(
+                    "Unsloth MLX: streaming text rows with labels or masks must "
+                    "not be mixed with rows that do not provide labels."
+                )
+        if not usable:
+            return
+        if schema is None:
+            state["schema"] = kind
+        state.setdefault(
+            "pretokenized_completion_only_loss",
+            completion_mode,
+        )
+        if label_state is None:
+            state["label_state"] = has_labels
+        saw_usable_this_pass = True
+
+    def _resolve_completion_mode(item_has_boundary, row_has_boundary=False):
+        if completion_only_loss is not None:
+            return completion_only_loss
+        if item_has_boundary or row_has_boundary:
+            # A prompt/completion row always resolves the default mask mode
+            # from its own shape; inheriting a plain-text row's False here
+            # would silently train prompt tokens, and ordering would decide.
+            # The schema/label validators then reject mixed streams.
+            state["pretokenized_completion_only_loss"] = True
+            return True
+        if "pretokenized_completion_only_loss" in state:
+            return state["pretokenized_completion_only_loss"]
+        return False
+
+    def _filtered_label_observation(
+        completion_mode,
+        has_completion_boundary=False,
+    ):
+        # Empty label-owned rows have no token labels, but they also are not an
+        # unlabeled schema transition. A non-None sentinel preserves that fact.
+        label_owned = response_mask_fn is not None or assistant_only_loss or (
+            completion_mode is True and has_completion_boundary
+        )
+        return () if label_owned else None
+
+    for item in dataset:
+        if reject_rows and _contains_mlx_values(item):
+            # Rows carrying MLX arrays must reject before any parsing,
+            # truthiness probe, or formatter call can touch them off-thread.
+            _reject_mlx_valued_text("the dataset row")
+        item_has_completion_boundary = (
+            isinstance(item, Mapping)
+            and "prompt" in item
+            and "completion" in item
+        )
+        formatter_applied = False
+        formatter_needs_completion_boundary = False
+        source_rows = item if (
+            isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
+        ) else [item]
+        if not source_rows:
+            # Assistant-only validation applies to the original logical row
+            # before a formatter can replace it or produce side effects.
+            source_rows = [None]
+        source_has_input_ids = any(
+            isinstance(row, Mapping) and "input_ids" in row
+            for row in source_rows
+        )
+        if (
+            assistant_only_loss
+            and formatting_func is not None
+            and "assistant_source_checked" not in state
+        ):
+            # Match the eager/SFT contract: validate the first original sample
+            # once, then validate every formatter result below. Pretokenized
+            # rows bypass the formatter and carry their own assistant metadata.
+            if not source_has_input_ids:
+                _require_assistant_conversation(item)
+            state["assistant_source_checked"] = True
+        if formatting_func is not None and not source_has_input_ids:
+            formatted = formatting_func(item)
+            if reject_rows and _contains_mlx_values(formatted):
+                # Formatters can introduce MLX values after the row scan.
+                _reject_mlx_valued_text("the formatting function")
+            formatter_applied = True
+            formatter_needs_completion_boundary = (
+                completion_only_loss is None
+                and item_has_completion_boundary
+            )
+            source_rows = formatted if (
+                isinstance(formatted, list)
+                and not _looks_like_mlx_chat_messages(formatted)
+            ) else [formatted]
+        if not source_rows:
+            # An empty formatter list expands to zero rows, not one invalid
+            # row. Preserve only its schema/label observation, then continue.
+            row_completion_only_loss = _resolve_completion_mode(
+                item_has_completion_boundary
+            )
+            _validate_state(
+                "raw",
+                _filtered_label_observation(
+                    row_completion_only_loss,
+                    item_has_completion_boundary,
+                ),
+                usable=False,
+                completion_mode=row_completion_only_loss,
+            )
+            continue
+
+        for row in source_rows:
+            prepared_source = item if isinstance(item, Mapping) else row
+            row_has_completion_boundary = (
+                isinstance(row, Mapping)
+                and "prompt" in row
+                and "completion" in row
+            )
+            row_completion_only_loss = _resolve_completion_mode(
+                item_has_completion_boundary,
+                row_has_completion_boundary,
+            )
+            tokenized = _tokenize_mlx_pretokenized_row(
+                row,
+                completion_only_loss=row_completion_only_loss,
+                assistant_only_loss=assistant_only_loss,
+                state=state,
+            )
+            if tokenized is not None:
+                ids, labels = tokenized
+                source_labels = labels
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                    labels = (
+                        labels[:max_seq_length] if labels is not None else None
+                    )
+                    source_labels = (
+                        source_labels[:max_seq_length]
+                        if source_labels is not None else None
+                    )
+                source_usable = (
+                    len(ids) >= 2
+                    and _labeled_row_has_supervision(source_labels, len(ids))
+                )
+                if response_mask_fn is not None:
+                    ids, labels = _apply_mlx_response_mask_to_text_row(
+                        ids, labels, response_mask_fn, state=state,
+                    )
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                )
+                if (
+                    formatter_applied
+                    and row_completion_only_loss is True
+                    and source_labels is None
+                    and source_usable
+                ):
+                    if formatter_needs_completion_boundary:
+                        raise ValueError(
+                            "Unsloth MLX: a formatting_func was provided for a "
+                            "prompt/completion dataset, which drops the completion "
+                            "boundary needed for the default completion-only loss. "
+                            "Apply your formatting before passing the dataset, or set "
+                            "completion_only_loss=False."
+                        )
+                    raise ValueError(
+                        "Unsloth MLX: formatting_func produced pretokenized "
+                        "input_ids without labels or completion_mask while "
+                        "completion-only loss is active."
+                    )
+                _validate_state(
+                    "pretokenized",
+                    source_labels,
+                    usable=usable,
+                    completion_mode=row_completion_only_loss,
+                )
+                if usable:
+                    yield _output(prepared_source, ids, labels)
+                continue
+
+            _require_assistant_conversation(row)
+            labeled = None
+            if row_completion_only_loss is not False or assistant_only_loss:
+                labeled = _tokenize_mlx_prompt_completion_row(
+                    tokenizer,
+                    row,
+                    dataset_text_field=dataset_text_field,
+                    append_eos=append_eos,
+                    completion_only_loss=row_completion_only_loss,
+                    assistant_only_loss=assistant_only_loss,
+                    state=state,
+                )
+                if labeled is None and assistant_only_loss:
+                    labeled = _tokenize_mlx_assistant_messages_row(tokenizer, row, state=state)
+            if labeled is not None:
+                ids, labels = labeled
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                    labels = labels[:max_seq_length]
+                if response_mask_fn is not None:
+                    ids, labels = _apply_mlx_response_mask_to_text_row(
+                        ids, labels, response_mask_fn, state=state,
+                    )
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                )
+                _validate_state(
+                    "raw",
+                    labels,
+                    usable=usable,
+                    completion_mode=row_completion_only_loss,
+                )
+                if usable:
+                    yield _output(prepared_source, ids, labels)
+                continue
+            if assistant_only_loss:
+                raise ValueError(
+                    "You set `assistant_only_loss=True`, but the dataset is not "
+                    "conversational. This option is only supported for "
+                    "conversational datasets."
+                )
+            texts = None
+            if formatter_applied:
+                texts = collect_mlx_texts(
+                    tokenizer,
+                    row,
+                    dataset_text_field=dataset_text_field,
+                    is_vlm=False,
+                )
+                if not texts:
+                    _validate_state(
+                        "raw",
+                        _filtered_label_observation(
+                            row_completion_only_loss,
+                            item_has_completion_boundary
+                            or row_has_completion_boundary,
+                        ),
+                        usable=False,
+                        completion_mode=row_completion_only_loss,
+                    )
+                    continue
+
+            if texts is None:
+                texts = collect_mlx_texts(
+                    tokenizer,
+                    row,
+                    dataset_text_field=dataset_text_field,
+                    is_vlm=False,
+                )
+            if not texts:
+                _validate_state(
+                    "raw",
+                    _filtered_label_observation(
+                        row_completion_only_loss,
+                        item_has_completion_boundary
+                        or row_has_completion_boundary,
+                    ),
+                    usable=False,
+                    completion_mode=row_completion_only_loss,
+                )
+                continue
+            for text in texts:
+                ids = list(encode_mlx_text(tokenizer, text, state=state))
+                if eos_id is not None and (not ids or ids[-1] != eos_id):
+                    ids.append(int(eos_id))
+                if max_seq_length is not None:
+                    ids = ids[:max_seq_length]
+                source_usable = len(ids) >= 2
+                labels = None
+                if response_mask_fn is not None:
+                    ids, labels = _apply_mlx_response_mask_to_text_row(
+                        ids, None, response_mask_fn, state=state,
+                    )
+                usable = len(ids) >= 2 and _labeled_row_has_supervision(
+                    labels, len(ids)
+                )
+                if (
+                    source_usable
+                    and formatter_needs_completion_boundary
+                    and row_completion_only_loss is True
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: a formatting_func was provided for a "
+                        "prompt/completion dataset, which drops the completion "
+                        "boundary needed for the default completion-only loss. "
+                        "Apply your formatting before passing the dataset, or set "
+                        "completion_only_loss=False."
+                    )
+                if source_usable and row_completion_only_loss is True:
+                    raise ValueError(
+                        "Unsloth MLX: text completion_only_loss=True requires "
+                        "prompt/completion rows for streaming text training."
+                    )
+                _validate_state(
+                    "raw",
+                    labels,
+                    usable=usable,
+                    completion_mode=row_completion_only_loss,
+                )
+                if usable:
+                    yield _output(prepared_source, ids, labels)
+
+
+def _close_mlx_owned_iterator(iterator):
+    """Close an iterator owned by the lazy text pipeline when supported."""
+    if iterator is None:
+        return
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
+
+def _probe_lazy_replayability(source_dataset, current_iterator, set_epoch,
+                              require_replayable, resume_error):
+    """Classify a lazy source's replayability; prove it when resume needs it.
+
+    Returns ``(replayable, cached_next_iterator)`` where ``replayable`` is
+    True / False / None (unknown until first restart) and the cached iterator
+    is a proven-fresh traversal retained only for sources without
+    ``set_epoch`` (epoch-aware sources recreate after ``set_epoch`` advances).
+    """
+    if isinstance(source_dataset, Iterator):
+        replayable = False
+    elif _is_mlx_hf_iterable_text_source(source_dataset):
+        replayable = True
+    else:
+        replayable = None
+    cached_next_iterator = None
+    if require_replayable:
+        if replayable is False:
+            raise resume_error()
+        if replayable is None:
+            try:
+                candidate = iter(source_dataset)
+            except Exception as exc:
+                raise resume_error() from exc
+            if candidate is current_iterator:
+                raise resume_error()
+            if not callable(set_epoch):
+                cached_next_iterator = candidate
+            else:
+                _close_mlx_owned_iterator(candidate)
+            replayable = True
+    return replayable, cached_next_iterator
+
+
+
+def _validate_streaming_prefetch(value):
+    """Validate streaming_prefetch_batches before source consumption."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "Unsloth MLX: streaming_prefetch_batches must be an integer >= 0 "
+            f"(got {value!r})."
+        )
+    if value < 0:
+        raise ValueError(
+            "Unsloth MLX: streaming_prefetch_batches must be >= 0 "
+            f"(got {value})."
+        )
+    return value
+
+
+_PREFETCH_ITEM = "item"
+_PREFETCH_END = "end"
+_PREFETCH_ERROR = "error"
+
+
+class _LazyTextPrefetcher:
+    """Bounded single-producer prefetch over host-staged text batches.
+
+    The producer thread owns source consumption and host staging (tokenizer,
+    formatter, response-mask closures included); MLX finalization runs only on
+    the consumer thread. A queue slot is reserved BEFORE staging each batch so
+    read-ahead is exactly the configured depth. Cancellation is cooperative:
+    the stop event is honored between batches, cleanup closes the owned
+    iterator in ``finally``, and a bounded join that times out marks the
+    prefetcher ORPHANED — while the orphan thread lives, reusing the shared
+    preprocessing objects is refused by the trainer.
+    """
+
+    _JOIN_TIMEOUT = 5.0
+    _QUIESCE_TIMEOUT = 30.0
+
+    def __init__(self, make_iterator, depth, skip_batches=0,
+                 finalize=None, include_epoch=False):
+        self._make_iterator = make_iterator
+        self._depth = int(depth)
+        self._skip_batches = int(skip_batches)
+        self._finalize = finalize or _finalize_text_batch
+        self._include_epoch = include_epoch
+        self._slots = threading.BoundedSemaphore(self._depth)
+        self._envelopes = _queue_module.Queue()
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._quiescent = threading.Event()
+        self._ready = threading.Event()
+        self._done = threading.Event()
+        self._thread = None
+        self.orphaned = False
+        self._closed = False
+        self._lifecycle_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+
+    # -- producer side ----------------------------------------------------
+    def _run(self):
+        iterator = None
+        try:
+            iterator = self._make_iterator()
+            for _ in range(self._skip_batches):
+                if self._stop.is_set():
+                    return
+                try:
+                    next(iterator)  # resume fast-forward on the producer thread
+                except StopIteration:
+                    if self._stop.is_set():
+                        return  # cooperative stop during skip, not exhaustion
+                    raise RuntimeError(
+                        "Unsloth: streaming dataset exhausted while "
+                        "fast-forwarding to the resume position. Dataset may "
+                        "be shorter than the killed run consumed."
+                    ) from None
+            self._ready.set()
+            while not self._stop.is_set():
+                if self._pause.is_set():
+                    self._quiescent.set()
+                    while self._pause.is_set() and not self._stop.is_set():
+                        time.sleep(0.005)
+                    self._quiescent.clear()
+                    continue
+                if not self._slots.acquire(timeout=0.05):
+                    continue  # queue full: stay responsive to stop/pause
+                try:
+                    staged = next(iterator)
+                except StopIteration:
+                    self._slots.release()
+                    self._envelopes.put((_PREFETCH_END, None))
+                    return
+                except BaseException as exc:  # positioned via FIFO envelope
+                    self._slots.release()
+                    self._envelopes.put((_PREFETCH_ERROR, exc))
+                    return
+                self._envelopes.put((_PREFETCH_ITEM, staged))
+        except BaseException as exc:
+            self._envelopes.put((_PREFETCH_ERROR, exc))
+        finally:
+            self._ready.set()
+            try:
+                if iterator is not None:
+                    try:
+                        _close_mlx_owned_iterator(iterator)
+                    except Exception:
+                        pass
+            finally:
+                # Published only after producer-owned cleanup: quiesce() treats
+                # _done as proof the thread no longer touches shared objects.
+                self._done.set()
+
+    def _ensure_started(self):
+        with self._lifecycle_lock:
+            # One lock covers the closed check and thread publication so a
+            # concurrent close() cannot return "clean" and then observe a
+            # producer started afterwards.
+            if self._closed or self._stop.is_set():
+                raise StopIteration
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="unsloth-mlx-prefetch", daemon=True,
+                )
+                self._thread.start()
+        while not self._ready.wait(timeout=0.1):
+            if self._closed or self._stop.is_set():
+                raise StopIteration
+
+    # -- consumer side ----------------------------------------------------
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._ensure_started()
+        while True:
+            try:
+                kind, payload = self._envelopes.get(timeout=0.5)
+            except _queue_module.Empty:
+                if self._stop.is_set():
+                    raise StopIteration
+                continue
+            break
+        if kind == _PREFETCH_ITEM:
+            self._slots.release()
+            if self._include_epoch:
+                staged, epoch = payload
+                return self._finalize(staged), epoch
+            return self._finalize(payload)
+        if kind == _PREFETCH_END:
+            raise StopIteration
+        raise payload
+
+    # -- lifecycle --------------------------------------------------------
+    def quiesce(self):
+        """RUNNING -> PAUSE_REQUESTED -> QUIESCENT; bounded, actionable."""
+        if self._thread is None or not self._thread.is_alive():
+            return
+        self._pause.set()
+        deadline = time.monotonic() + self._QUIESCE_TIMEOUT
+        while True:
+            if self._quiescent.wait(timeout=0.05):
+                return
+            if self._done.is_set():
+                return  # a terminated producer is trivially quiescent
+            if time.monotonic() >= deadline:
+                self._pause.clear()
+                raise RuntimeError(
+                    "Unsloth MLX: the prefetch producer did not quiesce (it "
+                    "may be blocked inside the tokenizer or source). Use "
+                    "streaming_prefetch_batches=0 for this run."
+                )
+
+    def resume(self):
+        self._pause.clear()
+
+    def close(self):
+        """Join the producer, then release any queued batches once it is
+        confirmed dead. Terminal, idempotent, and safe under concurrent
+        callers. Returns True when the producer terminated (queue drained),
+        False when it overran the join and is a live orphan.
+
+        The join, classification, and drain run under one lock, and the return
+        reflects this caller's own post-join observation — so a True return
+        guarantees the queue was drained under that lock before it was reported,
+        and no concurrent closer can observe it half-drained. ``orphaned`` is
+        set conservatively before the join, so an interrupted join leaves a live
+        producer classified as an orphan rather than falsely clean."""
+        # Mark a conservative orphan up front: if anything below is interrupted
+        # (a signal during lock acquisition, the join, or the drain), the
+        # producer is already recorded as unresolved rather than left falsely
+        # clean. A clean termination clears it below.
+        self.orphaned = True
+        with self._lifecycle_lock:
+            self._stop.set()
+            self._pause.clear()
+            self._closed = True
+            thread = self._thread
+        with self._close_lock:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=self._JOIN_TIMEOUT)
+            terminated = thread is None or not thread.is_alive()
+            if terminated:
+                # A joined-dead thread has published its final enqueue and will
+                # never write again, so draining here cannot lose a batch. Clear
+                # the orphan flag only AFTER the drain completes: a signal during
+                # the drain then still leaves a conservative orphan (flag set,
+                # queue not yet empty) for the caller's finally to persist.
+                self._drain_envelopes()
+                self.orphaned = False
+            return terminated
+
+    def _drain_envelopes(self):
+        """Discard queued batches so their payloads (device tensors for opaque
+        VLM outputs) are released instead of retained until the consumer
+        generator is collected — a terminal close is followed by a save."""
+        while True:
+            try:
+                self._envelopes.get_nowait()
+            except _queue_module.Empty:
+                return
+
+    def orphan_alive(self):
+        return self.orphaned and self._thread is not None and self._thread.is_alive()
+
+
+def _validate_streaming_length_window(value):
+    """Validate streaming_text_length_window_batches before source consumption."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "Unsloth MLX: streaming_text_length_window_batches must be an "
+            f"integer >= 1 (got {value!r})."
+        )
+    if value < 1:
+        raise ValueError(
+            "Unsloth MLX: streaming_text_length_window_batches must be >= 1 "
+            f"(got {value})."
+        )
+    return value
+
+
+def _lazy_window_sort_key(item, max_seq_length):
+    """Window grouping key: exact truncated prepared-token length (lazy rows
+    carry ``(input_ids, labels)`` for every schema)."""
+    if item is None:
+        return 0
+    return min(len(item[0]), max_seq_length)
+
+
+def _window_batch_permutation(seed, epoch, window_ordinal, count):
+    """Deterministic batch-order permutation for one flushed window."""
+    mix = (int(seed) * 1_000_003 + int(epoch) * 9_973 + int(window_ordinal)) % (2 ** 32)
+    return np.random.RandomState(mix).permutation(count)
+
+
+def _iterate_lazy_text_training_batches(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    *,
+    dataset_text_field="text",
+    formatting_func=None,
+    dataset_order="default",
+    append_eos=True,
+    completion_only_loss=None,
+    assistant_only_loss=False,
+    response_mask_fn=None,
+    comm_group=None,
+    require_replayable=False,
+    repeat=True,
+    distributed_pad_mode="cycle",
+    expected_rows_per_pass=None,
+    include_epoch=False,
+    length_window_batches=1,
+    window_seed=0,
+    yield_host_staged=False,
+    reject_mlx_valued=False,
+    should_stop=None,
+):
+    """Yield text batches without materializing an unsized source.
+
+    ``sequential`` order and ``length_window_batches=1`` emit exact source
+    order. Default order with a window > 1 pools that many global micro-batches
+    of trainable rows, stable-sorts them by truncated prepared-token length,
+    and emits the full chunks in a seeded deterministic permutation (partial
+    chunk last) — a documented, deterministic reordering.
+
+    Custom replayable sources must return independent fresh traversals from
+    ``iter(source)``. Resume validation may create one non-consuming iterator
+    ahead of the serving iterator; epoch-aware validation iterators are closed
+    immediately and recreated only after ``set_epoch`` advances.
+    """
+    if dataset_order == "torch_randperm":
+        raise ValueError(
+            "Unsloth MLX: dataset_order='torch_randperm' is not supported for "
+            "an unsized streaming text source."
+        )
+    if dataset_order not in (None, "default", "sequential"):
+        raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
+
+    length_window = _validate_streaming_length_window(length_window_batches)
+    if dataset_order == "sequential":
+        # Sequential contract: exact source order, length grouping off.
+        length_window = 1
+    window_seed = _normalize_seed(window_seed)
+    # Cycle padding only feeds direct multi-rank slicing; the single-process
+    # path and the rank-0 owner iterator (comm_group=None, outer cycle_source)
+    # must not retain a pass-long first batch on top of the window bound.
+    needs_padding_source = _distributed_rank_size(comm_group)[1] > 1
+
+    prepared_view = (
+        dataset if isinstance(dataset, _MLXIterableTokenizedDatasetView) else None
+    )
+    if prepared_view is not None:
+        tokenizer = prepared_view._tokenizer
+    source_dataset = _mlx_lazy_text_source(dataset)
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+    state = {"reject_mlx_valued": True} if reject_mlx_valued else {}
+    epoch = 0
+    set_epoch = getattr(source_dataset, "set_epoch", None)
+
+    def _set_epoch(value):
+        if callable(set_epoch):
+            set_epoch(value)
+
+    def _resume_replay_error():
+        return RuntimeError(
+            "Unsloth MLX: this operation requires a replayable iterable text "
+            "source; a one-shot iterator cannot be replayed deterministically."
+        )
+
+    def _exhaustion_error():
+        return RuntimeError(
+            "Unsloth MLX: one-shot streaming text source is exhausted and "
+            "cannot be replayed. Use a replayable iterable or reduce max_steps."
+        )
+
+    if require_replayable and isinstance(source_dataset, Iterator):
+        raise _resume_replay_error()
+
+    _set_epoch(0)
+    current_iterator = iter(source_dataset)
+    cached_next_iterator = None
+    try:
+        replayable, cached_next_iterator = _probe_lazy_replayability(
+            source_dataset, current_iterator, set_epoch,
+            require_replayable, _resume_replay_error,
+        )
+
+        def _make_batch(local_items):
+            if state.get("schema") == "raw" and state.get("label_state") is False:
+                return _stage_text_batch_from_items(
+                    [
+                        None if item is None else item[0]
+                        for item in local_items
+                    ],
+                    tokenizer,
+                    max_seq_length,
+                    host_valued=state.get("host_valued", True),
+                )
+            return _stage_tokenized_text_batch(
+                local_items,
+                max_seq_length,
+                pad_id=_mlx_text_pad_id(tokenizer),
+                labels_expected=state.get("label_state"),
+                host_valued=state.get("host_valued", True),
+            )
+
+        def _yield_value(local_items):
+            staged = _make_batch(local_items)
+            batch = staged if yield_host_staged else _finalize_text_batch(staged)
+            return (batch, epoch) if include_epoch else batch
+
+        while True:
+            pending = []
+            deferred_final = None
+            padding_source = []
+            yielded = False
+            source_rows_seen = 0
+            prepared_rows_seen = 0
+            window_rows = []
+            window_ordinal = 0
+
+            def _flush_window():
+                # Emit pooled rows as length-grouped global batches: stable sort
+                # by truncated length with arrival tiebreak, chunk, then a seeded
+                # permutation of the FULL chunks only — a trailing partial chunk
+                # always emits last so mid-stream batches keep uniform row counts.
+                nonlocal window_rows, window_ordinal, yielded
+                if not window_rows:
+                    return
+                order = sorted(
+                    range(len(window_rows)),
+                    key=lambda i: (
+                        _lazy_window_sort_key(window_rows[i], max_seq_length),
+                        i,
+                    ),
+                )
+                chunks = [
+                    [window_rows[i] for i in order[start:start + global_batch_size]]
+                    for start in range(0, len(order), global_batch_size)
+                ]
+                full = len(chunks)
+                if chunks and len(chunks[-1]) < global_batch_size:
+                    full -= 1
+                emit = list(_window_batch_permutation(
+                    window_seed, epoch, window_ordinal, full,
+                )) + list(range(full, len(chunks)))
+                window_ordinal += 1
+                window_rows = []
+                for chunk_index in emit:
+                    # Release each chunk as it is emitted so flush-time retention
+                    # stays within the W-batch window bound.
+                    chunk = chunks[chunk_index]
+                    chunks[chunk_index] = None
+                    local_items = _rank_slice_distributed_batch(
+                        chunk,
+                        batch_size,
+                        comm_group=comm_group,
+                        pad_source=padding_source,
+                        pad_mode=distributed_pad_mode,
+                    )
+                    chunk = None
+                    yielded = True
+                    yield _yield_value(local_items)
+                    local_items = None
+
+            def _tokenized_rows(source):
+                if prepared_view is not None:
+                    return prepared_view._iter_tokenized_rows(
+                        source, state=state,
+                    )
+                return _iter_lazy_tokenized_text_rows(
+                    source,
+                    tokenizer,
+                    dataset_text_field=dataset_text_field,
+                    formatting_func=formatting_func,
+                    append_eos=append_eos,
+                    completion_only_loss=completion_only_loss,
+                    assistant_only_loss=assistant_only_loss,
+                    max_seq_length=max_seq_length,
+                    response_mask_fn=response_mask_fn,
+                    state=state,
+                )
+
+            def _exactly_one_prepared_row_per_source():
+                nonlocal source_rows_seen
+                for item in pass_source:
+                    source_rows_seen += 1
+                    if source_rows_seen > expected_rows_per_pass:
+                        raise ValueError(
+                            "Unsloth MLX: epoch training requires exactly one "
+                            "trainable text row per declared source row. Use "
+                            "max_steps when the source exceeds its declared length."
+                        )
+                    prepared = _tokenized_rows((item,))
+                    missing = object()
+                    first = next(prepared, missing)
+                    extra = next(prepared, missing)
+                    _close_mlx_owned_iterator(prepared)
+                    if first is missing or extra is not missing:
+                        raise ValueError(
+                            "Unsloth MLX: epoch training requires exactly one "
+                            "trainable text row per declared source row. Use "
+                            "max_steps when rows expand or are filtered."
+                        )
+                    yield first
+
+            def _stoppable(source):
+                # Cooperative cancellation lands between SOURCE rows — checked
+                # BEFORE each pull (a stop during row processing must not cost
+                # another blocking read) and after, for stops during next().
+                iterator = iter(source)
+                while True:
+                    if should_stop():
+                        return
+                    try:
+                        source_item = next(iterator)
+                    except StopIteration:
+                        return
+                    if should_stop():
+                        return
+                    yield source_item
+
+            pass_source = (
+                _stoppable(current_iterator)
+                if should_stop is not None else current_iterator
+            )
+            row_iterator = (
+                _exactly_one_prepared_row_per_source()
+                if expected_rows_per_pass is not None
+                else _tokenized_rows(pass_source)
+            )
+            rows_pending = iter(row_iterator)
+            while True:
+                if should_stop is not None and should_stop():
+                    return
+                try:
+                    row = next(rows_pending)
+                except StopIteration:
+                    break
+                prepared_rows_seen += 1
+                if (
+                    expected_rows_per_pass is not None
+                    and (
+                        source_rows_seen != prepared_rows_seen
+                        or source_rows_seen > expected_rows_per_pass
+                    )
+                ):
+                    raise ValueError(
+                        "Unsloth MLX: epoch training requires exactly one "
+                        "trainable text row per declared source row. Use "
+                        "max_steps when rows expand or are filtered."
+                    )
+                if needs_padding_source and len(padding_source) < global_batch_size:
+                    padding_source.append(row)
+                pending.append(row)
+                if len(pending) < global_batch_size:
+                    continue
+                if length_window > 1:
+                    window_rows.extend(pending)
+                    pending = []
+                    if len(window_rows) >= length_window * global_batch_size and (
+                        expected_rows_per_pass is None
+                        or prepared_rows_seen < expected_rows_per_pass
+                    ):
+                        yield from _flush_window()
+                    continue
+                if (
+                    expected_rows_per_pass is not None
+                    and prepared_rows_seen == expected_rows_per_pass
+                ):
+                    deferred_final = pending
+                    pending = []
+                    continue
+                local_items = _rank_slice_distributed_batch(
+                    pending,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=padding_source,
+                    pad_mode=distributed_pad_mode,
+                )
+                yielded = True
+                yield _yield_value(local_items)
+                pending = []
+
+            if should_stop is not None and should_stop():
+                return  # cooperative stop: skip pass-end flush and validation
+            if expected_rows_per_pass is not None and (
+                source_rows_seen != expected_rows_per_pass
+                or prepared_rows_seen != expected_rows_per_pass
+            ):
+                raise ValueError(
+                    "Unsloth MLX: the streaming text source's declared length "
+                    "does not match one trainable row per source row. Use "
+                    "max_steps for filtered or expanding streams."
+                )
+
+            if length_window > 1:
+                window_rows.extend(pending)
+                pending = []
+                yield from _flush_window()
+
+            if deferred_final is not None:
+                local_items = _rank_slice_distributed_batch(
+                    deferred_final,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=padding_source,
+                    pad_mode=distributed_pad_mode,
+                )
+                yielded = True
+                yield _yield_value(local_items)
+
+            if pending:
+                local_items = _rank_slice_distributed_batch(
+                    pending,
+                    batch_size,
+                    comm_group=comm_group,
+                    pad_source=padding_source,
+                    pad_mode=distributed_pad_mode,
+                )
+                yielded = True
+                yield _yield_value(local_items)
+
+            exhausted_iterator = current_iterator
+            current_iterator = None
+            _close_mlx_owned_iterator(exhausted_iterator)
+            if not yielded:
+                raise ValueError(
+                    "Unsloth MLX: streaming text source produced no trainable rows."
+                )
+            if not repeat:
+                return
+            if replayable is False:
+                raise _exhaustion_error()
+            epoch += 1
+            _set_epoch(epoch)
+            if cached_next_iterator is not None:
+                current_iterator = cached_next_iterator
+                cached_next_iterator = None
+                del exhausted_iterator
+                continue
+            try:
+                candidate = iter(source_dataset)
+            except Exception as exc:
+                if replayable is True:
+                    raise RuntimeError(
+                        "Unsloth MLX: replayable streaming text source failed to "
+                        f"create an iterator for epoch {epoch}: {exc}"
+                    ) from exc
+                raise _exhaustion_error() from exc
+            if candidate is exhausted_iterator:
+                raise _exhaustion_error()
+            current_iterator = candidate
+            replayable = True
+            del exhausted_iterator
+    finally:
+        active_iterator = current_iterator
+        current_iterator = None
+        replay_iterator = cached_next_iterator
+        cached_next_iterator = None
+        cleanup_iterators = (
+            (active_iterator,)
+            if replay_iterator is active_iterator
+            else (active_iterator, replay_iterator)
+        )
+        # A schema/source error may already be unwinding. Cleanup must attempt
+        # every owned cursor without replacing that primary failure. The normal
+        # epoch-boundary close above remains strict and still surfaces errors.
+        for iterator in cleanup_iterators:
+            try:
+                _close_mlx_owned_iterator(iterator)
+            except Exception:
+                pass
+
+
+def _pad_dispatched_text_batch(
+    batch,
+    target_size,
+    *,
+    pad_id,
+    pad_mode,
+    cycle_source=None,
+):
+    """Pad one owner-built global text batch before rank dispatch."""
+    input_ids, lengths, labels = batch
+    row_count = int(input_ids.shape[0])
+    if row_count >= target_size:
+        return input_ids[:target_size], lengths[:target_size], (
+            None if labels is None else labels[:target_size]
+        )
+    if row_count == 0:
+        raise ValueError("Unsloth MLX: cannot dispatch an empty text batch.")
+    if pad_mode not in ("cycle", "empty"):
+        raise ValueError(f"Unsupported distributed pad mode: {pad_mode!r}.")
+
+    missing = target_size - row_count
+    if pad_mode == "empty":
+        padded_ids = mx.full(
+            (missing, int(input_ids.shape[1])), int(pad_id), dtype=input_ids.dtype,
+        )
+        padded_lengths = mx.zeros(
+            (missing, int(lengths.shape[1])), dtype=lengths.dtype,
+        )
+        padded_labels = (
+            None
+            if labels is None
+            else mx.full(
+                (missing, int(labels.shape[1])), -100, dtype=labels.dtype,
+            )
+        )
+    else:
+        source_ids, source_lengths, source_labels = cycle_source or batch
+        if (labels is None) != (source_labels is None):
+            raise ValueError(
+                "Unsloth MLX: streaming text labels changed within one pass."
+            )
+        source_rows = int(source_ids.shape[0])
+        indices = mx.array(
+            [index % source_rows for index in range(missing)], dtype=mx.int32,
+        )
+        padded_ids = mx.take(source_ids, indices, axis=0)
+        padded_lengths = mx.take(source_lengths, indices, axis=0)
+        padded_labels = (
+            None
+            if source_labels is None
+            else mx.take(source_labels, indices, axis=0)
+        )
+
+    width = max(int(input_ids.shape[1]), int(padded_ids.shape[1]))
+
+    def _pad_width(value, fill):
+        missing_width = width - int(value.shape[1])
+        if missing_width <= 0:
+            return value
+        padding = mx.full(
+            (int(value.shape[0]), missing_width), fill, dtype=value.dtype,
+        )
+        return mx.concatenate((value, padding), axis=1)
+
+    input_ids = _pad_width(input_ids, int(pad_id))
+    padded_ids = _pad_width(padded_ids, int(pad_id))
+    if labels is not None:
+        labels = _pad_width(labels, -100)
+        padded_labels = _pad_width(padded_labels, -100)
+    return (
+        mx.concatenate((input_ids, padded_ids), axis=0),
+        mx.concatenate((lengths, padded_lengths), axis=0),
+        None
+        if labels is None
+        else mx.concatenate((labels, padded_labels), axis=0),
+    )
+
+
+def _iterate_dispatched_lazy_text_training_batches(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    *,
+    comm_group,
+    distributed_pad_mode="cycle",
+    **kwargs,
+):
+    """Dispatch rank-0-owned lazy text batches to all data-parallel ranks.
+
+    The owner retains the first global batch of the current pass only to keep
+    legacy cycle-padding deterministic. Non-owner ranks never touch the source.
+    The supplied source is therefore interpreted as the global, unsharded stream.
+    """
+    rank, world_size = _distributed_rank_size(comm_group)
+    target_size = int(batch_size) * world_size
+    if target_size <= 0:
+        raise ValueError("batch_size must be positive for distributed batching.")
+    if distributed_pad_mode not in ("cycle", "empty"):
+        raise ValueError(
+            f"Unsupported distributed pad mode: {distributed_pad_mode!r}."
+        )
+
+    owner_iterator = None
+    owner_contract_error = None
+    owner_tokenizer = tokenizer
+    if rank == 0:
+        try:
+            if isinstance(dataset, _MLXIterableTokenizedDatasetView):
+                owner_tokenizer = dataset._tokenizer
+            source_distribution = getattr(
+                _mlx_lazy_text_source(dataset), "_distributed", None,
+            )
+            if int(getattr(source_distribution, "world_size", 1)) > 1:
+                owner_contract_error = ValueError(
+                    "Unsloth MLX: distributed lazy text dispatch requires the "
+                    "global unsharded Hugging Face iterable. Pass the source "
+                    "before split_dataset_by_node(); MLX owns rank partitioning."
+                )
+        except BaseException as exc:
+            # Even interrupts must be deferred: peers block in the dispatch
+            # collective below, so rank 0 cannot unwind before the failure
+            # status is broadcast. Re-raised through the loop's rank-0 path.
+            owner_contract_error = exc
+        owner_iterator = _iterate_lazy_text_training_batches(
+            dataset,
+            owner_tokenizer,
+            target_size,
+            max_seq_length,
+            comm_group=None,
+            distributed_pad_mode=distributed_pad_mode,
+            include_epoch=True,
+            **kwargs,
+        )
+    cycle_source = None
+    cycle_epoch = None
+    try:
+        while True:
+            owner_error = None
+            epoch = 0
+            rows = 0
+            width = 0
+            has_labels = 0
+            status = 0
+            # Drop the previous fetch's tensors before the owner pulls the next
+            # batch so dispatch never holds two batches alongside the window.
+            owner_batch = input_ids = lengths = labels = None
+            if rank == 0:
+                try:
+                    if owner_contract_error is not None:
+                        raise owner_contract_error
+                    owner_batch, epoch = next(owner_iterator)
+                    if cycle_epoch != epoch:
+                        cycle_epoch = epoch
+                        cycle_source = owner_batch
+                    owner_batch = _pad_dispatched_text_batch(
+                        owner_batch,
+                        target_size,
+                        pad_id=_mlx_text_pad_id(owner_tokenizer),
+                        pad_mode=distributed_pad_mode,
+                        cycle_source=cycle_source,
+                    )
+                    input_ids, lengths, labels = owner_batch
+                    rows = int(input_ids.shape[0])
+                    width = int(input_ids.shape[1])
+                    has_labels = int(labels is not None)
+                    status = 1
+                except StopIteration:
+                    pass
+                except BaseException as exc:
+                    # Synchronize interrupts too (KeyboardInterrupt during a
+                    # source/formatter/tokenizer call): peers are entering the
+                    # all_sum below and would hang if rank 0 unwound past it.
+                    # The original error is re-raised on rank 0 after sync.
+                    owner_error = exc
+                    status = -1
+
+            metadata = mx.array(
+                [status, rows, width, has_labels]
+                if rank == 0 else [0, 0, 0, 0],
+                dtype=mx.int32,
+            )
+            metadata = mx.distributed.all_sum(metadata, group=comm_group)
+            mx.eval(metadata)
+            status, rows, width, has_labels = (
+                int(value) for value in metadata.tolist()
+            )
+            if status < 0:
+                if owner_error is not None:
+                    raise owner_error
+                raise RuntimeError(
+                    "Unsloth MLX: rank 0 failed while reading the global "
+                    "streaming text source before batch dispatch."
+                )
+            if status == 0:
+                return
+            if rows != target_size or width <= 0:
+                raise RuntimeError(
+                    "Unsloth MLX: rank-0 streaming text dispatch produced "
+                    f"invalid global batch shape ({rows}, {width})."
+                )
+
+            if rank != 0:
+                input_ids = mx.zeros((rows, width), dtype=mx.int32)
+                lengths = mx.zeros((rows, 2), dtype=mx.int32)
+                labels = (
+                    mx.zeros((rows, width), dtype=mx.int64)
+                    if has_labels else None
+                )
+            input_ids = mx.distributed.all_sum(input_ids, group=comm_group)
+            lengths = mx.distributed.all_sum(lengths, group=comm_group)
+            if has_labels:
+                labels = mx.distributed.all_sum(labels, group=comm_group)
+                mx.eval(input_ids, lengths, labels)
+            else:
+                mx.eval(input_ids, lengths)
+            yield (
+                input_ids[rank:target_size:world_size],
+                lengths[rank:target_size:world_size],
+                None
+                if labels is None
+                else labels[rank:target_size:world_size],
+            )
+    finally:
+        _close_mlx_owned_iterator(owner_iterator)
+
+
 def _iterate_ordered_text_training_batches(dataset, tokenizer, batch_size,
                                            max_seq_length, seed=42,
                                            dataset_text_field="text",
@@ -6287,17 +8474,96 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              model_name=None, model_type=None,
                              append_eos=True, completion_only_loss=None,
                              assistant_only_loss=False, dataset_order="default",
-                             comm_group=None):
+                             comm_group=None, require_replayable=False,
+                             response_mask_fn=None, repeat=True,
+                             distributed_pad_mode="cycle",
+                             expected_rows_per_pass=None,
+                             length_window_batches=1,
+                             prefetch_batches=0,
+                             prefetch_skip_batches=0,
+                             prefetch_control=None):
     """Streaming batch generator for MLX training.
 
-    Wraps mlx-lm's iterate_batches(loop=True) as a generator, avoiding
-    materializing all batches in memory at once. Useful for large datasets.
+    Map-style datasets retain the existing mlx-lm batching behavior. Unsized
+    text sources are normalized and tokenized incrementally, retaining at most
+    ``length_window_batches`` global micro-batches of prepared rows (plus the
+    rank-0 owner's pass-long cycle-padding batch under DDP). Default order with
+    a window > 1 emits length-grouped, seeded-permuted batches; ``sequential``
+    and window 1 preserve exact source order.
 
     Yields:
         (batch, lengths, labels) tuples — same format as create_batches.
         ``labels`` is ``None`` unless text prompt/completion masking is active.
     """
     from mlx_lm.tuner.trainer import iterate_batches
+
+    if _is_mlx_lazy_text_source(dataset):
+        tokenizer = normalize_mlx_chat_template(
+            tokenizer,
+            chat_template=chat_template,
+            model_name=model_name,
+            model_type=model_type,
+            is_vlm=False,
+            strict=False,
+        )
+        lazy_batch_kwargs = dict(
+            dataset_text_field=dataset_text_field,
+            formatting_func=formatting_func,
+            dataset_order=dataset_order,
+            append_eos=append_eos,
+            completion_only_loss=completion_only_loss,
+            assistant_only_loss=assistant_only_loss,
+            response_mask_fn=response_mask_fn,
+            require_replayable=require_replayable,
+            repeat=repeat,
+            expected_rows_per_pass=expected_rows_per_pass,
+            length_window_batches=length_window_batches,
+            window_seed=seed,
+        )
+        prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
+        if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
+            prefetcher = _LazyTextPrefetcher(
+                None,
+                prefetch_depth,
+                skip_batches=prefetch_skip_batches,
+            )
+            prefetcher._make_iterator = (
+                lambda pf=prefetcher: _iterate_lazy_text_training_batches(
+                    dataset, tokenizer, batch_size, max_seq_length,
+                    comm_group=None, distributed_pad_mode=distributed_pad_mode,
+                    yield_host_staged=True, reject_mlx_valued=True,
+                    should_stop=pf._stop.is_set,
+                    **lazy_batch_kwargs,
+                )
+            )
+            if prefetch_control is not None:
+                prefetch_control["prefetcher"] = prefetcher
+            try:
+                yield from prefetcher
+            finally:
+                prefetcher.close()
+            return
+        if _distributed_rank_size(comm_group)[1] > 1:
+            yield from _iterate_dispatched_lazy_text_training_batches(
+                dataset,
+                tokenizer,
+                batch_size,
+                max_seq_length,
+                comm_group=comm_group,
+                distributed_pad_mode=distributed_pad_mode,
+                **lazy_batch_kwargs,
+            )
+        else:
+            yield from _iterate_lazy_text_training_batches(
+                dataset,
+                tokenizer,
+                batch_size,
+                max_seq_length,
+                comm_group=comm_group,
+                distributed_pad_mode=distributed_pad_mode,
+                **lazy_batch_kwargs,
+            )
+        return
 
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
