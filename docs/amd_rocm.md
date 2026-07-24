@@ -5,15 +5,24 @@ on Linux, WSL, and Windows via ROCm.
 
 ## Quick Start
 
+**Linux / WSL:**
 ```bash
-# Install ROCm PyTorch (replace rocm6.2 with your ROCm version)
+# Replace rocm6.2 with your installed ROCm version
 pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+pip install unsloth
+```
 
-# Install Unsloth
+**Windows (native ROCm):**
+AMD provides ROCm-enabled PyTorch wheels for Windows via the TheRock project.
+Follow the [AMD ROCm Windows installation guide](https://rocm.docs.amd.com/en/latest/install/windows.html)
+to install the correct wheel for your GPU and ROCm version, then install Unsloth:
+```bash
 pip install unsloth
 ```
 
 Then train exactly as you would on NVIDIA - no code changes needed.
+
+---
 
 ## Recommended Configuration for AMD Instinct (MI300X / MI325X)
 
@@ -67,27 +76,31 @@ trainer = SFTTrainer(
 )
 ```
 
-### 3. Target all projection matrices in LoRA
+### 3. Use the standard full-module LoRA target set
 
-Targeting q_proj, k_proj, v_proj, and o_proj (full QKV+O) instead of only
-q_proj + v_proj reduces VRAM by 28% at essentially the same throughput:
+Use Unsloth's recommended full target_modules (attention + MLP) with lora_dropout=0
+for the optimized training path:
 
 ```python
 model = FastLanguageModel.get_peft_model(
     model,
     r = 16,
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_alpha = 32,
-    lora_dropout = 0.05,
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 16,
+    lora_dropout = 0,    # 0 is the optimized path in Unsloth
+    bias = "none",       # "none" is the optimized path in Unsloth
+    use_gradient_checkpointing = "unsloth",
 )
 ```
 
-| Target modules            | Throughput   | VRAM    |
-|---------------------------|--------------|---------|
-| q_proj + v_proj (default) | 27,418 tok/s | 10.6 GB |
-| q+k+v+o (full QKV+O)      | 26,793 tok/s | 7.6 GB  |
+**Note on attention-only LoRA (q+k+v+o):** Targeting only the four attention
+projection matrices instead of all seven saves ~28% VRAM at similar throughput,
+but it reduces training coverage by excluding MLP layers. This trades model
+quality for memory. Use the full seven-module set above for best results; use
+attention-only if you need to fit a larger model or longer context on a single GPU.
 
-### 4. Gradient checkpointing for very large models
+### 4. Use gradient checkpointing for very large models
 
 ```python
 model = FastLanguageModel.get_peft_model(
@@ -97,9 +110,8 @@ model = FastLanguageModel.get_peft_model(
 )
 ```
 
-With full QKV+O LoRA + gradient checkpointing, VRAM drops to 3.1 GB for a
-1B-parameter model - enabling very long context or large batch training on any
-AMD Instinct GPU.
+With full LoRA + gradient checkpointing, VRAM drops dramatically, enabling
+very long context or large model training on any AMD Instinct GPU.
 
 ### 5. Account for ROCm JIT warm-up in benchmarks
 
@@ -114,16 +126,33 @@ first ~15 training steps:
 | 15   | 1,111 |
 | 20+  | 1,454 |
 
-Exclude steps 1-10 from benchmark measurements. Set
-MIOPEN_USER_DB_PATH=/path/to/persistent/cache to avoid recompilation across runs.
+Exclude steps 1-10 from benchmark measurements.
+
+To persist compiled kernels across runs (avoids recompilation cost every restart):
+
+```bash
+# Persist compiled kernel binaries (the main compilation cost)
+export MIOPEN_CUSTOM_CACHE_DIR=/path/to/persistent/miopen_cache
+
+# Optionally also persist the performance tuning database
+export MIOPEN_USER_DB_PATH=/path/to/persistent/miopen_userdb
+```
+
+Both variables should point to persistent directories (not /tmp). Setting only
+`MIOPEN_USER_DB_PATH` relocates the performance database but does not avoid
+kernel recompilation; set `MIOPEN_CUSTOM_CACHE_DIR` to eliminate recompilation.
+
+---
 
 ## Validated Hardware
 
-| GPU                 | Architecture | VRAM         | ROCm | Status      |
-|---------------------|--------------|--------------|------|-------------|
-| AMD Instinct MI325X | gfx942       | 256 GB HBM3e | 6.2+ | Validated   |
-| AMD Instinct MI300X | gfx942       | 192 GB HBM3  | 6.2+ | Validated   |
-| AMD Instinct MI355X | gfx950       | 288 GB HBM3e | 7.0+ | Validated   |
+| GPU                 | Architecture | VRAM         | ROCm | Status    |
+|---------------------|--------------|--------------|------|-----------|
+| AMD Instinct MI325X | gfx942       | 256 GB HBM3e | 6.2+ | Validated |
+| AMD Instinct MI300X | gfx942       | 192 GB HBM3  | 6.2+ | Validated |
+| AMD Instinct MI355X | gfx950       | 288 GB HBM3e | 7.0+ | Validated |
+
+---
 
 ## Troubleshooting
 
@@ -138,9 +167,10 @@ python -c "import torch; print(torch.version.hip)"  # should print ROCm version
 
 FlashInfer requires NVIDIA nvcc and is automatically skipped on ROCm. No action needed.
 
-**Slow first run**
+**Slow first run / recompilation on every restart**
 
-ROCm JIT kernel compilation on first use is normal. See the warm-up note in section 5.
+ROCm JIT kernel compilation on first use is normal. Set `MIOPEN_CUSTOM_CACHE_DIR`
+to a persistent path to avoid recompilation across runs. See section 5 above.
 
 **UNSLOTH_IS_PRESENT error**
 
@@ -148,6 +178,8 @@ If running unsloth-zoo directly without the unsloth package installed:
 ```bash
 export UNSLOTH_IS_PRESENT=1
 ```
+
+---
 
 ## Running the AMD Validation Suite
 
