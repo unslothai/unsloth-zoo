@@ -91,3 +91,9 @@ jobs:
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
         run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
+
+      - name: tests/test_mlx_double_quant_load_metal.py
+        # Real nf4 + double-quant checkpoint through the bnb dequant path:
+        # load + generate and a few LoRA SFT steps. Skips (reported via -rs)
+        # when the real bitsandbytes wheel or the checkpoint is unavailable.
+        run: python -m pytest tests/test_mlx_double_quant_load_metal.py -v -rs
