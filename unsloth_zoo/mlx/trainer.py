@@ -2561,7 +2561,7 @@ class MLXTrainer:
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-        # Per-parameter gradient scaling (LoRA+, embedding LR)
+        # Per-group learning rates (LoRA+, embedding LR) via post-update rescale
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
@@ -2578,11 +2578,11 @@ class MLXTrainer:
                 f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e})."
             )
 
-        _needs_grad_scaling = use_lora_plus or use_embedding_lr
+        _scoped_lr_requested = use_lora_plus or use_embedding_lr
 
         # --- Per-group LR via post-update STEP rescale (not gradient scaling) ---
         # The update-normalizing optimizers (AdamW/Adam/Lion/Adafactor, and Muon
-        # for rank->=2 matrices) are scale-invariant to a constant gradient
+        # for rank>=2 matrices) are scale-invariant to a constant gradient
         # scale, so applying LoRA+ / embedding-LR ratios to the gradient is a
         # near no-op. Instead, let the single optimizer take its normal step,
         # then rescale the realized delta of the scoped params:
@@ -2618,7 +2618,7 @@ class MLXTrainer:
         # scoped leaves once here rather than re-running _scoped_step_ratio over
         # the whole tree every optimizer step.
         _scoped_ratios = {}
-        if _needs_grad_scaling:
+        if _scoped_lr_requested:
             for name, _value in tree_flatten(model.trainable_parameters()):
                 r = _scoped_step_ratio(name)
                 # ratio == 1.0 is a no-op rescale (pre + 1*(post-pre) == post);
@@ -2626,6 +2626,11 @@ class MLXTrainer:
                 # scoped LR equals the base LR.
                 if r is not None and r != 1.0:
                     _scoped_ratios[name] = r
+        # True only when some scoped leaf actually needs rescaling. A requested
+        # but no-op ratio (lora_plus_ratio=1.0, or embedding_learning_rate ==
+        # learning_rate) leaves this False, so it neither snapshots anything nor
+        # disables the single-step fast path below.
+        _needs_step_rescale = bool(_scoped_ratios)
 
         def _snapshot_scoped_params():
             """Pre-update values (immutable mx arrays) + ratio for scoped leaves,
@@ -2693,7 +2698,7 @@ class MLXTrainer:
         _direct_single_step_update = (
             grad_accum == 1 and
             distributed_world_size <= 1 and
-            not _needs_grad_scaling and
+            not _needs_step_rescale and
             max_grad_norm <= 0 and
             not _clip_grad_value and
             not _clip_grad_leaf_norm
@@ -2781,7 +2786,7 @@ class MLXTrainer:
             # Snapshot the scoped params BEFORE decay so the post-update rescale
             # scales the whole realized delta (decoupled decay + optimizer step)
             # by the per-group ratio (LoRA+ / embedding-LR).
-            _scoped_snap = _snapshot_scoped_params() if _needs_grad_scaling else None
+            _scoped_snap = _snapshot_scoped_params() if _needs_step_rescale else None
             # Coupled (SGD) decay folds into the post-clip grad so it feeds
             # momentum; decoupled (AdamW-family) decay shrinks params directly.
             final_grad = self._apply_coupled_weight_decay(model, final_grad)
