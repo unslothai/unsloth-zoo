@@ -4876,6 +4876,14 @@ class FastMLXModel:
                 parallel text or VLM inference.
             tensor_group: Optional MLX distributed group for tensor parallel
                 text or VLM inference.
+
+        Reloading a saved LoRA/DoRA adapter directory returns a model whose
+        base is frozen and whose adapter parameters are trainable — the same
+        state as a fresh ``get_peft_model`` — so it can be passed straight to a
+        new ``MLXTrainer`` to warm-start continued adapter training with a fresh
+        optimizer and schedule. Non-LoRA weights that were separately trained
+        (for example embeddings or a projector) are not re-enabled for training
+        on reload; re-specify them if continued training of those is needed.
         """
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
@@ -5481,6 +5489,31 @@ class FastMLXModel:
                                 "Unsloth MLX: adapter load failed and "
                                 "adapters.safetensors is missing."
                             )
+                    # A reloaded LoRA/DoRA adapter comes back with the base
+                    # model still trainable: mlx-lm's load_adapters applies the
+                    # adapter layers but, unlike get_peft_model, never freezes
+                    # the base. Left as-is, a fresh MLXTrainer over this model
+                    # would warm-start into a full-base finetune under a
+                    # LoRA-scale learning rate. Restore the get_peft_model
+                    # trainable state (base frozen, adapter trainable) so
+                    # continued training updates only the adapter. Skip when
+                    # full_finetuning was requested (an explicit full-training
+                    # reload) or when no LoRA modules exist (e.g. a
+                    # fine_tune_type="full" adapter), which would otherwise be
+                    # left fully frozen and untrainable.
+                    if not full_finetuning:
+                        from .utils import iter_mlx_lora_modules
+                        _lora_modules = list(iter_mlx_lora_modules(model))
+                        if _lora_modules:
+                            _fix_missing_no_grad(model)
+                            model.freeze()
+                            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+                            # DoRA magnitude is unfrozen per DoRA module rather
+                            # than via a global "m" key, so an unrelated base
+                            # parameter named "m" is never made trainable.
+                            for _lora_name, _lora_module in _lora_modules:
+                                if type(_lora_module).__name__.startswith("DoRA"):
+                                    _lora_module.unfreeze(keys=["m"], recurse=False)
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
