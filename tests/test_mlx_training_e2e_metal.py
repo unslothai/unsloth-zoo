@@ -8,6 +8,7 @@ functions (CCE and baseline).
 """
 
 import glob
+import json
 import os
 
 import pytest
@@ -30,7 +31,8 @@ if _METAL:
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx.utils import (
-        FiniteTextBatchPlan, _FiniteTextRow, make_baseline_loss_fn,
+        FiniteTextBatchPlan, _FiniteTextRow, collect_mlx_lora_adapter_tensors,
+        make_baseline_loss_fn,
     )
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
@@ -296,3 +298,185 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
                     overrides={"compile_mode": "best_effort"})
     assert state["step_ran"] and state["raised"]
     assert "falling back to eager" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Warm-starting continued training from a saved adapter.
+#
+# Reloading a saved LoRA/DoRA adapter via FastMLXModel.from_pretrained must
+# return the same trainable state as a fresh get_peft_model (base frozen,
+# adapter trainable), so a new MLXTrainer continues adapter training with a
+# fresh optimizer instead of silently full-finetuning the base. These use a
+# tiny locally-built unquantized Llama (no pretrained-model download; a small
+# tokenizer is fetched once) so the full_finetuning and DoRA branches are cheap.
+# ---------------------------------------------------------------------------
+
+
+def _trainable_names(model):
+    return {name for name, _ in tree_flatten(model.trainable_parameters())}
+
+
+def _adapter_keys(model):
+    # The canonical adapter parameter set the production code targets
+    # (lora_a/lora_b for every LoRA module, plus m for DoRA modules only).
+    return set(collect_mlx_lora_adapter_tensors(model).keys())
+
+
+def _tiny_base(path):
+    """Write a tiny unquantized HF Llama + tokenizer to ``path``."""
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
+    # vocab_size matches hf-internal-testing/llama-tokenizer so tokenized
+    # training inputs stay in range (out-of-range ids would silently corrupt
+    # the embedding/label ops under unchecked Metal indexing).
+    cfg = LlamaConfig(
+        hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=32000,
+        max_position_embeddings=128, tie_word_embeddings=False,
+    )
+    LlamaForCausalLM(cfg).save_pretrained(path, safe_serialization=True)
+    AutoTokenizer.from_pretrained(
+        "hf-internal-testing/llama-tokenizer"
+    ).save_pretrained(path)
+    return path
+
+
+def _save_lora_adapter(base_path, adapter_path):
+    """Attach LoRA to the tiny base and save an adapter directory."""
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    model, _ = FastMLXModel.from_pretrained(
+        str(base_path), load_in_4bit=False, max_seq_length=64,
+    )
+    model = FastMLXModel.get_peft_model(
+        model, r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"],
+    )
+    save_lora_adapters(model, str(adapter_path))
+    return adapter_path
+
+
+def _save_dora_adapter(base_path, adapter_path):
+    """Build a DoRA adapter with mlx-lm and save it in reloadable form."""
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+    model, _ = FastMLXModel.from_pretrained(
+        str(base_path), load_in_4bit=False, max_seq_length=64,
+    )
+    num_layers = 2
+    lora_params = {"rank": 8, "scale": 16.0, "dropout": 0.0,
+                   "keys": ["self_attn.q_proj", "self_attn.v_proj"]}
+    model.freeze()
+    linear_to_lora_layers(model, num_layers, lora_params, use_dora=True)
+    os.makedirs(adapter_path, exist_ok=True)
+    mx.save_safetensors(
+        os.path.join(str(adapter_path), "adapters.safetensors"),
+        dict(tree_flatten(model.trainable_parameters())),
+    )
+    with open(os.path.join(str(adapter_path), "adapter_config.json"), "w") as f:
+        json.dump({"fine_tune_type": "dora", "num_layers": num_layers,
+                   "lora_parameters": lora_params,
+                   "base_model_name_or_path": str(base_path)}, f)
+    return adapter_path
+
+
+@metal_only
+def test_adapter_reload_freezes_base(tmp_path):
+    base = _tiny_base(tmp_path / "base")
+    adapter = _save_lora_adapter(base, tmp_path / "adapter")
+
+    model, _ = FastMLXModel.from_pretrained(
+        str(adapter), load_in_4bit=False, max_seq_length=64,
+    )
+    adapter_keys = _adapter_keys(model)
+    assert any(n.endswith("lora_a") for n in adapter_keys)
+    # The regression: the whole base used to come back trainable. The trainable
+    # set must be exactly the adapter tensors, nothing more.
+    assert _trainable_names(model) == adapter_keys
+
+
+@metal_only
+def test_warm_start_trains_only_adapter(tmp_path):
+    base = _tiny_base(tmp_path / "base")
+    adapter = _save_lora_adapter(base, tmp_path / "adapter")
+
+    model, tok = FastMLXModel.from_pretrained(
+        str(adapter), load_in_4bit=False, max_seq_length=64,
+    )
+    # A non-adapter base weight must be untouched by warm-start training, while
+    # an adapter tensor must actually change (else a no-op run would pass).
+    probe_key = "model.layers.0.mlp.down_proj.weight"
+    lora_key = next(n for n in _trainable_names(model) if n.endswith("lora_b"))
+    params_before = dict(tree_flatten(model.parameters()))
+    base_before = params_before[probe_key]
+    lora_before = params_before[lora_key]
+    cfg = MLXTrainingConfig(
+        output_dir=str(tmp_path / "out"), per_device_train_batch_size=2,
+        max_steps=2, learning_rate=1e-3, compile=False, use_cce=False,
+        report_to="none",
+    )
+    MLXTrainer(
+        model=model, tokenizer=tok,
+        train_dataset=[{"text": f"warm start {i}"} for i in range(6)],
+        args=cfg,
+    ).train()
+    params_after = dict(tree_flatten(model.parameters()))
+    assert mx.array_equal(base_before, params_after[probe_key])
+    assert not mx.array_equal(lora_before, params_after[lora_key])
+    assert _trainable_names(model) == _adapter_keys(model)
+
+
+@metal_only
+def test_dora_reload_keeps_magnitude_trainable(tmp_path):
+    base = _tiny_base(tmp_path / "base")
+    adapter = _save_dora_adapter(base, tmp_path / "dora")
+
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+    model, _ = FastMLXModel.from_pretrained(
+        str(adapter), load_in_4bit=False, max_seq_length=64,
+    )
+    trainable = _trainable_names(model)
+    dora_modules = [n for n, m in iter_mlx_lora_modules(model)
+                    if type(m).__name__.startswith("DoRA")]
+    assert len(dora_modules) > 0
+    # Every DoRA magnitude must stay trainable (not just one).
+    assert len([n for n in trainable if n.endswith(".m")]) == len(dora_modules)
+    # Trainable set is exactly the adapter tensors (lora_a/lora_b + DoRA m),
+    # so no base weight leaks in. (A regression that also unfroze an unrelated
+    # base parameter literally named "m" is not observable on this stock-Llama
+    # fixture, which has none; that pathological case is left to follow-up.)
+    assert trainable == _adapter_keys(model)
+
+
+@metal_only
+def test_full_finetuning_reload_keeps_base_trainable(tmp_path):
+    base = _tiny_base(tmp_path / "base")
+    adapter = _save_lora_adapter(base, tmp_path / "adapter")
+
+    model, _ = FastMLXModel.from_pretrained(
+        str(adapter), load_in_4bit=False, max_seq_length=64,
+        full_finetuning=True,
+    )
+    # full_finetuning is an explicit full-training request: the freeze is
+    # skipped, so the trainable set strictly exceeds the adapter tensors.
+    assert _trainable_names(model) > _adapter_keys(model)
+
+
+@metal_only
+def test_resume_from_adapter_dir_names_warm_start(tmp_path):
+    base = _tiny_base(tmp_path / "base")
+    adapter = _save_lora_adapter(base, tmp_path / "adapter")
+
+    model, tok = FastMLXModel.from_pretrained(
+        str(adapter), load_in_4bit=False, max_seq_length=64,
+    )
+    cfg = MLXTrainingConfig(
+        output_dir=str(tmp_path / "out"), per_device_train_batch_size=2,
+        max_steps=2, learning_rate=1e-3, compile=False, use_cce=False,
+        report_to="none",
+    )
+    trainer = MLXTrainer(
+        model=model, tokenizer=tok,
+        train_dataset=[{"text": f"row {i}"} for i in range(6)], args=cfg,
+    )
+    # The adapter dir has no optimizer_state.safetensors, so resume must fail
+    # and point at the warm-start route rather than silently restarting.
+    with pytest.raises(RuntimeError, match="from_pretrained"):
+        trainer.train(resume_from_checkpoint=str(adapter))

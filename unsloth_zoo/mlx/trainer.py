@@ -2506,6 +2506,29 @@ class MLXTrainer:
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
         if _resume_from:
+            # A complete checkpoint has all three resume files; a saved adapter
+            # directory has only adapters.safetensors. Detect an incomplete set
+            # up front and point the user at the warm-start route, rather than
+            # surfacing a raw mx.load open failure — mx.load raises a generic
+            # RuntimeError (not FileNotFoundError) for a missing file, so the
+            # handler below would not catch it. Mirrors the required-file set of
+            # the distributed resume validator, and uses isfile so a same-named
+            # directory is not mistaken for a present file.
+            _missing_resume = [
+                _f for _f in ("adapters.safetensors",
+                              "optimizer_state.safetensors", "trainer_state.json")
+                if not os.path.isfile(os.path.join(_resume_from, _f))
+            ]
+            if _missing_resume:
+                raise RuntimeError(
+                    f"Unsloth: resume_from_checkpoint={_resume_from!r} is "
+                    f"missing resume state file(s) {_missing_resume}. Refusing "
+                    f"to silently restart from step 0. If this is a saved "
+                    f"adapter directory rather than a training checkpoint and "
+                    f"you meant to start a new run from it with a fresh "
+                    f"optimizer, load it with FastMLXModel.from_pretrained(<dir>) "
+                    f"and train without resume_from_checkpoint."
+                )
             try:
                 # 1. Load trained adapter weights into the model. The model
                 #    already has LoRA wrappers applied (Unsloth pipeline does
