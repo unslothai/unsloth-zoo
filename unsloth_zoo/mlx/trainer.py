@@ -918,7 +918,14 @@ def _plan_single_process_vlm_shapes(
         frontier = build_text_shape_frontier(
             events, compile_scope=compile_scope,
         )
-        shape_plan = select_text_shape_padding_budget(frontier)
+        # VLM catalogs keep every media family as its own endpoint group, so
+        # budget compression eliminates too few signatures to pay for its
+        # recurring padded compute. Stay exact up to the automatic ceiling
+        # and compress only once the signature cap genuinely binds.
+        shape_plan = select_text_shape_padding_budget(
+            frontier,
+            exact_signature_threshold=AUTOMATIC_TEXT_COMPILE_CEILING,
+        )
     else:
         shape_plan = plan_text_shape_buckets(
             events,
@@ -1426,8 +1433,18 @@ class MLXTrainer:
         *,
         automatic=False,
         local_error=None,
+        keep_exact_local=False,
     ):
-        """Require every DDP rank to admit its local finite shape plan."""
+        """Require every DDP rank to admit its local finite shape plan.
+
+        ``keep_exact_local`` makes ranks whose automatic selection is exact
+        keep that plan instead of joining shared-cap re-materialization: an
+        exact catalog's size is descriptive, and contributing it to the
+        shared maximum would force budget-bucketed peers above the ceiling
+        to abandon their compression. Such ranks contribute a neutral value
+        to the cap collective and still run every collective in the same
+        order, so the coordinated schedule is unchanged.
+        """
         if self.distributed_world_size <= 1:
             if local_error is not None:
                 raise local_error
@@ -1463,7 +1480,10 @@ class MLXTrainer:
         if not automatic or frontier is None:
             return shape_plan, report, compile_allowed
 
-        shared_cap = self._distributed_max_int(report.effective_cap)
+        keep_local = keep_exact_local and report.action == "exact"
+        shared_cap = self._distributed_max_int(
+            1 if keep_local else report.effective_cap
+        )
         final_plan = None
         final_error = None
         try:
@@ -1472,17 +1492,20 @@ class MLXTrainer:
                     "automatic finite text cap synchronization exceeded "
                     f"{AUTOMATIC_TEXT_COMPILE_CEILING}"
                 )
-            final_plan = materialize_text_shape_frontier(
-                frontier,
-                cap=shared_cap,
-                cap_selection=report.cap_selection,
-            )
-            if final_plan.report.action == "eager":
-                raise RuntimeError(final_plan.report.reason)
+            if not keep_local:
+                final_plan = materialize_text_shape_frontier(
+                    frontier,
+                    cap=shared_cap,
+                    cap_selection=report.cap_selection,
+                )
+                if final_plan.report.action == "eager":
+                    raise RuntimeError(final_plan.report.reason)
         except Exception as exc:
             final_error = exc
         final_failed_any = self._distributed_any_flag(final_error is not None)
         if not final_failed_any:
+            if keep_local:
+                return shape_plan, report, True
             return final_plan, final_plan.report, True
         if compile_policy.mode == "strict":
             error = RuntimeError(
@@ -2641,6 +2664,7 @@ class MLXTrainer:
                     compile_policy,
                     automatic=args.compile_max_variants is None,
                     local_error=local_plan_error,
+                    keep_exact_local=True,
                 )
                 # Mandatory-abort synchronization: a should_raise decision
                 # (per-arch strict overrides can produce one even under a

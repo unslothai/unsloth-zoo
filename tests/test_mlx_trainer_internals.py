@@ -324,6 +324,41 @@ def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
     assert failed_report.effective_cap == failed_report.cap == 128
 
 
+def test_ddp_vlm_exact_rank_keeps_local_plan_and_neutral_cap_share():
+    """An exact rank must not export its catalog size as the shared cap
+    (widening budget-bucketed peers) and keeps its local plan."""
+    from unsloth_zoo.mlx import shape_guard as sg
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    events = [sg.TextShapeEvent(("vlm",), w, "none") for w in range(10, 50)]
+    frontier = sg.build_text_shape_frontier(
+        events, compile_scope=sg.FULL_STEP_SCOPE,
+    )
+    local_plan = sg.select_text_shape_padding_budget(
+        frontier, exact_signature_threshold=sg.AUTOMATIC_TEXT_COMPILE_CEILING,
+    )
+    assert local_plan.report.action == "exact"
+    contributed = []
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = (
+        lambda cap: contributed.append(cap) or 14  # peer's budget cap wins
+    )
+
+    plan, report, allowed = trainer._coordinate_text_shape_guard(
+        local_plan, frontier, local_plan.report, True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True, keep_exact_local=True,
+    )
+
+    assert contributed == [1]  # neutral share, never the catalog size
+    assert allowed is True and plan is local_plan
+    assert report is local_plan.report and report.action == "exact"
+
+
 def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (

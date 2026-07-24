@@ -303,40 +303,17 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     the compiled path over planned widths only; losses and token counts
     match the unplanned eager run exactly (padded tails are inert), and
     every compiled input width is an admitted endpoint."""
+    import os as _os
+    import sys as _sys
     import types
 
-    import numpy as np
     import mlx.nn as nn
     import unsloth_zoo.mlx.trainer as trainer_mod
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
-    class _Tok:
-        pad_token_id = 2
-
-        def encode(self, text):
-            return [int(part) for part in str(text).split()]
-
-        def convert_tokens_to_ids(self, token):
-            if isinstance(token, list):
-                return [self.convert_tokens_to_ids(item) for item in token]
-            return -1
-
-    class _Proc:
-        tokenizer = _Tok()
-        image_processor = object()
-
-        def __call__(self, text, **_kwargs):
-            width = 5 + 35 * (max(int(item) % 2 for item in text))
-            rows = [
-                ([int(item), 200] + [2] * width)[:width] for item in text
-            ]
-            return {
-                "input_ids": np.array(rows, dtype=np.int32),
-                "attention_mask": np.array(
-                    [[1] * width for _ in rows], dtype=np.int32,
-                ),
-            }
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from test_mlx_batching_and_decay import _WidthOnlyProcessor as _Proc
 
     class TinyVLM(nn.Module):
         # Real nn.Module: keep the genuine train()/state members — the

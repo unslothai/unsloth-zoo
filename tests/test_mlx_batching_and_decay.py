@@ -371,16 +371,10 @@ class _FakeWorld:
 
 def test_finite_vlm_plan_reproduces_merged_main_goldens():
     """Independent oracle: complete-pytree digests frozen from the pre-plan
-    eager builder on merged main. Two smoke modes cover the plain default
-    epoch-replay path and the multi_modality prepare-time image-token
-    expansion path; the full 11-mode golden matrix is retained as recorded
-    validation evidence outside the repository."""
+    eager builder on merged main (two smoke modes; full matrix recorded)."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
-    # Frozen full-pytree batch digests captured from the pre-plan eager VLM
-    # builder on merged main (independent parity oracle). Values are
-    # dtype-native; regenerate only from a tree WITHOUT the plan diff.
     GOLDENS = {
         "default_epoch_replay": ((('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((0, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((0, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((0, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((1, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((1, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((1, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((2, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((2, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((2, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((3, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((3, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((3, -100, 2),))), (('_unsloth_raw_input_ids_for_labels', 'mlx.core.int32', (1, 3), ((4, 200, 2),)), ('attention_mask', 'mlx.core.int32', (1, 3), ((1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 3), ((4, 200, 2),)), ('labels', 'mlx.core.int32', (1, 3), ((4, -100, 2),)))),
         "multi_modality_expansion": ((('attention_mask', 'mlx.core.int32', (1, 5), ((1, 1, 1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 5), ((0, 250, 250, 250, 2),)), ('labels', 'mlx.core.int64', (1, 5), ((0, -100, -100, -100, 2),)), ('pixel_values', 'mlx.core.float32', (1, 2), ((0.5, 0.5),))), (('attention_mask', 'mlx.core.int32', (1, 5), ((1, 1, 1, 1, 1),)), ('input_ids', 'mlx.core.int32', (1, 5), ((1, 250, 250, 250, 2),)), ('labels', 'mlx.core.int64', (1, 5), ((1, -100, -100, -100, 2),)), ('pixel_values', 'mlx.core.float32', (1, 2), ((0.5, 0.5),)))),
@@ -399,10 +393,9 @@ def test_finite_vlm_plan_reproduces_merged_main_goldens():
             dataset=dataset, processor=processor, config=config, **kwargs,
         )
         assert plan.visit_policy == "identity", name
+        assert [plan.batch_index_for_visit(v) for v in range(2 * len(plan))] \
+            == [v % len(plan) for v in range(2 * len(plan))], name
         assert _digest_vlm_batches(plan.materialize_all()) == GOLDENS[name], name
-        assert [
-            plan.batch_index_for_visit(v) for v in range(2 * len(plan))
-        ] == [v % len(plan) for v in range(2 * len(plan))], name
 
 
 def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeypatch):
@@ -456,15 +449,13 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
 
 def test_vlm_family_invariant_against_live_mx_compile_traces():
     """The serializer's central safety invariant checked against OBSERVED
-    mx.compile cache behavior, not assumed rules. Families are computed
-    BEFORE the compile walk, mirroring the production survey-then-compile
-    order. 'merge' pairs must share one plannable family and one trace;
-    'split' pairs (one per value-encoding rule) must produce two traces and
-    two still-plannable families; 'guard' pairs are cases MLX keys apart that
-    one family may absorb ONLY by being unplannable; leaves the compile walk
-    rejects must be unplannable too. The exhaustive adversarial matrix
-    (stateful/among-walk-varying containers, hostile metaclasses, tag-cache
-    lifetime) is retained as recorded validation evidence outside the repo."""
+    mx.compile cache behavior, with families computed BEFORE the compile walk
+    (production survey-then-compile order). 'merge' pairs share one plannable
+    family and one trace; 'split' pairs (one per value-encoding rule) produce
+    two traces and two still-plannable families; 'guard' pairs are cases MLX
+    keys apart that one family may absorb ONLY by being unplannable; leaves
+    the compile walk rejects are unplannable too. The exhaustive adversarial
+    matrix is retained as recorded validation evidence outside the repo."""
     _skip_if_mlx_core_was_replaced()
     import collections
 
@@ -495,17 +486,13 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
         ("guard", {"x": ids, "t": Point(1, 2)}, {"x": ids, "t": Point(3, 4)}),
     ]
     for kind, left, right in cases:
-        # Families first: production surveys before MLX ever walks the object.
         fam_left, fam_right = family(left), family(right)
         traces = []
-        # The probe body ignores its input: mx.compile keys on the argument
-        # walk itself, which is exactly what the family must mirror.
+        # The probe body ignores its input: mx.compile keys on the walk.
         compiled = mx.compile(lambda d: (traces.append(1), mx.ones(1))[1])
         compiled(left)
         compiled(right)
         same_key = len(traces) == 1
-        # The safety direction, always: a plannable shared family implies a
-        # shared compile key.
         if fam_left == fam_right and plannable(fam_left):
             assert same_key, (kind, left, right)
         if kind == "merge":
@@ -518,7 +505,6 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
             assert plannable(fam_left) and plannable(fam_right)
         else:
             assert not plannable(fam_left) and not plannable(fam_right)
-    # Structures the compile walk rejects can never be plannable either.
     rejected = [
         {"x": ids, "n": np.zeros((1,))},
         {"x": ids, "big": 2 ** 63},
@@ -528,11 +514,9 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
         assert not plannable(family(tree))
         with pytest.raises(Exception):
             mx.compile(lambda d: mx.ones(1))(tree)
-    # Boundary values MLX still accepts stay plannable.
     edge = {"x": ids, "lo": -(2 ** 63), "hi": 2 ** 63 - 1}
     assert plannable(family(edge))
     mx.compile(lambda d: mx.ones(1))(edge)
-    # A guarded tuple subclass never shares the plain tuple's family.
     assert family({"t": Point(1, 2)}) != family({"t": (1, 2)})
 
 
@@ -713,17 +697,14 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     reordered = dict(reversed(list(batch.items())))
     with pytest.raises(RuntimeError, match="drifted"):
         plan.check_family_drift(1, reordered)
-    # Families genuinely differ across these indices, so a checker pinned to
-    # the wrong descriptor cannot pass.
+    # Families genuinely differ, so a checker pinned wrong cannot pass.
     assert plan.batch_family(0) != plan.batch_family(1)
     with pytest.raises(RuntimeError, match="batch 0 drifted"):
         plan.check_family_drift(0, batch)
 
 
 class _WidthOnlyProcessor(_CountingProcessor):
-    """Same structure everywhere; batch width follows content — and spreads
-    far enough (5 vs 40) that the rounded planned widths stay distinct, so
-    the planner genuinely sees one family at several widths."""
+    """One family; widths 5 vs 40 stay distinct after event-width rounding."""
 
     def __call__(self, text, **kwargs):
         self.calls += 1
@@ -772,3 +753,35 @@ def test_vlm_should_raise_decision_aborts_inside_the_coordinated_block():
                 reason="unsupported architecture",
             ),
         )
+
+
+def test_vlm_automatic_planning_stays_exact_below_ceiling():
+    """Below the ceiling: canonical event widths, no budget compression."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
+
+    class _SteppedWidthProcessor(_CountingProcessor):
+        def __call__(self, text, **kwargs):  # 32-step widths: distinct signatures
+
+            self.calls += 1
+            width = 5 + 32 * max(int(item) for item in text)
+            rows = [([int(item), 200] + [2] * width)[:width] for item in text]
+            return {"input_ids": np.array(rows, dtype=np.int32),
+                    "attention_mask": np.array(
+                        [[1] * width for _ in rows], dtype=np.int32)}
+
+    plan = _vlm_planner_fixtures(processor=_SteppedWidthProcessor(), rows=40)
+    _shape_plan, report, allowed, _frontier = _plan_single_process_vlm_shapes(
+        plan, None,
+        args=SimpleNamespace(compile_max_variants=None,
+                             gradient_accumulation_steps=1),
+        total_steps=len(plan), distributed_world_size=1,
+        compile_policy=SimpleNamespace(mode="strict"),
+        compile_decision=SimpleNamespace(enabled=True),
+    )
+    assert allowed and report.action == "exact"
+    assert report.raw_signatures == report.planned_signatures == 40
+    assert (report.cap_selection, report.budget_satisfied) == ("exact", True)
+    assert (report.padding_work_fraction, report.max_width_stretch) == (0.0, 1.0)
