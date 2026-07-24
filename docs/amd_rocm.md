@@ -56,29 +56,30 @@ which delivers flash_attention_2-level performance with zero extra packages.
 For inputs with unsupported dtypes or mask shapes, SDPA may fall back to a
 math or memory-efficient implementation with different performance characteristics.
 
-Benchmark results (MI325X, TinyLlama-1.1B, inference):
+Inference benchmark (MI325X, TinyLlama-1.1B, batch=1, seq=512, bfloat16):
 
 | Implementation | Throughput     | VRAM    |
 |----------------|----------------|---------|
 | sdpa           | 108,505 tok/s  | 2.22 GB |
 | eager          | 78,914 tok/s   | 2.45 GB |
 
-SDPA is +37% faster and uses 9% less VRAM than eager.
+SDPA is +37% faster and uses 9% less VRAM than eager for this benchmark workload.
 
-At sequence lengths >= 2048, SDPA is effectively required. Eager attention allocates
-an O(n^2) attention matrix and runs out of memory approximately 3x sooner than SDPA.
-At seq=2048, SDPA gives +41% throughput over eager.
+At longer sequence lengths, SDPA's memory advantage grows. In the training benchmark
+(TinyLlama-1.1B, batch=4, bfloat16), SDPA gives +41% throughput at seq=2048 and
+eager runs out of memory approximately 3x sooner. The crossover point depends on
+model size, batch size, and dtype — smaller models or single-batch inference at
+the same length may still fit with eager.
 
 ### 2. Scale batch size - AMD GPUs have large VRAM
 
-AMD Instinct MI300X/MI325X have 192-256 GB HBM3e. At the benchmark workload
-(TinyLlama-1.1B, LoRA r=16, seq=512, bfloat16), default batch=4 uses less than
-5% of available VRAM:
+AMD Instinct MI300X/MI325X have 192-256 GB HBM3e. LoRA training benchmark
+(TinyLlama-1.1B, LoRA r=16, seq=512, bfloat16, steady-state training tok/s):
 
-| Batch size  | Throughput     | VRAM used              |
-|-------------|----------------|------------------------|
-| 4 (default) | 27,418 tok/s   | 10.6 GB (4% of 256 GB) |
-| 16          | 41,271 tok/s   | 20.5 GB (8% of 256 GB) |
+| Batch size             | Training tok/s | VRAM used              |
+|------------------------|----------------|------------------------|
+| 4 (benchmark baseline) | 27,418         | 10.6 GB (4% of 256 GB) |
+| 16                     | 41,271         | 20.5 GB (8% of 256 GB) |
 
 **+51% throughput for this benchmark workload.** These numbers are specific to the
 benchmark conditions above. For larger models or longer sequences, batch=16 may
@@ -114,9 +115,10 @@ model = FastLanguageModel.get_peft_model(
 ```
 
 **Note on attention-only LoRA (q+k+v+o):** Targeting only the four attention
-projection matrices saves ~28% VRAM compared to attention-only baselines but
-excludes MLP layers from training. This trades model quality for memory and
-is not equivalent to the standard configuration above.
+projection matrices (q, k, v, o) excludes MLP layers from training. This reduces
+the number of trained parameters and may reduce VRAM usage depending on optimizer
+state configuration, but it also changes training coverage and can affect model quality.
+It is not equivalent to the standard seven-module configuration above.
 
 ### 4. Use gradient checkpointing for very large models
 
@@ -134,15 +136,16 @@ very long context or large model training on any AMD Instinct GPU.
 ### 5. Account for ROCm JIT warm-up in benchmarks
 
 ROCm compiles HIP kernels on first use. Throughput ramps significantly over the
-first ~20 training steps before reaching steady state:
+first ~20 training steps. LoRA training benchmark (TinyLlama-1.1B, batch=4,
+seq=512, bfloat16 — training tok/s, distinct from the inference benchmark above):
 
-| Step | Tok/s  |
-|------|--------|
-| 1    | 78     |
-| 5    | 386    |
-| 10   | 756    |
-| 15   | 1,111  |
-| 20+  | 1,454  |
+| Step | Training tok/s |
+|------|----------------|
+| 1    | 78             |
+| 5    | 386            |
+| 10   | 756            |
+| 15   | 1,111          |
+| 20+  | 1,454          |
 
 **Exclude steps 1-20 from benchmark measurements** — throughput is still rising
 at step 10 (756 tok/s vs 1,454 steady-state). Start measuring only after
@@ -186,6 +189,15 @@ Notes:
   default to disabled; see `unsloth_zoo/compile_cache.py`).
 - On torch < 2.7, Mega-cache is not available; the one-time compile cost is paid
   on every new process.
+- **Directory trust requirements (POSIX):** The cache path and all its parent
+  directories must be owned by the current user and must not be group- or
+  world-writable. If the check fails, Mega-cache is silently disabled. Recommended
+  setup:
+  ```bash
+  mkdir -p ~/.cache/unsloth/mega_cache
+  chmod 700 ~/.cache/unsloth/mega_cache
+  export UNSLOTH_MEGA_CACHE_DIR=~/.cache/unsloth/mega_cache
+  ```
 
 ---
 
