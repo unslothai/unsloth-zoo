@@ -210,25 +210,111 @@ def test_whisper_does_not_use_config_pad_when_it_is_in_eos_list():
         fix_pad_token(tok, model_config=cfg)
 
 
-def test_whisper_non_string_model_type_uses_generic_fallback():
+def test_config_declared_pad_used_regardless_of_model_type():
+    # The config-declared-pad rescue is model-type agnostic: any model whose config
+    # declares a valid, distinct pad id pointing at an existing token gets it reused,
+    # so a non-string / non-whisper model_type must NOT fall back to adding a token.
     tok = FakeTokenizer(
         {"": 50256, "<|endoftext|>": 50257},
         pad_token="<|endoftext|>",
         eos_token="<|endoftext|>",
     )
+    tok.unk_token = "<|endoftext|>"
     cfg = type(
         "Cfg",
         (),
         {
-            "model_type": ["whisper"],
+            "model_type": ["whisper"],  # not a str: the old whisper-only gate is gone
             "vocab_size": 51866,
             "pad_token_id": 50256,
             "eos_token_id": 50257,
         },
     )()
 
-    with pytest.raises(RuntimeError):
-        fix_pad_token(tok, model_config=cfg)
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res["changed"] and res["new_pad"] == "" and res["added"] is False
+    assert tok.pad_token_id == 50256 and tok.pad_token_id != tok.eos_token_id
+    assert len(tok.get_vocab()) == 2
+
+
+def test_non_whisper_model_reuses_config_declared_pad():
+    # Generalization: a non-whisper model whose tokenizer aliases pad to eos but whose
+    # config declares a valid distinct pad id (pointing at an existing, non-reserved
+    # token the search families do not recognise) reuses it instead of adding a token.
+    tok = FakeTokenizer(
+        {"<|end|>": 7, "<extra_0>": 3},
+        pad_token="<|end|>",
+        eos_token="<|end|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {"model_type": "llama", "vocab_size": 100, "pad_token_id": 3, "eos_token_id": 7},
+    )()
+
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res == {
+        "changed": True,
+        "reason": "equals_eos",
+        "old_pad": "<|end|>",
+        "new_pad": "<extra_0>",
+        "added": False,
+    }
+    assert tok.pad_token_id == 3 and tok.pad_token_id != tok.eos_token_id
+    assert len(tok.get_vocab()) == 2
+
+
+def test_valid_pad_in_generation_stop_list_is_left_alone():
+    # Qwen2/2.5 regression: the tokenizer pads with <|endoftext|> (a distinct, valid pad)
+    # while its generation config lists that id as a SECONDARY stop token alongside the
+    # real training eos <|im_end|>. A generation stop id is not the training eos, so the
+    # pad must NOT be "healed" - this stays a no-op.
+    tok = FakeTokenizer(
+        {"<|endoftext|>": 151643, "<|im_end|>": 151645, "<|vision_pad|>": 151654},
+        pad_token="<|endoftext|>",
+        eos_token="<|im_end|>",
+    )
+    model = type(
+        "Model",
+        (),
+        {
+            "config": type("Cfg", (), {
+                "model_type": "qwen2", "vocab_size": 151936,
+                "pad_token_id": 151643, "eos_token_id": 151645,
+            })(),
+            "generation_config": type("Gen", (), {
+                "eos_token_id": [151645, 151643], "pad_token_id": 151643,
+            })(),
+        },
+    )()
+
+    res = fix_pad_token(tok, model=model)
+    assert res["changed"] is False
+    assert tok.pad_token == "<|endoftext|>"
+
+
+def test_bool_config_pad_id_is_rejected():
+    # bool subclasses int; True/False must never be accepted as a pad id.
+    tok = FakeTokenizer({"</s>": 2}, pad_token="</s>", eos_token="</s>")
+    cfg = type("Cfg", (), {"vocab_size": 100, "pad_token_id": True, "eos_token_id": 2})()
+    res = fix_pad_token(tok, model_config=cfg, allow_add=False)
+    assert res["changed"] is False and tok.pad_token == "</s>"
+
+
+def test_string_vocab_size_does_not_crash():
+    # A malformed (string) vocab_size must be treated as unknown, not raise TypeError.
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    tok.unk_token = "<|endoftext|>"
+    cfg = type("Cfg", (), {
+        "model_type": "whisper", "vocab_size": "51866",
+        "pad_token_id": 50256, "eos_token_id": 50257,
+    })()
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res["changed"] and res["new_pad"] == "" and tok.pad_token_id == 50256
 
 
 def test_missing_pad_picks_reserved():
