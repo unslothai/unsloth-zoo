@@ -20,6 +20,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 (which pulls in CUDA kernels).
 """
 
+import ast
 import gc
 import json
 import importlib
@@ -50,6 +51,7 @@ from .compile import (
 )
 
 _vlm_model_types_cache = None
+_VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
 _SAFE_TEXT_SANITIZE_PATCHED: set[str] = set()
 _AUDIO_CONV_SANITIZE_PATCHED: set[str] = set()
 _MULTIMODAL_STRIP_KEYS = (
@@ -217,16 +219,11 @@ def _collect_all_linear_target_names(model):
 
 
 def _is_vlm(config: dict) -> bool:
-    """Detect whether a config describes a VLM (via "vision_config" or a
-    model_type in mlx_vlm's supported set)."""
-    if "vision_config" in config:
+    """Detect a VLM from explicit modality data or a modality-aware model set."""
+    if any(config.get(key) not in (None, {}) for key in _VLM_MODALITY_CONFIG_FIELDS):
         return True
-
-    architectures = config.get("architectures") or ()
-    if isinstance(architectures, str):
-        architectures = (architectures,)
-    if any(str(arch).endswith("ForCausalLM") for arch in architectures):
-        return False
+    if _deepseek_ocr_config_model_type(config) is not None:
+        return True
 
     model_type = config.get("model_type", "")
     if not model_type:
@@ -235,6 +232,15 @@ def _is_vlm(config: dict) -> bool:
     global _vlm_model_types_cache
     if _vlm_model_types_cache is None:
         _vlm_model_types_cache = _build_vlm_model_types()
+
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    if (
+        any(str(arch).endswith("ForCausalLM") for arch in architectures)
+        and model_type not in _vlm_model_types_cache
+    ):
+        return False
 
     return model_type in _vlm_model_types_cache
 
@@ -280,8 +286,8 @@ def _message_matches_known_fallback(message, rule):
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict mlx load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too
-    old (or regressed, e.g. 0.31.3 - mlx-lm #1242) for a QK-norm arch; dropping
-    those weights breaks the model, so raise a clear error instead."""
+    old or incompatible for a QK-norm arch; dropping those weights breaks the
+    model, so raise a clear error instead."""
     if "parameters not in model" not in message:
         return
     if not any(marker in message for marker in ("k_norm", "q_norm")):
@@ -309,9 +315,10 @@ def _raise_if_qk_norm_version_gap(model_type, message, error):
     raise ValueError(
         f"Unsloth: cannot load MLX {model_type or 'model'} - the installed "
         f"mlx-lm / mlx-vlm rejects its QK-norm (q_norm/k_norm) weights, so it is "
-        f"too old or regressed for this architecture (mlx-lm 0.31.3 broke "
-        f"gemma4 / qwen3_5). Reinstall an arch-complete build, e.g. "
-        f'`pip install -U "mlx-lm>=0.22.0,!=0.31.3" "mlx-vlm"`. See mlx-lm #1242.{installed}'
+        f"too old or incompatible for this architecture. Upgrade unsloth-zoo, mlx, "
+        f"mlx-lm, mlx-vlm, and mlx-audio together through the supported installer "
+        f"or dependency policy for your environment; Studio users should rerun "
+        f"installer/repair. Do not bypass this error with strict=False.{installed}"
     ) from error
 
 
@@ -1159,15 +1166,41 @@ def _repair_degraded_vlm_processor(
     return repaired
 
 
+def _config_source_has_modality(package_dir: Path) -> bool:
+    """Inspect config declarations without importing model packages."""
+
+    candidates = (
+        package_dir / "config.py",
+        package_dir / f"{package_dir.name}.py",
+        package_dir / "__init__.py",
+    )
+    for path in candidates:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            fields = {
+                item.target.id for item in node.body
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+            }
+            if fields.intersection(_VLM_MODALITY_CONFIG_FIELDS):
+                return True
+    return False
+
+
 def _build_vlm_model_types():
-    """Frozenset of model_type strings mlx_vlm supports (discovered via
-    pkgutil + MODEL_REMAPPING); cached at module level by _is_vlm()."""
+    """Discover only model types whose mlx-vlm config declares a modality."""
     types_set = set()
     try:
         import mlx_vlm.models as vlm_models_pkg
         import pkgutil
-        for importer, modname, ispkg in pkgutil.iter_modules(vlm_models_pkg.__path__):
-            if ispkg:
+        for finder, modname, ispkg in pkgutil.iter_modules(vlm_models_pkg.__path__):
+            if not ispkg:
+                continue
+            if _config_source_has_modality(Path(finder.path) / modname):
                 types_set.add(modname)
     except ImportError:
         pass
@@ -1175,8 +1208,8 @@ def _build_vlm_model_types():
     try:
         from mlx_vlm.utils import MODEL_REMAPPING
         for src, tgt in MODEL_REMAPPING.items():
-            types_set.add(src)
-            types_set.add(tgt)
+            if src in types_set or tgt in types_set:
+                types_set.update((src, tgt))
     except (ImportError, AttributeError):
         pass
 
@@ -2016,17 +2049,10 @@ def _patch_mixed_precision_set_dtype(model):
 _vlm_prompt_utils_patched = False
 _original_vlm_apply_chat_template = None
 
-_MULTIMODAL_ITEM_TYPES = frozenset(
-    {
-        "image",
-        "image_url",
-        "input_image",
-        "audio",
-        "input_audio",
-        "video",
-    }
-)
 _NON_USER_ROLES = frozenset({"system", "assistant"})
+_COUNT_RENDERER_ITEM_TYPES = frozenset(
+    {"text", "input_text", "image", "image_url", "input_image", "audio", "input_audio", "video", "input_video", "video_url"}
+)
 _ROLE_PROMPT_NAMES = {
     "user": "Human",
     "assistant": "Assistant",
@@ -3664,24 +3690,31 @@ def _apply_mlx_distributed_sharding(
     return mode
 
 
+def _structured_multimodal_counts(content):
+    """Count explicit image, audio, and video items in structured content."""
+    if isinstance(content, list):
+        counts = [_structured_multimodal_counts(item) for item in content]
+        return tuple(sum(values) for values in zip(*counts)) if counts else (0, 0, 0)
+
+    if not isinstance(content, dict):
+        return (0, 0, 0)
+
+    item_type = str(content.get("type", "")).lower()
+    if item_type in ("image", "image_url", "input_image"):
+        return (1, 0, 0)
+    if item_type in ("audio", "input_audio"):
+        return (0, 1, 0)
+    if item_type in ("video", "input_video", "video_url"):
+        return (0, 0, 1)
+    nested = content.get("content", None)
+    if nested is not None and nested is not content:
+        return _structured_multimodal_counts(nested)
+    return (0, 0, 0)
+
+
 def _content_has_structured_multimodal_markers(content):
     """Return True when content already contains explicit image/audio/video items."""
-    if isinstance(content, list):
-        for item in content:
-            if _content_has_structured_multimodal_markers(item):
-                return True
-        return False
-
-    if isinstance(content, dict):
-        item_type = str(content.get("type", "")).lower()
-        if item_type in _MULTIMODAL_ITEM_TYPES:
-            return True
-        nested = content.get("content", None)
-        if nested is not None and nested is not content:
-            return _content_has_structured_multimodal_markers(nested)
-        return False
-
-    return False
+    return any(_structured_multimodal_counts(content))
 
 
 def _normalize_prompt_messages(prompt_utils_module, prompt):
@@ -3707,6 +3740,56 @@ def _messages_have_structured_multimodal_content(messages):
     return any(
         _content_has_structured_multimodal_markers(message.get("content", ""))
         for message in messages
+    )
+
+
+def _content_matches_count_renderer_shape(content):
+    """Return whether mlx-vlm's flat content extractor preserves this content."""
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return False
+    return all(
+        isinstance(item, dict)
+        and str(item.get("type", "")) in _COUNT_RENDERER_ITEM_TYPES
+        and not isinstance(item.get("content"), (list, dict))
+        for item in content
+    )
+
+
+def _prompt_has_tool_metadata(prompt):
+    """Return whether mlx-vlm bypasses count rendering for a tool message."""
+    items = prompt if isinstance(prompt, list) else [prompt]
+    return any(
+        isinstance(item, dict)
+        and ("tool_calls" in item or "tool_call_id" in item or item.get("role") == "tool")
+        for item in items
+    )
+
+
+def _structured_media_matches_count_renderer(messages, num_images, num_audios):
+    """Return whether upstream count-based rendering preserves media ownership."""
+    last_target_idx = -1
+    media_indices = set()
+    totals = [0, 0, 0]
+    for i, message in enumerate(messages):
+        role = str(message.get("role", "user"))
+        if role not in _NON_USER_ROLES:
+            last_target_idx = i
+        content = message.get("content", "")
+        if not _content_matches_count_renderer_shape(content):
+            return False
+        counts = _structured_multimodal_counts(content)
+        if any(counts):
+            media_indices.add(i)
+            totals = [total + count for total, count in zip(totals, counts)]
+
+    return (
+        last_target_idx >= 0
+        and str(messages[last_target_idx].get("role", "user")) == "user"
+        and media_indices == {last_target_idx}
+        and any(totals)
+        and totals == [num_images, num_audios, 0]
     )
 
 
@@ -3811,7 +3894,7 @@ def _flatten_multimodal_content_for_prompt(
             return image_token
         if item_type in ("audio", "input_audio"):
             return audio_token
-        if item_type == "video":
+        if item_type in ("video", "input_video", "video_url"):
             return video_token
         nested = content.get("content", None)
         if nested is not None and nested is not content:
@@ -3932,6 +4015,15 @@ def _render_vlm_template_or_fallback(
     return rendered
 
 
+def _has_vlm_template_result(rendered):
+    """Return whether a chat renderer produced a usable prompt or message list."""
+    if isinstance(rendered, str):
+        return bool(rendered.strip())
+    if isinstance(rendered, (list, tuple, dict)):
+        return bool(rendered)
+    return rendered is not None
+
+
 def _ensure_vlm_prompt_utils_patched():
     """Patch mlx-vlm chat-template helper for stable multi-turn multimodal chat."""
     global _vlm_prompt_utils_patched, _original_vlm_apply_chat_template
@@ -3979,6 +4071,32 @@ def _ensure_vlm_prompt_utils_patched():
                 kwargs=kwargs,
             )
         )
+        if (
+            not return_messages
+            and not kwargs.get("video")
+            and not _prompt_has_tool_metadata(prompt)
+            and model_type in getattr(prompt_utils, "MODEL_CONFIG", {})
+            and _structured_media_matches_count_renderer(
+                normalized_messages, num_images, num_audios
+            )
+        ):
+            try:
+                rendered = _original_vlm_apply_chat_template(
+                    processor,
+                    config,
+                    prompt,
+                    add_generation_prompt=add_generation_prompt,
+                    return_messages=return_messages,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
+            except Exception:
+                pass
+            else:
+                if _has_vlm_template_result(rendered):
+                    return rendered
+
         if needs_custom_render:
             if return_messages:
                 return template_messages
@@ -4018,6 +4136,8 @@ def _ensure_vlm_prompt_utils_patched():
     for modname in (
         "mlx_vlm.chat",
         "mlx_vlm.generate",
+        "mlx_vlm.generate.dispatch",
+        "mlx_vlm.generate.ar",
         "mlx_vlm.server",
         "mlx_vlm.evals.utils",
     ):
@@ -4025,7 +4145,7 @@ def _ensure_vlm_prompt_utils_patched():
             module = importlib.import_module(modname)
         except Exception:
             continue
-        if hasattr(module, "apply_chat_template"):
+        if getattr(module, "apply_chat_template", None) is _original_vlm_apply_chat_template:
             module.apply_chat_template = patched_apply_chat_template
 
     _vlm_prompt_utils_patched = True

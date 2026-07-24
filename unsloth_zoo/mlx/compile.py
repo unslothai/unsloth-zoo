@@ -27,7 +27,7 @@ compile-ready only once explicitly verified.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from itertools import accumulate
 import importlib
@@ -1535,6 +1535,15 @@ def _arch_matches_prefixes(arch: str, prefixes: tuple[str, ...]) -> bool:
     return bool(prefixes) and arch.startswith(prefixes)
 
 
+_QWEN_LIKE_MERGE_ARCHES = frozenset(
+    {"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"}
+)
+_MASKED_SCATTER_PATCH_ARCHES = frozenset(
+    {"gemma3", "gemma4", "idefics2", "idefics3"}
+)
+_IDEFICS_SHARED_PATCH_ARCHES = frozenset({"idefics2", "idefics3"})
+
+
 def _adapter_matches(
     adapter: CompilePatchAdapter,
     arch: str,
@@ -1879,30 +1888,6 @@ def _try_import_module(module_name: str):
         return None
 
 
-def _iter_trait_model_modules(
-    trait: str,
-    *,
-    include_arches: Iterable[str] = (),
-):
-    """Yield model modules for architectures that share a compile trait.
-
-    Trait discovery (over the standard `mlx_vlm.models.<arch>.<arch>` layout)
-    lets future architectures inherit a shared patch automatically.
-    """
-
-    candidate_arches = set(include_arches)
-    candidate_arches.update(
-        arch
-        for arch, report in build_compile_trait_reports().items()
-        if trait in report.pattern_traits
-    )
-    for arch in sorted(candidate_arches):
-        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
-        if module is None:
-            continue
-        yield arch, module
-
-
 def _install_safe_fused_sdpa_mask_patches():
     """Work around MLX SDPA NaN gradients on fully masked query rows.
 
@@ -2174,6 +2159,23 @@ def _attach_position_ids(features, position_ids):
     return features
 
 
+def _explicit_position_embedding_adapter(original, replacement):
+    """Use Zoo's explicit-position path only while training."""
+
+    @wraps(original)
+    def patched(self, input_ids=None, pixel_values=None, **kwargs):
+        if not getattr(self, "training", False) or kwargs.get("position_ids") is None:
+            return original(self, input_ids, pixel_values, **kwargs)
+        return replacement(self, input_ids, pixel_values, **kwargs)
+
+    return patched
+
+
+def _patch_explicit_position_embeddings(model_cls, replacement):
+    adapted = _explicit_position_embedding_adapter(model_cls.get_input_embeddings, replacement)
+    _patch_method(model_cls, "get_input_embeddings", adapted)
+
+
 def _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds):
     """Compile-safe additive merge for sparse visual embeddings."""
 
@@ -2393,6 +2395,8 @@ def _install_qwen2_5_compile_patches():
         return hidden_states
 
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         explicit_position_ids = kwargs.get("position_ids", None)
@@ -2434,7 +2438,7 @@ def _install_qwen2_5_compile_patches():
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen2_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "get_window_index", patched_qwen2_get_window_index)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen2_vision_call)
-    _patch_method(module.Model, "get_input_embeddings", patched_qwen2_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_qwen2_get_input_embeddings)
     _PATCHED_ARCHES.add("qwen2_5_vl")
 
 
@@ -2545,6 +2549,8 @@ def _install_qwen2_compile_patches():
         return self.merger(hidden_states)
 
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         explicit_position_ids = kwargs.get("position_ids", None)
@@ -2585,7 +2591,7 @@ def _install_qwen2_compile_patches():
     _patch_method(vision_module.Attention, "__call__", patched_qwen2_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen2_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen2_vision_call)
-    _patch_method(module.Model, "get_input_embeddings", patched_qwen2_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_qwen2_get_input_embeddings)
     _PATCHED_ARCHES.add("qwen2_vl")
 
 
@@ -2867,6 +2873,8 @@ def _install_qwen3_family_compile_patches():
         return _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds)
 
     def patched_qwen3_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
@@ -2915,6 +2923,8 @@ def _install_qwen3_family_compile_patches():
         return _attach_position_ids(features, position_ids)
 
     def patched_qwen35_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
@@ -2962,8 +2972,8 @@ def _install_qwen3_family_compile_patches():
     _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
     _patch_method(importlib.import_module("mlx_vlm.models.qwen3_vl.language").Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
-    _patch_method(module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
-    _patch_method(qwen35_module.Model, "get_input_embeddings", patched_qwen35_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_qwen3_get_input_embeddings)
+    _patch_explicit_position_embeddings(qwen35_module.Model, patched_qwen35_get_input_embeddings)
     if qwen3moe_module is not None:
         qwen3moe_module.masked_scatter = _masked_scatter_no_numpy
         _patch_staticmethod(qwen3moe_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
@@ -2973,7 +2983,7 @@ def _install_qwen3_family_compile_patches():
         _patch_method(qwen3moe_vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
         _patch_method(qwen3moe_vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
         _patch_method(qwen3moe_language_module.Qwen3VLMoEModel, "_deepstack_process", patched_qwen3_deepstack)
-        _patch_method(qwen3moe_module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
+        _patch_explicit_position_embeddings(qwen3moe_module.Model, patched_qwen3_get_input_embeddings)
         _PATCHED_ARCHES.add("qwen3_vl_moe")
     _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
 
@@ -3087,6 +3097,8 @@ def _install_glm_ocr_compile_patches():
         return self.merger(hidden_states)
 
     def patched_glm_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
@@ -3132,8 +3144,21 @@ def _install_glm_ocr_compile_patches():
     _patch_method(vision_module.GlmOcrVisionAttention, "__call__", patched_glm_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_glm_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_glm_vision_call)
-    _patch_method(module.Model, "get_input_embeddings", patched_glm_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_glm_get_input_embeddings)
     _PATCHED_ARCHES.add("glm_ocr")
+
+
+def _paddleocr_vl_has_batched_vision(vision_module) -> bool:
+    """Whether PaddleOCR-VL exposes its newer batched vision contract."""
+
+    for class_name, method in (
+        ("VisionModel", "_forward_same_grid_batch"),
+        ("PaddleOCRVisionEmbeddings", "same_grid_batch"),
+        ("PaddleOCRProjector", "same_grid_batch"),
+    ):
+        if callable(getattr(getattr(vision_module, class_name, None), method, None)):
+            return True
+    return False
 
 
 def _install_paddleocr_vl_compile_patches():
@@ -3143,6 +3168,11 @@ def _install_paddleocr_vl_compile_patches():
         module = importlib.import_module("mlx_vlm.models.paddleocr_vl.paddleocr_vl")
         vision_module = importlib.import_module("mlx_vlm.models.paddleocr_vl.vision")
     except Exception:
+        return
+
+    if _paddleocr_vl_has_batched_vision(vision_module):
+        _VERIFIED_TRAINING_ARCHES.discard("paddleocr_vl")
+        _PATCHED_ARCHES.discard("paddleocr_vl")
         return
 
     InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
@@ -3342,12 +3372,19 @@ def _install_qwen_like_image_merge_patches():
     plumbing.
     """
 
-    for arch, module in _iter_trait_model_modules(
-        "qwen_like_image_merge",
-        include_arches=("qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"),
-    ):
-        if arch.startswith("qwen3"):
+    for arch in sorted(_QWEN_LIKE_MERGE_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
             continue
+        if arch == "paddleocr_vl":
+            vision_module = _try_import_module("mlx_vlm.models.paddleocr_vl.vision")
+            if (
+                vision_module is not None
+                and _paddleocr_vl_has_batched_vision(vision_module)
+            ):
+                _VERIFIED_TRAINING_ARCHES.discard(arch)
+                _PATCHED_ARCHES.discard(arch)
+                continue
         model_cls = getattr(module, "Model", None)
         if (
             model_cls is None
@@ -3839,6 +3876,45 @@ def _install_mistral4_compile_patches():
     _PATCHED_ARCHES.add("mistral4")
 
 
+def _gemma3n_language_contract(method):
+    """Identify the installed Gemma3n cache and attention-mask contract."""
+
+    try:
+        source = inspect.getsource(method)
+    except (OSError, TypeError):
+        return None
+    if "cache[self.first_full_idx :]" in source and "int(c.offset)" in source:
+        return "legacy"
+    if (
+        "cache[self.first_full_idx]" in source
+        and "window_size=self.config.sliding_window" in source
+        and "raw_offset.max().item()" in source
+    ):
+        return "current"
+    return None
+
+
+def _gemma3n_cache_offset(cache):
+    """Normalize absolute cache progress for per-layer embedding slices.
+
+    Rotating caches compact or wrap their private ``_idx`` storage cursor while
+    the public ``offset`` continues to track the processed token position.
+    """
+
+    raw_offset = next(
+        (
+            c.offset
+            for c in (cache or [])
+            if c is not None and hasattr(c, "offset")
+        ),
+        0,
+    )
+    if isinstance(raw_offset, mx.array):
+        raw_offset = raw_offset.max() if raw_offset.ndim else raw_offset
+        return int(raw_offset.item())
+    return int(raw_offset)
+
+
 def _install_gemma3n_compile_patches():
     """Install Gemma3n multiscale fusion and merge compatibility patches."""
 
@@ -3848,6 +3924,12 @@ def _install_gemma3n_compile_patches():
         language_module = importlib.import_module("mlx_vlm.models.gemma3n.language")
         kernels_module = importlib.import_module("mlx_vlm.models.kernels")
     except Exception:
+        return
+
+    language_contract = _gemma3n_language_contract(language_module.Gemma3Model.__call__)
+    if language_contract is None:
+        _VERIFIED_TRAINING_ARCHES.discard("gemma3n")
+        _PATCHED_ARCHES.discard("gemma3n")
         return
 
     def patched_merge_multimodal_and_text(
@@ -3927,14 +4009,17 @@ def _install_gemma3n_compile_patches():
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-            cache_offset = next(
-                (
-                    int(c.offset)
-                    for c in (cache or [])
-                    if c is not None and hasattr(c, "offset")
-                ),
-                0,
-            )
+            if language_contract == "legacy":
+                cache_offset = next(
+                    (
+                        int(c.offset)
+                        for c in (cache or [])
+                        if c is not None and hasattr(c, "offset")
+                    ),
+                    0,
+                )
+            else:
+                cache_offset = _gemma3n_cache_offset(cache)
             max_start = max(per_layer_inputs.shape[1] - target_len, 0)
             start = min(cache_offset, max_start)
             per_layer_inputs = per_layer_inputs[:, start : start + target_len]
@@ -3945,14 +4030,25 @@ def _install_gemma3n_compile_patches():
             cache = [None] * len(self.layers)
 
         if mask is None:
-            full_mask = language_module.create_attention_mask(
-                h,
-                cache[self.first_full_idx :],
-            )
-            sliding_window_mask = language_module.create_attention_mask(
-                h,
-                cache[self.first_sliding_idx :],
-            )
+            if language_contract == "legacy":
+                full_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_full_idx :],
+                )
+                sliding_window_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_sliding_idx :],
+                )
+            else:
+                full_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_full_idx],
+                )
+                sliding_window_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_sliding_idx],
+                    window_size=self.config.sliding_window,
+                )
         h0 = h
 
         target_magnitude = _safe_branch_magnitude(h0)
@@ -4363,10 +4459,10 @@ def _install_deepseek_ocr_compile_patches():
 def _install_masked_scatter_multimodal_patches():
     """Patch `masked_scatter` implementations that rely on host-side mutation."""
 
-    for arch, module in _iter_trait_model_modules(
-        "masked_scatter_multimodal",
-        include_arches=("gemma3", "idefics2", "idefics3"),
-    ):
+    for arch in sorted(_MASKED_SCATTER_PATCH_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
+            continue
         if getattr(module, "masked_scatter", None) is None:
             continue
         setattr(module, "masked_scatter", _masked_scatter_no_numpy)
@@ -4377,7 +4473,6 @@ def _install_idefics_family_compile_patches():
     """Patch Idefics-family image filtering and multimodal merges for compile.
 
     Shared issue: Python-side padded-image filtering and placeholder merging.
-    Architectures with the same trait and standard layout inherit this patch.
     """
 
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
@@ -4447,11 +4542,9 @@ def _install_idefics_family_compile_patches():
         )
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
-    for arch, module in _iter_trait_model_modules(
-        "padded_image_filtering",
-        include_arches=("idefics2", "idefics3"),
-    ):
-        if arch == "smolvlm":
+    for arch in sorted(_IDEFICS_SHARED_PATCH_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
             continue
         model_cls = getattr(module, "Model", None)
         if model_cls is None:
