@@ -121,6 +121,7 @@ jobs:
             tests/test_temporary_patches_imports.py \
             tests/test_zoo_history_regressions.py \
             tests/test_pypi_version_sync.py \
+            tests/test_olmoe_moe_routing.py \
             -v
 
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
