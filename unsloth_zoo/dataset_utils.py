@@ -335,12 +335,21 @@ def train_on_responses_only(
     return_function   = False, # Useful for iterating over lists
     num_proc          = None,
     last_response_only = False, # Train only on the last assistant turn
+    mask_out_tokens   = None,  # e.g. ["</think>"] - also mask these inside kept responses
 ):
     """Train only on responses by masking instruction labels to -100.
 
     With last_response_only=True, only the final assistant turn is unmasked;
     earlier assistant turns stay at -100 (never written, never copied from
     old_labels).
+
+    mask_out_tokens re-masks the given token strings to -100 even inside kept
+    response spans - e.g. mask_out_tokens=["</think>"] reproduces the Nemotron
+    Ultra recipe of never training on the thinking closer. Each entry is matched
+    as its tokenized id sequence (a leading-space variant is matched too, for
+    SentencePiece-style tokenizers). Atomic added tokens such as "</think>"
+    always match exactly; multi-token strings match only where the in-context
+    tokenization equals the standalone one.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if trainer is not None:
@@ -406,6 +415,18 @@ def train_on_responses_only(
     Q_right_forward = Q_right
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
+
+    # Precompute id sequences for mask_out_tokens (see docstring). Done once here so
+    # the per-example closure below only does integer comparisons.
+    mask_out_sequences = []
+    if mask_out_tokens:
+        if isinstance(mask_out_tokens, str): mask_out_tokens = [mask_out_tokens]
+        for token_string in mask_out_tokens:
+            for candidate in dict.fromkeys((token_string, " " + token_string)):
+                ids = tokenizer(candidate, add_special_tokens = False).input_ids
+                if ids and ids not in mask_out_sequences:
+                    mask_out_sequences.append(ids)
+    pass
 
     def _train_on_responses_only(examples):
         input_ids_ = examples["input_ids"]
@@ -499,6 +520,19 @@ def train_on_responses_only(
                     labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
                 else:
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+
+            # Re-mask requested token sequences (e.g. "</think>") wherever they occur;
+            # positions outside kept spans are already -100, so re-masking is harmless.
+            for seq in mask_out_sequences:
+                seq_len, first = len(seq), seq[0]
+                i, limit = 0, n - len(seq)
+                while i <= limit:
+                    if input_ids[i] == first and input_ids[i : i + seq_len] == seq:
+                        labels[i : i + seq_len] = [-100] * seq_len
+                        i += seq_len
+                    else:
+                        i += 1
+            pass
 
             all_labels.append(labels)
         pass
@@ -696,6 +730,7 @@ def train_on_responses_only(
             tokenizer          = coll_proc,
             return_function    = True,
             last_response_only = last_response_only,
+            mask_out_tokens    = mask_out_tokens,
             **parts,
         )
         print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")

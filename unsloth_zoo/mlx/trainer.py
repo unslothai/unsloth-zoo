@@ -4328,6 +4328,7 @@ def train_on_responses_only(
     return_function=False,
     num_proc=None,
     last_response_only=False,
+    mask_out_tokens=None,
 ):
     """Mask instruction tokens from loss — train only on assistant responses.
 
@@ -4383,6 +4384,7 @@ def train_on_responses_only(
         tokenizer=_detect_source,
         return_function=True,
         last_response_only=last_response_only,
+        mask_out_tokens=mask_out_tokens,
     )
 
     if return_function:
