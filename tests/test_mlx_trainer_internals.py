@@ -2534,6 +2534,72 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_qwen3_vl_prefill_windows_align_masks_and_deepstack():
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    full_mask = mx.array([[0, 1, 1, 0, 1, 0, 0, 1],
+                          [1, 0, 1, 0, 0, 1, 1, 0]], dtype=mx.bool_)
+    embeds = [mx.arange(8).reshape(8, 1)]
+    cases = [
+        (0, 3, [[0, 1, 1], [1, 0, 1]], [0, 1, 4, 5]),
+        (mx.array([2, 4]), 3, [[1, 0, 1], [0, 1, 1]], [1, 2, 6, 7]),
+        (6, 2, [[0, 1], [1, 0]], [3, 7]),
+    ]
+    for offsets, window, expected_mask, expected_embeds in cases:
+        aligned_mask, aligned_embeds = mc._align_qwen3_vl_prefill_window(
+            mx.zeros((2, window)), [types.SimpleNamespace(offset=offsets)], full_mask, embeds,
+        )
+        assert aligned_mask.tolist() == expected_mask
+        assert aligned_embeds[0].reshape(-1).tolist() == expected_embeds
+
+    same_mask = mx.ones((2, 2))
+    aligned = mc._align_qwen3_vl_prefill_window(mx.zeros((2, 2)), None, same_mask, embeds)
+    assert aligned == (same_mask, embeds)
+
+    start_cases = [
+        (types.SimpleNamespace(offset=6, _idx=2), 1, [6]),
+        (types.SimpleNamespace(offset=mx.array([6, 4]), _offset=6), 2, [6, 4]),
+        (types.SimpleNamespace(offset=mx.array([-4]), left_padding=mx.array([4])), 1, [0]),
+        (types.SimpleNamespace(offset=mx.array([2]), _offset=6), 1, [2]),
+        (types.SimpleNamespace(offset=mx.array([4, 2]), left_padding=mx.array([2, 1])), 2, [6, 3]),
+        (types.SimpleNamespace(offset=mx.array([5, 5]), left_padding=mx.array([-1, -1]), _offset=5, max_size=4), 2, [5, 5]),
+    ]
+    for cache_state, batch_size, expected in start_cases:
+        assert mc._qwen3_vl_prefill_starts([cache_state], batch_size) == expected
+    with pytest.raises(ValueError, match="cover every batch row"):
+        cache_state = types.SimpleNamespace(offset=mx.array([2]), _offset=6)
+        mc._qwen3_vl_prefill_starts([cache_state], 2)
+
+
+def test_qwen3_vl_prefill_wrapper_is_scoped_and_idempotent(monkeypatch):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+    class LanguageModel:
+        def __call__(self, inputs, **kwargs):
+            calls.append(kwargs)
+            return "delegated"
+
+    language_module = types.SimpleNamespace(LanguageModel=LanguageModel)
+    mc._patch_qwen3_vl_prefill_window(language_module)
+    patched = LanguageModel.__call__
+    mc._patch_qwen3_vl_prefill_window(language_module)
+    assert LanguageModel.__call__ is patched
+    assert LanguageModel()(mx.zeros((1, 2)), n_to_process=2, custom=7) == "delegated"
+    assert calls[0]["custom"] == 7 and "n_to_process" not in calls[0]
+
+    bindings = []
+    def patcher(module):
+        bindings.append(module.__name__)
+    monkeypatch.setattr(mc, "_patch_qwen3_vl_prefill_window", patcher)
+    monkeypatch.setattr(mc, "_patch_method", lambda *_args: None)
+    monkeypatch.setattr(mc, "_patch_staticmethod", lambda *_args: None)
+    mc._install_qwen3_family_compile_patches()
+    assert bindings == ["mlx_vlm.models.qwen3_vl.language", "mlx_vlm.models.qwen3_vl_moe.language"]
+
+
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
     import inspect
     import unsloth_zoo.mlx.utils as mlx_utils
@@ -2567,6 +2633,84 @@ def test_compile_patch_primitives_exist():
     import unsloth_zoo.mlx.compile as mc
     primitives = mc.list_compile_patch_primitives()
     assert len(primitives) > 0
+
+
+def test_family_installers_patch_only_allowlisted_models(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    def native(*_args, **_kwargs):
+        return None
+
+    def model_module(arch):
+        attrs = {name: native for name in method_names}
+        attrs["merge_input_ids_with_image_features"] = staticmethod(native)
+        model = type(f"{arch}Model", (), attrs)
+        return types.SimpleNamespace(Model=model)
+
+    method_names = (
+        "merge_input_ids_with_image_features",
+        "_prepare_inputs_for_multimodal",
+        "get_input_embeddings",
+    )
+    assert mc._QWEN_LIKE_MERGE_ARCHES == frozenset(
+        {"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"}
+    )
+    assert mc._IDEFICS_SHARED_PATCH_ARCHES == frozenset({"idefics2", "idefics3"})
+    qwen_arches = tuple(mc._QWEN_LIKE_MERGE_ARCHES)
+    idefics_arches = tuple(mc._IDEFICS_SHARED_PATCH_ARCHES)
+    denied_arches = (
+        "lfm2_vl", "minicpmo", "phi4mm", "qwen3_vl_moe", "qwen3_5",
+    )
+    modules = {
+        arch: model_module(arch)
+        for arch in (*qwen_arches, *idefics_arches, *denied_arches, "qwen3_vl")
+    }
+    smol = types.SimpleNamespace(
+        Model=type(
+            "smolvlmModel",
+            (modules["idefics3"].Model,),
+            {"_prepare_inputs_for_multimodal": native},
+        )
+    )
+    imported = {
+        "mlx_vlm.models.qwen3_vl.qwen3_vl": modules["qwen3_vl"],
+        "mlx_vlm.models.smolvlm.smolvlm": smol,
+    }
+
+    def trait_modules(_trait, *, include_arches=()):
+        arches = (*denied_arches, "qwen3_vl", *include_arches)
+        return [(arch, modules[arch]) for arch in dict.fromkeys(arches)]
+
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(mc, "_iter_trait_model_modules", trait_modules)
+    monkeypatch.setattr(mc, "_try_import_module", imported.get)
+    mc._install_qwen_like_image_merge_patches()
+    mc._install_idefics_family_compile_patches()
+
+    assert all(
+        modules[arch].Model.merge_input_ids_with_image_features
+        is mc._merge_special_token_features_only
+        for arch in qwen_arches
+    )
+    assert all(
+        getattr(modules[arch].Model, name) is not native
+        for arch in idefics_arches
+        for name in ("_prepare_inputs_for_multimodal", "get_input_embeddings")
+    )
+    assert smol.Model._prepare_inputs_for_multimodal is not native
+    assert "get_input_embeddings" not in smol.Model.__dict__
+    assert smol.Model.get_input_embeddings is modules["idefics3"].Model.get_input_embeddings
+    assert modules["qwen3_vl"].Model.merge_input_ids_with_image_features is not native
+
+    expected_patched = set(
+        (*qwen_arches, *idefics_arches, "qwen3_vl", "smolvlm")
+    )
+    assert mc._PATCHED_ARCHES == expected_patched
+    assert all(
+        getattr(modules[arch].Model, name) is native
+        for arch in denied_arches for name in method_names
+    )
 
 
 def test_compile_protocol_requirements_exist():

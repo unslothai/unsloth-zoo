@@ -76,7 +76,10 @@ def test_idempotent_and_guard_shared(base_init):
     assert base_init.__init__ is wrapped
 
 
-def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
+def test_materialize_normalizes_list_extra_special_tokens_sidecar(
+    tmp_path, monkeypatch
+):
+    import transformers.models.auto.tokenization_auto as tokenization_auto
     from unsloth_zoo.mlx.loader import (
         _materialize_mlx_vlm_config_override,
         _normalize_tokenizer_config_extra_special_tokens,
@@ -84,10 +87,14 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     source_dir = tmp_path / "snapshot"
     source_dir.mkdir()
     original = {
+        "tokenizer_class": "TokenizersBackend",
         "extra_special_tokens": ["<|im_start|>", "<|im_end|>"],
         "additional_special_tokens": ["<existing>", "<|im_start|>"],
         "model_specific_special_tokens": {"image_token": "<|image_pad|>"},
     }
+    monkeypatch.setattr(
+        tokenization_auto, "tokenizer_class_from_name", lambda _name: None
+    )
     (source_dir / "tokenizer_config.json").write_text(
         json.dumps(original),
         encoding="utf-8",
@@ -111,6 +118,7 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     patched_config = json.loads(
         (Path(load_path) / "tokenizer_config.json").read_text(encoding="utf-8")
     )
+    assert patched_config["tokenizer_class"] == "PreTrainedTokenizerFast"
     assert patched_config["extra_special_tokens"] == {"image_token": "<|image_pad|>"}
     assert patched_config["additional_special_tokens"] == [
         "<existing>",
@@ -123,6 +131,9 @@ def test_materialize_normalizes_list_extra_special_tokens_sidecar(tmp_path):
     ) == (
         original,
         False,
+    )
+    monkeypatch.setattr(
+        tokenization_auto, "tokenizer_class_from_name", lambda _name: object
     )
     assert _materialize_mlx_vlm_config_override(
         str(source_dir),
@@ -176,6 +187,68 @@ def test_materialize_probe_ignores_installed_coercion_patch(base_init, tmp_path)
     )
 
     assert load_path != str(source_dir)
+
+
+def test_normalizes_tokenizers_backend_only_when_unavailable(monkeypatch):
+    import transformers.models.auto.tokenization_auto as tokenization_auto
+    from unsloth_zoo.mlx.loader import _normalize_tokenizer_config_backend_class
+
+    config = {"tokenizer_class": "TokenizersBackend"}
+    assert _normalize_tokenizer_config_backend_class(
+        config, backend_class_available=False
+    ) == ({"tokenizer_class": "PreTrainedTokenizerFast"}, True)
+    assert _normalize_tokenizer_config_backend_class(
+        config, backend_class_available=True
+    ) == (config, False)
+    unrelated = {"tokenizer_class": "CustomTokenizer"}
+    assert _normalize_tokenizer_config_backend_class(
+        unrelated, backend_class_available=False
+    ) == (unrelated, False)
+
+    def unavailable(_name):
+        raise RuntimeError("resolver unavailable")
+
+    monkeypatch.setattr(
+        tokenization_auto,
+        "tokenizer_class_from_name",
+        unavailable,
+    )
+    assert _normalize_tokenizer_config_backend_class(config) == (config, False)
+
+
+def test_materializes_only_missing_vlm_processor_geometry(tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+    source = tmp_path / "snapshot"
+    source.mkdir()
+    original = {"processor_class": "LlavaProcessor", "patch_size": None}
+    (source / "processor_config.json").write_text(json.dumps(original), encoding="utf-8")
+    (source / "config.json").write_text(json.dumps({"model_type": "raw"}), encoding="utf-8")
+    model = {"model_type": "llava", "vision_config": {"patch_size": 14}, "vision_feature_select_strategy": "default"}
+    view, _ = loader._materialize_mlx_vlm_config_override(
+        str(source), model, config_override_data=model, normalize_processor_geometry=True,
+    )
+    assert json.loads((Path(view) / "config.json").read_text()) == model
+    patched = json.loads((Path(view) / "processor_config.json").read_text(encoding="utf-8"))
+    assert patched == {**original, "patch_size": 14, "vision_feature_select_strategy": "default"}
+    assert json.loads((source / "processor_config.json").read_text(encoding="utf-8")) == original
+    second_view = tmp_path / "second_view"
+    second_view.mkdir()
+    loaded, _ = loader._load_mlx_vlm_with_config_views(
+        lambda: (type("Model", (), {})(), object()), [view, second_view],
+    )
+    for finalizer in loaded._unsloth_mlx_config_view_finalizers:
+        finalizer()
+    assert not Path(view).exists() and not second_view.exists()
+    failed_view = tmp_path / "failed_view"
+    failed_view.mkdir()
+    with pytest.raises(RuntimeError):
+        loader._load_mlx_vlm_with_config_views(
+            lambda: (_ for _ in ()).throw(RuntimeError("load failed")), [failed_view],
+        )
+    assert not failed_view.exists()
+
+    existing = {"patch_size": 16, "vision_feature_select_strategy": "full"}
+    assert loader._normalize_vlm_processor_geometry(existing, model) == (existing, False)
 
 
 def test_temporary_patch_exposes_original_init_for_probe(
@@ -234,3 +307,69 @@ def test_temporary_patch_exposes_original_init_for_probe(
 
     assert hasattr(base_init.__init__, "_unsloth_original_init")
     assert _tokenizer_supports_list_extra_special_tokens() is False
+
+
+def test_mlx_vlm_bpe_incomplete_utf8_fallback(monkeypatch):
+    pytest.importorskip("mlx.core")
+    from unsloth_zoo.mlx.loader import _ensure_mlx_vlm_bpe_utf8_fallback, _mlx_vlm_bpe_needs_utf8_fallback
+    tokenizer_utils = types.ModuleType("mlx_vlm.tokenizer_utils")
+    tokenizer_utils._remove_space = lambda text: text[1:] if text.startswith(" ") else text
+    monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", tokenizer_utils)
+    class StrictBPEStreamingDetokenizer:
+        _byte_decoder = {"Ã": 0xC3, "¿": 0xBF, " ": 32}
+        make_byte_decoder = classmethod(lambda cls: None)
+        def reset(self):
+            self.offset, self._unflushed, self.text, self.tokens = 0, "", "", []
+        def add_token(self, token, skip_special_token_ids=[]):
+            value = self.tokenmap[token]
+            if token in (2, 3, 4):
+                encoding = "synthetic-codec" if token == 2 else "utf-8"
+                self.failure = UnicodeDecodeError(encoding, b"\xc3", 0, 1, "unexpected end of data")
+                if token == 3:
+                    self.text = "changed"
+                if token == 4:
+                    self._unflushed = "changed"
+                raise self.failure
+            if self._byte_decoder[value[0]] == 32:
+                bytearray(self._byte_decoder[char] for char in self._unflushed).decode("utf-8")
+                self._unflushed = value
+            else:
+                self._unflushed += value
+    strict = StrictBPEStreamingDetokenizer
+    tokenizer_utils.BPEStreamingDetokenizer = strict
+    byte_chars = {byte: char for char, byte in strict._byte_decoder.items()}
+    def make_detokenizer(tokenmap=None):
+        detokenizer = object.__new__(strict)
+        detokenizer.trim_space = False
+        detokenizer.tokenmap = tokenmap or [byte_chars[0xC3], byte_chars[32] + "x", byte_chars[32], byte_chars[32], byte_chars[32]]
+        detokenizer.reset()
+        return detokenizer
+    _ensure_mlx_vlm_bpe_utf8_fallback()
+    detokenizer = make_detokenizer()
+    detokenizer.add_token(0)
+    detokenizer.add_token(1)
+    assert (detokenizer.text, detokenizer._unflushed) == ("\ufffd", byte_chars[32] + "x")
+    assert not _mlx_vlm_bpe_needs_utf8_fallback(strict)
+    detokenizer = make_detokenizer({123: byte_chars[0xBF], 220: byte_chars[32], 2: byte_chars[32]})
+    for token in (123, 220):
+        detokenizer.add_token(token)
+    assert (detokenizer.text, detokenizer._unflushed) == ("\ufffd", byte_chars[32])
+    detokenizer = make_detokenizer()
+    detokenizer.add_token(0)
+    with pytest.raises(UnicodeDecodeError, match="synthetic-codec"):
+        detokenizer.add_token(2)
+    for token in (3, 4):
+        detokenizer = make_detokenizer()
+        detokenizer.add_token(0)
+        with pytest.raises(UnicodeDecodeError) as raised:
+            detokenizer.add_token(token)
+        assert raised.value is detokenizer.failure
+    def incomplete_safe_add_token(self, token, skip_special_token_ids=[]):
+        value = self.tokenmap[token]
+        if token == 0 or self._unflushed == byte_chars[0xC3]:
+            self._unflushed = value
+            return
+        bytearray(self._byte_decoder[char] for char in self._unflushed).decode("utf-8")
+    monkeypatch.setattr(strict, "add_token", incomplete_safe_add_token)
+    assert _mlx_vlm_bpe_needs_utf8_fallback(strict)

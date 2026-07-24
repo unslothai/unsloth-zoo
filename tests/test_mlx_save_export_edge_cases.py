@@ -1471,24 +1471,38 @@ def test_resolve_processor_class_follows_model_remapping(monkeypatch):
         pass
 
     fake_vlm_utils = types.ModuleType("mlx_vlm.utils")
-    fake_vlm_utils.MODEL_REMAPPING = {"alias_type": "real_type"}
+    fake_vlm_utils.MODEL_REMAPPING = {
+        "alias-type": "real_type",
+        "alias_type": "wrong_type",
+    }
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
-    fake_processing = types.ModuleType("mlx_vlm.models.real_type.processing")
-    fake_processing.RemappedProcessor = RemappedProcessor
+    fake_package = types.ModuleType("mlx_vlm.models.real_type")
+    fake_package.RemappedProcessor = RemappedProcessor
     monkeypatch.setitem(
-        sys.modules, "mlx_vlm.models.real_type.processing", fake_processing
+        sys.modules, "mlx_vlm.models.real_type", fake_package
     )
-    # The alias package does not exist in real mlx-vlm; the permissive shim
-    # would auto-create it, so block those imports to mirror production.
-    monkeypatch.setitem(sys.modules, "mlx_vlm.models.alias_type.processing", None)
-    monkeypatch.setitem(
-        sys.modules, "mlx_vlm.models.alias_type.processing_alias_type", None
-    )
-
     resolved = loader._resolve_mlx_vlm_processor_class(
         "alias-type", "RemappedProcessor"
     )
     assert resolved is RemappedProcessor
+
+    class InheritedComponent:
+        pass
+
+    class ParentProcessor:
+        pass
+
+    ParentProcessor.__module__ = "mlx_vlm.models.parent.processing_parent"
+    parent_module = types.ModuleType(ParentProcessor.__module__)
+    parent_module.InheritedComponent = InheritedComponent
+    monkeypatch.setitem(sys.modules, ParentProcessor.__module__, parent_module)
+
+    class ChildProcessor(ParentProcessor):
+        pass
+
+    assert loader._resolve_mlx_vlm_processor_class(
+        "child", "InheritedComponent", ChildProcessor,
+    ) is InheritedComponent
 
 
 def test_sanitize_pipelines_built_from_submodule_only_sanitizers():

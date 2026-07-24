@@ -20,6 +20,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 (which pulls in CUDA kernels).
 """
 
+import copy
 import gc
 import json
 import importlib
@@ -37,6 +38,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
+from functools import wraps
 from pathlib import Path
 
 from .compile import (
@@ -425,16 +427,71 @@ def _normalize_tokenizer_config_extra_special_tokens(
     return patched_config, True
 
 
-def _materialize_mlx_vlm_config_data(local_path, config_data):
+def _normalize_tokenizer_config_backend_class(
+    tokenizer_config,
+    *,
+    backend_class_available=None,
+):
+    if tokenizer_config.get("tokenizer_class") != "TokenizersBackend":
+        return tokenizer_config, False
+    if backend_class_available is None:
+        try:
+            from transformers.models.auto.tokenization_auto import (
+                tokenizer_class_from_name,
+            )
+            backend_class_available = (
+                tokenizer_class_from_name("TokenizersBackend") is not None
+            )
+        except Exception:
+            return tokenizer_config, False
+    if backend_class_available:
+        return tokenizer_config, False
+
+    patched_config = dict(tokenizer_config)
+    patched_config["tokenizer_class"] = "PreTrainedTokenizerFast"
+    return patched_config, True
+
+
+def _normalize_vlm_processor_geometry(processor_config, model_config):
+    vision_config = model_config.get("vision_config")
+    if not isinstance(vision_config, dict):
+        vision_config = {}
+    patch_size = vision_config.get("patch_size")
+    strategy = model_config.get("vision_feature_select_strategy")
+    updates = {}
+    if (
+        processor_config.get("patch_size") is None
+        and isinstance(patch_size, int)
+        and not isinstance(patch_size, bool)
+        and patch_size > 0
+    ):
+        updates["patch_size"] = patch_size
+    if (
+        processor_config.get("vision_feature_select_strategy") is None
+        and isinstance(strategy, str)
+        and strategy.strip()
+    ):
+        updates["vision_feature_select_strategy"] = strategy
+    if not updates:
+        return processor_config, False
+    return {**processor_config, **updates}, True
+
+
+def _materialize_mlx_vlm_sidecar_overrides(local_path, patched_files):
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name == "config.json":
-            continue
-        _link_or_copy_path(src, dst)
-    with open(os.path.join(override_dir, "config.json"), "w") as f:
-        json.dump(config_data, f, indent=2)
+    try:
+        for name in os.listdir(local_path):
+            src = os.path.join(local_path, name)
+            dst = os.path.join(override_dir, name)
+            if name in patched_files:
+                continue
+            _link_or_copy_path(src, dst)
+        for name, data in patched_files.items():
+            with open(os.path.join(override_dir, name), "w") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        shutil.rmtree(override_dir, ignore_errors=True)
+        raise
     return override_dir
 
 
@@ -472,11 +529,25 @@ def _keep_mlx_vlm_config_view_alive(model, override_dir):
         pass
 
 
+def _load_mlx_vlm_with_config_views(load_fn, view_paths, *args, **kwargs):
+    try:
+        model, processor = load_fn(*args, **kwargs)
+    except Exception:
+        for path in reversed(view_paths):
+            shutil.rmtree(path, ignore_errors=True)
+        raise
+    for path in view_paths:
+        _keep_mlx_vlm_config_view_alive(model, path)
+    return model, processor
+
+
 def _materialize_mlx_vlm_config_override(
     local_path,
     config_data,
     *,
+    config_override_data=None,
     normalize_tokenizer_config=False,
+    normalize_processor_geometry=False,
     supports_list_extra_special_tokens=None,
 ):
     """Return a load path whose sidecars are compatible with mlx-vlm loaders."""
@@ -486,7 +557,10 @@ def _materialize_mlx_vlm_config_override(
 
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     patched_config = config_data
-    if (
+    if config_override_data is not None:
+        patched_config = dict(config_override_data)
+        patched_files["config.json"] = patched_config
+    elif (
         corrected_model_type is not None
         and config_data.get("model_type") != corrected_model_type
     ):
@@ -501,31 +575,49 @@ def _materialize_mlx_vlm_config_override(
         tokenizer_config = _read_json_file(
             os.path.join(local_path, "tokenizer_config.json")
         )
+        patched_tokenizer_config, patched_backend = (
+            _normalize_tokenizer_config_backend_class(tokenizer_config)
+        )
         patched_tokenizer_config, patched_tokenizer = (
             _normalize_tokenizer_config_extra_special_tokens(
-                tokenizer_config,
+                patched_tokenizer_config,
                 supports_list_extra_special_tokens=supports_list_extra_special_tokens,
             )
         )
-        if patched_tokenizer:
+        if patched_backend or patched_tokenizer:
             patched_files["tokenizer_config.json"] = patched_tokenizer_config
+
+    processor_config = (
+        _read_json_file(os.path.join(local_path, "processor_config.json"))
+        if normalize_processor_geometry else {}
+    )
+    if processor_config:
+        patched_processor_config, patched_geometry = (
+            _normalize_vlm_processor_geometry(processor_config, patched_config)
+        )
+        if patched_geometry:
+            patched_files["processor_config.json"] = patched_processor_config
 
     if not patched_files:
         return local_path, config_data
 
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name in patched_files:
-            continue
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            pass
-    for name, data in patched_files.items():
-        with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    try:
+        for name in os.listdir(local_path):
+            src = os.path.join(local_path, name)
+            dst = os.path.join(override_dir, name)
+            if name in patched_files:
+                continue
+            try:
+                os.symlink(src, dst)
+            except FileExistsError:
+                pass
+        for name, data in patched_files.items():
+            with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        shutil.rmtree(override_dir, ignore_errors=True)
+        raise
     if corrected_model_type is not None and "config.json" in patched_files:
         print(
             "Unsloth: Routing DeepSeek OCR checkpoint through "
@@ -921,6 +1013,7 @@ def _load_mlx_vlm_distributed(
     hf_token=None,
     revision=None,
     config_override_data=None,
+    sidecar_override_data=None,
 ):
     pipeline_group, tensor_group = _mlx_active_distributed_groups(
         pipeline_group,
@@ -942,10 +1035,12 @@ def _load_mlx_vlm_distributed(
     try:
         with _temporary_hf_token_env(hf_token):
             load_target = get_model_path(model_name, revision=revision)
+            patched_files = dict(sidecar_override_data or {})
             if config_override_data is not None:
-                load_target = _materialize_mlx_vlm_config_data(
-                    str(load_target),
-                    config_override_data,
+                patched_files["config.json"] = config_override_data
+            if patched_files:
+                load_target = _materialize_mlx_vlm_sidecar_overrides(
+                    str(load_target), patched_files,
                 )
                 try:
                     model, processor = sharded_load(
@@ -998,43 +1093,734 @@ def _read_json_file(path):
     return data if isinstance(data, dict) else {}
 
 
-def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
+def _resolve_mlx_vlm_processor_class(
+    model_type,
+    processor_class_name,
+    processor_class=None,
+):
     """Resolve a custom mlx-vlm or Transformers processor class by name."""
     if not processor_class_name:
         return None
 
-    module_model_type = (model_type or "").replace("-", "_")
-    module_types = [module_model_type]
+    raw_model_type = str(model_type or "")
+    module_model_type = raw_model_type.replace("-", "_")
+    module_types = []
     # Aliased model types live under their MODEL_REMAPPING target package.
     try:
         from mlx_vlm.utils import MODEL_REMAPPING
-        remapped = MODEL_REMAPPING.get(module_model_type)
-        if remapped and remapped not in module_types:
+
+        remapped = MODEL_REMAPPING.get(raw_model_type)
+        if remapped is None:
+            remapped = MODEL_REMAPPING.get(module_model_type)
+        if remapped:
             module_types.append(str(remapped).replace("-", "_"))
     except Exception:
         pass
-    module_candidates = tuple(
+    if module_model_type and module_model_type not in module_types:
+        module_types.append(module_model_type)
+    module_candidates = [
         name
         for module_type in module_types
         for name in (
+            f"mlx_vlm.models.{module_type}",
             f"mlx_vlm.models.{module_type}.processing",
             f"mlx_vlm.models.{module_type}.processing_{module_type}",
+            f"mlx_vlm.models.{module_type}.image_processing_{module_type}",
+            f"mlx_vlm.models.{module_type}.audio_feature_extractor",
+            f"mlx_vlm.models.{module_type}.feature_extraction_{module_type}",
+            f"mlx_vlm.models.{module_type}.video_processing_{module_type}",
         )
-    )
+    ]
+    for base_class in getattr(processor_class, "__mro__", ()):
+        module_name = getattr(base_class, "__module__", "")
+        if not module_name.startswith("mlx_vlm.models."):
+            continue
+        for candidate in (module_name, module_name.rsplit(".", 1)[0]):
+            if candidate not in module_candidates:
+                module_candidates.append(candidate)
     for module_name in module_candidates:
         try:
             module = importlib.import_module(module_name)
         except Exception:
             continue
-        processor_class = getattr(module, processor_class_name, None)
-        if processor_class is not None:
-            return processor_class
+        resolved_class = getattr(module, processor_class_name, None)
+        if isinstance(resolved_class, type):
+            return resolved_class
 
     try:
         import transformers
-        return getattr(transformers, processor_class_name, None)
+        resolved_class = getattr(transformers, processor_class_name, None)
+        return resolved_class if isinstance(resolved_class, type) else None
     except Exception:
         return None
+
+
+_VLM_PROCESSOR_COMPONENT_TYPES = {
+    "image_processor": (("image_processor_type",), ("image_processor_type",)),
+    "video_processor": (("video_processor_type",), ("video_processor_type",)),
+    "feature_extractor": (("feature_extractor_type",), ("feature_extractor_type",)),
+    "audio_processor": (
+        ("audio_processor_type", "feature_extractor_type"),
+        ("audio_processor_type", "feature_extractor_type"),
+    ),
+}
+_VLM_PROCESSOR_COMPONENT_BASES = {
+    "image_processor": (
+        "transformers.image_processing_utils",
+        "ImageProcessingMixin",
+    ),
+    "video_processor": (
+        "transformers.video_processing_utils",
+        "BaseVideoProcessor",
+    ),
+    "feature_extractor": (
+        "transformers.feature_extraction_utils",
+        "FeatureExtractionMixin",
+    ),
+    "audio_processor": (
+        "transformers.feature_extraction_utils",
+        "FeatureExtractionMixin",
+    ),
+    "tokenizer": (
+        "transformers.tokenization_utils_base",
+        "PreTrainedTokenizerBase",
+    ),
+}
+
+
+def _vlm_processor_attributes(processor_class):
+    get_attributes = getattr(processor_class, "get_attributes", None)
+    if callable(get_attributes):
+        try:
+            attributes = get_attributes()
+        except (AttributeError, TypeError, ValueError):
+            pass
+        else:
+            return tuple(dict.fromkeys(
+                name for name in attributes if isinstance(name, str)
+            ))
+    return tuple(dict.fromkeys(
+        name
+        for name in getattr(processor_class, "attributes", ())
+        if isinstance(name, str)
+    ))
+
+
+def _is_native_mlx_vlm_factory(processor_class):
+    from_pretrained = getattr(processor_class, "from_pretrained", None)
+    factory = inspect.unwrap(getattr(from_pretrained, "__func__", from_pretrained))
+    return getattr(factory, "__module__", "").startswith("mlx_vlm.models.")
+
+
+def _declared_vlm_processor_components(
+    processor_config,
+    preprocessor_config,
+    video_processor_config=None,
+):
+    """Return modality attribute -> class name declarations from sidecars."""
+    sidecars = (processor_config, preprocessor_config, video_processor_config or {})
+    components = {}
+    for attribute_name, (nested_keys, flat_keys) in (
+        _VLM_PROCESSOR_COMPONENT_TYPES.items()
+    ):
+        for config in sidecars:
+            nested = config.get(attribute_name)
+            class_name = None
+            if isinstance(nested, dict):
+                class_name = next(
+                    (nested.get(key) for key in nested_keys if nested.get(key)),
+                    None,
+                )
+            class_name = class_name or next(
+                (config.get(key) for key in flat_keys if config.get(key)),
+                None,
+            )
+            if isinstance(class_name, str) and class_name:
+                components[attribute_name] = class_name
+                break
+    return components
+
+
+def _shadowed_vlm_feature_alias(attribute_name, processor_attributes, components):
+    aliases = {
+        "feature_extractor": "audio_processor",
+        "audio_processor": "feature_extractor",
+    }
+    owner = aliases.get(attribute_name)
+    return (
+        attribute_name not in processor_attributes
+        and owner in processor_attributes
+        and owner in components
+        and components.get(attribute_name) == components.get(owner)
+    )
+
+
+def _matches_vlm_component_kind(attribute_name, argument):
+    module_and_class = _VLM_PROCESSOR_COMPONENT_BASES.get(attribute_name)
+    if module_and_class is None:
+        return False
+    try:
+        component_base = getattr(
+            importlib.import_module(module_and_class[0]),
+            module_and_class[1],
+        )
+    except (ImportError, AttributeError):
+        return False
+    matches = (
+        issubclass(argument, component_base)
+        if isinstance(argument, type)
+        else isinstance(argument, component_base)
+    )
+    if not matches or attribute_name != "image_processor":
+        return matches
+    try:
+        video_base = getattr(
+            importlib.import_module("transformers.video_processing_utils"),
+            "BaseVideoProcessor",
+        )
+    except (ImportError, AttributeError):
+        return True
+    return not (
+        issubclass(argument, video_base)
+        if isinstance(argument, type)
+        else isinstance(argument, video_base)
+    )
+
+
+def _vlm_processor_class_contract(
+    processor_class,
+    components,
+    model_type,
+):
+    """Return custom lookup and exact component identities for one processor."""
+    custom_lookup = {}
+    accepted = {}
+    attributes = set(_vlm_processor_attributes(processor_class)) | set(components)
+    for attribute_name in attributes:
+        component = components.get(attribute_name)
+        class_names = getattr(processor_class, f"{attribute_name}_class", None)
+        class_names = (
+            list(class_names) if isinstance(class_names, tuple) else [class_names]
+        )
+        if component is not None:
+            class_names.insert(0, component[0])
+        declared_classes = []
+        for class_name in class_names:
+            if not isinstance(class_name, str) or not class_name:
+                continue
+            resolved_class = _resolve_mlx_vlm_processor_class(
+                model_type,
+                class_name,
+                processor_class,
+            )
+            module_name = getattr(resolved_class, "__module__", "")
+            if module_name.startswith("mlx_vlm.models."):
+                custom_lookup[class_name] = resolved_class
+            if resolved_class is not None and not module_name.startswith(
+                "transformers.models.auto."
+            ):
+                declared_classes.append(resolved_class)
+
+        accepted[attribute_name] = set(declared_classes)
+    return custom_lookup, accepted
+
+
+def _valid_vlm_processor_contract(
+    processor,
+    processor_class,
+    processor_attributes,
+    components,
+    accepted_classes,
+    *,
+    allow_native,
+):
+    required = set(components)
+    if "tokenizer" in processor_attributes:
+        required.add("tokenizer")
+    if any(getattr(processor, name, None) is None for name in required):
+        return False
+
+    native_factory = _is_native_mlx_vlm_factory(processor_class)
+    modality_attributes = (
+        processor_attributes | set(components)
+    ) & set(_VLM_PROCESSOR_COMPONENT_TYPES)
+    for attribute_name in modality_attributes:
+        argument = getattr(processor, attribute_name, None)
+        if argument is None or type(argument) in accepted_classes.get(
+            attribute_name, ()
+        ):
+            continue
+        if (
+            allow_native
+            and native_factory
+            # Native factories may intentionally substitute a backend-safe
+            # implementation of the same modality (for example, fast -> slow).
+            and _matches_vlm_component_kind(attribute_name, argument)
+        ):
+            continue
+        return False
+    return True
+
+
+def _vlm_processor_needs_repair(
+    processor,
+    processor_class,
+    components,
+):
+    """Detect tokenizer-only or structurally incomplete processor results."""
+    if processor is None:
+        return True
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        if isinstance(processor, PreTrainedTokenizerBase):
+            return True
+    except ImportError:
+        pass
+
+    attributes = set(_vlm_processor_attributes(processor_class))
+    required = set(components)
+    if "tokenizer" in attributes:
+        required.add("tokenizer")
+    return any(getattr(processor, name, None) is None for name in required)
+
+
+def _reconstruct_declared_vlm_processor(
+    processor_class,
+    model_path,
+    components,
+    contract,
+    *,
+    token=None,
+    trust_remote_code=False,
+    processor_kwargs=None,
+):
+    """Run a declared processor's native factory with local custom lookup."""
+    from_pretrained = getattr(processor_class, "from_pretrained", None)
+    original_lookup = getattr(processor_class, "get_possibly_dynamic_module", None)
+    if not callable(from_pretrained) or not callable(original_lookup):
+        return None
+
+    custom_components, accepted_classes = contract
+    processor_attribute_order = _vlm_processor_attributes(processor_class)
+    processor_attributes = set(processor_attribute_order)
+
+    def get_possibly_dynamic_module(class_name):
+        component_class = custom_components.get(class_name)
+        if component_class is not None:
+            return component_class
+        return original_lookup(class_name)
+
+    base_check = getattr(processor_class, "check_argument_for_proper_class", None)
+
+    def valid_component(attribute_name, argument):
+        if type(argument) in accepted_classes.get(attribute_name, ()):
+            return True
+        return (
+            attribute_name in _VLM_PROCESSOR_COMPONENT_TYPES
+            # Apply the same native-factory substitution contract while the
+            # temporary ProcessorMixin subclass validates constructor args.
+            and _is_native_mlx_vlm_factory(processor_class)
+            and _matches_vlm_component_kind(attribute_name, argument)
+        )
+
+    def check_argument_for_proper_class(self, attribute_name, argument):
+        try:
+            return base_check(self, attribute_name, argument)
+        except TypeError:
+            if valid_component(attribute_name, argument):
+                return None
+            raise
+
+    subclass_attrs = {
+        "__module__": processor_class.__module__,
+        "get_possibly_dynamic_module": staticmethod(get_possibly_dynamic_module),
+    }
+    if callable(getattr(processor_class, "get_attributes", None)):
+        subclass_attrs["get_attributes"] = classmethod(
+            lambda _cls: list(processor_attribute_order)
+        )
+    for attribute_name, (class_name, _component_class) in components.items():
+        declared_class = getattr(processor_class, f"{attribute_name}_class", None)
+        if (
+            attribute_name in processor_attributes
+            and (
+                declared_class is None
+                or (
+                    isinstance(declared_class, str)
+                    and declared_class.startswith("Auto")
+                )
+            )
+        ):
+            subclass_attrs[f"{attribute_name}_class"] = class_name
+    if callable(base_check):
+        subclass_attrs["check_argument_for_proper_class"] = check_argument_for_proper_class
+    temporary_class = type(processor_class.__name__, (processor_class,), subclass_attrs)
+
+    factory_kwargs = dict(processor_kwargs or {})
+    if trust_remote_code:
+        factory_kwargs.setdefault("trust_remote_code", True)
+    if token:
+        factory_kwargs.setdefault("token", token)
+    try:
+        repaired = temporary_class.from_pretrained(model_path, **factory_kwargs)
+    except Exception:
+        return None
+    if repaired is None:
+        return None
+
+    if not isinstance(repaired, temporary_class):
+        return None
+    for attribute_name in processor_attributes:
+        argument = getattr(repaired, attribute_name, None)
+        if argument is None:
+            continue
+        if not callable(base_check):
+            continue
+        try:
+            temporary_class.check_argument_for_proper_class(
+                repaired,
+                attribute_name,
+                argument,
+            )
+        except (TypeError, ValueError):
+            return None
+    if not _valid_vlm_processor_contract(
+        repaired,
+        processor_class,
+        processor_attributes,
+        components,
+        accepted_classes,
+        allow_native=True,
+    ):
+        return None
+
+    if isinstance(repaired, temporary_class):
+        try:
+            repaired.__class__ = processor_class
+        except TypeError:
+            return None
+    if type(repaired) is not processor_class:
+        return None
+    return repaired
+
+
+def _set_mlx_vlm_processor_runtime_state(
+    processor,
+    model_path,
+    eos_token_ids=None,
+):
+    """Attach mlx-vlm generation state to a newly reconstructed processor."""
+    try:
+        import mlx_vlm.utils as vlm_utils
+
+        tokenizer = getattr(processor, "tokenizer", processor)
+        detokenizer_class = vlm_utils.load_tokenizer(
+            Path(model_path),
+            return_tokenizer=False,
+        )
+        processor.detokenizer = detokenizer_class(tokenizer)
+        final_eos_ids = eos_token_ids
+        if final_eos_ids is None:
+            final_eos_ids = getattr(tokenizer, "eos_token_ids", None)
+        if final_eos_ids is None:
+            final_eos_ids = getattr(tokenizer, "eos_token_id", None)
+        criteria = vlm_utils.StoppingCriteria(final_eos_ids, tokenizer)
+        if hasattr(processor, "tokenizer"):
+            tokenizer.stopping_criteria = criteria
+        else:
+            processor.stopping_criteria = criteria
+    except Exception:
+        return False
+    return True
+
+
+def _recoverable_mlx_vlm_processor_error(error):
+    message = str(error)
+    if isinstance(error, TypeError):
+        return (
+            message.startswith("Received a ")
+            and " for argument " in message
+            and ", but a " in message
+            and message.endswith(" was expected.")
+        )
+    return (
+        isinstance(error, ValueError)
+        and message.startswith("Could not find module ")
+        and " in `transformers`." in message
+    )
+
+
+def _ensure_mlx_vlm_processor_repair():
+    """Recover native processor resolution and component mismatch failures."""
+    try:
+        import mlx_vlm.utils as vlm_utils
+    except ImportError:
+        return
+
+    load_processor = getattr(vlm_utils, "load_processor", None)
+    if load_processor is None or getattr(
+        load_processor, "_unsloth_processor_repair", False
+    ):
+        return
+
+    @wraps(load_processor)
+    def repairing_load_processor(
+        model_path,
+        add_detokenizer=True,
+        eos_token_ids=None,
+        **kwargs,
+    ):
+        try:
+            return load_processor(
+                model_path,
+                add_detokenizer=add_detokenizer,
+                eos_token_ids=eos_token_ids,
+                **kwargs,
+            )
+        except (TypeError, ValueError) as error:
+            if not _recoverable_mlx_vlm_processor_error(error):
+                raise
+            try:
+                config = _read_json_file(os.path.join(str(model_path), "config.json"))
+                repaired = _repair_degraded_vlm_processor(
+                    None,
+                    model_path,
+                    config.get("model_type"),
+                    token=kwargs.get("token"),
+                    trust_remote_code=bool(kwargs.get("trust_remote_code", False)),
+                    processor_kwargs=kwargs,
+                    add_detokenizer=add_detokenizer,
+                    eos_token_ids=eos_token_ids,
+                )
+            except Exception:
+                repaired = None
+            if repaired is None:
+                raise
+        return repaired
+
+    repairing_load_processor._unsloth_processor_repair = True
+    repairing_load_processor._unsloth_original = load_processor
+    vlm_utils.load_processor = repairing_load_processor
+
+
+_MLX_VLM_PT_ONLY_ERROR = (
+    "Failed to process inputs with error: "
+    "Only returning PyTorch tensors is currently supported."
+)
+
+
+def _convert_pt_vlm_output(value, return_tensors):
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if tensor.is_conj():
+            tensor = tensor.resolve_conj()
+        if tensor.is_neg():
+            tensor = tensor.resolve_neg()
+        if return_tensors in {"mlx", "mx"}:
+            import mlx.core as mx
+            from_dlpack = getattr(mx, "from_dlpack", None)
+            if from_dlpack is not None:
+                return from_dlpack(tensor.contiguous())
+            if tensor.dtype is torch.bfloat16:
+                tensor = tensor.float()
+            return mx.array(tensor.numpy())
+        if tensor.dtype is torch.bfloat16:
+            tensor = tensor.float()
+        return tensor.numpy()
+    if isinstance(value, Mapping):
+        converted_items = {
+            key: _convert_pt_vlm_output(item, return_tensors)
+            for key, item in value.items()
+        }
+        try:
+            converted = copy.copy(value)
+            for key, item in converted_items.items():
+                converted[key] = item
+            return converted
+        except (AttributeError, TypeError):
+            try:
+                return type(value)(converted_items)
+            except TypeError:
+                return converted_items
+    if isinstance(value, tuple):
+        converted = tuple(
+            _convert_pt_vlm_output(item, return_tensors) for item in value
+        )
+        if hasattr(value, "_fields"):
+            return type(value)(*converted)
+        if type(value) is not tuple:
+            try:
+                return type(value)(converted)
+            except TypeError:
+                pass
+        return converted
+    if isinstance(value, list):
+        converted = [_convert_pt_vlm_output(item, return_tensors) for item in value]
+        if type(value) is list:
+            return converted
+        try:
+            copied = copy.copy(value)
+            copied[:] = converted
+            return copied
+        except (AttributeError, TypeError):
+            return converted
+    return value
+
+
+def _ensure_mlx_vlm_pt_output_fallback():
+    """Retry processors that only implement PyTorch tensor output."""
+    try:
+        import mlx_vlm.utils as vlm_utils
+    except ImportError:
+        return
+
+    process_inputs = getattr(vlm_utils, "process_inputs_with_fallback", None)
+    if process_inputs is None or getattr(process_inputs, "_unsloth_pt_fallback", False):
+        return
+
+    @wraps(process_inputs)
+    def process_inputs_with_pt_fallback(
+        processor,
+        prompts,
+        images,
+        audio,
+        add_special_tokens=False,
+        return_tensors="mlx",
+        **kwargs,
+    ):
+        try:
+            return process_inputs(
+                processor,
+                prompts,
+                images,
+                audio,
+                add_special_tokens=add_special_tokens,
+                return_tensors=return_tensors,
+                **kwargs,
+            )
+        except ValueError as error:
+            if (
+                return_tensors not in {"mlx", "mx", "np"}
+                or str(error) != _MLX_VLM_PT_ONLY_ERROR
+            ):
+                raise
+        outputs = process_inputs(
+            processor,
+            prompts,
+            images,
+            audio,
+            add_special_tokens=add_special_tokens,
+            return_tensors="pt",
+            **kwargs,
+        )
+        return _convert_pt_vlm_output(outputs, return_tensors)
+
+    process_inputs_with_pt_fallback._unsloth_pt_fallback = True
+    process_inputs_with_pt_fallback._unsloth_original = process_inputs
+    vlm_utils.process_inputs_with_fallback = process_inputs_with_pt_fallback
+
+
+def _mlx_vlm_bpe_flush_recovery(error, buffered, token, tokenmap, byte_decoder):
+    try:
+        value = tokenmap[token]
+        buffered_bytes = bytes(byte_decoder[char] for char in buffered)
+        buffered_bytes.decode("utf-8")
+    except UnicodeDecodeError as buffered_error:
+        if (
+            value
+            and byte_decoder.get(value[0]) == 32
+            and error.encoding == buffered_error.encoding == "utf-8"
+            and bytes(error.object) == buffered_bytes
+            and error.start == buffered_error.start
+            and error.end == buffered_error.end
+            and error.reason == buffered_error.reason
+        ):
+            return buffered_bytes, value
+    except Exception:
+        pass
+    return None
+
+
+def _mlx_vlm_bpe_needs_utf8_fallback(detokenizer_class):
+    try:
+        detokenizer_class.make_byte_decoder()
+        byte_chars = {
+            byte: char for char, byte in detokenizer_class._byte_decoder.items()
+        }
+    except Exception:
+        return False
+
+    def fails_strict_flush(byte):
+        try:
+            probe = object.__new__(detokenizer_class)
+            probe.trim_space = False
+            probe.tokenmap = [byte_chars[byte], byte_chars[32] + "x"]
+            probe.reset()
+            probe.add_token(0)
+            if probe._unflushed != byte_chars[byte] or probe.text:
+                return False
+            buffered, text = probe._unflushed, probe.text
+        except Exception:
+            return False
+        try:
+            probe.add_token(1)
+        except UnicodeDecodeError as error:
+            return (
+                _mlx_vlm_bpe_flush_recovery(
+                    error, buffered, 1, probe.tokenmap, probe._byte_decoder
+                )
+                is not None
+                and probe._unflushed == buffered
+                and probe.text == text
+            )
+        except Exception:
+            pass
+        return False
+
+    return any(fails_strict_flush(byte) for byte in (0xC3, 0xBF))
+
+
+def _ensure_mlx_vlm_bpe_utf8_fallback():
+    """Replace invalid UTF-8 flushes in release mlx-vlm."""
+    try:
+        import mlx_vlm.tokenizer_utils as tokenizer_utils
+    except ImportError:
+        return
+    detokenizer_class = getattr(tokenizer_utils, "BPEStreamingDetokenizer", None)
+    add_token = getattr(detokenizer_class, "add_token", None)
+    if (
+        add_token is None
+        or getattr(add_token, "_unsloth_utf8_fallback", False)
+        or not _mlx_vlm_bpe_needs_utf8_fallback(detokenizer_class)
+    ):
+        return
+
+    @wraps(add_token)
+    def add_token_utf8_safe(self, *args, **kwargs):
+        buffered, text = self._unflushed, self.text
+        try:
+            return add_token(self, *args, **kwargs)
+        except UnicodeDecodeError as error:
+            token = kwargs.get("token", args[0] if args else None)
+            recovery = _mlx_vlm_bpe_flush_recovery(
+                error, buffered, token, self.tokenmap, self._byte_decoder
+            )
+            if recovery is None or self._unflushed != buffered or self.text != text:
+                raise
+            buffered_bytes, value = recovery
+            current_text = buffered_bytes.decode("utf-8", errors="replace")
+            if self.text or not self.trim_space:
+                self.text += current_text
+            else:
+                self.text += tokenizer_utils._remove_space(current_text)
+            self._unflushed = value
+
+    add_token_utf8_safe._unsloth_utf8_fallback = True
+    add_token_utf8_safe._unsloth_original = add_token
+    detokenizer_class.add_token = add_token_utf8_safe
 
 
 def _build_vlm_image_processor_from_config(
@@ -1066,7 +1852,8 @@ def _build_vlm_image_processor_from_config(
         # mlx-vlm models can ship their own image processor classes.
         try:
             image_processor_class = _resolve_mlx_vlm_processor_class(
-                model_type, image_processor_type,
+                model_type,
+                image_processor_type,
             )
             if image_processor_class is not None:
                 return image_processor_class(**image_kwargs)
@@ -1087,6 +1874,9 @@ def _repair_degraded_vlm_processor(
     *,
     token=None,
     trust_remote_code=False,
+    processor_kwargs=None,
+    add_detokenizer=True,
+    eos_token_ids=None,
 ):
     """Rebuild VLM processors when mlx-vlm falls back to tokenizer-only.
 
@@ -1094,9 +1884,6 @@ def _repair_degraded_vlm_processor(
     fails; rebuild from the source sidecar configs so downstream saves keep
     real multimodal processor metadata.
     """
-    if processor is None or getattr(processor, "image_processor", None) is not None:
-        return processor
-
     if not model_path or not os.path.isdir(str(model_path)):
         return processor
 
@@ -1106,56 +1893,123 @@ def _repair_degraded_vlm_processor(
     preprocessor_config = _read_json_file(
         os.path.join(str(model_path), "preprocessor_config.json")
     )
+    video_processor_config = _read_json_file(
+        os.path.join(str(model_path), "video_preprocessor_config.json")
+    )
+    tokenizer_config = _read_json_file(
+        os.path.join(str(model_path), "tokenizer_config.json")
+    )
     processor_class_name = (
         processor_config.get("processor_class")
         or preprocessor_config.get("processor_class")
+        or video_processor_config.get("processor_class")
+        or tokenizer_config.get("processor_class")
     )
-    processor_class = _resolve_mlx_vlm_processor_class(
-        model_type, processor_class_name,
-    )
+    if not isinstance(processor_class_name, str) or not processor_class_name:
+        return processor
+
+    processor_class = _resolve_mlx_vlm_processor_class(model_type, processor_class_name)
     if processor_class is None:
         return processor
-
-    image_processor = _build_vlm_image_processor_from_config(
-        model_path, processor_config, preprocessor_config, model_type,
+    declared_components = _declared_vlm_processor_components(
+        processor_config,
+        preprocessor_config,
+        video_processor_config,
     )
-    if image_processor is None:
+    processor_attributes = set(_vlm_processor_attributes(processor_class))
+    components = {}
+    for attribute_name, class_name in declared_components.items():
+        if _shadowed_vlm_feature_alias(
+            attribute_name, processor_attributes, declared_components,
+        ):
+            continue
+        component_class = _resolve_mlx_vlm_processor_class(
+            model_type,
+            class_name,
+            processor_class,
+        )
+        custom_component = getattr(component_class, "__module__", "").startswith(
+            "mlx_vlm.models."
+        )
+        if attribute_name in processor_attributes or custom_component:
+            components[attribute_name] = (class_name, component_class)
+    if not _vlm_processor_needs_repair(processor, processor_class, components):
         return processor
 
-    tokenizer = getattr(processor, "tokenizer", None) or processor
-    if tokenizer is None or not hasattr(tokenizer, "save_pretrained"):
-        try:
-            from transformers import AutoTokenizer
-            tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
-            if token:
-                tokenizer_kwargs["token"] = token
-            tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
-        except Exception:
-            return processor
-
-    chat_template = getattr(processor, "chat_template", None)
-    if chat_template is not None and getattr(tokenizer, "chat_template", None) is None:
-        tokenizer.chat_template = chat_template
-
-    try:
-        repaired = processor_class(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
+    contract = _vlm_processor_class_contract(processor_class, components, model_type)
+    repaired = _reconstruct_declared_vlm_processor(
+        processor_class,
+        model_path,
+        components,
+        contract,
+        token=token,
+        trust_remote_code=trust_remote_code,
+        processor_kwargs=processor_kwargs,
+    )
+    accepted_classes = contract[1]
+    if repaired is None and processor is not None and "image_processor" in components:
+        image_processor = _build_vlm_image_processor_from_config(
+            model_path, processor_config, preprocessor_config, model_type,
         )
-    except TypeError:
+        tokenizer = getattr(processor, "tokenizer", None) or processor
+        chat_template = getattr(processor, "chat_template", None)
         try:
             repaired = processor_class(
                 image_processor=image_processor,
                 tokenizer=tokenizer,
+                chat_template=chat_template,
             )
+        except TypeError:
+            try:
+                repaired = processor_class(
+                    image_processor=image_processor,
+                    tokenizer=tokenizer,
+                )
+            except Exception:
+                repaired = None
         except Exception:
-            return processor
-    except Exception:
+            repaired = None
+
+        if (
+            repaired is None
+            or type(repaired) is not processor_class
+            or _vlm_processor_needs_repair(repaired, processor_class, components)
+            or not _valid_vlm_processor_contract(
+                repaired,
+                processor_class,
+                processor_attributes,
+                components,
+                accepted_classes,
+                allow_native=False,
+            )
+        ):
+            repaired = None
+
+    if repaired is None:
         return processor
 
+    target_tokenizer = getattr(repaired, "tokenizer", None)
+    source_tokenizer = getattr(processor, "tokenizer", None) or processor
+    chat_template = getattr(processor, "chat_template", None) or getattr(
+        source_tokenizer, "chat_template", None
+    )
     if chat_template is not None and getattr(repaired, "chat_template", None) is None:
         repaired.chat_template = chat_template
+    if (
+        chat_template is not None
+        and target_tokenizer is not None
+        and getattr(target_tokenizer, "chat_template", None) is None
+    ):
+        target_tokenizer.chat_template = chat_template
+    if eos_token_ids is None and source_tokenizer is not None:
+        source_criteria = getattr(source_tokenizer, "stopping_criteria", None)
+        eos_token_ids = getattr(source_criteria, "eos_token_ids", None)
+    if add_detokenizer and not _set_mlx_vlm_processor_runtime_state(
+        repaired,
+        model_path,
+        eos_token_ids=eos_token_ids,
+    ):
+        return processor
     return repaired
 
 
@@ -2016,16 +2870,6 @@ def _patch_mixed_precision_set_dtype(model):
 _vlm_prompt_utils_patched = False
 _original_vlm_apply_chat_template = None
 
-_MULTIMODAL_ITEM_TYPES = frozenset(
-    {
-        "image",
-        "image_url",
-        "input_image",
-        "audio",
-        "input_audio",
-        "video",
-    }
-)
 _NON_USER_ROLES = frozenset({"system", "assistant"})
 _ROLE_PROMPT_NAMES = {
     "user": "Human",
@@ -3664,24 +4508,30 @@ def _apply_mlx_distributed_sharding(
     return mode
 
 
+def _structured_multimodal_counts(content):
+    """Count explicit image, audio, and video items in structured content."""
+    if isinstance(content, list):
+        counts = [_structured_multimodal_counts(item) for item in content]
+        return tuple(sum(values) for values in zip(*counts)) if counts else (0, 0, 0)
+    if not isinstance(content, dict):
+        return (0, 0, 0)
+
+    item_type = str(content.get("type", "")).lower()
+    if item_type in ("image", "image_url", "input_image"):
+        return (1, 0, 0)
+    if item_type in ("audio", "input_audio"):
+        return (0, 1, 0)
+    if item_type == "video":
+        return (0, 0, 1)
+    nested = content.get("content", None)
+    if nested is not None and nested is not content:
+        return _structured_multimodal_counts(nested)
+    return (0, 0, 0)
+
+
 def _content_has_structured_multimodal_markers(content):
     """Return True when content already contains explicit image/audio/video items."""
-    if isinstance(content, list):
-        for item in content:
-            if _content_has_structured_multimodal_markers(item):
-                return True
-        return False
-
-    if isinstance(content, dict):
-        item_type = str(content.get("type", "")).lower()
-        if item_type in _MULTIMODAL_ITEM_TYPES:
-            return True
-        nested = content.get("content", None)
-        if nested is not None and nested is not content:
-            return _content_has_structured_multimodal_markers(nested)
-        return False
-
-    return False
+    return any(_structured_multimodal_counts(content))
 
 
 def _normalize_prompt_messages(prompt_utils_module, prompt):
@@ -3707,6 +4557,29 @@ def _messages_have_structured_multimodal_content(messages):
     return any(
         _content_has_structured_multimodal_markers(message.get("content", ""))
         for message in messages
+    )
+
+
+def _structured_media_matches_count_renderer(messages, num_images, num_audios):
+    """Return whether upstream count-based rendering preserves media ownership."""
+    last_target_idx = -1
+    media_indices = set()
+    totals = [0, 0, 0]
+    for i, message in enumerate(messages):
+        role = str(message.get("role", "user"))
+        if role not in _NON_USER_ROLES:
+            last_target_idx = i
+        counts = _structured_multimodal_counts(message.get("content", ""))
+        if any(counts):
+            media_indices.add(i)
+            totals = [total + count for total, count in zip(totals, counts)]
+
+    return (
+        last_target_idx >= 0
+        and str(messages[last_target_idx].get("role", "user")) == "user"
+        and media_indices == {last_target_idx}
+        and any(totals)
+        and totals == [num_images, num_audios, 0]
     )
 
 
@@ -3932,6 +4805,15 @@ def _render_vlm_template_or_fallback(
     return rendered
 
 
+def _has_vlm_template_result(rendered):
+    """Return whether a chat renderer produced a usable prompt or message list."""
+    if isinstance(rendered, str):
+        return bool(rendered.strip())
+    if isinstance(rendered, (list, tuple, dict)):
+        return bool(rendered)
+    return rendered is not None
+
+
 def _ensure_vlm_prompt_utils_patched():
     """Patch mlx-vlm chat-template helper for stable multi-turn multimodal chat."""
     global _vlm_prompt_utils_patched, _original_vlm_apply_chat_template
@@ -3979,6 +4861,31 @@ def _ensure_vlm_prompt_utils_patched():
                 kwargs=kwargs,
             )
         )
+        if (
+            not return_messages
+            and not kwargs.get("video")
+            and model_type in getattr(prompt_utils, "MODEL_CONFIG", {})
+            and _structured_media_matches_count_renderer(
+                normalized_messages, num_images, num_audios
+            )
+        ):
+            try:
+                rendered = _original_vlm_apply_chat_template(
+                    processor,
+                    config,
+                    prompt,
+                    add_generation_prompt=add_generation_prompt,
+                    return_messages=return_messages,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
+            except Exception:
+                pass
+            else:
+                if _has_vlm_template_result(rendered):
+                    return rendered
+
         if needs_custom_render:
             if return_messages:
                 return template_messages
@@ -5008,6 +5915,8 @@ class FastMLXModel:
         local_path = None
         original_local_path = None
         vlm_config_override_data = None
+        vlm_sidecar_override_data = None
+        vlm_config_view_paths = []
         try:
             with _temporary_hf_token_env(token):
                 config_allow_patterns = None
@@ -5036,19 +5945,10 @@ class FastMLXModel:
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
             original_local_path = local_path
-            original_config_data = dict(config_data)
-            if distributed_requested:
-                patched_config_data = _mlx_vlm_config_override_data(config_data)
-                if patched_config_data is not None:
-                    config_data = patched_config_data
-                    vlm_config_override_data = dict(config_data)
-            else:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                )
-                if local_path != original_local_path or config_data != original_config_data:
-                    vlm_config_override_data = dict(config_data)
+            patched_config_data = _mlx_vlm_config_override_data(config_data)
+            if patched_config_data is not None:
+                config_data = patched_config_data
+                vlm_config_override_data = dict(config_data)
 
         # bitsandbytes-quantized repos store NF4 weights MLX cannot read. When
         # the real bitsandbytes wheel is importable, let bnb dequantize to fp16
@@ -5607,16 +6507,12 @@ class FastMLXModel:
                     stacklevel=2,
                 )
 
-            if local_path:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                    normalize_tokenizer_config=True,
-                )
-
             if patch_mode == "patched":
                 install_mlx_compile_patches()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_mlx_vlm_processor_repair()
+            _ensure_mlx_vlm_pt_output_fallback()
+            _ensure_mlx_vlm_bpe_utf8_fallback()
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
@@ -5640,13 +6536,41 @@ class FastMLXModel:
             if want_runtime_quant:
                 import mlx.core as mx
                 from mlx_vlm.utils import load_config as _vlm_load_config
+                _patch_deepseek_ocr_transformers_import_compat(model_type)
+
+            if local_path:
+                if distributed_requested:
+                    processor_config = _read_json_file(
+                        os.path.join(local_path, "processor_config.json")
+                    )
+                    patched_processor_config, patched_geometry = (
+                        _normalize_vlm_processor_geometry(processor_config, config_data)
+                    )
+                    if processor_config and patched_geometry:
+                        vlm_sidecar_override_data = {
+                            "processor_config.json": patched_processor_config,
+                        }
+                else:
+                    previous_local_path = local_path
+                    local_path, config_data = _materialize_mlx_vlm_config_override(
+                        local_path,
+                        config_data,
+                        config_override_data=vlm_config_override_data,
+                        normalize_tokenizer_config=True,
+                        normalize_processor_geometry=True,
+                    )
+                    if local_path != previous_local_path:
+                        vlm_config_view_paths.append(local_path)
+
+            if want_runtime_quant:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
-                _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
                     try:
-                        model, processor = vlm_load(
+                        model, processor = _load_mlx_vlm_with_config_views(
+                            vlm_load,
+                            vlm_config_view_paths,
                             vlm_load_target,
                             lazy=True,
                             revision=revision,
@@ -5685,6 +6609,7 @@ class FastMLXModel:
                     hf_token=token,
                     revision=revision,
                     config_override_data=vlm_config_override_data,
+                    sidecar_override_data=vlm_sidecar_override_data,
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
@@ -5693,17 +6618,20 @@ class FastMLXModel:
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
-                model, processor = _load_mlx_vlm_with_extra_weight_filter(
-                    local_path or model_name,
-                    model_type,
-                    vlm_load,
-                    vlm_kwargs,
+                model, processor = _load_mlx_vlm_with_config_views(
+                    _load_mlx_vlm_with_extra_weight_filter,
+                    vlm_config_view_paths,
+                    local_path or model_name, model_type, vlm_load, vlm_kwargs,
                     hf_token=token,
                 )
 
+            config_view_paths = getattr(model, "_unsloth_mlx_config_view_paths", ())
+            processor_source_path = (
+                config_view_paths[-1] if config_view_paths else local_path or model_name
+            )
             processor = _repair_degraded_vlm_processor(
                 processor,
-                local_path or model_name,
+                processor_source_path,
                 model_type,
                 token=token,
                 trust_remote_code=trust_remote_code,
@@ -5752,7 +6680,7 @@ class FastMLXModel:
             # saving needs the mlx-vlm patched dir when one was materialized
             # (e.g. DeepSeek OCR), else saved adapters copy the unpatched
             # model_type/auto_map the override drops.
-            model._config_src_path = local_path or original_local_path
+            model._config_src_path = processor_source_path
             model._unsloth_base_revision = revision
             model._unsloth_base_commit_hash = _infer_snapshot_commit(
                 original_local_path or local_path
