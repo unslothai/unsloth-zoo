@@ -485,10 +485,68 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     assert processor.images_seen[0] == ["embedded"]
 
 
-def test_vlm_top_level_image_key_is_not_cuda_images_alias():
+def test_vlm_prompt_completion_uses_top_level_image_for_bare_placeholder():
+    from unsloth_zoo.mlx.utils import _extract_vlm_pc_images
+
+    messages = [{"role": "user", "content": [{"type": "image"}]}]
+    assert _extract_vlm_pc_images(
+        {"image": "top-level"}, messages, [], image_size=16,
+    ) == ["top-level"]
+
+
+def test_vlm_collate_passes_studio_top_level_image_to_processor():
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch
+
+    processor = _ConversationalPromptCompletionProcessor()
+    _collate_vlm_batch(
+        [{
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Q"},
+                ],
+            }],
+            "image": "top-level",
+        }],
+        processor,
+        max_seq_length=8,
+        image_size=16,
+    )
+
+    assert processor.images_seen == [["top-level"]]
+
+
+def test_vlm_top_level_images_key_still_wins_over_image_key():
     from unsloth_zoo.mlx.utils import _extract_vlm_images
 
+    assert _extract_vlm_images(
+        {"images": ["plural"], "image": "singular"},
+        [],
+        image_size=16,
+    ) == ["plural"]
+
+
+def test_vlm_top_level_image_key_requires_bare_image_placeholder():
+    from unsloth_zoo.mlx.utils import _extract_vlm_images
+
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Q"}]}]
+    assert _extract_vlm_images({"image": "top-level"}, messages, image_size=16) == []
     assert _extract_vlm_images({"image": "top-level"}, [], image_size=16) == []
+
+
+def test_vlm_top_level_image_key_rejects_mixed_bare_placeholders():
+    from unsloth_zoo.mlx.utils import _extract_vlm_images
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image"},
+            {"type": "video"},
+        ],
+    }]
+    with pytest.raises(ValueError, match="image, image_url or video"):
+        _extract_vlm_images({"image": "top-level"}, messages, image_size=16)
 
 
 def test_vlm_image_extraction_raises_process_errors_like_cuda(monkeypatch):
