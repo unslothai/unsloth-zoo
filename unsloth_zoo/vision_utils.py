@@ -47,6 +47,7 @@ import time
 import warnings
 import os
 from functools import lru_cache
+from collections.abc import Mapping
 
 
 import requests
@@ -551,13 +552,53 @@ def _fix_audio_feature_extractor_padding_side(processor):
         feature_extractor.padding_side = "right"
 
 
+@lru_cache(maxsize=1)
+def _audio_decoder_types():
+    # torchcodec AudioDecoder type (datasets >= 4 Audio() columns), matched
+    # directly so an unpatched decoder (only __getitem__) is still recognized.
+    # Returns () when datasets < 4 / the dep is unavailable. See #7226.
+    try:
+        from datasets.features._torchcodec import AudioDecoder
+    except (ImportError, AttributeError, RuntimeError):
+        return ()
+    return (AudioDecoder,)
+
+
+def _is_audio_mapping(audio):
+    # True for anything _resolve_audio_dict can read "array"/"sampling_rate" from:
+    # a Mapping, a torchcodec AudioDecoder, or a duck-typed mapping. isinstance(dict)
+    # alone drops decoders into the raw-waveform catch-all (#7226). callable() (not
+    # hasattr) rejects objects with a non-callable get/keys.
+    if isinstance(audio, Mapping):
+        return True
+    if isinstance(audio, _audio_decoder_types()):
+        return True
+    return (
+        callable(getattr(audio, "get", None)) and
+        callable(getattr(audio, "keys", None)) and
+        callable(getattr(audio, "__contains__", None))
+    )
+
+
+def _audio_get(audio, key, default=None):
+    # Mapping-style lookup that falls back to subscripting for an unpatched
+    # AudioDecoder (only __getitem__, no .get).
+    getter = getattr(audio, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return audio[key]
+    except (KeyError, TypeError, IndexError):
+        return default
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
-    _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
-    value = audio.get("array")
+    _check_audio_sampling_rate(_audio_get(audio, "sampling_rate"), sampling_rate)
+    value = _audio_get(audio, "array")
     if value is None:
-        value = audio.get("path") or audio.get("url")
+        value = _audio_get(audio, "path") or _audio_get(audio, "url")
     return value
 
 
@@ -581,7 +622,7 @@ def extract_audio_info(
                     # Feature extractors also accept local paths and URLs as strings
                     if audio is None:
                         audio = ele.get("url") or ele.get("path")
-                    if isinstance(audio, dict):
+                    if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
@@ -1049,7 +1090,7 @@ class UnslothVisionDataCollator:
             # No usable top-level audio -> fall back to inline message content
             clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
-        elif isinstance(audio_val, dict):
+        elif _is_audio_mapping(audio_val):
             clip = _resolve_audio_dict(audio_val, target_sr)
             if clip is None:
                 raise ValueError(
@@ -1062,12 +1103,16 @@ class UnslothVisionDataCollator:
                 clips = []
             # A flat list of samples is one clip, not a list of clips
             # (strings are path/url clips, so they stay in the list-of-clips branch)
-            elif not isinstance(audio_val[0], (dict, list, tuple, str)) and getattr(audio_val[0], "ndim", 0) == 0:
+            elif (
+                not _is_audio_mapping(audio_val[0])
+                and not isinstance(audio_val[0], (list, tuple, str))
+                and getattr(audio_val[0], "ndim", 0) == 0
+            ):
                 clips = [audio_val]
             else:
                 clips = []
                 for clip in audio_val:
-                    if isinstance(clip, dict):
+                    if _is_audio_mapping(clip):
                         clip = _resolve_audio_dict(clip, target_sr)
                         if clip is None:
                             raise ValueError(

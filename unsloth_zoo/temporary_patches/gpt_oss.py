@@ -2460,12 +2460,49 @@ def patch_GptOssModel():
     pass
 
     # transformers 4.x uses `input_embeds` and accepts `cache_position`;
-    # transformers 5.x renamed to `inputs_embeds` and dropped `cache_position`.
-    # Inspect the mask factory signatures once and pass only the kwargs they
-    # actually accept so this patch works on both 4.x and 5.x.
+    # transformers 5.x renamed it to `inputs_embeds` and later dropped
+    # `cache_position` (deprecated then removed by 5.13). Inspect the mask factory
+    # signatures once and pass only the kwargs they actually accept so this patch
+    # works across 4.x and the whole 5.x line.
     import inspect as _inspect
-    _ccm_params = set(_inspect.signature(create_causal_mask).parameters)
-    _cswc_params = set(_inspect.signature(create_sliding_window_causal_mask).parameters)
+    def _mask_factory_params(fn, name):
+        # The factory may be wrapped (see misc.py) or torch-compiled, which
+        # collapses inspect.signature() to (*args, **kwargs) and would make the
+        # kwargs filter below drop every mask argument -> create_causal_mask()
+        # called with no args -> "missing required positional arguments". Recover
+        # the true parameter names from the pristine reference misc.py saves, then
+        # __wrapped__, then the object itself, then a version-aware fallback.
+        for cand in (
+            getattr(transformers.masking_utils, "_unsloth_original_" + name, None),
+            getattr(fn, "__wrapped__", None),
+            fn,
+        ):
+            if cand is None: continue
+            try:
+                params = set(_inspect.signature(cand).parameters)
+            except (TypeError, ValueError):
+                continue
+            if not params <= {"args", "kwargs", "self"}:
+                return params
+        # Introspection failed on every candidate (should not happen: misc.py saves
+        # the pristine factory and torch.compile exposes __wrapped__). Fall back to
+        # the parameter set for the running transformers, choosing the kwargs by
+        # major version so a reached fallback never passes an unexpected keyword to
+        # the real factory: 4.x uses `input_embeds` and accepts `cache_position`,
+        # while 5.x uses `inputs_embeds` and dropped `cache_position` (optional and
+        # defaulting to None on early 5.x, removed entirely by 5.13), so omitting it
+        # on 5.x is safe across the whole line.
+        try:
+            _tf_major = int(str(transformers.__version__).split(".", 1)[0])
+        except (ValueError, AttributeError, IndexError):
+            _tf_major = 5
+        if _tf_major < 5:
+            return {"config", "input_embeds", "attention_mask",
+                    "cache_position", "past_key_values", "position_ids"}
+        return {"config", "inputs_embeds", "attention_mask",
+                "past_key_values", "position_ids"}
+    _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
+    _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
     _mask_params = _ccm_params | _cswc_params
 
     def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):

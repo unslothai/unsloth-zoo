@@ -200,7 +200,7 @@ def test_RL_REPLACEMENTS_values_are_callables_or_source_strings():
 
 
 def test_RL_REPLACEMENTS_contains_public_api_keys():
-    # The known-good keys that downstream unsloth + Studio code calls
+    # The known-good keys that downstream unsloth + Unsloth code calls
     # by name. If any of these go missing the consumer side breaks.
     expected = {
         "calculate_pad_tokens_in_prompt",

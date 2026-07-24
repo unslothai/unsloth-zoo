@@ -131,7 +131,7 @@ def test_q2_k_l_ffn_down_pattern_order_is_specific_first(monkeypatch):
 
 
 def test_q2_k_l_is_case_insensitive(monkeypatch):
-    """Studio frontend may send Q2_K_L / Q2_k_L / etc. Treat them identically."""
+    """Unsloth frontend may send Q2_K_L / Q2_k_L / etc. Treat them identically."""
 
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
