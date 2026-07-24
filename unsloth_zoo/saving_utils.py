@@ -14,17 +14,13 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+from __future__ import annotations
 __all__ = [
     "create_huggingface_repo",
     "merge_and_dequantize_lora",
     "merge_and_overwrite_lora",
 ]
 import warnings
-from .peft_utils import get_lora_layer_modules
-from .utils import _get_dtype, Version
-from .hf_utils import dtype_from_config
-from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
-from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
 # Import each independently: convert_moe_packed_tensors_cpu is injected at runtime by Unsloth's
@@ -66,15 +62,77 @@ This {model_type} model was trained 2x faster with [Unsloth](https://github.com/
 [<img src="https://raw.githubusercontent.com/unslothai/unsloth/main/images/unsloth%20made%20with%20love.png" width="200"/>](https://github.com/unslothai/unsloth)
 """
 
-import torch
-try:
-    import bitsandbytes as bnb
-    _BNB_LINEAR4BIT = (bnb.nn.Linear4bit,)
-except Exception:
-    # No bnb (e.g. gfx906, whose generic wheel has no kernels) -> no 4bit layers
-    # exist, so the isinstance check below is simply always False.
-    bnb = None
-    _BNB_LINEAR4BIT = ()
+class _LazyModule:
+    """Import-on-first-attribute proxy so this module stays importable on
+    hosts without the heavy CUDA-side dependencies (e.g. MLX-only Apple
+    installs importing the adapter-format helpers below)."""
+    def __init__(self, name):
+        self._lazy_name = name
+        self._lazy_module = None
+    def __getattr__(self, attr):
+        if self._lazy_module is None:
+            import importlib
+            self._lazy_module = importlib.import_module(self._lazy_name)
+        return getattr(self._lazy_module, attr)
+
+
+class _LazyLogger:
+    """Defers unsloth_zoo.temporary_patches.common (which imports torch)."""
+    def __getattr__(self, attr):
+        from unsloth_zoo.temporary_patches.common import logger as _logger
+        return getattr(_logger, attr)
+
+logger = _LazyLogger()
+
+def _unsloth_logging_enabled():
+    from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING
+    return UNSLOTH_ENABLE_LOGGING
+
+def _device_type():
+    from .device_type import DEVICE_TYPE
+    return DEVICE_TYPE
+
+def _device_type_torch():
+    from .device_type import DEVICE_TYPE_TORCH
+    return DEVICE_TYPE_TORCH
+
+def _device_empty_cache():
+    from .device_type import device_empty_cache
+    return device_empty_cache()
+
+def _st_save_file(*args, **kwargs):
+    from safetensors.torch import save_file as _sf
+    return _sf(*args, **kwargs)
+
+torch = _LazyModule("torch")
+bnb = _LazyModule("bitsandbytes")
+
+def _lazy_symbol(module_name, symbol):
+    import importlib
+    return getattr(importlib.import_module(module_name), symbol)
+
+def _inference_mode(fn):
+    """@torch.inference_mode without importing torch at decoration time."""
+    import functools
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with torch.inference_mode():
+            return fn(*args, **kwargs)
+    return _wrapped
+
+
+def _bnb_linear4bit():
+    # Empty when bitsandbytes is absent (e.g. gfx906, whose generic wheel has
+    # no kernels) or stubbed out, as it is on hosts with no CUDA build: either
+    # way there are no 4bit layers, so isinstance against an empty tuple is
+    # exactly right. Resolved lazily to keep the import off this module's
+    # import path, and filtered to real classes because the stub answers every
+    # attribute with a placeholder object that isinstance would reject.
+    try:
+        candidate = bnb.nn.Linear4bit
+    except Exception:
+        return ()
+    return (candidate,) if isinstance(candidate, type) else ()
 try:
     from huggingface_hub import get_token
 except:
@@ -85,19 +143,17 @@ except:
         from huggingface_hub.utils._token import get_token
     pass
 pass
-from transformers.modeling_utils import PushToHubMixin
 import json
 import os
 from pathlib import Path
 from typing import Union, List, Optional
 import tempfile
-from peft import PeftModelForCausalLM, PeftModel
 
 def find_skipped_quantized_modules(model):
     skipped_modules = []
     quantized_modules = []
     for name, module in model.named_modules():
-        if isinstance(module, _BNB_LINEAR4BIT):
+        if isinstance(module, _bnb_linear4bit()):
             if hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
                 quantized_modules.append(name)
             else:
@@ -159,7 +215,6 @@ from huggingface_hub import (
     HfFileSystem,
 )
 from safetensors import safe_open
-from safetensors.torch import save_file
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
@@ -173,7 +228,7 @@ _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 def _active_merge_device():
     """Pick the active accelerator family for LoRA merge math, cached.
 
-    Hardcoding "cuda" breaks ROCm/XPU/MPS; DEVICE_TYPE_TORCH drops MPS (needed
+    Hardcoding "cuda" breaks ROCm/XPU/MPS; _device_type_torch() drops MPS (needed
     by the MLX backend's on-host merge). So probe at first call instead.
     """
     if torch.cuda.is_available():
@@ -229,7 +284,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     # for export has no merge-time provenance signal, so it would also fold onto dequant(W4).
     if use_dequant_base and _is_bnb_4bit_base(getattr(lora_stats, "module", None)):
         try:
-            W_dq = dequantize_module_weight(lora_stats.module)
+            W_dq = _lazy_symbol("peft.utils.integrations", "dequantize_module_weight")(lora_stats.module)
         except Exception as e:
             # For a gated arch the 16bit base is the known-wrong base (the +q error this path
             # exists to remove), so silently folding onto it would emit a corrupt merged_16bit.
@@ -345,7 +400,6 @@ def expand_module_keys(name, module, original_keys):
 pass
 
 
-from peft.utils.integrations import dequantize_module_weight
 import collections
 import numpy as np
 import inspect
@@ -445,12 +499,12 @@ def _get_lora_scaling(module):
 pass
 
 
-@torch.inference_mode
+@_inference_mode
 def create_lora_statistics(model, merge_into_original = False, return_state_dict = True):
     # All Unsloth Zoo code licensed under LGPLv3
     # merge_into_original is merging directly into 16bit downloaded model
     # without dequantizing
-    Linear_LoRA_Layers = get_lora_layer_modules()
+    Linear_LoRA_Layers = _lazy_symbol("unsloth_zoo.peft_utils", "get_lora_layer_modules")()
     Linear_LoRA_Layers = tuple(x[0] for x in Linear_LoRA_Layers)
 
     lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
@@ -622,38 +676,35 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 pass
 
 
-import torch
 import gc
 import time
 import safetensors
 import json
 import mmap
 import ctypes
-# Mapping from BF16 to torch.blfloat16 etc
-try:
-    SAFETENSORS_DTYPES = safetensors.torch._TYPES
-except:
-    logger.info("Unsloth: `safetensors.torch._TYPES` does not exist. Will set to our default version")
-    SAFETENSORS_DTYPES = {
-        'F64': torch.float64,
-        'F32': torch.float32,
-        'F16': torch.float16,
-        'BF16': torch.bfloat16,
-        'I64': torch.int64,
-        'I32': torch.int32,
-        'I16': torch.int16,
-        'I8': torch.int8,
-        'U8': torch.uint8,
-        'BOOL': torch.bool,
-        'F8_E4M3': torch.float8_e4m3fn,
-        'F8_E5M2': torch.float8_e5m2,
-        'U64': torch.uint64,
-        'U32': torch.uint32,
-        'U16': torch.uint16,
-    }
-pass
+# BF16 -> torch.bfloat16 etc; lazy because both sources import torch.
+_SAFETENSORS_DTYPES_CACHE = None
+def _safetensors_dtypes():
+    global _SAFETENSORS_DTYPES_CACHE
+    if _SAFETENSORS_DTYPES_CACHE is None:
+        try:
+            # No longer imported eagerly anywhere; without this a fresh process
+            # takes the smaller fallback table and KeyErrors on newer dtype tags.
+            import safetensors.torch as _st_mod
+            _SAFETENSORS_DTYPES_CACHE = _st_mod._TYPES
+        except Exception:
+            logger.info("Unsloth: `safetensors.torch._TYPES` does not exist. Will set to our default version")
+            _SAFETENSORS_DTYPES_CACHE = {
+                'F64': torch.float64, 'F32': torch.float32, 'F16': torch.float16,
+                'BF16': torch.bfloat16, 'I64': torch.int64, 'I32': torch.int32,
+                'I16': torch.int16, 'I8': torch.int8, 'U8': torch.uint8,
+                'BOOL': torch.bool, 'F8_E4M3': torch.float8_e4m3fn,
+                'F8_E5M2': torch.float8_e5m2, 'U64': torch.uint64,
+                'U32': torch.uint32, 'U16': torch.uint16,
+            }
+    return _SAFETENSORS_DTYPES_CACHE
 
-@torch.inference_mode
+@_inference_mode
 def _merge_and_overwrite_lora(
     save_directory,
     filename,
@@ -671,7 +722,7 @@ def _merge_and_overwrite_lora(
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
-        if UNSLOTH_ENABLE_LOGGING:
+        if _unsloth_logging_enabled():
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
         # mxfp4 needs the full-rewrite path
         return _merge_and_overwrite_lora_mxfp4(
@@ -688,7 +739,7 @@ def _merge_and_overwrite_lora(
         isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights
     )
     if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit" and not _fp8_moe_expert_lora:
-        if UNSLOTH_ENABLE_LOGGING:
+        if _unsloth_logging_enabled():
             logger.info("FP8 quantized model detected. Dequantizing to 16bit via full rewrite.")
         return _merge_and_overwrite_lora_fp8(
             save_directory, filename, lora_weights, output_dtype,
@@ -757,7 +808,7 @@ def _merge_and_overwrite_lora(
                 if _ne is not None and _ne > 1:
                     moe_num_experts[_prefix] = _ne
             processed_mxfp4_keys = set()
-            if UNSLOTH_ENABLE_LOGGING:
+            if _unsloth_logging_enabled():
                 try:
                     logger.info(f"[merge_debug] Converted LoRA keys (sample): {list(converted_lora_weights.keys())[:6]}")
                 except Exception:
@@ -784,7 +835,7 @@ def _merge_and_overwrite_lora(
                     continue
 
                 if (
-                    UNSLOTH_ENABLE_LOGGING
+                    _unsloth_logging_enabled()
                     and count == 0
                     and len(processed_moe_gate) == 0
                     and len(processed_mxfp4_keys) == 0
@@ -841,7 +892,7 @@ def _merge_and_overwrite_lora(
                 # sharded as per-expert gate_proj/up_proj on disk.
                 m_gate = re.match(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj)\.weight$", key)
                 if m_gate:
-                    if UNSLOTH_ENABLE_LOGGING and len(processed_moe_gate) < 2:
+                    if _unsloth_logging_enabled() and len(processed_moe_gate) < 2:
                         logger.info(f"[merge_debug] Matched gate/up key {key}")
                     base_prefix, expert_idx, proj_type = m_gate.groups()
                     expert_idx = int(expert_idx)
@@ -891,11 +942,11 @@ def _merge_and_overwrite_lora(
                     fused_key = base_prefix  # down_proj LoRA stored on experts module
                     lora_stats = converted_lora_weights.get(fused_key)
                     if lora_stats is None and len(processed_moe_gate) < 3:
-                        if UNSLOTH_ENABLE_LOGGING:
+                        if _unsloth_logging_enabled():
                             logger.info(f"[merge_debug] No LoRA found for down_proj prefix {base_prefix}")
                     if lora_stats is not None and lora_stats.lora_A is not None and lora_stats.lora_B is not None:
                         num_experts = moe_num_experts.get(base_prefix, None)
-                        if UNSLOTH_ENABLE_LOGGING:
+                        if _unsloth_logging_enabled():
                             logger.info(f"[merge_debug] Applying down_proj LoRA for {fused_key} expert {expert_idx}")
                         down_W = file.get_tensor(key)
                         merged_down = _merge_moe_down_proj_expert(
@@ -913,7 +964,7 @@ def _merge_and_overwrite_lora(
                     # In this mode, we don't dequantize or modify MXFP4 tensors.
                     # Since we're doing an in-place overwrite on the file,
                     # skipping these keys leaves them untouched in the final model file.
-                    if UNSLOTH_ENABLE_LOGGING:
+                    if _unsloth_logging_enabled():
                         logger.info(f"[DEBUG] Preserving MXFP4 tensor: {key}")
                     continue
                 pass
@@ -976,7 +1027,7 @@ def _merge_and_overwrite_lora(
                 del W
                 # flush only after a large tensor; per-key flush was pure stall.
                 if nbytes >= _EMPTY_CACHE_BYTES_THRESHOLD:
-                    device_empty_cache()
+                    _device_empty_cache()
             pass
         pass
         mm.flush()
@@ -989,7 +1040,7 @@ def _merge_and_overwrite_lora(
         if resized:
             _merge_and_overwrite_lora._resized = {}
             gc.collect()
-            device_empty_cache()
+            _device_empty_cache()
 
             temp_dir = os.path.dirname(os.path.abspath(filename_original))
             est_bytes = _estimate_resized_shard_bytes(header_metadata, resized, length_of_header)
@@ -1026,9 +1077,9 @@ def _merge_and_overwrite_lora(
                 )
             del resized
             gc.collect()
-            device_empty_cache()
+            _device_empty_cache()
 
-        device_empty_cache()
+        _device_empty_cache()
         return count, safetensor_keys_seen
 
     except RuntimeError:
@@ -1439,7 +1490,7 @@ def _resolve_moe_num_experts(prefix, lora_stats, moe_num_experts):
             value = getattr(module, attr, None)
             if isinstance(value, int) and value > 1:
                 moe_num_experts[prefix] = value
-                if UNSLOTH_ENABLE_LOGGING:
+                if _unsloth_logging_enabled():
                     try:
                         logger.info(
                             f"[merge_debug] Derived num_experts={value} for {prefix} from module.{attr}"
@@ -1465,7 +1516,7 @@ def _resolve_moe_num_experts(prefix, lora_stats, moe_num_experts):
 
     candidate = total_rank // rank
     moe_num_experts[prefix] = candidate
-    if UNSLOTH_ENABLE_LOGGING:
+    if _unsloth_logging_enabled():
         try:
             logger.info(
                 f"[merge_debug] Derived num_experts={candidate} for {prefix} from LoRA stats"
@@ -1535,7 +1586,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
     count = 0
     debug_logged = 0
     file_path = getattr(file, "path", None)
-    if UNSLOTH_ENABLE_LOGGING:
+    if _unsloth_logging_enabled():
         try:
             logger.info(
                 f"[merge_debug] Running MoE expert merge for {file_path or 'safetensors shard'}"
@@ -1565,7 +1616,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     _is_transposed_format = shape[2] > shape[1]
                 break
 
-    if is_gpt_oss_format and UNSLOTH_ENABLE_LOGGING:
+    if is_gpt_oss_format and _unsloth_logging_enabled():
         try:
             logger.info(f"[merge_debug] Detected fused 3D tensor format (transposed={_is_transposed_format})")
         except Exception:
@@ -1593,7 +1644,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             if _fused_key in processed_mxfp4_keys:
                 continue
             _fused_W = file.get_tensor(_fused_key)
-            if _fused_W.dim() != 3 or _fused_W.dtype in _FP8_WEIGHT_DTYPES:
+            if _fused_W.dim() != 3 or _fused_W.dtype in _fp8_weight_dtypes():
                 continue
             _num_experts_disk = _fused_W.shape[0]
             _device = _active_merge_device()
@@ -1656,7 +1707,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 gate_up_key = f"{shard_prefix}.gate_up_proj"
                 if gate_up_key in header_metadata:
                     gate_up_W = file.get_tensor(gate_up_key)
-                    if gate_up_W.dtype in _FP8_WEIGHT_DTYPES:
+                    if gate_up_W.dtype in _fp8_weight_dtypes():
                         raise RuntimeError(
                             "Unsloth: FP8 fused MoE expert LoRA merge (gate_up_proj) is not "
                             "supported; merging raw FP8 without its companion scale would "
@@ -1677,7 +1728,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     )
                     processed_mxfp4_keys.add(gate_up_key)
                     module_updated = True
-                    if UNSLOTH_ENABLE_LOGGING and debug_logged < 8:
+                    if _unsloth_logging_enabled() and debug_logged < 8:
                         try:
                             logger.info(
                                 f"[merge_debug] Merged GPT-OSS gate_up_proj for {shard_prefix}"
@@ -1690,7 +1741,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 down_key = f"{shard_prefix}.down_proj"
                 if down_key in header_metadata:
                     down_W = file.get_tensor(down_key)
-                    if down_W.dtype in _FP8_WEIGHT_DTYPES:
+                    if down_W.dtype in _fp8_weight_dtypes():
                         raise RuntimeError(
                             "Unsloth: FP8 fused MoE expert LoRA merge (down_proj) is not "
                             "supported; merging raw FP8 without its companion scale would "
@@ -1711,7 +1762,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                     )
                     processed_mxfp4_keys.add(down_key)
                     module_updated = True
-                    if UNSLOTH_ENABLE_LOGGING and debug_logged < 8:
+                    if _unsloth_logging_enabled() and debug_logged < 8:
                         try:
                             logger.info(
                                 f"[merge_debug] Merged GPT-OSS down_proj for {shard_prefix}"
@@ -1741,7 +1792,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             prefix, resolution_stats, moe_num_experts,
             header_metadata, (gate_name, up_name, down_name),
         )
-        if UNSLOTH_ENABLE_LOGGING and num_experts is not None and debug_logged < 2:
+        if _unsloth_logging_enabled() and num_experts is not None and debug_logged < 2:
             try:
                 logger.info(
                     f"[merge_debug] {lora_key}: merging {num_experts} experts via MoE merge path"
@@ -1750,7 +1801,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
             except Exception:
                 pass
         if num_experts is None or num_experts == 0:
-            if UNSLOTH_ENABLE_LOGGING and debug_logged < 4:
+            if _unsloth_logging_enabled() and debug_logged < 4:
                 try:
                     logger.info(f"[merge_debug] Skipping {lora_key}: num_experts missing")
                     debug_logged += 1
@@ -1760,7 +1811,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 
         module_updated = False
         already_counted = lora_key in counted_lora_modules
-        if UNSLOTH_ENABLE_LOGGING and debug_logged < 8:
+        if _unsloth_logging_enabled() and debug_logged < 8:
             try:
                 logger.info(f"[merge_debug] Merging {lora_key} is_gate={is_gate} num_experts={num_experts} A={tuple(lora_stats.lora_A.shape) if getattr(lora_stats,'lora_A',None) is not None else None} B={tuple(lora_stats.lora_B.shape) if getattr(lora_stats,'lora_B',None) is not None else None}")
                 debug_logged += 1
@@ -2019,7 +2070,7 @@ def _mxfp4_base_returns_transposed(convert_cpu_variant, transformers_version):
         # are treated like the final 4.56.0, which self-transposes -- a plain
         # Version(...) >= Version("4.56.0") sorts every pre-release BELOW 4.56.0 and
         # would wrongly re-apply the external transpose (double-transpose) on them.
-        return Version(transformers_version).release >= (4, 56, 0)
+        return _lazy_symbol("unsloth_zoo.utils", "Version")(transformers_version).release >= (4, 56, 0)
     except Exception:
         # Version unparseable: assume the modern stock behaviour (self-transposes).
         return True
@@ -2063,7 +2114,7 @@ def _fold_perexpert_lora_into_fused(W, fused_base_name, converted_lora_weights):
 pass
 
 
-@torch.inference_mode
+@_inference_mode
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -2129,7 +2180,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 blocks_tensor, scales_tensor = file.get_tensor(key), file.get_tensor(scales_key)
 
                 # Free the allocator before the large dequant alloc.
-                device_empty_cache()
+                _device_empty_cache()
 
                 # Pick device + chunk size for mxfp4 dequantization
                 device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
@@ -2164,7 +2215,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     W = _cmpt_cpu(
                         blocks_tensor, scales_tensor, rows_per_chunk=rows_per_chunk
                     ).transpose(1, 2).contiguous()
-                    if UNSLOTH_ENABLE_LOGGING:
+                    if _unsloth_logging_enabled():
                         logger.info(f"[DEBUG] Using CPU dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
                 else:
                     W = _cmpt_base(
@@ -2173,7 +2224,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     # Add the external transpose unless the base already returns the transposed
                     # GPT-OSS layout (stock transformers >= 4.56.0).
                     W = W.contiguous() if _base_returns_transposed else W.transpose(1, 2).contiguous()
-                    if UNSLOTH_ENABLE_LOGGING:
+                    if _unsloth_logging_enabled():
                         _which = "GPU" if device_type != 'cpu' else "CPU-fallback"
                         logger.info(f"[DEBUG] Using {_which} dequantization for {base_name} with {rows_per_chunk:,} rows per chunk")
 
@@ -2186,7 +2237,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     # use_dora adapter on the experts bypasses the refuse and _merge_lora fails with an
                     # opaque shape error on the 3D expert group instead of the clear message.
                     _refuse_dora_on_moe(lora_stats)
-                    if UNSLOTH_ENABLE_LOGGING:
+                    if _unsloth_logging_enabled():
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
                 else:
@@ -2194,7 +2245,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     # lookup above misses it, so fold each delta into its slice of W.
                     _folded = _fold_perexpert_lora_into_fused(W, base_name, converted_lora_weights)
                     count += _folded
-                    if UNSLOTH_ENABLE_LOGGING:
+                    if _unsloth_logging_enabled():
                         if _folded:
                             logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING {_folded} per-expert LoRA(s) into Key Group: {base_name}")
                         else:
@@ -2243,7 +2294,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
             # Free VRAM only after a large dequant/merge, not every small tensor.
             if W.numel() * W.element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
-                device_empty_cache()
+                _device_empty_cache()
 
     # CRITICAL: Force cleanup to release file handles on Windows
     if os.name == 'nt':
@@ -2254,7 +2305,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
         temp_filename_safetensors = tmpfile.name
 
-    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
+    _st_save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
 
     # Replace the temporary file with the original file
     try:
@@ -2290,9 +2341,11 @@ pass
 
 # FP8 weight dtypes and companion scale suffixes (dropped on merge). Underscore
 # variants cover fused params whose scale is <key>_scale(_inv), not <key>.weight_scale.
-_FP8_WEIGHT_DTYPES = tuple(
-    getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
-)
+def _fp8_weight_dtypes():
+    return tuple(
+        getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2")
+        if hasattr(torch, _n)
+    )
 _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
                        "_scale_inv", "_scale")
 # safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
@@ -2309,7 +2362,7 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
     """
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
     W = file.get_tensor(weight_key)
-    if W.dtype not in _FP8_WEIGHT_DTYPES:
+    if W.dtype not in _fp8_weight_dtypes():
         return W, []
     base = weight_key[: -len(".weight")] if weight_key.endswith(".weight") else weight_key
     # <base>.weight_scale(_inv) for .weight; <key>_scale(_inv) for fused params.
@@ -2475,7 +2528,7 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
                     tensors[key] = f.get_tensor(key).contiguous()
         with tempfile.NamedTemporaryFile(suffix = ".safetensors", dir = save_directory, delete = False) as tmp:
             tmp_path = tmp.name
-        save_file(tensors, tmp_path, metadata = {"format": "pt"})
+        _st_save_file(tensors, tmp_path, metadata = {"format": "pt"})
         os.replace(tmp_path, path)
         removed.update(drop)
     return removed
@@ -2581,7 +2634,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             tensors[output_key] = W.to(device = "cpu", dtype = write_dtype).contiguous()
             del W
             if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
-                device_empty_cache()
+                _device_empty_cache()
 
         # Remove the dropped scale companions from the rewritten shard.
         for sk in scale_keys_to_drop:
@@ -2596,7 +2649,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
 
     with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
         temp_filename_safetensors = tmpfile.name
-    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
+    _st_save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
     try:
         os.replace(temp_filename_safetensors, filename_original)
     except OSError as e:
@@ -2683,7 +2736,7 @@ def prepare_saving(
         pass
     pass
 
-    if output_dtype is None: output_dtype = _get_dtype(dtype_from_config(model.config))
+    if output_dtype is None: output_dtype = _lazy_symbol("unsloth_zoo.utils", "_get_dtype")(_lazy_symbol("unsloth_zoo.hf_utils", "dtype_from_config")(model.config))
     assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
     assert(type(torch.bfloat16) is torch.dtype)
     element_size = torch.tensor([], dtype = output_dtype).element_size()
@@ -2877,7 +2930,7 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
-@torch.inference_mode
+@_inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
     model,
@@ -2894,7 +2947,7 @@ def merge_and_overwrite_lora(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Directly downloads 16bit original weights and merges LoRA
-    inner_model = model.base_model.model if isinstance(model, PeftModel) else model
+    inner_model = model.base_model.model if isinstance(model, _lazy_symbol("peft", "PeftModel")) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
     safetensors_list = []
     max_size_in_bytes = 0
@@ -2902,7 +2955,7 @@ def merge_and_overwrite_lora(
     config = model.config
 
     for loop_iteration in range(2):
-        if not isinstance(model, PeftModel):
+        if not isinstance(model, _lazy_symbol("peft", "PeftModel")):
             warnings.warn("Model is not a PeftModel (no Lora adapters detected). Skipping Merge. Please use save_pretrained() or push_to_hub() instead!")
             return None
         if loop_iteration == 0:
@@ -2923,7 +2976,7 @@ def merge_and_overwrite_lora(
         if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit":
             _sibling = _resolve_fp8_16bit_sibling(model_name, token)
             if _sibling is not None:
-                if UNSLOTH_ENABLE_LOGGING:
+                if _unsloth_logging_enabled():
                     logger.info(f"Unsloth: FP8 base detected; merging onto 16bit sibling `{_sibling}`.")
                 model_name = _sibling
                 final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token, save_method)
@@ -3165,16 +3218,16 @@ def merge_and_overwrite_lora(
 
     # --- Handle 4-bit merging first ---
     if save_method == "merged_4bit" or save_method == "forced_merged_4bit":
-        base_model = model.base_model if isinstance(model, PeftModel) else model
+        base_model = model.base_model if isinstance(model, _lazy_symbol("peft", "PeftModel")) else model
         print(f"Unsloth: Merging LoRA weights into 4bit model...")
-        if not isinstance(model, PeftModelForCausalLM) and not isinstance(model, PeftModel):
+        if not isinstance(model, _lazy_symbol("peft", "PeftModelForCausalLM")) and not isinstance(model, _lazy_symbol("peft", "PeftModel")):
              raise TypeError("Model must be a PeftModelForCausalLM or PeftModel for 'merged_4bit' save.")
         if not getattr(model.config, "quantization_config", None):
              raise ValueError("Model does not appear to be quantized. Cannot use 'merged_4bit'.")
 
         # Perform the merge
         try:
-            # Use the base_model reference which points to the PeftModel's base
+            # Use the base_model reference which points to the _lazy_symbol("peft", "PeftModel")'s base
             merged_model = base_model.merge_and_unload()
             print(f"Unsloth: Merging finished.")
         except Exception as e:
@@ -3244,7 +3297,7 @@ def merge_and_overwrite_lora(
 
     # Step 3: Conditional index handling
     import subprocess
-    is_t4 = DEVICE_TYPE == "cuda" and "Tesla T4" in torch.cuda.get_device_name(0)
+    is_t4 = _device_type() == "cuda" and "Tesla T4" in torch.cuda.get_device_name(0)
     needs_splitting = should_split_shards(is_t4, config, safetensors_list, max_size_in_bytes) if save_method == "merged_16bit" else False
     _hf_cache_dir = _get_hf_cache_dir()
     copied_all_from_cache = False
@@ -3447,7 +3500,7 @@ def merge_and_overwrite_lora(
     # path in the loop below. Keeps a genuine 16bit output instead of FP8-labelled-as-16bit.
     if (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit"
             and any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights)):
-        if UNSLOTH_ENABLE_LOGGING:
+        if _unsloth_logging_enabled():
             logger.info("FP8 MoE-expert LoRA detected: dequantizing to 16bit, then merging experts.")
         _prerewrite_fp8_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list)
         for _fn in final_safetensors_list:
@@ -3488,7 +3541,7 @@ def merge_and_overwrite_lora(
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
-        device_empty_cache()
+        _device_empty_cache()
 
         file_path = os.path.join(save_directory, filename)
 
@@ -3734,8 +3787,8 @@ pass
 
 _PUSHING_CODE = \
 """
-PushToHubMixin._upload_modified_files(
-    PushToHubMixin,
+_lazy_symbol("transformers.modeling_utils", "PushToHubMixin")._upload_modified_files(
+    _lazy_symbol("transformers.modeling_utils", "PushToHubMixin"),
     working_dir = save_directory,
     repo_id = '{repo_id}',
     files_timestamps = files_timestamps,
@@ -3752,7 +3805,7 @@ else:
 if {use_temp_file}:
     temp_file = tempfile.TemporaryDirectory(ignore_cleanup_errors = True)
     save_directory = temp_file.name
-files_timestamps = PushToHubMixin._get_files_timestamps(PushToHubMixin, save_directory)
+files_timestamps = _lazy_symbol("transformers.modeling_utils", "PushToHubMixin")._get_files_timestamps(_lazy_symbol("transformers.modeling_utils", "PushToHubMixin"), save_directory)
 """
 
 def incremental_save_pretrained(
@@ -3855,7 +3908,7 @@ def merge_and_dequantize_lora(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantizes model to 16bit weights and merges LoRA
-    inner_model = model.base_model.model if isinstance(model, PeftModelForCausalLM) else model
+    inner_model = model.base_model.model if isinstance(model, _lazy_symbol("peft", "PeftModelForCausalLM")) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
 
     (
@@ -3947,7 +4000,7 @@ def merge_and_dequantize_lora(
         x = state_dict[name]
         if type(x) is LoraStats:
             DEQUANTIZED_KEYS.append(name)
-            W = dequantize_module_weight(x.module)
+            W = _lazy_symbol("peft.utils.integrations", "dequantize_module_weight")(x.module)
             W = _merge_lora(W, x, name)
             x = W.to(device = 'cpu', dtype = {str(output_dtype)}, non_blocking = True)
         # Remove memory leak
@@ -3988,8 +4041,8 @@ def merge_and_dequantize_lora(
     save_pretrained_dequantized = functions["save_pretrained_dequantized"]
     save_pretrained_dequantized = torch.inference_mode(save_pretrained_dequantized)
 
-    files_timestamps = PushToHubMixin._get_files_timestamps(
-        PushToHubMixin,
+    files_timestamps = _lazy_symbol("transformers.modeling_utils", "PushToHubMixin")._get_files_timestamps(
+        _lazy_symbol("transformers.modeling_utils", "PushToHubMixin"),
         save_directory,
     )
     save_pretrained_dequantized(
@@ -4008,8 +4061,8 @@ def merge_and_dequantize_lora(
     if tokenizer is not None: tokenizer.save_pretrained(save_directory = save_directory,)
 
     if push_to_hub:
-        commit = PushToHubMixin._upload_modified_files(
-            PushToHubMixin,
+        commit = _lazy_symbol("transformers.modeling_utils", "PushToHubMixin")._upload_modified_files(
+            _lazy_symbol("transformers.modeling_utils", "PushToHubMixin"),
             working_dir = save_directory,
             repo_id = repo_id,
             files_timestamps = files_timestamps,
@@ -5529,7 +5582,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
             combined_score = calculate_combined_score(3.0, chunk_size)
 
             suitable_strategies.append({
-                'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
+                'device_type': _device_type_torch(),  # 'cuda' on ROCm (PyTorch alias)
                 'device_id': gpu['device_id'],
                 'rows_per_chunk': chunk_size,
                 'available_memory': gpu['free'] * GPU_SAFETY_FACTOR,
@@ -5577,7 +5630,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
 
         best = suitable_strategies[0]
 
-        if UNSLOTH_ENABLE_LOGGING:
+        if _unsloth_logging_enabled():
             logger.info(
                 f"[MXFP4] Selected {best['device_type']}:{best['device_id'] or ''} "
                 f"with {best['rows_per_chunk']:,} rows per chunk "
@@ -5603,7 +5656,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     # Add GPU fallbacks
     for gpu in stats['gpus']:
         fallback_options.append({
-            'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
+            'device_type': _device_type_torch(),  # 'cuda' on ROCm (PyTorch alias)
             'device_id': gpu['device_id'],
             'available': gpu['free'] * GPU_SAFETY_FACTOR,
             'total_available': gpu['free']
@@ -5676,16 +5729,16 @@ def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
         for i, shard in enumerate(shards):
             temp_filename = f"temp_split_{temp_base}_{i:03d}.safetensors"
             temp_file_path = os.path.join(save_directory, temp_filename)
-            save_file(shard, temp_file_path, metadata={"format": "pt"})
+            _st_save_file(shard, temp_file_path, metadata={"format": "pt"})
             temp_filenames.append(temp_filename)
 
             shard_size = sum(tensor.numel() * tensor.element_size() for tensor in shard.values())
-            if UNSLOTH_ENABLE_LOGGING:
+            if _unsloth_logging_enabled():
                 logger.info(f"Created temp chunk: {temp_filename} (size: {shard_size / (1024**3):.2f} GB)")
 
         # Remove original file
         os.remove(file_path)
-        if UNSLOTH_ENABLE_LOGGING:
+        if _unsloth_logging_enabled():
             logger.info(f"Removed original file: {filename}")
 
         return temp_filenames
@@ -5704,7 +5757,7 @@ def renumber_safetensor_files(file_list, save_directory):
             new_path = os.path.join(save_directory, "model.safetensors")
             if os.path.exists(old_path):
                 os.rename(old_path, new_path)
-                if UNSLOTH_ENABLE_LOGGING:
+                if _unsloth_logging_enabled():
                     logger.info(f"Renamed {file_list[0]} -> model.safetensors")
             return ["model.safetensors"]
         return file_list
@@ -5713,7 +5766,7 @@ def renumber_safetensor_files(file_list, save_directory):
     total_files = len(file_list)
     clean_names = [f"model-{i+1:05d}-of-{total_files:05d}.safetensors" for i in range(total_files)]
 
-    if UNSLOTH_ENABLE_LOGGING:
+    if _unsloth_logging_enabled():
         logger.info("Unsloth: Renumbering safetensor files with sequential numbering...")
 
     # Create mapping of old -> new names
@@ -5729,7 +5782,7 @@ def renumber_safetensor_files(file_list, save_directory):
             temp_path = os.path.join(save_directory, f"renaming_{new_name}")
             os.rename(old_path, temp_path)
             os.rename(temp_path, new_path)
-            if UNSLOTH_ENABLE_LOGGING:
+            if _unsloth_logging_enabled():
                 logger.info(f"Renamed {old_name} -> {new_name}")
 
     return clean_names
@@ -5775,7 +5828,7 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
     # Cast resized tensors to the header dtype so bytes match the label.
     res_t = {}
     for k in resized:
-        dt = SAFETENSORS_DTYPES[header_metadata[k]["dtype"]]
+        dt = _safetensors_dtypes()[header_metadata[k]["dtype"]]
         res_t[k] = resized[k].detach().to(dt).contiguous().cpu()
 
     new_header = {}
@@ -5847,7 +5900,7 @@ def _inplace_rewrite_resized_shard(filename_original, header_metadata, resized):
     with safe_open(filename_original, framework = "pt", device = "cpu") as f:
         for key in f.keys():
             tensors[key] = resized[key] if key in resized else f.get_tensor(key)
-    save_file(tensors, filename_original, metadata = meta)
+    _st_save_file(tensors, filename_original, metadata = meta)
     tensors.clear()
 
 
@@ -5879,7 +5932,7 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
                 pass
 
         gc.collect()
-        device_empty_cache()
+        _device_empty_cache()
 
         for attempt in range(max_retries):
             try:
@@ -5903,7 +5956,7 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
                 )
                 if is_lock_error and attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    if UNSLOTH_ENABLE_LOGGING:
+                    if _unsloth_logging_enabled():
                         logger.warning(
                             f"[Retry {attempt + 1}/{max_retries}] Windows file lock "
                             f"detected for {filename_original}: {e}. "
@@ -5955,7 +6008,7 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         tensor_bytes = tensor_formatted.untyped_storage().nbytes()
 
         if tensor_bytes != expected_size:
-            if UNSLOTH_ENABLE_LOGGING:
+            if _unsloth_logging_enabled():
                 logger.warning(f"Size mismatch for {output_key}: expected {expected_size}, got {tensor_bytes}")
             return False
 
@@ -5973,7 +6026,7 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         return True
 
     except Exception as e:
-        if UNSLOTH_ENABLE_LOGGING:
+        if _unsloth_logging_enabled():
             logger.info(f"Direct tensor write failed for {output_key}: {e}")
         return False
 pass
@@ -5992,3 +6045,522 @@ pass
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+# ---------------------------------------------------------------------------
+# PEFT <-> MLX LoRA adapter interop. PEFT adapters
+# (adapter_model.safetensors, lora_A/lora_B keys under a base_model.model.
+# prefix) and mlx-lm adapters (adapters.safetensors, lora_a/lora_b keys)
+# encode the same math in different layouts:
+#
+#     peft {p}.lora_A.weight [r, in]   ==  mlx {p}.lora_a [in, r], transposed
+#     peft {p}.lora_B.weight [out, r]  ==  mlx {p}.lora_b [r, out], transposed
+#     effective scale = lora_alpha / r     (rsLoRA: lora_alpha / sqrt(r))
+#
+# Conversion is rename + transpose only; dtypes are preserved exactly and a
+# round trip is bitwise-identical for the supported subset (plain linear
+# LoRA). Adapters carrying DoRA magnitudes, modules_to_save state, embedding
+# LoRA, or expert target_parameters factors are refused with a named reason
+# instead of being partially or lossily converted. Tensor IO prefers
+# mlx.core (native bfloat16) with a safetensors.torch fallback off Apple
+# hardware; the safetensors numpy backend cannot represent bf16.
+# ---------------------------------------------------------------------------
+
+import math
+import re
+
+PEFT_WEIGHTS_FILE = "adapter_model.safetensors"
+MLX_WEIGHTS_FILE = "adapters.safetensors"
+_PEFT_PREFIX = "base_model.model."
+
+# peft resolves rank_pattern / alpha_pattern keys by ordered first-match against
+# the module path, and a key may be a regex fragment; mirror peft's expression
+# exactly (end-anchored, optional dotted ancestry).
+def _resolve_pattern(patterns, module_path):
+    if not patterns:
+        return None
+    for key, value in patterns.items():
+        try:
+            if re.match(rf"(.*\.)?({key})$", module_path):
+                return value
+        except re.error:
+            # A malformed regex key cannot silently mean "no override".
+            raise ValueError(
+                f"Unsloth MLX: PEFT pattern key {key!r} is not a valid "
+                f"regular expression; fix rank_pattern/alpha_pattern in "
+                f"adapter_config.json."
+            )
+    return None
+
+
+def _tensor_backend():
+    """Return (name, load_file, save_file, transpose) for the host."""
+    try:
+        import mlx.core as mx
+
+        def _load(path):
+            return dict(mx.load(str(path)))
+
+        def _save(path, tensors):
+            mx.save_safetensors(str(path), tensors)
+
+        return "mlx", _load, _save, lambda t: t.T
+    except ImportError:
+        pass
+    try:
+        import torch  # noqa: F401
+        from safetensors.torch import load_file, save_file
+
+        def _transpose(t):
+            return t.transpose(0, 1).contiguous()
+
+        def _save(path, tensors):
+            # safetensors.torch.save_file takes (tensors, filename); normalize
+            # to the (path, tensors) order the mlx branch uses.
+            save_file(tensors, str(path))
+
+        return "torch", load_file, _save, _transpose
+    except ImportError:
+        raise ImportError(
+            "Unsloth MLX: adapter conversion needs mlx (Apple hosts) or "
+            "torch + safetensors (other hosts) for bf16-safe tensor IO; "
+            "the safetensors numpy backend cannot represent bfloat16."
+        )
+
+
+def detect_adapter_format(path):
+    """Return 'peft' or 'mlx' for an adapter directory; refuse ambiguity."""
+    has_peft = os.path.exists(os.path.join(path, PEFT_WEIGHTS_FILE))
+    has_mlx = os.path.exists(os.path.join(path, MLX_WEIGHTS_FILE))
+    if has_peft and has_mlx:
+        raise ValueError(
+            f"Unsloth MLX: {path!r} contains both {PEFT_WEIGHTS_FILE} and "
+            f"{MLX_WEIGHTS_FILE}; cannot tell which adapter is current. "
+            "Remove one of the weight files."
+        )
+    if has_peft:
+        return "peft"
+    if has_mlx:
+        return "mlx"
+    raise FileNotFoundError(
+        f"Unsloth MLX: no adapter weights ({PEFT_WEIGHTS_FILE} or "
+        f"{MLX_WEIGHTS_FILE}) found in {path!r}."
+    )
+
+
+# Config keys this converter implements or may safely ignore. Anything else set
+# to a non-empty value is refused by name so a feature is never silently dropped
+# (an aLoRA adapter would otherwise become an always-on LoRA).
+_PEFT_HANDLED_KEYS = {
+    "peft_type", "r", "lora_alpha", "use_rslora", "lora_dropout",
+    "target_modules", "base_model_name_or_path", "revision",
+    "rank_pattern", "alpha_pattern", "layers_to_transform", "layers_pattern",
+}
+_PEFT_NEUTRAL_KEYS = {
+    "task_type", "inference_mode", "init_lora_weights", "peft_version",
+    "auto_mapping", "fan_in_fan_out", "exclude_modules",
+    # EVA redistributes ranks/alphas through the supported pattern fields and
+    # leaves base weights alone; peft serializes eva_config even at defaults.
+    "eva_config",
+    # Only meaningful when use_qalora is set, which is rejected below.
+    "qalora_group_size",
+    # megatron_core is set by default; only megatron_config makes it megatron.
+    "megatron_core",
+}
+_PEFT_REJECTED_KEYS = {
+    "use_dora": "DoRA adapters are not supported on the MLX backend yet",
+    "modules_to_save": "modules_to_save (full-weight modules) is not "
+                       "supported on the MLX backend yet",
+    "target_parameters": "expert-parameter (MoE) LoRA is not supported on "
+                         "the MLX backend yet",
+    "alora_invocation_tokens": "aLoRA adapters activate conditionally; "
+                               "converting would silently make them "
+                               "always-on",
+    "trainable_token_indices": "trainable token indices are not supported "
+                               "on the MLX backend",
+    "megatron_config": "megatron-format adapters are not supported on the "
+                       "MLX backend",
+    # Replicated/reordered stacks change which base layer a path denotes, so
+    # strict binding would attach weights to the wrong layers.
+    "layer_replication": "layer_replication adapters remap base layers and "
+                         "cannot bind onto the unmodified model",
+    # QALoRA pools/reshapes A-side inputs; not plain LoRA factors.
+    "use_qalora": "QALoRA adapters are not plain LoRA and are not supported "
+                  "on the MLX backend",
+    # Adds a trainable bias to lora_B; mlx-lm LoRA layers have no such term.
+    "lora_bias": "lora_bias (trainable LoRA bias) is not supported on the "
+                 "MLX backend",
+}
+
+
+def _is_empty(value):
+    return value in (None, False, 0, 0.0, "", "none") or value == [] or value == {}
+
+
+def normalize_peft_adapter_config(cfg, adapter_dir=None):
+    """Validate a PEFT LoraConfig dict for MLX import; return a copy with
+    zoo-loader key aliases (``base_model_revision``) filled in. Raises
+    ValueError naming the first unsupported field, so an adapter is refused
+    before the expensive base-model load.
+    """
+    if str(cfg.get("peft_type", "")).upper() != "LORA":
+        raise ValueError(
+            f"Unsloth MLX: only peft_type='LORA' adapters can be imported; "
+            f"got {cfg.get('peft_type')!r}."
+        )
+    if cfg.get("bias") not in (None, "none"):
+        raise ValueError(
+            "Unsloth MLX: PEFT LoRA bias terms (bias="
+            f"{cfg.get('bias')!r}) are not supported on the MLX backend."
+        )
+    for key, reason in _PEFT_REJECTED_KEYS.items():
+        if not _is_empty(cfg.get(key)):
+            raise ValueError(
+                f"Unsloth MLX: cannot import this PEFT adapter: {reason} "
+                f"(adapter_config.json field {key!r})."
+            )
+    # PiSSA/OLoRA/CorDA subtract their decomposition from the base at init and
+    # LoftQ writes its re-quantized weight back, so their factors only reproduce
+    # the trained model on that mutated base, which this importer never applies.
+    # peft can convert them to plain LoRA at save time; require that instead of
+    # silently changing logits.
+    init_mode = cfg.get("init_lora_weights")
+    # peft matches these case-insensitively, dispatching corda by prefix.
+    init_norm = init_mode.lower() if isinstance(init_mode, str) else ""
+    if not _is_empty(cfg.get("loftq_config")) or init_norm == "loftq":
+        raise ValueError(
+            "Unsloth MLX: LoftQ-initialized adapters assume the base weight "
+            "was replaced by its re-quantized form at initialization; "
+            "re-save the adapter converted to plain LoRA before importing."
+        )
+    if (
+        init_norm.startswith("pissa")
+        or init_norm.startswith("corda")
+        or init_norm == "olora"
+    ):
+        raise ValueError(
+            f"Unsloth MLX: init_lora_weights={init_mode!r} adapters assume "
+            "a base model mutated at initialization; re-save the adapter "
+            "converted to plain LoRA (peft's "
+            "path_initial_model_for_weight_conversion) before importing."
+        )
+    known = _PEFT_HANDLED_KEYS | _PEFT_NEUTRAL_KEYS | set(_PEFT_REJECTED_KEYS)
+    known |= {"bias", "loftq_config"}
+    for key, value in cfg.items():
+        if key in known or _is_empty(value):
+            continue
+        raise ValueError(
+            f"Unsloth MLX: PEFT adapter_config.json field {key!r}="
+            f"{value!r} is not understood by the MLX importer; refusing to "
+            "import an adapter whose semantics would be dropped."
+        )
+    normalized = dict(cfg)
+    if cfg.get("revision") and not normalized.get("base_model_revision"):
+        normalized["base_model_revision"] = cfg["revision"]
+    normalized["_unsloth_peft_import"] = True
+    if adapter_dir is not None:
+        index_file = os.path.join(adapter_dir, "adapter_model.safetensors.index.json")
+        if os.path.exists(index_file):
+            raise ValueError(
+                "Unsloth MLX: sharded PEFT adapters "
+                "(adapter_model.safetensors.index.json) are not supported."
+            )
+    return normalized
+
+
+def _effective_scale(cfg, module_path, rank):
+    alpha = _resolve_pattern(cfg.get("alpha_pattern"), module_path)
+    if alpha is None:
+        alpha = cfg.get("lora_alpha", rank)
+    denom = math.sqrt(rank) if cfg.get("use_rslora") else rank
+    return float(alpha) / float(denom)
+
+
+def group_peft_lora_pairs(tensors):
+    """Split raw PEFT tensors into {mlx_module_path: {'A':..., 'B':...}}.
+
+    Returns (pairs, rejected) where ``rejected`` maps keys to the reason they
+    cannot be treated as plain linear LoRA. The wrapper prefix is stripped
+    exactly once; keys without it are rejected rather than guessed at.
+    """
+    pairs = {}
+    rejected = {}
+    for key, tensor in tensors.items():
+        if ".lora_embedding_" in key:
+            rejected[key] = "embedding LoRA is not supported on MLX yet"
+            continue
+        if ".lora_magnitude_vector" in key:
+            rejected[key] = "DoRA magnitudes are not supported on MLX yet"
+            continue
+        m = re.match(
+            rf"^{re.escape(_PEFT_PREFIX)}(.+)\.lora_(A|B)\.weight$", key
+        )
+        if m is None:
+            rejected[key] = "not a recognized PEFT linear LoRA key"
+            continue
+        path, which = m.group(1), m.group(2)
+        pairs.setdefault(path, {})[which] = tensor
+    for path, pair in pairs.items():
+        if "A" not in pair or "B" not in pair:
+            rejected[f"{_PEFT_PREFIX}{path}.lora_*"] = (
+                "incomplete lora_A/lora_B pair"
+            )
+    pairs = {p: v for p, v in pairs.items() if "A" in v and "B" in v}
+    return pairs, rejected
+
+
+def _raise_rejected(rejected, where):
+    preview = "; ".join(f"{k}: {v}" for k, v in list(rejected.items())[:5])
+    if len(rejected) > 5:
+        preview += f"; ... (+{len(rejected) - 5} more)"
+    raise ValueError(
+        f"Unsloth MLX: {where} contains adapter tensors that cannot be "
+        f"converted as plain linear LoRA ({preview}). No partial conversion "
+        "is performed."
+    )
+
+
+def _require_fresh_dir(dst):
+    # mkdir is the lock: exactly one caller can create the directory, so
+    # racing conversions cannot interleave into one destination. Accepting
+    # a pre-existing empty directory would reopen that race (created-but-
+    # not-yet-written looks identical to empty), so it is refused too.
+    try:
+        os.makedirs(dst)
+    except FileExistsError:
+        raise ValueError(
+            f"Unsloth MLX: destination {dst!r} already exists. Adapter "
+            "conversion creates its own fresh directory so two formats can "
+            "never mix in one place; pass a path that does not exist yet."
+        )
+
+
+def _num_hidden_layers(base_config):
+    for holder in (base_config, base_config.get("text_config") or {}):
+        for key in ("num_hidden_layers", "num_layers"):
+            if isinstance(holder, dict) and holder.get(key) is not None:
+                return int(holder[key])
+    raise ValueError(
+        "Unsloth MLX: base config lacks num_hidden_layers (top-level or "
+        "text_config); cannot synthesize mlx-lm adapter metadata."
+    )
+
+
+def convert_peft_dir_to_mlx(src, dst, base_config):
+    """Convert a PEFT LoRA directory to an mlx-lm adapter directory."""
+    # Raises on a both-formats directory; the source must be unambiguous.
+    detect_adapter_format(src)
+    backend, load_file, save_file, transpose = _tensor_backend()
+    with open(os.path.join(src, "adapter_config.json"), "r") as f:
+        cfg = normalize_peft_adapter_config(json.load(f), adapter_dir=src)
+    tensors = load_file(os.path.join(src, PEFT_WEIGHTS_FILE))
+    pairs, rejected = group_peft_lora_pairs(tensors)
+    if rejected:
+        _raise_rejected(rejected, f"{src!r}")
+    if not pairs:
+        raise ValueError(f"Unsloth MLX: {src!r} has no linear LoRA tensor pairs.")
+
+    out = {}
+    ranks, scales = {}, {}
+    for path in sorted(pairs):
+        a, b = pairs[path]["A"], pairs[path]["B"]
+        # 2-D only: higher-rank factors are not linear LoRA, and the two IO
+        # backends transpose them differently.
+        if getattr(a, "ndim", 0) != 2 or getattr(b, "ndim", 0) != 2:
+            raise ValueError(
+                f"Unsloth MLX: {path} carries non-2-D LoRA factors "
+                f"(A ndim={getattr(a, 'ndim', '?')}, "
+                f"B ndim={getattr(b, 'ndim', '?')}); not plain linear LoRA."
+            )
+        rank = int(a.shape[0])
+        if int(b.shape[1]) != rank:
+            raise ValueError(
+                f"Unsloth MLX: {path} has lora_A rank {rank} but lora_B "
+                f"rank {int(b.shape[1])}; the adapter file is inconsistent."
+            )
+        out[f"{path}.lora_a"] = transpose(a)
+        out[f"{path}.lora_b"] = transpose(b)
+        ranks[path] = rank
+        scales[path] = _effective_scale(cfg, path, rank)
+    uniform_rank = len(set(ranks.values())) == 1
+    uniform_scale = len(set(scales.values())) == 1
+    any_path = next(iter(sorted(ranks)))
+    mlx_cfg = {
+        "fine_tune_type": "lora",
+        "peft_type": "LORA",
+        "num_layers": _num_hidden_layers(base_config),
+        "base_model_name_or_path": cfg.get("base_model_name_or_path", ""),
+        "lora_parameters": {
+            "rank": ranks[any_path],
+            "scale": scales[any_path],
+            "dropout": float(cfg.get("lora_dropout") or 0.0),
+            # Pin the exact module set: without "keys", mlx-lm wraps every
+            # supported projection in the selected layers, growing the topology
+            # with zero-initialized extras.
+            "keys": sorted(ranks),
+        },
+        "unsloth_mlx_lora_module_paths": sorted(ranks),
+    }
+    if cfg.get("base_model_revision"):
+        mlx_cfg["base_model_revision"] = cfg["base_model_revision"]
+    if not (uniform_rank and uniform_scale):
+        # Stock mlx-lm rebuilds from one global rank/scale; record the
+        # per-module truth and flag that reloads need the unsloth loader.
+        mlx_cfg["unsloth_mlx_lora_module_ranks"] = ranks
+        mlx_cfg["unsloth_mlx_lora_module_scales"] = scales
+        mlx_cfg["unsloth_mlx_requires_unsloth_loader"] = True
+        print(
+            "Unsloth: this adapter uses per-module ranks/alphas; the MLX "
+            "copy needs Unsloth to load (stock mlx-lm assumes one global "
+            "rank/scale)."
+        )
+    # Claim the destination only after everything above validated, so a
+    # refused conversion never leaves a half-written directory behind.
+    _require_fresh_dir(dst)
+    save_file(os.path.join(dst, MLX_WEIGHTS_FILE), out)
+    with open(os.path.join(dst, "adapter_config.json"), "w") as f:
+        json.dump(mlx_cfg, f, indent=2, sort_keys=True)
+    return dst
+
+
+def convert_mlx_dir_to_peft(src, dst, module_types=None):
+    """Convert an mlx-lm adapter directory to a PEFT LoRA directory.
+
+    ``module_types`` optionally maps module paths to ``"linear"`` /
+    ``"embedding"``. Supplying an entry is a caller assertion of BOTH facts
+    a weights file cannot establish: the module's type on the live base
+    model, AND that the same dotted path exists in the Hugging Face module
+    tree (mlx-lm renames some roots — e.g. GPT-2's ``model.h.*`` vs HF's
+    ``transformer.h.*`` — and a mis-asserted path yields an adapter peft
+    cannot bind). Without the map, only paths inside a ``layers.N`` stack —
+    where mlx-lm mirrors the HF tree and every LoRA target is a Linear —
+    are converted; anything else is refused, and that refusal points at the
+    MLX-format fallback rather than at this map, which only a caller able to
+    make the assertions above can safely supply.
+    """
+    for _path, _kind in (module_types or {}).items():
+        if _kind not in ("linear", "embedding"):
+            raise ValueError(
+                f"Unsloth MLX: module_types[{_path!r}]={_kind!r}; expected "
+                "'linear' or 'embedding'."
+            )
+    # Raises on a both-formats directory; the source must be unambiguous.
+    detect_adapter_format(src)
+    backend, load_file, save_file, transpose = _tensor_backend()
+    with open(os.path.join(src, "adapter_config.json"), "r") as f:
+        cfg = json.load(f)
+    if str(cfg.get("fine_tune_type", "lora")).lower() != "lora":
+        raise ValueError(
+            f"Unsloth MLX: fine_tune_type={cfg.get('fine_tune_type')!r} "
+            "adapters cannot be exported to PEFT format yet; only plain "
+            "LoRA is supported."
+        )
+    tensors = load_file(os.path.join(src, MLX_WEIGHTS_FILE))
+    pairs = {}
+    rejected = {}
+    for key, tensor in tensors.items():
+        m = re.match(r"^(.+)\.lora_(a|b)$", key)
+        if m is None:
+            rejected[key] = (
+                "not a plain LoRA tensor; DoRA/full-weight/embedding state "
+                "cannot be exported to PEFT format yet"
+            )
+            continue
+        # Embedding LoRA shares the lora_a/lora_b key shape but PEFT stores it
+        # as lora_embedding_A/B, and a weights file alone cannot tell an
+        # Embedding from a Linear. An explicit module_types entry wins; else
+        # only the root-anchored stack below converts, where every LoRA target
+        # is a Linear, and anything else is refused rather than guessed.
+        path = m.group(1)
+        declared = (module_types or {}).get(path)
+        if declared == "embedding":
+            rejected[key] = (
+                "embedding LoRA cannot be exported to PEFT format yet"
+            )
+            continue
+        if declared is None and re.match(
+            # Root-anchored `model.layers.N.` only: that is the layout mlx-lm
+            # mirrors from HF, so emitted paths bind in peft. GPT-2-style stacks
+            # rename roots (`model.h.*` vs HF `transformer.h.*`) and VLM
+            # wrappers reorder them (`language_model.model.layers.*` vs HF
+            # `model.language_model.layers.*`), so any unanchored heuristic
+            # would emit adapters peft cannot load.
+            r"^model\.layers\.\d+\.", path
+        ) is None:
+            rejected[key] = (
+                "outside a Hugging-Face-mirroring transformer stack, so its "
+                "Hugging Face path cannot be confirmed and PEFT export could "
+                "emit an adapter that binds to nothing — save this adapter "
+                "in MLX format instead"
+            )
+            continue
+        pairs.setdefault(path, {})[m.group(2)] = tensor
+    for path, pair in list(pairs.items()):
+        if "a" not in pair or "b" not in pair:
+            rejected[f"{path}.lora_*"] = "incomplete lora_a/lora_b pair"
+            pairs.pop(path)
+    if rejected:
+        _raise_rejected(rejected, f"{src!r}")
+    if not pairs:
+        raise ValueError(f"Unsloth MLX: {src!r} has no LoRA tensor pairs.")
+
+    scale_map = cfg.get("unsloth_mlx_lora_module_scales") or {}
+    lora_params = cfg.get("lora_parameters") or {}
+    global_scale = float(lora_params.get("scale", cfg.get("scale", 1.0)))
+    dropout = float(lora_params.get("dropout", cfg.get("dropout", 0.0)) or 0.0)
+
+    out = {}
+    ranks, alphas = {}, {}
+    for path in sorted(pairs):
+        a, b = pairs[path]["a"], pairs[path]["b"]
+        if getattr(a, "ndim", 0) != 2 or getattr(b, "ndim", 0) != 2:
+            raise ValueError(
+                f"Unsloth MLX: {path} carries non-2-D LoRA factors "
+                f"(lora_a ndim={getattr(a, 'ndim', '?')}, "
+                f"lora_b ndim={getattr(b, 'ndim', '?')}); switch/MoE LoRA "
+                "cannot be exported to PEFT format yet."
+            )
+        rank = int(a.shape[1])
+        if int(b.shape[0]) != rank:
+            raise ValueError(
+                f"Unsloth MLX: {path} has lora_a rank {rank} but lora_b "
+                f"rank {int(b.shape[0])}; the adapter file is inconsistent."
+            )
+        out[f"{_PEFT_PREFIX}{path}.lora_A.weight"] = transpose(a)
+        out[f"{_PEFT_PREFIX}{path}.lora_B.weight"] = transpose(b)
+        ranks[path] = rank
+        scale = float(scale_map.get(path, global_scale))
+        alphas[path] = scale * rank
+    ref_path = next(iter(sorted(ranks)))
+    peft_cfg = {
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "r": ranks[ref_path],
+        "lora_alpha": alphas[ref_path],
+        "lora_dropout": dropout,
+        "bias": "none",
+        "use_rslora": False,
+        # Full module paths, matched exactly by peft's list semantics. Leaf
+        # names would suffix-match EVERY layer's projection, so a layer-subset
+        # adapter would grow zero-initialized extras and train a different
+        # topology.
+        "target_modules": sorted(ranks),
+        "base_model_name_or_path": cfg.get("base_model_name_or_path", ""),
+    }
+    revision = cfg.get("base_model_revision") or cfg.get("base_model_commit_hash")
+    if revision:
+        peft_cfg["revision"] = revision
+    if len(set(ranks.values())) > 1:
+        peft_cfg["rank_pattern"] = {
+            re.escape(p): r for p, r in ranks.items() if r != peft_cfg["r"]
+        }
+    if len(set(alphas.values())) > 1:
+        peft_cfg["alpha_pattern"] = {
+            re.escape(p): a for p, a in alphas.items()
+            if a != peft_cfg["lora_alpha"]
+        }
+    _require_fresh_dir(dst)
+    save_file(os.path.join(dst, PEFT_WEIGHTS_FILE), out)
+    with open(os.path.join(dst, "adapter_config.json"), "w") as f:
+        json.dump(peft_cfg, f, indent=2, sort_keys=True)
+    return dst
