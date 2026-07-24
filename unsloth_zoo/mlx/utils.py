@@ -35,6 +35,7 @@ import json
 import math
 import numbers
 import operator
+import re
 import textwrap
 import numpy as np
 import os
@@ -10988,6 +10989,47 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             for key in ("rank", "scale", "dropout"):
                 if key in lora_parameters:
                     adapter_config[key] = lora_parameters[key]
+        # One global rank/scale cannot represent per-module adapters (imported
+        # rank_pattern/alpha_pattern). Persist per-module maps and mark the
+        # artifact as needing the unsloth loader; stock mlx-lm rebuilds wrong.
+        if has_lora_modules:
+            _module_ranks, _module_scales = {}, {}
+            _maps_reliable = True
+            for _name, _module in iter_mlx_lora_modules(model):
+                _lora_a = getattr(_module, "lora_a", None)
+                _scale = getattr(_module, "scale", None)
+                # Only plain 2-D factors with a scalar scale are representable;
+                # switch-LoRA stacks experts into 3-D where shape[-1] is the
+                # input width, not the rank. A partial map is worse than none.
+                if (
+                    _lora_a is None
+                    or getattr(_lora_a, "ndim", 0) != 2
+                    or _scale is None
+                    or not isinstance(_scale, (int, float))
+                ):
+                    _maps_reliable = False
+                    break
+                _module_ranks[_name] = int(_lora_a.shape[-1])
+                _module_scales[_name] = float(_scale)
+            if _maps_reliable and (
+                len(set(_module_ranks.values())) > 1
+                or len(set(_module_scales.values())) > 1
+            ):
+                adapter_config["unsloth_mlx_lora_module_ranks"] = _module_ranks
+                adapter_config["unsloth_mlx_lora_module_scales"] = _module_scales
+                adapter_config["unsloth_mlx_requires_unsloth_loader"] = True
+                print(
+                    "Unsloth: this adapter uses per-module ranks/scales; "
+                    "reloading it needs Unsloth (stock mlx-lm assumes one "
+                    "global rank/scale)."
+                )
+            else:
+                for _stale_key in (
+                    "unsloth_mlx_lora_module_ranks",
+                    "unsloth_mlx_lora_module_scales",
+                    "unsloth_mlx_requires_unsloth_loader",
+                ):
+                    adapter_config.pop(_stale_key, None)
         # mlx-lm.load_adapters() reads num_layers off the config.
         if "num_layers" not in adapter_config:
             try:
@@ -11008,6 +11050,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         for _stale in (
             "peft_type", "lora_parameters", "rank", "scale", "dropout",
             "num_layers", "unsloth_mlx_lora_module_paths",
+            "unsloth_mlx_lora_module_ranks", "unsloth_mlx_lora_module_scales",
+            "unsloth_mlx_requires_unsloth_loader",
         ):
             adapter_config.pop(_stale, None)
 
@@ -12636,3 +12680,133 @@ def push_to_hub_gguf(
         )
 
     print(f"Unsloth: GGUF pushed to https://huggingface.co/{repo_id}")
+
+
+# ---------------------------------------------------------------------------
+# PEFT <-> MLX LoRA adapter interop.
+#
+# PEFT adapters (adapter_model.safetensors, lora_A/lora_B keys under a
+# base_model.model. prefix) and mlx-lm adapters (adapters.safetensors,
+# lora_a/lora_b keys) encode the same math in different layouts:
+#
+#     peft {p}.lora_A.weight [r, in]   ==  mlx {p}.lora_a [in, r], transposed
+#     peft {p}.lora_B.weight [out, r]  ==  mlx {p}.lora_b [r, out], transposed
+#     effective scale = lora_alpha / r     (rsLoRA: lora_alpha / sqrt(r))
+#
+# Conversion is rename + transpose only; dtypes are preserved exactly and a
+# round trip is bitwise-identical for the supported subset (plain linear
+# LoRA). Adapters carrying DoRA magnitudes, modules_to_save state, embedding
+# LoRA, or expert target_parameters factors are refused with a named reason
+# instead of being partially or lossily converted. Tensor IO prefers
+# mlx.core (native bfloat16) with a safetensors.torch fallback off Apple
+# hardware; the safetensors numpy backend cannot represent bf16.
+# ---------------------------------------------------------------------------
+
+def detect_adapter_format(path):
+    from ..saving_utils import detect_adapter_format as _impl
+    return _impl(path)
+
+
+def normalize_peft_adapter_config(cfg, adapter_dir=None):
+    from ..saving_utils import normalize_peft_adapter_config as _impl
+    return _impl(cfg, adapter_dir=adapter_dir)
+
+
+def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
+    """Attach LoRA modules described by a PEFT directory onto a live MLX model
+    and bind the converted weights.
+
+    The weight file decides what is attached: the module set, each module's
+    rank (from tensor shapes), and — with ``alpha_pattern`` / ``use_rslora``
+    from the config — each module's scale. Any tensor that cannot bind, or any
+    expected module missing from the live tree, aborts the load; a partially
+    applied adapter is never returned.
+    """
+    from ..saving_utils import (
+        PEFT_WEIGHTS_FILE,
+        _effective_scale,
+        _raise_rejected,
+        group_peft_lora_pairs,
+    )
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+
+    tensors = dict(mx.load(os.path.join(adapter_dir, PEFT_WEIGHTS_FILE)))
+    pairs, rejected = group_peft_lora_pairs(tensors)
+    if rejected:
+        _raise_rejected(rejected, f"{adapter_dir!r}")
+    if not pairs:
+        raise ValueError(
+            f"Unsloth MLX: {adapter_dir!r} has no linear LoRA tensor pairs."
+        )
+
+    by_name = dict(model.named_modules())
+    linear_types = (nn.Linear, nn.QuantizedLinear)
+    dropout = float(cfg.get("lora_dropout") or 0.0)
+    unmatched = []
+    module_scales = {}
+    module_ranks = {}
+    staged = []
+    for path in sorted(pairs):
+        a, b = pairs[path]["A"], pairs[path]["B"]
+        rank = int(a.shape[0])
+        if int(b.shape[1]) != rank:
+            unmatched.append(f"{path} (lora_A rank {rank} != lora_B rank {int(b.shape[1])})")
+            continue
+        module = by_name.get(path)
+        # Exact types only: nn.Linear subclasses (fused projections with
+        # tuple-returning forwards and their own to_lora()) accept these factor
+        # shapes, then crash or misbehave inside a generic LoRALinear wrapper.
+        if module is None or type(module) not in linear_types:
+            found = type(module).__name__ if module is not None else "no module"
+            unmatched.append(
+                f"{path} ({found}; the base model's MLX module tree names "
+                "this weight differently, lacks it, or wraps it in an "
+                "unsupported linear variant)"
+            )
+            continue
+        scale = _effective_scale(cfg, path, rank)
+        wrapped = LoRALinear.from_base(module, r=rank, dropout=dropout, scale=scale)
+        lora_a, lora_b = a.T, b.T
+        if wrapped.lora_a.shape != lora_a.shape:
+            unmatched.append(
+                f"{path} (adapter in-dim {lora_a.shape[0]} != module in-dim "
+                f"{wrapped.lora_a.shape[0]})"
+            )
+            continue
+        if wrapped.lora_b.shape != lora_b.shape:
+            unmatched.append(
+                f"{path} (adapter out-dim {lora_b.shape[1]} != module "
+                f"out-dim {wrapped.lora_b.shape[1]})"
+            )
+            continue
+        wrapped.lora_a = lora_a
+        wrapped.lora_b = lora_b
+        staged.append((path, wrapped))
+        module_scales[path] = scale
+        module_ranks[path] = rank
+    if unmatched:
+        preview = "; ".join(unmatched[:5])
+        if len(unmatched) > 5:
+            preview += f"; ... (+{len(unmatched) - 5} more)"
+        raise ValueError(
+            f"Unsloth MLX: {len(unmatched)} PEFT adapter tensor pair(s) do "
+            f"not map onto the loaded MLX model ({preview}). Refusing a "
+            "partial import."
+        )
+    # Freeze the base before installing wrappers so only the new LoRA tensors
+    # train (peft's is_trainable contract); a save must capture everything an
+    # optimizer moved.
+    model.freeze()
+    from mlx.utils import tree_unflatten
+    model.update_modules(tree_unflatten(staged))
+    # New wrappers start in training mode regardless of the host's; re-propagate
+    # so nonzero lora_dropout cannot make inference stochastic on an eval model.
+    model.train(bool(getattr(model, "training", False)))
+    mx.eval(model.parameters())
+    # Shapes carry ranks, but scale variance must survive a zoo-side re-save
+    # (stock mlx-lm has a single global scale).
+    model._unsloth_lora_module_scales = module_scales
+    model._unsloth_lora_module_ranks = module_ranks
+    return len(staged)
