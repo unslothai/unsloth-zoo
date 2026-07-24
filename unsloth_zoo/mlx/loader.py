@@ -7493,7 +7493,33 @@ class FastMLXModel:
                         _saved_lora_paths = _normalize_mlx_lora_module_paths(
                             adapter_cfg.get("unsloth_mlx_lora_module_paths"),
                         )
-                        # Saved exact paths win: build and shape-check those wrappers before strict=False can mutate them.
+                        # Saved exact paths win: build and shape-check those
+                        # wrappers before strict=False can mutate them. The
+                        # full-state shape snapshot must be taken here too —
+                        # afterwards the live tree reflects whatever the file
+                        # carried, and the resized-artifact check needs the
+                        # base's shapes.
+                        _fs_prebind = {}
+                        _fs_cfg_map = dict(
+                            adapter_cfg.get("full_state_modules") or {}
+                        )
+                        if _fs_cfg_map:
+                            from mlx.utils import tree_flatten as _tf
+                            _params0 = dict(_tf(model.parameters()))
+                            for _p in _fs_cfg_map:
+                                for _t in ("weight", "bias"):
+                                    # The base tree may be unwrapped; a
+                                    # wrapper-inner spelling falls back to the
+                                    # bare module tensor.
+                                    _bare_v = _params0.get(f"{_p}.{_t}")
+                                    for _k in (
+                                        f"{_p}.{_t}",
+                                        f"{_p}.embedding.{_t}",
+                                        f"{_p}.linear.{_t}",
+                                    ):
+                                        _v = _params0.get(_k, _bare_v)
+                                        if _v is not None:
+                                            _fs_prebind[_k] = tuple(_v.shape)
                         # Let older mlx-lm load_adapters accept scale=/dropout=.
                         _patch_mlx_lora_from_base_compat()
                         adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
@@ -7603,6 +7629,43 @@ class FastMLXModel:
                     if os.path.exists(adapter_weights_file):
                         _unfreeze_saved_mlx_non_adapter_parameters(
                             model, adapter_weights_file,
+                        )
+                    if adapter_cfg.get("unsloth_peft_converted") and not (
+                        adapter_cfg.get("_unsloth_peft_import")
+                    ):
+                        _emb_wrapped = sorted(
+                            _n for _n, _m in model.named_modules()
+                            if hasattr(_m, "lora_a")
+                            and getattr(_m, "embedding", None) is not None
+                        )
+                        if _emb_wrapped:
+                            from .utils import _model_ties_output_to_embedding
+                            if _model_ties_output_to_embedding(model):
+                                raise ValueError(
+                                    f"Unsloth MLX: {_emb_wrapped} carry "
+                                    "embedding adapters but this model "
+                                    "routes output logits through the "
+                                    "embedding; mlx-lm would apply the "
+                                    "update to output projection while "
+                                    "peft-side training applied it to "
+                                    "input lookup only. The artifact "
+                                    "cannot load faithfully."
+                                )
+                    if adapter_cfg.get("unsloth_peft_converted"):
+                        # Provenance survives load/save: derivatives keep their
+                        # peft-parity guarantees.
+                        model._unsloth_peft_converted = True
+                    _fs_map = dict(adapter_cfg.get("full_state_modules") or {})
+                    if _fs_map and not adapter_cfg.get("_unsloth_peft_import"):
+                        # After the freeze, never before: restores
+                        # modules_to_save trainability.
+                        from .utils import _mark_full_state_modules
+                        _mark_full_state_modules(
+                            model, _fs_map, adapter_weights_file,
+                            expected_shapes=_fs_prebind,
+                            trainable_paths=adapter_cfg.get(
+                                "full_state_trainable"
+                            ),
                         )
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)

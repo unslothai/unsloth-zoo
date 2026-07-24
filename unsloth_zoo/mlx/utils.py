@@ -12750,6 +12750,53 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             "tensors; use save_lora_adapters() or "
             "save_trainable_adapters() at the public entry point."
         )
+    _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+    if _fs_map:
+        # No pristine base at save time: every recorded module ships as-is.
+        _by_name = dict(model.named_modules())
+        tensors = dict(tensors)
+        for _p in sorted(_fs_map):
+            _module = _by_name.get(_p)
+            if _module is None:
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} was recorded at "
+                    "adapter attach but no longer exists in the model tree; "
+                    "refusing to write an artifact that cannot restore it."
+                )
+            # LoRA wrappers hold the base under .embedding/.linear; that
+            # inner path is what a reload's load_weights binds.
+            _prefix, _source = _p, _module
+            if hasattr(_module, "lora_a"):
+                for _inner in ("embedding", "linear"):
+                    _in = getattr(_module, _inner, None)
+                    if _in is not None and hasattr(_in, "parameters"):
+                        _prefix, _source = f"{_p}.{_inner}", _in
+                        break
+            if isinstance(_source, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} was quantized "
+                    "after adapter attach; its packed tensors cannot be "
+                    "persisted as module state. Keep it unquantized."
+                )
+            _found = False
+            for _tname in ("weight", "bias"):
+                _live = getattr(_source, _tname, None)
+                if isinstance(_live, mx.array):
+                    if "float" not in str(_live.dtype).lower():
+                        raise ValueError(
+                            f"Unsloth MLX: full-state module {_p!r} holds "
+                            f"non-floating {_tname} ({_live.dtype}); packed "
+                            "or quantized state cannot be persisted as "
+                            "module state. Keep it unquantized."
+                        )
+                    tensors.setdefault(f"{_prefix}.{_tname}", _live)
+                    _found = True
+            if not _found:
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} carries no "
+                    "weight/bias arrays to persist (it may have been "
+                    "quantized after attach); refusing a partial artifact."
+                )
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
@@ -13088,7 +13135,8 @@ def _lora_module_types(model):
         n: t for n, t in wrapped.items() if not t.startswith("unsupported:")
     }
     mirrored_layout = supported and not unsupported and all(
-        in_stack.match(name) or name == "lm_head" for name in supported
+        in_stack.match(name) or name in ("lm_head", "model.embed_tokens")
+        for name in supported
     )
     if not mirrored_layout:
         supported = {n: t for n, t in supported.items() if in_stack.match(n)}
@@ -13127,6 +13175,36 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
                 "Unsloth MLX: this model carries LoRA wrappers that plain "
                 f"PEFT format cannot represent ({preview}); PEFT export is "
                 "not possible for it."
+            )
+        from unsloth_zoo.saving_utils import _OUTPUT_HEAD_LEAF_NAMES, _leaf_in
+        _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+        _named = dict(model.named_modules())
+        _m2s_emb = sorted(
+            p for p, o in _fs_map.items()
+            if o == "modules_to_save"
+            and (
+                isinstance(
+                    _named.get(p), (nn.Embedding, nn.QuantizedEmbedding)
+                )
+                or _leaf_in(p, _OUTPUT_HEAD_LEAF_NAMES)
+            )
+        )
+        if _m2s_emb and _model_ties_output_to_embedding(model):
+            raise ValueError(
+                f"Unsloth MLX: {_m2s_emb} are modules_to_save replacements "
+                "of a tied embedding or output head; peft would train an "
+                "untied copy while the tied MLX embedding both looks up "
+                "inputs and projects output logits, so no faithful export "
+                "exists."
+            )
+        if any(t == "embedding" for t in module_types.values()) and (
+            _model_ties_output_to_embedding(model)
+        ):
+            raise ValueError(
+                "Unsloth MLX: this model ties word embeddings and routes "
+                "output logits through the embedding adapter; peft applies "
+                "embedding LoRA to input lookup only, so PEFT export would "
+                "change semantics."
             )
         # PEFT has no per-module dropout; a mixed-dropout model would
         # silently train differently after export.
@@ -13174,6 +13252,230 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
         convert_mlx_dir_to_peft(scratch_dir, path, module_types=module_types)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _model_ties_output_to_embedding(model, by_name=None):
+    """True when output logits may route through the embedding module: the
+    config declares tied word embeddings, OR the tree carries no output head
+    under any known spelling (always-tied architectures carry no flag). A tree
+    WITH a head cannot prove the reverse — some build one and still route tied
+    logits through the embedding — so a true flag stays conservative."""
+    flag = getattr(
+        getattr(model, "args", None), "tie_word_embeddings", None,
+    )
+    if flag is None:
+        config = getattr(model, "_config", None)
+        if isinstance(config, dict):
+            text_config = config.get("text_config")
+            for scope in (
+                text_config if isinstance(text_config, dict) else {},
+                config,
+            ):
+                if "tie_word_embeddings" in scope:
+                    flag = bool(scope["tie_word_embeddings"])
+                    break
+    if flag is True:
+        # Declared True stays conservative: some architectures keep a dead head.
+        return True
+    if by_name is None:
+        by_name = dict(model.named_modules())
+    # No head module means output NECESSARILY projects through the embedding,
+    # outranking even a declared False (some declare False yet route via
+    # as_linear). Spellings: lm_head (most), output (Llama-4 text, InternLM2),
+    # embed_out (GPT-NeoX). Bare "output" stays root-only so unrelated nested
+    # submodules cannot masquerade as the head.
+    return not any(
+        name in ("lm_head", "output", "embed_out")
+        or name.endswith(".lm_head")
+        or name.endswith(".embed_out")
+        for name in by_name
+    )
+
+
+def _full_state_base_module(module):
+    """The module holding a full-state tensor: a LoRA wrapper keeps its base
+    under .embedding/.linear, which carries the non-adapter parameters."""
+    if hasattr(module, "lora_a"):
+        for inner in ("embedding", "linear"):
+            candidate = getattr(module, inner, None)
+            if candidate is not None and hasattr(candidate, "parameters"):
+                return candidate
+    return module
+
+
+def _full_state_key_candidates(path):
+    """Tree-native key spellings a full-state module's tensors may use:
+    plain for a bare module, .embedding/.linear-inner for a LoRA wrapper."""
+    keys = []
+    for prefix in (path, f"{path}.embedding", f"{path}.linear"):
+        for tname in ("weight", "bias"):
+            keys.append(f"{prefix}.{tname}")
+    return keys
+
+
+def _mark_full_state_modules(model, fs_map, adapter_weights_file,
+                             expected_shapes=None, trainable_paths=None):
+    """Re-establish full-state bookkeeping after an mlx-format reload.
+
+    load_weights(strict=False) neither validates shapes nor reports what it
+    bound, and a resized saved tensor silently replaces the live array, so
+    verify each recorded module's saved tensors against the live tree AND
+    against ``expected_shapes`` captured before binding, restore
+    modules_to_save trainability, and re-record the origin map.
+    """
+    fs_map = dict(fs_map or {})
+    if not fs_map:
+        return
+    _bad_origins = {
+        p: o for p, o in fs_map.items()
+        if o not in ("modules_to_save", "embedding_auto")
+    }
+    if _bad_origins:
+        raise ValueError(
+            f"Unsloth MLX: full_state_modules carries unknown origin "
+            f"tag(s) {_bad_origins}; expected 'modules_to_save' or "
+            "'embedding_auto'."
+        )
+    by_name = dict(model.named_modules())
+    params = dict(mlx.utils.tree_flatten(model.parameters()))
+    expected_shapes = expected_shapes or {}
+    problems = []
+    saved_shapes = {}
+    saved_dtypes = {}
+    try:
+        from safetensors import safe_open
+        with safe_open(adapter_weights_file, framework="numpy") as f:
+            keys = set(f.keys())
+            for p in fs_map:
+                for key in _full_state_key_candidates(p):
+                    if key in keys:
+                        # Metadata-only: works for dtypes numpy cannot hold (bf16).
+                        sl = f.get_slice(key)
+                        saved_shapes[key] = tuple(sl.get_shape())
+                        saved_dtypes[key] = str(sl.get_dtype())
+    except Exception as exc:
+        raise ValueError(
+            "Unsloth MLX: adapter_config lists full_state_modules but the "
+            f"weights file could not be inspected ({exc!r})."
+        ) from exc
+    tied_routing = None
+    for p, origin in sorted(fs_map.items()):
+        module = by_name.get(p)
+        if module is None:
+            problems.append(f"{p} (module missing from the live tree)")
+            continue
+        import mlx.nn as nn
+        from unsloth_zoo.saving_utils import _OUTPUT_HEAD_LEAF_NAMES, _leaf_in
+        _embeddingish = isinstance(
+            module, (nn.Embedding, nn.QuantizedEmbedding)
+        ) or _leaf_in(p, _OUTPUT_HEAD_LEAF_NAMES)
+        if origin == "modules_to_save" and _embeddingish:
+            if tied_routing is None:
+                tied_routing = _model_ties_output_to_embedding(
+                    model, by_name,
+                )
+            if tied_routing:
+                problems.append(
+                    f"{p} (modules_to_save replacement of a tied "
+                    "embedding or output head: peft trained an untied "
+                    "copy while this model's tied embedding both "
+                    "looks up inputs and projects output logits)"
+                )
+                continue
+        if origin == "embedding_auto" and _leaf_in(
+            p, _OUTPUT_HEAD_LEAF_NAMES
+        ):
+            # A tied conversion folds head duplicates away; a survivor would
+            # bind dead head state while logits flow through the embedding.
+            if tied_routing is None:
+                tied_routing = _model_ties_output_to_embedding(
+                    model, by_name,
+                )
+            if tied_routing:
+                problems.append(
+                    f"{p} (auto-saved output-head state on a model that "
+                    "routes logits through its embedding; the snapshot "
+                    "cannot restore as head state)"
+                )
+                continue
+        found = False
+        for key in _full_state_key_candidates(p):
+            if key not in saved_shapes:
+                # Full-module snapshots: a missing tensor would silently
+                # retain base state.
+                if key in params:
+                    problems.append(f"{key} (live tensor missing from the artifact)")
+                continue
+            found = True
+            if not saved_dtypes.get(key, "").upper().startswith(("F", "BF")):
+                problems.append(
+                    f"{key} (non-floating dtype {saved_dtypes[key]}; "
+                    "quantized or corrupted full-module state cannot "
+                    "restore)"
+                )
+                continue
+            live = params.get(key)
+            live_shape = tuple(getattr(live, "shape", ()) or ())
+            if live_shape != saved_shapes[key]:
+                problems.append(
+                    f"{key} (saved {saved_shapes[key]} vs live {live_shape})"
+                )
+                continue
+            expected = expected_shapes.get(key)
+            if expected is not None and saved_shapes[key] != expected:
+                problems.append(
+                    f"{key} (saved {saved_shapes[key]} vs base "
+                    f"{expected}; resized vocabularies are not supported "
+                    "yet)"
+                )
+        if not found:
+            problems.append(f"{p} (no saved weight/bias tensors)")
+    if problems:
+        preview = "; ".join(problems[:5])
+        if len(problems) > 5:
+            preview += f"; ... (+{len(problems) - 5} more)"
+        raise ValueError(
+            f"Unsloth MLX: {len(problems)} full-state entr(ies) failed to "
+            f"restore on reload ({preview}). Refusing a partial adapter."
+        )
+    _trainable_at_save = frozenset(trainable_paths or ())
+    for p, origin in fs_map.items():
+        module = by_name[p]
+        if origin == "modules_to_save":
+            module.unfreeze()
+            continue
+        # Auto-saved embeddings are frozen by default, but continued
+        # pretraining may have trained one; the artifact records which so a
+        # reload restores the same contract. Only the inner base is touched.
+        target = _full_state_base_module(module)
+        if p in _trainable_at_save:
+            target.unfreeze()
+        else:
+            target.freeze()
+    # An mlx-format reload treats restored non-adapter tensors as continued-
+    # pretraining state eligible for the scoped embedding LR. modules_to_save
+    # is adapter state: drop it so this path trains it at the main LR, exactly
+    # as a direct PEFT import does.
+    _cpt_keys = getattr(model, "_unsloth_cpt_full_module_weight_keys", None)
+    if _cpt_keys:
+        _m2s = frozenset(
+            path for path, origin in fs_map.items()
+            if origin == "modules_to_save"
+        )
+
+        def _owns(key):
+            owner = key.rsplit(".", 1)[0]
+            if owner in _m2s:
+                return True
+            for inner in (".embedding", ".linear"):
+                if owner.endswith(inner) and owner[: -len(inner)] in _m2s:
+                    return True
+            return False
+
+        model._unsloth_cpt_full_module_weight_keys = {
+            key for key in _cpt_keys if not _owns(key)
+        }
+    model._unsloth_full_state_modules = fs_map
 
 
 def _infer_snapshot_commit(path):
@@ -13485,6 +13787,34 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     if resolved_map and quant_source != "mlx_config":
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
+
+    _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+    if _fs_map:
+        adapter_config["full_state_modules"] = _fs_map
+        # Record save-time trainability so a reload restores it:
+        # modules_to_save is trainable by definition, an auto-saved embedding
+        # frozen UNLESS continued pretraining unfroze it.
+        _by_name = dict(model.named_modules())
+        _trainable_fs = []
+        for _p in sorted(_fs_map):
+            _module = _by_name.get(_p)
+            if _module is None:
+                continue
+            _base = _full_state_base_module(_module)
+            if dict(mlx.utils.tree_flatten(_base.trainable_parameters())):
+                _trainable_fs.append(_p)
+        if _trainable_fs:
+            adapter_config["full_state_trainable"] = _trainable_fs
+        else:
+            adapter_config.pop("full_state_trainable", None)
+    else:
+        adapter_config.pop("full_state_modules", None)
+        adapter_config.pop("full_state_trainable", None)
+
+    if getattr(model, "_unsloth_peft_converted", False):
+        adapter_config["unsloth_peft_converted"] = True
+    else:
+        adapter_config.pop("unsloth_peft_converted", None)
 
     # Only stamp LoRA fields when the live model has LoRA modules (or the
     # caller declared a lora/dora artifact); otherwise mlx-lm.load_adapters()
@@ -15228,24 +15558,12 @@ def push_to_hub_gguf(
 
 
 # ---------------------------------------------------------------------------
-# PEFT <-> MLX LoRA adapter interop.
-#
-# PEFT adapters (adapter_model.safetensors, lora_A/lora_B keys under a
-# base_model.model. prefix) and mlx-lm adapters (adapters.safetensors,
-# lora_a/lora_b keys) encode the same math in different layouts:
-#
-#     peft {p}.lora_A.weight [r, in]   ==  mlx {p}.lora_a [in, r], transposed
-#     peft {p}.lora_B.weight [out, r]  ==  mlx {p}.lora_b [r, out], transposed
-#     effective scale = lora_alpha / r     (rsLoRA: lora_alpha / sqrt(r))
-#
-# Conversion is rename + transpose only; dtypes are preserved exactly and a
-# round trip is bitwise-identical for the supported subset (plain linear
-# LoRA and linear DoRA, whose magnitude maps to mlx-lm's m without
-# transpose). Adapters carrying modules_to_save state, embedding LoRA, or
-# expert target_parameters factors are refused with a named reason instead
-# of being partially or lossily converted. Tensor IO prefers
-# mlx.core (native bfloat16) with a safetensors.torch fallback off Apple
-# hardware; the safetensors numpy backend cannot represent bf16.
+# PEFT <-> MLX LoRA adapter interop. The format mapping and conversion rules
+# are documented in unsloth_zoo.saving_utils, which holds the detection,
+# validation and conversion helpers so CUDA hosts can import them without mlx.
+# The delegates below keep the loader-facing surface here, and mx-native
+# attach_and_bind_peft_adapter stays so torch-less Apple installs never import
+# the torch-side module.
 # ---------------------------------------------------------------------------
 
 def detect_adapter_format(path):
@@ -15270,7 +15588,10 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     """
     from unsloth_zoo.saving_utils import (
         PEFT_WEIGHTS_FILE,
+        _EMBEDDING_LEAF_NAMES,
+        _OUTPUT_HEAD_LEAF_NAMES,
         _effective_scale,
+        _leaf_in,
         _raise_rejected,
         group_peft_lora_pairs,
     )
@@ -15291,13 +15612,17 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
             ) from exc
 
     tensors = dict(mx.load(os.path.join(adapter_dir, PEFT_WEIGHTS_FILE)))
-    pairs, rejected = group_peft_lora_pairs(tensors)
+    pairs, full_state, rejected = group_peft_lora_pairs(tensors, cfg)
     if rejected:
         _raise_rejected(rejected, f"{adapter_dir!r}")
     if not pairs:
         raise ValueError(
-            f"Unsloth MLX: {adapter_dir!r} has no linear LoRA tensor pairs."
+            f"Unsloth MLX: {adapter_dir!r} has no LoRA tensor pairs."
         )
+    try:
+        from mlx_lm.tuner.lora import LoRAEmbedding
+    except ImportError:
+        LoRAEmbedding = None
 
     by_name = dict(model.named_modules())
     linear_types = (nn.Linear, nn.QuantizedLinear)
@@ -15306,7 +15631,55 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     module_scales = {}
     module_ranks = {}
     staged = []
+    emb_types = tuple(
+        t for t in (nn.Embedding, nn.QuantizedEmbedding) if t is not None
+    )
+    tied_embeddings = _model_ties_output_to_embedding(model, by_name)
     for path in sorted(pairs):
+        if "EA" in pairs[path]:
+            module = by_name.get(path)
+            if module is None or type(module) not in emb_types:
+                unmatched.append(
+                    f"{path} ({type(module).__name__ if module else 'missing'};"
+                    " embedding LoRA needs a stock embedding module)"
+                )
+                continue
+            if tied_embeddings:
+                unmatched.append(
+                    f"{path} (embedding LoRA on a tied-embeddings model: "
+                    "mlx-lm applies the update to the tied output "
+                    "projection while peft applies it to input lookup "
+                    "only, so no faithful import exists)"
+                )
+                continue
+            if dropout > 0:
+                unmatched.append(
+                    f"{path} (embedding LoRA with nonzero lora_dropout: "
+                    "peft applies no dropout on embedding adapters while "
+                    "mlx-lm does; import would change training behavior)"
+                )
+                continue
+            if LoRAEmbedding is None:
+                raise ImportError(
+                    "Unsloth MLX: embedding LoRA needs mlx_lm.tuner.lora."
+                    "LoRAEmbedding; upgrade mlx-lm."
+                )
+            ea, eb = pairs[path]["EA"], pairs[path]["EB"]
+            rank = int(ea.shape[0])
+            scale = _effective_scale(cfg, path, rank)
+            wrapped = LoRAEmbedding.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
+            la, lb = ea.T, eb.T
+            if wrapped.lora_a.shape != la.shape or wrapped.lora_b.shape != lb.shape:
+                unmatched.append(f"{path} (embedding LoRA shape mismatch)")
+                continue
+            wrapped.lora_a = la
+            wrapped.lora_b = lb
+            staged.append((path, wrapped))
+            module_scales[path] = scale
+            module_ranks[path] = rank
+            continue
         a, b = pairs[path]["A"], pairs[path]["B"]
         rank = int(a.shape[0])
         if int(b.shape[1]) != rank:
@@ -15366,24 +15739,172 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
         staged.append((path, wrapped))
         module_scales[path] = scale
         module_ranks[path] = rank
+    # Full-state entries: verify against the live base and PLAN the
+    # application — nothing mutates until every entry validates, so a refused
+    # import leaves the caller's model untouched. Equal snapshots are skipped;
+    # differing ones are applied and origin-recorded so saves round-trip them.
+    applied_full_state = {}
+    fs_plan = []
+    for path, entries in sorted(full_state.items()):
+        origin = entries["__origin__"]
+        module = by_name.get(path)
+        if (
+            origin == "embedding_auto"
+            and tied_embeddings
+            and _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
+        ):
+            # peft saves the tied output head as its own entry, but the
+            # tensor IS the tied embedding weight: verify against the incoming
+            # snapshot (or the live embedding) and fold — never apply as head
+            # state, whether or not the tree keeps a dead head module.
+            emb_candidates = [
+                m for n, m in by_name.items()
+                if _leaf_in(n, _EMBEDDING_LEAF_NAMES)
+                and isinstance(m, emb_types)
+            ]
+            if len(emb_candidates) > 1:
+                unmatched.append(
+                    f"{path} (multiple embedding modules; the tied "
+                    "output-head duplicate cannot be attributed)"
+                )
+                continue
+            emb_module = emb_candidates[0] if emb_candidates else None
+            emb_weight = getattr(emb_module, "weight", None)
+            for _ep, _ev in full_state.items():
+                if _leaf_in(_ep, _EMBEDDING_LEAF_NAMES):
+                    # Artifact replaces the embedding: match the INCOMING weight.
+                    emb_weight = _ev.get("weight", emb_weight)
+                    break
+            snapshot = entries.get("weight")
+            if snapshot is not None and "float" not in str(
+                snapshot.dtype
+            ).lower():
+                unmatched.append(
+                    f"{path} (non-floating tied output-head snapshot "
+                    f"dtype {snapshot.dtype})"
+                )
+                continue
+            extra = sorted(set(entries) - {"__origin__", "weight"})
+            if extra:
+                unmatched.append(
+                    f"{path} (tied output-head snapshot carries "
+                    f"{extra}; the tied MLX embedding has no slot for "
+                    "them)"
+                )
+                continue
+            if emb_weight is not None and snapshot is not None:
+                if snapshot.dtype != emb_weight.dtype:
+                    snapshot = snapshot.astype(emb_weight.dtype)
+                if bool(mx.array_equal(emb_weight, snapshot)):
+                    continue
+            unmatched.append(
+                f"{path} (tied output-head snapshot differs from the "
+                "tied embedding; a tied MLX model cannot hold an "
+                "independent output head)"
+            )
+            continue
+        if module is None:
+            unmatched.append(f"{path} (full-state target missing)")
+            continue
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            unmatched.append(
+                f"{path} (a quantized base cannot verify or accept a "
+                "full-module snapshot; exclude the module from "
+                "quantization to import it)"
+            )
+            continue
+        if (
+            origin == "modules_to_save"
+            and tied_embeddings
+            and (
+                isinstance(module, emb_types)
+                or _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
+            )
+        ):
+            unmatched.append(
+                f"{path} (modules_to_save snapshot of a tied embedding or "
+                "output head: peft trains an untied copy while the tied "
+                "MLX embedding both looks up inputs and projects output "
+                "logits)"
+            )
+            continue
+        for tname, tensor in entries.items():
+            if tname == "__origin__":
+                continue
+            live = getattr(module, tname, None)
+            if live is None or tuple(live.shape) != tuple(tensor.shape):
+                unmatched.append(
+                    f"{path}.{tname} (full-state shape mismatch; resized "
+                    "vocabularies are not supported yet)"
+                )
+                continue
+            if "float" not in str(tensor.dtype).lower():
+                unmatched.append(
+                    f"{path}.{tname} (non-floating snapshot dtype "
+                    f"{tensor.dtype}; packed or quantized state cannot "
+                    "restore as module state)"
+                )
+                continue
+            # Compare and apply in the live dtype: the loader may have cast
+            # the base while peft saved full precision, and a pure precision
+            # gap is not a replacement.
+            if tensor.dtype != live.dtype:
+                tensor = tensor.astype(live.dtype)
+            if bool(mx.array_equal(live, tensor)):
+                continue
+            fs_plan.append((module, tname, tensor))
+            applied_full_state[path] = origin
+        if origin == "modules_to_save" and path not in applied_full_state:
+            # Equal-valued snapshot still marks the module trainable.
+            applied_full_state[path] = origin
+    # peft replaces the ENTIRE module for modules_to_save: every tensor the
+    # live module carries must be in the snapshot, else a truncated artifact
+    # silently retains base state.
+    from mlx.utils import tree_flatten as _tree_flatten
+    for _name in sorted(set(cfg.get("modules_to_save") or [])):
+        for _parent_path, _parent in by_name.items():
+            # Raw endswith, matching peft's selection (["head"] wraps lm_head).
+            if not _parent_path.endswith(_name):
+                continue
+            for _k, _v in _tree_flatten(_parent.parameters()):
+                _tname = _k.rsplit(".", 1)[-1]
+                _sub = (
+                    _parent_path if "." not in _k
+                    else f"{_parent_path}.{_k[: -len(_tname) - 1]}"
+                )
+                if _tname not in (full_state.get(_sub) or {}):
+                    unmatched.append(
+                        f"{_sub}.{_tname} (modules_to_save snapshot for "
+                        f"{_name!r} lacks this tensor; peft snapshots are "
+                        "full module state)"
+                    )
     if unmatched:
         preview = "; ".join(unmatched[:5])
         if len(unmatched) > 5:
             preview += f"; ... (+{len(unmatched) - 5} more)"
         raise ValueError(
-            f"Unsloth MLX: {len(unmatched)} PEFT adapter tensor pair(s) do "
-            f"not map onto the loaded MLX model ({preview}). Refusing a "
+            f"Unsloth MLX: {len(unmatched)} PEFT adapter entr(ies) do not "
+            f"map onto the loaded MLX model ({preview}). Refusing a "
             "partial import."
         )
     # Freeze the base before installing wrappers so only the new LoRA tensors
     # train (peft's is_trainable contract); a save must capture everything an
     # optimizer moved.
     model.freeze()
+    for module, tname, tensor in fs_plan:
+        setattr(module, tname, tensor)
     from mlx.utils import tree_unflatten
     model.update_modules(tree_unflatten(staged))
     # New wrappers start in training mode regardless of the host's; re-propagate
     # so nonzero lora_dropout cannot make inference stochastic on an eval model.
     model.train(bool(getattr(model, "training", False)))
+    # modules_to_save stays trainable (peft semantics); auto-saved frozen.
+    for path, origin in applied_full_state.items():
+        if origin == "modules_to_save":
+            by_name[path].unfreeze()
+    model._unsloth_full_state_modules = dict(applied_full_state)
+    # peft-origin: saves of this model carry the conversion marker.
+    model._unsloth_peft_converted = True
     mx.eval(model.parameters())
     # Shapes carry ranks, but scale variance must survive a zoo-side re-save
     # (stock mlx-lm has a single global scale).
