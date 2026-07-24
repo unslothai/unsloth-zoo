@@ -402,11 +402,15 @@ def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None
         if suggested <= batch_size:
             return  # Computed suggestion doesn't improve on current batch — skip
         _AMD_VRAM_ADVISORY_EMITTED = True
+        # Keep benchmark attribution fixed to its actual conditions (batch 4->16, seq=512).
+        # Report the runtime suggestion separately so the claim is not applied to
+        # different seq_len values or smaller batch increments.
         msg = (
             f"Unsloth [AMD ROCm]: batch_size={batch_size} with {free_vram_gb:.0f} GB "
             f"free VRAM on your {total_vram_gb:.0f} GB GPU.  "
-            f"Try --per_device_train_batch_size={suggested} for ~+50% throughput "
-            f"(benchmark: MI325X, LoRA, seq={seq_len})."
+            f"Consider --per_device_train_batch_size={suggested} to better utilize "
+            f"available VRAM.  "
+            f"(Reference benchmark: batch 4->16, seq=512, MI325X, LoRA: +51% throughput.)"
         )
         if log_fn is None:
             print(msg)
