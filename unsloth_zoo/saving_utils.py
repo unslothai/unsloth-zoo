@@ -5345,9 +5345,10 @@ pass
 #
 # Conversion is rename + transpose only; dtypes are preserved exactly and a
 # round trip is bitwise-identical for the supported subset (plain linear
-# LoRA). Adapters carrying DoRA magnitudes, modules_to_save state, embedding
-# LoRA, or expert target_parameters factors are refused with a named reason
-# instead of being partially or lossily converted. Tensor IO prefers
+# LoRA). Linear DoRA converts (magnitude <-> m, numerically verified);
+# modules_to_save state, embedding LoRA, and expert target_parameters
+# factors are refused with a named reason instead of being partially or
+# lossily converted. Tensor IO prefers
 # mlx.core (native bfloat16) with a safetensors.torch fallback off Apple
 # hardware; the safetensors numpy backend cannot represent bf16.
 # ---------------------------------------------------------------------------
@@ -5441,7 +5442,18 @@ _PEFT_HANDLED_KEYS = {
     "peft_type", "r", "lora_alpha", "use_rslora", "lora_dropout",
     "target_modules", "base_model_name_or_path", "revision",
     "rank_pattern", "alpha_pattern", "layers_to_transform", "layers_pattern",
+    # Linear DoRA converts (magnitude <-> m); embedding DoRA refuses later.
+    "use_dora",
 }
+# peft applies DoRA dropout inside the correction term, mlx-lm scales
+# base-plus-dropped-update together: continued training would diverge.
+def _reject_dora_dropout(cfg):
+    if cfg.get("use_dora") and float(cfg.get("lora_dropout") or 0.0) > 0:
+        raise ValueError(
+            "Unsloth MLX: use_dora with nonzero lora_dropout cannot be "
+            "converted; peft and mlx-lm apply DoRA dropout with different "
+            "training-mode formulas. Zero the dropout before converting."
+        )
 _PEFT_NEUTRAL_KEYS = {
     "task_type", "inference_mode", "init_lora_weights", "peft_version",
     "auto_mapping", "fan_in_fan_out", "exclude_modules",
@@ -5454,7 +5466,6 @@ _PEFT_NEUTRAL_KEYS = {
     "megatron_core",
 }
 _PEFT_REJECTED_KEYS = {
-    "use_dora": "DoRA adapters are not supported on the MLX backend yet",
     "modules_to_save": "modules_to_save (full-weight modules) is not "
                        "supported on the MLX backend yet",
     "target_parameters": "expert-parameter (MoE) LoRA is not supported on "
@@ -5494,6 +5505,7 @@ def normalize_peft_adapter_config(cfg, adapter_dir=None):
             f"Unsloth MLX: only peft_type='LORA' adapters can be imported; "
             f"got {cfg.get('peft_type')!r}."
         )
+    _reject_dora_dropout(cfg)
     if cfg.get("bias") not in (None, "none"):
         raise ValueError(
             "Unsloth MLX: PEFT LoRA bias terms (bias="
@@ -5575,8 +5587,12 @@ def group_peft_lora_pairs(tensors):
         if ".lora_embedding_" in key:
             rejected[key] = "embedding LoRA is not supported on MLX yet"
             continue
-        if ".lora_magnitude_vector" in key:
-            rejected[key] = "DoRA magnitudes are not supported on MLX yet"
+        mag = re.match(
+            rf"^{re.escape(_PEFT_PREFIX)}(.+)\.lora_magnitude_vector(?:\.weight)?$",
+            key,
+        )
+        if mag is not None:
+            pairs.setdefault(mag.group(1), {})["M"] = tensor
             continue
         m = re.match(
             rf"^{re.escape(_PEFT_PREFIX)}(.+)\.lora_(A|B)\.weight$", key
@@ -5586,11 +5602,20 @@ def group_peft_lora_pairs(tensors):
             continue
         path, which = m.group(1), m.group(2)
         pairs.setdefault(path, {})[which] = tensor
+    has_mag = {p for p, v in pairs.items() if "M" in v}
     for path, pair in pairs.items():
         if "A" not in pair or "B" not in pair:
             rejected[f"{_PEFT_PREFIX}{path}.lora_*"] = (
                 "incomplete lora_A/lora_B pair"
             )
+    # use_dora is global: a partial magnitude set means file and config
+    # disagree about what the adapter is.
+    if has_mag and len(has_mag) != len(pairs):
+        rejected[f"{_PEFT_PREFIX}<mixed>.lora_magnitude_vector"] = (
+            "magnitudes present on only some modules; peft DoRA is all-or-"
+            "nothing"
+        )
+        pairs = {}
     pairs = {p: v for p, v in pairs.items() if "A" in v and "B" in v}
     return pairs, rejected
 
@@ -5662,13 +5687,33 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
             )
         out[f"{path}.lora_a"] = transpose(a)
         out[f"{path}.lora_b"] = transpose(b)
+        mag = pairs[path].get("M")
+        if cfg.get("use_dora") and mag is None:
+            raise ValueError(
+                f"Unsloth MLX: use_dora is set but {path} has no magnitude "
+                "vector; the config and weights disagree."
+            )
+        if mag is not None and not cfg.get("use_dora"):
+            raise ValueError(
+                f"Unsloth MLX: {path} carries a DoRA magnitude but the "
+                "config does not set use_dora; the artifact is inconsistent."
+            )
+        if mag is not None:
+            if getattr(mag, "ndim", 0) != 1 or int(mag.shape[0]) != int(b.shape[0]):
+                raise ValueError(
+                    f"Unsloth MLX: {path} magnitude shape "
+                    f"{tuple(getattr(mag, 'shape', ()))} does not match the "
+                    f"module out-dim {int(b.shape[0])}."
+                )
+            out[f"{path}.m"] = mag
         ranks[path] = rank
         scales[path] = _effective_scale(cfg, path, rank)
     uniform_rank = len(set(ranks.values())) == 1
     uniform_scale = len(set(scales.values())) == 1
     any_path = next(iter(sorted(ranks)))
+    _is_dora = bool(cfg.get("use_dora"))
     mlx_cfg = {
-        "fine_tune_type": "lora",
+        "fine_tune_type": "dora" if _is_dora else "lora",
         "peft_type": "LORA",
         "num_layers": _num_hidden_layers(base_config),
         "base_model_name_or_path": cfg.get("base_model_name_or_path", ""),
@@ -5763,11 +5808,11 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
     backend, load_file, save_file, transpose = _tensor_backend()
     with open(os.path.join(src, "adapter_config.json"), "r") as f:
         cfg = json.load(f)
-    if str(cfg.get("fine_tune_type", "lora")).lower() != "lora":
+    _ft = str(cfg.get("fine_tune_type", "lora")).lower()
+    if _ft not in ("lora", "dora"):
         raise ValueError(
             f"Unsloth MLX: fine_tune_type={cfg.get('fine_tune_type')!r} "
-            "adapters cannot be exported to PEFT format yet; only plain "
-            "LoRA is supported."
+            "adapters cannot be exported to PEFT format."
         )
     if cfg.get("full_state_modules"):
         raise ValueError(
@@ -5779,11 +5824,17 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
     pairs = {}
     rejected = {}
     for key, tensor in tensors.items():
+        magm = re.match(r"^(.+)\.m$", key)
+        if magm is not None and str(cfg.get("fine_tune_type", "")).lower() == "dora":
+            pairs.setdefault(magm.group(1), {})["m_vec"] = tensor
+            continue
         m = re.match(r"^(.+)\.lora_(a|b)$", key)
         if m is None:
             rejected[key] = (
-                "not a plain LoRA tensor; DoRA/full-weight/embedding state "
-                "cannot be exported to PEFT format yet"
+                "not a LoRA/DoRA adapter tensor for this artifact's "
+                "fine_tune_type; full-weight/embedding state cannot be "
+                "exported, and a stray magnitude means the flag and "
+                "weights disagree"
             )
             continue
         # Embedding LoRA shares the lora_a/lora_b key shape but PEFT stores it
@@ -5831,6 +5882,19 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
 
     out = {}
     ranks, alphas = {}, {}
+    if _ft == "dora" and dropout > 0:
+        raise ValueError(
+            "Unsloth MLX: DoRA adapters with nonzero dropout cannot be "
+            "exported; peft and mlx-lm apply DoRA dropout with different "
+            "training-mode formulas."
+        )
+    _mag_paths = {p for p, v in pairs.items() if "m_vec" in v}
+    if _ft == "dora" and _mag_paths != set(pairs):
+        raise ValueError(
+            "Unsloth MLX: DoRA magnitudes present on only some modules; "
+            "peft applies use_dora globally, so a partial set cannot be "
+            "exported."
+        )
     for path in sorted(pairs):
         a, b = pairs[path]["a"], pairs[path]["b"]
         if getattr(a, "ndim", 0) != 2 or getattr(b, "ndim", 0) != 2:
@@ -5848,6 +5912,16 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
             )
         out[f"{_PEFT_PREFIX}{path}.lora_A.weight"] = transpose(a)
         out[f"{_PEFT_PREFIX}{path}.lora_B.weight"] = transpose(b)
+        if "m_vec" in pairs[path]:
+            _mv = pairs[path]["m_vec"]
+            if getattr(_mv, "ndim", 0) != 1 or int(_mv.shape[0]) != int(b.shape[1]):
+                raise ValueError(
+                    f"Unsloth MLX: {path} DoRA magnitude shape "
+                    f"{tuple(getattr(_mv, 'shape', ()))} does not match the "
+                    f"module out-dim {int(b.shape[1])}."
+                )
+            # peft's on-disk form has no .weight suffix (stripped at save).
+            out[f"{_PEFT_PREFIX}{path}.lora_magnitude_vector"] = _mv
         ranks[path] = rank
         scale = float(scale_map.get(path, global_scale))
         alphas[path] = scale * rank
@@ -5865,6 +5939,7 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None):
         "lora_dropout": dropout,
         "bias": "none",
         "use_rslora": False,
+        "use_dora": _ft == "dora",
         # Full module paths, matched exactly by peft's list semantics. Leaf
         # names would suffix-match EVERY layer's projection, so a layer-subset
         # adapter would grow zero-initialized extras and train a different

@@ -10538,6 +10538,7 @@ def save_trainable_adapters(model, path, adapter_config=None):
     base weights INSIDE a LoRA module (reload-leaked state that would
     reintroduce the original Unsloth adapter-export bloat).
     """
+    _reject_mixed_lora_dora(model)
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
@@ -10619,6 +10620,25 @@ def load_trainer_state(path):
         return json.load(f)
 
 
+def _reject_mixed_lora_dora(model):
+    """One fine_tune_type is recorded, so a mixed save would reload every
+    module as DoRA and silently change the plain ones."""
+    has_dora = has_plain = False
+    for _name, _module in model.named_modules():
+        if hasattr(_module, "lora_a") and hasattr(_module, "lora_b"):
+            if type(_module).__name__.startswith("DoRA"):
+                has_dora = True
+            else:
+                has_plain = True
+    if has_dora and has_plain:
+        raise ValueError(
+            "Unsloth MLX: this model mixes plain-LoRA and DoRA wrappers; "
+            "the adapter format records one fine_tune_type, so a mixed "
+            "save would reload every module as DoRA. Unify the wrapper "
+            "kind before saving."
+        )
+
+
 def _lora_module_types(model):
     """Map LoRA-wrapped module paths to 'linear' / 'embedding', but only where
     the live tree demonstrates the Hugging Face identity an oracle entry
@@ -10634,6 +10654,10 @@ def _lora_module_types(model):
         from mlx_lm.tuner.lora import LoRAEmbedding
     except ImportError:
         LoRAEmbedding = None
+    try:
+        from mlx_lm.tuner.dora import DoRALinear
+    except ImportError:
+        DoRALinear = None
     wrapped = {}
     for name, module in model.named_modules():
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
@@ -10648,9 +10672,10 @@ def _lora_module_types(model):
             and type(base_embedding) in (nn.Embedding, nn.QuantizedEmbedding)
         ):
             wrapped[name] = "embedding"
-        elif type(module) is LoRALinear and type(base_linear) in (
-            nn.Linear, nn.QuantizedLinear,
-        ):
+        elif (
+            type(module) is LoRALinear
+            or (DoRALinear is not None and type(module) is DoRALinear)
+        ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
             wrapped[name] = "linear"
         elif type(module) is LoRALinear or (
             LoRAEmbedding is not None and type(module) is LoRAEmbedding
@@ -10682,7 +10707,8 @@ def _lora_module_types(model):
 
 
 def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
-    """Save LoRA adapter weights (lora_a / lora_b only) to disk.
+    """Save LoRA adapter weights (lora_a / lora_b, plus DoRA magnitudes) to
+    disk.
 
     Args:
         model: MLX model with LoRA-wrapped modules.
@@ -10732,6 +10758,7 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
                 "dropout, so exporting would silently change training "
                 "behavior. Unify dropout before exporting."
             )
+    _reject_mixed_lora_dora(model)
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     if not adapter_tensors:
         raise ValueError(
@@ -12815,9 +12842,10 @@ def push_to_hub_gguf(
 #
 # Conversion is rename + transpose only; dtypes are preserved exactly and a
 # round trip is bitwise-identical for the supported subset (plain linear
-# LoRA). Adapters carrying DoRA magnitudes, modules_to_save state, embedding
-# LoRA, or expert target_parameters factors are refused with a named reason
-# instead of being partially or lossily converted. Tensor IO prefers
+# LoRA and linear DoRA, whose magnitude maps to mlx-lm's m without
+# transpose). Adapters carrying modules_to_save state, embedding LoRA, or
+# expert target_parameters factors are refused with a named reason instead
+# of being partially or lossily converted. Tensor IO prefers
 # mlx.core (native bfloat16) with a safetensors.torch fallback off Apple
 # hardware; the safetensors numpy backend cannot represent bf16.
 # ---------------------------------------------------------------------------
@@ -12851,6 +12879,18 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
+
+    from ..saving_utils import _reject_dora_dropout
+    _reject_dora_dropout(cfg)
+    use_dora = bool(cfg.get("use_dora"))
+    if use_dora:
+        try:
+            from mlx_lm.tuner.dora import DoRALinear
+        except ImportError as exc:
+            raise ImportError(
+                "Unsloth MLX: this adapter uses DoRA but mlx_lm.tuner.dora "
+                "is unavailable; upgrade mlx-lm."
+            ) from exc
 
     tensors = dict(mx.load(os.path.join(adapter_dir, PEFT_WEIGHTS_FILE)))
     pairs, rejected = group_peft_lora_pairs(tensors)
@@ -12887,7 +12927,21 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
             )
             continue
         scale = _effective_scale(cfg, path, rank)
-        wrapped = LoRALinear.from_base(module, r=rank, dropout=dropout, scale=scale)
+        mag = pairs[path].get("M")
+        if use_dora and mag is None:
+            unmatched.append(f"{path} (use_dora set but magnitude missing)")
+            continue
+        if not use_dora and mag is not None:
+            unmatched.append(f"{path} (magnitude present without use_dora)")
+            continue
+        if use_dora:
+            wrapped = DoRALinear.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
+        else:
+            wrapped = LoRALinear.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
         lora_a, lora_b = a.T, b.T
         if wrapped.lora_a.shape != lora_a.shape:
             unmatched.append(
@@ -12903,6 +12957,14 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
             continue
         wrapped.lora_a = lora_a
         wrapped.lora_b = lora_b
+        if use_dora:
+            if getattr(mag, "ndim", 0) != 1 or mag.shape != wrapped.m.shape:
+                unmatched.append(
+                    f"{path} (magnitude shape {tuple(mag.shape)} != module "
+                    f"out-dim {wrapped.m.shape[0]})"
+                )
+                continue
+            wrapped.m = mag
         staged.append((path, wrapped))
         module_scales[path] = scale
         module_ranks[path] = rank
