@@ -137,7 +137,10 @@ pass
 
 
 @functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = None):
+def _get_chunk_multiplier(
+    vocab_size, target_gb = None, device = None,
+    logit_scale_multiply = None, logit_scale_divide = None, logit_softcapping = None
+):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
@@ -156,7 +159,16 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
     # Self-calibrate true bytes per element at runtime
     bytes_per_element = 18.0 # default fallback
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+            
+        if device.type == "cuda":
+            rng_state = torch.cuda.get_rng_state(device)
+        else:
+            rng_state = torch.get_rng_state()
+
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
             mem_before = torch.cuda.max_memory_allocated(device)
@@ -164,12 +176,22 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
             dummy_qlen = 256
             # Use small hidden dim (e.g. 16) to minimize overhead not related to vocab_size
             hidden = torch.randn(1, dummy_qlen, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
-            weight = torch.randn(vocab_size, 16, dtype=torch.bfloat16, device=device)
+            weight = torch.randn(vocab_size, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
             target = torch.randint(0, vocab_size, (dummy_qlen,), device=device)
             
             with torch.enable_grad():
                 logits = torch.nn.functional.linear(hidden, weight)
                 logits_fp32 = logits.view(-1, vocab_size).float()
+                
+                if logit_scale_multiply != 0 and logit_scale_multiply is not None:
+                    logits_fp32 = logits_fp32 * logit_scale_multiply
+                if logit_scale_divide != 0 and logit_scale_divide is not None:
+                    logits_fp32 = logits_fp32 / logit_scale_divide
+                if logit_softcapping != 0 and logit_softcapping is not None:
+                    logits_fp32 = logits_fp32 / logit_softcapping
+                    logits_fp32 = torch.tanh(logits_fp32)
+                    logits_fp32 = logits_fp32 * logit_softcapping
+
                 loss = torch.nn.functional.cross_entropy(logits_fp32, target)
                 loss.backward()
 
@@ -183,15 +205,30 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
             del hidden, weight, target, logits, logits_fp32, loss
     except Exception as e:
         print(f"[CALIBRATION] failed, using fallback: {e}")
+    finally:
+        if 'rng_state' in locals():
+            try:
+                if device.type == "cuda":
+                    torch.cuda.set_rng_state(rng_state, device)
+                else:
+                    torch.set_rng_state(rng_state)
+            except Exception as e:
+                print(f"[CALIBRATION] Failed to restore RNG state: {e}")
 
     multiplier = (vocab_size * bytes_per_element / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, device = None, **kwargs):
     """Number of chunks that fits the target max memory usage."""
-    multiplier = _get_chunk_multiplier(vocab_size, target_gb)
+    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
+    logit_scale_divide = kwargs.get("logit_scale_divide", None)
+    logit_softcapping = kwargs.get("logit_softcapping", None)
+    multiplier = _get_chunk_multiplier(
+        vocab_size, target_gb, device,
+        logit_scale_multiply, logit_scale_divide, logit_softcapping
+    )
     n_splits = (bsz*qlen) * multiplier
     # n_splits * 4 == (full float32 logits GiB) / target: the exact number of
     # chunks needed to keep every chunk within target. Round UP to the next
@@ -281,7 +318,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
-            n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
+            n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb, device = device, **extra_kwargs)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
