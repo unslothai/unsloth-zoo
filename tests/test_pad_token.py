@@ -293,6 +293,27 @@ def test_valid_pad_in_generation_stop_list_is_left_alone():
     assert tok.pad_token == "<|endoftext|>"
 
 
+class _NoEosIdTokenizer(FakeTokenizer):
+    """A tokenizer that exposes eos_token but not eos_token_id (some remote-code ones)."""
+
+    @property
+    def eos_token_id(self):
+        return None
+
+
+@pytest.mark.parametrize("cls", [FakeTokenizer, _NoEosIdTokenizer])
+def test_config_declared_pad_never_re_aliases_eos(cls):
+    # A config that declares pad == eos must never be honoured - that is the very bug
+    # being repaired. Caught by id normally, and by token name when the tokenizer hides
+    # eos_token_id (where the id check alone would miss it).
+    tok = cls({"</s>": 2, "<s>": 1}, pad_token="</s>", eos_token="</s>")
+    cfg = type("Cfg", (), {"vocab_size": 100, "pad_token_id": 2})()
+
+    res = fix_pad_token(tok, model_config=cfg, allow_add=False)
+    assert res["changed"] is False
+    assert tok.pad_token == "</s>"
+
+
 def test_bool_config_pad_id_is_rejected():
     # bool subclasses int; True/False must never be accepted as a pad id.
     tok = FakeTokenizer({"</s>": 2}, pad_token="</s>", eos_token="</s>")

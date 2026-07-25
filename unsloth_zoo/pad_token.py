@@ -148,7 +148,7 @@ def _classify_bad_pad(inner, vocab_size):
     return None
 
 
-def _config_declared_pad(inner, cfg, eos_token_ids, vocab_size):
+def _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size):
     """Reuse the model config's own declared pad_token_id, as a last resort before
     synthesizing a brand-new token.
 
@@ -158,7 +158,9 @@ def _config_declared_pad(inner, cfg, eos_token_ids, vocab_size):
     while the tokenizer reports pad == eos == 50257), but the pattern is not Whisper
     specific, so this stays model-type agnostic. Honoring that declared id avoids adding a
     token and resizing embeddings. Guards: the id must be a real int (not bool), in vocab,
-    distinct from every known EOS id, and round-trip cleanly through the tokenizer. Runs
+    distinct from every known EOS id, and round-trip cleanly through the tokenizer; the
+    token it resolves to must also differ from the eos token itself, so a config that
+    declares pad == eos can never re-alias the two (the very bug being repaired). Runs
     only after the reserved-token search fails, so it never overrides a pad-named choice
     for an already-working model.
     """
@@ -178,8 +180,12 @@ def _config_declared_pad(inner, cfg, eos_token_ids, vocab_size):
         return None
     try:
         candidate = convert_ids_to_tokens(pad_token_id)
-        # Require a clean round-trip so we never promote an unknown / unstable id.
-        if candidate is None or convert_tokens_to_ids(candidate) != pad_token_id:
+        # Require a clean round-trip so we never promote an unknown / unstable id, and
+        # reject the eos token by name as well as by id: a tokenizer that does not expose
+        # eos_token_id would otherwise let a config-declared pad == eos slip through.
+        if candidate is None or candidate == eos_token:
+            return None
+        if convert_tokens_to_ids(candidate) != pad_token_id:
             return None
     except Exception:
         return None
@@ -319,7 +325,7 @@ def fix_pad_token(
         # Before synthesizing a token and resizing embeddings, honor the model config's
         # own declared pad id when it is safe (Whisper-large-v3 and any similarly
         # misconfigured tokenizer). This reuses an existing token, so no resize.
-        config_pad = _config_declared_pad(inner, cfg, eos_token_ids, vocab_size)
+        config_pad = _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size)
         if config_pad is not None:
             result.update(changed=True, new_pad=config_pad, added=False)
             pad_token_id = getattr(inner, "pad_token_id", None)
