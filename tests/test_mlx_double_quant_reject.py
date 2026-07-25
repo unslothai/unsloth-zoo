@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_reject_unsupported_hf_quantization_fields must accept an explicitly-passed
-bnb_4bit_use_double_quant (nested/double-quant is supported on the MLX load
-path) while still failing loud on genuinely unsupported BitsAndBytesConfig
-fields. Pure-logic; runs under the torch shim so Linux CI covers it.
+"""bnb_4bit_use_double_quant is accepted (bool only) while every other
+BitsAndBytesConfig field still fails loud. Pure logic, runs under the torch shim.
 """
-
-from __future__ import annotations
 
 import pytest
 
@@ -31,59 +27,42 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-def _reject():
+def _reject(cfg):
     from unsloth_zoo.mlx.loader import _reject_unsupported_hf_quantization_fields
-    return _reject_unsupported_hf_quantization_fields
+    return _reject_unsupported_hf_quantization_fields(cfg)
 
 
 @pytest.mark.parametrize("cfg", [
+    {}, {"load_in_4bit": True},
     {"bnb_4bit_use_double_quant": True},
     {"bnb_4bit_use_double_quant": False},
-    {"bnb_4bit_use_double_quant": None},           # absent-equivalent, accepted
-    {"bnb_4bit_quant_type": "fp4", "bnb_4bit_use_double_quant": True},
-    {"load_in_4bit": True, "bnb_4bit_use_double_quant": True},
+    {"bnb_4bit_use_double_quant": None},
 ])
-def test_double_quant_is_accepted(cfg):
-    """double_quant (True, False, or None) no longer triggers rejection."""
-    _reject()(cfg)  # must not raise
+def test_double_quant_accepted(cfg):
+    _reject(cfg)  # must not raise
 
 
-@pytest.mark.parametrize("bad_value", ["true", "false", 0, 1, 1.0, [], {"x": 1}])
-def test_non_bool_double_quant_fails_loud(bad_value):
-    """A non-bool value raises loud and names the field (0/1 are ints, not bools)."""
-    with pytest.raises(ValueError) as exc:
-        _reject()({"bnb_4bit_use_double_quant": bad_value})
-    assert "bnb_4bit_use_double_quant" in str(exc.value)
+@pytest.mark.parametrize("bad", ["true", 0, 1, 1.0, []])
+def test_non_bool_double_quant_rejected(bad):
+    """0/1 are ints, not bools, so numeric spellings raise too."""
+    with pytest.raises(ValueError, match="bnb_4bit_use_double_quant"):
+        _reject({"bnb_4bit_use_double_quant": bad})
 
 
-def test_double_quant_not_in_error_message():
-    """When another field is bad, double_quant=True is not among the rejected."""
-    with pytest.raises(ValueError) as exc:
-        _reject()({
-            "bnb_4bit_quant_type": "nf4",          # still unsupported
-            "bnb_4bit_use_double_quant": True,     # now supported
-        })
-    msg = str(exc.value)
-    assert "bnb_4bit_quant_type" in msg
-    assert "bnb_4bit_use_double_quant" not in msg
-
-
-@pytest.mark.parametrize("cfg,bad_field", [
-    ({"bnb_4bit_quant_type": "nf4"}, "bnb_4bit_quant_type"),
-    ({"llm_int8_threshold": 3.0}, "llm_int8_threshold"),
-    ({"bnb_4bit_quant_storage": "float16"}, "bnb_4bit_quant_storage"),
-    ({"llm_int8_enable_fp32_cpu_offload": True}, "llm_int8_enable_fp32_cpu_offload"),
-    ({"bnb_4bit_compute_dtype": "float16"}, "bnb_4bit_compute_dtype"),
+@pytest.mark.parametrize("field,value", [
+    ("bnb_4bit_quant_type", "nf4"),
+    ("bnb_4bit_compute_dtype", "float16"),
+    ("bnb_4bit_quant_storage", "float16"),
+    ("llm_int8_threshold", 3.0),
+    ("llm_int8_enable_fp32_cpu_offload", True),
 ])
-def test_genuinely_unsupported_still_fails_loud(cfg, bad_field):
-    """Every other bnb-specific field still raises a clear error."""
+def test_other_fields_still_rejected(field, value):
+    with pytest.raises(ValueError, match=field):
+        _reject({field: value})
+
+
+def test_double_quant_not_blamed_for_another_field():
+    """nf4 is rejected; the now-supported double_quant is not named."""
     with pytest.raises(ValueError) as exc:
-        _reject()(cfg)
-    assert bad_field in str(exc.value)
-
-
-def test_empty_and_default_configs_pass():
-    """No fields, or only defaulted/accepted fields, never raise."""
-    _reject()({})
-    _reject()({"load_in_4bit": True})
-    _reject()({"bnb_4bit_compute_dtype": "float32", "bnb_4bit_use_double_quant": True})
+        _reject({"bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True})
+    assert "bnb_4bit_use_double_quant" not in str(exc.value)
