@@ -245,8 +245,10 @@ def get_amd_attention_implementation():
         import importlib.util  # must import submodule explicitly (not bare importlib)
         if importlib.util.find_spec("aiter") is not None:
             import aiter as _aiter
-            # Validate: AMD AI tensor engine exposes flash_attn_func or FlashAttnFunc
-            if hasattr(_aiter, "flash_attn_func") or hasattr(_aiter, "FlashAttnFunc"):
+            # Validate: AMD AI tensor engine exposes the functional flash_attn_func API.
+            # FlashAttnFunc (class API) requires 13+ positional args and cannot be
+            # wrapped safely; only accept the simpler flash_attn_func functional API.
+            if hasattr(_aiter, "flash_attn_func"):
                 return "amd_aiter"
     except Exception:
         pass
@@ -273,11 +275,13 @@ def get_amd_flash_attn_func():
         import aiter as _aiter
         if hasattr(_aiter, "flash_attn_func"):
             return _aiter.flash_attn_func
-        if hasattr(_aiter, "FlashAttnFunc"):
-            # Class-based API: must call via .apply(); wrap in lambda so callers
-            # always receive a plain callable with signature (q, k, v, causal=True)
-            _cls = _aiter.FlashAttnFunc
-            return lambda q, k, v, causal=True: _cls.apply(q, k, v, causal)
+        # FlashAttnFunc is a torch.autograd.Function whose .apply() requires 13+
+        # positional arguments (dropout_p, softmax_scale, causal, window_size,
+        # bias, alibi_slopes, deterministic, return_lse, return_softmax,
+        # is_grad_enabled, ...) — see ROCm/aiter:aiter/ops/mha.py.
+        # We cannot safely wrap it without knowing the required defaults for the
+        # installed aiter version.  Return None so callers fall back to SDPA.
+        # (FlashAttnFunc environments should expose flash_attn_func in aiter >= 0.7)
     except Exception:
         pass
     return None
