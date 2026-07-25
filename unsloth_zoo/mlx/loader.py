@@ -2165,7 +2165,7 @@ def _reject_unsupported_hf_quantization_fields(config_dict):
             "supported on the MLX path; only this value is invalid."
         )
     if double_quant:
-        print("Unsloth: bnb_4bit_use_double_quant has no effect here; MLX applies its own affine quantization.")
+        print("Unsloth: bnb_4bit_use_double_quant has no effect; MLX does not use bitsandbytes nested quantization.")
     for key in (
         "bnb_4bit_compute_dtype", "bnb_4bit_quant_type",
         "bnb_4bit_quant_storage",
