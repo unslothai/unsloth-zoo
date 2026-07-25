@@ -153,7 +153,37 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
     if target_gb <= 1e-9: # Use a small epsilon for float comparison
         raise RuntimeError("Unsloth: No or negligible GPU memory available for fused cross entropy.")
 
-    multiplier = (vocab_size * 4 / 1024 / 1024 / 1024) / (target_gb)
+    # Self-calibrate true bytes per element at runtime
+    bytes_per_element = 18.0 # default fallback
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            mem_before = torch.cuda.max_memory_allocated(device)
+
+            dummy_qlen = 256
+            # Use small hidden dim (e.g. 16) to minimize overhead not related to vocab_size
+            hidden = torch.randn(1, dummy_qlen, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
+            weight = torch.randn(vocab_size, 16, dtype=torch.bfloat16, device=device)
+            target = torch.randint(0, vocab_size, (dummy_qlen,), device=device)
+            
+            logits = torch.nn.functional.linear(hidden, weight)
+            logits_fp32 = logits.view(-1, vocab_size).float()
+            loss = torch.nn.functional.cross_entropy(logits_fp32, target)
+            loss.backward()
+
+            mem_after = torch.cuda.max_memory_allocated(device)
+            peak_used = mem_after - mem_before
+            measured_bytes = peak_used / (dummy_qlen * vocab_size)
+            
+            print(f"[CALIBRATION] measured_bytes = {measured_bytes:.2f} bytes/element")
+            bytes_per_element = max(float(measured_bytes), 4.0)
+                
+            del hidden, weight, target, logits, logits_fp32, loss
+    except Exception:
+        pass
+
+    multiplier = (vocab_size * bytes_per_element / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
