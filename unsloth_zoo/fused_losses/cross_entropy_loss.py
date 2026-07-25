@@ -167,10 +167,11 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
             weight = torch.randn(vocab_size, 16, dtype=torch.bfloat16, device=device)
             target = torch.randint(0, vocab_size, (dummy_qlen,), device=device)
             
-            logits = torch.nn.functional.linear(hidden, weight)
-            logits_fp32 = logits.view(-1, vocab_size).float()
-            loss = torch.nn.functional.cross_entropy(logits_fp32, target)
-            loss.backward()
+            with torch.enable_grad():
+                logits = torch.nn.functional.linear(hidden, weight)
+                logits_fp32 = logits.view(-1, vocab_size).float()
+                loss = torch.nn.functional.cross_entropy(logits_fp32, target)
+                loss.backward()
 
             mem_after = torch.cuda.max_memory_allocated(device)
             peak_used = mem_after - mem_before
@@ -180,8 +181,8 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
             bytes_per_element = max(float(measured_bytes), 4.0)
                 
             del hidden, weight, target, logits, logits_fp32, loss
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[CALIBRATION] failed, using fallback: {e}")
 
     multiplier = (vocab_size * bytes_per_element / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
