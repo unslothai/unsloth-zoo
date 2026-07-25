@@ -17,7 +17,8 @@ incompatible-import errors, especially for multimodal workloads):
 
 ```bash
 # Example for ROCm 6.2; substitute the nearest available index for your ROCm version
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2 \
+    --upgrade --force-reinstall  # force-reinstall in case CUDA wheels are already present
 pip install unsloth
 ```
 
@@ -32,7 +33,7 @@ to install the correct wheel for your GPU and ROCm version.
 > wheel supports ROCm. For inference on Windows, follow the
 > [AMD ROCm Windows guide](https://rocm.docs.amd.com/en/latest/install/windows.html).
 
-Then train exactly as you would on NVIDIA - no code changes needed.
+On Linux / WSL, train exactly as you would on NVIDIA — no code changes needed.
 
 ---
 
@@ -44,10 +45,12 @@ ROCm 6.2, TinyLlama-1.1B, LoRA r=16, batch=4, seq=512, bfloat16).
 ### 1. Use SDPA attention (most important)
 
 ```python
-# Works with any model; benchmarks above used TinyLlama-1.1B
+# Works with SDPA-capable architectures (Llama, Qwen, Mistral, Gemma, etc.).
+# Some architectures (e.g. Pixtral, Mistral 3) do not support SDPA — Unsloth
+# detects this automatically and falls back to 'eager' when needed.
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name = "unsloth/Meta-Llama-3-8B",  # replace with your model
-    attn_implementation = "sdpa",             # recommended on ROCm
+    attn_implementation = "sdpa",             # recommended on ROCm for supported models
 )
 ```
 
@@ -71,9 +74,9 @@ These figures measure a single forward pass over the full input — not token-by
 autoregressive generation, which has much lower throughput for both backends.
 
 At longer sequence lengths, SDPA's memory advantage grows. In the training benchmark
-(TinyLlama-1.1B, batch=4, bfloat16), SDPA gives +41% prefill throughput at seq=2048
-and eager runs out of memory approximately 3x sooner. The crossover depends on
-model size, batch size, and dtype.
+(TinyLlama-1.1B, batch=4, bfloat16), SDPA gives +41% training-step throughput at
+seq=2048 and eager runs out of memory approximately 3x sooner. The crossover depends
+on model size, batch size, and dtype.
 
 ### 2. Scale batch size - AMD GPUs have large VRAM
 
