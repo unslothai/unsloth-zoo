@@ -3353,12 +3353,9 @@ def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     denom = mx.where(absmax > 0, absmax, mx.ones_like(absmax))
     scaled = groups / denom
     indices = mx.argmin(mx.abs(scaled[..., None] - codebook), axis=-1)
-    # Only simulate the nested (double-quantized) absmax when double quant is
-    # requested. This use_double_quant branch is a dead diagnostic path: real
-    # double-quant checkpoints are reconstructed by bitsandbytes' own
-    # .dequantize() on the bnb load path, not here. CUDA bitsandbytes
-    # dequantizes plain NF4 with the raw absmax, so default NF4 must keep
-    # un-nested scales.
+    # Dead diagnostic path: real double-quant checkpoints are reconstructed by
+    # bitsandbytes' own .dequantize() on the bnb load path, not here. Plain NF4
+    # keeps un-nested scales, matching how CUDA bitsandbytes dequantizes it.
     if use_double_quant:
         absmax = _bnb_nested_absmax(absmax.reshape((-1,))).reshape((-1, 1))
     dequantized = (codebook[indices] * absmax).reshape((-1,))[:original_size]
