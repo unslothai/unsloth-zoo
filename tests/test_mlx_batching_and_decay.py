@@ -987,6 +987,34 @@ def test_vlm_plan_refreshes_visit_dependent_formatting_per_occurrence():
     assert [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))] == heads
 
 
+def test_vlm_plan_pins_each_visit_against_an_in_place_formatting_func():
+    """A formatting_func that mutates and returns its argument must not let a
+    later visit rewrite the row an earlier visit already stored, so every batch
+    keeps the value the eager builder collated at that point in the schedule."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    dataset = [{"text": str(i)} for i in range(3)]
+
+    def formatting_func(item):
+        item["text"] = str(int(item["text"]) + 10)
+        return item
+
+    plan = _create_vlm_batch_plan(
+        dataset=dataset,
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=6,
+        dataset_order="sequential",
+        formatting_func=formatting_func,
+    )
+
+    heads = [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))]
+    assert heads == [10, 11, 12, 20, 21, 22]
+
+
 def test_vlm_plan_formats_only_scheduled_rows_and_compacts_without_a_formatter():
     """Unscheduled rows never reach the formatter, and the plans that need no
     per-visit formatting keep storing one row per referenced dataset index."""

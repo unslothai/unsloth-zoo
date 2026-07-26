@@ -5394,6 +5394,18 @@ def _filter_trainable_vlm_indices(
     return kept_indices, removed, formatted_items, supervision
 
 
+def _snapshot_formatted_vlm_row(item):
+    """Shallow snapshot of one formatted VLM row. A ``formatting_func`` that
+    mutates and returns its argument hands every visit the same object, so
+    without this a later visit's mutation would rewrite earlier stored visits.
+    Only the container is copied, never the payloads it points at."""
+    if isinstance(item, dict):
+        return copy.copy(item)
+    if isinstance(item, list):
+        return list(item)
+    return item
+
+
 class _FiniteVLMRow:
     """CPU-side formatted VLM item plus its checker-supervision flag."""
 
@@ -6229,9 +6241,12 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         # One row per scheduled slot, formatted in schedule order: the eager
         # builder ran the formatter while building every batch, so a stochastic
         # or epoch-dependent formatter must refresh on every revisit. Consuming
-        # it here still keeps user code out of re-materialization.
+        # it here still keeps user code out of re-materialization, and each
+        # result is snapshotted so a later visit cannot rewrite an earlier one.
         rows = tuple(
-            _FiniteVLMRow(formatting_func(dataset[idx]), True)
+            _FiniteVLMRow(
+                _snapshot_formatted_vlm_row(formatting_func(dataset[idx])), True,
+            )
             for batch in schedule for idx in batch
         )
         remapped = []
