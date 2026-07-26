@@ -901,11 +901,78 @@ def generate_batch(
             return adapter.generate(validated)
 
 
+def fast_generate(
+    self,
+    prompts,
+    *,
+    max_tokens=256,
+    temperature=0.0,
+    top_p=0.0,
+    top_k=0,
+    min_p=0.0,
+    stop_strings=(),
+    prefill_batch_size=8,
+    completion_batch_size=32,
+    max_kv_size=None,
+    kv_bits=None,
+    kv_group_size=None,
+):
+    """Batch-generate text rollouts from a training-resident MLX model.
+
+    Accepts one rendered prompt or a sequence of rendered prompts and always
+    returns a list of ``GenerationResult`` objects in input order. Callers that
+    need token-id prompts or heterogeneous per-request controls should use
+    ``generate_batch`` directly.
+    """
+
+    if getattr(self, "_is_vlm_model", False):
+        raise ValueError(
+            "Unsloth MLX: fast_generate is currently available for text "
+            "models only."
+        )
+    tokenizer = getattr(self, "_tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("Unsloth MLX: fast_generate requires model._tokenizer.")
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    else:
+        try:
+            prompts = list(prompts)
+        except TypeError as exc:
+            raise TypeError(
+                "Unsloth MLX: fast_generate prompts must be a string or a "
+                "sequence of strings."
+            ) from exc
+    if any(not isinstance(prompt, str) for prompt in prompts):
+        raise TypeError(
+            "Unsloth MLX: every fast_generate prompt must be a string."
+        )
+
+    defaults = GenerationDefaults(
+        max_tokens=max_tokens,
+        sampling=SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        ),
+        stop_strings=stop_strings,
+        prefill_batch_size=prefill_batch_size,
+        completion_batch_size=completion_batch_size,
+        max_kv_size=max_kv_size,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+    )
+    requests = [GenerationRequest(prompt=prompt) for prompt in prompts]
+    return generate_batch(self, tokenizer, requests, defaults=defaults)
+
+
 __all__ = [
     "GenerationDefaults",
     "GenerationRequest",
     "GenerationResult",
     "SamplingParams",
+    "fast_generate",
     "generate_batch",
     "generation_mode",
 ]

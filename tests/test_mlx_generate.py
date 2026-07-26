@@ -279,3 +279,27 @@ def test_generation_mode_releases_lock_when_limit_restore_raises(monkeypatch):
         release.set()
         holder.result()
     assert model.training is True
+
+def test_fast_generate_binds_only_text_models_and_maps_shared_controls(monkeypatch):
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.loader import _patch_mlx_saving
+    captured, expected = {}, [object()]
+    def fake_generate(model, tokenizer, requests, *, defaults):
+        captured.update(model=model, tokenizer=tokenizer, requests=requests, defaults=defaults)
+        return expected
+    monkeypatch.setattr(generate_module, "generate_batch", fake_generate)
+    tokenizer, model = object(), types.SimpleNamespace(_is_vlm_model=False)
+    _patch_mlx_saving(model, tokenizer)
+    result = model.fast_generate(
+        ("one", "two"), max_tokens=7, temperature=0.5,
+        prefill_batch_size=2, completion_batch_size=3, max_kv_size=32,
+    )
+    assert result is expected
+    assert [request.prompt for request in captured["requests"]] == ["one", "two"]
+    assert (captured["defaults"].max_tokens, captured["defaults"].sampling.temperature) == (7, 0.5)
+    assert (captured["defaults"].prefill_batch_size, captured["defaults"].completion_batch_size, captured["defaults"].max_kv_size) == (2, 3, 32)
+    with pytest.raises(TypeError, match="every fast_generate prompt"):
+        model.fast_generate(["valid", 3])
+    vlm = types.SimpleNamespace(_is_vlm_model=True)
+    _patch_mlx_saving(vlm, tokenizer)
+    assert not hasattr(vlm, "fast_generate")

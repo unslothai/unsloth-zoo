@@ -113,6 +113,10 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
         assert result.logprobs == pytest.approx(logprobs, abs=0.02)
         assert result.finish_reason == reason
         assert result.text == text
+    from unsloth_zoo.mlx.loader import _patch_mlx_saving
+    _patch_mlx_saving(model, tokenizer)
+    smoke = model.fast_generate([request.prompt for request in requests], max_tokens=2)
+    assert len(smoke) == 2 and all(result.token_ids for result in smoke)
 
 @metal_only
 def test_compiled_training_state_survives_generation(monkeypatch):
