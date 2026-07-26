@@ -1943,6 +1943,8 @@ class MLXTrainer:
 
     def _call_callback_log(self, logs):
         """Record and dispatch a Hugging Face on_log callback event."""
+        if self.state.epoch is not None:
+            logs["epoch"] = self.state.epoch
         output = dict(logs)
         output["step"] = self.state.global_step
         self.state.log_history.append(output)
@@ -4030,6 +4032,10 @@ class MLXTrainer:
             }
             if grad_norm_val is not None:
                 logs["grad_norm"] = grad_norm_val
+            # HF's Trainer.log stamps the epoch onto every payload, so a persisted
+            # log_history entry keeps it after state.epoch has moved on.
+            if self.state.epoch is not None:
+                logs["epoch"] = self.state.epoch
             self.control.should_log = False
             if is_main_process:
                 record = dict(logs)
@@ -4071,6 +4077,10 @@ class MLXTrainer:
                         _main_print(f"Unsloth: eval callback error: {e}")
 
             metrics = self._last_eval_metrics or {}
+            # Same epoch stamp. Rebound rather than mutated so the checkpoint's
+            # eval_metrics payload stays exactly as evaluated.
+            if self.state.epoch is not None:
+                metrics = {**metrics, "epoch": self.state.epoch}
             if is_main_process:
                 record = dict(metrics)
                 record["step"] = self.state.global_step

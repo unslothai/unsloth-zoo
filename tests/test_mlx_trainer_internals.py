@@ -5938,3 +5938,63 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
     ) == pytest.approx(
         whole._train_loss_token_sum / whole._train_loss_token_total
     )
+
+
+def test_log_payloads_carry_epoch(monkeypatch):
+    # HF's Trainer.log does `logs["epoch"] = self.state.epoch` on every payload,
+    # so log_history entries keep their epoch once state.epoch has moved on.
+    # Without the stamp the persisted history has no recoverable epoch series.
+    import mlx.core as mx
+    from transformers import TrainerCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    seen = []
+
+    class Spy(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            seen.append((state.global_step, dict(logs or {})))
+
+    args = MLXTrainingConfig(
+        max_steps=4,
+        gradient_accumulation_steps=1,
+        logging_steps=1,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(4)],
+        args=args,
+        callbacks=[Spy()],
+    )
+    trainer._prepare_data = lambda _is_vlm: ([make_batch(10) for _ in range(4)], None)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer.train()
+
+    assert seen, "no on_log events fired"
+    for step, logs in seen:
+        assert "epoch" in logs, f"step {step} logs missing epoch: {sorted(logs)}"
+    # The stamp is the live value, and it is preserved per entry in the history
+    # that this trainer persists to trainer_state.json.
+    assert [logs["epoch"] for _, logs in seen] == [
+        entry["epoch"] for entry in trainer.state.log_history if "epoch" in entry
+    ]
+    assert [logs["epoch"] for _, logs in seen] == sorted(
+        logs["epoch"] for _, logs in seen
+    )
