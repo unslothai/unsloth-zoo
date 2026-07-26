@@ -667,9 +667,8 @@ class MLXTrainingConfig:
     # console/W&B/TB, _grad_norm_history, and the legacy step callback (None).
     # Reporting never changes update numerics; the reported value is the fp32
     # norm of the token-normalized gradient — after the accumulation divide and
-    # DDP reduction; before any clipping, weight decay, the optimizer update, and
-    # the LoRA+/embedding-LR post-update step rescale (which no longer scales the
-    # gradient).
+    # DDP reduction; before clipping, weight decay, the optimizer update and the
+    # LoRA+/embedding-LR post-update step rescale.
     report_grad_norm: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -2581,25 +2580,21 @@ class MLXTrainer:
         _scoped_lr_requested = use_lora_plus or use_embedding_lr
 
         # --- Per-group LR via post-update STEP rescale (not gradient scaling) ---
-        # The update-normalizing optimizers (AdamW/Adam/Lion/Adafactor, and Muon
-        # for rank>=2 matrices) are scale-invariant to a constant gradient
-        # scale, so applying LoRA+ / embedding-LR ratios to the gradient is a
-        # near no-op. Instead, let the single optimizer take its normal step,
-        # then rescale the realized delta of the scoped params:
-        # ``param = pre + ratio*(post - pre)``. This yields effective LR
+        # Update-normalizing optimizers (AdamW/Adam/Lion/Adafactor, Muon for
+        # rank>=2) are scale-invariant to a constant gradient scale, so scaling
+        # the gradient is a near no-op. Instead let the optimizer take its
+        # normal step, then rescale the realized delta of the scoped params:
+        # ``param = pre + ratio*(post - pre)``. That gives effective LR
         # ``ratio*base_lr`` for ANY optimizer, scales the decoupled decay along
-        # with the step (the snapshot precedes it), and adds no optimizer state.
-        # Scoped keys: LoRA+ -> ``lora_b``; embedding LR -> the full-module
-        # embed_tokens/lm_head weight (registered keys recorded by
-        # get_peft_model's CPT partition when present, else the literal
-        # ``<...>.embed_tokens/lm_head.weight`` fallback).
+        # with the step, and adds no optimizer state. Scoped keys: LoRA+ ->
+        # ``lora_b``; embedding LR -> the full-module embed_tokens/lm_head
+        # weight (keys recorded by the CPT partition, else a literal fallback).
         _cpt_full_keys = getattr(
             model, "_unsloth_cpt_full_module_weight_keys", None) or set()
 
         def _scoped_step_ratio(name):
             # mlx-lm may wrap the LoRA halves in nn.Linear children, flattening
-            # lora_b to `...lora_b.weight` (the layout loader.py / utils.py
-            # already unwrap); match it too so LoRA+ scales that layout as well.
+            # lora_b to `...lora_b.weight`; match that layout too.
             if use_lora_plus and (
                 name == "lora_b" or name.endswith(".lora_b")
                 or name == "lora_b.weight" or name.endswith(".lora_b.weight")
@@ -2615,26 +2610,22 @@ class MLXTrainer:
             return None
 
         # The trainable set is fixed after get_peft_model, so classify the
-        # scoped leaves once here rather than re-running _scoped_step_ratio over
-        # the whole tree every optimizer step.
+        # scoped leaves once instead of re-walking the tree every step.
         _scoped_ratios = {}
         if _scoped_lr_requested:
             for name, _value in tree_flatten(model.trainable_parameters()):
                 r = _scoped_step_ratio(name)
-                # ratio == 1.0 is a no-op rescale (pre + 1*(post-pre) == post);
-                # skip it so no large full-module tensor is snapshotted when the
-                # scoped LR equals the base LR.
+                # ratio == 1.0 is a no-op; skip it so no large full-module
+                # tensor is snapshotted when the scoped LR is the base LR.
                 if r is not None and r != 1.0:
                     _scoped_ratios[name] = r
-        # True only when some scoped leaf actually needs rescaling. A requested
-        # but no-op ratio (lora_plus_ratio=1.0, or embedding_learning_rate ==
-        # learning_rate) leaves this False, so it neither snapshots anything nor
-        # disables the single-step fast path below.
+        # True only when some scoped leaf actually needs rescaling, so a no-op
+        # ratio neither snapshots anything nor disables the fast path below.
         _needs_step_rescale = bool(_scoped_ratios)
 
         def _snapshot_scoped_params():
-            """Pre-update values (immutable mx arrays) + ratio for scoped leaves,
-            captured before decoupled decay so the rescale scales decay too."""
+            """Pre-update values + ratio per scoped leaf, captured before
+            decoupled decay so the rescale scales the decay too."""
             if not _scoped_ratios:
                 return {}
             snap = {}
@@ -2739,10 +2730,9 @@ class MLXTrainer:
             optimizer.update to promote params/m/v too).
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            # NOTE: the per-group LoRA+ / embedding-LR ratios are NOT applied
-            # here. Scaling the gradient is a near no-op under the update-
-            # normalizing optimizers (AdamW/Lion/Adafactor/Muon), so those
-            # ratios are applied as a post-update STEP rescale instead (see
+            # The LoRA+ / embedding-LR ratios are NOT applied here: scaling the
+            # gradient is a near no-op under update-normalizing optimizers, so
+            # they are applied as a post-update step rescale instead (see
             # _snapshot_scoped_params / _rescale_scoped_params).
             if clip_scale is not None:
                 scale = scale * clip_scale
@@ -2783,9 +2773,8 @@ class MLXTrainer:
                 final_grad = _clip_grad_by_value(final_grad, max_grad_value)
             if _clip_grad_leaf_norm:
                 final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
-            # Snapshot the scoped params BEFORE decay so the post-update rescale
-            # scales the whole realized delta (decoupled decay + optimizer step)
-            # by the per-group ratio (LoRA+ / embedding-LR).
+            # Snapshot BEFORE decay so the rescale scales the whole realized
+            # delta (decoupled decay + optimizer step) by the per-group ratio.
             _scoped_snap = _snapshot_scoped_params() if _needs_step_rescale else None
             # Coupled (SGD) decay folds into the post-clip grad so it feeds
             # momentum; decoupled (AdamW-family) decay shrinks params directly.

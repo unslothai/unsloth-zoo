@@ -1551,10 +1551,8 @@ def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
 
 
 def test_save_lora_adapters_method_ignores_a_fully_unfrozen_tree(tmp_path):
-    # mlx-lm's load_adapters() never freezes, so a model whose adapters were
-    # just reloaded reports EVERY base weight as trainable. That is not
-    # continued-pretraining state, so model.save_lora_adapters() must keep the
-    # LoRA-only writer instead of dumping the whole base model.
+    # load_adapters() never freezes, so a just-reloaded model reports EVERY
+    # base weight as trainable. Not CPT state: keep the LoRA-only writer.
     from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
 
     model = _make_model({
@@ -1569,8 +1567,7 @@ def test_save_lora_adapters_method_ignores_a_fully_unfrozen_tree(tmp_path):
 
 
 def test_save_lora_adapters_method_raises_when_no_lora_modules(tmp_path):
-    # A base model that never went through get_peft_model must still get the
-    # actionable error rather than a whole-model file labelled as an adapter.
+    # A base model must still error, not write a whole-model "adapter".
     from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
 
     model = _make_model({"up_proj": _MockPlainLinear(16, 32)})
@@ -1579,8 +1576,7 @@ def test_save_lora_adapters_method_raises_when_no_lora_modules(tmp_path):
 
 
 def test_save_lora_adapters_method_keeps_continued_pretraining_tensors(tmp_path):
-    # The CPT case get_peft_model actually produces: embed_tokens.weight is
-    # trainable while the rest of the tree stays frozen.
+    # Real CPT state: embed_tokens.weight trainable, the rest frozen.
     from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
 
     model = _make_model({

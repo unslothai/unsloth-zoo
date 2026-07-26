@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CUDA-parity continued pretraining, end-to-end on real MLX (Apple Silicon).
+"""CUDA-parity continued pretraining, end to end on real MLX (Apple Silicon).
 
 Drives get_peft_model + save routing (LR key, full-module unfreeze, save/reload).
 Fine-grained matrix: analysis_artifacts/2026-07-21_mlx-cpt-validation/.
@@ -27,8 +27,7 @@ import tempfile
 
 import pytest
 
-# Skip the whole module (before importing mlx.nn/utils) when MLX is absent, so
-# collection on Linux / non-MLX environments does not raise ModuleNotFoundError.
+# Skip before importing mlx.nn/utils so non-MLX collection does not error.
 pytest.importorskip("mlx.core")
 import mlx.core as mx
 import mlx.nn as nn
@@ -37,8 +36,8 @@ import mlx.utils as mu
 
 @pytest.fixture(autouse=True)
 def _require_real_metal():
-    # Re-import: the shim swaps mlx.core in sys.modules at run time, after this
-    # module imported real MLX; these must skip (not fail) under the shim.
+    # Re-import: the shim swaps mlx.core in sys.modules after this module
+    # imported real MLX, and these must skip (not fail) under the shim.
     import mlx.core as _mx
     if not (getattr(_mx, "metal", None) and _mx.metal.is_available()
             and _mx.default_device() == _mx.gpu):
@@ -86,12 +85,10 @@ def _peft(model, **kw):
 def test_untied_cpt_partition_lr_key_and_save_reload():
     m = _tiny()
     _peft(m, target_modules=["q_proj", "embed_tokens", "lm_head"])
-    # embed -> full module (weight trainable); lm_head -> LoRA; q_proj -> LoRA.
     trainable = set(dict(mu.tree_flatten(m.trainable_parameters())))
     assert "model.embed_tokens.weight" in trainable
     assert {"lm_head.lora_a", "lm_head.lora_b"} <= trainable
     assert "lm_head.weight" not in trainable
-    # AD-7: recorded LR keys are the exact registered full-module weight keys.
     assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
     # Save keeps the full module; a reloaded model (no marker) saves it too.
     from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters  # noqa: E402
@@ -107,14 +104,13 @@ def test_tied_trains_shared_matrix_and_rejects_lm_head():
     m = _tiny(tied=True)
     _peft(m, target_modules=["embed_tokens"], finetune_language_layers=False)
     assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
-    # The documented recipe co-requests embed_tokens + lm_head; on a tied model
-    # that trains the shared matrix via embed_tokens rather than erroring.
+    # The recipe co-requests embed_tokens + lm_head; tied trains the shared
+    # matrix via embed_tokens rather than erroring.
     m2 = _tiny(tied=True)
     _peft(m2, target_modules=["embed_tokens", "lm_head"], finetune_language_layers=False)
     assert m2._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
     trn = set(dict(mu.tree_flatten(m2.trainable_parameters())))
     assert not any(k.startswith("lm_head") for k in trn)  # tied: no separate head
-    # A standalone lm_head request is still rejected.
     with pytest.raises(ValueError, match="tied"):
         _peft(_tiny(tied=True), target_modules=["lm_head"])
 
@@ -131,8 +127,7 @@ def test_set_valued_target_modules_are_not_silently_emptied():
 
 
 def test_all_linear_sentinel_accepts_set_form():
-    # target_modules={"all-linear"} must expand like the string sentinel rather
-    # than be treated as a literal module name that matches nothing.
+    # {"all-linear"} must expand like the string sentinel, not be a literal name.
     m = _tiny()
     _peft(m, target_modules={"all-linear"})
     trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
@@ -140,8 +135,7 @@ def test_all_linear_sentinel_accepts_set_form():
 
 
 def test_set_target_modules_respects_finetune_filters():
-    # A set selection must still honor finetune_attention_modules=False:
-    # q_proj (attention) is filtered out while embed_tokens still trains.
+    # A set selection must still honor finetune_attention_modules=False.
     m = _tiny()
     _peft(m, target_modules={"q_proj", "embed_tokens"},
           finetune_attention_modules=False)
@@ -169,10 +163,8 @@ class _AltHead(nn.Module):
 
 
 def test_unusable_lm_head_keeps_the_other_lora_targets():
-    # target_modules=[..., "lm_head"] LoRA'd the other targets before CPT
-    # existed. An lm_head this backend cannot train must not abort the run:
-    # warn and drop it, so tied models (Llama/Qwen/Gemma) and unresolved-head
-    # models (GPT-NeoX embed_out, InternLM2 output) still train.
+    # An lm_head this backend cannot train must warn and drop, not abort, so
+    # tied and unresolved-head models keep the pre-CPT behaviour.
     m = _tiny(tied=True)
     with pytest.warns(UserWarning, match="tied"):
         _peft(m, target_modules=["q_proj", "lm_head"])
@@ -199,8 +191,8 @@ class _WrappedHead(nn.Module):
 
 
 def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
-    # mlx-lm's to_lora() raises for a head it cannot wrap, which used to take
-    # the whole run down; modules_to_save still trains it as a full module.
+    # mlx-lm's to_lora() raises for a head it cannot wrap; that must not take
+    # the run down, and modules_to_save still trains it as a full module.
     m = _tiny(); m.lm_head = _WrappedHead()
     with pytest.warns(UserWarning, match="cannot wrap as a LoRA layer"):
         _peft(m, target_modules=["q_proj", "lm_head"])
@@ -214,10 +206,8 @@ def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
 
 
 def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
-    # A wrapper head owns no `.weight` of its own, so recording `lm_head.weight`
-    # named a tensor that does not exist: it matches neither the trainer's
-    # recorded-key lookup nor its `<...>.embed_tokens/lm_head.weight` leaf
-    # fallback, and embedding_learning_rate silently never reached the head.
+    # A wrapper head owns no `.weight`, so recording `lm_head.weight` named a
+    # nonexistent tensor and embedding_learning_rate never reached the head.
     m = _tiny(); m.lm_head = _WrappedHead()
     _peft(m, target_modules=["q_proj"], modules_to_save=["lm_head"])
     keys = m._unsloth_cpt_full_module_weight_keys
@@ -235,9 +225,7 @@ def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
 
 def test_quantized_child_of_a_wrapper_head_is_rejected():
     # Quantization on a wrapper head lives on a descendant, so a leaf-only
-    # `scales` check accepted it and MLX then raised
-    # "[QuantizedMatmul::vjp] no gradient wrt the quantized weights" at the
-    # first backward instead of this actionable error.
+    # `scales` check accepted it and MLX raised at the first backward instead.
     m = _tiny(); m.lm_head = _WrappedHead()
     m.lm_head.linear = nn.QuantizedLinear.from_linear(
         m.lm_head.linear, group_size=32, bits=4)
@@ -255,8 +243,7 @@ def test_quantized_child_of_a_wrapper_head_is_rejected():
 
 def test_unusable_lm_head_still_raises_when_nothing_else_trains():
     # Dropping lm_head must never leave an empty selection to fall through to
-    # mlx-lm's auto-discovery, and an explicit modules_to_save request names
-    # one module, so both keep raising.
+    # auto-discovery, and modules_to_save names one module, so both raise.
     with pytest.raises(ValueError, match="tied"):
         _peft(_tiny(tied=True), target_modules=["lm_head"])
     with pytest.raises(ValueError, match="output head could not be resolved"):

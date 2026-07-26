@@ -299,11 +299,10 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
 
 @metal_only
 def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
-    """Post-update step rescale: the LoRA+ ratio must actually scale
-    lora_b's realized step. The old gradient pre-scale was an AdamW no-op, so
-    boosting the ratio left lora_b movement unchanged. lora_b initialises to
-    zero, so its final L2 norm is its total movement. Same mechanism as the
-    embedding-LR scope (validated end-to-end by the CUDA comparison after CPT).
+    """The LoRA+ ratio must actually scale lora_b's realized step.
+
+    The old gradient pre-scale was an AdamW no-op. lora_b starts at zero, so
+    its final L2 norm is its total movement. Same mechanism as embedding LR.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten
@@ -318,8 +317,7 @@ def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
     base = _lora_b_norm(_train(tmp_path / "r1", lora_plus_ratio=1.0, max_steps=6))
     boosted = _lora_b_norm(_train(tmp_path / "r8", lora_plus_ratio=8.0, max_steps=6))
     assert base > 0.0, "lora_b never moved at ratio=1"
-    # Under the fix, boosting the ratio 8x moves lora_b markedly farther; under
-    # the old gradient-scale AdamW no-op, boosted/base would be ~1.0.
+    # Under the old gradient-scale no-op, boosted/base would be ~1.0.
     assert boosted > 3.0 * base, (
         f"LoRA+ ratio did not scale the step (fix regressed): "
         f"base={base:.4f} boosted={boosted:.4f} ratio={boosted / base:.2f}"
@@ -329,10 +327,9 @@ def test_lora_plus_ratio_scales_the_lora_b_step(tmp_path):
 @metal_only
 @pytest.mark.parametrize("nested", [True, False])
 def test_lora_plus_scales_layer_wrapped_lora_b_weight(tmp_path, nested):
-    """mlx-lm may wrap the LoRA halves in nn.Linear children, flattening lora_b
-    to `...lora_b.weight` (the layout loader.py / utils.py already unwrap). The
-    LoRA+ scoped rescale must scale that layout too, not only a raw `.lora_b` —
-    for both a nested (`proj.lora_b.weight`) and a root (`lora_b.weight`) key.
+    """mlx-lm may wrap the LoRA halves in nn.Linear children, flattening
+    lora_b to `...lora_b.weight`. The scoped rescale must scale that layout
+    too, both nested (`proj.lora_b.weight`) and root (`lora_b.weight`).
     """
     key = "proj.lora_b.weight" if nested else "lora_b.weight"
 
