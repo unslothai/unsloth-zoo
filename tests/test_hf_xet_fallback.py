@@ -2197,6 +2197,45 @@ def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
 
 
+def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
+    """Regression for issue #889: unsloth/Qwen3.5-4B shards its safetensors with a NON-standard name that
+    keeps the format suffix in the middle (model.safetensors-00001-of-00002.safetensors), referenced that
+    way by model.safetensors.index.json. transformers enumerates the weight through the index, so the
+    post-download gate must accept it rather than raise a spurious DownloadStallError. Shard completeness
+    is still enforced: a missing shard is rejected, and the standard sharded layout is unaffected."""
+    shards = ["model.safetensors-00001-of-00002.safetensors",
+              "model.safetensors-00002-of-00002.safetensors"]
+    # Complete cache with the non-standard shard names -> accepted (the #889 fix).
+    snap, blob = _mk_snapshot(tmp_path, "qwen35_nonstd")
+    (snap / "config.json").write_text("{}")
+    for s in shards:
+        (snap / s).symlink_to(blob)
+    (snap / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+    # Same layout but one shard missing -> still rejected (Invariant B validates via the index).
+    snap2, blob2 = _mk_snapshot(tmp_path, "qwen35_nonstd_missing")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / shards[0]).symlink_to(blob2)
+    (snap2 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+
+    # Sanity: the standard sharded layout still passes.
+    snap3, blob3 = _mk_snapshot(tmp_path, "qwen35_standard")
+    (snap3 / "config.json").write_text("{}")
+    std = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for s in std:
+        (snap3 / s).symlink_to(blob3)
+    (snap3 / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"a": std[0], "b": std[1]}}))
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
+
+
 def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_path):
     """A sentence-transformers model reads a weight-bearing subfolder module (2_Dense) the canonical root
     gate does not check, so a partial cache holding the root weight but missing the 2_Dense weight must
@@ -2328,6 +2367,46 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
+
+
+def test_post_accepts_nonstandard_sharded_variant_names(tmp_path):
+    """Variant analog of #889: a variant sharded with NON-standard shard names the variant-weight regex
+    misses (the format suffix kept in the middle) is enumerated through model.safetensors.index.fp16.json,
+    so the post-download gate must accept it rather than raise a spurious DownloadStallError. Shard
+    completeness is still enforced via the index: a missing shard is rejected."""
+    shards = ["model.fp16.safetensors-00001-of-00002.safetensors",
+              "model.fp16.safetensors-00002-of-00002.safetensors"]
+    # Complete cache with the non-standard variant shard names -> accepted.
+    snap, blob = _mk_snapshot(tmp_path, "varnonstd")
+    (snap / "config.json").write_text("{}")
+    for s in shards:
+        (snap / s).symlink_to(blob)
+    (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is True
+
+    # Same layout but one shard missing -> still rejected (Invariant B validates via the index).
+    snap2, blob2 = _mk_snapshot(tmp_path, "varnonstd_missing")
+    (snap2 / "config.json").write_text("{}")
+    (snap2 / shards[0]).symlink_to(blob2)
+    (snap2 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None,
+        variant = "fp16") is False
+
+    # The variant index does not rescue when its format is ignored (load reads .bin only).
+    snap3, blob3 = _mk_snapshot(tmp_path, "varnonstd_ignored")
+    (snap3 / "config.json").write_text("{}")
+    for s in shards:
+        (snap3 / s).symlink_to(blob3)
+    (snap3 / "model.safetensors.index.fp16.json").write_text(json.dumps(
+        {"weight_map": {"a": shards[0], "b": shards[1]}}))
+    assert xf._download_result_usable(
+        snap3, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.safetensors"],
+        variant = "fp16") is False
 
 
 def test_post_download_rejects_patterned_canonical_only_for_variant(tmp_path):
@@ -2844,6 +2923,96 @@ def test_post_download_rejects_incomplete_diffusers_component_shards_unpatterned
     assert xf._download_result_usable(
         snapv, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
+
+
+def test_post_accepts_nonstandard_sharded_diffusers_component_names(tmp_path):
+    """Diffusers analog of issue #889: a pipeline COMPONENT (unet/) sharded with the NON-standard name that
+    keeps the format suffix in the middle (diffusion_pytorch_model.safetensors-00001-of-00002.safetensors),
+    enumerated via unet/diffusion_pytorch_model.safetensors.index.json, must be accepted rather than raise a
+    spurious DownloadStallError. The presence check reads the component index like the root does; shard
+    completeness stays the component-shard check's job, and an ignored format is not rescued."""
+    shards = ["diffusion_pytorch_model.safetensors-00001-of-00002.safetensors",
+              "diffusion_pytorch_model.safetensors-00002-of-00002.safetensors"]
+
+    def _pipe(name, present, index_name = "diffusion_pytorch_model.safetensors.index.json", weight_map = None):
+        # a pipeline declaring a model-style unet (sharded, under test) + a single-file vae.
+        snap, blob = _mk_snapshot(tmp_path, name)
+        (snap / "model_index.json").write_text(json.dumps(
+            {"_class_name": "StableDiffusionPipeline",
+             "unet": ["diffusers", "UNet2DConditionModel"], "vae": ["diffusers", "AutoencoderKL"]}))
+        (snap / "unet").mkdir()
+        (snap / "unet" / "config.json").write_text("{}")
+        for s in present:
+            (snap / "unet" / s).symlink_to(blob)
+        (snap / "unet" / index_name).write_text(json.dumps(
+            {"weight_map": weight_map or {"a": shards[0], "b": shards[1]}}))
+        (snap / "vae").mkdir()
+        (snap / "vae" / "config.json").write_text("{}")
+        (snap / "vae" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
+        return snap
+
+    # Complete non-standard unet shards -> accepted (the fix).
+    assert xf._download_result_usable(
+        _pipe("diff_nonstd", shards), repo_type = "model", allow_patterns = None,
+        ignore_patterns = None) is True
+    # One shard missing -> still rejected (the component-shard check validates via the index).
+    assert xf._download_result_usable(
+        _pipe("diff_nonstd_missing", shards[:1]), repo_type = "model", allow_patterns = None,
+        ignore_patterns = None) is False
+    # The index does not rescue when its format is ignored (the load reads .bin only, which is absent).
+    assert xf._download_result_usable(
+        _pipe("diff_nonstd_ignored", shards), repo_type = "model", allow_patterns = None,
+        ignore_patterns = ["*.safetensors"]) is False
+    # Variant component enumerated via a variant index (diffusion_pytorch_model.safetensors.index.fp16.json).
+    vshards = ["diffusion_pytorch_model.fp16.safetensors-00001-of-00002.safetensors",
+               "diffusion_pytorch_model.fp16.safetensors-00002-of-00002.safetensors"]
+    assert xf._download_result_usable(
+        _pipe("diff_nonstd_variant", vshards, index_name = "diffusion_pytorch_model.safetensors.index.fp16.json",
+              weight_map = {"a": vshards[0], "b": vshards[1]}),
+        repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = "fp16") is True
+
+
+def test_diffusers_component_index_review_hardening(tmp_path):
+    """Hardening of the component-index presence path: (a) a component-scoped ignore matches the component's
+    OWN base (not model.*), so ignoring unet/ weights leaves the component unproven; (b) a stale malformed
+    index sidecar is not accepted as a component index; (c) a variant load accepts a canonical FALLBACK
+    index only when its shards are complete (the variant completeness pass does not validate it)."""
+    nonstd = ["diffusion_pytorch_model.safetensors-00001-of-00002.safetensors",
+              "diffusion_pytorch_model.safetensors-00002-of-00002.safetensors"]
+
+    def _pipe(name, unet_shards, unet_index = "diffusion_pytorch_model.safetensors.index.json",
+              vae_name = "diffusion_pytorch_model.safetensors"):
+        snap, blob = _mk_snapshot(tmp_path, name)
+        (snap / "model_index.json").write_text(json.dumps(
+            {"_class_name": "StableDiffusionPipeline",
+             "unet": ["diffusers", "UNet2DConditionModel"], "vae": ["diffusers", "AutoencoderKL"]}))
+        (snap / "unet").mkdir()
+        (snap / "unet" / "config.json").write_text("{}")
+        for s in unet_shards:
+            (snap / "unet" / s).symlink_to(blob)
+        if unet_index is not None:
+            (snap / "unet" / unet_index).write_text(json.dumps(
+                {"weight_map": {"a": nonstd[0], "b": nonstd[1]}}))
+        (snap / "vae").mkdir()
+        (snap / "vae" / "config.json").write_text("{}")
+        (snap / "vae" / vae_name).symlink_to(blob)
+        return snap
+
+    # (a) a component-scoped ignore of the unet weights matches the real base -> unet has no read weight.
+    assert xf._download_result_usable(
+        _pipe("hard_ignore", nonstd), repo_type = "model", allow_patterns = None,
+        ignore_patterns = ["unet/diffusion_pytorch_model*"]) is False
+    # (b) a malformed index sidecar is not a component index, so it cannot prove the unet weight.
+    assert xf._download_result_usable(
+        _pipe("hard_sidecar", nonstd, unet_index = "diffusion_pytorch_model.safetensors.index.fp16.extra.json"),
+        repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
+    # (c) a variant load rejects an incomplete canonical fallback, accepts a complete one.
+    assert xf._download_result_usable(
+        _pipe("hard_var_missing", nonstd[:1], vae_name = "diffusion_pytorch_model.fp16.safetensors"),
+        repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = "fp16") is False
+    assert xf._download_result_usable(
+        _pipe("hard_var_complete", nonstd, vae_name = "diffusion_pytorch_model.fp16.safetensors"),
+        repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = "fp16") is True
 
 
 def test_post_download_single_safetensors_beats_stale_index(tmp_path):

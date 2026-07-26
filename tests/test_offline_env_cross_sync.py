@@ -24,15 +24,38 @@ import pytest
 @pytest.fixture
 def reload_zoo(monkeypatch):
     """Strip the three offline env vars, then reload ``unsloth_zoo`` so its
-    import-time cross-sync runs."""
+    import-time cross-sync runs.
+
+    Reloading swaps a fresh, half-initialized ``unsloth_zoo`` object into
+    ``sys.modules`` -- one that lacks submodule attributes (e.g.
+    ``vision_utils``) the package only binds when they are first imported.
+    Snapshot the original ``unsloth_zoo*`` modules and restore them on
+    teardown so the reload does not leak that shell into the rest of the
+    session and break later tests that resolve submodules via string paths
+    (e.g. ``monkeypatch.setattr("unsloth_zoo.vision_utils.<attr>", ...)``).
+    """
     for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(v, raising = False)
+
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "unsloth_zoo" or name.startswith("unsloth_zoo.")
+    }
 
     def _reload():
         sys.modules.pop("unsloth_zoo", None)
         return importlib.import_module("unsloth_zoo")
 
-    return _reload
+    yield _reload
+
+    for name in [
+        name for name in sys.modules
+        if name == "unsloth_zoo" or name.startswith("unsloth_zoo.")
+    ]:
+        if name not in saved:
+            del sys.modules[name]
+    sys.modules.update(saved)
 
 
 class TestOfflineCrossSync:
