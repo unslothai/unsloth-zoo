@@ -1,0 +1,825 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Batched generation primitives for training-resident MLX text models."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import inspect
+import math
+import threading
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from numbers import Integral
+from typing import Any, Literal, Sequence
+
+
+_MLX_LM_PIN = "mlx-lm==0.31.2"
+_TEXT_EVENT_FIELDS = frozenset(("uid", "token", "logprobs", "finish_reason"))
+
+
+def _current_async_task():
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+class _GenerationModeLock:
+    """Thread-reentrant lock that rejects unsafe same-thread task overlap."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._owner_thread = None
+        self._owner_task = None
+        self._depth = 0
+
+    def acquire(self, blocking=True, timeout=-1):
+        owner_thread = threading.get_ident()
+        owner_task = _current_async_task()
+        with self._state_lock:
+            if (
+                self._depth
+                and self._owner_thread == owner_thread
+                and self._owner_task is not owner_task
+            ):
+                raise RuntimeError(
+                    "generation_mode contexts from different async tasks cannot "
+                    "overlap on the same thread."
+                )
+        acquired = (
+            self._lock.acquire(blocking)
+            if timeout == -1
+            else self._lock.acquire(blocking, timeout)
+        )
+        if not acquired:
+            return False
+        with self._state_lock:
+            if self._depth == 0:
+                self._owner_thread = owner_thread
+                self._owner_task = owner_task
+            self._depth += 1
+        return True
+
+    def release(self):
+        owner_thread = threading.get_ident()
+        owner_task = _current_async_task()
+        with self._state_lock:
+            if (
+                not self._depth
+                or self._owner_thread != owner_thread
+                or self._owner_task is not owner_task
+            ):
+                raise RuntimeError("generation_mode lock released by a non-owner.")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner_thread = None
+                self._owner_task = None
+        self._lock.release()
+
+
+_GENERATION_MODE_LOCK = _GenerationModeLock()
+_GENERATION_MODE_DEPTH = 0
+_GENERATION_LIMIT_SNAPSHOT: dict[str, int] | None = None
+
+
+@dataclass(frozen=True)
+class SamplingParams:
+    """Sampling controls understood by mlx-lm's sampler factory."""
+
+    temperature: float = 0.0
+    top_p: float = 0.0
+    top_k: int = 0
+    min_p: float = 0.0
+
+    def __post_init__(self):
+        temperature = float(self.temperature)
+        top_p = float(self.top_p)
+        min_p = float(self.min_p)
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be a finite value >= 0.")
+        if not math.isfinite(top_p) or not 0 <= top_p <= 1:
+            raise ValueError("top_p must be a finite value between 0 and 1.")
+        if isinstance(self.top_k, bool) or not isinstance(self.top_k, Integral):
+            raise TypeError("top_k must be an integer.")
+        if self.top_k < 0:
+            raise ValueError("top_k must be >= 0.")
+        if not math.isfinite(min_p) or not 0 <= min_p <= 1:
+            raise ValueError("min_p must be a finite value between 0 and 1.")
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "top_p", top_p)
+        object.__setattr__(self, "top_k", int(self.top_k))
+        object.__setattr__(self, "min_p", min_p)
+
+
+@dataclass(frozen=True)
+class GenerationDefaults:
+    """Batch-wide defaults used when a request does not override a value."""
+
+    max_tokens: int = 256
+    sampling: SamplingParams = field(default_factory=SamplingParams)
+    stop_strings: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        _validate_max_tokens(self.max_tokens, "defaults.max_tokens")
+        if not isinstance(self.sampling, SamplingParams):
+            raise TypeError("defaults.sampling must be SamplingParams.")
+        stops = _normalize_stop_strings(self.stop_strings)
+        object.__setattr__(self, "max_tokens", int(self.max_tokens))
+        object.__setattr__(self, "stop_strings", stops)
+
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    """One text-generation request.
+
+    Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided.
+    Rendered prompt strings are encoded as-is; chat templating belongs to the
+    caller.
+    """
+
+    prompt: str | None = None
+    prompt_token_ids: Sequence[int] | None = None
+    image: Any | None = None
+    audio: Any | None = None
+    max_tokens: int | None = None
+    sampling: SamplingParams | None = None
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """Sampled-token output with text from mlx-lm's streaming detokenizer."""
+
+    token_ids: list[int]
+    text: str
+    logprobs: list[float] | None
+    finish_reason: Literal["stop", "length", "stop_string"]
+    stop_match: str | None = None
+
+
+def _validate_max_tokens(value: Any, name: str):
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive.")
+
+
+def _normalize_stop_strings(stop_strings: Sequence[str] | str | None) -> tuple[str, ...]:
+    if stop_strings is None:
+        return ()
+    if isinstance(stop_strings, str):
+        stop_strings = (stop_strings,)
+    try:
+        stops = tuple(stop_strings)
+    except TypeError as exc:
+        raise TypeError("stop_strings must be a string or a sequence of strings.") from exc
+    if any(not isinstance(stop, str) for stop in stops):
+        raise TypeError("Every stop string must be a string.")
+    if any(not stop for stop in stops):
+        raise ValueError("Stop strings must not be empty.")
+    return tuple(dict.fromkeys(stops))
+
+
+def _validate_text_requests(
+    requests: Sequence[GenerationRequest],
+    defaults: GenerationDefaults,
+) -> list[GenerationRequest]:
+    validated = list(requests)
+    for index, request in enumerate(validated):
+        if not isinstance(request, GenerationRequest):
+            raise TypeError(f"requests[{index}] must be GenerationRequest.")
+        has_prompt = request.prompt is not None
+        has_ids = request.prompt_token_ids is not None
+        if has_prompt == has_ids:
+            raise ValueError(
+                f"requests[{index}] must provide exactly one of prompt or "
+                "prompt_token_ids."
+            )
+        if has_prompt and not isinstance(request.prompt, str):
+            raise TypeError(f"requests[{index}].prompt must be a string.")
+        if has_ids:
+            try:
+                prompt_ids = list(request.prompt_token_ids)
+            except TypeError as exc:
+                raise TypeError(
+                    f"requests[{index}].prompt_token_ids must be a sequence "
+                    "of integers."
+                ) from exc
+            if not prompt_ids:
+                raise ValueError(
+                    f"requests[{index}].prompt_token_ids must not be empty."
+                )
+            if any(
+                isinstance(token, bool) or not isinstance(token, Integral)
+                for token in prompt_ids
+            ):
+                raise TypeError(
+                    f"requests[{index}].prompt_token_ids must contain only "
+                    "integers."
+                )
+            validated[index] = replace(
+                request,
+                prompt_token_ids=tuple(int(token) for token in prompt_ids),
+            )
+        if request.max_tokens is not None:
+            _validate_max_tokens(request.max_tokens, f"requests[{index}].max_tokens")
+        if request.sampling is not None and not isinstance(
+            request.sampling, SamplingParams
+        ):
+            raise TypeError(f"requests[{index}].sampling must be SamplingParams.")
+        if request.image is not None or request.audio is not None:
+            raise ValueError(
+                f"requests[{index}] includes media, but text models accept "
+                "text prompts only."
+            )
+    return validated
+
+
+def _api_shape_error(details: str) -> RuntimeError:
+    return RuntimeError(
+        "Unsupported mlx-lm batch-generation API shape "
+        f"({details}). This engine requires the workspace pin {_MLX_LM_PIN}; "
+        "sync the workspace dependencies before using batched generation."
+    )
+
+
+def _probe_text_api(generate_module):
+    """Verify the event-level mlx-lm control surface used by this adapter."""
+
+    batch_generator = getattr(generate_module, "BatchGenerator", None)
+    generation_batch = getattr(generate_module, "GenerationBatch", None)
+    response_type = getattr(generation_batch, "Response", None)
+    if batch_generator is None or response_type is None:
+        raise _api_shape_error("BatchGenerator or GenerationBatch.Response missing")
+    for name in ("insert", "next_generated", "remove", "close"):
+        if not callable(getattr(batch_generator, name, None)):
+            raise _api_shape_error(f"BatchGenerator.{name} missing")
+
+    try:
+        constructor_signature = inspect.signature(batch_generator)
+        insert_parameters = inspect.signature(batch_generator.insert).parameters
+        insert_signature = inspect.signature(batch_generator.insert)
+        next_signature = inspect.signature(batch_generator.next_generated)
+        remove_signature = inspect.signature(batch_generator.remove)
+        close_signature = inspect.signature(batch_generator.close)
+    except AttributeError as exc:
+        raise _api_shape_error("required BatchGenerator method missing") from exc
+    except (TypeError, ValueError) as exc:
+        raise _api_shape_error("BatchGenerator callable signature unavailable") from exc
+
+    required_constructor = {"max_tokens", "stop_tokens"}
+    missing_constructor = required_constructor.difference(
+        constructor_signature.parameters
+    )
+    if missing_constructor:
+        names = ", ".join(sorted(missing_constructor))
+        raise _api_shape_error(f"BatchGenerator constructor missing {names}")
+    required_insert = {"prompts", "max_tokens", "samplers", "logits_processors"}
+    missing_insert = required_insert.difference(insert_parameters)
+    if missing_insert:
+        names = ", ".join(sorted(missing_insert))
+        raise _api_shape_error(f"BatchGenerator.insert missing {names}")
+    try:
+        constructor_signature.bind(object(), max_tokens=1, stop_tokens=[])
+        insert_signature.bind(
+            object(),
+            [[1]],
+            max_tokens=[1],
+            samplers=[None],
+            logits_processors=[[]],
+        )
+        next_signature.bind(object())
+        remove_signature.bind(object(), [0])
+        close_signature.bind(object())
+    except TypeError as exc:
+        raise _api_shape_error("BatchGenerator call signatures are incompatible") from exc
+
+    fields = set(getattr(response_type, "__dataclass_fields__", ()))
+    if not fields:
+        fields = set(getattr(response_type, "__annotations__", ()))
+    missing_fields = _TEXT_EVENT_FIELDS.difference(fields)
+    if missing_fields:
+        names = ", ".join(sorted(missing_fields))
+        raise _api_shape_error(f"GenerationBatch.Response missing {names}")
+
+
+def _probe_sampler_api(sample_utils_module):
+    make_sampler = getattr(sample_utils_module, "make_sampler", None)
+    if not callable(make_sampler):
+        raise _api_shape_error("sample_utils.make_sampler missing")
+    try:
+        signature = inspect.signature(make_sampler)
+    except (TypeError, ValueError) as exc:
+        raise _api_shape_error("make_sampler signature unavailable") from exc
+    required = {"temp", "top_p", "top_k", "min_p"}
+    missing = required.difference(signature.parameters)
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise _api_shape_error(f"make_sampler missing {names}")
+    try:
+        signature.bind(temp=0.0, top_p=0.0, top_k=0, min_p=0.0)
+    except TypeError as exc:
+        raise _api_shape_error("make_sampler call signature is incompatible") from exc
+
+
+def _iter_model_modules(model) -> list[Any]:
+    named_modules = getattr(model, "named_modules", None)
+    if callable(named_modules):
+        modules = [module for _, module in named_modules()]
+        if modules:
+            return modules
+    return [model]
+
+
+def _snapshot_training_flags(model) -> list[tuple[Any, bool]]:
+    states = []
+    seen = set()
+    for module in _iter_model_modules(model):
+        if id(module) in seen or not hasattr(module, "training"):
+            continue
+        seen.add(id(module))
+        states.append((module, bool(module.training)))
+    return states
+
+
+def _restore_training_flags(states: Sequence[tuple[Any, bool]]):
+    first_error = None
+    for module, training in states:
+        try:
+            set_mode = getattr(module, "_set_training_mode", None)
+            if callable(set_mode):
+                set_mode(training)
+            else:
+                setattr(module, "training", training)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _snapshot_metal_limits() -> dict[str, int]:
+    """Read process-global Metal limits through their return-previous setters."""
+
+    import mlx.core as mx
+
+    if not mx.metal.is_available():
+        return {}
+    snapshot = {}
+    try:
+        for name in ("memory", "cache", "wired"):
+            setter = getattr(mx, f"set_{name}_limit")
+            previous = setter(0)
+            snapshot[name] = int(previous)
+            setter(previous)
+    except BaseException:
+        _restore_metal_limits(snapshot)
+        raise
+    return snapshot
+
+
+def _restore_metal_limits(snapshot: dict[str, int] | None):
+    if not snapshot:
+        return
+    import mlx.core as mx
+
+    first_error = None
+    for name in ("memory", "cache", "wired"):
+        if name in snapshot:
+            try:
+                getattr(mx, f"set_{name}_limit")(int(snapshot[name]))
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+@contextmanager
+def generation_mode(model):
+    """Temporarily switch a model to eval mode and steward global MLX limits.
+
+    The outermost context snapshots the process-global memory, cache, and wired
+    limits. Nested contexts only track their own model flags; the outer context
+    restores the limits after all nested generation work completes. Gradient
+    checkpointing patches are intentionally left untouched because they are
+    class-level and may belong to a live compiled training step.
+    """
+
+    global _GENERATION_MODE_DEPTH, _GENERATION_LIMIT_SNAPSHOT
+
+    _GENERATION_MODE_LOCK.acquire()
+    training_states: list[tuple[Any, bool]] = []
+    entered = False
+    active_error = None
+    try:
+        if _GENERATION_MODE_DEPTH == 0:
+            _GENERATION_LIMIT_SNAPSHOT = _snapshot_metal_limits()
+        training_states = _snapshot_training_flags(model)
+        eval_model = getattr(model, "eval", None)
+        if not callable(eval_model):
+            raise TypeError("generation_mode requires a model with eval().")
+        eval_model()
+        _GENERATION_MODE_DEPTH += 1
+        entered = True
+        yield model
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        restoration_error = None
+        try:
+            if training_states:
+                _restore_training_flags(training_states)
+        except BaseException as exc:
+            restoration_error = exc
+        if entered:
+            _GENERATION_MODE_DEPTH -= 1
+        try:
+            if _GENERATION_MODE_DEPTH == 0:
+                snapshot = _GENERATION_LIMIT_SNAPSHOT
+                _GENERATION_LIMIT_SNAPSHOT = None
+                try:
+                    _restore_metal_limits(snapshot)
+                except BaseException as exc:
+                    if restoration_error is None:
+                        restoration_error = exc
+        finally:
+            _GENERATION_MODE_LOCK.release()
+        if restoration_error is not None:
+            if active_error is None:
+                raise restoration_error
+            try:
+                warnings.warn(
+                    "generation_mode could not fully restore model or MLX "
+                    f"state after {type(active_error).__name__}: "
+                    f"{restoration_error}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except BaseException:
+                pass
+
+
+class _StopStringScanner:
+    """Incrementally search new detokenized text with longest-stop lookback."""
+
+    def __init__(self, stop_strings: Sequence[str]):
+        self.stop_strings = tuple(stop_strings)
+        self.max_stop_length = max(map(len, self.stop_strings), default=0)
+        self.previous_length = 0
+
+    def feed(self, text: str) -> tuple[int, str] | None:
+        if not self.stop_strings:
+            self.previous_length = len(text)
+            return None
+        search_start = max(0, self.previous_length - self.max_stop_length + 1)
+        matches = []
+        for order, stop in enumerate(self.stop_strings):
+            position = text.find(stop, search_start)
+            if position >= 0:
+                matches.append((position, -len(stop), order, stop))
+        self.previous_length = len(text)
+        if not matches:
+            return None
+        position, _, _, stop = min(matches)
+        return position, stop
+
+
+class _DecodeStreamingDetokenizer:
+    """Pinned mlx-lm naive-streaming semantics for raw tokenizers."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.reset()
+
+    def reset(self):
+        self.offset = 0
+        self.tokens: list[int] = []
+        self._text = ""
+        self._current_tokens: list[int] = []
+        self._current_text = ""
+
+    def add_token(self, token: int):
+        self._current_tokens.append(token)
+        self.tokens.append(token)
+
+    def finalize(self):
+        self._text += self.tokenizer.decode(self._current_tokens)
+        self._current_tokens = []
+        self._current_text = ""
+
+    @property
+    def text(self):
+        if self._current_tokens:
+            self._current_text = self.tokenizer.decode(self._current_tokens)
+            if self._current_text.endswith("\ufffd") or (
+                getattr(self.tokenizer, "clean_up_tokenization_spaces", False)
+                and self._current_text.endswith(" ")
+            ):
+                self._current_text = self._current_text[:-1]
+        if self._current_text.endswith("\n"):
+            self._text += self._current_text
+            self._current_tokens.clear()
+            self._current_text = ""
+        return self._text + self._current_text
+
+    @property
+    def last_segment(self):
+        segment = self.text[self.offset :]
+        self.offset = len(self.text)
+        return segment
+
+
+def _new_detokenizer(tokenizer):
+    try:
+        detokenizer = tokenizer.detokenizer
+    except (AttributeError, TypeError):
+        detokenizer = None
+    if detokenizer is None:
+        return _DecodeStreamingDetokenizer(tokenizer)
+    reset = getattr(detokenizer, "reset", None)
+    if callable(reset):
+        reset()
+    return detokenizer
+
+
+def _replay_stream_text(detokenizer, token_ids: Sequence[int]) -> str:
+    detokenizer.reset()
+    text = ""
+    for token in token_ids:
+        detokenizer.add_token(int(token))
+        text += detokenizer.last_segment
+    detokenizer.finalize()
+    return text + detokenizer.last_segment
+
+
+@dataclass
+class _PendingResult:
+    detokenizer: Any
+    scanner: _StopStringScanner
+    token_ids: list[int] = field(default_factory=list)
+    logprobs: list[float] = field(default_factory=list)
+    text: str = ""
+    finish_reason: Literal["stop", "length", "stop_string"] | None = None
+    stop_match: str | None = None
+
+    def _apply_stop_match(
+        self,
+        tokenizer,
+        match: tuple[int, str],
+    ):
+        stop_start, self.stop_match = match
+        target_prefix = self.text[:stop_start]
+        boundary_detokenizer = _new_detokenizer(tokenizer)
+        keep = 0
+        for token_count in range(len(self.token_ids) - 1, -1, -1):
+            candidate_text = _replay_stream_text(
+                boundary_detokenizer,
+                self.token_ids[:token_count],
+            )
+            if target_prefix.startswith(candidate_text):
+                keep = token_count
+                break
+        del self.token_ids[keep:]
+        del self.logprobs[keep:]
+        self.text = _replay_stream_text(self.detokenizer, self.token_ids)
+        self.finish_reason = "stop_string"
+
+    def add_terminal(self, token: int, logprob: float):
+        self.token_ids.append(token)
+        self.logprobs.append(logprob)
+        self.detokenizer.add_token(token)
+
+    def append(self, tokenizer, token: int, logprob: float) -> bool:
+        self.add_terminal(token, logprob)
+        self.text += self.detokenizer.last_segment
+        match = self.scanner.feed(self.text)
+        if match is None:
+            return False
+        self._apply_stop_match(tokenizer, match)
+        return True
+
+    def finish(self, tokenizer, reason: Literal["stop", "length"]):
+        self.detokenizer.finalize()
+        self.text += self.detokenizer.last_segment
+        match = self.scanner.feed(self.text)
+        if match is not None:
+            self._apply_stop_match(tokenizer, match)
+        else:
+            self.finish_reason = reason
+
+    def result(self, tokenizer) -> GenerationResult:
+        if self.finish_reason is None:
+            raise RuntimeError("Internal error: generation ended without a finish reason.")
+        return GenerationResult(
+            token_ids=list(self.token_ids),
+            text=self.text,
+            logprobs=list(self.logprobs),
+            finish_reason=self.finish_reason,
+            stop_match=self.stop_match,
+        )
+
+
+def _encode_prompt(tokenizer, request: GenerationRequest) -> list[int]:
+    if request.prompt_token_ids is not None:
+        return [int(token) for token in request.prompt_token_ids]
+    try:
+        prompt_ids = tokenizer.encode(request.prompt, add_special_tokens=False)
+    except TypeError:
+        prompt_ids = tokenizer.encode(request.prompt)
+    prompt_ids = [int(token) for token in prompt_ids]
+    if not prompt_ids:
+        raise ValueError("Encoded prompts must contain at least one token.")
+    return prompt_ids
+
+
+def _eos_stop_tokens(tokenizer) -> list[list[int]]:
+    eos_ids = getattr(tokenizer, "eos_token_ids", None)
+    if eos_ids is None:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        eos_ids = () if eos_id is None else (eos_id,)
+    if isinstance(eos_ids, Integral):
+        eos_ids = (eos_ids,)
+    return [[int(token)] for token in eos_ids if token is not None]
+
+
+def _sampled_logprob(event) -> float:
+    try:
+        value = event.logprobs[int(event.token)]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "mlx-lm emitted a logprob vector that does not contain the sampled "
+            f"token {event.token}."
+        ) from exc
+    if hasattr(value, "item"):
+        value = value.item()
+    return float(value)
+
+
+class _TextBatchAdapter:
+    def __init__(self, model, tokenizer, defaults: GenerationDefaults):
+        generate_module = importlib.import_module("mlx_lm.generate")
+        sample_utils_module = importlib.import_module("mlx_lm.sample_utils")
+        _probe_text_api(generate_module)
+        _probe_sampler_api(sample_utils_module)
+        self.batch_generator_type = generate_module.BatchGenerator
+        self.make_sampler = sample_utils_module.make_sampler
+        self.model = model
+        self.tokenizer = tokenizer
+        self.defaults = defaults
+
+    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+        prompts = [_encode_prompt(self.tokenizer, request) for request in requests]
+        max_tokens = [
+            int(request.max_tokens or self.defaults.max_tokens)
+            for request in requests
+        ]
+        sampling = [
+            request.sampling or self.defaults.sampling
+            for request in requests
+        ]
+        samplers = [
+            self.make_sampler(
+                temp=params.temperature,
+                top_p=params.top_p,
+                top_k=params.top_k,
+                min_p=params.min_p,
+            )
+            for params in sampling
+        ]
+        generator = self.batch_generator_type(
+            self.model,
+            max_tokens=self.defaults.max_tokens,
+            stop_tokens=_eos_stop_tokens(self.tokenizer),
+        )
+        active_error = None
+        try:
+            uids = generator.insert(
+                prompts,
+                max_tokens=max_tokens,
+                samplers=samplers,
+                logits_processors=[[] for _ in requests],
+            )
+            pending = {
+                uid: _PendingResult(
+                    detokenizer=_new_detokenizer(self.tokenizer),
+                    scanner=_StopStringScanner(self.defaults.stop_strings),
+                )
+                for uid in uids
+            }
+            completed: dict[int, GenerationResult] = {}
+            while pending:
+                events = generator.next_generated()
+                if not events:
+                    raise RuntimeError(
+                        "mlx-lm ended its event stream before every request "
+                        "reported a finish reason."
+                    )
+                for event in events:
+                    state = pending.get(event.uid)
+                    if state is None:
+                        continue
+                    finish_reason = event.finish_reason
+                    if finish_reason is None:
+                        stopped = state.append(
+                            self.tokenizer,
+                            int(event.token),
+                            _sampled_logprob(event),
+                        )
+                        if stopped:
+                            generator.remove([event.uid])
+                            completed[event.uid] = state.result(self.tokenizer)
+                            del pending[event.uid]
+                            continue
+                        continue
+                    if finish_reason not in ("stop", "length"):
+                        raise RuntimeError(
+                            "mlx-lm emitted an unsupported finish reason: "
+                            f"{finish_reason!r}."
+                        )
+                    if finish_reason == "length":
+                        state.add_terminal(
+                            int(event.token),
+                            _sampled_logprob(event),
+                        )
+                    state.finish(self.tokenizer, finish_reason)
+                    completed[event.uid] = state.result(self.tokenizer)
+                    del pending[event.uid]
+            return [completed[uid] for uid in uids]
+        except BaseException as exc:
+            active_error = exc
+            raise
+        finally:
+            try:
+                generator.close()
+            except BaseException as close_error:
+                if active_error is None:
+                    raise
+                try:
+                    warnings.warn(
+                        "BatchGenerator.close() failed while preserving an "
+                        f"active {type(active_error).__name__}: {close_error}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                except BaseException:
+                    pass
+
+
+def generate_batch(
+    model,
+    tokenizer_or_processor,
+    requests: Sequence[GenerationRequest],
+    *,
+    defaults: GenerationDefaults | None = None,
+) -> list[GenerationResult]:
+    """Generate a batch from a training-resident MLX text model.
+
+    Results preserve input order. ``token_ids`` come directly from mlx-lm's
+    sampled-token events, and ``logprobs`` are aligned one-to-one with them.
+    """
+
+    if getattr(model, "_is_vlm_model", False):
+        raise ValueError(
+            "VLM batched generation is not enabled in this text-only engine."
+        )
+    if defaults is None:
+        defaults = GenerationDefaults()
+    if not isinstance(defaults, GenerationDefaults):
+        raise TypeError("defaults must be GenerationDefaults.")
+    validated = _validate_text_requests(requests, defaults)
+    if not validated:
+        return []
+    if tokenizer_or_processor is None:
+        raise ValueError("Text batched generation requires a tokenizer.")
+    with generation_mode(model):
+        adapter = _TextBatchAdapter(model, tokenizer_or_processor, defaults)
+        return adapter.generate(validated)
+
+
+__all__ = [
+    "GenerationDefaults",
+    "GenerationRequest",
+    "GenerationResult",
+    "SamplingParams",
+    "generate_batch",
+    "generation_mode",
+]
