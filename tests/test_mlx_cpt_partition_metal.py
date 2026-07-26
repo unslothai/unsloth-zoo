@@ -213,6 +213,26 @@ def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
     assert "lm_head.linear.weight" in trn
 
 
+def test_quantized_child_of_a_wrapper_head_is_rejected():
+    # Quantization on a wrapper head lives on a descendant, so a leaf-only
+    # `scales` check accepted it and MLX then raised
+    # "[QuantizedMatmul::vjp] no gradient wrt the quantized weights" at the
+    # first backward instead of this actionable error.
+    m = _tiny(); m.lm_head = _WrappedHead()
+    m.lm_head.linear = nn.QuantizedLinear.from_linear(
+        m.lm_head.linear, group_size=32, bits=4)
+    with pytest.raises(ValueError, match=r"quantized module at 'lm_head\.linear'"):
+        _peft(m, target_modules=["q_proj"], modules_to_save=["lm_head"])
+    # A directly quantized full module still reports its own path.
+    e = _tiny()
+    e.model.embed_tokens = nn.QuantizedEmbedding.from_embedding(
+        e.model.embed_tokens, group_size=32, bits=4)
+    with pytest.raises(
+        ValueError, match=r"quantized module at 'model\.embed_tokens'",
+    ):
+        _peft(e, target_modules=["q_proj", "embed_tokens"])
+
+
 def test_unusable_lm_head_still_raises_when_nothing_else_trains():
     # Dropping lm_head must never leave an empty selection to fall through to
     # mlx-lm's auto-discovery, and an explicit modules_to_save request names

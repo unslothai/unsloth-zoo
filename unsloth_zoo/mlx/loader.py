@@ -4736,6 +4736,23 @@ def _is_lora_capable_head(module):
         module, (nn.Linear, nn.QuantizedLinear))
 
 
+def _quantized_descendant_path(path, module):
+    """Registered path of ``module`` or of its first quantized descendant.
+
+    A wrapper head keeps its quantization one level down (mlx-lm's phixtral
+    ``OutputHead`` is a LayerNorm + Linear, so a 4-bit checkpoint carries the
+    ``scales`` on ``lm_head.linear``), so a leaf-only ``scales`` check accepts
+    the wrapper and MLX raises ``[QuantizedMatmul::vjp] no gradient wrt the
+    quantized weights`` at the first backward instead of the actionable error.
+    ``named_modules()`` yields the module itself under the empty name, so this
+    covers the direct case too. Returns ``None`` when nothing is quantized.
+    """
+    for name, child in module.named_modules():
+        if hasattr(child, "scales"):
+            return f"{path}.{name}" if name else path
+    return None
+
+
 def _partition_cpt_targets(model, target_modules, modules_to_save):
     """Split LoRA targets from full-module (continued-pretraining) targets.
 
@@ -4781,11 +4798,13 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
         # Quantized modules cannot be full-module trained: the CCE backward
         # zeroes the quantized weight gradient (dequant->grad->requant is
         # unimplemented), so the module would silently never update.
-        if hasattr(module, "scales"):
+        quantized_path = _quantized_descendant_path(path, module)
+        if quantized_path is not None:
             raise ValueError(
                 f"Unsloth: full-module training of the quantized module at "
-                f"{path!r} is not supported. Load the unquantized (16-bit) base "
-                "model for continued pretraining, or LoRA-target it instead."
+                f"{quantized_path!r} is not supported. Load the unquantized "
+                "(16-bit) base model for continued pretraining, or LoRA-target "
+                "it instead."
             )
         seen_full.add(path)
         full_specs.append((path, module))
