@@ -1718,7 +1718,11 @@ class MLXTrainer:
         """
         suppressed = []
         for callback in getattr(self.callback_handler, "callbacks", ()):
-            if type(callback).__name__ != "WandbCallback":
+            # Match the MRO, not just the concrete class: subclassing
+            # WandbCallback to customise logging is a common recipe and
+            # inherits the same on_train_end.
+            if not any(base.__name__ == "WandbCallback"
+                       for base in type(callback).__mro__):
                 continue
             mode = getattr(callback, "_log_model", None)
             if mode is None or not getattr(mode, "is_enabled", False):

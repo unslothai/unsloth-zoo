@@ -4406,19 +4406,24 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
                     "'MLXTrainingConfig' object has no attribute 'full_determinism'"
                 )
 
+    class CustomWandbCallback(WandbCallback):
+        """Subclassing WandbCallback to customise logging is a common recipe,
+        and it inherits the same on_train_end."""
+
     class OtherCallback:
         def __init__(self):
             self._log_model = _LogModel("end")
 
     artifact_cb = WandbCallback("end")
     checkpoint_cb = WandbCallback("checkpoint")
+    subclass_cb = CustomWandbCallback("end")
     off_cb = WandbCallback("false")
     other_cb = OtherCallback()
 
     trainer = MLXTrainer.__new__(MLXTrainer)
     trainer.args = MLXTrainingConfig(max_steps=1)
     trainer.callback_handler = _MLXCallbackHandler(
-        [artifact_cb, checkpoint_cb, off_cb, other_cb],
+        [artifact_cb, checkpoint_cb, subclass_cb, off_cb, other_cb],
         model=object(),
         processing_class=None,
         optimizer=None,
@@ -4426,7 +4431,9 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
     )
 
     suppressed = trainer._suppress_torch_only_wandb_artifacts()
-    assert [cb for cb, _ in suppressed] == [artifact_cb, checkpoint_cb]
+    assert [cb for cb, _ in suppressed] == [
+        artifact_cb, checkpoint_cb, subclass_cb,
+    ]
     # Both artifact modes are cleared for the dispatch...
     assert artifact_cb._log_model.is_enabled is False
     assert checkpoint_cb._log_model.is_enabled is False
