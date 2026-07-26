@@ -1230,66 +1230,134 @@ def _plan_for(processor, rows=6):
     )
 
 
-def test_vlm_missing_pad_token_degrades_before_any_survey_work():
-    """No pad id degrades to eager, and aborts under strict, before the survey
-    runs, even when uniform widths mean the plan would never widen."""
-    _skip_if_mlx_core_was_replaced()
+def _vlm_shape_plan(plan, mode, args=None):
+    """Run the real VLM planner for one policy mode."""
     from types import SimpleNamespace
 
     from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
 
-    args = SimpleNamespace(
+    args = args or SimpleNamespace(
         compile_max_variants=None, gradient_accumulation_steps=1,
     )
-    processor = _UniformNoPadProcessor()
-    plan = _plan_for(processor)
-    shape_plan, report, allowed, _frontier = _plan_single_process_vlm_shapes(
+    return _plan_single_process_vlm_shapes(
         plan, None, args=args, total_steps=len(plan),
         distributed_world_size=1,
-        compile_policy=SimpleNamespace(mode="best_effort"),
-        compile_decision=SimpleNamespace(enabled=True),
+        compile_policy=SimpleNamespace(mode=mode),
+        compile_decision=SimpleNamespace(enabled=True, policy_mode=mode),
     )
-    assert not allowed
-    assert (report.action, report.reason) == ("eager", "vlm_pad_token_unavailable")
-    assert shape_plan is None
-    # The survey materializes every scheduled batch; a plan that can never be
-    # compiled must not pay for it.
-    assert processor.calls == 0
-
-    strict_processor = _UniformNoPadProcessor()
-    strict_plan = _plan_for(strict_processor)
-    with pytest.raises(RuntimeError, match="without a tokenizer pad id"):
-        _plan_single_process_vlm_shapes(
-            strict_plan, None, args=args, total_steps=len(strict_plan),
-            distributed_world_size=1,
-            compile_policy=SimpleNamespace(mode="strict"),
-            compile_decision=SimpleNamespace(enabled=True),
-        )
-    assert strict_processor.calls == 0
 
 
-def test_vlm_uniform_width_plan_would_abort_mid_run_without_a_pad_id():
-    """Why the guard cannot wait for "does the plan widen?": a later uniformly
-    narrower rebuild passes the drift check, then cannot be widened back."""
+class _WideningNoPadProcessor(_UniformNoPadProcessor):
+    """One wider batch, so the shared rounded width really does widen the rest."""
+
+    def __init__(self, widths=(40, 32, 32, 32, 32, 32)):
+        super().__init__(width=widths[0])
+        self.widths = widths
+        self.row = 0
+
+    def __call__(self, text, **kwargs):
+        self.width = self.widths[self.row % len(self.widths)]
+        self.row += 1
+        return super().__call__(text, **kwargs)
+
+
+def test_vlm_exact_plan_compiles_without_a_pad_token():
+    """A pad id is required by the BUILT plan, not by the processor: when no
+    admitted endpoint widens a batch, nothing is ever padded."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE, phase_for_microstep
 
+    for mode in ("best_effort", "strict"):
+        processor = _UniformNoPadProcessor()
+        plan = _plan_for(processor)
+        shape_plan, report, allowed, _frontier = _vlm_shape_plan(plan, mode)
+        assert allowed, mode
+        assert (report.action, report.reason) == ("exact", "schedule_within_cap")
+        assert plan.pad_token_id is None
+        raw = tuple(plan.batch_width(index) for index in range(len(plan)))
+        endpoints = tuple(
+            shape_plan.endpoint_for(plan.batch_family(index), width)
+            for index, width in enumerate(plan.planned_event_widths())
+        )
+        assert endpoints == raw == (32,) * len(plan)
+        # The planned fetch the training loop makes must not need a pad id.
+        batch = plan.materialize(0, phase=phase_for_microstep(
+            FULL_STEP_SCOPE, 1, 0,
+        ))
+        assert batch["input_ids"].shape[1] == 32
+
+
+def test_vlm_declined_only_plan_compiles_without_a_pad_token():
+    """A sidecar sharing the text extent declines every batch, so the width
+    finalizer returns them untouched and no pad id is consulted."""
+    _skip_if_mlx_core_was_replaced()
+
+    class _DeclinedNoPadProcessor(_UniformNoPadProcessor):
+        def __call__(self, text, **kwargs):
+            batch = super().__call__(text, **kwargs)
+            width = batch["input_ids"].shape[1]
+            batch["pixel_values"] = np.zeros(
+                (len(batch["input_ids"]), width), dtype=np.float32,
+            )
+            return batch
+
+    processor = _DeclinedNoPadProcessor()
+    plan = _plan_for(processor)
+    _shape_plan, report, allowed, _frontier = _vlm_shape_plan(plan, "strict")
+    assert allowed
+    assert report.action == "exact"
+    assert not any(plan._padable)
+
+
+def test_vlm_widening_plan_still_requires_a_pad_token():
+    """Widening still needs a fill value, including the forbidden-width bump
+    that widens batches whose raw widths are identical."""
+    _skip_if_mlx_core_was_replaced()
+
+    processor = _WideningNoPadProcessor()
+    plan = _plan_for(processor)
+    _shape_plan, report, allowed, _frontier = _vlm_shape_plan(
+        plan, "best_effort",
+    )
+    assert not allowed
+    assert (report.action, report.reason) == ("eager", "vlm_pad_token_unavailable")
+    raw = tuple(plan.batch_width(index) for index in range(len(plan)))
+    planned = plan.planned_event_widths()
+    assert raw == (40, 32, 32, 32, 32, 32)
+    # The five identical raw widths are bumped off a forbidden extent.
+    assert planned == (40, 33, 33, 33, 33, 33)
+
+    strict_plan = _plan_for(_WideningNoPadProcessor())
+    with pytest.raises(RuntimeError, match="without a tokenizer pad id"):
+        _vlm_shape_plan(strict_plan, "strict")
+
+
+def test_vlm_plan_rejects_a_rebuild_that_leaves_its_frozen_endpoint():
+    """Endpoints freeze at survey time, so a processor that rebuilds at a new
+    width hard-fails on the planned fetch whether or not a pad id exists."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE, phase_for_microstep
+
+    phase = phase_for_microstep(FULL_STEP_SCOPE, 1, 0)
+    for pad_token_id, rebuilt, message in (
+        (0, 36, "is below this batch's prepared width"),
+        (None, 30, "pad id is required to pad"),
+    ):
+        processor = _UniformNoPadProcessor(width=32, narrowed=rebuilt)
+        processor.tokenizer.pad_token_id = pad_token_id
+        plan = _plan_for(processor)
+        _shape_plan, _report, allowed, _frontier = _vlm_shape_plan(
+            plan, "best_effort",
+        )
+        assert allowed
+        processor.training = True
+        plan._mru = None
+        with pytest.raises(ValueError, match=message):
+            plan.materialize(0, phase=phase)
+
+    # A uniform narrowing is not family drift, so nothing earlier catches it.
     processor = _UniformNoPadProcessor(width=32, narrowed=30)
     plan = _plan_for(processor)
     plan.ensure_descriptors()
-    raw = tuple(plan.batch_width(i) for i in range(len(plan)))
-    planned = plan.planned_event_widths()
-    # The premise the reviewer relies on really does hold at survey time.
-    assert raw == planned == (32,) * len(plan)
-
-    # Training starts and the processor rebuilds every array uniformly narrower.
     processor.training = True
-    narrowed = plan._build_batch(0)
-    assert narrowed["input_ids"].shape[1] == 30
-    # A uniform narrowing is deliberately NOT family drift.
-    assert plan.check_family_drift(0, narrowed) is None
-
-    from unsloth_zoo.mlx.utils import _finalize_vlm_batch_width
-
-    with pytest.raises(ValueError, match="pad id is required to pad"):
-        _finalize_vlm_batch_width(dict(narrowed), 32, plan.pad_token_id)
+    assert plan.check_family_drift(0, plan._build_batch(0)) is None

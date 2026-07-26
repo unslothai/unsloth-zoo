@@ -864,21 +864,6 @@ def _plan_single_process_vlm_shapes(
             )
         return None, report, False, None
 
-    if batches.pad_token_id is None:
-        # Widening writes the tokenizer pad id into input_ids tails, so without
-        # one no endpoint above a batch's raw width can materialize and no width
-        # plan holds. Known before any survey work: degrade to eager for free.
-        report = _shape_guard_report(
-            "eager", "vlm_pad_token_unavailable", cap, compile_scope,
-            cap_selection="not_applicable",
-        )
-        if effective_mode == "strict":
-            raise RuntimeError(
-                "Unsloth: strict mx.compile cannot plan VLM widths without "
-                "a tokenizer pad id."
-            )
-        return None, report, False, None
-
     batches.ensure_descriptors()
     unplannable = [
         index
@@ -950,6 +935,25 @@ def _plan_single_process_vlm_shapes(
                 f"({shape_plan.report.reason})."
             )
         return shape_plan, shape_plan.report, False, frontier
+    # Only widening writes the tokenizer pad id into a tail, so a pad id is
+    # required by the BUILT plan rather than by the processor: uniform-width
+    # and declined-only schedules pad nothing and stay compilable without one.
+    if batches.pad_token_id is None and any(
+        shape_plan.endpoint_for(
+            batches.batch_family(index), planned_widths[index],
+        ) > batches.batch_width(index)
+        for index in range(len(batches))
+    ):
+        report = _shape_guard_report(
+            "eager", "vlm_pad_token_unavailable", cap, compile_scope,
+            cap_selection="not_applicable",
+        )
+        if effective_mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan VLM widths without "
+                "a tokenizer pad id."
+            )
+        return None, report, False, None
     if install_plan:
         batches.set_shape_plan(shape_plan, planned_widths)
     return shape_plan, shape_plan.report, True, frontier
