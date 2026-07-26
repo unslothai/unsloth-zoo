@@ -3679,6 +3679,21 @@ class MLXTrainer:
         grad_accum_state = None
         accum_progress = 0
         batches_per_epoch = self._callback_batches_per_epoch(batches)
+        # Streaming has no finite dataset length, so batches_per_epoch is None and
+        # the epoch lifecycle events stay disabled. HF still reports a NUMERIC
+        # state.epoch for a length-less dataloader -- steps_in_epoch falls back to
+        # max_steps * gradient_accumulation_steps and state.epoch = epoch +
+        # (step + 1) / steps_in_epoch (transformers trainer.py, 4.x and 5.x) -- and
+        # callbacks rely on that: WandbCallback.on_save builds its checkpoint alias
+        # as f"epoch_{round(state.epoch, 2)}", which raises TypeError on None and
+        # kills a live run at its first scheduled checkpoint. Streaming always has
+        # max_steps > 0 (num_train_epochs is rejected for it), so report the same
+        # fractional progress instead of leaving state.epoch unset.
+        stream_epoch_microbatches = None
+        if not batches_per_epoch and batch_iter is not None:
+            _stream_max_steps = int(getattr(args, "max_steps", 0) or 0)
+            if _stream_max_steps > 0:
+                stream_epoch_microbatches = _stream_max_steps * grad_accum
 
         def _run_callback_epoch_begin(epoch_value):
             """Dispatch one epoch-begin event at a dataset boundary (rank 0)."""
@@ -4381,6 +4396,8 @@ class MLXTrainer:
                 self._distributed_should_stop()
             if batches_per_epoch:
                 self.state.epoch = it / batches_per_epoch
+            elif stream_epoch_microbatches:
+                self.state.epoch = it / stream_epoch_microbatches
             train_time += time.perf_counter() - tic
 
             # Only log/eval on actual optimizer steps

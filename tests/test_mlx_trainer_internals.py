@@ -4459,3 +4459,125 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
     source = inspect.getsource(MLXTrainer._train_inner)
     assert "_suppress_torch_only_wandb_artifacts()" in source
     assert 'finally:\n            self._restore_wandb_artifact_modes(' in source
+
+
+def _tiny_lm_for_loop_tests():
+    """Minimal MLX module the training loop can run end to end."""
+    import mlx.nn as nn
+
+    class TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(128, 4)
+            self.proj = nn.Linear(4, 128, bias=False)
+            self._config = {"model_type": "tiny"}
+
+        def __call__(self, input_ids):
+            return self.proj(self.embed(input_ids))
+
+        def train(self):
+            return self
+
+        @property
+        def state(self):
+            return []
+
+    return TinyLM()
+
+
+def _frozen_optimizer():
+    """Optimizer stub that never changes the weights, so two runs see the
+    identical per-batch losses and only the log cadence differs."""
+    import mlx.core as mx
+
+    return lambda _total_steps: types.SimpleNamespace(
+        learning_rate=mx.array(1e-5),
+        state={},
+        update=lambda _model, _grad: None,
+    )
+
+
+def _patch_value_and_grad_with_aux(monkeypatch):
+    """The MLX-on-torch shim's nn.value_and_grad has no aux support, so the
+    trainer's (loss, tokens) return unpacks wrong. Return the real loss with
+    zero gradients; the frozen optimizer keeps the weights fixed anyway."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+
+    def value_and_grad_with_aux(model, fn):
+        def wrapped(*args):
+            return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
+        return wrapped
+
+    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
+
+
+def test_streaming_runs_report_a_numeric_epoch_to_callbacks(monkeypatch):
+    # Streaming has no finite dataset length, so batches_per_epoch is None. Leaving
+    # state.epoch at None diverges from HF, which falls back to steps_in_epoch =
+    # max_steps * gradient_accumulation_steps for a length-less dataloader, and it
+    # breaks stock integrations: WandbCallback.on_save builds its checkpoint alias
+    # as f"epoch_{round(state.epoch, 2)}" (transformers integrations/
+    # integration_utils.py), which raises TypeError on None and takes down a run
+    # that was training fine.
+    import tempfile
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochAliasCallback:
+        def __init__(self):
+            self.step_epochs = []
+            self.save_aliases = []
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.step_epochs.append(state.epoch)
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            # Verbatim shape of WandbCallback.on_save's alias.
+            self.save_aliases.append(f"epoch_{round(state.epoch, 2)}")
+            return control
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    spy = EpochAliasCallback()
+    args = MLXTrainingConfig(
+        max_steps=4,
+        gradient_accumulation_steps=1,
+        logging_steps=4,
+        save_steps=2,
+        streaming=True,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+        callbacks=[spy],
+    )
+    stream = iter([make_batch(10) for _ in range(4)])
+    trainer._prepare_data = lambda _is_vlm: (None, stream)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+
+    trainer.train()
+
+    # HF's (step + 1) / (max_steps * grad_accum) progress, not None.
+    assert spy.step_epochs == [0.25, 0.5, 0.75, 1.0]
+    assert spy.save_aliases == ["epoch_0.5", "epoch_1.0"]
