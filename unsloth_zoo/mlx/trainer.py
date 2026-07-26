@@ -4208,6 +4208,15 @@ class MLXTrainer:
         # on rank 0 only) drains every rank together before the next collective.
         microstep = _resume_step * grad_accum
         self._global_step = _resume_step
+        # Resuming mid-epoch re-enters an epoch whose boundary already passed, so
+        # the loop's own predicate never fires its begin and a fresh callback sees
+        # that epoch's on_epoch_end unpaired. HF dispatches on_epoch_begin for the
+        # resumed partial epoch too, before skipping its trained batches
+        # (trainer.py on_epoch_begin at the top of the epoch loop, then
+        # skip_first_batches). A stop set here is drained by the loop's first
+        # _distributed_should_stop().
+        if batches_per_epoch and microstep % batches_per_epoch:
+            _run_callback_epoch_begin(microstep // batches_per_epoch)
         while self._global_step < total_steps:
             it = microstep + 1
             if self._distributed_should_stop() or self._early_stopped:

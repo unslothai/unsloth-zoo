@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import os
 import types
 
 import pytest
@@ -4651,3 +4652,84 @@ def test_streaming_runs_report_a_numeric_epoch_to_callbacks(monkeypatch):
     # HF's (step + 1) / (max_steps * grad_accum) progress, not None.
     assert spy.step_epochs == [0.25, 0.5, 0.75, 1.0]
     assert spy.save_aliases == ["epoch_0.5", "epoch_1.0"]
+
+
+def test_resume_mid_epoch_fires_epoch_begin(monkeypatch):
+    # Codex NEW-d: "Fire epoch-begin when resuming inside an epoch." HF dispatches
+    # on_epoch_begin at the top of every epoch of `range(epochs_trained, ...)`,
+    # including the resumed partial one, and only afterwards skips its
+    # already-trained batches. The MLX loop only fired begin at exact boundaries,
+    # so a run resumed mid-epoch delivered that epoch's on_epoch_end with no
+    # preceding begin and a freshly constructed callback tore down per-epoch state
+    # it never set up.
+    import tempfile
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochOrderCallback:
+        def __init__(self):
+            self.events = []
+
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            self.events.append("begin")
+            return control
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            self.events.append("end")
+            return control
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    out_dir = tempfile.mkdtemp()
+    # 4 micro-batches per epoch, 6 steps, checkpoint at 3: mid-epoch-2 resume.
+    batches = [make_batch(10) for _ in range(6)]
+
+    def build(spy):
+        args = MLXTrainingConfig(
+            max_steps=6,
+            gradient_accumulation_steps=1,
+            logging_steps=6,
+            save_steps=3,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+            callbacks=[spy],
+        )
+        trainer._prepare_data = lambda _is_vlm: (list(batches), None)
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    build(EpochOrderCallback()).train()
+    ckpt = os.path.join(out_dir, "checkpoint-3")
+    assert os.path.isdir(ckpt), sorted(os.listdir(out_dir))
+
+    resumed = EpochOrderCallback()
+    build(resumed).train(resume_from_checkpoint=ckpt)
+
+    # Every end is paired with a preceding begin, and the resumed partial epoch
+    # opens with one rather than closing an epoch nobody opened.
+    assert resumed.events, resumed.events
+    assert resumed.events[0] == "begin", resumed.events
+    depth = 0
+    for event in resumed.events:
+        depth += 1 if event == "begin" else -1
+        assert depth in (0, 1), resumed.events
