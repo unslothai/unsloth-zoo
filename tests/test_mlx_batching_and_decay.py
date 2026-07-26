@@ -950,6 +950,80 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
     assert set(capped_processor.seen_max_length) == {5}
     assert all(batch["input_ids"].shape == (2, 5) for batch in capped)
 
+
+def test_vlm_plan_refreshes_visit_dependent_formatting_per_occurrence():
+    """A stochastic or epoch-dependent formatting_func must refresh on every
+    scheduled visit, the way the eager builder did when it formatted inside
+    each batch build, while re-materialization stays free of user code."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    visits = {}
+
+    def formatting_func(item):
+        row = int(item["row"])
+        visit = visits.get(row, 0)
+        visits[row] = visit + 1
+        return {"text": str(10 * visit + row)}
+
+    plan = _create_vlm_batch_plan(
+        dataset=[{"row": i} for i in range(3)],
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=6,
+        dataset_order="sequential",
+        formatting_func=formatting_func,
+    )
+
+    assert visits == {0: 2, 1: 2, 2: 2}
+    heads = [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))]
+    assert heads == [0, 1, 2, 10, 11, 12]
+
+    plan.materialize_all()
+    plan.ensure_descriptors()
+    assert visits == {0: 2, 1: 2, 2: 2}
+    assert [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))] == heads
+
+
+def test_vlm_plan_formats_only_scheduled_rows_and_compacts_without_a_formatter():
+    """Unscheduled rows never reach the formatter, and the plans that need no
+    per-visit formatting keep storing one row per referenced dataset index."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    seen = []
+
+    def formatting_func(item):
+        seen.append(int(item["row"]))
+        return {"text": str(item["row"])}
+
+    plan = _create_vlm_batch_plan(
+        dataset=[{"row": i} for i in range(6)],
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=4,
+        dataset_order="sequential",
+        formatting_func=formatting_func,
+    )
+    assert seen == [0, 1, 2, 3]
+    assert len(plan.rows) == 4
+
+    plain = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(3)],
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=6,
+        dataset_order="sequential",
+    )
+    assert (len(plain), len(plain.rows)) == (6, 3)
+
+
 class _AugProcessor:
     """Index-deterministic widths, globally-drawn pixel content."""
 

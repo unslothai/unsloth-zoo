@@ -5762,11 +5762,11 @@ def _preserved_preprocessing_rng():
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
-    Rows hold formatted dataset items (``formatting_func`` is consumed once
-    at construction), the schedule holds compact row positions with a mask of
-    distributed pad slots, and the plan-owned cache retains only the most
-    recent batch. Visits are identity-only: merged VLM epoch semantics replay
-    the stored schedule, so epoch permutation stays a text-plan behavior.
+    Rows hold formatted dataset items (``formatting_func`` is consumed at
+    construction, once per scheduled slot), the schedule holds row positions
+    with a mask of distributed pad slots, and the plan-owned cache retains only
+    the most recent batch. Visits are identity-only: merged VLM epoch semantics
+    replay the stored schedule, so epoch permutation stays a text-plan behavior.
     """
 
     __slots__ = (
@@ -6225,28 +6225,39 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             f"were -100 after train_on_responses_only masking."
         )
 
-    # Compact remap: store only rows the schedule references.
-    used = []
-    seen_used = set()
-    for batch in schedule:
-        for idx in batch:
-            if idx not in seen_used:
-                seen_used.add(idx)
-                used.append(idx)
     if formatting_func is not None and formatted_items is None:
-        # Consume formatting once per referenced row, in first-visit order, so
-        # re-materialization never re-invokes user code and unscheduled rows
-        # never reach the formatter (legacy parity).
-        formatted_items = {idx: formatting_func(dataset[idx]) for idx in used}
-    position = {idx: pos for pos, idx in enumerate(used)}
-    rows = tuple(
-        _FiniteVLMRow(
-            _item(idx),
-            True if _supervision is None else _supervision[idx],
+        # One row per scheduled slot, formatted in schedule order: the eager
+        # builder ran the formatter while building every batch, so a stochastic
+        # or epoch-dependent formatter must refresh on every revisit. Consuming
+        # it here still keeps user code out of re-materialization.
+        rows = tuple(
+            _FiniteVLMRow(formatting_func(dataset[idx]), True)
+            for batch in schedule for idx in batch
         )
-        for idx in used
-    )
-    schedule = [tuple(position[idx] for idx in batch) for batch in schedule]
+        remapped = []
+        offset = 0
+        for batch in schedule:
+            remapped.append(tuple(range(offset, offset + len(batch))))
+            offset += len(batch)
+        schedule = remapped
+    else:
+        # Compact remap: store only rows the schedule references.
+        used = []
+        seen_used = set()
+        for batch in schedule:
+            for idx in batch:
+                if idx not in seen_used:
+                    seen_used.add(idx)
+                    used.append(idx)
+        position = {idx: pos for pos, idx in enumerate(used)}
+        rows = tuple(
+            _FiniteVLMRow(
+                _item(idx),
+                True if _supervision is None else _supervision[idx],
+            )
+            for idx in used
+        )
+        schedule = [tuple(position[idx] for idx in batch) for batch in schedule]
     return FiniteVLMBatchPlan(
         rows,
         schedule,
