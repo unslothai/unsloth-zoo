@@ -5761,7 +5761,12 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         )
         self._processor = processor
         self._config = config
-        self.max_seq_length = int(max_seq_length)
+        # ``None`` stays ``None``: the VLM builder treats it as "no cap" (the
+        # processor omits ``max_length`` and the truncation helper is a no-op),
+        # and the plan only ever forwards this value, never computes with it.
+        self.max_seq_length = (
+            None if max_seq_length is None else int(max_seq_length)
+        )
         self._image_size = image_size
         self._response_mask_fn = response_mask_fn
         self._ignore_token_ids = ignore_token_ids

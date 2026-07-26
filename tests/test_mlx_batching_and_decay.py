@@ -840,3 +840,69 @@ def test_vlm_automatic_planning_stays_exact_below_ceiling():
     assert report.raw_signatures == report.planned_signatures == 40
     assert (report.cap_selection, report.budget_satisfied) == ("exact", True)
     assert (report.padding_work_fraction, report.max_width_stretch) == (0.0, 1.0)
+
+
+class _ProcessorNativeLimitProcessor:
+    """Emits its own native width and honours ``max_length`` only when given."""
+
+    def __init__(self, native_width=12):
+        self.tokenizer = _TinyTokenizer()
+        self.image_processor = object()
+        self.native_width = native_width
+        self.seen_max_length = []
+
+    def __call__(self, text, **kwargs):
+        self.seen_max_length.append(kwargs.get("max_length", "<absent>"))
+        width = self.native_width
+        if kwargs.get("max_length") is not None:
+            width = min(width, int(kwargs["max_length"]))
+        rows = [([int(item), 200] + [7] * width)[:width] for item in text]
+        masks = [[1] * width for _ in rows]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+        }
+
+
+def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
+    """``max_seq_length=None`` means "use the processor's own limit"."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan, create_vlm_batches
+
+    processor = _ProcessorNativeLimitProcessor(native_width=12)
+    batches = create_vlm_batches(
+        dataset=[{"text": str(i)} for i in range(4)],
+        processor=processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=None,
+        dataset_order="sequential",
+    )
+
+    # The processor is never handed a cap, so nothing is truncated.
+    assert set(processor.seen_max_length) == {"<absent>"}
+    assert len(batches) == 2
+    assert all(batch["input_ids"].shape == (2, 12) for batch in batches)
+
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(4)],
+        processor=_ProcessorNativeLimitProcessor(native_width=12),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=None,
+        dataset_order="sequential",
+    )
+    assert plan.max_seq_length is None
+
+    # A finite cap still coerces to int and still truncates.
+    capped_processor = _ProcessorNativeLimitProcessor(native_width=12)
+    capped = create_vlm_batches(
+        dataset=[{"text": str(i)} for i in range(4)],
+        processor=capped_processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=5,
+        dataset_order="sequential",
+    )
+    assert set(capped_processor.seen_max_length) == {5}
+    assert all(batch["input_ids"].shape == (2, 5) for batch in capped)
