@@ -22,15 +22,19 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 
 import ast
 import gc
+import hashlib
 import json
 import importlib
 import inspect
+import io
 import math
 import os
 import re
 import shutil
 import sys
 import tempfile
+import textwrap
+import tokenize
 import types
 import warnings
 import weakref
@@ -38,6 +42,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
+from functools import wraps
 from pathlib import Path
 
 from .compile import (
@@ -2331,6 +2336,205 @@ def _resolve_mlx_vlm_model_class(model_type):
         if cls is not None:
             return cls
     return None
+
+
+_MINICPM_SOURCE_PREFIXES = ("llm.", "vpm.", "apm.")
+_MINICPM_MLX_PREFIX_ALIASES = {
+    "language_model.": "llm.",
+    "vision_tower.": "vpm.",
+    "audio_tower.": "apm.",
+}
+_MINICPM_SANITIZE_TOKEN_SHA256 = (
+    "0706ec1a5d2252c16b6e9a2e665c7774fb6061aef763494d8e78d3fda68b439b"
+)
+
+
+def _source_token_sha256(source: str) -> str:
+    """Hash Python tokens while retaining indentation as semantic markers."""
+
+    ignored = {
+        tokenize.ENCODING,
+        tokenize.COMMENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.ENDMARKER,
+    }
+    parts = []
+    try:
+        tokens = tokenize.generate_tokens(
+            io.StringIO(textwrap.dedent(source)).readline
+        )
+        for token in tokens:
+            if token.type in ignored:
+                continue
+            if token.type == tokenize.INDENT:
+                parts.append("<INDENT>")
+            elif token.type == tokenize.DEDENT:
+                parts.append("<DEDENT>")
+            else:
+                parts.append(token.string)
+    except (IndentationError, tokenize.TokenError, TypeError):
+        return ""
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+
+def _unconditionally_sanitizes_mlx_vlm_weights(load_model) -> bool:
+    """Whether load_model sanitizes model weights without an MLX-format gate."""
+
+    try:
+        tree = ast.parse(textwrap.dedent(_safe_getsource(load_model)))
+    except (IndentationError, SyntaxError):
+        return False
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "load_model"
+    ]
+    if len(functions) != 1:
+        return False
+    function = functions[0]
+    sanitize_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sanitize_weights"
+        and len(node.args) >= 2
+        and all(
+            isinstance(argument, ast.Name) and argument.id == expected
+            for argument, expected in zip(node.args[:2], ("model", "weights"))
+        )
+    ]
+    direct_assignments = [
+        statement
+        for statement in function.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "weights"
+        and sanitize_calls
+        and statement.value is sanitize_calls[0]
+    ]
+    if len(sanitize_calls) != 1 or len(direct_assignments) != 1:
+        return False
+    assignment_index = function.body.index(direct_assignments[0])
+    return not any(
+        isinstance(node, ast.Return)
+        for statement in function.body[:assignment_index]
+        for node in ast.walk(statement)
+    )
+
+
+def _minicpmo_sanitize_requires_source_prefixes(sanitize) -> bool:
+    """Whether MiniCPM accepts source tower names but drops converted names."""
+
+    try:
+        parameters = inspect.signature(
+            sanitize,
+            follow_wrapped=False,
+        ).parameters
+    except (TypeError, ValueError):
+        return False
+    fingerprint = _source_token_sha256(_safe_getsource(sanitize))
+    if (
+        tuple(parameters) != ("self", "weights")
+        or fingerprint != _MINICPM_SANITIZE_TOKEN_SHA256
+    ):
+        return False
+
+    suffixes = (
+        "model.norm._unsloth_probe",
+        "embeddings.norm._unsloth_probe",
+        "layer_norm._unsloth_probe",
+    )
+    source_keys = tuple(
+        prefix + suffix
+        for prefix, suffix in zip(_MINICPM_SOURCE_PREFIXES, suffixes)
+    )
+    mlx_keys = tuple(
+        prefix + suffix
+        for prefix, suffix in zip(_MINICPM_MLX_PREFIX_ALIASES, suffixes)
+    )
+    values = tuple(object() for _ in source_keys)
+    probe = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            text_config=types.SimpleNamespace(tie_word_embeddings=False),
+        ),
+    )
+    try:
+        source_result = sanitize(probe, dict(zip(source_keys, values)))
+        mlx_result = sanitize(probe, dict(zip(mlx_keys, values)))
+    except Exception:
+        return False
+    return (
+        isinstance(source_result, Mapping)
+        and tuple(source_result) == mlx_keys
+        and all(source_result[key] is value for key, value in zip(mlx_keys, values))
+        and isinstance(mlx_result, Mapping)
+        and not mlx_result
+    )
+
+
+def _minicpmo_mlx_sanitize_adapter(original):
+    """Delegate converted MiniCPM tower names through its installed sanitizer."""
+
+    if getattr(original, "_unsloth_minicpmo_mlx_weights", False):
+        return original
+    if not _minicpmo_sanitize_requires_source_prefixes(original):
+        return original
+
+    @wraps(original)
+    def patched(self, weights):
+        if not isinstance(weights, Mapping):
+            return original(self, weights)
+        has_source_names = any(
+            key.startswith(_MINICPM_SOURCE_PREFIXES)
+            for key in weights
+        )
+        mlx_prefix_presence = tuple(
+            any(key.startswith(prefix) for key in weights)
+            for prefix in _MINICPM_MLX_PREFIX_ALIASES
+        )
+        if has_source_names and any(mlx_prefix_presence):
+            raise ValueError(
+                "Unsloth: MiniCPM checkpoint mixes source and MLX tower names."
+            )
+        if not all(mlx_prefix_presence):
+            return original(self, weights)
+
+        prepared = {}
+        for key, value in weights.items():
+            for target, source in _MINICPM_MLX_PREFIX_ALIASES.items():
+                if key.startswith(target):
+                    key = source + key[len(target) :]
+                    break
+            prepared[key] = value
+        return original(self, prepared)
+
+    patched._unsloth_minicpmo_mlx_weights = True
+    return patched
+
+
+def _ensure_minicpmo_mlx_sanitize(model_type: str) -> None:
+    """Preserve converted MiniCPM weights in unconditional sanitize loaders."""
+
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmo.minicpmo"
+        or not hasattr(cls, "sanitize")
+    ):
+        return
+    try:
+        from mlx_vlm.utils import load_model
+    except (ImportError, AttributeError):
+        return
+    if not _unconditionally_sanitizes_mlx_vlm_weights(load_model):
+        return
+    adapted = _minicpmo_mlx_sanitize_adapter(cls.sanitize)
+    if adapted is not cls.sanitize:
+        cls.sanitize = adapted
 
 
 def _lookup_module_array(root, dotted_key):
@@ -6206,6 +6410,7 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(

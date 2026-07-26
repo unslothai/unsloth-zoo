@@ -999,6 +999,81 @@ def test_legacy_quantized_projector_binding_is_scoped_and_capability_gated(monke
     assert loader._bind_mlx_vlm_quantized_projector_loader(processor_bound)("model") == "processor"
 
 
+def test_minicpmo_mlx_sanitize_is_complete_and_loader_gated(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    class MiniCPM:
+        __module__ = "mlx_vlm.models.minicpmo.minicpmo"
+        def sanitize(self, weights):
+            output = {}
+            for key, value in weights.items():
+                for source, target in zip(
+                    ("llm.", "vpm.", "apm."),
+                    ("language_model.", "vision_tower.", "audio_tower."),
+                ):
+                    if key.startswith(source):
+                        key = target + key[len(source) :]
+                        break
+                else:
+                    if not key.startswith(("resampler.", "audio_projection_layer.")):
+                        continue
+                if key == "resampler.attn.in_proj_weight":
+                    output.update({
+                        f"resampler.attn.{name}_proj.weight": part
+                        for name, part in zip(("q", "k", "v"), value)
+                    })
+                elif key.endswith("embeddings.patch_embedding.weight"):
+                    output[key] = ("vision-layout", value)
+                elif key.endswith("audio_tower.conv1.weight"):
+                    output[key] = ("audio-layout", value)
+                elif key != "language_model.lm_head.weight":
+                    output[key] = value
+            return output
+
+    sanitize_weights = lambda _model, weights: weights
+    def affected_load_model(model, weights): return sanitize_weights(model, weights)
+    def bypassing_load_model(model, weights):
+        mlx_format = True
+        return weights if mlx_format else sanitize_weights(model, weights)
+
+    load_source = "def load_model(model, weights):\n    weights = sanitize_weights(model, weights)\n    return weights\n"
+    bypass_source = "def load_model(model, weights):\n    if mlx_format:\n        return weights\n    weights = sanitize_weights(model, weights)\n    return weights\n"
+    sources = {affected_load_model: load_source, bypassing_load_model: bypass_source}
+    original_getsource = loader._safe_getsource
+    def getsource(obj): return sources[obj] if obj in sources else original_getsource(obj)
+    monkeypatch.setattr(loader, "_MINICPM_SANITIZE_TOKEN_SHA256", loader._source_token_sha256(getsource(MiniCPM.sanitize)))
+    monkeypatch.setattr(loader, "_safe_getsource", getsource); monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: MiniCPM)
+    utils = types.ModuleType("mlx_vlm.utils")
+    utils.load_model = affected_load_model; monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+
+    original = MiniCPM.sanitize; loader._ensure_minicpmo_mlx_sanitize("minicpmo")
+    assert MiniCPM.sanitize.__wrapped__ is original
+    language, vision, audio = object(), object(), object()
+    values = {"language_model.model.norm.weight": language, "vision_tower.embeddings.patch_embedding.weight": vision, "audio_tower.conv1.weight": audio,
+              "resampler.attn.in_proj_weight": ("q", "k", "v"), "language_model.lm_head.weight": object()}
+    result = MiniCPM().sanitize(values)
+    assert result["language_model.model.norm.weight"] is language and result["vision_tower.embeddings.patch_embedding.weight"] == ("vision-layout", vision)
+    assert result["audio_tower.conv1.weight"] == ("audio-layout", audio) and "language_model.lm_head.weight" not in result
+    assert tuple(result[f"resampler.attn.{name}_proj.weight"] for name in ("q", "k", "v")) == ("q", "k", "v")
+    source_values = {name: object() for name in ("llm.x", "vpm.x", "apm.x")}; assert set(MiniCPM().sanitize(source_values)) == {"language_model.x", "vision_tower.x", "audio_tower.x"}
+    with pytest.raises(ValueError, match="mixes source and MLX tower names"):
+        MiniCPM().sanitize({"llm.x": 1, "language_model.x": 2})
+    assert MiniCPM().sanitize({"language_model.x": 1}) == {}
+    loader._ensure_minicpmo_mlx_sanitize("minicpmo"); assert MiniCPM.sanitize.__wrapped__ is original
+
+    class CompatibleMiniCPM:
+        def sanitize(self, weights): return weights
+    assert loader._minicpmo_mlx_sanitize_adapter(CompatibleMiniCPM.sanitize) is CompatibleMiniCPM.sanitize
+
+    class NativeMiniCPM: pass
+    NativeMiniCPM.__module__, NativeMiniCPM.sanitize = MiniCPM.__module__, original
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: NativeMiniCPM)
+    utils.load_model = bypassing_load_model
+    native = NativeMiniCPM.sanitize
+    loader._ensure_minicpmo_mlx_sanitize("minicpmo")
+    assert NativeMiniCPM.sanitize is native
+
+
 def test_llava_processor_geometry_uses_temporary_config_view(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 

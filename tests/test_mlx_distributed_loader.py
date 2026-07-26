@@ -325,11 +325,12 @@ def test_from_pretrained_distributed_vlm_passes_override_without_temp_view(monke
     from unsloth_zoo.mlx.loader import FastMLXModel
 
     config = {"model_type": "raw", "vision_config": {}, "architectures": ["DeepSeekOCRForCausalLM"], "auto_map": {"x": "y"}}
-    model_path, calls = _write_config(tmp_path, config), []
+    model_path, calls, sanitize_calls = _write_config(tmp_path, config), [], []
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda *_a, **_k: model_path)
     monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", lambda *_a, config_override_data=None, **_k: (calls.append(config_override_data), (types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())))[1])
-    for name in ("install_mlx_compile_patches", "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype", "_patch_mixed_precision_set_dtype", "_fix_gemma4_kv_sharing", "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa", "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32", "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation", "_fix_gemma3_multimodal_image_feature_scale"):
+    for name in ("install_mlx_compile_patches", "_ensure_vlm_processor_inputs_patched", "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype", "_patch_mixed_precision_set_dtype", "_fix_gemma4_kv_sharing", "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa", "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32", "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation", "_fix_gemma3_multimodal_image_feature_scale"):
         monkeypatch.setattr(loader, name, lambda *_a, **_k: None)
+    monkeypatch.setattr(loader, "_ensure_minicpmo_mlx_sanitize", sanitize_calls.append)
     monkeypatch.setattr(loader, "_repair_degraded_vlm_processor", lambda processor, *_a, **_k: processor)
     monkeypatch.setattr(loader, "_infer_snapshot_commit", lambda *_a, **_k: "commit")
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.SimpleNamespace(load=lambda *_a, **_k: None))
@@ -337,6 +338,7 @@ def test_from_pretrained_distributed_vlm_passes_override_without_temp_view(monke
     FastMLXModel.from_pretrained("fake/vlm", text_only=False, tensor_group=_FakeGroup(), load_in_4bit=False)
 
     assert calls == [{k: v for k, v in config.items() if k != "auto_map"} | {"model_type": "deepseekocr"}]
+    assert sanitize_calls == ["deepseekocr"]
 
 
 def _patch_fast_mlx_text_load(monkeypatch, tmp_path, config):
