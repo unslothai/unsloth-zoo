@@ -2922,8 +2922,14 @@ def merge_and_overwrite_lora(
             warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
             return None
         if final_model_name is None:
-            warnings.warn(f"Model {model_name} not found locally or on HuggingFace")
-            return None
+            # Never return None here. `save_pretrained_merged` would look like it
+            # succeeded while creating no output directory at all, and the only
+            # signal would be a UserWarning that scrolls past in a notebook.
+            raise RuntimeError(
+                f"Unsloth: Model {model_name} not found locally or on Hugging Face, so the "
+                f"{save_method} merge cannot obtain the base weights. Nothing was written to "
+                f"`{save_directory}`."
+            )
         model_name = final_model_name
 
         # Handle case for local model where config._name_or_path is a local os path
@@ -4412,13 +4418,47 @@ def find_lora_base_model(model_to_inspect):
     return current
 pass
 
+from huggingface_hub.errors import (
+    EntryNotFoundError,
+    GatedRepoError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
+
+# Exceptions that genuinely mean "this repo is not there / not usable".
+# `HfFileSystem.ls` reports an absent repo, revision or path as a plain
+# FileNotFoundError: `hf_file_system._raise_file_not_found` is reached only
+# after `_repo_and_revision_exists` catches RepositoryNotFoundError,
+# RevisionNotFoundError or HFValidationError. Every other failure (429, 5xx,
+# DNS, read timeout, OfflineModeIsEnabled) propagates out of `ls` unchanged,
+# which is exactly what lets us tell "absent" apart from "unreachable".
+_HUB_ABSENT_ERRORS = (
+    FileNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+    EntryNotFoundError,
+    GatedRepoError,
+)
+
 def check_hf_model_exists(model_name, token=None):
-    """Check if model exists on HuggingFace"""
+    """Check if model exists on HuggingFace.
+
+    Only a genuinely absent or inaccessible repo may answer False. A bare
+    `except:` here turns every transient transport failure (429 rate limit, 5xx,
+    DNS or proxy error, read timeout, HF_HUB_OFFLINE) into "this model does not
+    exist", and the caller then silently exports nothing.
+    """
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
         return any(x["name"].endswith(".safetensors") for x in file_list)
-    except:
+    except _HUB_ABSENT_ERRORS:
         return False
+    except Exception as e:
+        raise RuntimeError(
+            f"Unsloth: could not reach the Hugging Face Hub while checking whether "
+            f"`{model_name}` exists ({type(e).__name__}: {e}). This is a connectivity "
+            f"or rate limiting problem, not a missing model. Retry, or pass a local path."
+        ) from e
 pass
 
 def check_local_model_exists(model_path):
