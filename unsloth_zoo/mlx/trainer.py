@@ -3225,7 +3225,10 @@ class MLXTrainer:
                 # best-saves and early-stop against a model that
                 # load_best_model_at_end can't restore.
                 _best_path = f"{args.output_dir}/best/adapters.safetensors"
-                if self._best_step is not None and not os.path.exists(_best_path):
+                _best_weights_missing = (
+                    self._best_step is not None and not os.path.exists(_best_path)
+                )
+                if _best_weights_missing:
                     _main_print(
                         f"Unsloth: checkpoint carries best-model state (step "
                         f"{self._best_step}) but {args.output_dir}/best has no "
@@ -3234,16 +3237,16 @@ class MLXTrainer:
                     self._best_metric = None
                     self._best_step = None
                     self._es_patience_counter = 0
-                # TrainerState.best_metric advances on every eval whenever
-                # metric_for_best_model is set, so it can be live while
-                # "best_metric" above is null. Restore it from its own key, else
-                # EarlyStoppingCallback sees None and calls the first post-resume
-                # eval a new best. Read after the best/-missing branch so pre-fix
-                # checkpoints keep the native fallback.
-                self._resume_callback_best_metric = ts.get(
+                # TrainerState.best_metric can be live while "best_metric" above
+                # is null, so restore it from its own key, else
+                # EarlyStoppingCallback calls the first post-resume eval a new
+                # best. The restart above clears it too: HF keeps ONE watermark
+                # for callbacks and best selection. Read after that branch so
+                # pre-fix checkpoints keep the native fallback.
+                self._resume_callback_best_metric = None if _best_weights_missing else ts.get(
                     "callback_best_metric", self._best_metric,
                 )
-                self._resume_callback_best_step = ts.get(
+                self._resume_callback_best_step = None if _best_weights_missing else ts.get(
                     "callback_best_step", self._best_step,
                 )
                 _main_print(

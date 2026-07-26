@@ -5718,6 +5718,126 @@ def test_callback_best_metric_persisted_across_resume_without_native_tracking(mo
     assert legacy_spy.seen == [(4, None, None)]
 
 
+@pytest.mark.parametrize("best_weights_present", [False, True])
+def test_missing_best_weights_clears_callback_best_state(monkeypatch, best_weights_present):
+    # Resuming a checkpoint copied into an output_dir without best/ restarts the
+    # NATIVE best tracking, but the callback-visible watermark was still restored
+    # from the checkpoint. EarlyStoppingCallback then measured the first eval
+    # against weights that no longer exist (patience 1 stops immediately) while
+    # _run_best_tracking called that same eval a new best and overwrote the
+    # watermark with that worse value. HF keeps one watermark for both, and its
+    # _determine_best_metric only ever moves it in the improving direction.
+    import json
+    import shutil
+
+    import mlx.core as mx
+    from transformers import EarlyStoppingCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    class BestSpy:
+        def __init__(self):
+            self.seen = []
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            self.seen.append((state.global_step, state.best_metric,
+                              state.best_global_step, state.best_model_checkpoint))
+            return control
+
+    def build(out_dir, max_steps, eval_losses, callbacks):
+        args = MLXTrainingConfig(
+            max_steps=max_steps,
+            gradient_accumulation_steps=1,
+            logging_steps=1000,
+            eval_steps=2,
+            save_steps=2,
+            load_best_model_at_end=True,
+            early_stopping_patience=0,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(8)],
+            args=args,
+            callbacks=list(callbacks),
+        )
+        trainer._prepare_data = lambda _is_vlm: (
+            [make_batch(10) for _ in range(max_steps + 2)], None,
+        )
+        trainer.eval_dataset = [{"input_ids": [1, 2, 3, 4]}]
+        trainer._eval_batches_labeled = ["batch-0"]
+        pending = list(eval_losses)
+
+        def _fake_evaluate(batches, loss_fn, is_vlm=False):
+            value = pending.pop(0)
+            trainer._last_eval_metrics = {"eval_loss": value}
+            return value, 2.0
+
+        trainer._evaluate = _fake_evaluate
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    dir_a = tempfile.mkdtemp()
+    dir_b = tempfile.mkdtemp()
+    first = build(dir_a, 2, [0.9], [])
+    first.train()
+    assert (first._best_metric, first._best_step) == (0.9, 2)
+    assert os.path.isdir(os.path.join(dir_a, "best"))
+
+    ckpt = os.path.join(dir_a, "checkpoint-2")
+    with open(os.path.join(ckpt, "trainer_state.json")) as fh:
+        saved = json.load(fh)
+    assert saved["callback_best_metric"] == pytest.approx(0.9)
+
+    # Copy the checkpoint alone into a fresh output_dir; best/ follows only in
+    # the control leg.
+    shutil.copytree(ckpt, os.path.join(dir_b, "checkpoint-2"))
+    if best_weights_present:
+        shutil.copytree(os.path.join(dir_a, "best"), os.path.join(dir_b, "best"))
+
+    spy = BestSpy()
+    resumed = build(dir_b, 8, [1.5, 1.4, 1.3],
+                    [spy, EarlyStoppingCallback(early_stopping_patience=1)])
+    resumed.train(resume_from_checkpoint=os.path.join(dir_b, "checkpoint-2"))
+
+    if best_weights_present:
+        # Weights are there, so the restored watermark is real: the first worse
+        # eval exhausts patience and the best stays where it was.
+        assert spy.seen == [(4, pytest.approx(0.9), 2, f"{dir_b}/best")]
+        assert resumed.state.global_step == 4
+        assert (resumed._best_metric, resumed._best_step) == (0.9, 2)
+        assert resumed.state.best_metric == pytest.approx(0.9)
+    else:
+        # Tracking restarted, so callbacks must see no watermark and the run must
+        # not stop against a model it cannot restore.
+        assert spy.seen[0] == (4, None, None, None)
+        assert resumed.state.global_step == 8
+        assert [step for step, *_ in spy.seen] == [4, 6, 8]
+        # Native and callback best stay in lockstep, and the watermark only improves.
+        assert (resumed._best_metric, resumed._best_step) == (1.3, 8)
+        assert resumed.state.best_metric == pytest.approx(1.3)
+        assert resumed.state.best_global_step == 8
+        assert [m for _, m, *_ in spy.seen] == [None, pytest.approx(1.5), pytest.approx(1.4)]
+
+
 def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
     # train_loss_token_sum/_total are written only by _run_training_log, so a
     # checkpoint taken on a step whose applied updates are not logged yet (a save
