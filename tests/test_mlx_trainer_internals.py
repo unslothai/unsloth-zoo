@@ -2010,6 +2010,85 @@ def test_reset_run_state_clears_last_eval_metrics():
     assert trainer._last_eval_metrics == {}
 
 
+def _compat_args(**overrides):
+    """Minimal MLXTrainingConfig-like args for _ensure_callback_args_compat."""
+    import types
+
+    fields = dict(
+        logging_steps=1, eval_steps=0, save_steps=0,
+        output_dir="out", logging_dir=None, run_name=None,
+    )
+    fields.update(overrides)
+    return types.SimpleNamespace(**fields)
+
+
+def test_synthesized_eval_strategy_refreshes_when_eval_is_enabled_later():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = _compat_args()
+    trainer.eval_dataset = None
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "no"
+
+    # eval_dataset/eval_steps stay writable on a constructed trainer, and
+    # _ensure_callback_args_compat runs again on add_callback and each train().
+    # A stale "no" makes HF's EarlyStoppingCallback assert in on_train_begin
+    # even though native eval runs.
+    trainer.eval_dataset = [{}]
+    trainer.args.eval_steps = 1
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "steps"
+
+    # ... and back off again when eval is disabled for a later run.
+    trainer.args.eval_steps = 0
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "no"
+
+    # Same derivation for the other synthesized strategies.
+    trainer.args.save_steps = 5
+    trainer.args.logging_steps = 0
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.save_strategy == "steps"
+    assert trainer.args.logging_strategy == "no"
+
+
+def test_caller_supplied_strategies_are_never_overwritten():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    # A real TrainingArguments/SFTConfig already carries these fields.
+    trainer.args = _compat_args(
+        eval_strategy="epoch", logging_strategy="epoch", save_strategy="epoch",
+    )
+    trainer.eval_dataset = None
+    trainer._ensure_callback_args_compat()
+    trainer.args.eval_steps = 1
+    trainer.eval_dataset = [{}]
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "epoch"
+    assert trainer.args.logging_strategy == "epoch"
+    assert trainer.args.save_strategy == "epoch"
+
+
+def test_user_override_of_synthesized_eval_strategy_survives():
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = _compat_args()
+    trainer.eval_dataset = None
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "no"
+    # An explicit override of our synthesized value wins over the derivation.
+    trainer.args.eval_strategy = "epoch"
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "epoch"
+    trainer.eval_dataset = [{}]
+    trainer.args.eval_steps = 1
+    trainer._ensure_callback_args_compat()
+    assert trainer.args.eval_strategy == "epoch"
+
+
 def test_distributed_diagnostics_per_rank_tokens_use_local_history():
     import inspect
     import re

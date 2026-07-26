@@ -1785,12 +1785,17 @@ class MLXTrainer:
     def _ensure_callback_args_compat(self):
         """Populate TrainingArguments-style fields read by common callbacks."""
         args = self.args
-        if not hasattr(args, "logging_strategy"):
-            args.logging_strategy = "steps" if getattr(args, "logging_steps", 0) else "no"
-        if not hasattr(args, "eval_strategy") or getattr(args, "eval_strategy", None) is None:
-            args.eval_strategy = self._default_callback_eval_strategy()
-        if not hasattr(args, "save_strategy"):
-            args.save_strategy = "steps" if getattr(args, "save_steps", 0) else "no"
+        self._sync_synthesized_arg(
+            "logging_strategy",
+            "steps" if getattr(args, "logging_steps", 0) else "no",
+        )
+        self._sync_synthesized_arg(
+            "eval_strategy", self._default_callback_eval_strategy(),
+        )
+        self._sync_synthesized_arg(
+            "save_strategy",
+            "steps" if getattr(args, "save_steps", 0) else "no",
+        )
         if not hasattr(args, "logging_first_step"):
             args.logging_first_step = False
         if not hasattr(args, "eval_delay"):
@@ -1801,6 +1806,34 @@ class MLXTrainer:
             args.logging_dir = os.path.join(args.output_dir, "runs")
         if getattr(args, "run_name", None) is None:
             args.run_name = args.output_dir
+
+    def _sync_synthesized_arg(self, name, value):
+        """Set a callback-compat arg we synthesized, refreshing it per run.
+
+        These strategies are derived from MLX knobs (eval_dataset, eval_steps,
+        logging_steps, save_steps) that stay writable on a constructed trainer,
+        and _ensure_callback_args_compat runs again on add_callback and at each
+        train(). Without a refresh, a trainer built without eval keeps
+        eval_strategy="no" after eval is enabled for a later run: native eval
+        runs, but HF's EarlyStoppingCallback asserts eval_strategy is not "no"
+        in on_train_begin and aborts the run. Only values this trainer wrote are
+        refreshed, so a real TrainingArguments/SFTConfig field, or an explicit
+        user override of our synthesized value, is never clobbered.
+        """
+        args = self.args
+        synthesized = getattr(self, "_synthesized_callback_args", None)
+        if synthesized is None:
+            synthesized = self._synthesized_callback_args = {}
+        current = getattr(args, name, None)
+        if name in synthesized:
+            # Someone changed our value by hand: theirs wins from now on.
+            if current != synthesized[name]:
+                del synthesized[name]
+                return
+        elif hasattr(args, name) and current is not None:
+            return
+        setattr(args, name, value)
+        synthesized[name] = value
 
     def _default_callback_eval_strategy(self):
         """Return the MLX-derived eval strategy for callback compatibility."""
