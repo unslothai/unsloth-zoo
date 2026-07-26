@@ -4887,12 +4887,22 @@ def _full_module_weight_keys(model, full_specs):
     (e.g. Moondream3 exposes its ``text`` stack through a ``language_model``
     property, so the embedding registers at ``text.model.wte`` while the
     descriptor path reads ``language_model.model.wte``).
+
+    Descends into the selected module: a wrapper head owns no ``.weight`` of
+    its own (mlx-lm's phixtral ``OutputHead`` registers ``ln.weight`` and
+    ``linear.weight``), so recording ``<name>.weight`` there names a tensor
+    that does not exist and the scoped LR silently never applies. For a plain
+    Embedding / Linear this still yields exactly ``<name>.weight``.
     """
+    import mlx.utils as _mu
     targets = [m for _, m in full_specs]
     keys = set()
     for name, module in model.named_modules():
-        if name and any(module is t for t in targets):
-            keys.add(f"{name}.weight")
+        if not name or not any(module is t for t in targets):
+            continue
+        for leaf, _value in _mu.tree_flatten(module.parameters()):
+            if leaf == "weight" or leaf.endswith(".weight"):
+                keys.add(f"{name}.{leaf}")
     return keys
 
 

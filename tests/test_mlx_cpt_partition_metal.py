@@ -213,6 +213,26 @@ def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
     assert "lm_head.linear.weight" in trn
 
 
+def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
+    # A wrapper head owns no `.weight` of its own, so recording `lm_head.weight`
+    # named a tensor that does not exist: it matches neither the trainer's
+    # recorded-key lookup nor its `<...>.embed_tokens/lm_head.weight` leaf
+    # fallback, and embedding_learning_rate silently never reached the head.
+    m = _tiny(); m.lm_head = _WrappedHead()
+    _peft(m, target_modules=["q_proj"], modules_to_save=["lm_head"])
+    keys = m._unsloth_cpt_full_module_weight_keys
+    assert keys == {"lm_head.ln.weight", "lm_head.linear.weight"}
+    trainable = set(dict(mu.tree_flatten(m.trainable_parameters())))
+    assert keys <= trainable
+    # A plain Linear / Embedding full module keeps the exact previous key.
+    plain = _tiny()
+    _peft(plain, target_modules=["q_proj", "embed_tokens"],
+          modules_to_save=["lm_head"])
+    assert plain._unsloth_cpt_full_module_weight_keys == {
+        "model.embed_tokens.weight", "lm_head.weight",
+    }
+
+
 def test_quantized_child_of_a_wrapper_head_is_rejected():
     # Quantization on a wrapper head lives on a descendant, so a leaf-only
     # `scales` check accepted it and MLX then raised
