@@ -1105,3 +1105,119 @@ def test_reused_padded_vlm_batch_is_loss_equivalent():
         assert masked_ce(padded) == masked_ce(unpadded), (
             f"batch {index}: planned padding changed the masked loss"
         )
+
+class _NoPadTokenizer:
+    pad_token_id = None
+    eos_token_id = 2
+    unk_token_id = -1
+    image_token_id = 200
+
+    def encode(self, text):
+        return [int(part) for part in str(text).split()]
+
+    def convert_tokens_to_ids(self, token):
+        if isinstance(token, list):
+            return [self.convert_tokens_to_ids(item) for item in token]
+        return {"<image>": 200, "<|image_pad|>": 201}.get(token, self.unk_token_id)
+
+
+class _UniformNoPadProcessor:
+    """Uniform width, no tokenizer pad id: every planned endpoint would equal
+    the raw width, so this plan looks like it never needs to pad."""
+
+    image_processor = object()
+
+    def __init__(self, width=32, narrowed=None):
+        self.tokenizer = _NoPadTokenizer()
+        self.width = width
+        self.narrowed = narrowed
+        self.training = False
+        self.calls = 0
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        width = self.narrowed if self.training else self.width
+        rows = [([int(item), 200] + [2] * width)[:width] for item in text]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(
+                [[1] * width for _ in rows], dtype=np.int32,
+            ),
+        }
+
+
+def _plan_for(processor, rows=6):
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    return _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(rows)],
+        processor=processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=None,
+    )
+
+
+def test_vlm_missing_pad_token_degrades_before_any_survey_work():
+    """No pad id degrades to eager, and aborts under strict, before the survey
+    runs, even when uniform widths mean the plan would never widen."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
+
+    args = SimpleNamespace(
+        compile_max_variants=None, gradient_accumulation_steps=1,
+    )
+    processor = _UniformNoPadProcessor()
+    plan = _plan_for(processor)
+    shape_plan, report, allowed, _frontier = _plan_single_process_vlm_shapes(
+        plan, None, args=args, total_steps=len(plan),
+        distributed_world_size=1,
+        compile_policy=SimpleNamespace(mode="best_effort"),
+        compile_decision=SimpleNamespace(enabled=True),
+    )
+    assert not allowed
+    assert (report.action, report.reason) == ("eager", "vlm_pad_token_unavailable")
+    assert shape_plan is None
+    # The survey materializes every scheduled batch; a plan that can never be
+    # compiled must not pay for it.
+    assert processor.calls == 0
+
+    strict_processor = _UniformNoPadProcessor()
+    strict_plan = _plan_for(strict_processor)
+    with pytest.raises(RuntimeError, match="without a tokenizer pad id"):
+        _plan_single_process_vlm_shapes(
+            strict_plan, None, args=args, total_steps=len(strict_plan),
+            distributed_world_size=1,
+            compile_policy=SimpleNamespace(mode="strict"),
+            compile_decision=SimpleNamespace(enabled=True),
+        )
+    assert strict_processor.calls == 0
+
+
+def test_vlm_uniform_width_plan_would_abort_mid_run_without_a_pad_id():
+    """Why the guard cannot wait for "does the plan widen?": a later uniformly
+    narrower rebuild passes the drift check, then cannot be widened back."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE, phase_for_microstep
+
+    processor = _UniformNoPadProcessor(width=32, narrowed=30)
+    plan = _plan_for(processor)
+    plan.ensure_descriptors()
+    raw = tuple(plan.batch_width(i) for i in range(len(plan)))
+    planned = plan.planned_event_widths()
+    # The premise the reviewer relies on really does hold at survey time.
+    assert raw == planned == (32,) * len(plan)
+
+    # Training starts and the processor rebuilds every array uniformly narrower.
+    processor.training = True
+    narrowed = plan._build_batch(0)
+    assert narrowed["input_ids"].shape[1] == 30
+    # A uniform narrowing is deliberately NOT family drift.
+    assert plan.check_family_drift(0, narrowed) is None
+
+    from unsloth_zoo.mlx.utils import _finalize_vlm_batch_width
+
+    with pytest.raises(ValueError, match="pad id is required to pad"):
+        _finalize_vlm_batch_width(dict(narrowed), 32, plan.pad_token_id)
