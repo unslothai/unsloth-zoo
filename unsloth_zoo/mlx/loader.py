@@ -4116,16 +4116,31 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None):
     import mlx.utils as _mu
     from .utils import (
         save_lora_adapters, save_trainable_adapters,
-        collect_mlx_lora_adapter_tensors,
+        collect_mlx_lora_adapter_tensors, iter_mlx_lora_modules,
+        _is_base_tensor_inside_lora_module,
     )
     # Continued pretraining trains full modules (embed_tokens / lm_head weight)
     # that are not LoRA tensors; the LoRA-only writer would silently drop them
-    # and reload would revert to the base weight. Detect any trainable non-LoRA
-    # tensor directly (robust to a reloaded model that no longer carries the
-    # get_peft_model marker) and route through the trainable-tensor writer.
+    # and reload would revert to the base weight. Detect a trainable non-LoRA
+    # tensor in a selectively frozen tree and route through the trainable-tensor
+    # writer (no get_peft_model marker needed).
     _trainable = dict(_mu.tree_flatten(self.trainable_parameters()))
+    _all = dict(_mu.tree_flatten(self.parameters()))
     _lora = set(collect_mlx_lora_adapter_tensors(self))
-    _has_full_module = any(k not in _lora for k in _trainable)
+    _lora_names = [name for name, _ in iter_mlx_lora_modules(self)]
+    _lora_prefixes = tuple(f"{name}." for name in _lora_names if name)
+    _root_lora = any(name == "" for name in _lora_names)
+    # A model nothing has frozen (a plain base model, or one whose adapters
+    # were just reloaded) reports EVERY parameter as trainable, which is not
+    # continued-pretraining evidence: keep the LoRA-only writer there instead
+    # of dumping the whole base model into adapters.safetensors. The wrapped-
+    # base filter matches MLXTrainer.save_model so a reload-leaked q_proj.weight
+    # under a LoRA-wrapped q_proj does not count either.
+    _has_full_module = len(_trainable) < len(_all) and any(
+        k not in _lora
+        and not _is_base_tensor_inside_lora_module(k, _lora_prefixes, _root_lora)
+        for k in _trainable
+    )
     if _has_full_module:
         save_trainable_adapters(self, path, adapter_config=adapter_config)
     else:
