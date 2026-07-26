@@ -1169,6 +1169,13 @@ class MLXTrainer:
         and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
+        # Running token-weighted totals behind the returned train_loss.
+        # _train_loss_history holds per-window means over unequal token counts, so
+        # averaging those unweighted makes the result depend on the log cadence,
+        # which any callback setting control.should_log can move.
+        self._train_loss_token_sum = 0.0
+        self._train_loss_token_total = 0
+        self._train_loss_weighting_ok = True
         self._grad_norm_history = []
         self._tokens_per_second_history = []
         self._peak_memory_history = []
@@ -3011,6 +3018,18 @@ class MLXTrainer:
                 # loop overwrites this on every optimizer step of a real resume.
                 self._global_step = _resume_step
                 self._train_loss_history = list(ts.get("train_loss_history", []))
+                # Restore the totals so a resumed run still spans both halves.
+                # Older checkpoints carry the history but no weights: fall back to
+                # the legacy mean rather than report only post-resume windows.
+                if "train_loss_token_total" in ts:
+                    self._train_loss_token_sum = float(
+                        ts.get("train_loss_token_sum", 0.0) or 0.0
+                    )
+                    self._train_loss_token_total = int(
+                        ts.get("train_loss_token_total", 0) or 0
+                    )
+                elif self._train_loss_history:
+                    self._train_loss_weighting_ok = False
                 self._best_metric = ts.get("best_metric", None)
                 self._best_step = ts.get("best_step", None)
                 self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
@@ -3679,16 +3698,10 @@ class MLXTrainer:
         grad_accum_state = None
         accum_progress = 0
         batches_per_epoch = self._callback_batches_per_epoch(batches)
-        # Streaming has no finite dataset length, so batches_per_epoch is None and
-        # the epoch lifecycle events stay disabled. HF still reports a NUMERIC
-        # state.epoch for a length-less dataloader -- steps_in_epoch falls back to
-        # max_steps * gradient_accumulation_steps and state.epoch = epoch +
-        # (step + 1) / steps_in_epoch (transformers trainer.py, 4.x and 5.x) -- and
-        # callbacks rely on that: WandbCallback.on_save builds its checkpoint alias
-        # as f"epoch_{round(state.epoch, 2)}", which raises TypeError on None and
-        # kills a live run at its first scheduled checkpoint. Streaming always has
-        # max_steps > 0 (num_train_epochs is rejected for it), so report the same
-        # fractional progress instead of leaving state.epoch unset.
+        # Streaming has no dataset length, so batches_per_epoch is None and epoch
+        # events stay off -- but state.epoch must still be numeric: HF falls back to
+        # steps_in_epoch = max_steps * grad_accum for a length-less dataloader, and
+        # WandbCallback.on_save does round(state.epoch, 2), a TypeError on None.
         stream_epoch_microbatches = None
         if not batches_per_epoch and batch_iter is not None:
             _stream_max_steps = int(getattr(args, "max_steps", 0) or 0)
@@ -3759,6 +3772,10 @@ class MLXTrainer:
             peak_mem = mx.get_peak_memory() / 1e9
 
             self._train_loss_history.append(train_loss)
+            # metric_losses is already sum(loss * tokens) over the window, so these
+            # totals give the exact global mean whatever the boundaries were.
+            self._train_loss_token_sum += float(metric_losses.item())
+            self._train_loss_token_total += tok_count
             grad_norm_val = (
                 float(grad_norm.item())
                 if grad_norm is not None else None
@@ -3969,6 +3986,12 @@ class MLXTrainer:
                                     "global_step": current_step,
                                     "train_loss_history": list(
                                         self._train_loss_history
+                                    ),
+                                    "train_loss_token_sum": float(
+                                        self._train_loss_token_sum
+                                    ),
+                                    "train_loss_token_total": int(
+                                        self._train_loss_token_total
                                     ),
                                     "best_metric": self._best_metric,
                                     "best_step": self._best_step,
@@ -4631,10 +4654,16 @@ class MLXTrainer:
         if steps > 0:
             _run_training_log(self._global_step, None)
 
-        avg_loss = (
-            sum(self._train_loss_history) / len(self._train_loss_history)
-            if self._train_loss_history else 0.0
-        )
+        # Token-weighted, so the returned loss is cadence-free like HF's
+        # (_total_loss_scalar / effective_global_step). Falls back to the plain
+        # window mean when the weights are unavailable (legacy resume, 0 tokens).
+        if self._train_loss_weighting_ok and self._train_loss_token_total > 0:
+            avg_loss = self._train_loss_token_sum / self._train_loss_token_total
+        else:
+            avg_loss = (
+                sum(self._train_loss_history) / len(self._train_loss_history)
+                if self._train_loss_history else 0.0
+            )
         # Total wall-clock training time, consumed by the summary line and the
         # distributed diagnostics / train_runtime metrics below.
         total_time = time.perf_counter() - start_time

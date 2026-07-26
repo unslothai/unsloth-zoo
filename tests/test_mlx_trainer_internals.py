@@ -4513,6 +4513,76 @@ def _patch_value_and_grad_with_aux(monkeypatch):
     monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
 
 
+def test_returned_train_loss_is_independent_of_callback_log_cadence(monkeypatch):
+    # A callback that sets control.should_log splits the accumulated loss into
+    # different windows. _train_loss_history entries are per-window token-weighted
+    # means, so averaging them UNWEIGHTED made MLXTrainOutput["train_loss"] move
+    # when a logging callback was added to an otherwise identical run - the caller
+    # got a different experiment metric for the same training. HF has no such
+    # dependency (train_loss = _total_loss_scalar / effective_global_step,
+    # transformers trainer.py). Aggregate loss*tokens / tokens instead.
+    import tempfile
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class ForceLogAtStepOne:
+        def on_step_begin(self, args, state, control, **kwargs):
+            if state.global_step == 0:
+                control.should_log = True
+            return control
+
+    # One model instance for both runs: the frozen optimizer never updates it, so
+    # every step sees the same weights and any difference in the reported loss can
+    # only come from the aggregation.
+    model = _tiny_lm_for_loop_tests()
+
+    def run(callbacks):
+        args = MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            logging_steps=4,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        )
+        trainer = MLXTrainer(
+            model,
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [],
+            args=args,
+            callbacks=callbacks,
+        )
+        # Uneven token counts per step: an unweighted mean over windows can only
+        # match the weighted one when every window carries the same tokens.
+        trainer._batches = _make_shape_guard_text_plan((30, 10, 10, 10))
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer, trainer.train()
+
+    plain, plain_result = run(None)
+    forced, forced_result = run([ForceLogAtStepOne()])
+
+    # The callback really did change the cadence.
+    assert len(plain._train_loss_history) == 1
+    assert len(forced._train_loss_history) == 2
+    # ...but not the number handed back to the caller.
+    assert forced_result["train_loss"] == pytest.approx(
+        plain_result["train_loss"], rel=1e-5,
+    )
+    # Guard the guard: the old unweighted mean would have reported something else.
+    unweighted = (
+        sum(forced._train_loss_history) / len(forced._train_loss_history)
+    )
+    assert unweighted != pytest.approx(plain_result["train_loss"], rel=1e-5)
+
+
 def test_streaming_runs_report_a_numeric_epoch_to_callbacks(monkeypatch):
     # Streaming has no finite dataset length, so batches_per_epoch is None. Leaving
     # state.epoch at None diverges from HF, which falls back to steps_in_epoch =
