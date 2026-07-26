@@ -2966,7 +2966,23 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         peft_config = get_peft_config(save_directory)
         state_dict = model.state_dict()
         items = state_dict.items()
-        state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
+        # Ship CLONES, never the live training tensors. vLLM's
+        # LoRAModel.from_lora_tensors stores `tensor.to(device, dtype)`, which
+        # is a NO-OP (same storage) when device+dtype already match, so the
+        # engine would hold ALIASES of the training weights:
+        # (1) LoRALayerWeights.optimize() then runs `lora_b *= scaling`
+        #     in-place -> with lora_alpha != lora_rank the TRAINING weights get
+        #     multiplied by s on every hot-load (s^8 per GRPO step observed;
+        #     rollouts rot to gibberish within ~5 steps);
+        # (2) the engine's adapter registry keeps live references into training
+        #     memory, so later readers (save_pretrained_merged with the engine
+        #     alive) race the engine's allocator churn.
+        # A LoRA-sized clone (a few MB) per hot-load is negligible.
+        state_dict = {
+            k.replace(".default", ""): v.detach().clone()
+            for k, v in items
+            if ".lora_A." in k or ".lora_B." in k
+        }
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)

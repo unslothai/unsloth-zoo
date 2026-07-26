@@ -238,6 +238,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         # else: a shape mismatch is structural (e.g. vocab resize handled below), not a dequant
         # failure, so keep the 16bit W here and let the resize path reconcile it.
     W = W.to(device, dtype = torch.float32, non_blocking = True)
+    W_base_absmax = torch.amax(torch.abs(W)).item()
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
@@ -264,6 +265,18 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         W = (magnitude / weight_norm).unsqueeze(1) * W
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
+    # Recycled-memory corruption (e.g. merging while a colocated vLLM engine is
+    # still alive) folds FINITE garbage (~1e12+) into the export, which the
+    # isfinite gate above cannot catch. A healthy LoRA delta cannot inflate the
+    # merged magnitude by orders of magnitude over the base weight.
+    W_absmax = torch.amax(torch.abs(W)).item()
+    if W_absmax > max(64.0 * W_base_absmax, 1e4):
+        raise ValueError(
+            f"Unsloth: Merge failed for {name}: merged |W|max = {W_absmax:.3e} vs "
+            f"base |W|max = {W_base_absmax:.3e}. The LoRA weights read at merge "
+            "time look like recycled/corrupted GPU memory. Re-merge offline from "
+            "the last checkpoint (do not merge with a live vLLM engine)."
+        )
     return W
 pass
 
@@ -438,6 +451,23 @@ def _get_lora_scaling(module):
 pass
 
 
+def _snapshot_lora_weight(weight):
+    # Snapshot LoRA factors to CPU at capture time. create_lora_statistics used
+    # to store LIVE GPU references, and _merge_lora reads them only later while
+    # the merge allocates/frees GBs of VRAM (and, under fast_inference, while
+    # the vLLM engine still owns part of the pool). If a tensor's storage gets
+    # recycled in between, the merge folds finite garbage (~1e12+) into the
+    # export while the checkpoint on disk stays clean. A CPU copy of a LoRA
+    # factor is a few MB and pins the values read at entry.
+    # inference_mode(False): create_lora_statistics runs under
+    # @torch.inference_mode; without this the snapshot would be an inference
+    # tensor (the original code stored plain Parameters), and downstream code
+    # outside inference mode may reject inference tensors.
+    with torch.inference_mode(False):
+        return weight.detach().to("cpu", copy = True)
+pass
+
+
 @torch.inference_mode
 def create_lora_statistics(model, merge_into_original = False, return_state_dict = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -457,19 +487,19 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
         if name == "": continue
 
         elif name.endswith(".lora_A.default"):
-            lora_weights[name[:-len(".lora_A.default")]].lora_A = module.weight
+            lora_weights[name[:-len(".lora_A.default")]].lora_A = _snapshot_lora_weight(module.weight)
             lora_A_count += 1
             expand_module_keys(name, module, remove_keys)
 
         elif name.endswith(".lora_B.default"):
-            lora_weights[name[:-len(".lora_B.default")]].lora_B = module.weight
+            lora_weights[name[:-len(".lora_B.default")]].lora_B = _snapshot_lora_weight(module.weight)
             lora_B_count += 1
             expand_module_keys(name, module, remove_keys)
 
         elif name.endswith(".lora_magnitude_vector.default"):
             # DoRA magnitude vector m; folded onto the merged weight in _merge_lora. Register its
             # key so the key-consistency check does not flag it (the merged model omits it).
-            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = module.weight
+            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = _snapshot_lora_weight(module.weight)
             expand_module_keys(name, module, remove_keys)
 
         elif isinstance(module, Linear_LoRA_Layers):
