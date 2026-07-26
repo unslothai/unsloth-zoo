@@ -432,19 +432,6 @@ def _normalize_tokenizer_config_extra_special_tokens(
     return patched_config, True
 
 
-def _materialize_mlx_vlm_config_data(local_path, config_data):
-    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name == "config.json":
-            continue
-        _link_or_copy_path(src, dst)
-    with open(os.path.join(override_dir, "config.json"), "w") as f:
-        json.dump(config_data, f, indent=2)
-    return override_dir
-
-
 def _mlx_vlm_config_override_data(config_data):
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     if (
@@ -479,17 +466,61 @@ def _keep_mlx_vlm_config_view_alive(model, override_dir):
         pass
 
 
+class _MLXVLMConfigViewOwner:
+    """Own a temporary load view until its lifetime moves to the model."""
+
+    def __init__(self, local_path, original_local_path):
+        self._path = str(local_path) if local_path else None
+        self._finalizer = None
+        if (
+            self._path
+            and original_local_path
+            and self._path != str(original_local_path)
+        ):
+            self._finalizer = weakref.finalize(
+                self,
+                shutil.rmtree,
+                self._path,
+                ignore_errors=True,
+            )
+
+    def call(self, operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except Exception:
+            self.cleanup()
+            raise
+
+    def cleanup(self):
+        if self._finalizer is not None and self._finalizer.alive:
+            self._finalizer()
+
+    def transfer_to(self, model):
+        if self._finalizer is None:
+            return
+        try:
+            _keep_mlx_vlm_config_view_alive(model, self._path)
+        except Exception:
+            self.cleanup()
+            raise
+        self._finalizer.detach()
+
+
 def _materialize_mlx_vlm_config_override(
     local_path,
     config_data,
     *,
     normalize_tokenizer_config=False,
     supports_list_extra_special_tokens=None,
+    allow_tokenizer_remote_code=True,
 ):
     """Return a load path whose sidecars are compatible with mlx-vlm loaders."""
     if not local_path:
         return local_path, config_data
     patched_files = {}
+    source_config = _read_json_file(os.path.join(local_path, "config.json"))
+    if source_config != config_data:
+        patched_files["config.json"] = config_data
 
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     patched_config = config_data
@@ -504,35 +535,79 @@ def _materialize_mlx_vlm_config_override(
         patched_config.pop("auto_map", None)
         patched_files["config.json"] = patched_config
 
-    if normalize_tokenizer_config:
+    if normalize_tokenizer_config or not allow_tokenizer_remote_code:
         tokenizer_config = _read_json_file(
             os.path.join(local_path, "tokenizer_config.json")
         )
-        patched_tokenizer_config, patched_tokenizer = (
-            _normalize_tokenizer_config_extra_special_tokens(
-                tokenizer_config,
-                supports_list_extra_special_tokens=supports_list_extra_special_tokens,
+        patched_tokenizer_config = tokenizer_config
+        patched_tokenizer = False
+        if normalize_tokenizer_config:
+            patched_tokenizer_config, patched_tokenizer = (
+                _normalize_tokenizer_config_extra_special_tokens(
+                    patched_tokenizer_config,
+                    supports_list_extra_special_tokens=supports_list_extra_special_tokens,
+                )
             )
-        )
+        if not allow_tokenizer_remote_code:
+            auto_map = patched_tokenizer_config.get("auto_map")
+            if isinstance(auto_map, dict) and auto_map:
+                patched_tokenizer_config = dict(patched_tokenizer_config)
+                patched_tokenizer_config.pop("auto_map", None)
+                patched_tokenizer = True
         if patched_tokenizer:
             patched_files["tokenizer_config.json"] = patched_tokenizer_config
+
+        model_auto_map = patched_config.get("auto_map")
+        if not allow_tokenizer_remote_code and isinstance(model_auto_map, dict):
+            patched_model_config = dict(patched_config)
+            patched_model_config.pop("auto_map", None)
+            patched_config = patched_model_config
+            patched_files["config.json"] = patched_model_config
+
+    if config_data.get("model_type") == "llava":
+        processor_config = _read_json_file(
+            os.path.join(local_path, "processor_config.json")
+        )
+        if processor_config.get("processor_class") == "LlavaProcessor":
+            patched_processor_config = dict(processor_config)
+            vision_config = config_data.get("vision_config")
+            if not isinstance(vision_config, dict):
+                vision_config = {}
+            if patched_processor_config.get("patch_size") is None:
+                patch_size = vision_config.get("patch_size")
+                if (
+                    isinstance(patch_size, int)
+                    and not isinstance(patch_size, bool)
+                    and patch_size > 0
+                ):
+                    patched_processor_config["patch_size"] = patch_size
+            if patched_processor_config.get("vision_feature_select_strategy") is None:
+                strategy = config_data.get("vision_feature_select_strategy")
+                if strategy in {"default", "full"}:
+                    patched_processor_config["vision_feature_select_strategy"] = strategy
+            if patched_processor_config != processor_config:
+                patched_files["processor_config.json"] = patched_processor_config
 
     if not patched_files:
         return local_path, config_data
 
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name in patched_files:
-            continue
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            pass
-    for name, data in patched_files.items():
-        with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    try:
+        for name in os.listdir(local_path):
+            src = os.path.join(local_path, name)
+            dst = os.path.join(override_dir, name)
+            if name in patched_files:
+                continue
+            try:
+                os.symlink(src, dst)
+            except FileExistsError:
+                pass
+        for name, data in patched_files.items():
+            with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        shutil.rmtree(override_dir, ignore_errors=True)
+        raise
     if corrected_model_type is not None and "config.json" in patched_files:
         print(
             "Unsloth: Routing DeepSeek OCR checkpoint through "
@@ -928,6 +1003,7 @@ def _load_mlx_vlm_distributed(
     hf_token=None,
     revision=None,
     config_override_data=None,
+    allow_remote_code=False,
 ):
     pipeline_group, tensor_group = _mlx_active_distributed_groups(
         pipeline_group,
@@ -945,31 +1021,36 @@ def _load_mlx_vlm_distributed(
             "Unsloth: distributed MLX VLM inference requires mlx-vlm with "
             "sharded_load support. Install or upgrade mlx-vlm on Apple Silicon."
         ) from error
+    sharded_load = _bind_mlx_vlm_processor_loader(
+        sharded_load,
+        allow_remote_code=allow_remote_code,
+    )
 
     try:
         with _temporary_hf_token_env(hf_token):
-            load_target = get_model_path(model_name, revision=revision)
-            if config_override_data is not None:
-                load_target = _materialize_mlx_vlm_config_data(
-                    str(load_target),
-                    config_override_data,
-                )
-                try:
-                    model, processor = sharded_load(
-                        load_target,
-                        tensor_group=tensor_group,
-                        pipeline_group=pipeline_group,
-                    )
-                except Exception:
-                    shutil.rmtree(load_target, ignore_errors=True)
-                    raise
-                _keep_mlx_vlm_config_view_alive(model, load_target)
-                return model, processor
-            return sharded_load(
-                load_target,
-                tensor_group=tensor_group,
-                pipeline_group=pipeline_group,
+            resolved_path = str(get_model_path(model_name, revision=revision))
+            load_config = config_override_data or _read_json_file(
+                os.path.join(resolved_path, "config.json")
             )
+            load_target, _ = _materialize_mlx_vlm_config_override(
+                resolved_path,
+                load_config,
+                normalize_tokenizer_config=True,
+            )
+            temporary_view = str(load_target) != resolved_path
+            try:
+                model, processor = sharded_load(
+                    load_target,
+                    tensor_group=tensor_group,
+                    pipeline_group=pipeline_group,
+                )
+            except Exception:
+                if temporary_view:
+                    shutil.rmtree(load_target, ignore_errors=True)
+                raise
+            if temporary_view:
+                _keep_mlx_vlm_config_view_alive(model, load_target)
+            return model, processor
     except ValueError as error:
         message = str(error)
         lower_message = message.lower()
@@ -1024,6 +1105,7 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         name
         for module_type in module_types
         for name in (
+            f"mlx_vlm.models.{module_type}.processor",
             f"mlx_vlm.models.{module_type}.processing",
             f"mlx_vlm.models.{module_type}.processing_{module_type}",
         )
@@ -1034,14 +1116,206 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         except Exception:
             continue
         processor_class = getattr(module, processor_class_name, None)
-        if processor_class is not None:
+        if isinstance(processor_class, type):
             return processor_class
 
     try:
         import transformers
-        return getattr(transformers, processor_class_name, None)
+        processor_class = getattr(transformers, processor_class_name, None)
+        return processor_class if isinstance(processor_class, type) else None
     except Exception:
         return None
+
+
+def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
+    """Construct a sidecar-declared processor with its installed components."""
+
+    if not model_path or not os.path.isdir(str(model_path)):
+        return None
+    processor_config = _read_json_file(
+        os.path.join(str(model_path), "processor_config.json")
+    )
+    preprocessor_config = _read_json_file(
+        os.path.join(str(model_path), "preprocessor_config.json")
+    )
+    processor_class_name = (
+        processor_config.get("processor_class")
+        or preprocessor_config.get("processor_class")
+    )
+    processor_class = _resolve_mlx_vlm_processor_class(
+        model_type, processor_class_name,
+    )
+    if processor_class is None or not str(
+        getattr(processor_class, "__module__", "")
+    ).startswith("mlx_vlm.models."):
+        return None
+
+    component_module = importlib.import_module(processor_class.__module__)
+    inherited_resolver = getattr(
+        processor_class, "get_possibly_dynamic_module", None,
+    )
+    scoped_processor_class = processor_class
+    if inherited_resolver is not None:
+        def resolve_component(class_name):
+            component_class = getattr(component_module, class_name, None)
+            if isinstance(component_class, type):
+                return component_class
+            return inherited_resolver(class_name)
+
+        scoped_processor_class = type(
+            processor_class.__name__,
+            (processor_class,),
+            {
+                "__module__": processor_class.__module__,
+                "get_possibly_dynamic_module": staticmethod(resolve_component),
+            },
+        )
+    processor_load_path = model_path
+    if not kwargs.get("trust_remote_code", False):
+        config_data = _read_json_file(
+            os.path.join(str(model_path), "config.json")
+        )
+        processor_load_path, _ = _materialize_mlx_vlm_config_override(
+            str(model_path),
+            config_data,
+            allow_tokenizer_remote_code=False,
+        )
+    try:
+        return scoped_processor_class.from_pretrained(
+            processor_load_path,
+            **kwargs,
+        )
+    finally:
+        if str(processor_load_path) != str(model_path):
+            shutil.rmtree(processor_load_path, ignore_errors=True)
+
+
+def _is_mlx_vlm_processor_resolution_error(error):
+    """Return whether AutoProcessor failed before native MLX construction."""
+
+    message = str(error).lower()
+    if isinstance(error, ValueError):
+        return any(
+            marker in message
+            for marker in (
+                "contains custom code which must be executed",
+                "unrecognized processing class",
+                "could not find module",
+            )
+        )
+    return isinstance(error, ImportError) and "tensorflow" in message
+
+
+def _inherit_mlx_vlm_processor_runtime(processor, repaired):
+    """Carry mlx-vlm's runtime generation state onto a rebuilt processor."""
+
+    chat_template = getattr(processor, "chat_template", None)
+    if chat_template is not None and getattr(repaired, "chat_template", None) is None:
+        repaired.chat_template = chat_template
+    detokenizer = getattr(processor, "detokenizer", None)
+    if detokenizer is not None:
+        repaired.detokenizer = detokenizer
+
+    source_tokenizer = getattr(processor, "tokenizer", processor)
+    target_tokenizer = getattr(repaired, "tokenizer", repaired)
+    stopping_criteria = getattr(source_tokenizer, "stopping_criteria", None)
+    if stopping_criteria is not None:
+        target_tokenizer.stopping_criteria = stopping_criteria
+    return repaired
+
+
+def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
+    """Bind processor recovery to one mlx-vlm load without global mutation."""
+
+    if not isinstance(load_callable, types.FunctionType):
+        return load_callable
+    processor_loader = load_callable.__globals__.get("load_processor")
+    if not isinstance(processor_loader, types.FunctionType):
+        return load_callable
+    direct_processor_load = load_callable is processor_loader
+    original_auto_processor = processor_loader.__globals__.get("AutoProcessor")
+    if original_auto_processor is None:
+        return load_callable
+
+    class ScopedAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *args, **kwargs):
+            processor_load_path = model_path
+            call_kwargs = dict(kwargs)
+            call_kwargs["trust_remote_code"] = bool(allow_remote_code)
+            if not allow_remote_code and os.path.isdir(str(model_path)):
+                config_data = _read_json_file(
+                    os.path.join(str(model_path), "config.json")
+                )
+                model_type = config_data.get("model_type")
+                processor_config = _read_json_file(
+                    os.path.join(str(model_path), "processor_config.json")
+                )
+                processor_class = _resolve_mlx_vlm_processor_class(
+                    model_type,
+                    processor_config.get("processor_class"),
+                )
+                processor_owner = str(
+                    getattr(processor_class, "__module__", "")
+                )
+                if (
+                    model_type in {"molmo", "molmo2"}
+                    and processor_owner.startswith("mlx_vlm.models.")
+                ):
+                    processor_load_path, _ = _materialize_mlx_vlm_config_override(
+                        str(model_path),
+                        config_data,
+                        allow_tokenizer_remote_code=False,
+                    )
+            try:
+                try:
+                    return original_auto_processor.from_pretrained(
+                        processor_load_path,
+                        *args,
+                        **call_kwargs,
+                    )
+                except Exception as error:
+                    if not _is_mlx_vlm_processor_resolution_error(error):
+                        raise
+                    config_data = _read_json_file(
+                        os.path.join(str(processor_load_path), "config.json")
+                    )
+                    processor = _load_declared_mlx_vlm_processor(
+                        processor_load_path,
+                        config_data.get("model_type"),
+                        **call_kwargs,
+                    )
+                    if processor is None:
+                        raise
+                    return processor
+            finally:
+                if str(processor_load_path) != str(model_path):
+                    shutil.rmtree(processor_load_path, ignore_errors=True)
+
+    processor_globals = dict(processor_loader.__globals__)
+    processor_globals["AutoProcessor"] = ScopedAutoProcessor
+    scoped_processor_loader = types.FunctionType(
+        processor_loader.__code__,
+        processor_globals,
+        processor_loader.__name__,
+        processor_loader.__defaults__,
+        processor_loader.__closure__,
+    )
+    scoped_processor_loader.__kwdefaults__ = processor_loader.__kwdefaults__
+    if direct_processor_load:
+        return scoped_processor_loader
+
+    load_globals = dict(load_callable.__globals__)
+    load_globals["load_processor"] = scoped_processor_loader
+    scoped_load = types.FunctionType(
+        load_callable.__code__,
+        load_globals,
+        load_callable.__name__,
+        load_callable.__defaults__,
+        load_callable.__closure__,
+    )
+    scoped_load.__kwdefaults__ = load_callable.__kwdefaults__
+    return scoped_load
 
 
 def _build_vlm_image_processor_from_config(
@@ -1122,6 +1396,23 @@ def _repair_degraded_vlm_processor(
     )
     if processor_class is None:
         return processor
+
+    native_kwargs = {
+        "use_fast": True,
+        "trust_remote_code": trust_remote_code,
+    }
+    if token:
+        native_kwargs["token"] = token
+    try:
+        repaired = _load_declared_mlx_vlm_processor(
+            model_path,
+            model_type,
+            **native_kwargs,
+        )
+    except Exception:
+        repaired = None
+    if repaired is not None and getattr(repaired, "image_processor", None) is not None:
+        return _inherit_mlx_vlm_processor_runtime(processor, repaired)
 
     image_processor = _build_vlm_image_processor_from_config(
         model_path, processor_config, preprocessor_config, model_type,
@@ -5166,19 +5457,10 @@ class FastMLXModel:
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
             original_local_path = local_path
-            original_config_data = dict(config_data)
-            if distributed_requested:
-                patched_config_data = _mlx_vlm_config_override_data(config_data)
-                if patched_config_data is not None:
-                    config_data = patched_config_data
-                    vlm_config_override_data = dict(config_data)
-            else:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                )
-                if local_path != original_local_path or config_data != original_config_data:
-                    vlm_config_override_data = dict(config_data)
+            patched_config_data = _mlx_vlm_config_override_data(config_data)
+            if patched_config_data is not None:
+                config_data = patched_config_data
+                vlm_config_override_data = dict(config_data)
 
         # bitsandbytes-quantized repos store NF4 weights MLX cannot read. When
         # the real bitsandbytes wheel is importable, let bnb dequantize to fp16
@@ -5729,19 +6011,16 @@ class FastMLXModel:
                     "Install via: pip install mlx-vlm\n"
                     "Or pass text_only=True to load as text-only via mlx-lm."
                 )
+            vlm_load = _bind_mlx_vlm_processor_loader(
+                vlm_load,
+                allow_remote_code=trust_remote_code,
+            )
 
             if text_only is False and not _is_vlm(config_data):
                 warnings.warn(
                     f"text_only=False but '{model_name}' does not appear to be a VLM. "
                     f"Attempting mlx_vlm.load() anyway — this may fail.",
                     stacklevel=2,
-                )
-
-            if local_path:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                    normalize_tokenizer_config=True,
                 )
 
             if patch_mode == "patched":
@@ -5770,13 +6049,37 @@ class FastMLXModel:
             if want_runtime_quant:
                 import mlx.core as mx
                 from mlx_vlm.utils import load_config as _vlm_load_config
+                _patch_deepseek_ocr_transformers_import_compat(model_type)
+            from .utils import (
+                normalize_mlx_chat_template,
+                normalize_vlm_processor_chat_template,
+            )
+
+            vlm_config_view_owner = None
+            if local_path and not distributed_requested:
+                local_path, config_data = _materialize_mlx_vlm_config_override(
+                    local_path,
+                    config_data,
+                    normalize_tokenizer_config=True,
+                )
+                vlm_config_view_owner = _MLXVLMConfigViewOwner(
+                    local_path,
+                    original_local_path,
+                )
+
+            def _run_with_vlm_config_view(operation, *args, **kwargs):
+                if vlm_config_view_owner is None:
+                    return operation(*args, **kwargs)
+                return vlm_config_view_owner.call(operation, *args, **kwargs)
+
+            if want_runtime_quant:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
-                _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
                     try:
-                        model, processor = vlm_load(
+                        model, processor = _run_with_vlm_config_view(
+                            vlm_load,
                             vlm_load_target,
                             lazy=True,
                             revision=revision,
@@ -5787,13 +6090,19 @@ class FastMLXModel:
                         # surface the QK-norm version gap here too.
                         _raise_if_qk_norm_version_gap(model_type, str(error), error)
                         raise
-                    vlm_cfg = _vlm_load_config(vlm_load_target)
-                model, vlm_cfg = _apply_mlx_quantization(
+                    vlm_cfg = _run_with_vlm_config_view(
+                        _vlm_load_config,
+                        vlm_load_target,
+                    )
+                model, vlm_cfg = _run_with_vlm_config_view(
+                    _apply_mlx_quantization,
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
                 )
                 model._config = vlm_cfg
-                mx.eval(model.parameters())
+                _run_with_vlm_config_view(
+                    lambda: mx.eval(model.parameters()),
+                )
             elif distributed_requested:
                 if text_only is False and not _is_vlm(config_data):
                     raise ValueError(
@@ -5807,7 +6116,8 @@ class FastMLXModel:
                 )
                 mode = "tensor" if active_tensor_group is not None else "pipeline"
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (distributed {mode} VLM)...")
-                model, processor = _load_mlx_vlm_distributed(
+                model, processor = _run_with_vlm_config_view(
+                    _load_mlx_vlm_distributed,
                     model_name,
                     model_type,
                     pipeline_group=active_pipeline_group,
@@ -5815,6 +6125,7 @@ class FastMLXModel:
                     hf_token=token,
                     revision=revision,
                     config_override_data=vlm_config_override_data,
+                    allow_remote_code=trust_remote_code,
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
@@ -5823,7 +6134,8 @@ class FastMLXModel:
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
-                model, processor = _load_mlx_vlm_with_extra_weight_filter(
+                model, processor = _run_with_vlm_config_view(
+                    _load_mlx_vlm_with_extra_weight_filter,
                     local_path or model_name,
                     model_type,
                     vlm_load,
@@ -5831,7 +6143,8 @@ class FastMLXModel:
                     hf_token=token,
                 )
 
-            processor = _repair_degraded_vlm_processor(
+            processor = _run_with_vlm_config_view(
+                _repair_degraded_vlm_processor,
                 processor,
                 local_path or model_name,
                 model_type,
@@ -5840,18 +6153,20 @@ class FastMLXModel:
             )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
+                _run_with_vlm_config_view(
+                    _convert_mlx_dtype,
+                    model,
+                    target_dtype,
+                    model_type=model_type,
+                )
             elif want_runtime_quant:
-                import mlx.core as mx
-                mx.eval(model.parameters())
-            _fix_gemma3_text_rmsnorm_fp32(model)
+                _run_with_vlm_config_view(
+                    lambda: mx.eval(model.parameters()),
+                )
+            _run_with_vlm_config_view(_fix_gemma3_text_rmsnorm_fp32, model)
 
-            from .utils import (
-                normalize_mlx_chat_template,
+            processor = _run_with_vlm_config_view(
                 normalize_vlm_processor_chat_template,
-            )
-
-            processor = normalize_vlm_processor_chat_template(
                 processor,
                 chat_template=chat_template,
                 model_name=model_name,
@@ -5866,14 +6181,17 @@ class FastMLXModel:
                 model._unsloth_text_only_vlm = True
             model._is_vlm_model = True
             model._processor = processor
-            _fix_gemma4_kv_sharing(model)
-            _fix_gemma3_vision_post_layernorm_eps(model)
-            _fix_gemma3_vision_attention_fp32_sdpa(model)
-            _fix_gemma3_vision_encoder_fp32_layernorm(model)
-            _fix_gemma3_vision_post_layernorm_fp32(model)
-            _fix_gemma3_vision_mlp_fp32_activation(model)
-            _fix_gemma3_language_mlp_fp32_activation(model)
-            _fix_gemma3_multimodal_image_feature_scale(model)
+            for fixup in (
+                _fix_gemma4_kv_sharing,
+                _fix_gemma3_vision_post_layernorm_eps,
+                _fix_gemma3_vision_attention_fp32_sdpa,
+                _fix_gemma3_vision_encoder_fp32_layernorm,
+                _fix_gemma3_vision_post_layernorm_fp32,
+                _fix_gemma3_vision_mlp_fp32_activation,
+                _fix_gemma3_language_mlp_fp32_activation,
+                _fix_gemma3_multimodal_image_feature_scale,
+            ):
+                _run_with_vlm_config_view(fixup, model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
@@ -5884,26 +6202,43 @@ class FastMLXModel:
             # model_type/auto_map the override drops.
             model._config_src_path = local_path or original_local_path
             model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(
-                original_local_path or local_path
+            model._unsloth_base_commit_hash = _run_with_vlm_config_view(
+                _infer_snapshot_commit,
+                original_local_path or local_path,
             )
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
             if quant_state == "compatible":
-                model._unsloth_quantization_config = _get_existing_mlx_quantization(config_data)
+                model._unsloth_quantization_config = _run_with_vlm_config_view(
+                    _get_existing_mlx_quantization,
+                    config_data,
+                )
                 model._unsloth_quantization_policy = quantization_spec.to_metadata()
                 model._unsloth_quantized_source = "mlx_config"
-            model._unsloth_compile_trait_report = get_compile_trait_report(model)
-            model._unsloth_compile_qualification = get_compile_qualification(model)
-            model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
-            model._unsloth_compile_trace = trace_compile_application(model)
-            model._unsloth_compile_explain = explain_compile_support(model)
-            _patch_mixed_precision_set_dtype(model)
+            model._unsloth_compile_trait_report = _run_with_vlm_config_view(
+                get_compile_trait_report, model,
+            )
+            model._unsloth_compile_qualification = _run_with_vlm_config_view(
+                get_compile_qualification, model,
+            )
+            model._unsloth_compile_backend_qualifications = (
+                _run_with_vlm_config_view(
+                    get_backend_compile_qualifications, model,
+                )
+            )
+            model._unsloth_compile_trace = _run_with_vlm_config_view(
+                trace_compile_application, model,
+            )
+            model._unsloth_compile_explain = _run_with_vlm_config_view(
+                explain_compile_support, model,
+            )
+            _run_with_vlm_config_view(_patch_mixed_precision_set_dtype, model)
 
             public_target = processor
             if force_vlm_text_path:
-                public_target = normalize_mlx_chat_template(
+                public_target = _run_with_vlm_config_view(
+                    normalize_mlx_chat_template,
                     getattr(processor, "tokenizer", processor),
                     chat_template=chat_template,
                     model_name=model_name,
@@ -5913,7 +6248,9 @@ class FastMLXModel:
                 )
                 model._tokenizer = public_target
 
-            _patch_mlx_saving(model, public_target)
+            _run_with_vlm_config_view(_patch_mlx_saving, model, public_target)
+            if vlm_config_view_owner is not None:
+                vlm_config_view_owner.transfer_to(model)
             return model, public_target
         else:
             # Text path via mlx-lm (original behavior)

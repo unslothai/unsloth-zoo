@@ -30,6 +30,18 @@ from pathlib import Path
 import pytest
 
 
+AutoProcessor = None
+load_processor = None
+
+
+def _test_bound_load_processor(model_path, **kwargs):
+    return AutoProcessor.from_pretrained(model_path, **kwargs)
+
+
+def _test_bound_vlm_load(model_path):
+    return load_processor(model_path)
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_torch_shim():
     pytest.importorskip("torch")
@@ -839,6 +851,133 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     assert repaired.tokenizer is tokenizer
     assert repaired.chat_template == "{{ messages }}"
     assert tokenizer.chat_template == "{{ messages }}"
+
+
+def test_declared_mlx_vlm_processor_owns_custom_components_and_recovery(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.loader as loader
+
+    class NativeImageProcessor: pass
+    factory_calls = []
+
+    class NativeProcessor:
+        __module__ = "mlx_vlm.models.molmo.processor"
+        get_possibly_dynamic_module = staticmethod(lambda name: (_ for _ in ()).throw(ValueError(f"Could not find module {name} in `transformers`")))
+        @classmethod
+        def from_pretrained(cls, model_path, **kwargs):
+            factory_calls.append((
+                loader._read_json_file(Path(model_path) / "config.json").get("auto_map"),
+                loader._read_json_file(Path(model_path) / "tokenizer_config.json").get("auto_map"),
+                kwargs.get("trust_remote_code", False),
+            ))
+            return cls(cls.get_possibly_dynamic_module("NativeImageProcessor")())
+        def __init__(self, image_processor): self.image_processor, self.chat_template, self.tokenizer = image_processor, None, types.SimpleNamespace()
+
+    native_module = types.ModuleType("mlx_vlm.models.molmo.processor")
+    native_module.NativeProcessor, native_module.NativeImageProcessor = NativeProcessor, NativeImageProcessor
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.molmo.processor", native_module)
+    (tmp_path / "config.json").write_text('{"model_type":"molmo","auto_map":{"AutoConfig":"remote.Config"}}', encoding="utf-8")
+    (tmp_path / "processor_config.json").write_text('{"processor_class":"NativeProcessor"}', encoding="utf-8")
+    (tmp_path / "tokenizer_config.json").write_text('{"auto_map":{"AutoTokenizer":"remote.Tokenizer"}}', encoding="utf-8")
+
+    processor = loader._load_declared_mlx_vlm_processor(tmp_path, "molmo")
+    assert isinstance(processor, NativeProcessor) and isinstance(processor.image_processor, NativeImageProcessor)
+    assert factory_calls[-1] == (None, None, False)
+    loader._load_declared_mlx_vlm_processor(tmp_path, "molmo", trust_remote_code=True)
+    assert factory_calls[-1] == ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, True)
+    detokenizer, stopping = object(), object(); degraded = types.SimpleNamespace(image_processor=None, chat_template="{{ messages }}", detokenizer=detokenizer, tokenizer=types.SimpleNamespace(stopping_criteria=stopping))
+    repaired = loader._repair_degraded_vlm_processor(degraded, tmp_path, "molmo")
+    assert isinstance(repaired, NativeProcessor) and repaired.chat_template == "{{ messages }}" and repaired.detokenizer is detokenizer and repaired.tokenizer.stopping_criteria is stopping
+
+    healthy = object()
+    class AutoProcessor:
+        outcome = ValueError("Unrecognized processing class")
+        calls = []
+        @classmethod
+        def from_pretrained(cls, model_path, **kwargs):
+            cls.calls.append((
+                loader._read_json_file(Path(model_path) / "config.json").get("auto_map"),
+                loader._read_json_file(Path(model_path) / "tokenizer_config.json").get("auto_map"),
+                kwargs.get("trust_remote_code"),
+            ))
+            if isinstance(cls.outcome, BaseException): raise cls.outcome
+            return cls.outcome
+
+    monkeypatch.setitem(globals(), "AutoProcessor", AutoProcessor)
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    scoped_load = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    recovered = scoped_load(tmp_path)
+    (tmp_path / "config.json").write_text('{"model_type":"native","auto_map":{"AutoConfig":"remote.Config"}}', encoding="utf-8")
+    AutoProcessor.outcome = healthy
+    assert _test_bound_vlm_load(tmp_path) is healthy
+    assert scoped_load(tmp_path) is healthy
+    AutoProcessor.outcome = RuntimeError("unrelated")
+    with pytest.raises(RuntimeError, match="unrelated"):
+        scoped_load(tmp_path)
+    AutoProcessor.outcome = healthy
+    trusted_load = loader._bind_mlx_vlm_processor_loader(
+        _test_bound_vlm_load,
+        allow_remote_code=True,
+    )
+    assert trusted_load(tmp_path) is healthy
+    assert isinstance(recovered, NativeProcessor)
+    assert AutoProcessor.calls == [
+        (None, None, False),
+        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, None),
+        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, False),
+        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, False),
+        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, True),
+    ]
+    assert load_processor is _test_bound_load_processor
+
+
+def test_llava_processor_geometry_uses_temporary_config_view(tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    config = {"model_type": "llava", "vision_config": {"patch_size": 14}, "vision_feature_select_strategy": "default"}
+    processor_config = {"processor_class": "LlavaProcessor", "patch_size": None, "vision_feature_select_strategy": None}
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / "processor_config.json").write_text(json.dumps(processor_config), encoding="utf-8")
+
+    view, returned_config = loader._materialize_mlx_vlm_config_override(tmp_path, config)
+    patched = loader._read_json_file(Path(view) / "processor_config.json")
+    assert returned_config is config
+    assert (patched["patch_size"], patched["vision_feature_select_strategy"]) == (14, "default")
+    assert loader._read_json_file(tmp_path / "processor_config.json") == processor_config
+
+    class Model: pass
+    model = Model()
+    owner = loader._MLXVLMConfigViewOwner(view, tmp_path)
+    owner.transfer_to(model)
+    assert model._unsloth_mlx_config_view_paths == [str(view)]
+    model._unsloth_mlx_config_view_finalizers[0]()
+    assert not Path(view).exists()
+
+    processor_config["patch_size"], processor_config["vision_feature_select_strategy"] = 16, "full"
+    (tmp_path / "processor_config.json").write_text(json.dumps(processor_config), encoding="utf-8")
+    assert loader._materialize_mlx_vlm_config_override(tmp_path, config)[0] == tmp_path
+    processor_config["patch_size"], processor_config["vision_feature_select_strategy"] = None, None
+    (tmp_path / "processor_config.json").write_text(json.dumps(processor_config), encoding="utf-8")
+    failed_view, _ = loader._materialize_mlx_vlm_config_override(tmp_path, {**config, "vision_config": {"patch_size": 14}})
+    failed_owner = loader._MLXVLMConfigViewOwner(failed_view, tmp_path)
+    with pytest.raises(RuntimeError, match="load failed"):
+        failed_owner.call(lambda: (_ for _ in ()).throw(RuntimeError("load failed")))
+    assert not Path(failed_view).exists()
+    invalid_config = {
+        **config,
+        "vision_config": {"patch_size": 0},
+        "vision_feature_select_strategy": "unsupported",
+    }
+    invalid_view, _ = loader._materialize_mlx_vlm_config_override(
+        tmp_path,
+        invalid_config,
+    )
+    assert loader._read_json_file(
+        Path(invalid_view) / "processor_config.json"
+    ) == processor_config
+    loader._MLXVLMConfigViewOwner(invalid_view, tmp_path).cleanup()
 
 
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):

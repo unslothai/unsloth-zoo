@@ -270,6 +270,47 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     assert all(call[1:3] == (None, pipeline_group) for call in calls[1:])
 
 
+def test_load_mlx_vlm_distributed_applies_llava_processor_geometry(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
+
+    config = {
+        "model_type": "llava",
+        "vision_config": {"patch_size": 14},
+        "vision_feature_select_strategy": "default",
+    }
+    model_dir = _write_config(tmp_path, config)
+    processor_config = {
+        "processor_class": "LlavaProcessor",
+        "patch_size": None,
+        "vision_feature_select_strategy": None,
+    }
+    (model_dir / "processor_config.json").write_text(json.dumps(processor_config))
+    seen = []
+
+    class _FakeVLM:
+        pass
+
+    def sharded_load(repo, **_kwargs):
+        seen.append(json.loads((Path(repo) / "processor_config.json").read_text()))
+        return _FakeVLM(), types.SimpleNamespace(name="processor")
+
+    vlm_utils = types.ModuleType("mlx_vlm.utils")
+    vlm_utils.get_model_path = lambda *_a, **_k: model_dir
+    vlm_utils.sharded_load = sharded_load
+    monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", vlm_utils)
+
+    model, _ = _load_mlx_vlm_distributed(
+        "fake/llava",
+        "llava",
+        tensor_group=_FakeGroup(name="tensor"),
+    )
+
+    assert (seen[0]["patch_size"], seen[0]["vision_feature_select_strategy"]) == (14, "default")
+    assert json.loads((model_dir / "processor_config.json").read_text()) == processor_config
+    model._unsloth_mlx_config_view_finalizers[0]()
+
+
 def test_from_pretrained_distributed_vlm_passes_override_without_temp_view(monkeypatch, tmp_path):
     import mlx_lm.utils as mlx_lm_utils
     import unsloth_zoo.mlx.loader as loader
@@ -278,7 +319,6 @@ def test_from_pretrained_distributed_vlm_passes_override_without_temp_view(monke
     config = {"model_type": "raw", "vision_config": {}, "architectures": ["DeepSeekOCRForCausalLM"], "auto_map": {"x": "y"}}
     model_path, calls = _write_config(tmp_path, config), []
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda *_a, **_k: model_path)
-    monkeypatch.setattr(loader, "_materialize_mlx_vlm_config_data", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("first temp view")))
     monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", lambda *_a, config_override_data=None, **_k: (calls.append(config_override_data), (types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())))[1])
     for name in ("install_mlx_compile_patches", "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype", "_patch_mixed_precision_set_dtype", "_fix_gemma4_kv_sharing", "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa", "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32", "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation", "_fix_gemma3_multimodal_image_feature_scale"):
         monkeypatch.setattr(loader, name, lambda *_a, **_k: None)
