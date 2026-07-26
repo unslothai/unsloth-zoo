@@ -1,9 +1,18 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
-# This program is free software: you can redistribute it and/or modify it under
-# the terms of the GNU Affero General Public License, version 3 or (at your
-# option) any later version. See <https://www.gnu.org/licenses/>.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """CUDA-parity continued pretraining, end-to-end on real MLX (Apple Silicon).
 
@@ -139,3 +148,53 @@ def test_set_target_modules_respects_finetune_filters():
     trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
     assert "model.embed_tokens.weight" in trn
     assert not any("q_proj.lora" in k for k in trn)
+
+
+class _AltHead(nn.Module):
+    """No lm_head and no tie flag: the head descriptor stays unresolved."""
+
+    def __init__(s):
+        super().__init__()
+        s.model = nn.Module()
+        s.model.embed_tokens = nn.Embedding(64, 32)
+        lyr = nn.Module(); lyr.self_attn = _Attn(); s.model.layers = [lyr]
+        s.embed_out = nn.Linear(32, 64, bias=False)
+
+    @property
+    def layers(s):
+        return s.model.layers
+
+    def __call__(s, x):
+        return s.embed_out(s.model.embed_tokens(x))
+
+
+def test_unusable_lm_head_keeps_the_other_lora_targets():
+    # target_modules=[..., "lm_head"] LoRA'd the other targets before CPT
+    # existed. An lm_head this backend cannot train must not abort the run:
+    # warn and drop it, so tied models (Llama/Qwen/Gemma) and unresolved-head
+    # models (GPT-NeoX embed_out, InternLM2 output) still train.
+    m = _tiny(tied=True)
+    with pytest.warns(UserWarning, match="tied"):
+        _peft(m, target_modules=["q_proj", "lm_head"])
+    trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
+    assert any(k.endswith("q_proj.lora_a") for k in trn)
+    assert not any(k.startswith("lm_head") for k in trn)
+
+    alt = _AltHead()
+    with pytest.warns(UserWarning, match="output head could not be resolved"):
+        _peft(alt, target_modules=["q_proj", "lm_head"])
+    assert any(k.endswith("q_proj.lora_a")
+               for k in dict(mu.tree_flatten(alt.trainable_parameters())))
+
+
+def test_unusable_lm_head_still_raises_when_nothing_else_trains():
+    # Dropping lm_head must never leave an empty selection to fall through to
+    # mlx-lm's auto-discovery, and an explicit modules_to_save request names
+    # one module, so both keep raising.
+    with pytest.raises(ValueError, match="tied"):
+        _peft(_tiny(tied=True), target_modules=["lm_head"])
+    with pytest.raises(ValueError, match="output head could not be resolved"):
+        _peft(_AltHead(), target_modules=["lm_head"])
+    with pytest.raises(ValueError, match="tied"):
+        _peft(_tiny(tied=True), target_modules=["q_proj"],
+              modules_to_save=["lm_head"])

@@ -4776,29 +4776,44 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
             )
         _add_full(emb_path, emb)
 
+    lora_targets = [m for m in tm if m not in ("embed_tokens", "lm_head")]
+
     lm_head_lora_path = None
     if "lm_head" in tm or "lm_head" in mts:
+        unusable = None
         if tied:
             # The tied output head shares embed_tokens' weight, so it trains via
             # the embed_tokens full module. Accept the common recipe
             # target_modules=[..., "embed_tokens", "lm_head"] by treating a
-            # co-requested lm_head as already selected; reject only a standalone
-            # lm_head, which cannot train the head without the shared embedding.
+            # co-requested lm_head as already selected.
             if "embed_tokens" not in tm and "embed_tokens" not in mts:
-                raise ValueError(
+                unusable = (
                     "Unsloth: lm_head cannot be trained separately on a tied-"
                     "embedding model — the output head shares embed_tokens' "
                     "weight. Add 'embed_tokens' to target_modules to train the "
                     "shared matrix."
                 )
         elif desc.module is None:
-            _raise_no_lora_targets(["lm_head"])
+            unusable = (
+                "Unsloth: the output head could not be resolved on this model, "
+                "so lm_head cannot be trained. Use target_modules='all-linear' "
+                "or name the head's own module (for example 'output' or "
+                "'embed_out') instead."
+            )
         elif "lm_head" in mts:            # precedence: modules_to_save -> full module
             _add_full(desc.path, desc.module)
         else:                            # target_modules -> LoRA on the head Linear
             lm_head_lora_path = desc.path
+        if unusable is not None:
+            # modules_to_save names one module and nothing else, so an
+            # unusable head there is unambiguous and must fail loudly. In
+            # target_modules it is one entry among many: dropping it while the
+            # other targets still train preserves the pre-CPT behaviour instead
+            # of aborting a run that used to work.
+            if "lm_head" in mts or not (lora_targets or full_specs):
+                raise ValueError(unusable)
+            warnings.warn(unusable, stacklevel=3)
 
-    lora_targets = [m for m in tm if m not in ("embed_tokens", "lm_head")]
     return lora_targets, full_specs, lm_head_lora_path, desc
 
 
