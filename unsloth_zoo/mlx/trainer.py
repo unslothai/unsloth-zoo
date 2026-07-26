@@ -1877,22 +1877,24 @@ class MLXTrainer:
     def _callback_num_train_epochs(self, total_steps, batches):
         """Return the epoch total HF's TrainerState reports for this run.
 
-        Epoch-count runs use num_train_epochs directly. A max_steps run leaves
-        args.num_train_epochs at -1, but HF still derives a real epoch total from
+        Epoch-count runs (max_steps off) use num_train_epochs directly. A
+        max_steps run usually leaves it at -1, but HF derives a real total from
         the dataloader length, so reporting 0 while the loop dispatches epoch
         events and drives state.epoch past 1.0 hands callbacks inconsistent
         metadata, and a ZeroDivisionError to anything normalizing by it.
         """
         epochs = max(0, int(getattr(self.args, "num_train_epochs", 0) or 0))
-        if epochs > 0:
+        # HF derives the total from max_steps whenever it is set, ignoring
+        # num_train_epochs, which a real TrainingArguments leaves positive.
+        if epochs > 0 and int(getattr(self.args, "max_steps", 0) or 0) <= 0:
             return epochs
         total_steps = int(total_steps or 0)
         if total_steps <= 0:
-            return 0
+            return epochs
         micro_per_epoch = self._callback_batches_per_epoch(batches)
         if not micro_per_epoch:
             # Streaming: no known boundaries, so the loop fires no epoch events.
-            return 0
+            return epochs
         grad_accum = max(1, int(getattr(self.args, "gradient_accumulation_steps", 1) or 1))
         updates_per_epoch = max(1, math.ceil(micro_per_epoch / grad_accum))
         return max(1, math.ceil(total_steps / updates_per_epoch))

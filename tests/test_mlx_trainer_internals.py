@@ -5595,6 +5595,32 @@ def test_callback_num_train_epochs_mirrors_hf_arithmetic():
     assert epochs._callback_num_train_epochs(0, list(range(12))) == 3
 
 
+def test_callback_num_train_epochs_honors_max_steps_over_configured_epochs():
+    # HF derives the total from max_steps whenever it is set, ignoring
+    # num_train_epochs, which a real TrainingArguments leaves at 3.0.
+    # MLXTrainingConfig.max_steps defaults to 60, so this is the common path.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        max_steps=60, num_train_epochs=3, per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+    )
+    trainer._distributed_world_size = 1
+    trainer._mlx_train_dataset_for_batches = list(range(16))  # one pass = 8 micro
+    trainer.train_dataset = trainer._mlx_train_dataset_for_batches
+    trainer._prepared_batches_include_epochs = False
+
+    # ceil(8 / 4) = 2 updates per epoch -> ceil(60 / 2) = 30, not the configured 3.
+    assert trainer._callback_num_train_epochs(60, list(range(240))) == 30
+    # A max_steps run cut short of one pass reports the truncated total, not 3.
+    trainer.args.gradient_accumulation_steps = 1
+    assert trainer._callback_num_train_epochs(3, list(range(3))) == 1
+    # Streaming has no boundaries to derive from: keep the configured value
+    # rather than dropping back to the ZeroDivisionError-prone 0.
+    assert trainer._callback_num_train_epochs(60, None) == 3
+
+
 def test_callback_best_metric_persisted_across_resume_without_native_tracking(monkeypatch):
     # The callback-visible watermark (TrainerState.best_metric) advances on every
     # eval whenever metric_for_best_model is set, but the NATIVE best fields
