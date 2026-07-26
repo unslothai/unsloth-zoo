@@ -267,26 +267,39 @@ _KNOWN_MLX_LM_STRICT_FALLBACKS = {
 
 _KNOWN_VLM_EXTRA_WEIGHT_FILTERS = {
     "gemma4": {
-        "message_tokens": (
-            "parameters not in model",
-            "per_layer_model_projection",
-            "scales",
-            "biases",
+        "message_token_sets": (
+            (
+                "parameters not in model",
+                "per_layer_model_projection",
+                "scales",
+                "biases",
+            ),
+            (
+                "parameters not in model",
+                "language_model.model.layers.",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.k_norm",
+            ),
         ),
         "notice": (
-            "Unsloth: Gemma4 VLM checkpoint has extra quantized "
-            "per-layer projection state - ignoring only those known keys."
+            "Unsloth: Gemma4 VLM checkpoint has extra model state - "
+            "ignoring only keys known to be unused by the installed model."
         ),
         "allowed_extra": frozenset({
             "language_model.model.per_layer_model_projection.biases",
             "language_model.model.per_layer_model_projection.scales",
         }),
+        "allow_shared_kv": True,
     },
 }
 
 
 def _message_matches_known_fallback(message, rule):
-    return all(token in message for token in rule.get("message_tokens", ()))
+    token_sets = rule.get("message_token_sets")
+    if token_sets is None:
+        token_sets = (rule.get("message_tokens", ()),)
+    return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
@@ -972,17 +985,28 @@ def _load_mlx_vlm_with_extra_weight_filter(
 
         allowed_extra = rule["allowed_extra"]
 
-        # why: nn.Module.load_weights is patched process-globally; lock so
-        # a concurrent load doesn't see the filtered version.
+        # why: nn.Module.load_weights is patched process-globally; the lock
+        # serializes retries and the owner check preserves concurrent native loads.
         with _LOAD_WEIGHTS_PATCH_LOCK:
             original_load_weights = nn.Module.load_weights
+            retry_thread = threading.get_ident()
 
             def _load_weights_without_projection_quant_state(self, file_or_weights, strict=True):
+                if threading.get_ident() != retry_thread:
+                    return original_load_weights(
+                        self, file_or_weights, strict=strict
+                    )
                 if isinstance(file_or_weights, list):
                     file_or_weights = [
                         (key, value)
                         for key, value in file_or_weights
-                        if key not in allowed_extra
+                        if (
+                            key not in allowed_extra
+                            and not (
+                                rule.get("allow_shared_kv", False)
+                                and _gemma4_unused_shared_kv_weight(self, key)
+                            )
+                        )
                     ]
                 return original_load_weights(self, file_or_weights, strict=strict)
 
@@ -2361,6 +2385,9 @@ _LFM2_PROJECTOR_INIT_TOKEN_SHA256 = (
 _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
     "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
 )
+_GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
+    "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
+)
 
 
 def _source_token_sha256(source: str) -> str:
@@ -2472,6 +2499,38 @@ def _ensure_lfm2_projector_layernorm(model_type) -> None:
 
     patched._unsloth_disabled_layernorm = True
     projector.__init__ = patched
+
+
+def _gemma4_unused_shared_kv_weight(model, key) -> bool:
+    """Whether the installed Gemma4 model owns this redundant shared-KV key."""
+
+    language_model = getattr(model, "language_model", None)
+    cls = type(language_model)
+    predicate = cls.__dict__.get("_is_unused_shared_kv_weight")
+    if (
+        cls.__module__ != "mlx_vlm.models.gemma4.language"
+        or cls.__name__ != "LanguageModel"
+        or not callable(predicate)
+        or _source_token_sha256(_safe_getsource(predicate))
+        != _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256
+    ):
+        return False
+    match = re.fullmatch(
+        r"language_model\.model\.layers\.(0|[1-9][0-9]*)"
+        r"\.self_attn\.(?:[kv]_proj\.(?:weight|bias|biases|scales)"
+        r"|[kv]_norm\.weight)",
+        key,
+    )
+    if match is None:
+        return False
+    layers = getattr(getattr(language_model, "model", None), "layers", ())
+    try:
+        layer_index = int(match.group(1))
+        if layer_index >= len(layers):
+            return False
+        return bool(predicate(language_model, key))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
 
 
 def _unconditionally_sanitizes_mlx_vlm_weights(load_model) -> bool:
