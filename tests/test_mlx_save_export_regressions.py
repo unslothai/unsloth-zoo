@@ -52,6 +52,8 @@ def _test_make_streaming_detokenizer(processor):
 def _test_naive_detokenizer_init(self, tokenizer):
     self._tokenizer, self._tokens = tokenizer, []
 def _test_naive_detokenizer_reset(self): self._tokens = []
+def _test_lfm_projector_init(self, config): self.projector_use_layernorm, self.layer_norm = config.projector_use_layernorm, lambda x: ("normalized", x)
+def _test_lfm_projector_call(self, x): return self.layer_norm(x) if self.projector_use_layernorm else x
 def _test_minicpmo_legacy_vision(self, pixel_values, tgt_sizes):
     dtype = self.language_model.model.embed_tokens.weight.dtype
     return _to_mx_array(pixel_values, dtype=dtype)
@@ -935,6 +937,26 @@ def test_legacy_naive_detokenizer_copy_is_capability_gated(monkeypatch):
     loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
     fixed = NaiveStreamingDetokenizer(tokenizer)
     assert "__copy__" not in NaiveStreamingDetokenizer.__dict__ and copy(fixed) is fixed
+
+
+def test_lfm_disabled_projector_norm_is_loader_gated(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module_name = "mlx_vlm.models.lfm2_vl.lfm2_vl"
+    Projector = type("Lfm2VlMultiModalProjector", (), {"__module__": module_name, "__init__": _test_lfm_projector_init, "__call__": _test_lfm_projector_call})
+    module = types.ModuleType(module_name); module.Lfm2VlMultiModalProjector = Projector
+    monkeypatch.setitem(sys.modules, module_name, module)
+    init_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_init)); call_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_call))
+    original = Projector.__init__
+    for init_token, call_token, class_name in (("unknown", call_hash, Projector.__name__), (init_hash, "unknown", Projector.__name__), (init_hash, call_hash, "OtherProjector")):
+        monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_token); monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_token); Projector.__name__ = class_name
+        loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl"); assert Projector.__init__ is original
+    Projector.__name__ = "Lfm2VlMultiModalProjector"; monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_hash); monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_hash)
+    loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
+    disabled, enabled = Projector(types.SimpleNamespace(projector_use_layernorm=False)), Projector(types.SimpleNamespace(projector_use_layernorm=True))
+    assert not hasattr(disabled, "layer_norm") and enabled("x") == ("normalized", "x")
+    installed = Projector.__init__; loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
+    assert Projector.__init__ is installed
 
 
 def test_declared_mlx_vlm_processor_owns_custom_components_and_recovery(

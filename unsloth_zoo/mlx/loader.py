@@ -1325,7 +1325,7 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
     return scoped_load
 
 
-def _bind_mlx_vlm_quantized_projector_loader(load_callable):
+def _bind_mlx_vlm_quantized_projector_loader(load_callable, *, model_type=None):
     """Honor checkpoint-quantized projectors in a known legacy loader shape.
 
     Mlx-vlm briefly skipped every ``multi_modal_projector`` whenever the
@@ -1340,6 +1340,7 @@ def _bind_mlx_vlm_quantized_projector_loader(load_callable):
     global is changed for concurrent loads.
     """
 
+    _ensure_lfm2_projector_layernorm(model_type)
     if not isinstance(load_callable, types.FunctionType):
         return load_callable
     model_loader = load_callable.__globals__.get("load_model")
@@ -2354,6 +2355,12 @@ _MINICPM_LEGACY_VISION_TOKEN_SHA256 = (
 _MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256 = (
     "deceb0843cbd9ba04bb86cded962550e7ae0a8814cf321fd61d654a07458262e"
 )
+_LFM2_PROJECTOR_INIT_TOKEN_SHA256 = (
+    "6534244e2803564731343c4768c75b04d7bc86fc061ae12c59df55c8867b894e"
+)
+_LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
+    "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
+)
 
 
 def _source_token_sha256(source: str) -> str:
@@ -2426,6 +2433,45 @@ def _ensure_vlm_detokenizer_copy() -> None:
         return type(self)(self._tokenizer)
 
     detokenizer.__copy__ = __copy__
+
+
+def _ensure_lfm2_projector_layernorm(model_type) -> None:
+    """Do not register LFM projector normalization when config disables it."""
+
+    if model_type != "lfm2_vl":
+        return
+    try:
+        module = importlib.import_module(
+            "mlx_vlm.models.lfm2_vl.lfm2_vl"
+        )
+    except Exception:
+        return
+    projector = getattr(module, "Lfm2VlMultiModalProjector", None)
+    if (
+        not isinstance(projector, type)
+        or projector.__module__ != module.__name__
+        or projector.__name__ != "Lfm2VlMultiModalProjector"
+    ):
+        return
+    installed_init = projector.__init__
+    installed_call = projector.__call__
+    if (
+        getattr(installed_init, "_unsloth_disabled_layernorm", False)
+        or _source_token_sha256(_safe_getsource(installed_init))
+        != _LFM2_PROJECTOR_INIT_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(installed_call))
+        != _LFM2_PROJECTOR_CALL_TOKEN_SHA256
+    ):
+        return
+
+    @wraps(installed_init)
+    def patched(self, config):
+        installed_init(self, config)
+        if not self.projector_use_layernorm:
+            del self.layer_norm
+
+    patched._unsloth_disabled_layernorm = True
+    projector.__init__ = patched
 
 
 def _unconditionally_sanitizes_mlx_vlm_weights(load_model) -> bool:
@@ -6520,7 +6566,10 @@ class FastMLXModel:
                 vlm_load,
                 allow_remote_code=trust_remote_code,
             )
-            vlm_load = _bind_mlx_vlm_quantized_projector_loader(vlm_load)
+            vlm_load = _bind_mlx_vlm_quantized_projector_loader(
+                vlm_load,
+                model_type=model_type,
+            )
 
             if text_only is False and not _is_vlm(config_data):
                 warnings.warn(
