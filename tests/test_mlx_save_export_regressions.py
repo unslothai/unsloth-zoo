@@ -33,6 +33,7 @@ import pytest
 AutoProcessor = None
 load_processor = None
 load_model = skip_multimodal_module = nn = _has_quantized_weights = None
+_to_mx_array = None
 
 
 def _test_bound_load_processor(model_path, **kwargs):
@@ -45,6 +46,12 @@ def _test_bound_vlm_load(model_path):
 
 def _test_bound_model_load(paths, weights):
     return load_model(paths, weights)
+def _test_minicpmo_legacy_vision(self, pixel_values, tgt_sizes):
+    dtype = self.language_model.model.embed_tokens.weight.dtype
+    return _to_mx_array(pixel_values, dtype=dtype)
+def _test_minicpmo_fixed_vision(self, pixel_values, tgt_sizes):
+    dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
+    return _to_mx_array(pixel_values, dtype=dtype)
 def _test_legacy_model_load(paths, weights):
     config, skip_vision = {"quantization": {"multi_modal_projector.dense": True}}, True
     def get_class_predicate(p, m):
@@ -1072,6 +1079,28 @@ def test_minicpmo_mlx_sanitize_is_complete_and_loader_gated(monkeypatch):
     native = NativeMiniCPM.sanitize
     loader._ensure_minicpmo_mlx_sanitize("minicpmo")
     assert NativeMiniCPM.sanitize is native
+
+
+def test_minicpmo_legacy_vision_uses_call_scoped_float_dtype(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    convert = lambda value, dtype=None: (value, dtype)
+    owner = "mlx_vlm.models.minicpmo.minicpmo"
+    for function, name in ((convert, "_to_mx_array"), (_test_minicpmo_legacy_vision, "get_vision_embedding"), (_test_minicpmo_fixed_vision, "get_vision_embedding")):
+        monkeypatch.setattr(function, "__module__", owner); monkeypatch.setattr(function, "__name__", name)
+    monkeypatch.setitem(globals(), "_to_mx_array", convert)
+    monkeypatch.setattr(loader, "_MINICPM_LEGACY_VISION_TOKEN_SHA256", loader._source_token_sha256(loader._safe_getsource(_test_minicpmo_legacy_vision)))
+    adapted = loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision)
+    model = types.SimpleNamespace(
+        language_model=types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="uint32")))),
+        vision_tower=types.SimpleNamespace(embeddings=types.SimpleNamespace(patch_embedding=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="float16")))),
+    )
+    assert _test_minicpmo_legacy_vision(model, "pixels", None) == ("pixels", "uint32")
+    assert adapted(model, "pixels", None) == ("pixels", "float16")
+    model.vision_tower.embeddings.patch_embedding.weight.dtype = "bfloat16"
+    assert adapted(model, "next", None) == ("next", "bfloat16") and _to_mx_array is convert
+    assert adapted.__wrapped__ is _test_minicpmo_legacy_vision and loader._minicpmo_vision_dtype_adapter(adapted) is adapted
+    assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_fixed_vision) is _test_minicpmo_fixed_vision
 
 
 def test_llava_processor_geometry_uses_temporary_config_view(tmp_path):

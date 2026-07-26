@@ -2347,6 +2347,9 @@ _MINICPM_MLX_PREFIX_ALIASES = {
 _MINICPM_SANITIZE_TOKEN_SHA256 = (
     "0706ec1a5d2252c16b6e9a2e665c7774fb6061aef763494d8e78d3fda68b439b"
 )
+_MINICPM_LEGACY_VISION_TOKEN_SHA256 = (
+    "54965adc15f72ca21df0dc646467c8e588f83de19edd2aacad70362690d6648a"
+)
 
 
 def _source_token_sha256(source: str) -> str:
@@ -2535,6 +2538,79 @@ def _ensure_minicpmo_mlx_sanitize(model_type: str) -> None:
     adapted = _minicpmo_mlx_sanitize_adapter(cls.sanitize)
     if adapted is not cls.sanitize:
         cls.sanitize = adapted
+
+
+def _minicpmo_vision_dtype_adapter(original):
+    """Use the vision execution dtype in the exact legacy MiniCPM method."""
+
+    if getattr(original, "_unsloth_minicpmo_vision_dtype", False):
+        return original
+    owner = "mlx_vlm.models.minicpmo.minicpmo"
+    if (
+        not isinstance(original, types.FunctionType)
+        or original.__module__ != owner
+        or original.__name__ != "get_vision_embedding"
+    ):
+        return original
+    try:
+        parameters = inspect.signature(
+            original,
+            follow_wrapped=False,
+        ).parameters
+    except (TypeError, ValueError):
+        return original
+    converter = original.__globals__.get("_to_mx_array")
+    if (
+        tuple(parameters) != ("self", "pixel_values", "tgt_sizes")
+        or _source_token_sha256(_safe_getsource(original))
+        != _MINICPM_LEGACY_VISION_TOKEN_SHA256
+        or not isinstance(converter, types.FunctionType)
+        or converter.__module__ != owner
+        or converter.__name__ != "_to_mx_array"
+    ):
+        return original
+
+    @wraps(original)
+    def patched(self, pixel_values, tgt_sizes):
+        try:
+            vision_dtype = (
+                self.vision_tower.embeddings.patch_embedding.weight.dtype
+            )
+        except AttributeError:
+            return original(self, pixel_values, tgt_sizes)
+
+        def convert(value, dtype=None):
+            return converter(value, dtype=vision_dtype)
+
+        scoped_globals = dict(original.__globals__)
+        scoped_globals["_to_mx_array"] = convert
+        scoped = types.FunctionType(
+            original.__code__,
+            scoped_globals,
+            original.__name__,
+            original.__defaults__,
+            original.__closure__,
+        )
+        scoped.__kwdefaults__ = original.__kwdefaults__
+        return scoped(self, pixel_values, tgt_sizes)
+
+    patched._unsloth_minicpmo_vision_dtype = True
+    return patched
+
+
+def _ensure_minicpmo_vision_dtype(model_type: str) -> None:
+    """Patch only the MiniCPM callable that uses packed language dtype."""
+
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmo.minicpmo"
+        or not hasattr(cls, "get_vision_embedding")
+    ):
+        return
+    adapted = _minicpmo_vision_dtype_adapter(cls.get_vision_embedding)
+    if adapted is not cls.get_vision_embedding:
+        cls.get_vision_embedding = adapted
 
 
 def _lookup_module_array(root, dotted_key):
@@ -6411,6 +6487,7 @@ class FastMLXModel:
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
             _ensure_minicpmo_mlx_sanitize(model_type)
+            _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
