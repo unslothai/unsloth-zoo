@@ -50,6 +50,8 @@ _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 # `_set_norm_output_cast_to_input_dtype` so the generic and Qwen3-VL
 # paths agree.
 _QWEN3_VISION_NORM_CAST_OUTPUT = True
+_QWEN3_VISUAL_STATE_KEY = "_unsloth_qwen3_visual_state"
+_QWEN3_VISUAL_POSITIONS_KEY = "_unsloth_qwen3_visual_positions"
 
 
 def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
@@ -2176,6 +2178,359 @@ def _patch_explicit_position_embeddings(model_cls, replacement):
     _patch_method(model_cls, "get_input_embeddings", adapted)
 
 
+def _qwen3_visual_window(
+    visual_pos_masks,
+    visual_state,
+    visual_positions,
+    *,
+    mask_offsets,
+    feature_offsets,
+    window,
+):
+    """Restore flattened Qwen3 features for one compact-state window."""
+
+    batch_size = int(visual_pos_masks.shape[0])
+    mask_offsets = tuple(int(offset) for offset in mask_offsets)
+    feature_offsets = tuple(int(offset) for offset in feature_offsets)
+    if len(mask_offsets) == 1 and batch_size > 1:
+        mask_offsets *= batch_size
+    if len(feature_offsets) == 1 and batch_size > 1:
+        feature_offsets *= batch_size
+    if len(mask_offsets) != batch_size or len(feature_offsets) != batch_size:
+        raise ValueError("Qwen3 visual state does not match the cache batch")
+
+    window_masks = []
+    feature_slices = [[] for _ in range(visual_state.shape[2])]
+    for row, (mask_start, feature_start) in enumerate(
+        zip(mask_offsets, feature_offsets)
+    ):
+        if visual_pos_masks.shape[-1] == window:
+            active_mask = visual_pos_masks[row]
+        else:
+            row_mask = visual_pos_masks[row]
+            active_mask = row_mask[mask_start : mask_start + window]
+            if active_mask.shape[0] < window:
+                active_mask = mx.concatenate(
+                    [
+                        active_mask,
+                        mx.zeros(
+                            (window - active_mask.shape[0],),
+                            dtype=row_mask.dtype,
+                        ),
+                    ]
+                )
+        window_masks.append(active_mask[None, :])
+
+        row_positions = visual_positions[row]
+        feature_stop = max(0, feature_start + window)
+        feature_start = max(0, feature_start)
+        feature_before = int(
+            ((row_positions >= 0) & (row_positions < feature_start)).sum().item()
+        )
+        feature_count = int(
+            (
+                (row_positions >= feature_start)
+                & (row_positions < feature_stop)
+            ).sum().item()
+        )
+        selected = visual_state[row][
+            feature_before : feature_before + feature_count
+        ]
+        for layer in range(visual_state.shape[2]):
+            feature_slices[layer].append(selected[:, layer, :])
+
+    return mx.concatenate(window_masks, axis=0), [
+        mx.concatenate(parts, axis=0)
+        for parts in feature_slices
+    ]
+
+
+def _qwen3_cache_offsets(cache, batch_size):
+    """Return unpadded and padded prompt progress for each cache row."""
+
+    if not cache or cache[0] is None:
+        zeros = (0,) * batch_size
+        return zeros, zeros
+    cache_entry = cache[0]
+
+    def row_values(value):
+        if hasattr(value, "ndim"):
+            if value.ndim > 0:
+                return tuple(int(item) for item in value.reshape((-1,)).tolist())
+            value = value.item()
+        return (int(value),) * batch_size
+
+    offsets = row_values(getattr(cache_entry, "offset", 0))
+    left_padding = row_values(getattr(cache_entry, "left_padding", 0))
+    if len(offsets) != batch_size or len(left_padding) != batch_size:
+        return offsets, offsets
+    mask_offsets = tuple(
+        max(0, offset + padding)
+        for offset, padding in zip(offsets, left_padding)
+    )
+    return offsets, mask_offsets
+
+
+def _pack_qwen3_visual_state(visual_pos_masks, deepstack_visual_embeds):
+    """Pack flattened Qwen3 features by row without scaling to prompt length."""
+
+    if (
+        deepstack_visual_embeds is None
+        or isinstance(deepstack_visual_embeds, mx.array)
+    ):
+        return deepstack_visual_embeds, None
+    if not deepstack_visual_embeds:
+        return deepstack_visual_embeds, None
+
+    counts = [
+        int(visual_pos_masks[row].sum().item())
+        for row in range(visual_pos_masks.shape[0])
+    ]
+    max_count = max(counts, default=0)
+    positions = []
+    packed_rows = []
+    feature_start = 0
+    for row, count in enumerate(counts):
+        prompt_positions = mx.arange(
+            visual_pos_masks.shape[1],
+            dtype=mx.int32,
+        )
+        position_keys = mx.where(
+            visual_pos_masks[row],
+            prompt_positions,
+            visual_pos_masks.shape[1],
+        )
+        row_positions = prompt_positions[mx.argsort(position_keys)[:count]]
+        if count < max_count:
+            row_positions = mx.concatenate(
+                [
+                    row_positions,
+                    mx.full((max_count - count,), -1, dtype=mx.int32),
+                ]
+            )
+        positions.append(row_positions[None, :])
+
+        row_layers = []
+        for embeds in deepstack_visual_embeds:
+            row_embeds = embeds[feature_start : feature_start + count]
+            if count < max_count:
+                row_embeds = mx.concatenate(
+                    [
+                        row_embeds,
+                        mx.zeros(
+                            (max_count - count, embeds.shape[-1]),
+                            dtype=embeds.dtype,
+                        ),
+                    ],
+                    axis=0,
+                )
+            row_layers.append(row_embeds)
+        packed_rows.append(mx.stack(row_layers, axis=1)[None, ...])
+        feature_start += count
+
+    return (
+        mx.concatenate(packed_rows, axis=0),
+        mx.concatenate(positions, axis=0),
+    )
+
+
+def _attach_qwen3_visual_state(features, visual_state, visual_positions):
+    """Carry compact Qwen3 state through mlx-vlm's generic prompt kwargs."""
+
+    original_to_dict = features.to_dict
+
+    @wraps(original_to_dict)
+    def to_dict():
+        values = original_to_dict()
+        values[_QWEN3_VISUAL_STATE_KEY] = visual_state
+        values[_QWEN3_VISUAL_POSITIONS_KEY] = visual_positions
+        return values
+
+    features.deepstack_visual_embeds = None
+    features.to_dict = to_dict
+    return features
+
+
+def _pad_qwen3_prompt_rows(prompt_kwargs_list):
+    """Equalize compact visual widths before generic batch concatenation."""
+
+    max_features = max(
+        (
+            kwargs[_QWEN3_VISUAL_STATE_KEY].shape[1]
+            for kwargs in prompt_kwargs_list
+            if kwargs and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is not None
+        ),
+        default=0,
+    )
+    if not max_features:
+        return prompt_kwargs_list
+
+    padded_rows = [dict(kwargs) if kwargs else kwargs for kwargs in prompt_kwargs_list]
+    for kwargs in padded_rows:
+        if not kwargs or kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None:
+            continue
+        state = kwargs[_QWEN3_VISUAL_STATE_KEY]
+        positions = kwargs[_QWEN3_VISUAL_POSITIONS_KEY]
+        pad = max_features - state.shape[1]
+        if pad <= 0:
+            continue
+        kwargs[_QWEN3_VISUAL_STATE_KEY] = mx.pad(
+            state,
+            [(0, 0), (0, pad), (0, 0), (0, 0)],
+        )
+        kwargs[_QWEN3_VISUAL_POSITIONS_KEY] = mx.pad(
+            positions,
+            [(0, 0), (0, pad)],
+            constant_values=-1,
+        )
+    return padded_rows
+
+
+def _qwen3_prompt_merge_adapter(original):
+    """Pad compact visual rows in mlx-vlm's cold prompt batching path."""
+
+    if getattr(original, "_unsloth_qwen3_prompt_merge", False):
+        return original
+
+    @wraps(original)
+    def patched(prompt_kwargs_list, input_ids):
+        return original(_pad_qwen3_prompt_rows(prompt_kwargs_list), input_ids)
+
+    patched._unsloth_qwen3_prompt_merge = True
+    return patched
+
+
+def _qwen3_mixed_prompt_batch_adapter(original):
+    """Pad compact visual rows in mlx-vlm's APC prompt batching path."""
+
+    if getattr(original, "_unsloth_qwen3_mixed_prompt_batch", False):
+        return original
+
+    @wraps(original)
+    def patched(self, sequences):
+        prompt_rows = [sequence[3] for sequence in sequences]
+        padded_rows = _pad_qwen3_prompt_rows(prompt_rows)
+        if padded_rows is not prompt_rows:
+            sequences = [
+                (*sequence[:3], kwargs, *sequence[4:])
+                for sequence, kwargs in zip(sequences, padded_rows)
+            ]
+        return original(self, sequences)
+
+    patched._unsloth_qwen3_mixed_prompt_batch = True
+    return patched
+
+
+def _qwen3_callable_source(original):
+    try:
+        return inspect.getsource(original)
+    except (OSError, TypeError):
+        return ""
+
+
+def _qwen3_drops_deepstack_after_eval(original):
+    return "deepstack_visual_embeds = mx.eval(" in _qwen3_callable_source(original)
+
+
+def _qwen3_batch_embedding_adapter(
+    original,
+    replacement=None,
+    *,
+    replace_visual_inference=False,
+):
+    """Expose flattened Qwen3 deepstack state in a compact row-owned format."""
+
+    if getattr(original, "_unsloth_qwen3_batch_visual_state", False):
+        return original
+
+    @wraps(original)
+    def patched(self, input_ids=None, pixel_values=None, **kwargs):
+        training = getattr(self, "training", False)
+        use_replacement = replacement is not None and (
+            (
+                training
+                and kwargs.get("position_ids") is not None
+            )
+            or (
+                not training and replace_visual_inference
+                and (
+                    pixel_values is not None
+                    or kwargs.get("pixel_values_videos") is not None
+                )
+            )
+        )
+        embedding_call = replacement if use_replacement else original
+        features = embedding_call(self, input_ids, pixel_values, **kwargs)
+        if training:
+            return features
+        visual_pos_masks = getattr(features, "visual_pos_masks", None)
+        if visual_pos_masks is not None:
+            visual_state, visual_positions = _pack_qwen3_visual_state(
+                visual_pos_masks,
+                getattr(features, "deepstack_visual_embeds", None),
+            )
+            if visual_positions is not None:
+                features = _attach_qwen3_visual_state(
+                    features,
+                    visual_state,
+                    visual_positions,
+                )
+        return features
+
+    patched._unsloth_qwen3_batch_visual_state = True
+    return patched
+
+
+def _qwen3_visual_state_adapter(original):
+    """Align Qwen3 mask/deepstack side channels before the language call."""
+
+    if getattr(original, "_unsloth_qwen3_visual_state", False):
+        return original
+
+    @wraps(original)
+    def patched(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        **kwargs,
+    ):
+        if visual_pos_masks is not None:
+            compact_state = kwargs.pop(_QWEN3_VISUAL_STATE_KEY, None)
+            visual_positions = kwargs.pop(_QWEN3_VISUAL_POSITIONS_KEY, None)
+            if compact_state is not None and visual_positions is not None:
+                feature_offsets, mask_offsets = _qwen3_cache_offsets(
+                    cache,
+                    int(visual_pos_masks.shape[0]),
+                )
+                visual_pos_masks, deepstack_visual_embeds = _qwen3_visual_window(
+                    visual_pos_masks,
+                    compact_state,
+                    visual_positions,
+                    mask_offsets=mask_offsets,
+                    feature_offsets=feature_offsets,
+                    window=int(inputs.shape[1]),
+                )
+                kwargs.pop("n_to_process", None)
+
+        return original(
+            self,
+            inputs,
+            inputs_embeds=inputs_embeds,
+            mask=mask,
+            cache=cache,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            **kwargs,
+        )
+
+    patched._unsloth_qwen3_visual_state = True
+    return patched
+
+
 def _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds):
     """Compile-safe additive merge for sparse visual embeddings."""
 
@@ -2613,6 +2968,35 @@ def _install_qwen3_family_compile_patches():
         qwen3moe_vision_module = None
         qwen3moe_language_module = None
 
+    for generate_name in ("mlx_vlm.generate", "mlx_vlm.generate.ar"):
+        try:
+            generate_module = importlib.import_module(generate_name)
+        except Exception:
+            continue
+        prompt_merge = getattr(
+            generate_module,
+            "_merge_prefill_prompt_kwargs",
+            None,
+        )
+        if prompt_merge is not None:
+            setattr(
+                generate_module,
+                "_merge_prefill_prompt_kwargs",
+                _qwen3_prompt_merge_adapter(prompt_merge),
+            )
+        batch_generator = getattr(generate_module, "BatchGenerator", None)
+        mixed_prompt_batch = getattr(
+            batch_generator,
+            "_build_mixed_prompt_batch",
+            None,
+        )
+        if mixed_prompt_batch is not None:
+            _patch_method(
+                batch_generator,
+                "_build_mixed_prompt_batch",
+                _qwen3_mixed_prompt_batch_adapter(mixed_prompt_batch),
+            )
+
     def merge_qwen3(image_features, inputs_embeds, input_ids, image_token_index, video_token_index):
         import mlx.core as mx
 
@@ -2971,8 +3355,25 @@ def _install_qwen3_family_compile_patches():
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
-    _patch_method(importlib.import_module("mlx_vlm.models.qwen3_vl.language").Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
-    _patch_explicit_position_embeddings(module.Model, patched_qwen3_get_input_embeddings)
+    language_module = importlib.import_module("mlx_vlm.models.qwen3_vl.language")
+    _patch_method(language_module.Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
+    language_call = language_module.LanguageModel.__call__
+    _patch_method(
+        language_module.LanguageModel,
+        "__call__",
+        _qwen3_visual_state_adapter(language_call),
+    )
+    _patch_method(
+        module.Model,
+        "get_input_embeddings",
+        _qwen3_batch_embedding_adapter(
+            module.Model.get_input_embeddings,
+            patched_qwen3_get_input_embeddings,
+            replace_visual_inference=_qwen3_drops_deepstack_after_eval(
+                module.Model.get_input_embeddings
+            ),
+        ),
+    )
     _patch_explicit_position_embeddings(qwen35_module.Model, patched_qwen35_get_input_embeddings)
     if qwen3moe_module is not None:
         qwen3moe_module.masked_scatter = _masked_scatter_no_numpy
@@ -2983,7 +3384,23 @@ def _install_qwen3_family_compile_patches():
         _patch_method(qwen3moe_vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
         _patch_method(qwen3moe_vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
         _patch_method(qwen3moe_language_module.Qwen3VLMoEModel, "_deepstack_process", patched_qwen3_deepstack)
-        _patch_explicit_position_embeddings(qwen3moe_module.Model, patched_qwen3_get_input_embeddings)
+        moe_language_call = qwen3moe_language_module.LanguageModel.__call__
+        _patch_method(
+            qwen3moe_language_module.LanguageModel,
+            "__call__",
+            _qwen3_visual_state_adapter(moe_language_call),
+        )
+        _patch_method(
+            qwen3moe_module.Model,
+            "get_input_embeddings",
+            _qwen3_batch_embedding_adapter(
+                qwen3moe_module.Model.get_input_embeddings,
+                patched_qwen3_get_input_embeddings,
+                replace_visual_inference=_qwen3_drops_deepstack_after_eval(
+                    qwen3moe_module.Model.get_input_embeddings
+                ),
+            ),
+        )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
     _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
 
