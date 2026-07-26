@@ -4361,3 +4361,94 @@ def test_callback_metadata_config_fields_are_appended_last():
         **{f.name: getattr(full, f.name) for f in dataclasses.fields(MLXTrainingConfig)}
     )
     assert same_version._unsloth_mlx_warmup_steps_explicit is False
+
+
+def test_wandb_artifact_mode_suppressed_for_on_train_end():
+    # transformers' WandbCallback.on_train_end logs its final-model artifact by
+    # constructing a Torch Trainer around args/model and calling its Torch
+    # save_model (integrations/integration_utils.py, 4.x and 5.x alike). MLX
+    # models are not torch.nn.Module and MLXTrainingConfig is not a
+    # TrainingArguments, so that constructor raises AttributeError
+    # (full_determinism on 5.x, batch_eval_metrics on 4.57.x). The adapters are
+    # already on disk by then, so the crash costs the caller the whole
+    # MLXTrainOutput of a run that actually finished. The bridge must clear the
+    # artifact mode for that one dispatch and restore it afterwards.
+    import enum
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLXCallbackHandler,
+    )
+
+    class _LogModel(str, enum.Enum):
+        # Mirrors transformers' WandbLogModel (a str Enum with .is_enabled).
+        CHECKPOINT = "checkpoint"
+        END = "end"
+        FALSE = "false"
+
+        @property
+        def is_enabled(self):
+            return self in (_LogModel.CHECKPOINT, _LogModel.END)
+
+    class WandbCallback:  # the class NAME is what the bridge matches on
+        def __init__(self, mode):
+            self._log_model = _LogModel(mode)
+            self._initialized = True
+            self.saw_enabled = None
+
+        def on_train_end(self, args, state, control, **kwargs):
+            self.saw_enabled = self._log_model.is_enabled
+            if self._log_model.is_enabled:
+                # Stands in for Trainer(args=MLXTrainingConfig, model=<mlx>).
+                raise AttributeError(
+                    "'MLXTrainingConfig' object has no attribute 'full_determinism'"
+                )
+
+    class OtherCallback:
+        def __init__(self):
+            self._log_model = _LogModel("end")
+
+    artifact_cb = WandbCallback("end")
+    checkpoint_cb = WandbCallback("checkpoint")
+    off_cb = WandbCallback("false")
+    other_cb = OtherCallback()
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(max_steps=1)
+    trainer.callback_handler = _MLXCallbackHandler(
+        [artifact_cb, checkpoint_cb, off_cb, other_cb],
+        model=object(),
+        processing_class=None,
+        optimizer=None,
+        lr_scheduler=None,
+    )
+
+    suppressed = trainer._suppress_torch_only_wandb_artifacts()
+    assert [cb for cb, _ in suppressed] == [artifact_cb, checkpoint_cb]
+    # Both artifact modes are cleared for the dispatch...
+    assert artifact_cb._log_model.is_enabled is False
+    assert checkpoint_cb._log_model.is_enabled is False
+    # ... a WandbCallback that never asked for artifacts is untouched, and a
+    # same-shaped non-Wandb callback is never rewritten.
+    assert off_cb._log_model is _LogModel.FALSE
+    assert other_cb._log_model is _LogModel.END
+
+    # The on_train_end dispatch now completes instead of raising.
+    trainer.callback_handler.call_event(
+        "on_train_end", trainer.args, object(), object(),
+    )
+    assert artifact_cb.saw_enabled is False
+    assert checkpoint_cb.saw_enabled is False
+
+    # The user's callbacks get their requested mode back afterwards.
+    trainer._restore_wandb_artifact_modes(suppressed)
+    assert artifact_cb._log_model is _LogModel.END
+    assert checkpoint_cb._log_model is _LogModel.CHECKPOINT
+
+    # ...and the training loop actually wires it around the real dispatch,
+    # with a restore that survives a callback raising.
+    source = inspect.getsource(MLXTrainer._train_inner)
+    assert "_suppress_torch_only_wandb_artifacts()" in source
+    assert 'finally:\n            self._restore_wandb_artifact_modes(' in source

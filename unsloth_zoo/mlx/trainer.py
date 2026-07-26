@@ -1704,6 +1704,42 @@ class MLXTrainer:
         """Remove and return a Hugging Face TrainerCallback class or instance."""
         return self.callback_handler.pop_callback(callback)
 
+    def _suppress_torch_only_wandb_artifacts(self):
+        """Disable HF WandbCallback final-model artifacts for one on_train_end.
+
+        WandbCallback.on_train_end logs that artifact by building a Torch
+        ``Trainer`` around ``args``/``model``, which raises AttributeError here
+        (``full_determinism`` on 5.x, ``batch_eval_metrics`` on 4.57.x). Adapters
+        are already saved by then, so the only casualty is the caller's
+        MLXTrainOutput. Per-checkpoint artifacts are untouched: on_save never
+        builds a Trainer. Returns (callback, previous_mode) pairs for
+        _restore_wandb_artifact_modes. Duck-typed so unsloth_zoo.mlx still
+        imports without Torch.
+        """
+        suppressed = []
+        for callback in getattr(self.callback_handler, "callbacks", ()):
+            if type(callback).__name__ != "WandbCallback":
+                continue
+            mode = getattr(callback, "_log_model", None)
+            if mode is None or not getattr(mode, "is_enabled", False):
+                continue
+            try:
+                # WandbLogModel is a str Enum, so the "false" member is
+                # reachable from the instance without importing transformers.
+                disabled = type(mode)("false")
+            except Exception:
+                continue
+            if getattr(disabled, "is_enabled", True):
+                continue
+            callback._log_model = disabled
+            suppressed.append((callback, mode))
+        return suppressed
+
+    def _restore_wandb_artifact_modes(self, suppressed):
+        """Undo _suppress_torch_only_wandb_artifacts on the user's callbacks."""
+        for callback, mode in suppressed:
+            callback._log_model = mode
+
     def _ensure_callback_args_compat(self):
         """Populate TrainingArguments-style fields read by common callbacks."""
         args = self.args
@@ -4630,7 +4666,23 @@ class MLXTrainer:
             final_save_error,
         )
 
-        _fire("on_train_end")
+        # HF's WandbCallback logs its final-model artifact by constructing a
+        # Torch Trainer around this (MLX) model, which raises AttributeError and
+        # would throw away the finished run's result. Skip just that artifact,
+        # keep the rest of on_train_end, restore the user's callback afterwards.
+        _wandb_artifact_modes = self._suppress_torch_only_wandb_artifacts()
+        if _wandb_artifact_modes:
+            _main_print(
+                "Unsloth: WandbCallback final-model artifacts need a Torch "
+                "Trainer and a torch.nn.Module, so they are skipped for MLX "
+                "runs. Adapters were still saved to "
+                f"{args.output_dir}; per-checkpoint W&B artifacts are "
+                "unaffected."
+            )
+        try:
+            _fire("on_train_end")
+        finally:
+            self._restore_wandb_artifact_modes(_wandb_artifact_modes)
         _sync_stop()
 
         return MLXTrainOutput({
