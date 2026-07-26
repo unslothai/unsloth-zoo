@@ -4216,7 +4216,7 @@ class MLXTrainer:
         # skip_first_batches). A stop set here is drained by the loop's first
         # _distributed_should_stop().
         if batches_per_epoch and microstep % batches_per_epoch:
-            _run_callback_epoch_begin(microstep // batches_per_epoch)
+            _run_callback_epoch_begin(float(microstep // batches_per_epoch))
         while self._global_step < total_steps:
             it = microstep + 1
             if self._distributed_should_stop() or self._early_stopped:
