@@ -1035,8 +1035,7 @@ def test_vlm_sized_index_routing_guard_and_cleanup():
         def __iter__(self): return iter(self.rows)
 
 
-    # Trainer seam: a sized iterable-map hybrid must pass the DDP gate and
-    # batch via the sized path...
+    # A sized iterable-map hybrid passes the DDP gate and batches via the sized path.
     sized_trainer = _vlm_trainer_shell_for(world_size=2, dataset=SizedIterableMap())
     _batches, sized_stream = sized_trainer._prepare_data(is_vlm=True)
     assert next(sized_stream)["input_ids"].shape[0] == 1
@@ -1044,7 +1043,7 @@ def test_vlm_sized_index_routing_guard_and_cleanup():
     knob_trainer.args.streaming_prefetch_batches = 1
     _b2, s2 = knob_trainer._prepare_data(is_vlm=True)  # notice path must not crash
     assert next(s2)["input_ids"].shape[0] == 1
-    # ...while a genuinely unsized source is rejected before consumption.
+    # A genuinely unsized source is rejected before consumption.
     lazy_probe = _LifecycleVLMRows(4)
     with pytest.raises(ValueError, match="DDP training"):
         _vlm_trainer_shell_for(world_size=2, dataset=lazy_probe)._prepare_data(is_vlm=True)
@@ -1115,8 +1114,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
         _RAW_INPUT_IDS_FOR_LABELS,
     )
 
-    # Placement authority: ignore ids, attention zeros, existing -100s; float
-    # comparisons mirror the finalized float32/int32 narrowing.
+    # Mask ignore ids, attention zeros and existing -100s; floats narrow as finalized.
     mask = _stage_vlm_label_mask_np(
         {"input_ids": np.array([[101, 200, 2, 7]]),
          "attention_mask": np.array([[1, 1, 0, 1]])},
@@ -1126,8 +1124,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
         {"input_ids": [[7, 8, 9]], "attention_mask": [[1, 0.5, 0.99999999]]})
     assert fractional.tolist() == [[False, True, False]]
 
-    # Float/exotic token-id streams never stage: they route to the bit-exact
-    # legacy path (sync) and reject in producer modes.
+    # Non-integer id streams never stage: legacy path in sync, reject in producer.
     from unsloth_zoo.mlx.utils import _vlm_ids_integer_host
     assert _vlm_ids_integer_host({"input_ids": np.array([[1, 2]])}) is True
     assert _vlm_ids_integer_host(
@@ -1160,8 +1157,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
             [{"prompt": "101", "completion": "102"}], FloatProcessor(), 8,
             None, reject_mlx_valued=True)
 
-    # Finalized values ride the SAME converted ids as legacy (dtype/keys/carrier
-    # by construction), incl. the P/C completion-branch int64 widening.
+    # Finalized values ride the same converted ids as legacy, incl. int64 widening.
     plain = _finalized_collate([{"text": "101"}], _FakeProcessor(), 8, None)
     assert plain["labels"].dtype == plain["input_ids"].dtype
     assert _RAW_INPUT_IDS_FOR_LABELS not in plain
@@ -1173,8 +1169,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
         completion_only_loss=False)
     assert off["labels"].dtype == off["input_ids"].dtype
 
-    # MLX-returning processors flag host_valued=False (prefetch contract),
-    # including nested mappings; reject mode raises BEFORE any conversion.
+    # MLX-returning processors flag host_valued=False, nested too; reject raises first.
     assert _vlm_inputs_host_valued(
         {"input_ids": np.array([[1]])}) is True
     assert _vlm_inputs_host_valued(
@@ -1184,8 +1179,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
         def __call__(self, text, **kwargs):
             out = super().__call__(text, **kwargs)
             return {k: mx.array(v) for k, v in out.items()}
-    # Processor-owned MLX outputs (mlx-vlm wrappers) stage OPAQUELY in
-    # producer mode: labels defer to the consumer-side finalizer.
+    # Processor-owned MLX outputs stage opaquely: labels defer to the finalizer.
     opaque = _collate_vlm_batch([{"text": "101"}], MxProcessor(), 8, None,
                                 reject_mlx_valued=True)
     assert opaque.host_valued is False and opaque.label_mask is None
@@ -1206,8 +1200,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
             yield_host_staged=True))
     assert probe.pulls == 0 and probe.epochs == []
 
-    # Routed value-carrying closures finalize through the verbatim legacy
-    # pipeline: custom values (777) and identity-closure dtype both match.
+    # Value-carrying closures finalize through the legacy pipeline unchanged.
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
     def _value_closure(mask_batch):
         width = len(mask_batch["input_ids"][0])
@@ -1219,8 +1212,7 @@ def test_vlm_host_label_authority_and_staged_finalize():
     assert routed["labels"].tolist()[0][1] == 777  # custom value preserved
     assert routed["labels"].dtype == mx.int64  # legacy value-pipeline dtype
 
-    # The raw wide-id carrier survives finalize for the legacy closure: an
-    # identity closure sees the invalid uint32 id, not a wrapped -100.
+    # The raw wide-id carrier survives finalize: the closure sees the uint32 id.
     class WideProcessor(_FakeProcessor):
         def __call__(self, text, **kwargs):
             out = super().__call__(text, **kwargs)
@@ -1356,7 +1348,7 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     assert np.asarray(batch["input_ids"]).tolist() == [[1, 2, 3, 4, 5]] * 2
     it.close()
 
-    class _PCRows:  # replayable UNSIZED source: the pc_opaque producer runs
+    class _PCRows:  # replayable unsized source
         def __iter__(self):
             return iter([{"prompt": "101", "completion": "102"},
                          {"prompt": "103", "completion": "104"}])
@@ -1378,8 +1370,7 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
         pf_it.close()
     assert label_threads and set(label_threads) == {threading.main_thread()}
 
-    # pc_opaque carries tokenizer-derived data, never the live processor:
-    # finalize must succeed after the tokenizer is torn down.
+    # pc_opaque holds no live tokenizer: finalize works after it is torn down.
     class _PoisonedTokenizer:
         def __getattr__(self, name):
             raise AssertionError(f"finalize dereferenced tokenizer.{name}")

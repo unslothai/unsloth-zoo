@@ -470,8 +470,7 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     env = os.environ.copy()
     repo_root = Path(__file__).resolve().parents[1]
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
-    # The ring launcher bash-execs the command array verbatim, so pin the
-    # interpreter as argv[0] instead of relying on a shebang + chmod.
+    # Ring launcher execs the array verbatim, so pin the interpreter as argv[0].
     cmd = [
         str(launcher), "-n", "2", "--backend", "ring",
         "--cwd", str(repo_root),
@@ -592,12 +591,10 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert ranks[0]["stream_labeled_empty"][1]["labels"][0] == [-100, 32]
     assert ranks[1]["stream_labeled_empty"][1]["lengths"][0] == [0, 0]
     assert ranks[1]["stream_labeled_empty"][1]["labels"][0] == [-100, -100]
-    # Intentional compatibility break: every-rank lazy-VLM consumption is
-    # replaced by a synchronized pre-consumption rejection on all ranks.
+    # Compatibility break: lazy VLM is now rejected on all ranks pre-consumption.
     assert [rank["stream_vlm_rejection"] for rank in ranks] == ["rejected", "rejected"]
-    # W=2 owner-side window: rows 10..14 (equal length) pool into chunks
-    # [10,11],[12,13]; seed-42 permutation emits [12,13] first, so the pass-tail
-    # partial [14] cycle-pads from that first dispatched batch.
+    # W=2: rows 10..14 pool into [10,11],[12,13]; seed 42 emits [12,13] first,
+    # so the partial tail [14] cycle-pads from it.
     assert [rank["stream_window"] for rank in ranks] == [
         [[12], [10], [14]], [[13], [11], [12]],
     ]

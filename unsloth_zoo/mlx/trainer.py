@@ -77,10 +77,9 @@ def _mlx_rank0_resolve_int(comm_group, resolver, context):
             value = int(resolver())
             status = 1
         except BaseException as exc:
-            # Synchronize the failure (KeyboardInterrupt/SystemExit included)
-            # before it propagates: peers are already blocking in the metadata
-            # collective and would hang if rank 0 unwound past it silently.
-            # The original error is re-raised on rank 0 below.
+            # Synchronize the failure (interrupts included) before it
+            # propagates: peers block in the metadata collective and would hang
+            # if rank 0 unwound past it. Re-raised on rank 0 below.
             owner_error = exc
             status = -1
     metadata = mx.array(
@@ -218,18 +217,15 @@ def _mlx_stream_declares_infinite(dataset):
             and getattr(ex_iterable, "num_times", 0) is None
         ):
             return True
-        # These are private datasets internals: read them defensively so a
-        # rename in a future release degrades detection (the stream just
-        # is not recognized as infinite) instead of failing eval for every
-        # stream whose wrapper class matches by name.
+        # Private datasets internals: read defensively so a future rename only
+        # loses detection instead of failing eval for every matching stream.
         if kind in (
             "VerticallyConcatenatedMultiSourcesExamplesIterable",
             "HorizontallyConcatenatedMultiSourcesExamplesIterable",
         ):
-            # Vertical concat runs children one after another. Horizontal
-            # concat advances them together but drops each child as it is
-            # exhausted and stops only once every child is gone, so it ends
-            # with the LONGEST child. Both are infinite when ANY child is.
+            # Vertical concat runs children in sequence; horizontal concat
+            # drops each as it exhausts and ends with the LONGEST child. Both
+            # are infinite when ANY child is.
             return any(
                 _is_infinite(child, seen)
                 for child in getattr(ex_iterable, "ex_iterables", ())
@@ -298,8 +294,8 @@ class _MLXLazyEvalBatchView:
                 except StopIteration:
                     return
         finally:
-            # max_eval_batches truncation (and early consumer exits) must
-            # release the lazy pass's owned source cursors deterministically.
+            # Truncation and early consumer exits must release the owned
+            # source cursors deterministically.
             close = getattr(iterator, "close", None)
             if callable(close):
                 close()
@@ -729,9 +725,9 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
               f"(save_total_limit={save_total_limit})")
 
 
-# Fields added after the original public MLXTrainingConfig surface. They must
-# stay a suffix of the declaration order (append new ones at the end and list
-# them here) so positional copies from older configs keep mapping correctly.
+# Fields added after the original public MLXTrainingConfig surface. Keep them a
+# suffix of the declaration order (append new ones at the end and list them
+# here) so positional copies from older configs keep mapping correctly.
 _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",
@@ -829,8 +825,8 @@ class MLXTrainingConfig:
     vlm_chat_template: object = None  # Unsloth template name/tuple or raw Jinja string
     per_device_eval_batch_size: int | None = None
     image_size: object = None  # VLM image resize override from UnslothVisionDataCollator(resize=...)
-    # Appended by main after image_size; kept before this branch's streaming
-    # fields so a positional copy from a main config still maps correctly.
+    # Appended by main after image_size; kept before the streaming fields so a
+    # positional copy from a main config still maps correctly.
     label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
     # Opt-in true global grad-norm reporting when global-norm clipping is off.
@@ -848,18 +844,17 @@ class MLXTrainingConfig:
     # weight decay.
     report_grad_norm: bool = False
 
-    # This branch's lazy-streaming fields, appended LAST after every pre-existing
-    # (including main-appended) field, so positional copies from older configs
-    # keep mapping correctly. Listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
+    # Lazy-streaming fields, appended LAST after every pre-existing field so
+    # positional copies from older configs keep mapping correctly. Listed in
+    # _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
     max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
     # Lazy default-order text streams: pool this many global micro-batches,
-    # length-sort, emit seeded-permuted batches. 1 = exact source order (prior
-    # behavior). Memory scales with world size; the DDP owner also retains one
-    # pass-long cycle-padding batch (documented bound W + 1).
+    # length-sort, emit seeded-permuted batches. 1 = exact source order. Memory
+    # scales with world size; the DDP owner retains one extra padding batch.
     streaming_text_length_window_batches: int = 8
-    # Lazy text streams: prepare up to this many batches ahead on a producer
-    # thread (0 = synchronous, the default; single-process only; host-valued
-    # rows required). Retention adds the queued batches to the window bound.
+    # Lazy text streams: prepare this many batches ahead on a producer thread
+    # (0 = synchronous default; single-process, host-valued rows only). Queued
+    # batches add to the window bound.
     streaming_prefetch_batches: int = 0
 
     def __init__(self, *args, **kwargs):
@@ -898,16 +893,11 @@ class MLXTrainingConfig:
 
         warmup_steps_default = type(self).warmup_steps
         warmup_ratio_default = type(self).warmup_ratio
-        # A config copied field-by-field (or round-tripped through a full-field
-        # dump) from an older Unsloth may omit fields added later; treat such
-        # copies as wholesale copies for warmup semantics, or a copied default
-        # warmup_steps would override a non-default warmup_ratio. Tolerate every
-        # field appended since: the positional optional-copy fields plus the
-        # later scalar additions.
-        # Every field appended after configs began round-tripping: this branch's
-        # streaming suffix plus the earlier scalar additions (compile_max_variants
-        # is mid-order; label_smoothing_factor / report_grad_norm precede the
-        # streaming suffix). A legacy dump missing any of them is still a copy.
+        # A config copied or round-tripped from an older Unsloth may omit later
+        # fields; still treat it as a wholesale copy for warmup semantics, or a
+        # copied default warmup_steps would override a non-default warmup_ratio.
+        # So tolerate every field appended since: the positional optional-copy
+        # fields plus the later scalar additions.
         _appended_fields = set(_MLX_CONFIG_OPTIONAL_COPY_FIELDS) | {
             "compile_max_variants",
             "label_smoothing_factor",
@@ -1569,10 +1559,9 @@ class MLXTrainer:
         if not failed_any:
             return
         if exc is not None and not isinstance(exc, Exception):
-            # Interrupts (KeyboardInterrupt/SystemExit) were captured only so
-            # this rank could join the consensus; re-raise them unwrapped and
-            # without mutating trainer state, so a reused trainer does not
-            # inherit a stop request from an interrupt.
+            # Interrupts were captured only so this rank could join the
+            # consensus. Re-raise unwrapped without mutating trainer state, so
+            # a reused trainer does not inherit a stop request.
             raise exc
         self.stop_requested = True
         if exc is not None:
@@ -2034,11 +2023,10 @@ class MLXTrainer:
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
-        # A stop requested before evaluation (e.g. a step callback firing on an
-        # eval step) must abort before the first pull: an unsized source's next
-        # row can block, so cancellation could otherwise never take effect. The
-        # check is rank-synchronized, so peers return together instead of
-        # diverging at the in-loop status collective.
+        # A stop requested before evaluation must abort before the first pull:
+        # an unsized source's next row can block, so cancellation could
+        # otherwise never take effect. Rank-synchronized so peers return
+        # together instead of diverging at the in-loop status collective.
         should_stop, _ = self._distributed_eval_status()
         if should_stop:
             return all_losses, ntokens
@@ -2053,7 +2041,7 @@ class MLXTrainer:
                 break
             except BaseException as exc:
                 # Interrupts included: every rank must reach the eval status
-                # collective below, or the surviving ranks hang in it.
+                # collective below or the survivors hang in it.
                 failed = True
                 error = exc
 
@@ -2117,8 +2105,8 @@ class MLXTrainer:
         if args.streaming and _is_mlx_lazy_text_source(eval_dataset):
             max_batches = getattr(args, "max_eval_batches", None)
             if max_batches is not None:
-                # Reject rather than truncate non-integral values (1.9, True):
-                # silent coercion would change how much eval data is scored.
+                # Reject rather than truncate: silent coercion would change how
+                # much eval data is scored.
                 coerced = None
                 if not isinstance(max_batches, bool):
                     try:
@@ -2455,8 +2443,8 @@ class MLXTrainer:
         """Best-effort release of an iterator owned by the training run."""
         batch_iter = getattr(self, "_active_batch_iter", None)
         self._active_batch_iter = None
-        # Normal, failed, and interrupted exits all pass through here: close the
-        # producer and persist a live orphan so the next run's gate sees it.
+        # Every exit path lands here: close the producer and persist a live
+        # orphan so the next run's gate sees it.
         control = getattr(self, "_mlx_prefetch_control", None)
         prefetcher = control.get("prefetcher") if control else None
         try:
@@ -2465,9 +2453,9 @@ class MLXTrainer:
                 try:
                     close()
                 except Exception:
-                    # An ordinary cleanup error must not mask the training error
-                    # already in flight or diverge ranks after a final
-                    # collective. A propagating signal is honored (see finally).
+                    # A cleanup error must not mask an in-flight training error
+                    # or diverge ranks after a final collective. A propagating
+                    # signal is still honored (see finally).
                     pass
             if prefetcher is not None:
                 try:
@@ -2476,10 +2464,9 @@ class MLXTrainer:
                     pass
         finally:
             if prefetcher is not None:
-                # close() marks a conservative orphan before doing anything, so
-                # a not-clean close OR a propagating interrupt leaves
-                # orphaned=True; persist it either way (a clean, drained close
-                # clears the flag). The next run's gate drains and clears it.
+                # close() marks a conservative orphan up front, so an unclean
+                # close or a propagating interrupt leaves orphaned=True. Persist
+                # it either way; the next run's gate drains and clears it.
                 if prefetcher.orphaned:
                     self._mlx_prefetch_orphan = prefetcher
                 if control is not None:
@@ -2502,9 +2489,8 @@ class MLXTrainer:
                     "to serialize concurrently. Wait for the thread to "
                     "terminate, then call save_model() again."
                 )
-            # Terminated orphan: close() drains its queued batches (device
-            # tensors for opaque VLM outputs) before this save, rather than
-            # relying on the reference drop to eventually free them.
+            # Terminated orphan: close() drains its queued device tensors
+            # before this save instead of waiting on the reference drop.
             orphan.close()
             self._mlx_prefetch_orphan = None
         control = getattr(self, "_mlx_prefetch_control", None)
@@ -2514,9 +2500,9 @@ class MLXTrainer:
         if not terminal:
             prefetcher.quiesce()
             return prefetcher
-        # Gate on close()'s return, not a fresh orphan_alive() read: close()
-        # drained the queue iff it reports clean, so this cannot proceed to
-        # save with staged batches (device tensors) still queued.
+        # Gate on close()'s return, not a fresh orphan_alive() read: it drained
+        # the queue iff it reports clean, so a save can never proceed with
+        # staged device tensors still queued.
         if not prefetcher.close():
             self._mlx_prefetch_orphan = prefetcher
             control["prefetcher"] = None
@@ -2527,7 +2513,7 @@ class MLXTrainer:
                 "then call save_model() again."
             )
         # Terminal close succeeded: drop the control reference so the ensuing
-        # save_model() wrapper gate is a no-op (no quiesce/resume re-entry).
+        # save_model() wrapper gate is a no-op.
         control["prefetcher"] = None
         return None
 
@@ -2848,9 +2834,9 @@ class MLXTrainer:
                 loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
                 _main_print("Unsloth: Using standard cross-entropy loss.")
 
-        # Prepare data, determine total_steps first. Keep any prebuilt flag
-        # from train_on_responses_only; _prepare_data returns self._batches
-        # early and never re-derives it for the completion-only text path.
+        # Prepare data and total_steps first. Keep any prebuilt flag from
+        # train_on_responses_only: _prepare_data returns self._batches early
+        # and never re-derives it for the completion-only text path.
         previous_orphan = getattr(self, "_mlx_prefetch_orphan", None)
         if previous_orphan is not None:
             if previous_orphan.orphan_alive():
@@ -2861,7 +2847,7 @@ class MLXTrainer:
                     "before training with this trainer again."
                 )
             # Terminated orphan: close() drains its queued batches before the
-            # reference is dropped, releasing them deterministically.
+            # reference is dropped.
             previous_orphan.close()
             self._mlx_prefetch_orphan = None
         self._mlx_resume_step_for_prefetch = 0
@@ -2874,9 +2860,9 @@ class MLXTrainer:
             and getattr(self.args, "streaming", False)
         )
         if _wants_prefetch and getattr(self, "_resume_from_checkpoint", None):
-            # Single authority: the same validated load feeds the producer skip
-            # now and the scalar restoration later (world size is 1 here, so no
-            # duplicated distributed collectives). Failures stay hard.
+            # Single authority: this validated load feeds the producer skip now
+            # and the scalar restoration later. World size is 1 here, so no
+            # duplicated collectives. Failures stay hard.
             _early_resume = self._validate_distributed_resume_checkpoint(
                 self._resume_from_checkpoint
             )
@@ -2909,9 +2895,8 @@ class MLXTrainer:
                 and args.num_train_epochs > 0
             ):
                 # Declared-length streaming epochs: total micro-batches come
-                # from the per-pass trainable-row count. The finite-plan step
-                # resolver rejects streaming + num_train_epochs, so resolve it
-                # here for the streaming path.
+                # from the per-pass trainable-row count. The finite-plan
+                # resolver rejects streaming, so resolve it here.
                 total_steps = max(1, (
                     _stream_epochs * args.num_train_epochs
                 ) // args.gradient_accumulation_steps)
@@ -2938,8 +2923,8 @@ class MLXTrainer:
                 distributed_world_size=distributed_world_size,
                 compile_policy=compile_policy,
             )
-        # Prefetch wiring is shared by both the preflight and prepared paths:
-        # batch_iter is the streaming producer when active, None otherwise.
+        # Shared by the preflight and prepared paths: batch_iter is the
+        # streaming producer when active, None otherwise.
         _prefetch_active = bool(
             getattr(self, "_mlx_prefetch_control", None)
             and self._mlx_prefetch_control.get("eligible")
@@ -3386,9 +3371,9 @@ class MLXTrainer:
                         outputs=_compile_state,
                     )
                 except BaseException as e:
-                    # Ordinary failures keep the eager-fallback path; an
-                    # interrupt must abort through the consensus instead of
-                    # silently downgrading the run to eager mode.
+                    # Ordinary failures fall back to eager, but an interrupt
+                    # must abort through the consensus instead of silently
+                    # downgrading the run.
                     if isinstance(e, Exception):
                         _compile_setup_error = e
                     else:
@@ -4083,9 +4068,9 @@ class MLXTrainer:
                 except Exception as e:
                     _main_print(f"Unsloth: failed to restore best model ({e}).")
                 except BaseException as e:
-                    # Ordinary restore failures stay log-and-continue, but an
+                    # Ordinary restore failures log and continue, but an
                     # interrupt must reach the consensus below before the
-                    # diagnostics collective, or peers hang in it.
+                    # diagnostics collective or peers hang in it.
                     restore_abort = e
         self._raise_distributed_failure(
             restore_abort is not None,
@@ -4512,9 +4497,8 @@ class MLXTrainer:
         try:
             return self._save_model_impl(output_dir)
         finally:
-            # A mid-training save (e.g. from a step callback) pauses the
-            # producer for exclusivity and resumes it; only the end-of-training
-            # path closes it terminally.
+            # A mid-training save pauses the producer for exclusivity and
+            # resumes it; only end-of-training closes it terminally.
             if paused_prefetcher is not None:
                 paused_prefetcher.resume()
 

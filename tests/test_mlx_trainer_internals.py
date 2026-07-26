@@ -1133,8 +1133,7 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     legacy_values = [getattr(MLXTrainingConfig(), field.name) for field in legacy_fields]
     _legacy_names = [field.name for field in legacy_fields]
     legacy_values[_legacy_names.index("warmup_ratio")] = 0.1
-    # image_size is an object field; set it by name (the optional-copy fields
-    # are the trailing suffix, so image_size is no longer the last legacy field).
+    # image_size is no longer the last legacy field, so set it by name.
     legacy_values[_legacy_names.index("image_size")] = (128, 256)
     copied_ratio_trainer.args = MLXTrainingConfig(*legacy_values)
     assert copied_ratio_trainer.args.image_size == (128, 256)
@@ -3157,8 +3156,8 @@ def test_streaming_window_identity_grouping_padding_gate_and_ddp_slice():
     assert grouped == _window_batches(rows, window=4) != baseline
     assert [ids for ids, _ in _window_batches(rows, window=4, seed=1)] != [ids for ids, _ in grouped]
 
-    # Single-process windowed slicing must see an EMPTY pad_source (cycle
-    # padding is multi-rank-only) and leave the partial tail short.
+    # Single process: pad_source must be empty (cycle padding is multi-rank only)
+    # and the partial tail stays short.
     from unsloth_zoo.mlx import utils as mlx_utils
     odd, seen_pads = _window_rows(_WINDOW_LENGTHS[:7]), []
     original = mlx_utils._rank_slice_distributed_batch
@@ -3296,8 +3295,7 @@ def test_host_staging_seam_parity_and_host_valued_flag():
     assert not _stage_tokenized_text_batch(
         [(mx.array([7, 8]), None), ([1, 2], None)], 8).host_valued
 
-    # Raw-text pipeline end-to-end: an mx-returning tokenizer must surface as a
-    # host_valued=False STAGED batch (the raw stager forwards the stream flag).
+    # An mx-returning tokenizer must stage host_valued=False end to end.
     class MxRawTok(_StreamingTextTokenizer):
         def encode(self, text, add_special_tokens=True):
             return mx.array(super().encode(text, add_special_tokens))
@@ -3344,16 +3342,14 @@ def test_streaming_prefetch_identity_laziness_and_knob():
     assert "streaming_prefetch_batches" in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
     assert MLXTrainingConfig().streaming_prefetch_batches == 0  # default OFF
 
-    # Producer-side resume skip parity: first batch equals the sync sequence
-    # at the skip offset (single skip authority — no double fast-forward).
+    # Resume skip parity: first batch equals sync at the skip offset, once only.
     sync_all = _window_batches(rows, window=4)
     skipped = _window_stream(rows, window=4, prefetch_batches=2,
                              prefetch_skip_batches=2)
     first_after_skip = [row[0] for row in next(iter(skipped))[0].tolist()]
     assert first_after_skip == sync_all[2][0]
 
-    # Trainer records prefetch eligibility synchronously (guards its own
-    # legacy fast-forward) and the orphan gate survives exceptional teardown.
+    # Eligibility is recorded synchronously and the orphan gate survives teardown.
     _T, trainer = _streaming_text_trainer(
         per_device_train_batch_size=2, max_seq_length=64,
         streaming_prefetch_batches=2)
@@ -3566,8 +3562,7 @@ def test_concat_streaming_eval_is_infinite_when_any_child_is():
         def __init__(self, ex): self._ex_iterable = ex
 
     inf, fin = RepeatExamplesIterable(), _FiniteChild()
-    # Horizontal concat drops each child as it is exhausted and stops only once
-    # all of them are gone, so it ends with the LONGEST child.
+    # Horizontal concat ends with the longest child, so any infinite child wins.
     assert _mlx_stream_declares_infinite(
         _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is True
     assert _mlx_stream_declares_infinite(
@@ -3585,8 +3580,7 @@ def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
     from datasets import IterableDataset, concatenate_datasets
     from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
 
-    # Generator-backed so the axis=1 cross-check does not hit the arrow-path
-    # cast that datasets raises for a ragged column-wise concat.
+    # Generator-backed: the arrow path rejects a ragged axis=1 concat.
     def rows(column, n):
         return lambda: ({column: str(i)} for i in range(n))
 

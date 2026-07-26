@@ -1573,8 +1573,7 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
     if values.dtype == np.float64:
         values = values.astype(np.float32)
     if np.issubdtype(values.dtype, np.integer):
-        # Compare on the SAME normalized representation finalize uses for the
-        # label base (wide unsigned ids become their int64 sentinels first).
+        # Same normalization finalize uses (wide unsigned ids -> int64 sentinels)
         values = _normalize_numpy_cce_labels(values)
     mask = values == -100
     if ignore_token_ids:
@@ -1700,20 +1699,17 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
         return _finalize_vlm_batch(inner, keep_raw_carrier=keep_raw_carrier)
     batch = _to_mx_vlm_batch(staged.inputs)
     if staged.label_mask is None:
-        # Opaque processor outputs (the processor itself returned MLX arrays,
-        # e.g. mlx-vlm wrappers): label semantics run the legacy path here on
-        # the consumer thread. Producer-side, Unsloth only ran the permitted
-        # materialization barrier over the processor's own pending graphs —
-        # no new MLX computation or value transform touched the payload.
+        # Opaque processor outputs (mlx-vlm wrappers return MLX arrays): run the
+        # legacy label path here on the consumer thread. The producer only
+        # materialized the processor's own pending graphs, nothing more.
         batch["labels"] = _apply_vlm_label_masks(
             batch, ignore_token_ids=staged.ignore_token_ids,
         )
         batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
         return _prepare_vlm_batch_for_compile(batch, staged.config)
     if staged.label_mask is not None:
-        # Values ride the SAME converted ids the legacy path used; only the
-        # host-decided placement differs from raw ids. Conversion-time errors
-        # therefore match legacy exactly.
+        # Values ride the same converted ids legacy used, so conversion-time
+        # errors match exactly; only the host-decided placement differs.
         raw = (
             batch.get(_RAW_INPUT_IDS_FOR_LABELS)
             if keep_raw_carrier
@@ -4213,14 +4209,12 @@ def _is_mlx_lazy_text_source(dataset):
     if isinstance(dataset, Iterator):
         return True
     source_mro = type(dataset).__mro__
-    # Explicit iteration wins over custom size/index methods: guarded streams
-    # may expose advisory or deliberately unusable map-style operations that
-    # must not be probed merely to decide whether streaming is safe.
+    # Explicit iteration wins over map-style methods, which may be advisory or
+    # deliberately unusable and must not be probed just to classify the source.
     if any("__iter__" in cls.__dict__ for cls in source_mro):
         return True
-    # Python's sequence-iteration fallback accepts __getitem__ without
-    # __iter__. Preserve classes declaring both map-style protocols without
-    # probing either operation; getitem-only fallback iterables remain lazy.
+    # Python's sequence-iteration fallback accepts __getitem__ without __iter__:
+    # both protocols means map-style, getitem-only stays lazy. Neither is probed.
     has_getitem = any("__getitem__" in cls.__dict__ for cls in source_mro)
     has_len = any("__len__" in cls.__dict__ for cls in source_mro)
     return has_getitem and not has_len
@@ -4432,8 +4426,7 @@ def _stage_tokenized_text_batch(
 def _create_tokenized_text_batch(batch_items, max_seq_length, pad_id=0,
                                  labels_expected=None):
     """Pad pretokenized ids plus optional labels for one MLX text batch."""
-    # host_valued=True skips the recursive provenance scan: this wrapper
-    # finalizes immediately, so the flag is never consumed.
+    # host_valued=True skips the provenance scan: this finalizes immediately.
     return _finalize_text_batch(_stage_tokenized_text_batch(
         batch_items, max_seq_length, pad_id=pad_id,
         labels_expected=labels_expected, host_valued=True,
@@ -5345,15 +5338,13 @@ def _collate_vlm_prompt_completion_batch(
         _vlm_inputs_host_valued(prompt_inputs)
         and _vlm_inputs_host_valued(completion_inputs)
     )
-    # Snapshot the tokenizer-derived collation scalars while this thread
-    # still exclusively owns the processor; the carrier transports data, not
-    # the live processor, so the consumer never dereferences it.
+    # Snapshot the tokenizer-derived collation scalars while this thread still
+    # owns the processor: the carrier transports data, never the live processor.
     flush_side = _vlm_tokenizer_padding_side(processor)
     pad_id = _vlm_pad_token_id(processor)
     if not pc_host_valued and reject_mlx_valued:
-        # Processor-owned MLX outputs: materialize their pending graphs on
-        # this thread (lazy arrays cannot cross the thread boundary) and
-        # defer the combine + label decisions to the consumer finalizer.
+        # Processor-owned MLX outputs: materialize their pending graphs here
+        # (lazy arrays cannot cross threads) and defer combine + labels.
         _materialize_mlx_values(prompt_inputs, completion_inputs)
         return _HostStagedVLMBatch(
             None, None, host_valued=False,
@@ -5462,15 +5453,14 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     """
     normalize_vlm_processor_chat_template(processor, strict=False)
     if reject_mlx_valued and any(_contains_mlx_values(item) for item in items):
-        # Source rows carrying MLX arrays (e.g. mx image tensors) must reject
-        # before formatting or the processor touches them off-thread.
+        # Reject before formatting or the processor touches them off-thread.
         _reject_mlx_valued_vlm("the dataset row")
     formatted_items = []
     for item in items:
         if formatting_func is not None:
             item = formatting_func(item)
             if reject_mlx_valued and _contains_mlx_values(item):
-                # Formatters can introduce MLX values after the row-level scan.
+                # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_vlm("the formatting function")
         formatted_items.append(item)
 
@@ -5522,23 +5512,20 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             inputs, label_mask, ignore_token_ids=ignore_token_ids,
         )
     elif reject_mlx_valued and not _vlm_inputs_host_valued(inputs):
-        # The PROCESSOR itself emitted MLX arrays (mlx-vlm wrappers do this
-        # regardless of return_tensors): materialize its pending graphs on
-        # this thread (lazy arrays cannot cross the thread boundary), carry
-        # the payload through otherwise untouched, and decide labels at
-        # finalize. Unsloth issues no new MLX computation producer-side.
+        # The processor itself emitted MLX arrays (mlx-vlm wrappers always do):
+        # materialize its pending graphs here (lazy arrays cannot cross threads),
+        # carry the payload through untouched, and decide labels at finalize.
         _materialize_mlx_values(inputs)
         staged = _HostStagedVLMBatch(
             inputs, None, host_valued=False,
             ignore_token_ids=ignore_token_ids,
         )
     elif reject_mlx_valued:
-        # Host-valued but non-integer ids: legacy conversion would run
-        # producer-side, so reject with the synchronous remedy.
+        # Host-valued non-integer ids: legacy conversion would run producer-side.
         _reject_non_integer_host_vlm_ids("the processor")
     else:
         # MLX-valued processor outputs: legacy synchronous label path, wrapped
-        # so the single finalizer stays the only exit to the trainer.
+        # so the finalizer stays the only exit to the trainer.
         batch = _to_mx_vlm_batch(inputs)
         batch["labels"] = _apply_vlm_label_masks(
             batch, ignore_token_ids=ignore_token_ids,
@@ -5640,10 +5627,9 @@ def _build_response_masked_vlm_batch(
     )
     staged.config = config
     if response_mask_fn is not None and not is_prompt_completion:
-        # Closure semantics are DEFINED on the converted, compile-prepared
-        # tensors (image-token expansion shifts positions), so response
-        # masking is consumer-side by nature and runs the verbatim legacy
-        # order. Producer-destined staging therefore cannot cover it.
+        # Closure semantics are defined on the converted, compile-prepared
+        # tensors (image-token expansion shifts positions), so response masking
+        # is consumer-side by nature and staging cannot cover it.
         if yield_host_staged:
             raise ValueError(
                 "Unsloth MLX VLM: train_on_responses_only streams are not "
@@ -6110,8 +6096,7 @@ def _iterate_lazy_vlm_training_batches(
             if replay_iterator is active_iterator
             else (active_iterator, replay_iterator)
         )
-        # A processor/cardinality error may already be unwinding; attempt every
-        # owned cursor without replacing that primary failure.
+        # Close every owned cursor without replacing an in-flight failure.
         for iterator in cleanup_iterators:
             try:
                 _close_mlx_owned_iterator(iterator)
@@ -6241,10 +6226,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
     else:
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
-            # The shared prefetch producer generalizes over host-staged
-            # batches; the VLM finalizer converts on the consumer thread.
-            # Response-masked streams reject at the iterator entry
-            # (zero-touch).
+            # The shared producer stages; the VLM finalizer converts on the
+            # consumer thread. Response-masked streams reject at iterator entry.
             prefetcher = _LazyTextPrefetcher(
                 None,
                 prefetch_depth,
@@ -7171,10 +7154,8 @@ def _iter_lazy_tokenized_text_rows(
         if completion_only_loss is not None:
             return completion_only_loss
         if item_has_boundary or row_has_boundary:
-            # A prompt/completion row always resolves the default mask mode
-            # from its own shape; inheriting a plain-text row's False here
-            # would silently train prompt tokens, and ordering would decide.
-            # The schema/label validators then reject mixed streams.
+            # Resolve from the row's own shape: inheriting a plain-text row's
+            # False would silently train prompt tokens, order-dependently.
             state["pretokenized_completion_only_loss"] = True
             return True
         if "pretokenized_completion_only_loss" in state:
@@ -7185,8 +7166,8 @@ def _iter_lazy_tokenized_text_rows(
         completion_mode,
         has_completion_boundary=False,
     ):
-        # Empty label-owned rows have no token labels, but they also are not an
-        # unlabeled schema transition. A non-None sentinel preserves that fact.
+        # Empty label-owned rows have no labels yet are not an unlabeled schema
+        # transition; a non-None sentinel preserves that.
         label_owned = response_mask_fn is not None or assistant_only_loss or (
             completion_mode is True and has_completion_boundary
         )
@@ -7194,8 +7175,7 @@ def _iter_lazy_tokenized_text_rows(
 
     for item in dataset:
         if reject_rows and _contains_mlx_values(item):
-            # Rows carrying MLX arrays must reject before any parsing,
-            # truthiness probe, or formatter call can touch them off-thread.
+            # Reject before any parse, truthiness probe, or formatter call.
             _reject_mlx_valued_text("the dataset row")
         item_has_completion_boundary = (
             isinstance(item, Mapping)
@@ -7208,8 +7188,7 @@ def _iter_lazy_tokenized_text_rows(
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
         ) else [item]
         if not source_rows:
-            # Assistant-only validation applies to the original logical row
-            # before a formatter can replace it or produce side effects.
+            # Validate the original logical row, before any formatter runs.
             source_rows = [None]
         source_has_input_ids = any(
             isinstance(row, Mapping) and "input_ids" in row
@@ -7220,9 +7199,8 @@ def _iter_lazy_tokenized_text_rows(
             and formatting_func is not None
             and "assistant_source_checked" not in state
         ):
-            # Match the eager/SFT contract: validate the first original sample
-            # once, then validate every formatter result below. Pretokenized
-            # rows bypass the formatter and carry their own assistant metadata.
+            # Eager/SFT contract: validate the first original sample once, then
+            # every formatter result below. Pretokenized rows bypass both.
             if not source_has_input_ids:
                 _require_assistant_conversation(item)
             state["assistant_source_checked"] = True
@@ -7241,8 +7219,7 @@ def _iter_lazy_tokenized_text_rows(
                 and not _looks_like_mlx_chat_messages(formatted)
             ) else [formatted]
         if not source_rows:
-            # An empty formatter list expands to zero rows, not one invalid
-            # row. Preserve only its schema/label observation, then continue.
+            # An empty formatter list expands to zero rows, not one invalid row.
             row_completion_only_loss = _resolve_completion_mode(
                 item_has_completion_boundary
             )
@@ -7600,15 +7577,14 @@ class _LazyTextPrefetcher:
                     except Exception:
                         pass
             finally:
-                # Published only after producer-owned cleanup: quiesce() treats
-                # _done as proof the thread no longer touches shared objects.
+                # quiesce() treats _done as proof the thread is finished with
+                # the shared objects, so publish it only after cleanup.
                 self._done.set()
 
     def _ensure_started(self):
         with self._lifecycle_lock:
-            # One lock covers the closed check and thread publication so a
-            # concurrent close() cannot return "clean" and then observe a
-            # producer started afterwards.
+            # One lock covers the closed check and thread publication, so a
+            # concurrent close() cannot report "clean" then see a new producer.
             if self._closed or self._stop.is_set():
                 raise StopIteration
             if self._thread is None:
@@ -7679,10 +7655,8 @@ class _LazyTextPrefetcher:
         and no concurrent closer can observe it half-drained. ``orphaned`` is
         set conservatively before the join, so an interrupted join leaves a live
         producer classified as an orphan rather than falsely clean."""
-        # Mark a conservative orphan up front: if anything below is interrupted
-        # (a signal during lock acquisition, the join, or the drain), the
-        # producer is already recorded as unresolved rather than left falsely
-        # clean. A clean termination clears it below.
+        # Conservative orphan up front: an interrupt during the lock, join, or
+        # drain then leaves the producer unresolved rather than falsely clean.
         self.orphaned = True
         with self._lifecycle_lock:
             self._stop.set()
@@ -7694,11 +7668,9 @@ class _LazyTextPrefetcher:
                 thread.join(timeout=self._JOIN_TIMEOUT)
             terminated = thread is None or not thread.is_alive()
             if terminated:
-                # A joined-dead thread has published its final enqueue and will
-                # never write again, so draining here cannot lose a batch. Clear
-                # the orphan flag only AFTER the drain completes: a signal during
-                # the drain then still leaves a conservative orphan (flag set,
-                # queue not yet empty) for the caller's finally to persist.
+                # A joined-dead thread never writes again, so this cannot lose
+                # a batch. Clear the flag only after the drain, so an interrupt
+                # mid-drain still leaves a conservative orphan.
                 self._drain_envelopes()
                 self.orphaned = False
             return terminated
@@ -7797,9 +7769,8 @@ def _iterate_lazy_text_training_batches(
         # Sequential contract: exact source order, length grouping off.
         length_window = 1
     window_seed = _normalize_seed(window_seed)
-    # Cycle padding only feeds direct multi-rank slicing; the single-process
-    # path and the rank-0 owner iterator (comm_group=None, outer cycle_source)
-    # must not retain a pass-long first batch on top of the window bound.
+    # Cycle padding only feeds direct multi-rank slicing; single-process and
+    # rank-0 owner iterators must not retain a pass-long first batch.
     needs_padding_source = _distributed_rank_size(comm_group)[1] > 1
 
     prepared_view = (
@@ -7876,10 +7847,8 @@ def _iterate_lazy_text_training_batches(
             window_ordinal = 0
 
             def _flush_window():
-                # Emit pooled rows as length-grouped global batches: stable sort
-                # by truncated length with arrival tiebreak, chunk, then a seeded
-                # permutation of the FULL chunks only — a trailing partial chunk
-                # always emits last so mid-stream batches keep uniform row counts.
+                # Stable sort by truncated length, chunk, then seeded-permute
+                # the FULL chunks only, so a partial chunk always emits last.
                 nonlocal window_rows, window_ordinal, yielded
                 if not window_rows:
                     return
@@ -7903,8 +7872,7 @@ def _iterate_lazy_text_training_batches(
                 window_ordinal += 1
                 window_rows = []
                 for chunk_index in emit:
-                    # Release each chunk as it is emitted so flush-time retention
-                    # stays within the W-batch window bound.
+                    # Release each chunk as emitted to stay within the window.
                     chunk = chunks[chunk_index]
                     chunks[chunk_index] = None
                     local_items = _rank_slice_distributed_batch(
@@ -7961,9 +7929,8 @@ def _iterate_lazy_text_training_batches(
                     yield first
 
             def _stoppable(source):
-                # Cooperative cancellation lands between SOURCE rows — checked
-                # BEFORE each pull (a stop during row processing must not cost
-                # another blocking read) and after, for stops during next().
+                # Cancellation lands between source rows: checked before each
+                # pull (so a stop costs no extra blocking read) and after it.
                 iterator = iter(source)
                 while True:
                     if should_stop():
@@ -8119,9 +8086,8 @@ def _iterate_lazy_text_training_batches(
             if replay_iterator is active_iterator
             else (active_iterator, replay_iterator)
         )
-        # A schema/source error may already be unwinding. Cleanup must attempt
-        # every owned cursor without replacing that primary failure. The normal
-        # epoch-boundary close above remains strict and still surfaces errors.
+        # Close every owned cursor without replacing an in-flight failure. The
+        # epoch-boundary close above stays strict and still surfaces errors.
         for iterator in cleanup_iterators:
             try:
                 _close_mlx_owned_iterator(iterator)
@@ -8249,9 +8215,9 @@ def _iterate_dispatched_lazy_text_training_batches(
                     "before split_dataset_by_node(); MLX owns rank partitioning."
                 )
         except BaseException as exc:
-            # Even interrupts must be deferred: peers block in the dispatch
-            # collective below, so rank 0 cannot unwind before the failure
-            # status is broadcast. Re-raised through the loop's rank-0 path.
+            # Defer even interrupts: peers block in the dispatch collective
+            # below, so rank 0 must broadcast the failure status before it
+            # unwinds. Re-raised through the loop's rank-0 path.
             owner_contract_error = exc
         owner_iterator = _iterate_lazy_text_training_batches(
             dataset,
@@ -8273,8 +8239,8 @@ def _iterate_dispatched_lazy_text_training_batches(
             width = 0
             has_labels = 0
             status = 0
-            # Drop the previous fetch's tensors before the owner pulls the next
-            # batch so dispatch never holds two batches alongside the window.
+            # Drop the previous fetch before pulling, so dispatch never holds
+            # two batches alongside the window.
             owner_batch = input_ids = lengths = labels = None
             if rank == 0:
                 try:
@@ -8299,10 +8265,9 @@ def _iterate_dispatched_lazy_text_training_batches(
                 except StopIteration:
                     pass
                 except BaseException as exc:
-                    # Synchronize interrupts too (KeyboardInterrupt during a
-                    # source/formatter/tokenizer call): peers are entering the
-                    # all_sum below and would hang if rank 0 unwound past it.
-                    # The original error is re-raised on rank 0 after sync.
+                    # Synchronize interrupts too: peers are entering the all_sum
+                    # below and would hang if rank 0 unwound past it. The
+                    # original error is re-raised on rank 0 after the sync.
                     owner_error = exc
                     status = -1
 
