@@ -301,14 +301,10 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# Warm-starting continued training from a saved adapter.
-#
-# Reloading a saved LoRA/DoRA adapter via FastMLXModel.from_pretrained must
-# return the same trainable state as a fresh get_peft_model (base frozen,
-# adapter trainable), so a new MLXTrainer continues adapter training with a
-# fresh optimizer instead of silently full-finetuning the base. These use a
-# tiny locally-built unquantized Llama (no pretrained-model download; a small
-# tokenizer is fetched once) so the full_finetuning and DoRA branches are cheap.
+# Warm-starting continued training from a saved adapter: reloading a LoRA/DoRA
+# adapter via FastMLXModel.from_pretrained must give the same trainable state as
+# a fresh get_peft_model (base frozen, adapter trainable). Uses a tiny
+# locally-built Llama so the full_finetuning and DoRA branches stay cheap.
 # ---------------------------------------------------------------------------
 
 
@@ -317,8 +313,7 @@ def _trainable_names(model):
 
 
 def _adapter_keys(model):
-    # The canonical adapter parameter set the production code targets
-    # (lora_a/lora_b for every LoRA module, plus m for DoRA modules only).
+    # lora_a/lora_b for every LoRA module, plus m for DoRA modules only.
     return set(collect_mlx_lora_adapter_tensors(model).keys())
 
 
@@ -326,9 +321,8 @@ def _tiny_base(path):
     """Write a tiny unquantized HF Llama + tokenizer to ``path``."""
     import torch
     from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
-    # vocab_size matches hf-internal-testing/llama-tokenizer so tokenized
-    # training inputs stay in range (out-of-range ids would silently corrupt
-    # the embedding/label ops under unchecked Metal indexing).
+    # vocab_size matches hf-internal-testing/llama-tokenizer so token ids stay
+    # in range (Metal indexing is unchecked).
     cfg = LlamaConfig(
         hidden_size=64, intermediate_size=128, num_hidden_layers=2,
         num_attention_heads=4, num_key_value_heads=2, vocab_size=32000,
@@ -387,8 +381,7 @@ def test_adapter_reload_freezes_base(tmp_path):
     )
     adapter_keys = _adapter_keys(model)
     assert any(n.endswith("lora_a") for n in adapter_keys)
-    # The regression: the whole base used to come back trainable. The trainable
-    # set must be exactly the adapter tensors, nothing more.
+    # The regression: the whole base used to come back trainable.
     assert _trainable_names(model) == adapter_keys
 
 
@@ -400,8 +393,8 @@ def test_warm_start_trains_only_adapter(tmp_path):
     model, tok = FastMLXModel.from_pretrained(
         str(adapter), load_in_4bit=False, max_seq_length=64,
     )
-    # A non-adapter base weight must be untouched by warm-start training, while
-    # an adapter tensor must actually change (else a no-op run would pass).
+    # A base weight must stay untouched while an adapter tensor must change
+    # (else a no-op run would pass).
     probe_key = "model.layers.0.mlp.down_proj.weight"
     lora_key = next(n for n in _trainable_names(model) if n.endswith("lora_b"))
     params_before = dict(tree_flatten(model.parameters()))
@@ -438,10 +431,9 @@ def test_dora_reload_keeps_magnitude_trainable(tmp_path):
     assert len(dora_modules) > 0
     # Every DoRA magnitude must stay trainable (not just one).
     assert len([n for n in trainable if n.endswith(".m")]) == len(dora_modules)
-    # Trainable set is exactly the adapter tensors (lora_a/lora_b + DoRA m),
-    # so no base weight leaks in. (A regression that also unfroze an unrelated
-    # base parameter literally named "m" is not observable on this stock-Llama
-    # fixture, which has none; that pathological case is left to follow-up.)
+    # Exactly the adapter tensors, so no base weight leaks in. (A base parameter
+    # literally named "m" does not exist on this fixture, so that pathological
+    # case is left to follow-up.)
     assert trainable == _adapter_keys(model)
 
 
@@ -454,8 +446,7 @@ def test_full_finetuning_reload_keeps_base_trainable(tmp_path):
         str(adapter), load_in_4bit=False, max_seq_length=64,
         full_finetuning=True,
     )
-    # full_finetuning is an explicit full-training request: the freeze is
-    # skipped, so the trainable set strictly exceeds the adapter tensors.
+    # full_finetuning is an explicit full-training request, so no freeze.
     assert _trainable_names(model) > _adapter_keys(model)
 
 
@@ -476,7 +467,7 @@ def test_resume_from_adapter_dir_names_warm_start(tmp_path):
         model=model, tokenizer=tok,
         train_dataset=[{"text": f"row {i}"} for i in range(6)], args=cfg,
     )
-    # The adapter dir has no optimizer_state.safetensors, so resume must fail
-    # and point at the warm-start route rather than silently restarting.
+    # No optimizer_state.safetensors, so resume must fail and name warm-start
+    # rather than silently restarting.
     with pytest.raises(RuntimeError, match="from_pretrained"):
         trainer.train(resume_from_checkpoint=str(adapter))

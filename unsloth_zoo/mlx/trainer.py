@@ -2506,14 +2506,10 @@ class MLXTrainer:
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
         if _resume_from:
-            # A complete checkpoint has all three resume files; a saved adapter
-            # directory has only adapters.safetensors. Detect an incomplete set
-            # up front and point the user at the warm-start route, rather than
-            # surfacing a raw mx.load open failure — mx.load raises a generic
-            # RuntimeError (not FileNotFoundError) for a missing file, so the
-            # handler below would not catch it. Mirrors the required-file set of
-            # the distributed resume validator, and uses isfile so a same-named
-            # directory is not mistaken for a present file.
+            # A saved adapter directory has only adapters.safetensors. Detect an
+            # incomplete resume set up front and name the warm-start route: a
+            # missing file otherwise surfaces as a generic mx.load RuntimeError
+            # that the handler below does not catch.
             _missing_resume = [
                 _f for _f in ("adapters.safetensors",
                               "optimizer_state.safetensors", "trainer_state.json")
