@@ -4899,6 +4899,25 @@ def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
     resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
     assert resumed.state.stateful_callbacks["Patience"]["attributes"]["counter"] == 2
 
+    # Reusing that SAME trainer for a fresh train() must not keep serving the
+    # first run's checkpoint bookkeeping: _resume_stateful_callbacks is cached
+    # on the trainer and the restore below _init_callback_state is
+    # unconditional, so without a per-run clear every lifecycle event of the
+    # fresh run sees run-1's counter. HF rebuilds TrainerState from the live
+    # callbacks at each run (transformers trainer.py _init_training_state) and
+    # only loads trainer_state.json when resume_from_checkpoint is given.
+    seen = []
+
+    class Recorder:
+        def on_train_begin(self, args, state, control, **kwargs):
+            seen.append(dict(state.stateful_callbacks or {}))
+            return control
+
+    resumed.callback_handler.callbacks.append(Recorder())
+    resumed.train()
+    assert seen == [{}], seen
+    assert resumed.state.stateful_callbacks["Patience"]["attributes"]["counter"] == 6
+
 
 def test_pre_optimizer_step_callback_fires_before_each_update(monkeypatch):
     # HF dispatches on_pre_optimizer_step immediately before optimizer.step()

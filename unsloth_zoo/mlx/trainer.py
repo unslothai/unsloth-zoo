@@ -1217,6 +1217,13 @@ class MLXTrainer:
         # Restored from a checkpoint's saved num_input_tokens_seen by the resume
         # block; 0 on a fresh run so a reused trainer starts the counter clean.
         self._resume_num_input_tokens_seen = 0
+        # Same contract for the checkpoint's ExportableState callback states:
+        # cleared here so a trainer that resumed once and is then reused for a
+        # FRESH train() does not expose run-1's checkpoint bookkeeping in
+        # state.stateful_callbacks. HF rebuilds TrainerState (and with it
+        # stateful_callbacks) from the LIVE callbacks at every run and only
+        # overwrites it from trainer_state.json when resuming.
+        self._resume_stateful_callbacks = {}
         self._distributed_world = None
         self._distributed_initialized = False
         self._distributed_rank = 0
