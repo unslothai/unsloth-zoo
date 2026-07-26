@@ -3546,7 +3546,7 @@ def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
     )
 
 
-def test_horizontal_concat_streaming_eval_infinite_only_if_all_children_infinite():
+def test_concat_streaming_eval_is_infinite_when_any_child_is():
     from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
 
     class RepeatExamplesIterable:  # HF infinite marker: num_times=None
@@ -3566,11 +3566,45 @@ def test_horizontal_concat_streaming_eval_infinite_only_if_all_children_infinite
         def __init__(self, ex): self._ex_iterable = ex
 
     inf, fin = RepeatExamplesIterable(), _FiniteChild()
-    # Horizontal (lockstep) ends with the shortest child -> finite if any is.
+    # Horizontal concat drops each child as it is exhausted and stops only once
+    # all of them are gone, so it ends with the LONGEST child.
     assert _mlx_stream_declares_infinite(
-        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is False
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is True
     assert _mlx_stream_declares_infinite(
-        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, inf]))) is True
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([fin, inf]))) is True
+    assert _mlx_stream_declares_infinite(
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([fin, fin]))) is False
     # Vertical (sequential) is infinite if any child is.
     assert _mlx_stream_declares_infinite(
         _Src(VerticallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is True
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
+    """Pin the detector against real ``datasets`` concat termination."""
+    from datasets import IterableDataset, concatenate_datasets
+    from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
+
+    # Generator-backed so the axis=1 cross-check does not hit the arrow-path
+    # cast that datasets raises for a ragged column-wise concat.
+    def rows(column, n):
+        return lambda: ({column: str(i)} for i in range(n))
+
+    finite = IterableDataset.from_generator(rows("a", 3))
+    other = IterableDataset.from_generator(rows("b" if axis else "a", 2))
+    for children, expected in (
+        ((finite, other), False),
+        ((finite, other.repeat(None)), True),
+        ((finite.repeat(None), other), True),
+    ):
+        combined = concatenate_datasets(list(children), axis=axis)
+        assert _mlx_stream_declares_infinite(combined) is expected
+        if not expected:  # a finite stream must actually terminate
+            assert sum(1 for _ in combined) < 1000
+        else:  # an infinite stream must keep producing past every child's length
+            produced = 0
+            for _ in combined:
+                produced += 1
+                if produced > 1000:
+                    break
+            assert produced > 1000
