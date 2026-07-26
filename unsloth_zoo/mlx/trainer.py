@@ -3898,12 +3898,10 @@ class MLXTrainer:
         pending_steps = 0
         trained_tokens = 0
         train_time = 0
-        # Wall-clock for the PENDING window, split exactly like the loss/token
-        # counters above: a forced log (on_epoch_end at a dataset boundary that
-        # lands on a non-update microstep) reports only the COMMITTED tokens, so
-        # charging it the pending micro-batches' duration too would understate
-        # tokens/s and overstate _step_times for that window -- and the reset
-        # would then hide that duration from the window that actually owns it.
+        # Wall-clock for the PENDING window, split like the loss/token counters
+        # above: a forced log reports only COMMITTED tokens, so charging it the
+        # pending micro-batches' time understates tokens/s for that window and
+        # hides that time from the window that owns it.
         pending_time = 0
         grad_accum_state = None
         accum_progress = 0
@@ -4083,13 +4081,10 @@ class MLXTrainer:
                 record["step"] = self.state.global_step
                 self.state.log_history.append(record)
             _fire("on_log", logs=dict(metrics))
-            # Clear the request AFTER the eval-metrics on_log and immediately
-            # before on_evaluate, where HF clears it
-            # (transformers/trainer_callback.py CallbackHandler.on_evaluate:
-            # `control.should_evaluate = False` then call_event). Clearing it
-            # earlier lets an on_log callback's fresh should_evaluate=True survive
-            # this dispatch, so a boundary step's _maybe_callback_epoch_end runs a
-            # second full evaluation at the same global_step.
+            # Clear AFTER the eval on_log and just before on_evaluate, where HF
+            # clears it (CallbackHandler.on_evaluate). Clearing earlier lets an
+            # on_log callback's fresh should_evaluate=True survive, so a boundary
+            # step evaluates twice at the same global_step.
             self.control.should_evaluate = False
             _fire("on_evaluate", metrics=metrics)
             # on_log/on_evaluate fire on rank 0 only, and either may itself
@@ -4678,12 +4673,10 @@ class MLXTrainer:
                 self.state.epoch = it / batches_per_epoch
             elif stream_epoch_microbatches:
                 self.state.epoch = it / stream_epoch_microbatches
-            # Charge this micro-batch's duration to the PENDING window and fold it
-            # into the COMMITTED window only once the optimizer step is applied,
-            # exactly where pending_losses/pending_n_tokens/pending_steps are
-            # folded above. train_time therefore always covers precisely the
-            # micro-batches whose tokens are in n_tokens, so the tokens/s and
-            # per-step time a forced log reports stay consistent.
+            # Charge this micro-batch to the PENDING window, folded into
+            # COMMITTED only on an applied update, where pending_losses and
+            # friends fold. train_time then covers exactly the micro-batches
+            # whose tokens are in n_tokens.
             pending_time += time.perf_counter() - tic
             if do_update:
                 train_time += pending_time
@@ -4755,9 +4748,8 @@ class MLXTrainer:
                         pending_losses = 0
                         pending_n_tokens = 0
                         pending_steps = 0
-                        # Drop the abandoned window's wall-clock with its tokens so
-                        # the next committed window's tokens/s is not deflated by
-                        # time whose tokens were just discarded.
+                        # Drop the abandoned window's time with its tokens, else
+                        # the next window's tokens/s is deflated by it.
                         pending_time = 0
                         it = _honor_epoch_stop_skip(
                             it, self._global_step, grad_norm)
