@@ -2704,6 +2704,110 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     assert language_calls[0][1][0].tolist() == [[10], [11]]
 
 
+def test_qwen_video_tensor_adapter_is_exact_and_composable(monkeypatch):
+    from functools import wraps
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+    calls = []
+    def legacy(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if pixel_values is None:
+            return ("text", grid_thw, mask)
+        calls.append((input_ids, pixel_values, kwargs))
+        return pixel_values
+    video, image = object(), object()
+    adapted = mc._qwen_video_tensor_adapter(legacy)
+    assert adapted(object(), 1, pixel_values_videos=video, video_grid_thw=2) is video
+    assert adapted(object(), 1, image, pixel_values_videos=video, video_grid_thw=2) is image
+    assert calls == [(1, video, {"pixel_values_videos": video, "video_grid_thw": 2}), (1, image, {"pixel_values_videos": video, "video_grid_thw": 2})]
+    assert adapted.__wrapped__ is legacy and mc._qwen_video_tensor_adapter(adapted) is adapted
+
+    def fixed(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        return pixel_values, video_grid_thw
+    assert mc._qwen_video_tensor_adapter(fixed) is fixed
+
+    def unknown(self, input_ids=None, pixel_values=None, **kwargs):
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if pixel_values is None:
+            kwargs.pop("pixel_values_videos", None)
+            return ("text", video_grid_thw)
+    assert mc._qwen_video_tensor_adapter(unknown) is unknown
+    def unreachable(self, input_ids=None, pixel_values=None, **kwargs):
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if pixel_values is None:
+            return video_grid_thw
+            pixel_values = kwargs.get("pixel_values_videos", None)
+    assert not mc._qwen_video_contract_matches(unreachable, "fixed")
+    def unreachable_guard(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        return grid_thw, mask
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+    assert not mc._qwen_video_contract_matches(unreachable_guard, "fixed") and not mc._qwen_video_contract_matches(unreachable_guard, "legacy")
+
+    @wraps(legacy)
+    def keyword_outer(self, *, input_ids=None, pixel_values=None, **kwargs):
+        return legacy(
+            self,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+    composed = mc._qwen_video_tensor_adapter(keyword_outer)
+    assert composed(object(), input_ids=3, pixel_values_videos=video) is video
+
+    def staged_legacy(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if pixel_values is None:
+            return grid_thw, mask, mx.eval([])
+    staged = mc._qwen3_batch_embedding_adapter(staged_legacy, replace_visual_inference=True)
+    assert mc._qwen_video_tensor_adapter(staged) is not staged
+    replacing_stage = mc._qwen3_batch_embedding_adapter(staged_legacy, fixed, replace_visual_inference=True)
+    assert mc._qwen_video_tensor_adapter(replacing_stage) is replacing_stage
+    owner = type("LegacyQwen", (), {"get_input_embeddings": legacy})
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._patch_qwen_video_tensor(owner)
+    assert owner.get_input_embeddings._unsloth_qwen_video_tensor
+
+
+def test_qwen_video_tensor_installer_has_exact_owners(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+    expected = ("mlx_vlm.models.qwen2_vl.qwen2_vl", "mlx_vlm.models.qwen2_5_vl.qwen2_5_vl",
+                "mlx_vlm.models.qwen3_5.qwen3_5", "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe")
+    assert mc._QWEN_VIDEO_TENSOR_OWNER_MODULES == expected
+    owners = {name: type(name, (), {"get_input_embeddings": lambda self: None}) for name in expected}
+    patched, imported = [], []
+    def import_module(module_name):
+        imported.append(module_name)
+        return types.SimpleNamespace(Model=owners[module_name])
+
+    monkeypatch.setattr(mc.importlib, "import_module", import_module)
+    monkeypatch.setattr(mc, "_patch_qwen_video_tensor", patched.append)
+    mc._install_qwen_video_tensor_patches()
+    assert imported == list(expected)
+    assert patched == [owners[module_name] for module_name in expected]
+    assert "mlx_vlm.models.qwen3_vl.qwen3_vl" not in imported
+    monkeypatch.setattr(mc.importlib, "import_module", lambda _: types.SimpleNamespace()); mc._install_qwen_video_tensor_patches()
+    called = []
+    monkeypatch.setattr(mc, "_PATCHES_INSTALLED", False); monkeypatch.setattr(mc, "_PATCHED_PATTERN_BUNDLES", set())
+    monkeypatch.setattr(mc, "_install_safe_fused_sdpa_mask_patches", lambda: None); monkeypatch.setattr(mc, "list_compile_pattern_bundles", lambda: ())
+    monkeypatch.setattr(mc, "_install_qwen_video_tensor_patches", lambda: called.append(True)); monkeypatch.setattr(mc, "_invalidate_qualification_cache", lambda: None)
+    monkeypatch.setattr(mc, "build_compile_qualifications", lambda: {})
+    assert mc.install_mlx_compile_patches() == {} and called == [True]
+
+
 def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
     import mlx.core as mx
     import unsloth_zoo.mlx.compile as mc

@@ -30,12 +30,14 @@ from dataclasses import dataclass
 from functools import lru_cache, wraps
 from pathlib import Path
 from itertools import accumulate
+import ast
 import importlib
 import inspect
 import mlx.core as mx
 import numpy as np
 import pkgutil
 import re
+import textwrap
 from typing import Any, Callable, Iterable, Mapping
 
 
@@ -2178,6 +2180,258 @@ def _patch_explicit_position_embeddings(model_cls, replacement):
     _patch_method(model_cls, "get_input_embeddings", adapted)
 
 
+def _qwen_kwargs_lookup(node, key):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "kwargs"
+        and node.func.attr == "get"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == key
+    )
+
+
+def _qwen_pixel_none_guard(node):
+    return (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "pixel_values"
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Is)
+        and len(node.test.comparators) == 1
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value is None
+    )
+
+
+def _qwen_video_tensor_access(node):
+    if isinstance(node, (ast.Name, ast.arg)):
+        name = node.id if isinstance(node, ast.Name) else node.arg
+        return name == "pixel_values_videos"
+    if isinstance(node, ast.Call):
+        return (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "kwargs"
+            and bool(node.args)
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "pixel_values_videos"
+        )
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "kwargs"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "pixel_values_videos"
+        )
+    return False
+
+
+def _qwen_video_tensor_contract(source):
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (IndentationError, SyntaxError):
+        return None
+    function = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef)),
+        None,
+    )
+    if function is None:
+        return None
+    has_grid_lookup = False
+    pixel_none_guards = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if (
+                any(
+                    isinstance(target, ast.Name)
+                    and target.id == "video_grid_thw"
+                    for target in targets
+                )
+                and _qwen_kwargs_lookup(node.value, "video_grid_thw")
+            ):
+                has_grid_lookup = True
+        if _qwen_pixel_none_guard(node):
+            pixel_none_guards.append(node)
+    if not has_grid_lookup or not pixel_none_guards:
+        return None
+
+    video_accesses = [
+        node for node in ast.walk(tree) if _qwen_video_tensor_access(node)
+    ]
+    native_fallbacks = []
+    for guard in pixel_none_guards:
+        for statement in guard.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if (
+                any(
+                    isinstance(target, ast.Name)
+                    and target.id == "pixel_values"
+                    for target in targets
+                )
+                and _qwen_kwargs_lookup(statement.value, "pixel_values_videos")
+            ):
+                native_fallbacks.append(statement.value)
+    if native_fallbacks:
+        first_guard_body = pixel_none_guards[0].body
+        first_statement = first_guard_body[0] if first_guard_body else None
+        if (
+            len(native_fallbacks) == 1
+            and function.body
+            and function.body[0] is pixel_none_guards[0]
+            and isinstance(first_statement, (ast.Assign, ast.AnnAssign))
+            and first_statement.value is native_fallbacks[0]
+            and video_accesses == native_fallbacks
+        ):
+            return "fixed"
+        return None
+    if video_accesses:
+        return None
+    legacy_guards = [
+        guard
+        for guard in pixel_none_guards
+        if guard in function.body
+        and any(
+            isinstance(node, ast.Return)
+            for statement in guard.body
+            for node in ast.walk(statement)
+        )
+    ]
+    if len(legacy_guards) != 1:
+        return None
+    guard_index = function.body.index(legacy_guards[0])
+    prelude_names = []
+    for statement in function.body[:guard_index]:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            return None
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            return None
+        prelude_names.append(targets[0].id)
+    if tuple(prelude_names) == (
+        "image_grid_thw",
+        "video_grid_thw",
+        "mask",
+        "grid_thw",
+    ):
+        return "legacy"
+    return None
+
+
+def _qwen_video_signature_supported(original):
+    try:
+        parameters = inspect.signature(
+            original,
+            follow_wrapped=False,
+        ).parameters
+    except (TypeError, ValueError):
+        return False
+    keyword_kinds = {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return (
+        all(
+            parameters.get(name) is not None
+            and parameters[name].kind in keyword_kinds
+            for name in ("input_ids", "pixel_values")
+        )
+        and any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+
+
+def _qwen_video_contract_matches(original, expected):
+    try:
+        source = inspect.getsource(original)
+    except (OSError, TypeError):
+        return False
+    return (
+        _qwen_video_signature_supported(original)
+        and _qwen_video_tensor_contract(source) == expected
+    )
+
+
+def _qwen_video_tensor_adapter(original):
+    """Route processor-owned video pixels into legacy Qwen embedding calls."""
+
+    if getattr(original, "_unsloth_qwen_video_tensor", False):
+        return original
+    if getattr(
+        original,
+        "_unsloth_qwen3_replaces_visual_inference",
+        False,
+    ):
+        return original
+    underlying = inspect.unwrap(original)
+    if (
+        not _qwen_video_signature_supported(original)
+        or not _qwen_video_contract_matches(underlying, "legacy")
+    ):
+        return original
+
+    @wraps(original)
+    def patched(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            video_pixels = kwargs.get("pixel_values_videos")
+            if video_pixels is not None:
+                pixel_values = video_pixels
+        return original(
+            self,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+
+    patched._unsloth_qwen_video_tensor = True
+    return patched
+
+
+def _patch_qwen_video_tensor(model_cls):
+    original = model_cls.get_input_embeddings
+    adapted = _qwen_video_tensor_adapter(original)
+    if adapted is not original:
+        _patch_method(model_cls, "get_input_embeddings", adapted)
+
+
+_QWEN_VIDEO_TENSOR_OWNER_MODULES = (
+    "mlx_vlm.models.qwen2_vl.qwen2_vl",
+    "mlx_vlm.models.qwen2_5_vl.qwen2_5_vl",
+    "mlx_vlm.models.qwen3_5.qwen3_5",
+    "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe",
+)
+
+
+def _install_qwen_video_tensor_patches():
+    """Patch only Qwen owners with the legacy processor/model video split."""
+
+    for module_name in _QWEN_VIDEO_TENSOR_OWNER_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        model_cls = getattr(module, "Model", None)
+        if model_cls is None or not hasattr(model_cls, "get_input_embeddings"):
+            continue
+        _patch_qwen_video_tensor(model_cls)
+
+
 def _qwen3_visual_window(
     visual_pos_masks,
     visual_state,
@@ -2478,6 +2732,11 @@ def _qwen3_batch_embedding_adapter(
         return features
 
     patched._unsloth_qwen3_batch_visual_state = True
+    patched._unsloth_qwen3_replaces_visual_inference = bool(
+        replacement is not None
+        and replace_visual_inference
+        and _qwen_video_contract_matches(replacement, "fixed")
+    )
     return patched
 
 
@@ -5953,6 +6212,7 @@ def install_mlx_compile_patches():
         _apply_compile_patch_plan(_resolve_compile_patch_plan(bundle))
         _PATCHED_PATTERN_BUNDLES.add(bundle.name)
 
+    _install_qwen_video_tensor_patches()
     _PATCHES_INSTALLED = True
     _invalidate_qualification_cache()
     return build_compile_qualifications()
