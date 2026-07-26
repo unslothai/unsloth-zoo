@@ -5670,7 +5670,9 @@ def _effective_mlx_quantization_map(model):
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
         quantized_types.append(vlm_switch_module.QuantizedSwitchLinear)
-    quantized_types = tuple(quantized_types)
+    # A stand-in runtime can export these names as non-class placeholders, which
+    # makes isinstance() below raise instead of returning False.
+    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
 
     quantized = {}
     config = getattr(model, "_config", None)

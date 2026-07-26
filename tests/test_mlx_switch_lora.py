@@ -17,13 +17,33 @@
 """MLX LoRA coverage for routed SwitchLinear expert projections."""
 
 import json
+import importlib
 import sys
 import types
 
 import pytest
 
 
-pytest.importorskip("mlx")
+def _real_mlx_runtime():
+    """True only when mlx and the routed switch layers are the genuine packages.
+
+    importorskip("mlx") is not enough: sibling files install the mlx_simulation
+    torch stub unconditionally, so `import mlx` still succeeds afterwards. Reject
+    both the pure stub, where SwitchLinear is a placeholder, and the hybrid where
+    switch layers stay real but mlx.core was swapped underneath them.
+    """
+    try:
+        switch_layers = importlib.import_module("mlx_lm.models.switch_layers")
+    except Exception:  # mlx / mlx-lm absent entirely
+        return False
+    if not isinstance(getattr(switch_layers, "SwitchLinear", None), type):
+        return False
+    origin = getattr(sys.modules.get("mlx.core"), "__file__", "") or ""
+    return "mlx_simulation" not in origin
+
+
+if not _real_mlx_runtime():
+    pytest.skip("needs the real mlx runtime", allow_module_level=True)
 
 
 class _Model:
