@@ -120,11 +120,10 @@ class _MLXTrainerState:
 def _resolve_interval_steps(value, total_steps):
     """Resolve an HF-style step interval to an absolute number of steps.
 
-    Hugging Face accepts logging_steps / eval_steps / save_steps either as a
-    step count or as a ratio in (0, 1) of the total steps, and resolves the
-    ratio in TrainerState.compute_steps (trainer_callback.py). Casting the
-    ratio straight to int would turn 0.1 into 0, which silently disables the
-    interval here and makes HF's DefaultFlowCallback divide by zero.
+    HF accepts logging_steps / eval_steps / save_steps as a step count or a
+    ratio in (0, 1) of the total steps, expanded in TrainerState.compute_steps.
+    int(ratio) would turn 0.1 into 0, silently disabling the interval and
+    making HF's DefaultFlowCallback divide by zero.
     """
     try:
         value = float(value or 0)
@@ -133,8 +132,7 @@ def _resolve_interval_steps(value, total_steps):
     if value <= 0:
         return 0
     if value < 1:
-        # max(1, ...) only guards total_steps == 0; ceil already returns >= 1
-        # for any positive ratio against a positive step count.
+        # max(1, ...) only guards total_steps == 0; ceil is already >= 1 otherwise.
         return max(1, math.ceil(float(total_steps) * value))
     return int(value)
 
@@ -1121,12 +1119,10 @@ class MLXTrainer:
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
         # each train() so a reused trainer starts clean); callbacks and
         # pre-created batches persist across runs and stay here.
-        # stop_requested is cleared at train() entry (before setup) rather than
-        # in _reset_run_state, so an external cancel raised during THIS run's
-        # data prep / optimizer build survives; initialize it here so a trainer
-        # inspected before train() still has the attribute. _run_generation
-        # stamps each request so the entry clear only drops a stop left behind
-        # by an EARLIER run (see the stop_requested property).
+        # stop_requested is cleared at train() entry, not in _reset_run_state, so
+        # a cancel raised during THIS run's setup survives; set here so a trainer
+        # inspected before train() has the attribute. _run_generation stamps each
+        # request, so that clear only drops an EARLIER run's stop.
         self._run_generation = 0
         self.stop_requested = False
         self._reset_run_state()
@@ -1185,18 +1181,15 @@ class MLXTrainer:
     @property
     def stop_requested(self):
         """True while an early stop is pending. Externally owned: a controller
-        (e.g. the Studio cancel button) may set it at ANY time, including after
-        the trainer is built but before train() is called."""
+        (e.g. the Studio cancel button) may set it at ANY time, even pre-train()."""
         return self._stop_requested
 
     @stop_requested.setter
     def stop_requested(self, value):
         self._stop_requested = value
-        # Stamp the request with the run generation it was made in.
-        # _run_generation is bumped when a run finishes, so a stop latched by
-        # run N carries stamp N while any request made after run N ended (a
-        # pre-start cancel for run N+1) carries stamp N+1. train() clears only
-        # the former, so a cancel raised before train() is never discarded.
+        # Stamp the request with its run generation, bumped when a run finishes:
+        # a stop latched by run N stamps N, a cancel raised after it stamps N+1.
+        # train() clears only the former, so a pre-train() cancel is never lost.
         self._stop_requested_generation = getattr(self, "_run_generation", 0)
 
     def _stop_request_generation(self):
@@ -1239,20 +1232,15 @@ class MLXTrainer:
         # Restored from a checkpoint's saved num_input_tokens_seen by the resume
         # block; 0 on a fresh run so a reused trainer starts the counter clean.
         self._resume_num_input_tokens_seen = 0
-        # Same contract for the checkpoint's ExportableState callback states:
-        # cleared here so a trainer that resumed once and is then reused for a
-        # FRESH train() does not expose run-1's checkpoint bookkeeping in
-        # state.stateful_callbacks. HF rebuilds TrainerState (and with it
-        # stateful_callbacks) from the LIVE callbacks at every run and only
-        # overwrites it from trainer_state.json when resuming.
+        # Same contract for the checkpoint's ExportableState callback states, so a
+        # reused trainer does not re-expose run-1's bookkeeping. HF rebuilds these
+        # from the LIVE callbacks each run, reading trainer_state.json only on resume.
         self._resume_stateful_callbacks = {}
-        # Same contract for the checkpoint's callback-visible log history:
-        # restored by the resume block, empty on a fresh run so a reused
-        # trainer does not carry run-1's entries into a fresh train().
+        # Same for the callback-visible log history: restored by the resume
+        # block, empty on a fresh run so a reused trainer carries nothing over.
         self._resume_log_history = []
-        # Same contract for TrainerState.best_metric: restored by the resume
-        # block, None on a fresh run so a reused trainer does not carry run-1's
-        # watermark into it.
+        # Same for TrainerState.best_metric: restored by the resume block, None
+        # on a fresh run so a reused trainer drops run-1's watermark.
         self._resume_callback_best_metric = None
         self._resume_callback_best_step = None
         self._distributed_world = None
@@ -1841,15 +1829,11 @@ class MLXTrainer:
     def _sync_synthesized_arg(self, name, value):
         """Set a callback-compat arg we synthesized, refreshing it per run.
 
-        These strategies are derived from MLX knobs (eval_dataset, eval_steps,
-        logging_steps, save_steps) that stay writable on a constructed trainer,
-        and _ensure_callback_args_compat runs again on add_callback and at each
-        train(). Without a refresh, a trainer built without eval keeps
-        eval_strategy="no" after eval is enabled for a later run: native eval
-        runs, but HF's EarlyStoppingCallback asserts eval_strategy is not "no"
-        in on_train_begin and aborts the run. Only values this trainer wrote are
-        refreshed, so a real TrainingArguments/SFTConfig field, or an explicit
-        user override of our synthesized value, is never clobbered.
+        These strategies derive from MLX knobs that stay writable after
+        construction, so without a per-run refresh a trainer built without eval
+        keeps eval_strategy="no" once eval is enabled later and HF's
+        EarlyStoppingCallback asserts in on_train_begin. Only values this trainer
+        wrote are refreshed; a real field or a user override is never clobbered.
         """
         args = self.args
         synthesized = getattr(self, "_synthesized_callback_args", None)
@@ -1877,11 +1861,10 @@ class MLXTrainer:
     def _callback_num_train_epochs(self, total_steps, batches):
         """Return the epoch total HF's TrainerState reports for this run.
 
-        Epoch-count runs (max_steps off) use num_train_epochs directly. A
-        max_steps run usually leaves it at -1, but HF derives a real total from
-        the dataloader length, so reporting 0 while the loop dispatches epoch
-        events and drives state.epoch past 1.0 hands callbacks inconsistent
-        metadata, and a ZeroDivisionError to anything normalizing by it.
+        Epoch-count runs use num_train_epochs directly. A max_steps run
+        derives the total from the dataloader length as HF does: reporting 0
+        while the loop dispatches epoch events contradicts state.epoch and
+        divides by zero downstream.
         """
         epochs = max(0, int(getattr(self.args, "num_train_epochs", 0) or 0))
         # HF derives the total from max_steps whenever it is set, ignoring
@@ -1902,9 +1885,8 @@ class MLXTrainer:
     def _init_callback_state(self, total_steps, resume_step, batches=None):
         """Initialize TrainerState for HF callback lifecycle events."""
         args = self.args
-        # Resolve HF's fractional (ratio-of-total-steps) interval form before
-        # storing absolute counts on the state, exactly as HF's
-        # TrainerState.compute_steps does at the top of its training loop.
+        # Expand HF's fractional (ratio-of-total-steps) intervals to absolute
+        # counts before storing them, as TrainerState.compute_steps does.
         eval_steps = _resolve_interval_steps(
             getattr(args, "eval_steps", 0), total_steps,
         )
@@ -1928,9 +1910,7 @@ class MLXTrainer:
                 getattr(self, "_resume_num_input_tokens_seen", 0) or 0
             ),
             # Continue the checkpoint's history on resume (HF restores the whole
-            # TrainerState, log_history included, from trainer_state.json), so a
-            # resumed run's state.log_history spans the entire experiment instead
-            # of only the post-resume steps. Empty on a fresh run.
+            # TrainerState from trainer_state.json); empty on a fresh run.
             log_history=list(getattr(self, "_resume_log_history", None) or []),
             is_local_process_zero=is_main_process,
             is_world_process_zero=is_main_process,
@@ -1942,9 +1922,8 @@ class MLXTrainer:
         # treat the first post-resume eval as the new best and can overwrite the
         # real best with a worse metric, diverging from the native best-model
         # tracking in _run_best_tracking (which uses the restored self._best_metric).
-        # Own checkpoint key, since it advances even when native tracking is
-        # off and self._best_metric stays None; falls back to the native value on
-        # a fresh run and on pre-fix checkpoints.
+        # Own checkpoint key, since it advances even when native tracking is off;
+        # falls back to the native value on fresh runs and pre-fix checkpoints.
         _cb_best_metric = getattr(self, "_resume_callback_best_metric", None)
         _cb_best_step = getattr(self, "_resume_callback_best_step", None)
         self.state.best_metric = (
@@ -2057,14 +2036,11 @@ class MLXTrainer:
     def _export_callback_states(self):
         """Populate state.stateful_callbacks from ExportableState callbacks.
 
-        HF does this in Trainer._save_checkpoint before writing
-        trainer_state.json, so an `ExportableState` callback's internal
-        bookkeeping (e.g. EarlyStoppingCallback.early_stopping_patience_counter)
-        travels with the checkpoint. Duck-typed on a working `state()` rather
-        than isinstance(ExportableState) to keep this module Torch-free.
-        HF's TrainerControl is deliberately excluded: MLX rebuilds control flags
-        from the loop on every train(), and rehydrating should_training_stop
-        would end a resumed run at step 0.
+        HF does this in _save_checkpoint, so a callback's internal bookkeeping
+        (EarlyStoppingCallback.early_stopping_patience_counter) travels with the
+        checkpoint. Duck-typed on a working `state()` to keep this module
+        Torch-free. TrainerControl is excluded: MLX rebuilds control flags every
+        train(), and rehydrating should_training_stop would end a resume at step 0.
         """
         exported = {}
         for cb in self.callback_handler.callbacks:
@@ -2090,12 +2066,9 @@ class MLXTrainer:
         return exported
 
     def _restore_callback_states(self, stateful_callbacks):
-        """Seed state.stateful_callbacks from a checkpoint.
-
-        Rehydrating the live callbacks is HF's opt-in
-        restore_callback_states_from_checkpoint path, which this config does not
-        expose, so only the callback-visible state is mirrored here.
-        """
+        """Seed state.stateful_callbacks from a checkpoint. Rehydrating the live
+        callbacks is HF's opt-in restore_callback_states_from_checkpoint path,
+        which this config does not expose, so only the visible state is mirrored."""
         if isinstance(stateful_callbacks, dict) and stateful_callbacks:
             self.state.stateful_callbacks = dict(stateful_callbacks)
 
@@ -2800,16 +2773,11 @@ class MLXTrainer:
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
-        # Clear a stale stop from a PRIOR run at the EARLIEST point, before any
-        # data prep / optimizer build / _train_inner, so a reused trainer starts
-        # un-stopped. _reset_run_state (post-setup) no longer touches this, so an
-        # external cancel raised DURING this run's setup (e.g. a Studio cancel on
-        # a large dataset materializing in _prepare_data) survives to the loop's
-        # top-of-loop _distributed_should_stop() check. Only a stop stamped by an
-        # EARLIER generation is cleared: a cancel raised after the last run ended
-        # (an external controller cancelling between construction/prior run and
-        # train()) carries the current generation and is honored. Local
-        # assignment only, no DDP collective.
+        # Clear a PRIOR run's stale stop at the EARLIEST point, before any setup,
+        # so a reused trainer starts un-stopped. Only a stop stamped by an EARLIER
+        # generation is cleared, so a cancel raised DURING this run's setup (a
+        # Studio cancel while _prepare_data materializes) survives to the loop's
+        # _distributed_should_stop(). Local assignment only, no DDP collective.
         if self._stop_request_generation() < getattr(self, "_run_generation", 0):
             self.stop_requested = False
         # Stash for _train_inner. None = fresh start, a path = resume.
@@ -3047,8 +3015,7 @@ class MLXTrainer:
                 pass
             self._text_shape_guard_preflight = None
             # Close this run's generation: a stop still latched from it is now
-            # stale (the next train() clears it), while any request made from
-            # here on belongs to the next run and survives that clear.
+            # stale, while any later request belongs to the next run.
             self._run_generation = getattr(self, "_run_generation", 0) + 1
 
     def _train_inner(self):
@@ -3243,15 +3210,13 @@ class MLXTrainer:
                     ts.get("num_input_tokens_seen", 0) or 0
                 )
                 # Stash the checkpoint's ExportableState callback state; it is
-                # applied after _init_callback_state below, which rebuilds
-                # self.state (and would otherwise drop it). .get default keeps
-                # pre-fix checkpoints (no stateful_callbacks key) resumable.
+                # applied after _init_callback_state, which rebuilds self.state.
+                # The .get default keeps pre-fix checkpoints resumable.
                 self._resume_stateful_callbacks = ts.get(
                     "stateful_callbacks", None
                 ) or {}
-                # Same for the callback-visible log history: _init_callback_state
-                # seeds state.log_history from this. .get default keeps pre-fix
-                # checkpoints (no log_history key) resumable.
+                # Same for the callback-visible log history, which seeds
+                # state.log_history. .get keeps pre-fix checkpoints resumable.
                 self._resume_log_history = list(ts.get("log_history", None) or [])
                 # best/ lives in output_dir, not in the checkpoint dir, so a
                 # checkpoint resumed elsewhere (copied dir, new output_dir) can
@@ -3271,12 +3236,10 @@ class MLXTrainer:
                     self._es_patience_counter = 0
                 # TrainerState.best_metric advances on every eval whenever
                 # metric_for_best_model is set, so it can be live while
-                # _run_best_tracking leaves "best_metric" above null. HF
-                # checkpoints and reloads it as part of TrainerState, so restore
-                # it from its own key: otherwise EarlyStoppingCallback sees None
-                # and treats the first post-resume eval as a new best. Read after
-                # the best/-missing branch so pre-fix checkpoints keep today's
-                # native fallback.
+                # "best_metric" above is null. Restore it from its own key, else
+                # EarlyStoppingCallback sees None and calls the first post-resume
+                # eval a new best. Read after the best/-missing branch so pre-fix
+                # checkpoints keep the native fallback.
                 self._resume_callback_best_metric = ts.get(
                     "callback_best_metric", self._best_metric,
                 )
@@ -3928,10 +3891,9 @@ class MLXTrainer:
         pending_steps = 0
         trained_tokens = 0
         train_time = 0
-        # Wall-clock for the PENDING window, split like the loss/token counters
-        # above: a forced log reports only COMMITTED tokens, so charging it the
-        # pending micro-batches' time understates tokens/s for that window and
-        # hides that time from the window that owns it.
+        # Wall clock for the PENDING window, split like the loss/token counters
+        # above: charging a forced log the pending micro-batches' time would
+        # understate its tokens/s and hide that time from the window that owns it.
         pending_time = 0
         grad_accum_state = None
         accum_progress = 0
@@ -4112,9 +4074,8 @@ class MLXTrainer:
                 self.state.log_history.append(record)
             _fire("on_log", logs=dict(metrics))
             # Clear AFTER the eval on_log and just before on_evaluate, where HF
-            # clears it (CallbackHandler.on_evaluate). Clearing earlier lets an
-            # on_log callback's fresh should_evaluate=True survive, so a boundary
-            # step evaluates twice at the same global_step.
+            # clears it. Clearing earlier lets an on_log callback's fresh
+            # should_evaluate=True survive, so a boundary step evaluates twice.
             self.control.should_evaluate = False
             _fire("on_evaluate", metrics=metrics)
             # on_log/on_evaluate fire on rank 0 only, and either may itself
@@ -4205,24 +4166,14 @@ class MLXTrainer:
         def _run_checkpoint(current_step):
             """Save a step checkpoint (rank 0) and dispatch HF on_save."""
             # Fold the committed-but-unlogged window into the totals WRITTEN to
-            # the checkpoint. losses/n_tokens hold optimizer steps that were
-            # already applied to the model (and to the optimizer state saved
-            # below) but that no log has folded into self._train_loss_token_*,
-            # whose only writer is _run_training_log. A save cadence that is not a
-            # multiple of the log cadence (save_steps=50, logging_steps=20), or a
-            # callback that requests should_save without should_log, would
-            # otherwise persist totals covering fewer steps than the checkpoint's
-            # own global_step, and the resumed run's final train_loss would
-            # silently drop those steps. Only the payload is adjusted:
-            # self._train_loss_token_* stays untouched so the later
-            # _run_training_log that folds this same window does not double count.
-            # The all-sum runs on EVERY rank, before the rank-0 write guard, to
-            # stay in lockstep (same reduction _run_training_log applies to these
-            # counters); steps advances identically on every rank, so the guard is
-            # rank-consistent. Skipped at steps == 0 because the accumulators are
-            # plain-int 0 after a reset and _distributed_all_sum would then return
-            # an int with no .item(). The pending (not-yet-applied) window is
-            # deliberately excluded, exactly as in the post-loop flush.
+            # the checkpoint: losses/n_tokens hold applied optimizer steps that no
+            # log has folded into self._train_loss_token_* yet, so a save cadence
+            # out of phase with the log cadence would persist totals covering
+            # fewer steps than the checkpoint's own global_step. Only the payload
+            # is adjusted, so the later _run_training_log does not double count.
+            # The all-sum runs on EVERY rank before the rank-0 write guard to stay
+            # in lockstep, and is skipped at steps == 0 where the accumulators are
+            # plain ints with no .item(). The pending window is excluded.
             ckpt_loss_sum = float(self._train_loss_token_sum)
             ckpt_loss_total = int(self._train_loss_token_total)
             ckpt_committed_steps = steps
@@ -4269,14 +4220,10 @@ class MLXTrainer:
                                     "num_input_tokens_seen": int(
                                         self.state.num_input_tokens_seen
                                     ),
-                                    # The callback-visible best-metric watermark
-                                    # lives on HF's TrainerState, which
-                                    # _save_checkpoint persists wholesale. It
-                                    # advances on every eval whenever
-                                    # metric_for_best_model is set, so it is
-                                    # non-null even when "best_metric"/"best_step"
-                                    # above are null (load_best_model_at_end and
-                                    # early stopping both off).
+                                    # HF's TrainerState watermark, persisted
+                                    # wholesale by _save_checkpoint. It advances
+                                    # on every eval, so it is non-null even when
+                                    # "best_metric"/"best_step" above are null.
                                     "callback_best_metric": (
                                         None if self.state.best_metric is None
                                         else float(self.state.best_metric)
@@ -4285,18 +4232,14 @@ class MLXTrainer:
                                         None if self.state.best_global_step is None
                                         else int(self.state.best_global_step)
                                     ),
-                                    # HF writes ExportableState callback state
-                                    # into every checkpoint (unconditionally, in
-                                    # _save_checkpoint); without it the field is
-                                    # permanently empty and no later release can
-                                    # recover it from these checkpoints.
+                                    # HF writes this into every checkpoint;
+                                    # without it the field stays permanently
+                                    # empty and no later release can recover it.
                                     "stateful_callbacks":
                                         self._export_callback_states(),
                                     # HF's trainer_state.json carries the full
-                                    # log_history; without it a resumed run's
-                                    # state.log_history (and any history-exporting
-                                    # callback reading it) starts empty and loses
-                                    # every pre-resume entry.
+                                    # log_history; without it a resumed run
+                                    # loses every pre-resume entry.
                                     "log_history": list(self.state.log_history),
                                 },
                                 ckpt_dir,
@@ -4504,12 +4447,10 @@ class MLXTrainer:
         microstep = _resume_step * grad_accum
         self._global_step = _resume_step
         # Resuming mid-epoch re-enters an epoch whose boundary already passed, so
-        # the loop's own predicate never fires its begin and a fresh callback sees
-        # that epoch's on_epoch_end unpaired. HF dispatches on_epoch_begin for the
-        # resumed partial epoch too, before skipping its trained batches
-        # (trainer.py on_epoch_begin at the top of the epoch loop, then
-        # skip_first_batches). A stop set here is drained by the loop's first
-        # _distributed_should_stop().
+        # the loop's predicate never fires its begin and a fresh callback sees an
+        # unpaired on_epoch_end. HF dispatches on_epoch_begin for the resumed
+        # partial epoch too, before skipping its trained batches. A stop set here
+        # is drained by the loop's first _distributed_should_stop().
         if batches_per_epoch and microstep % batches_per_epoch:
             _run_callback_epoch_begin(float(microstep // batches_per_epoch))
         while self._global_step < total_steps:
@@ -4585,21 +4526,14 @@ class MLXTrainer:
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, self._global_step)
                 # HF fires this between clipping and optimizer.step(). MLX fuses
-                # forward, backward, clipping and the update inside the compiled
-                # step_fn, so the last point with the update still un-applied is
-                # here, before step_fn rather than after the backward. That costs
-                # nothing observable: MLX parameters are mlx.core.array with no
-                # .grad, no callback kwarg is gradient-shaped, and the gradient
-                # pytree is a local of the compiled function freed on return, so
-                # HF's documented "monitor gradients" use is unreachable in this
-                # backend at ANY point in the loop. What HF consumers do mutate
-                # here still works: _set_optimizer_lr_for_step ran just above and
-                # the fused update reads optimizer.state after the dispatch, so an
-                # LR override reaches exactly the impending update. Like
-                # on_optimizer_step below, do NOT latch a callback stop now (HF
-                # only breaks after this step's on_step_end + log/eval/save):
-                # OR-reduce an external cancel and leave the callback stop to the
-                # tail _sync_stop().
+                # forward, backward, clipping and the update into step_fn, so the
+                # last point with the update un-applied is here, before step_fn.
+                # Nothing observable is lost: MLX parameters have no .grad and the
+                # gradient pytree is a local of the compiled function, so HF's
+                # "monitor gradients" use is unreachable in this backend, while an
+                # LR override still lands (the fused update reads optimizer.state
+                # after the dispatch). Like on_optimizer_step below, do NOT latch a
+                # callback stop here: OR-reduce an external cancel only.
                 _fire("on_pre_optimizer_step")
                 self._distributed_should_stop()
 
@@ -4743,10 +4677,9 @@ class MLXTrainer:
                 self.state.epoch = it / batches_per_epoch
             elif stream_epoch_microbatches:
                 self.state.epoch = it / stream_epoch_microbatches
-            # Charge this micro-batch to the PENDING window, folded into
-            # COMMITTED only on an applied update, where pending_losses and
-            # friends fold. train_time then covers exactly the micro-batches
-            # whose tokens are in n_tokens.
+            # Charge this micro-batch to the PENDING window; it folds into
+            # COMMITTED on an applied update, so train_time covers exactly the
+            # micro-batches whose tokens are in n_tokens.
             pending_time += time.perf_counter() - tic
             if do_update:
                 train_time += pending_time
@@ -4853,12 +4786,9 @@ class MLXTrainer:
             # same-step actions by the tail _sync_stop() below.
             self._distributed_should_stop()
 
-            # Logging. The cadences come from self.state, which _init_callback_state
-            # filled with HF-resolved absolute counts (a fractional ratio like 0.1
-            # is already expanded against total_steps there), and each is guarded
-            # against 0 to avoid a modulo-by-zero; the callback control flag (synced
-            # across ranks above) can also force a log. _run_training_log all-reduces
-            # the loss/token totals so every rank stays in lockstep.
+            # Logging. Cadences come from self.state as HF-resolved absolute
+            # counts, each guarded against 0; the synced control flag can also
+            # force a log. _run_training_log all-reduces the totals.
             logging_steps = int(getattr(self.state, "logging_steps", 0) or 0)
             eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
             save_steps = int(getattr(self.state, "save_steps", 0) or 0)
