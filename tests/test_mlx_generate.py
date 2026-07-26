@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import inspect
 import threading
 import types
 from dataclasses import make_dataclass
@@ -8,7 +9,7 @@ from unsloth_zoo.mlx.generate import (
     GenerationDefaults, GenerationRequest,
     _GENERATION_MODE_LOCK, _PendingResult, _StopStringScanner, _TextBatchAdapter,
     _eos_stop_tokens, _new_detokenizer, _probe_sampler_api, _probe_text_api,
-    _restore_training_flags,
+    _generation_cache_hygiene, _restore_training_flags,
     _validate_text_requests, generate_batch, generation_mode,
 )
 
@@ -118,7 +119,8 @@ def test_text_api_probe_accepts_pinned_shape_and_names_pin_on_mismatch():
     )
     GenerationBatch = type("GenerationBatch", (), {"Response": Response})
     class BatchGenerator:
-        def __init__(self, model, max_tokens=1, stop_tokens=None):
+        def __init__(self, model, max_tokens=1, stop_tokens=None,
+                     prefill_batch_size=8, completion_batch_size=32, max_kv_size=None):
             pass
         def insert(self, prompts, max_tokens=None, samplers=None,
                    logits_processors=None):
@@ -133,6 +135,13 @@ def test_text_api_probe_accepts_pinned_shape_and_names_pin_on_mismatch():
         "PinnedShape", (), {"BatchGenerator": BatchGenerator, "GenerationBatch": GenerationBatch}
     )
     _probe_text_api(module)
+    signature = inspect.signature(BatchGenerator)
+    for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size"):
+        BatchGenerator.__signature__ = signature.replace(
+            parameters=[item for item in signature.parameters.values() if item.name != name])
+        with pytest.raises(RuntimeError, match=rf"constructor missing {name}"):
+            _probe_text_api(module)
+    del BatchGenerator.__signature__
     del BatchGenerator.remove
     with pytest.raises(RuntimeError, match=r"remove missing.*mlx-lm==0\.31\.2"):
         _probe_text_api(module)
@@ -140,9 +149,25 @@ def test_text_api_probe_accepts_pinned_shape_and_names_pin_on_mismatch():
         _probe_sampler_api(type("Sample", (), {"make_sampler": lambda temp: None}))
     assert _eos_stop_tokens(types.SimpleNamespace(eos_token_ids={2, None})) == [[2]]
 
-def test_falsey_defaults_are_not_silently_replaced():
+def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
     with pytest.raises(TypeError, match="defaults"):
         generate_batch(object(), None, [], defaults={})
+    for name in ("kv_bits", "kv_group_size"):
+        with pytest.raises(ValueError, match=rf"{name} are not supported by mlx-lm==0\.31\.2"):
+            GenerationDefaults(**{name: 4})
+    for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size"):
+        for value in (-1, 0, True, 1.5):
+            with pytest.raises((TypeError, ValueError), match=name):
+                GenerationDefaults(**{name: value})
+    calls = []
+    def clear():
+        calls.append(None)
+        if len(calls) == 2:
+            raise RuntimeError("clear")
+    monkeypatch.setattr("mlx.core.clear_cache", clear)
+    with pytest.warns(RuntimeWarning, match="clear_cache"), pytest.raises(ValueError, match="body"):
+        with _generation_cache_hygiene():
+            raise ValueError("body")
 
 def test_training_flag_restore_attempts_every_module():
     class Module:
@@ -162,7 +187,7 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     class Generator:
         instances, fail, eos, close_fail = [], False, False, False
         def __init__(self, *_args, **_kwargs):
-            self.removed, self.closed = [], False
+            self.removed, self.closed, self.kwargs = [], False, _kwargs
             self.instances.append(self)
         def insert(self, *_args, **_kwargs):
             return [7]
@@ -189,11 +214,12 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     tokenizer, adapter = _CharTokenizer(), object.__new__(_TextBatchAdapter)
     tokenizer.eos_token_ids = ()
     adapter.model, adapter.tokenizer = object(), tokenizer
-    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",))
+    adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16)
     adapter.batch_generator_type = Generator
     adapter.make_sampler = lambda **_kwargs: None
     result = adapter.generate([GenerationRequest(prompt_token_ids=[9])])[0]
     assert result.token_ids == [1] and Generator.instances[-1].removed == [7]
+    assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size")) == (2, 3, 16)
     assert Generator.instances[-1].closed is True
     Generator.eos = True
     eos = adapter.generate([GenerationRequest(prompt_token_ids=[9])])[0]

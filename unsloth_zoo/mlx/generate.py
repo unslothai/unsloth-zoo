@@ -136,13 +136,47 @@ class GenerationDefaults:
     max_tokens: int = 256
     sampling: SamplingParams = field(default_factory=SamplingParams)
     stop_strings: tuple[str, ...] = ()
+    prefill_batch_size: int = 8
+    completion_batch_size: int = 32
+    max_kv_size: int | None = None
+    kv_bits: int | None = None
+    kv_group_size: int | None = None
 
     def __post_init__(self):
-        _validate_max_tokens(self.max_tokens, "defaults.max_tokens")
+        _validate_positive_int(self.max_tokens, "defaults.max_tokens")
+        _validate_positive_int(
+            self.prefill_batch_size,
+            "defaults.prefill_batch_size",
+        )
+        _validate_positive_int(
+            self.completion_batch_size,
+            "defaults.completion_batch_size",
+        )
+        if self.max_kv_size is not None:
+            _validate_positive_int(self.max_kv_size, "defaults.max_kv_size")
+        unsupported_kv = [
+            name
+            for name in ("kv_bits", "kv_group_size")
+            if getattr(self, name) is not None
+        ]
+        if unsupported_kv:
+            names = " and ".join(unsupported_kv)
+            raise ValueError(
+                f"{names} are not supported by {_MLX_LM_PIN}'s "
+                "BatchGenerator; omit these controls."
+            )
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
         stops = _normalize_stop_strings(self.stop_strings)
         object.__setattr__(self, "max_tokens", int(self.max_tokens))
+        object.__setattr__(self, "prefill_batch_size", int(self.prefill_batch_size))
+        object.__setattr__(
+            self,
+            "completion_batch_size",
+            int(self.completion_batch_size),
+        )
+        if self.max_kv_size is not None:
+            object.__setattr__(self, "max_kv_size", int(self.max_kv_size))
         object.__setattr__(self, "stop_strings", stops)
 
 
@@ -174,7 +208,7 @@ class GenerationResult:
     stop_match: str | None = None
 
 
-def _validate_max_tokens(value: Any, name: str):
+def _validate_positive_int(value: Any, name: str):
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise TypeError(f"{name} must be an integer.")
     if value <= 0:
@@ -239,7 +273,7 @@ def _validate_text_requests(
                 prompt_token_ids=tuple(int(token) for token in prompt_ids),
             )
         if request.max_tokens is not None:
-            _validate_max_tokens(request.max_tokens, f"requests[{index}].max_tokens")
+            _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
         if request.sampling is not None and not isinstance(
             request.sampling, SamplingParams
         ):
@@ -284,7 +318,13 @@ def _probe_text_api(generate_module):
     except (TypeError, ValueError) as exc:
         raise _api_shape_error("BatchGenerator callable signature unavailable") from exc
 
-    required_constructor = {"max_tokens", "stop_tokens"}
+    required_constructor = {
+        "max_tokens",
+        "stop_tokens",
+        "prefill_batch_size",
+        "completion_batch_size",
+        "max_kv_size",
+    }
     missing_constructor = required_constructor.difference(
         constructor_signature.parameters
     )
@@ -297,7 +337,14 @@ def _probe_text_api(generate_module):
         names = ", ".join(sorted(missing_insert))
         raise _api_shape_error(f"BatchGenerator.insert missing {names}")
     try:
-        constructor_signature.bind(object(), max_tokens=1, stop_tokens=[])
+        constructor_signature.bind(
+            object(),
+            max_tokens=1,
+            stop_tokens=[],
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            max_kv_size=None,
+        )
         insert_signature.bind(
             object(),
             [[1]],
@@ -471,6 +518,41 @@ def generation_mode(model):
                     "generation_mode could not fully restore model or MLX "
                     f"state after {type(active_error).__name__}: "
                     f"{restoration_error}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except BaseException:
+                pass
+
+
+@contextmanager
+def _generation_cache_hygiene():
+    """Cache hygiene around one burst; limits stay owned by ``generation_mode``."""
+
+    import mlx.core as mx
+
+    clear_cache = getattr(mx, "clear_cache", None)
+    if not callable(clear_cache):
+        raise RuntimeError(
+            "Unsupported MLX runtime API shape (mlx.core.clear_cache missing)."
+        )
+    clear_cache()
+    active_error = None
+    try:
+        yield
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        try:
+            clear_cache()
+        except BaseException as clear_error:
+            if active_error is None:
+                raise
+            try:
+                warnings.warn(
+                    "mlx.core.clear_cache() failed while preserving an active "
+                    f"{type(active_error).__name__}: {clear_error}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -709,6 +791,9 @@ class _TextBatchAdapter:
             self.model,
             max_tokens=self.defaults.max_tokens,
             stop_tokens=_eos_stop_tokens(self.tokenizer),
+            prefill_batch_size=self.defaults.prefill_batch_size,
+            completion_batch_size=self.defaults.completion_batch_size,
+            max_kv_size=self.defaults.max_kv_size,
         )
         active_error = None
         try:
@@ -811,8 +896,9 @@ def generate_batch(
     if tokenizer_or_processor is None:
         raise ValueError("Text batched generation requires a tokenizer.")
     with generation_mode(model):
-        adapter = _TextBatchAdapter(model, tokenizer_or_processor, defaults)
-        return adapter.generate(validated)
+        with _generation_cache_hygiene():
+            adapter = _TextBatchAdapter(model, tokenizer_or_processor, defaults)
+            return adapter.generate(validated)
 
 
 __all__ = [

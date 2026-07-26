@@ -8,6 +8,24 @@ except Exception:
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
+class _CompileBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear, self.dropout, self.seen_states = nn.Linear(8, 8), nn.Dropout(0.2), []
+    def __call__(self, hidden):
+        self.seen_states.append((self.training, hasattr(type(self), "_orig_call")))
+        return self.dropout(nn.relu(self.linear(hidden)))
+
+class _CompileLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed, self.layers, self.proj = (
+            nn.Embedding(16, 8), [_CompileBlock()], nn.Linear(8, 16, bias=False))
+    def make_cache(self):
+        return []
+    def __call__(self, tokens, cache=None):
+        return self.proj(self.layers[0](self.embed(tokens)))
+
 def _current_limit(name, expected):
     setter = getattr(mx, f"set_{name}_limit")
     current = setter(expected)
@@ -95,3 +113,92 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
         assert result.logprobs == pytest.approx(logprobs, abs=0.02)
         assert result.finish_reason == reason
         assert result.text == text
+
+@metal_only
+def test_compiled_training_state_survives_generation(monkeypatch):
+    import functools
+    import importlib
+    import mlx.optimizers as optim
+    mlx_lm_generate = importlib.import_module("mlx_lm.generate")
+    from mlx.utils import tree_flatten
+    from mlx_lm.sample_utils import make_sampler
+    from unsloth_zoo.mlx.generate import (
+        GenerationRequest, SamplingParams, generate_batch,
+    )
+    from unsloth_zoo.mlx.utils import (
+        apply_gradient_checkpointing, remove_gradient_checkpointing,
+    )
+    events = []
+    real_clear, real_close = mx.clear_cache, mlx_lm_generate.BatchGenerator.close
+    real_insert = mlx_lm_generate.BatchGenerator.insert
+    real_next = mlx_lm_generate.BatchGenerator.next_generated
+    def clear():
+        events.append("clear")
+        real_clear()
+    @functools.wraps(real_close)
+    def close(generator):
+        result = real_close(generator)
+        events.append(("close", _current_limit("wired", wired)))
+        return result
+    @functools.wraps(real_insert)
+    def insert(generator, *args, **kwargs):
+        events.append("insert")
+        return real_insert(generator, *args, **kwargs)
+    @functools.wraps(real_next)
+    def next_generated(generator):
+        events.append("decode")
+        return real_next(generator)
+    monkeypatch.setattr(mx, "clear_cache", clear)
+    monkeypatch.setattr(mlx_lm_generate.BatchGenerator, "close", close)
+    monkeypatch.setattr(mlx_lm_generate.BatchGenerator, "insert", insert)
+    monkeypatch.setattr(mlx_lm_generate.BatchGenerator, "next_generated", next_generated)
+    model, optimizer = _CompileLM(), optim.SGD(learning_rate=1e-2)
+    optimizer.init(model.trainable_parameters())
+    loss_and_grad = nn.value_and_grad(
+        model, lambda current, x, y: nn.losses.cross_entropy(
+            current(x), y, reduction="mean"),
+    )
+    def step(x, y):
+        loss, gradients = loss_and_grad(model, x, y)
+        optimizer.update(model, gradients)
+        return loss
+    state = [model.state, optimizer.state, mx.random.state]
+    compiled_step = mx.compile(step, inputs=state, outputs=state)
+    x, y = mx.array([[1, 2, 3]]), mx.array([[2, 3, 4]])
+    wired = int(mx.device_info()["max_recommended_working_set_size"] * 0.5)
+    previous_wired = mx.set_wired_limit(wired)
+    apply_gradient_checkpointing(model)
+    try:
+        mx.eval(state, before := compiled_step(x, y))
+        rng_before = tuple(mx.random.state[0].tolist())
+        def snapshot():
+            return [(name, value.tolist()) for name, value in tree_flatten(model.parameters())]
+        state_after_train = snapshot()
+        tokenizer = type("Tok", (), {"eos_token_ids": [0], "decode": lambda _, ids: str(ids)})()
+        model.eval()
+        oracle = []
+        for token, _ in mlx_lm_generate.generate_step(mx.array([1, 2]), model, max_tokens=3, sampler=make_sampler(temp=0.7)):
+            if int(token) == 0:
+                break
+            oracle.append(int(token))
+        expected_rng = tuple(mx.random.state[0].tolist())
+        model.train()
+        model.layers[0].seen_states.clear()
+        events.clear()
+        mx.random.state[0] = mx.array(rng_before, dtype=mx.uint32)
+        result = generate_batch(model, tokenizer, [GenerationRequest(prompt_token_ids=[1, 2], max_tokens=3, sampling=SamplingParams(temperature=0.7))])
+        assert result[0].token_ids == oracle
+        assert tuple(mx.random.state[0].tolist()) == expected_rng
+        assert snapshot() == state_after_train
+        mx.eval(state, after := compiled_step(x, y))
+        assert snapshot() != state_after_train
+        assert all(module.training for module in model.modules())
+        assert (False, True) in model.layers[0].seen_states
+        assert hasattr(_CompileBlock, "_orig_call") and optimizer.state["step"].item() == 2
+        labels = [event[0] if isinstance(event, tuple) else event for event in events]
+        assert labels[0] == "clear" and labels.index("insert") < labels.index("decode") < labels.index("close") < len(labels) - 1 and labels[-1] == "clear"
+        assert ("close", wired) in events and _current_limit("wired", wired) == wired
+        assert all(mx.isfinite(value).item() for value in (before, after))
+    finally:
+        remove_gradient_checkpointing(model)
+        mx.set_wired_limit(previous_wired)
