@@ -765,6 +765,20 @@ class _VLMCompileDecisionError(RuntimeError):
     should_raise even while the base policy mode is best_effort)."""
 
 
+def _effective_compile_mode(compile_policy, compile_decision):
+    """Return the compile mode in force after arch/backend overrides.
+
+    ``resolve_training_compile`` applies the per-architecture and
+    per-backend overrides, so a resolved decision can be strict (fallback
+    disabled) while the base policy mode is best_effort. Strictness checks
+    must follow the resolved mode, or an override-selected strict run would
+    silently degrade to eager. Decisions predating the resolved mode fall
+    back to the base policy mode.
+    """
+    mode = getattr(compile_decision, "policy_mode", None)
+    return mode if mode else compile_policy.mode
+
+
 def _plan_single_process_vlm_shapes(
     batches,
     batch_iter,
@@ -816,6 +830,10 @@ def _plan_single_process_vlm_shapes(
             "not_applicable", "vlm_compile_unqualified", cap,
             lazy_batches=lazy,
         ), True, None
+    # Every strictness check below follows the RESOLVED mode: an arch or
+    # backend override can select strict for this model while the base
+    # policy stays best_effort, and that run must abort rather than degrade.
+    effective_mode = _effective_compile_mode(compile_policy, compile_decision)
     max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
     if (
         distributed_world_size <= 1
@@ -838,7 +856,7 @@ def _plan_single_process_vlm_shapes(
             lazy_batches=False,
             cap_selection="not_applicable",
         )
-        if compile_policy.mode == "strict" and distributed_world_size <= 1:
+        if effective_mode == "strict" and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile requires a finite VLM batch plan."
             )
@@ -852,7 +870,7 @@ def _plan_single_process_vlm_shapes(
             "eager", "vlm_pad_token_unavailable", cap, compile_scope,
             cap_selection="not_applicable",
         )
-        if compile_policy.mode == "strict":
+        if effective_mode == "strict":
             raise RuntimeError(
                 "Unsloth: strict mx.compile cannot plan VLM widths without "
                 "a tokenizer pad id."
@@ -870,7 +888,7 @@ def _plan_single_process_vlm_shapes(
             "eager", "vlm_unplannable_family", cap, compile_scope,
             cap_selection="not_applicable",
         )
-        if compile_policy.mode == "strict":
+        if effective_mode == "strict":
             raise RuntimeError(
                 "Unsloth: strict mx.compile cannot plan VLM batch "
                 f"{unplannable[0]}: its compile-key family is not stable "
@@ -924,7 +942,7 @@ def _plan_single_process_vlm_shapes(
             compile_scope=compile_scope,
         )
     if shape_plan.report.action == "eager":
-        if compile_policy.mode == "strict":
+        if effective_mode == "strict":
             raise RuntimeError(
                 "Unsloth: strict mx.compile finite VLM shape planning failed "
                 f"({shape_plan.report.reason})."
@@ -1425,8 +1443,13 @@ class MLXTrainer:
         automatic=False,
         local_error=None,
         keep_exact_local=False,
+        compile_mode=None,
     ):
         """Require every DDP rank to admit its local finite shape plan.
+
+        ``compile_mode`` overrides the base policy mode with the resolved
+        one (arch/backend overrides can select strict under a best_effort
+        base), so a strict run aborts here instead of degrading to eager.
 
         ``keep_exact_local`` lets ranks whose automatic selection is exact
         keep that plan instead of joining shared-cap re-materialization,
@@ -1435,6 +1458,7 @@ class MLXTrainer:
         still contribute a neutral value and run every collective in the
         same order, so the coordinated schedule is unchanged.
         """
+        strict_mode = (compile_mode or compile_policy.mode) == "strict"
         if self.distributed_world_size <= 1:
             if local_error is not None:
                 raise local_error
@@ -1443,7 +1467,7 @@ class MLXTrainer:
             local_error is not None or not compile_allowed
         )
         if failed_any:
-            if compile_policy.mode == "strict":
+            if strict_mode:
                 error = RuntimeError(
                     "Unsloth: strict mx.compile finite text shape planning "
                     "failed on at least one DDP rank."
@@ -1497,7 +1521,7 @@ class MLXTrainer:
             if keep_local:
                 return shape_plan, report, True
             return final_plan, final_plan.report, True
-        if compile_policy.mode == "strict":
+        if strict_mode:
             error = RuntimeError(
                 "Unsloth: strict mx.compile finite text shared-cap "
                 "materialization failed on at least one DDP rank."
@@ -2634,6 +2658,9 @@ class MLXTrainer:
                     automatic=args.compile_max_variants is None,
                     local_error=local_plan_error,
                     keep_exact_local=True,
+                    compile_mode=_effective_compile_mode(
+                        compile_policy, self._compile_decision,
+                    ),
                 )
                 # A should_raise decision must abort EVERY rank, not just the one
                 # holding the error, or a lone exit strands peers at the next

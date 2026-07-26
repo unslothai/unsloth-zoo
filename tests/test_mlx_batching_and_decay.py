@@ -749,6 +749,67 @@ def test_vlm_should_raise_decision_aborts_inside_the_coordinated_block():
         )
 
 
+def test_vlm_shape_planning_follows_the_resolved_override_mode():
+    """The mode in force is the RESOLVED one: an arch override selecting
+    strict under a best_effort base must abort on a shape-planning failure
+    instead of silently degrading to eager, and the reverse override must
+    still degrade under a strict base."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        MLXVLMCompilePolicy,
+        get_compile_qualification,
+        resolve_training_compile,
+    )
+    from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
+
+    arch = "qwen2_vl"
+    qualification = get_compile_qualification(arch)
+    if qualification is None or not qualification.training_compile:
+        pytest.skip(f"{arch} is not training-compile qualified here")
+
+    class _UnstableFamilyProcessor(_CountingProcessor):
+        """An opaque batch key makes the compile-key family unplannable."""
+
+        def __call__(self, text, **kwargs):
+            batch = dict(super().__call__(text, **kwargs))
+            batch[object()] = 1
+            return batch
+
+    plan = _vlm_planner_fixtures(processor=_UnstableFamilyProcessor(), rows=2)
+    args = SimpleNamespace(
+        compile_max_variants=None, gradient_accumulation_steps=1,
+    )
+
+    strict_override = MLXVLMCompilePolicy(
+        mode="best_effort", arch_overrides=((arch, "strict"),),
+    )
+    decision = resolve_training_compile(arch, policy=strict_override)
+    # Qualified arch: the decision is enabled, so planning runs past the
+    # should_raise and unqualified guards and reaches the failure branches.
+    assert decision.enabled and decision.policy_mode == "strict"
+    assert not decision.fallback_allowed and not decision.should_raise
+    with pytest.raises(RuntimeError, match="not stable enough"):
+        _plan_single_process_vlm_shapes(
+            plan, None, args=args, total_steps=len(plan),
+            distributed_world_size=1, compile_policy=strict_override,
+            compile_decision=decision,
+        )
+
+    lenient_override = MLXVLMCompilePolicy(
+        mode="strict", arch_overrides=((arch, "best_effort"),),
+    )
+    lenient_decision = resolve_training_compile(arch, policy=lenient_override)
+    assert lenient_decision.enabled and lenient_decision.fallback_allowed
+    _shape_plan, report, allowed, _frontier = _plan_single_process_vlm_shapes(
+        plan, None, args=args, total_steps=len(plan),
+        distributed_world_size=1, compile_policy=lenient_override,
+        compile_decision=lenient_decision,
+    )
+    assert not allowed and report.reason == "vlm_unplannable_family"
+
+
 def test_vlm_automatic_planning_stays_exact_below_ceiling():
     """Below the ceiling: canonical event widths, no budget compression."""
     _skip_if_mlx_core_was_replaced()
