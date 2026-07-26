@@ -2476,9 +2476,9 @@ class MLXTrainer:
     def _quiesce_prefetcher_for_save(self, terminal=False):
         """Make serialization exclusive over shared preprocessing objects.
 
-        ``terminal=True`` (end of training) closes the producer for good;
-        otherwise an active producer is PAUSED and returned so the caller can
-        resume it after the save. Live persisted orphans always refuse.
+        ``terminal=True`` closes the producer for good; otherwise an active
+        producer is PAUSED and returned so the caller can resume it after the
+        save. Live persisted orphans always refuse.
         """
         orphan = getattr(self, "_mlx_prefetch_orphan", None)
         if orphan is not None:

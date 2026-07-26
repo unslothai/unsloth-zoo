@@ -1308,9 +1308,8 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     """Lazy processor-owned MLX graphs must cross the prefetch boundary.
 
     Regression: without the producer-side materialization barrier, consumer
-    evaluation raises "There is no Stream ... in current thread". Label
-    decisions for both opaque routes (plain-SFT and prompt/completion) must
-    run on the consumer thread only.
+    evaluation raises "There is no Stream ... in current thread". Label decisions
+    for both opaque routes must run on the consumer thread only.
     """
     import threading
 

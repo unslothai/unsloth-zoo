@@ -1546,13 +1546,10 @@ def _normalize_cce_label_dtype(labels):
 
 
 def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
-    """Host-side label-mask AUTHORITY for VLM batches: placement only.
-
-    Decides WHICH positions are ignored (ignore tokens, attention zeros, and
-    positions a response/completion mask already set to -100). Label VALUES
-    and dtypes are assembled at finalize time from the SAME converted ids the
-    legacy path used, so coercion parity holds by construction — including
-    legacy's conversion-time rejections. Float comparisons mirror MLX's
+    """Decide WHICH VLM positions are ignored (ignore tokens, attention zeros,
+    positions a response/completion mask already set to -100). Label VALUES come
+    at finalize time from the SAME converted ids the legacy path used, so
+    coercion parity holds by construction. Float comparisons mirror MLX's
     effective float32 narrowing so placement matches the finalized tensors.
     """
     if labels is None:
@@ -1615,11 +1612,8 @@ def _reject_non_integer_host_vlm_ids(context):
 
 def _vlm_ids_integer_host(inputs):
     """True when label-bearing ids are integer host values (the staged case).
-
-    Real processors emit integer token ids; float or exotic-dtype ids (fp16,
-    bf16, float64 probes) route to the bit-exact legacy path instead of a
-    numpy re-implementation of MLX float semantics.
-    """
+    Float or exotic-dtype ids route to the bit-exact legacy path instead of a
+    numpy re-implementation of MLX float semantics."""
     ids = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
     if ids is None:
         ids = inputs.get("input_ids")
@@ -1650,12 +1644,11 @@ class _HostStagedVLMBatch:
     """Host-side VLM batch: processor fields + decided labels, pre-MLX.
 
     ``prefinalized`` carries an already-MLX legacy batch for MLX-valued
-    processor outputs (``host_valued=False``) in synchronous mode. In
-    producer mode, MLX-valued PROCESSOR outputs stage opaquely instead —
-    materialized producer-side first, because lazy MLX graphs cannot cross
-    threads: plain-SFT payloads ride ``inputs`` with ``label_mask=None``;
-    prompt/completion payloads ride ``pc_opaque`` with the combine deferred
-    to the consumer finalizer.
+    processor outputs in synchronous mode. In producer mode those stage
+    opaquely instead, materialized producer-side because lazy MLX graphs cannot
+    cross threads: plain-SFT rides ``inputs`` with ``label_mask=None``,
+    prompt/completion rides ``pc_opaque`` with the combine deferred to the
+    consumer finalizer.
     """
 
     __slots__ = ("inputs", "label_mask", "widen_labels_int64", "host_valued",
@@ -1677,12 +1670,10 @@ class _HostStagedVLMBatch:
 def _finalize_vlm_batch(staged, keep_raw_carrier=False):
     """The single consumer-thread point converting staged VLM batches to MLX.
 
-    For host-staged batches every semantic label decision already happened
-    host-side; only conversion and compile preparation run here. Opaque
-    processor-owned payloads (plain-SFT with ``label_mask=None``, and
-    ``pc_opaque`` prompt/completion carriers) instead run their combine and
-    legacy label decisions here on the consumer thread — the producer only
-    materialized and transported them.
+    Host-staged batches already made every label decision, so only conversion
+    and compile preparation run here. Opaque processor-owned payloads (plain-SFT
+    with ``label_mask=None``, ``pc_opaque`` prompt/completion carriers) instead
+    run their combine and legacy label decisions here.
     """
     if staged.prefinalized is not None:
         return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
@@ -3160,8 +3151,7 @@ def _materialize_mlx_values(*trees):
 
     Lazy MLX arrays cannot be evaluated from another thread, so opaque
     processor-owned payloads must cross the prefetch boundary materialized.
-    This completes computation the processor already issued on this thread;
-    Unsloth still introduces no new MLX computation off the consumer thread.
+    This only completes computation the processor already issued on this thread.
     """
     arrays = []
     for tree in trees:
@@ -4016,10 +4006,9 @@ def _prepare_labeled_text_dataset(
 def _coerce_mlx_token_list(value, field_name, state=None):
     """Convert one token-id field from a pretokenized row to a Python list.
 
-    When ``state`` is provided and the value arrived as an MLX array, the
-    stream is marked ``host_valued=False`` BEFORE conversion — the conversion
-    itself is MLX work, which the prefetch producer must reject rather than
-    perform off the consumer thread.
+    With ``state``, an MLX-valued field marks the stream ``host_valued=False``
+    BEFORE conversion, since the conversion is itself MLX work the prefetch
+    producer must reject rather than run off the consumer thread.
     """
     if state is not None and _contains_mlx_values(value):
         if state.get("reject_mlx_valued"):
@@ -4221,11 +4210,9 @@ def _is_mlx_lazy_text_source(dataset):
 
 
 def _is_mlx_hf_iterable_text_source(dataset):
-    """Return whether Hugging Face defines this source as replayable.
-
-    Detected through ``sys.modules`` so classification never imports
-    ``datasets``: if the package was never imported, no instance can exist.
-    """
+    """Return whether Hugging Face defines this source as replayable. Detected
+    through ``sys.modules`` so classification never imports ``datasets``: if the
+    package was never imported, no instance can exist."""
     hf_datasets = sys.modules.get("datasets")
     hf_iterable = getattr(hf_datasets, "IterableDataset", None)
     return hf_iterable is not None and isinstance(dataset, hf_iterable)
@@ -4239,9 +4226,8 @@ def _mlx_lazy_text_source(dataset):
 class _MLXIterableTokenizedDatasetView:
     """Iterable-only public view over MLX's lazy text normalization pipeline.
 
-    The view deliberately has no ``__len__`` or ``__getitem__``. It preserves
-    the source's replay/one-shot behavior and forwards epoch changes without
-    consuming a row during construction.
+    Deliberately has no ``__len__`` or ``__getitem__``. Preserves the source's
+    replay/one-shot behavior and forwards epoch changes without consuming a row.
     """
 
     _INVALIDATED_SOURCE_METADATA = frozenset((
@@ -4341,9 +4327,8 @@ def _labeled_row_has_supervision(labels, max_seq_length):
 class _HostStagedTextBatch:
     """Host-side (python/numpy) text batch awaiting MLX finalization.
 
-    ``host_valued`` is False when any staged field arrived as an MLX array;
-    synchronous mode accepts such rows unchanged, while the prefetch producer
-    must reject them via the FIFO envelope.
+    ``host_valued`` is False when any staged field arrived as an MLX array:
+    synchronous mode accepts those unchanged, the prefetch producer rejects them.
     """
 
     __slots__ = ("ids", "lengths_info", "labels", "host_valued")
@@ -4377,8 +4362,8 @@ def _stage_tokenized_text_batch(
     """Host staging of one pretokenized text batch (no MLX work).
 
     ``host_valued=None`` computes the flag from the items; the lazy pipeline
-    passes the stream-level flag recorded at row normalization, where MLX
-    origin is still visible (rows are lists by the time they reach staging).
+    instead passes the stream-level flag recorded at row normalization, where
+    MLX origin is still visible.
     """
     valid_items = [item for item in batch_items if item is not None]
     lengths = [
@@ -5372,9 +5357,9 @@ def _combine_vlm_prompt_completion_inputs(
 ):
     """Concatenate prompt/completion processor outputs into one staged batch.
 
-    Runs on the collating thread for host-valued outputs and on the consumer
-    thread (via the ``pc_opaque`` carrier) for MLX-valued outputs. Takes the
-    tokenizer-derived collation scalars, never the processor itself.
+    Runs on the collating thread for host-valued outputs, on the consumer thread
+    (via ``pc_opaque``) for MLX-valued ones. Takes the tokenizer-derived
+    collation scalars, never the processor itself.
     """
     pc_host_valued = (
         _vlm_inputs_host_valued(prompt_inputs)
@@ -5612,10 +5597,10 @@ def _build_response_masked_vlm_batch(
 ):
     """Collate VLM rows and apply the CUDA response-mask closure.
 
-    Plain-SFT and prompt/completion streams stage host-side and exit through
-    the single ``_finalize_vlm_batch`` call (``yield_host_staged`` defers it
-    for the prefetch producer). Response-masked streams run the verbatim
-    legacy consumer-side order and are rejected in producer modes.
+    Plain-SFT and prompt/completion streams stage host-side and exit through the
+    single ``_finalize_vlm_batch`` call (``yield_host_staged`` defers it for the
+    prefetch producer). Response-masked streams run the verbatim legacy
+    consumer-side order and are rejected in producer modes.
     """
     staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
@@ -5851,12 +5836,11 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 def _vlm_has_sized_index_space(dataset):
     """True when the VLM batcher can index the dataset (`__len__` + `__getitem__`).
 
-    Both protocols must be declared on the TYPE (instance `__getattr__` proxies
-    do not make an object subscriptable), and known iterable-only bases are
-    excluded even when they inherit a raising `__getitem__` (torch
-    `IterableDataset`) or declare stream topology (HF iterables). Everything
-    else streams lazily; the sized path's permutations and response-mask
-    pre-scan require real indexing.
+    Both must be declared on the TYPE (instance `__getattr__` proxies do not
+    make an object subscriptable), and known iterable-only bases are excluded
+    even when they inherit a raising `__getitem__` or declare stream topology.
+    Everything else streams lazily; the sized path's permutations and
+    response-mask pre-scan require real indexing.
     """
     cls = type(dataset)
     if not callable(getattr(cls, "__len__", None)):
@@ -5882,10 +5866,10 @@ def _iterate_lazy_vlm_training_batches(
 ):
     """Unsized VLM batches under the lazy text-stream lifecycle contracts.
 
-    Single-process only: the previous every-rank consumption of the global
-    stream is intentionally removed, and rank-owned dispatch of ragged VLM
-    tensors is a planned follow-up. Per-row trainability filtering, label
-    masking, and collation reuse the sized-path helpers unchanged.
+    Single-process only: every-rank consumption of the global stream is
+    intentionally removed and rank-owned dispatch of ragged VLM tensors is a
+    planned follow-up. Trainability filtering, label masking, and collation
+    reuse the sized-path helpers unchanged.
     """
     if (yield_host_staged or reject_mlx_valued) and response_mask_fn is not None:
         # Zero-touch rejection: no set_epoch, no iterator, no source pull.
@@ -5923,10 +5907,8 @@ def _iterate_lazy_vlm_training_batches(
 
     def _filter_stream_item(item):
         """Return a formatted trainable streaming row, or None to skip it.
-
         Synchronous response-masked filtering finalizes and runs the legacy
-        closure (consumer thread); producer modes reject before reaching here.
-        """
+        closure; producer modes reject before reaching here."""
         if response_mask_fn is None:
             return item
         if yield_host_staged or reject_mlx_valued:
@@ -6115,11 +6097,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   prefetch_batches=0,
                                   prefetch_skip_batches=0,
                                   prefetch_control=None):
-    """Streaming VLM batch generator using processor directly.
-
-    Yields batch dicts with input_ids, pixel_values, attention_mask,
-    and optionally labels.
-    """
+    """Streaming VLM batch generator using processor directly. Yields batch
+    dicts with input_ids, pixel_values, attention_mask, and optionally labels."""
     import numpy as np
 
     image_size = _resolve_vlm_image_size(image_size, config, processor)
@@ -7440,10 +7419,10 @@ def _probe_lazy_replayability(source_dataset, current_iterator, set_epoch,
                               require_replayable, resume_error):
     """Classify a lazy source's replayability; prove it when resume needs it.
 
-    Returns ``(replayable, cached_next_iterator)`` where ``replayable`` is
-    True / False / None (unknown until first restart) and the cached iterator
-    is a proven-fresh traversal retained only for sources without
-    ``set_epoch`` (epoch-aware sources recreate after ``set_epoch`` advances).
+    Returns ``(replayable, cached_next_iterator)``; ``replayable`` is True /
+    False / None (unknown until first restart), and the cached proven-fresh
+    traversal is retained only for sources without ``set_epoch`` (epoch-aware
+    sources recreate after ``set_epoch`` advances).
     """
     if isinstance(source_dataset, Iterator):
         replayable = False
@@ -7494,14 +7473,12 @@ _PREFETCH_ERROR = "error"
 class _LazyTextPrefetcher:
     """Bounded single-producer prefetch over host-staged text batches.
 
-    The producer thread owns source consumption and host staging (tokenizer,
-    formatter, response-mask closures included); MLX finalization runs only on
-    the consumer thread. A queue slot is reserved BEFORE staging each batch so
-    read-ahead is exactly the configured depth. Cancellation is cooperative:
-    the stop event is honored between batches, cleanup closes the owned
-    iterator in ``finally``, and a bounded join that times out marks the
-    prefetcher ORPHANED — while the orphan thread lives, reusing the shared
-    preprocessing objects is refused by the trainer.
+    The producer thread owns source consumption and host staging; MLX
+    finalization runs only on the consumer thread. A queue slot is reserved
+    BEFORE staging each batch so read-ahead is exactly the configured depth.
+    Cancellation is cooperative, and a bounded join that times out marks the
+    prefetcher ORPHANED; while the orphan lives the trainer refuses to reuse the
+    shared preprocessing objects.
     """
 
     _JOIN_TIMEOUT = 5.0
@@ -7645,16 +7622,13 @@ class _LazyTextPrefetcher:
 
     def close(self):
         """Join the producer, then release any queued batches once it is
-        confirmed dead. Terminal, idempotent, and safe under concurrent
-        callers. Returns True when the producer terminated (queue drained),
-        False when it overran the join and is a live orphan.
-
-        The join, classification, and drain run under one lock, and the return
-        reflects this caller's own post-join observation — so a True return
-        guarantees the queue was drained under that lock before it was reported,
-        and no concurrent closer can observe it half-drained. ``orphaned`` is
-        set conservatively before the join, so an interrupted join leaves a live
-        producer classified as an orphan rather than falsely clean."""
+        confirmed dead. Terminal, idempotent, safe under concurrent callers.
+        Returns True when the producer terminated (queue drained), False when it
+        overran the join and is a live orphan. Join, classification, and drain
+        run under one lock, so a True return guarantees the queue was drained
+        before it was reported and no concurrent closer can see it half-drained.
+        ``orphaned`` is set conservatively before the join, so an interrupted
+        join leaves a live producer classified as an orphan."""
         # Conservative orphan up front: an interrupt during the lock, join, or
         # drain then leaves the producer unresolved rather than falsely clean.
         self.orphaned = True
@@ -7677,8 +7651,8 @@ class _LazyTextPrefetcher:
 
     def _drain_envelopes(self):
         """Discard queued batches so their payloads (device tensors for opaque
-        VLM outputs) are released instead of retained until the consumer
-        generator is collected — a terminal close is followed by a save."""
+        VLM outputs) are released at close instead of being retained until the
+        consumer generator is collected."""
         while True:
             try:
                 self._envelopes.get_nowait()
@@ -7705,8 +7679,7 @@ def _validate_streaming_length_window(value):
 
 
 def _lazy_window_sort_key(item, max_seq_length):
-    """Window grouping key: exact truncated prepared-token length (lazy rows
-    carry ``(input_ids, labels)`` for every schema)."""
+    """Window grouping key: exact truncated prepared-token length."""
     if item is None:
         return 0
     return min(len(item[0]), max_seq_length)
@@ -7747,14 +7720,11 @@ def _iterate_lazy_text_training_batches(
 
     ``sequential`` order and ``length_window_batches=1`` emit exact source
     order. Default order with a window > 1 pools that many global micro-batches
-    of trainable rows, stable-sorts them by truncated prepared-token length,
-    and emits the full chunks in a seeded deterministic permutation (partial
-    chunk last) — a documented, deterministic reordering.
-
-    Custom replayable sources must return independent fresh traversals from
-    ``iter(source)``. Resume validation may create one non-consuming iterator
-    ahead of the serving iterator; epoch-aware validation iterators are closed
-    immediately and recreated only after ``set_epoch`` advances.
+    of trainable rows, stable-sorts them by truncated prepared-token length, and
+    emits the full chunks in a seeded deterministic permutation (partial chunk
+    last). Custom replayable sources must return independent fresh traversals
+    from ``iter(source)``; resume validation may create one non-consuming
+    iterator ahead of the serving iterator.
     """
     if dataset_order == "torch_randperm":
         raise ValueError(
@@ -8185,9 +8155,9 @@ def _iterate_dispatched_lazy_text_training_batches(
 ):
     """Dispatch rank-0-owned lazy text batches to all data-parallel ranks.
 
-    The owner retains the first global batch of the current pass only to keep
-    legacy cycle-padding deterministic. Non-owner ranks never touch the source.
-    The supplied source is therefore interpreted as the global, unsharded stream.
+    The owner retains the first global batch of the pass only to keep legacy
+    cycle-padding deterministic. Non-owner ranks never touch the source, so the
+    supplied source is interpreted as the global, unsharded stream.
     """
     rank, world_size = _distributed_rank_size(comm_group)
     target_size = int(batch_size) * world_size
@@ -8454,11 +8424,9 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     ``length_window_batches`` global micro-batches of prepared rows (plus the
     rank-0 owner's pass-long cycle-padding batch under DDP). Default order with
     a window > 1 emits length-grouped, seeded-permuted batches; ``sequential``
-    and window 1 preserve exact source order.
-
-    Yields:
-        (batch, lengths, labels) tuples — same format as create_batches.
-        ``labels`` is ``None`` unless text prompt/completion masking is active.
+    and window 1 preserve exact source order. Yields ``(batch, lengths, labels)``
+    like create_batches, with ``labels`` None unless text prompt/completion
+    masking is active.
     """
     from mlx_lm.tuner.trainer import iterate_batches
 
