@@ -899,6 +899,29 @@ class MLXTrainingConfig:
         """Serialize this config like TrainingArguments.to_json_string()."""
         return json.dumps(self.to_dict(), indent=2, default=str)
 
+    def to_sanitized_dict(self):
+        """Serialize this config like TrainingArguments.to_sanitized_dict().
+
+        The other integration callbacks read the config through to_dict() /
+        to_json_string(); HF's NeptuneCallback reads it through this method
+        instead, unguarded, so omitting it aborts on_train_begin. HF reports
+        the resolved batch sizes next to the raw fields and stringifies
+        anything a tracker cannot store, so mirror both. torch.Tensor is on
+        HF's allow-list but cannot occur here: this module stays Torch-free.
+        """
+        output = self.to_dict()
+        output["train_batch_size"] = self.per_device_train_batch_size
+        output["eval_batch_size"] = (
+            getattr(self, "per_device_eval_batch_size", None)
+            or self.per_device_train_batch_size
+        )
+        # HF compares the exact type, so bool stays bool instead of widening.
+        valid_types = (bool, int, float, str)
+        return {
+            key: value if type(value) in valid_types else str(value)
+            for key, value in output.items()
+        }
+
 
 def _shape_guard_report(
     action,
@@ -1649,12 +1672,12 @@ class MLXTrainer:
     def _distributed_sync_control_actions(self):
         """OR the callback log/eval/save requests across ranks.
 
-        HF callbacks are dispatched on rank 0 only, so a callback that flips
-        control.should_log / should_evaluate / should_save sets it on rank 0
-        alone. Those actions run collective code (metric all-reduce, eval, and
-        rank-0-guarded saves), so every rank must agree before entering them or
-        the peers deadlock at the collective. One packed all-sum keeps the flags
-        in lockstep; a no-op at world size 1.
+        Callbacks fire on every rank, but a rank-dependent one can still flip
+        control.should_log / should_evaluate / should_save on a subset. Those
+        actions run collective code (metric all-reduce, eval, rank-0-guarded
+        saves), so every rank must agree before entering them or the peers
+        deadlock at the collective. One packed all-sum keeps the flags in
+        lockstep; a no-op at world size 1.
         """
         world = self._ensure_distributed()
         if world is None or self._distributed_world_size <= 1:
@@ -3794,29 +3817,32 @@ class MLXTrainer:
             return eval_batches
 
         def _fire(event, **kwargs):
-            """Dispatch an HF callback event on rank 0 only.
+            """Dispatch an HF callback event on every rank, like HF Trainer.
 
-            Callbacks perform host I/O (logging, saving, printing) and must not
-            run on every rank. Any resulting control-flag change is propagated
-            to the peer ranks by the caller (_sync_stop for the stop flag, or
-            _distributed_sync_control_actions for log/eval/save).
+            HF invokes callbacks per process and expects host I/O to self-gate
+            on state.is_world_process_zero (seeded per rank in
+            _init_callback_state, same as on_init_end). Dispatching on rank 0
+            alone leaves the peers' process-local training state un-mutated: an
+            on_pre_optimizer_step callback overriding optimizer.learning_rate
+            would update rank 0 only, so the peers apply the same all-reduced
+            gradient with a different LR and the replicas silently diverge.
+            Control-flag divergence is reconciled by the caller (_sync_stop for
+            the stop flag, _distributed_sync_control_actions for log/eval/save).
 
-            A callback that raises on rank 0 (an integration/logging error) must
-            not unwind rank 0 alone: the peers, which never enter this branch,
-            would return here and hang at the next collective while rank 0
-            aborts. Route the rank-0 failure through the distributed consensus
-            path (all ranks call _fire in lockstep) so every rank aborts with
-            the original error surfaced. Single-process keeps re-raising the
-            original exception unchanged.
+            A callback that raises on one rank must not unwind that rank alone:
+            the peers would return here and hang at the next collective. Route
+            the failure through the distributed consensus path (all ranks call
+            _fire in lockstep) so every rank aborts with the original error
+            surfaced. Single-process keeps re-raising the original exception
+            unchanged.
             """
             call_error = None
-            if is_main_process:
-                try:
-                    self.control = self.callback_handler.call_event(
-                        event, args, self.state, self.control, **kwargs,
-                    )
-                except Exception as e:
-                    call_error = e
+            try:
+                self.control = self.callback_handler.call_event(
+                    event, args, self.state, self.control, **kwargs,
+                )
+            except Exception as e:
+                call_error = e
             if distributed_world_size > 1:
                 self._raise_distributed_failure(
                     call_error is not None,
@@ -3946,8 +3972,8 @@ class MLXTrainer:
                 return
             self.state.epoch = microstep / batches_per_epoch
             _fire("on_epoch_end")
-            # on_epoch_end fires on rank 0 only; sync the log/eval/save requests
-            # before the collective control actions so peers stay in lockstep.
+            # A rank-dependent on_epoch_end callback can request log/eval/save on
+            # a subset; sync before the collective actions so peers stay in lockstep.
             self._distributed_sync_control_actions()
             if self.control.should_log or self.control.should_evaluate or self.control.should_save:
                 _run_callback_control_actions(current_step, grad_norm)
@@ -3957,8 +3983,8 @@ class MLXTrainer:
             """Emit one MLX/HF training log from accumulated loss counters.
 
             The loss/token totals are all-reduced so every rank logs the same
-            global figures; host I/O (printing, step callbacks, on_log) runs on
-            rank 0 only.
+            global figures. Printing and the native step callbacks run on rank 0;
+            on_log fires on every rank and self-gates on is_world_process_zero.
             """
             nonlocal losses, n_tokens, steps, train_time, trained_tokens
             # Nothing accumulated since the last log: an on_epoch_end (or other)
@@ -4048,17 +4074,18 @@ class MLXTrainer:
             if self.state.epoch is not None:
                 logs["epoch"] = self.state.epoch
             self.control.should_log = False
-            if is_main_process:
-                record = dict(logs)
-                record["step"] = self.state.global_step
-                self.state.log_history.append(record)
+            # Every rank appends, like HF Trainer.log: on_log now fires on all
+            # ranks, so a peer callback must see the entry it is notified about.
+            record = dict(logs)
+            record["step"] = self.state.global_step
+            self.state.log_history.append(record)
             _fire("on_log", logs=logs)
-            # on_log fires on rank 0 only and may itself request an eval or save
-            # (HF checks should_evaluate/should_save after logging in the same
-            # step). Sync those flags now: the caller's should_eval / should_save
-            # branches run collective eval + rank-0-guarded saves, so a request
-            # set on rank 0 alone would make rank 0 enter _run_eval/_run_checkpoint
-            # while peers skip them and hang at the collective. No-op at world 1.
+            # on_log may itself request an eval or save (HF checks
+            # should_evaluate/should_save after logging in the same step). Sync now:
+            # the caller's should_eval / should_save branches run collective eval +
+            # rank-0-guarded saves, so a request raised on a subset of ranks would
+            # make those ranks enter _run_eval/_run_checkpoint while the rest skip
+            # them and hang at the collective. No-op at world 1.
             self._distributed_sync_control_actions()
 
             losses = 0
@@ -4092,25 +4119,23 @@ class MLXTrainer:
             # eval_metrics payload stays exactly as evaluated.
             if self.state.epoch is not None:
                 metrics = {**metrics, "epoch": self.state.epoch}
-            if is_main_process:
-                record = dict(metrics)
-                record["step"] = self.state.global_step
-                self.state.log_history.append(record)
+            record = dict(metrics)
+            record["step"] = self.state.global_step
+            self.state.log_history.append(record)
             _fire("on_log", logs=dict(metrics))
             # Clear AFTER the eval on_log and just before on_evaluate, where HF
             # clears it. Clearing earlier lets an on_log callback's fresh
             # should_evaluate=True survive, so a boundary step evaluates twice.
             self.control.should_evaluate = False
             _fire("on_evaluate", metrics=metrics)
-            # on_log/on_evaluate fire on rank 0 only, and either may itself
-            # request a log/eval/save (HF checks should_save after on_evaluate in
-            # the same step). Sync those flags now, before the caller reads
-            # should_log / should_save: those branches run collective code
-            # (metric all-reduce, rank-0-guarded checkpoint save + on_save), so a
-            # request set on rank 0 alone would make rank 0 enter
-            # _run_training_log/_run_checkpoint while peers skip them and hang at
-            # the collective. Mirrors the on_log sync in _run_training_log; no-op
-            # at world size 1.
+            # on_log/on_evaluate may each request a log/eval/save (HF checks
+            # should_save after on_evaluate in the same step). Sync those flags
+            # before the caller reads should_log / should_save: those branches run
+            # collective code (metric all-reduce, rank-0-guarded checkpoint save +
+            # on_save), so a request raised on a subset of ranks would make those
+            # ranks enter _run_training_log/_run_checkpoint while the rest skip them
+            # and hang at the collective. Mirrors the on_log sync in
+            # _run_training_log; no-op at world size 1.
             self._distributed_sync_control_actions()
             self._update_callback_best_metric(metrics)
             # An external cancel arriving before/during eval is OR-reduced here so
@@ -4467,7 +4492,7 @@ class MLXTrainer:
         # DDP-lockstep microstep loop. global_step advances only on optimizer
         # updates; _distributed_should_stop() OR-reduces stop_requested at the
         # top so an early stop (external cancel or an HF stop callback that ran
-        # on rank 0 only) drains every rank together before the next collective.
+        # on a subset of ranks) drains every rank together before the next collective.
         microstep = _resume_step * grad_accum
         self._global_step = _resume_step
         # Resuming mid-epoch re-enters an epoch whose boundary already passed, so
@@ -4796,9 +4821,9 @@ class MLXTrainer:
             self.state.global_step = current_step
             accum_progress = 0
             _fire("on_step_end")
-            # on_step_end runs on rank 0 only and may request log/eval/save or a
-            # stop. Sync those decisions across ranks before the collective
-            # log/eval/save paths so every rank makes the same choice.
+            # on_step_end may request log/eval/save or a stop, and a rank-dependent
+            # callback can do so on a subset. Sync those decisions before the
+            # collective log/eval/save paths so every rank makes the same choice.
             self._distributed_sync_control_actions()
             # Do NOT copy a callback should_training_stop into stop_requested yet.
             # HF runs this step's log/evaluate/save before the loop breaks, so a
@@ -4907,7 +4932,7 @@ class MLXTrainer:
                 # hard external cancel (stop_requested without a callback
                 # should_training_stop) keeps its suppression: skip the actions
                 # entirely rather than emit a phantom eval. should_training_stop is
-                # rank-0 only, so OR-reduce it for a rank-consistent decision; the
+                # rank-dependent, so OR-reduce it for a consistent decision; the
                 # synced control flags above already put every rank in this branch,
                 # so the collective stays in lockstep.
                 _callback_stop = self._distributed_any_flag(

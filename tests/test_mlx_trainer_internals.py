@@ -6042,3 +6042,159 @@ def test_integration_callback_args_cover_stock_trackio_and_swanlab():
     trainer._ensure_callback_args_compat()
     assert args.project == "my-project"
     assert args.hub_private_repo is True
+
+
+def test_callback_events_dispatch_on_every_rank(monkeypatch):
+    # Regression for "Dispatch state-mutating callbacks on every rank". HF fires
+    # callbacks in every process and expects host I/O to self-gate on
+    # state.is_world_process_zero. Firing on rank 0 only left the peers'
+    # process-local state un-mutated: an on_pre_optimizer_step callback that
+    # overrides optimizer.learning_rate updated rank 0 alone, so the peers applied
+    # the same all-reduced gradient with a different LR and the replicas silently
+    # diverged. The per-rank flags _init_callback_state already seeds also stayed
+    # unobservable, since only rank 0 (always world-process-zero) ever saw them.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    # Homogeneous world of 2: every rank contributes an identical value, so the
+    # all-sum is the local value doubled and average_gradients is the identity.
+    monkeypatch.setattr(
+        trainer_mod.mx.distributed, "all_sum",
+        lambda value, group=None, stream=None: value * mx.array(2, dtype=value.dtype),
+    )
+    monkeypatch.setattr(
+        trainer_mod.nn, "average_gradients", lambda grad, group=None, **kw: grad,
+    )
+
+    base_lr, override_lr = 1e-5, 0.05
+
+    class OverrideLR:
+        def __init__(self):
+            self.calls = 0
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            self.calls += 1
+            kwargs["optimizer"].learning_rate = mx.array(override_lr)
+            return control
+
+    class GatedHostIO:
+        """Stock-callback shape: host I/O gated on the per-rank flag."""
+
+        def __init__(self):
+            self.writes = 0
+            self.peer_flags = []
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            self.peer_flags.append(state.is_world_process_zero)
+            if state.is_world_process_zero:
+                self.writes += 1
+            return control
+
+    def run(rank):
+        def _pinned_ensure_distributed(self):
+            self._distributed_world = object()
+            self._distributed_rank = rank
+            self._distributed_world_size = 2
+            self._distributed_is_main_process = (rank == 0)
+            self._distributed_initialized = True
+            return self._distributed_world
+
+        monkeypatch.setattr(
+            MLXTrainer, "_ensure_distributed", _pinned_ensure_distributed,
+        )
+        seen_lr = []
+        lr_cb, io_cb = OverrideLR(), GatedHostIO()
+        args = MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            logging_steps=2,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [],
+            args=args,
+            callbacks=[lr_cb, io_cb],
+        )
+        trainer._batches = _make_shape_guard_text_plan((8, 8, 8, 8))
+        trainer.save_model = lambda *_a, **_kw: None
+
+        def _recording_optimizer(_total_steps):
+            optimizer = types.SimpleNamespace(
+                learning_rate=mx.array(base_lr), state={},
+            )
+            # The fused update reads optimizer.learning_rate, so the value held
+            # here is what actually moves this rank's parameters.
+            optimizer.update = lambda _model, _grad: seen_lr.append(
+                round(float(mx.array(optimizer.learning_rate).item()), 6)
+            )
+            return optimizer
+
+        trainer._build_optimizer = _recording_optimizer
+        trainer.train()
+        return lr_cb, io_cb, seen_lr
+
+    rank0_lr_cb, rank0_io_cb, rank0_seen = run(0)
+    rank1_lr_cb, rank1_io_cb, rank1_seen = run(1)
+
+    # The callback runs on the peer too, so both ranks step with the same LR.
+    assert rank0_lr_cb.calls == 4
+    assert rank1_lr_cb.calls == 4
+    assert rank0_seen == [override_lr] * 4
+    assert rank1_seen == rank0_seen
+    # Guard the guard: rank-0-only dispatch left the peer on the un-overridden LR.
+    assert rank1_seen != [base_lr] * 4
+
+    # Cost check: the peer sees the real flag, so a stock-shaped callback still
+    # does its host I/O exactly once across the world.
+    assert rank0_io_cb.peer_flags and all(rank0_io_cb.peer_flags)
+    assert rank1_io_cb.peer_flags and not any(rank1_io_cb.peer_flags)
+    assert rank0_io_cb.writes == 2
+    assert rank1_io_cb.writes == 0
+
+
+def test_training_config_exposes_sanitized_dict_for_integration_callbacks():
+    # Regression for "Add the serialization method required by NeptuneCallback".
+    # HF's NeptuneCallback reads the config through args.to_sanitized_dict()
+    # (integrations/integration_utils.py) with a bare attribute access, so
+    # omitting it raised AttributeError out of on_train_begin and aborted the
+    # run. HF reports the resolved batch sizes and keeps only exact
+    # bool/int/float/str, stringifying anything a tracker cannot store.
+    import json
+
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    config = MLXTrainingConfig(
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=3,
+        compile_arch_overrides={"a": "b"},
+    )
+    sanitized = config.to_sanitized_dict()
+
+    assert sanitized["train_batch_size"] == 2
+    assert sanitized["eval_batch_size"] == 3
+    # Every raw field survives; only the values are coerced.
+    assert set(config.to_dict()) <= set(sanitized)
+    assert all(type(value) in (bool, int, float, str) for value in sanitized.values())
+    # A tracker must be able to serialize the whole payload.
+    json.dumps(sanitized)
+    # Non-scalars are stringified rather than dropped, and bool stays bool.
+    assert sanitized["compile_arch_overrides"] == str({"a": "b"})
+    assert isinstance(sanitized["packing"], bool)
+
+    # Unset eval batch size falls back to the train batch size, as HF reports it.
+    assert MLXTrainingConfig(
+        per_device_train_batch_size=4,
+    ).to_sanitized_dict()["eval_batch_size"] == 4
