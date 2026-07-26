@@ -587,6 +587,51 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     )
 
 
+def test_vlm_plan_survey_does_not_consume_preprocessing_rng():
+    """The descriptor survey is RNG-neutral: a processor that augments from
+    the global generators sees the SAME draws whether or not the survey ran,
+    so enabling compile cannot shift the training data stream. Without the
+    save/restore the surveyed run trains on a later augmentation stream."""
+    _skip_if_mlx_core_was_replaced()
+    import random as _random
+
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _AugmentingProcessor(_VarWidthProcessor):
+        """Width depends only on the items (so shapes are call-order
+        independent); the pixel content is a random augmentation draw."""
+
+        def __call__(self, text, **kwargs):
+            batch = super().__call__(text, **kwargs)
+            batch["pixel_values"] = np.stack([
+                np.random.randint(0, 255, size=(4,)) for _ in text
+            ]).astype(np.float32)
+            return batch
+
+    def _stream(survey):
+        np.random.seed(4321)
+        _random.seed(4321)
+        plan = _create_vlm_batch_plan(
+            dataset=[{"text": str(i)} for i in range(6)],
+            processor=_AugmentingProcessor(),
+            config={"image_size": 16, "image_token_id": 200},
+            batch_size=2,
+            max_seq_length=8,
+        )
+        if survey:
+            plan.ensure_descriptors()
+        return [
+            plan.materialize(index)["pixel_values"].tolist()
+            for index in range(len(plan))
+        ], (np.random.randint(0, 1 << 30), _random.random())
+
+    unsurveyed, unsurveyed_tail = _stream(False)
+    surveyed, surveyed_tail = _stream(True)
+    assert surveyed == unsurveyed
+    # The survey also leaves no offset behind for anything drawing afterwards.
+    assert surveyed_tail == unsurveyed_tail
+
+
 def test_vlm_plan_survey_releases_each_batch_before_the_next_build(monkeypatch):
     """One-at-a-time TENSOR ownership: every mx.array leaf of every built
     batch is tracked by weakref, all of the previous batch's tensors are

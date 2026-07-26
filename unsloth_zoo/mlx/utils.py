@@ -27,6 +27,7 @@ import mlx.nn as nn
 import mlx.utils
 import ast
 import collections
+import contextlib
 import copy
 import inspect
 import importlib
@@ -36,6 +37,7 @@ import operator
 import textwrap
 import numpy as np
 import os
+import random
 import sys
 import shutil
 import struct
@@ -5704,6 +5706,63 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+@contextlib.contextmanager
+def _preserved_preprocessing_rng():
+    """Run a block without leaving the shared preprocessing RNGs advanced.
+
+    The descriptor survey builds every scheduled batch through the real
+    processor purely to read shapes, then discards the tensors. A processor
+    that augments (random crop/flip/jitter) draws from the process-global
+    RNGs while doing so, and those draws are never replayed, so a
+    compile-enabled run would otherwise train on a later augmentation stream
+    than an eager or compile-ineligible run started from the same seed.
+    Snapshotting and restoring the global generators makes the survey
+    RNG-neutral, so enabling compile cannot change which samples training
+    sees. Generators a processor owns privately are outside any general
+    save/restore and stay the caller's responsibility.
+    """
+    states = []
+    try:
+        states.append((random.setstate, random.getstate()))
+    except Exception:
+        pass
+    try:
+        states.append((np.random.set_state, np.random.get_state()))
+    except Exception:
+        pass
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        try:
+            states.append((
+                torch_module.random.set_rng_state,
+                torch_module.random.get_rng_state(),
+            ))
+        except Exception:
+            pass
+    mx_state = None
+    try:
+        mx_random_state = mx.random.state
+        if isinstance(mx_random_state, list) and mx_random_state:
+            mx_state = mx.array(
+                mx_random_state[0].tolist(), dtype=mx.uint32,
+            )
+    except Exception:
+        mx_state = None
+    try:
+        yield
+    finally:
+        for restore, snapshot in states:
+            try:
+                restore(snapshot)
+            except Exception:
+                pass
+        if mx_state is not None:
+            try:
+                mx.random.state[0] = mx_state
+            except Exception:
+                pass
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -5938,7 +5997,10 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         The cache is invalidated up front and never repopulated here, and
         each batch is dropped before the next is built, so the survey owns at
         most one batch at a time. Repeated calls return the stored
-        descriptors without building anything.
+        descriptors without building anything. The whole survey runs under
+        preserved global preprocessing RNG state, so a stochastic processor's
+        augmentation draws are not consumed here and enabling compile cannot
+        shift the training data stream.
         """
         if self._descriptors is not None:
             return self._descriptors
@@ -5947,22 +6009,23 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         widths = []
         padable_flags = []
         forbidden_sets = []
-        for index in range(len(self._schedule)):
-            batch = self._build_batch(index)
-            width, axes, padable, forbidden = _vlm_width_survey(
-                batch,
-                disposable_keys=_vlm_pipeline_disposable_keys(self._config),
-            )
-            # Padable batches get symbolic families (batches differing only in text
-            # width coincide); declined batches keep every extent concrete.
-            family = _vlm_batch_family(
-                batch, symbolic_axes=axes if padable else None,
-            )
-            del batch
-            families.append(family)
-            widths.append(width)
-            padable_flags.append(bool(padable))
-            forbidden_sets.append(forbidden)
+        with _preserved_preprocessing_rng():
+            for index in range(len(self._schedule)):
+                batch = self._build_batch(index)
+                width, axes, padable, forbidden = _vlm_width_survey(
+                    batch,
+                    disposable_keys=_vlm_pipeline_disposable_keys(self._config),
+                )
+                # Padable batches get symbolic families (batches differing only in
+                # text width coincide); declined batches keep every extent concrete.
+                family = _vlm_batch_family(
+                    batch, symbolic_axes=axes if padable else None,
+                )
+                del batch
+                families.append(family)
+                widths.append(width)
+                padable_flags.append(bool(padable))
+                forbidden_sets.append(forbidden)
         self._descriptors = tuple(families)
         self._widths = tuple(widths)
         self._padable = tuple(padable_flags)
