@@ -1869,7 +1869,30 @@ class MLXTrainer:
             else "no"
         )
 
-    def _init_callback_state(self, total_steps, resume_step):
+    def _callback_num_train_epochs(self, total_steps, batches):
+        """Return the epoch total HF's TrainerState reports for this run.
+
+        Epoch-count runs use num_train_epochs directly. A max_steps run leaves
+        args.num_train_epochs at -1, but HF still derives a real epoch total from
+        the dataloader length, so reporting 0 while the loop dispatches epoch
+        events and drives state.epoch past 1.0 hands callbacks inconsistent
+        metadata, and a ZeroDivisionError to anything normalizing by it.
+        """
+        epochs = max(0, int(getattr(self.args, "num_train_epochs", 0) or 0))
+        if epochs > 0:
+            return epochs
+        total_steps = int(total_steps or 0)
+        if total_steps <= 0:
+            return 0
+        micro_per_epoch = self._callback_batches_per_epoch(batches)
+        if not micro_per_epoch:
+            # Streaming: no known boundaries, so the loop fires no epoch events.
+            return 0
+        grad_accum = max(1, int(getattr(self.args, "gradient_accumulation_steps", 1) or 1))
+        updates_per_epoch = max(1, math.ceil(micro_per_epoch / grad_accum))
+        return max(1, math.ceil(total_steps / updates_per_epoch))
+
+    def _init_callback_state(self, total_steps, resume_step, batches=None):
         """Initialize TrainerState for HF callback lifecycle events."""
         args = self.args
         # Resolve HF's fractional (ratio-of-total-steps) interval form before
@@ -1893,7 +1916,7 @@ class MLXTrainer:
                 getattr(args, "save_steps", 0), total_steps,
             ),
             train_batch_size=int(getattr(args, "per_device_train_batch_size", 0) or 0),
-            num_train_epochs=max(0, int(getattr(args, "num_train_epochs", 0) or 0)),
+            num_train_epochs=self._callback_num_train_epochs(total_steps, batches),
             num_input_tokens_seen=int(
                 getattr(self, "_resume_num_input_tokens_seen", 0) or 0
             ),
@@ -3245,7 +3268,7 @@ class MLXTrainer:
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
         self.callback_handler.processing_class = self.processor or self.tokenizer
         self._ensure_callback_args_compat()
-        self._init_callback_state(total_steps, _resume_step)
+        self._init_callback_state(total_steps, _resume_step, batches)
         # _init_callback_state rebuilds self.state, so seed the callback-visible
         # stateful_callbacks after it.
         self._restore_callback_states(
@@ -3875,6 +3898,13 @@ class MLXTrainer:
         pending_steps = 0
         trained_tokens = 0
         train_time = 0
+        # Wall-clock for the PENDING window, split exactly like the loss/token
+        # counters above: a forced log (on_epoch_end at a dataset boundary that
+        # lands on a non-update microstep) reports only the COMMITTED tokens, so
+        # charging it the pending micro-batches' duration too would understate
+        # tokens/s and overstate _step_times for that window -- and the reset
+        # would then hide that duration from the window that actually owns it.
+        pending_time = 0
         grad_accum_state = None
         accum_progress = 0
         batches_per_epoch = self._callback_batches_per_epoch(batches)
@@ -4048,12 +4078,19 @@ class MLXTrainer:
                         _main_print(f"Unsloth: eval callback error: {e}")
 
             metrics = self._last_eval_metrics or {}
-            self.control.should_evaluate = False
             if is_main_process:
                 record = dict(metrics)
                 record["step"] = self.state.global_step
                 self.state.log_history.append(record)
             _fire("on_log", logs=dict(metrics))
+            # Clear the request AFTER the eval-metrics on_log and immediately
+            # before on_evaluate, where HF clears it
+            # (transformers/trainer_callback.py CallbackHandler.on_evaluate:
+            # `control.should_evaluate = False` then call_event). Clearing it
+            # earlier lets an on_log callback's fresh should_evaluate=True survive
+            # this dispatch, so a boundary step's _maybe_callback_epoch_end runs a
+            # second full evaluation at the same global_step.
+            self.control.should_evaluate = False
             _fire("on_evaluate", metrics=metrics)
             # on_log/on_evaluate fire on rank 0 only, and either may itself
             # request a log/eval/save (HF checks should_save after on_evaluate in
@@ -4641,7 +4678,16 @@ class MLXTrainer:
                 self.state.epoch = it / batches_per_epoch
             elif stream_epoch_microbatches:
                 self.state.epoch = it / stream_epoch_microbatches
-            train_time += time.perf_counter() - tic
+            # Charge this micro-batch's duration to the PENDING window and fold it
+            # into the COMMITTED window only once the optimizer step is applied,
+            # exactly where pending_losses/pending_n_tokens/pending_steps are
+            # folded above. train_time therefore always covers precisely the
+            # micro-batches whose tokens are in n_tokens, so the tokens/s and
+            # per-step time a forced log reports stay consistent.
+            pending_time += time.perf_counter() - tic
+            if do_update:
+                train_time += pending_time
+                pending_time = 0
 
             # Only log/eval on actual optimizer steps
             if not do_update:
@@ -4709,6 +4755,10 @@ class MLXTrainer:
                         pending_losses = 0
                         pending_n_tokens = 0
                         pending_steps = 0
+                        # Drop the abandoned window's wall-clock with its tokens so
+                        # the next committed window's tokens/s is not deflated by
+                        # time whose tokens were just discarded.
+                        pending_time = 0
                         it = _honor_epoch_stop_skip(
                             it, self._global_step, grad_norm)
                     self.control.should_epoch_stop = False

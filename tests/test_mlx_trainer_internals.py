@@ -5265,3 +5265,331 @@ def test_fractional_step_intervals_resolve_against_total_steps(monkeypatch):
         name for name in os.listdir(out_dir) if name.startswith("checkpoint-")
     )
     assert checkpoints == ["checkpoint-2", "checkpoint-4"]
+
+
+class _FakeClock:
+    """Wall clock that only moves when the loop consumes a micro-batch.
+
+    perf_counter() is a pure read, so `train_time += perf_counter() - tic`
+    attributes exactly COST[i] seconds to micro-batch i and the reported
+    tokens/s and per-micro-batch step time become exact, checkable numbers.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.now = 0.0
+
+    def perf_counter(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
+    # Regression: the committed/pending split covered loss/tokens/steps but not
+    # train_time. When the epoch boundary lands on a NON-update microstep
+    # (grad_accum=2, batches-per-epoch=3) and on_epoch_end forces a log, the log
+    # reports the COMMITTED tokens but was charged the pending micro-batch's
+    # duration too -- understating that window's tokens/s and overstating
+    # _step_times -- and the reset then hid that duration from the window that
+    # actually owned it, overstating the next window in turn.
+    import tempfile
+    import time as _time
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    # micro-batch: 1 2 3 4 5 6   (updates at 2, 4 -> no; grad_accum=2 -> 2, 4, 6)
+    # epoch boundaries at 3 and 6; microstep 3 is a substep, and it is expensive.
+    costs = [1.0, 1.0, 10.0, 1.0, 1.0, 1.0]
+    clock = _FakeClock(_time)
+    monkeypatch.setattr(trainer_mod, "time", clock)
+
+    consumed = {"i": 0}
+    real_count = trainer_mod._mlx_batch_input_token_count
+
+    def _timed_count(batch_data):
+        index = consumed["i"]
+        consumed["i"] = index + 1
+        clock.now += costs[index] if index < len(costs) else 1.0
+        return real_count(batch_data)
+
+    monkeypatch.setattr(trainer_mod, "_mlx_batch_input_token_count", _timed_count)
+
+    class ForceLogAtEpochEnd:
+        def on_epoch_end(self, args, state, control, **kwargs):
+            control.should_log = True      # HF logging_strategy="epoch"
+            return control
+
+    args = MLXTrainingConfig(
+        max_steps=3,
+        gradient_accumulation_steps=2,
+        logging_steps=100,               # only the forced + final logs fire
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+        callbacks=[ForceLogAtEpochEnd()],
+    )
+    trainer._batches = _make_shape_guard_text_plan((10,) * 6)
+    trainer._callback_batches_per_epoch = lambda _batches: 3
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+
+    trainer.train()
+
+    # Two logs: the forced epoch-end log at microstep 3 (committed = micro 1+2)
+    # and the final-step log (committed = micro 3+4 and 5+6).
+    assert len(trainer._tokens_per_second_history) == 2
+    tokens = trainer._global_token_count_history
+    assert len(tokens) == 2
+
+    # Window 1 owns micro-batches 1 and 2 -> 1.0 + 1.0 = 2.0 s.
+    # Window 2 owns micro-batches 3..6 -> 10.0 + 1.0 + 1.0 + 1.0 = 13.0 s.
+    assert trainer._tokens_per_second_history[0] == pytest.approx(
+        tokens[0] / 2.0, rel=1e-9,
+    )
+    assert trainer._tokens_per_second_history[1] == pytest.approx(
+        tokens[1] / 13.0, rel=1e-9,
+    )
+    # _step_times is the window's wall clock over its micro-batch count.
+    assert trainer._step_times == pytest.approx([2.0 / 2, 13.0 / 4], rel=1e-9)
+    # Guard the guard: the unsplit clock charged window 1 all 12.0 s (micro 3
+    # included) and left window 2 with only 3.0 s.
+    assert trainer._tokens_per_second_history[0] != pytest.approx(
+        tokens[0] / 12.0, rel=1e-9,
+    )
+    assert trainer._tokens_per_second_history[1] != pytest.approx(
+        tokens[1] / 3.0, rel=1e-9,
+    )
+
+
+def test_pending_wall_clock_folds_only_on_an_applied_update():
+    # Source guard for the split above: the per-micro-batch duration lands in the
+    # PENDING clock and is folded into the COMMITTED train_time in the same
+    # do_update branch that folds pending_losses/pending_n_tokens/pending_steps,
+    # and the abandoned-window discard clears it alongside the pending tokens.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert "pending_time += time.perf_counter() - tic" in src
+    assert "train_time += time.perf_counter() - tic" not in src
+    fold = src.index("pending_time += time.perf_counter() - tic")
+    fold_block = src[fold:fold + 200]
+    assert "if do_update:" in fold_block
+    assert "train_time += pending_time" in fold_block
+    assert "pending_time = 0" in fold_block
+    # The forced-log helper still resets only the committed clock.
+    log_body = src[src.index("def _run_training_log("):src.index("def _run_eval(")]
+    assert "train_time = 0" in log_body
+    assert "pending_time" not in log_body
+    # The mid-epoch abandon drops the pending clock with the pending tokens.
+    discard = src.index("pending_losses = 0", src.index("grad_accum_state = None      #"))
+    assert "pending_time = 0" in src[discard:discard + 500]
+
+
+def test_eval_request_from_eval_log_is_cleared_before_on_evaluate(monkeypatch):
+    # Regression: _run_eval cleared control.should_evaluate BEFORE dispatching the
+    # eval-metrics on_log, so a callback that requests evaluation from on_log had
+    # its fresh should_evaluate=True survive on_evaluate. HF clears the flag inside
+    # CallbackHandler.on_evaluate -- `control.should_evaluate = False` immediately
+    # before call_event (transformers/trainer_callback.py:522-524) -- i.e. AFTER
+    # evaluate() has logged its metrics. With the early reset, a boundary step's
+    # _maybe_callback_epoch_end saw the stale flag and ran a SECOND full evaluation
+    # at the same global_step: duplicated metrics, duplicated log_history records,
+    # duplicated callback side effects and eval cost.
+    import inspect
+    import tempfile
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    eval_body = src[src.index("def _run_eval("):src.index("def _run_best_tracking(")]
+    reset = eval_body.index("self.control.should_evaluate = False", eval_body.index("metrics = self._last_eval_metrics"))
+    assert eval_body.index('_fire("on_log", logs=dict(metrics))') < reset
+    assert reset < eval_body.index('_fire("on_evaluate"')
+
+    class EvalFromEvalLog:
+        def __init__(self):
+            self.evaluates = []
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if any(key.startswith("eval_") for key in (logs or {})):
+                control.should_evaluate = True
+            return control
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            self.evaluates.append((state.global_step, control.should_evaluate))
+            return control
+
+    spy = EvalFromEvalLog()
+    args = MLXTrainingConfig(
+        max_steps=4,
+        gradient_accumulation_steps=1,
+        logging_steps=100,
+        eval_steps=4,                    # eval on the last step == epoch boundary
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+        callbacks=[spy],
+    )
+    trainer._batches = _make_shape_guard_text_plan((10,) * 4)
+    trainer._callback_batches_per_epoch = lambda _batches: 4
+    trainer.eval_dataset = [{"input_ids": [1, 2, 3, 4]}]
+    trainer._eval_batches_labeled = ["batch-0"]
+    # The eval maths is exercised elsewhere; here only the control-flag lifecycle
+    # around the on_log/on_evaluate dispatch matters.
+    evaluations = []
+
+    def _fake_evaluate(batches, loss_fn, is_vlm=False):
+        evaluations.append(len(batches))
+        trainer._last_eval_metrics = {"eval_loss": 1.25, "eval_perplexity": 3.5}
+        return 1.25, 3.5
+
+    trainer._evaluate = _fake_evaluate
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+
+    trainer.train()
+
+    # Exactly one evaluation at the boundary step, and HF's flag state inside
+    # on_evaluate (already cleared), not the stale True.
+    assert spy.evaluates == [(4, False)]
+    assert evaluations == [1], "the eval ran once, not twice at the same step"
+    eval_records = [
+        record for record in trainer.state.log_history
+        if any(key.startswith("eval_") for key in record)
+    ]
+    assert [record["step"] for record in eval_records] == [4]
+
+
+def test_max_steps_run_reports_hf_epoch_total_to_callbacks(monkeypatch):
+    # Regression: MLXTrainingConfig defaults num_train_epochs to -1, so every
+    # max_steps run initialized state.num_train_epochs to 0 even though the finite
+    # batch plan computes and dispatches real callback epochs. HF derives the field
+    # from the dataloader length -- `num_train_epochs = max_steps //
+    # num_update_steps_per_epoch + int(max_steps % num_update_steps_per_epoch > 0)`
+    # (transformers/trainer.py, _get_train_steps_and_epochs) -- so callbacks read
+    # metadata that contradicts the state.epoch values and epoch events they then
+    # receive, and anything normalizing progress by it divides by zero.
+    import tempfile
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochTotalSpy:
+        def __init__(self):
+            self.at_train_begin = None
+            self.epoch_ends = []
+            self.progress = []
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.at_train_begin = state.num_train_epochs
+            return control
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            self.epoch_ends.append(state.epoch)
+            # What a progress-normalizing callback does; ZeroDivisionError at 0.
+            self.progress.append(state.epoch / state.num_train_epochs)
+            return control
+
+    spy = EpochTotalSpy()
+    args = MLXTrainingConfig(
+        max_steps=6,
+        gradient_accumulation_steps=1,
+        logging_steps=100,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    assert args.num_train_epochs == -1, "the default max_steps config"
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+        callbacks=[spy],
+    )
+    trainer._batches = _make_shape_guard_text_plan((10,) * 6)
+    trainer._callback_batches_per_epoch = lambda _batches: 4
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+
+    trainer.train()
+
+    # 4 micro-batches per epoch at grad_accum=1 -> 4 updates per epoch, and
+    # ceil(6 / 4) = 2 epochs, exactly HF's arithmetic.
+    assert spy.at_train_begin == 2
+    assert trainer.state.num_train_epochs == 2
+    # The metadata matches the epoch events actually dispatched.
+    assert spy.epoch_ends and max(spy.epoch_ends) <= spy.at_train_begin
+    assert spy.progress == [pytest.approx(value / 2) for value in spy.epoch_ends]
+
+
+def test_callback_num_train_epochs_mirrors_hf_arithmetic():
+    # Unit coverage of the derivation, including the paths the loop cannot reach
+    # in one run: epoch-count runs pass through untouched, and a streaming /
+    # length-less plan (no epoch boundaries, so no epoch events) stays at 0.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        max_steps=50, per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+    )
+    trainer._distributed_world_size = 1
+    trainer._mlx_train_dataset_for_batches = list(range(8))   # one pass = 4 micro
+    trainer.train_dataset = trainer._mlx_train_dataset_for_batches
+    trainer._prepared_batches_include_epochs = False
+
+    # grad_accum=1 -> 4 updates/epoch -> ceil(50 / 4) = 13.
+    assert trainer._callback_num_train_epochs(50, list(range(100))) == 13
+    # grad_accum=3 -> ceil(4 / 3) = 2 updates/epoch -> ceil(50 / 2) = 25.
+    trainer.args.gradient_accumulation_steps = 3
+    assert trainer._callback_num_train_epochs(50, list(range(100))) == 25
+    # A run shorter than one epoch still reports one epoch, like HF's
+    # `max_steps // nupe + int(max_steps % nupe > 0)` for max_steps < nupe.
+    trainer.args.gradient_accumulation_steps = 1
+    assert trainer._callback_num_train_epochs(2, list(range(100))) == 1
+    # Streaming: no finite plan, no epoch events, field left alone.
+    assert trainer._callback_num_train_epochs(50, None) == 0
+
+    # Epoch-count runs are unchanged.
+    epochs = MLXTrainer.__new__(MLXTrainer)
+    epochs.args = MLXTrainingConfig(num_train_epochs=3, max_steps=-1)
+    epochs._prepared_batches_include_epochs = True
+    assert epochs._callback_num_train_epochs(0, list(range(12))) == 3
