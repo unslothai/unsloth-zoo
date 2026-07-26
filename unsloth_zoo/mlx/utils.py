@@ -43,6 +43,7 @@ import threading
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 
 
@@ -4588,6 +4589,90 @@ def _to_mx_vlm_batch(inputs):
     return batch
 
 
+_PYTORCH_ONLY_PROCESSOR_OUTPUT = (
+    "Only returning PyTorch tensors is currently supported."
+)
+
+
+def _convert_vlm_processor_output(value, return_tensors):
+    """Convert PyTorch-only processor output without changing its containers."""
+
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return mx.array(value) if return_tensors == "mlx" else value.numpy()
+    if isinstance(value, Mapping):
+        converted = copy.copy(value)
+        for key, item in value.items():
+            converted[key] = _convert_vlm_processor_output(item, return_tensors)
+        return converted
+    if isinstance(value, list):
+        return [_convert_vlm_processor_output(item, return_tensors) for item in value]
+    if isinstance(value, tuple):
+        converted = tuple(
+            _convert_vlm_processor_output(item, return_tensors) for item in value
+        )
+        return (
+            type(value)(*converted)
+            if hasattr(value, "_fields")
+            else type(value)(converted)
+        )
+    return value
+
+
+def _call_vlm_processor(processor_call, args, kwargs):
+    """Retry only the Transformers fast-processor PyTorch output contract."""
+
+    return_tensors = kwargs.get("return_tensors")
+    try:
+        return processor_call(*args, **kwargs)
+    except ValueError as error:
+        if (
+            return_tensors not in {"mlx", "np"}
+            or str(error) != _PYTORCH_ONLY_PROCESSOR_OUTPUT
+        ):
+            raise
+
+    retry_kwargs = dict(kwargs)
+    retry_kwargs["return_tensors"] = "pt"
+    output = processor_call(*args, **retry_kwargs)
+    return _convert_vlm_processor_output(output, return_tensors)
+
+
+def _mlx_vlm_process_inputs_adapter(original):
+    """Apply the exact PyTorch-only retry to mlx-vlm's processor boundary."""
+
+    if getattr(original, "_unsloth_pytorch_processor_output", False):
+        return original
+
+    @wraps(original)
+    def patched(
+        processor,
+        prompts,
+        images=None,
+        audio=None,
+        add_special_tokens=False,
+        padding=True,
+        padding_side="left",
+        return_tensors="mlx",
+        **kwargs,
+    ):
+        call_kwargs = dict(
+            images=images,
+            audio=audio,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            padding_side=padding_side,
+            return_tensors=return_tensors,
+            **kwargs,
+        )
+        return _call_vlm_processor(original, (processor, prompts), call_kwargs)
+
+    patched._unsloth_pytorch_processor_output = True
+    return patched
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -4639,7 +4724,7 @@ def _processor_vlm_inputs(
                 image_layout=image_layout,
             )
         try:
-            return processor(**proc_kwargs)
+            return _call_vlm_processor(processor, (), proc_kwargs)
         except TypeError as exc:
             if (
                 "add_special_tokens" in str(exc)
@@ -4648,7 +4733,7 @@ def _processor_vlm_inputs(
             ):
                 proc_kwargs.pop("add_special_tokens", None)
                 try:
-                    return processor(**proc_kwargs)
+                    return _call_vlm_processor(processor, (), proc_kwargs)
                 except Exception as retry_exc:
                     if first_error is None:
                         first_error = retry_exc
@@ -4658,7 +4743,7 @@ def _processor_vlm_inputs(
             if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
                 proc_kwargs.pop("padding_side", None)
                 try:
-                    return processor(**proc_kwargs)
+                    return _call_vlm_processor(processor, (), proc_kwargs)
                 except Exception as retry_exc:
                     if first_error is None:
                         first_error = retry_exc

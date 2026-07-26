@@ -4452,6 +4452,18 @@ def _ensure_vlm_prompt_utils_patched():
     _vlm_prompt_utils_patched = True
 
 
+def _ensure_vlm_processor_inputs_patched():
+    """Patch mlx-vlm's processor call without replacing its input preparation."""
+
+    from .utils import _mlx_vlm_process_inputs_adapter
+
+    vlm_utils = importlib.import_module("mlx_vlm.utils")
+    original = vlm_utils.process_inputs
+    adapted = _mlx_vlm_process_inputs_adapter(original)
+    if adapted is not original:
+        vlm_utils.process_inputs = adapted
+
+
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
     from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
@@ -6025,6 +6037,7 @@ class FastMLXModel:
 
             if patch_mode == "patched":
                 install_mlx_compile_patches()
+            _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
             _ensure_audio_conv_sanitize(model_type)
 

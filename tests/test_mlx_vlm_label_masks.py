@@ -738,6 +738,47 @@ def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
     assert "add_special_tokens" not in processor.calls[1]
 
 
+def test_vlm_processor_inputs_retry_only_exact_pytorch_output_error():
+    import torch
+
+    from unsloth_zoo.mlx.utils import _call_vlm_processor
+
+    class Batch(dict):
+        pass
+
+    calls = []
+    def pytorch_only(*_args, return_tensors=None, **_kwargs):
+        calls.append(return_tensors)
+        if return_tensors != "pt":
+            raise ValueError("Only returning PyTorch tensors is currently supported.")
+        return Batch({
+            "ids": torch.tensor([[1, 2]], dtype=torch.int64),
+            "nested": [torch.tensor([1.5], dtype=torch.float16), ("meta",)],
+        })
+
+    converted = _call_vlm_processor(
+        pytorch_only, (), {"return_tensors": "np"}
+    )
+    assert calls == ["np", "pt"] and isinstance(converted, Batch)
+    assert converted["ids"].dtype == np.int64
+    assert converted["nested"][0].dtype == np.float16
+    assert converted["nested"][1] == ("meta",)
+
+    converted = _call_vlm_processor(
+        pytorch_only, (), {"return_tensors": "mlx"}
+    )
+    assert isinstance(converted["ids"], mx.array)
+    assert converted["ids"].dtype == mx.int64
+
+    native, native_calls = object(), []
+    assert _call_vlm_processor(lambda **kw: native_calls.append(kw["return_tensors"]) or native, (), {"return_tensors": "np"}) is native
+    assert native_calls == ["np"]
+    unrelated = ValueError("unrelated")
+    with pytest.raises(ValueError) as raised:
+        _call_vlm_processor(lambda **_kwargs: (_ for _ in ()).throw(unrelated), (), {"return_tensors": "np"})
+    assert raised.value is unrelated
+
+
 def test_deepseek_ocr_loader_patches_removed_llama_flash_attention(monkeypatch):
     import sys
     import types
