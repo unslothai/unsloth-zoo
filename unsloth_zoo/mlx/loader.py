@@ -2435,9 +2435,7 @@ def _validate_mlx_adapter_base(model, adapter_cfg):
             if expected_map[path] != live_map[path]
         )
 
-        # Older Unsloth saves could not discover quantized Switch modules.
-        # New saves mark that capability even when no Switch layer is quantized;
-        # only an unmarked, Switch-free map receives the legacy allowance.
+        # Legacy allowance only for unmarked, Switch-free maps: old saves could not see quantized Switch modules.
         switch_types = _mlx_quantized_switch_module_types()
         legacy_switch_paths = {
             _canonical_mlx_quantization_path(path)
@@ -2703,8 +2701,7 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
             type_spec = None
         lora_cls = None
         if type_spec is None and use_dora and isinstance(module, linear_types):
-            # Fail loud: a plain-LoRA downgrade drops the saved DoRA `.m`
-            # tensor on strict=False.
+            # Fail loud: a plain-LoRA downgrade drops the saved DoRA `.m` tensor.
             if DoRALinear_cls is None:
                 raise ImportError(
                     "Unsloth MLX: adapter_config.json says "
@@ -5552,9 +5549,7 @@ class FastMLXModel:
                     _saved_lora_paths = _normalize_mlx_lora_module_paths(
                         adapter_cfg.get("unsloth_mlx_lora_module_paths"),
                     )
-                    # Saved exact paths are authoritative when present. Build
-                    # those wrappers and validate shapes before any
-                    # strict=False weight load can mutate them.
+                    # Saved exact paths win: build and shape-check those wrappers before strict=False can mutate them.
                     # Let older mlx-lm load_adapters accept scale=/dropout=.
                     _patch_mlx_lora_from_base_compat()
                     adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
