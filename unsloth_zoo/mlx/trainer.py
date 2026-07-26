@@ -4433,11 +4433,21 @@ class MLXTrainer:
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, self._global_step)
                 # HF fires this between clipping and optimizer.step(). MLX fuses
-                # both inside the compiled step_fn, so the last point with
-                # gradients still un-applied is here. Like on_optimizer_step
-                # below, do NOT latch a callback stop now (HF only breaks after
-                # this step's on_step_end + log/eval/save): OR-reduce an external
-                # cancel and leave the callback stop to the tail _sync_stop().
+                # forward, backward, clipping and the update inside the compiled
+                # step_fn, so the last point with the update still un-applied is
+                # here, before step_fn rather than after the backward. That costs
+                # nothing observable: MLX parameters are mlx.core.array with no
+                # .grad, no callback kwarg is gradient-shaped, and the gradient
+                # pytree is a local of the compiled function freed on return, so
+                # HF's documented "monitor gradients" use is unreachable in this
+                # backend at ANY point in the loop. What HF consumers do mutate
+                # here still works: _set_optimizer_lr_for_step ran just above and
+                # the fused update reads optimizer.state after the dispatch, so an
+                # LR override reaches exactly the impending update. Like
+                # on_optimizer_step below, do NOT latch a callback stop now (HF
+                # only breaks after this step's on_step_end + log/eval/save):
+                # OR-reduce an external cancel and leave the callback stop to the
+                # tail _sync_stop().
                 _fire("on_pre_optimizer_step")
                 self._distributed_should_stop()
 
