@@ -3895,11 +3895,8 @@ def _gemma3n_language_contract(method):
 
 
 def _gemma3n_cache_offset(cache):
-    """Normalize absolute cache progress for per-layer embedding slices.
-
-    Rotating caches compact or wrap their private ``_idx`` storage cursor while
-    the public ``offset`` continues to track the processed token position.
-    """
+    """Absolute token progress for per-layer embedding slices, read from the
+    public ``offset``: a rotating cache's private ``_idx`` wraps, ``offset`` does not."""
 
     raw_offset = next(
         (

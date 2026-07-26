@@ -285,9 +285,8 @@ def _message_matches_known_fallback(message, rule):
 
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
-    """A strict mlx load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too
-    old or incompatible for a QK-norm arch; dropping those weights breaks the
-    model, so raise a clear error instead."""
+    """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
+    this QK-norm arch; dropping those weights breaks the model, so raise instead."""
     if "parameters not in model" not in message:
         return
     if not any(marker in message for marker in ("k_norm", "q_norm")):
