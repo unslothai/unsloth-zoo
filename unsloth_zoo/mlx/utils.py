@@ -2416,10 +2416,10 @@ _VLM_POSITION_GENERATING_MODEL_TYPES = (
 
 
 def _vlm_pipeline_disposable_keys(config):
-    """Keys the position-recording phase overwrites wholesale for this
-    config. Whatever a processor placed under them is disposable for width
-    admission: it can neither decline a batch nor forbid extents, in any
-    representation."""
+    """Keys the position-recording phase overwrites wholesale for this config.
+
+    Whatever a processor placed under them is disposable for width admission:
+    it can neither decline a batch nor forbid extents."""
     model_type = _config_get(config, "model_type")
     if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES:
         return frozenset(("position_ids",))
@@ -2432,26 +2432,21 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
     """(text_width, symbolic_axes, padable, forbidden) for a prepared batch.
 
     ``text_width`` is the post-prepare ``input_ids`` width. ``symbolic_axes``
-    maps the pipeline-owned width-coupled leaf paths to their sequence axis
-    for ``_vlm_batch_family``. ``forbidden`` is the set of extents appearing
-    in arrays the pipeline does not pad, at ANY nesting depth — a planned
-    endpoint must avoid them, or an untouched array would suddenly share
-    the text width and reclassify the batch. ``padable`` is False — and the
-    axes None — whenever right-padding this batch to a larger width could
-    not be proven safe: unvalidated array-metadata captures; no exact-mx
-    2-D ``input_ids``; position data under a key OUTSIDE ``disposable_keys``
-    (the config-derived set of keys the position phase overwrites
-    wholesale — processor-authored position data the pipeline will not
-    regenerate is neither padded nor rebuilt, so those batches keep exact
-    families); any non-mx shape-carrying leaf
-    (its metadata cannot be read through the validated captures); an
-    ``attention_mask`` row that is not content-then-padding; or any
-    untouched array already sharing an extent with the text width.
+    maps pipeline-owned width-coupled leaf paths to their sequence axis for
+    ``_vlm_batch_family``. ``forbidden`` collects extents appearing at any
+    depth in arrays the pipeline does not pad: a planned endpoint must avoid
+    them, or an untouched array would suddenly share the text width and
+    reclassify the batch. ``padable`` is False (and the axes None) whenever
+    right-padding cannot be proven safe: invalid array-metadata captures, no
+    exact-mx 2-D ``input_ids``, position data under a key outside
+    ``disposable_keys`` (the pipeline neither pads nor regenerates it), a
+    non-mx shape-carrying leaf, an ``attention_mask`` row that is not
+    content-then-padding, or an untouched array already sharing an extent
+    with the text width.
 
-    Metadata is read exclusively through the import-time captured
-    descriptors and the walk mirrors the family serializer's raw container
-    traversal, so classification and the symbolic family always describe
-    the same pytree.
+    The walk mirrors the family serializer's traversal and reads metadata
+    only through the import-time captures, so classification and the
+    symbolic family always describe the same pytree.
     """
     if not _MX_ARRAY_CAPTURES_VALID:
         return None, None, False, frozenset()
@@ -2564,15 +2559,13 @@ def _finalize_vlm_batch_width(
 ):
     """Right-pad the pipeline-owned text-aligned arrays to ``target_width``.
 
-    Runs after prepare-time expansion and response masking have produced
-    the final content, and before width-derived sidecars are generated, so
-    every recorded absolute position refers to the preserved content prefix
-    and every generated sidecar is born at the final width. Padded tails
-    are inert: pad id under a zero attention mask, labels -100. Batches the
-    width survey declines are returned unchanged (they keep exact
-    families); a target below the current width is a caller bug and fails
-    hard. ``max_seq_length`` is deliberately never consulted: post-expansion
-    widths may legitimately exceed it.
+    Runs after expansion and response masking produce the final content but
+    before width-derived sidecars are generated, so recorded absolute
+    positions refer to the preserved content prefix and sidecars are born at
+    the final width. Padded tails are inert: pad id under a zero attention
+    mask, labels -100. Batches the width survey declines return unchanged; a
+    target below the current width fails hard. ``max_seq_length`` is never
+    consulted, since post-expansion widths may legitimately exceed it.
     """
     width, _axes, padable, forbidden = _vlm_width_survey(
         batch_dict, disposable_keys=disposable_keys,
@@ -2624,13 +2617,12 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     """Prepare a collated VLM batch for the compiled/training path.
 
     ``phase`` splits the work at the width seam: ``"content"`` runs sidecar
-    normalization and the prepare-time expansions that may REBUILD the text
-    arrays with data-dependent lengths; ``"positions"`` runs the steps that
-    record absolute positions or generate width-derived sidecars, and must
-    see the FINAL text width. ``None`` runs both back to back (the
-    unplanned public contract, byte-identical to the historical single
-    pass because each model type takes exactly one of the disjoint
-    branches).
+    normalization and the expansions that may rebuild the text arrays at
+    data-dependent lengths; ``"positions"`` runs the steps that record
+    absolute positions or generate width-derived sidecars and must see the
+    final text width. ``None`` runs both back to back, byte-identical to the
+    historical single pass since each model type takes exactly one of the
+    disjoint branches.
     """
     if phase is None:
         batch_dict = _prepare_vlm_batch_for_compile(
@@ -2831,9 +2823,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
 
 def _vlm_positions_for_compile(batch_dict, config):
     """Position-recording prepare steps: absolute-position constants and
-    width-derived sidecars, all computed from the FINAL text arrays (after
-    any prepare-time expansion and any planned width padding, whose
-    right-padded tails never shift a content position)."""
+    width-derived sidecars, computed from the final text arrays (after any
+    expansion and planned padding, whose tails never shift a content
+    position)."""
     model_type = _config_get(config, "model_type")
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
@@ -4234,11 +4226,11 @@ class _FiniteVisitMixin:
     def batch_index_for_visit(self, absolute_visit):
         """Map an absolute batch visit to one stored schedule index.
 
-        Identity plans replay the stored schedule cyclically (the historical
-        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
-        order for epoch 0, then visit a deterministic permutation of the same
-        batch multiset in every later epoch, derived only from the normalized
-        seed and the epoch — never from ambient RNG state.
+        Identity plans replay the schedule cyclically (the historical
+        ``visit % len``). ``epoch_permute`` plans replay the stored order for
+        epoch 0, then visit a deterministic permutation of the same batch
+        multiset each later epoch, derived only from the normalized seed and
+        the epoch, never from ambient RNG state.
         """
         count = len(self._schedule)
         if count == 0:
@@ -5297,9 +5289,8 @@ def _build_response_masked_vlm_batch(
     """Collate VLM rows and apply the CUDA response-mask closure.
 
     ``target_width`` (an installed shape-plan endpoint) right-pads the
-    text-aligned arrays AFTER expansion and response masking have produced
-    the final content — so padded tails stay inert — and BEFORE the
-    position-recording prepare phase, so absolute-position constants and
+    text-aligned arrays after expansion and response masking, so padded tails
+    stay inert, and before the position-recording phase, so positions and
     width-derived sidecars are computed at the final width.
     """
     batch_dict, is_prompt_completion = _collate_vlm_batch(
@@ -5436,11 +5427,9 @@ _MX_DTYPE_EQ = getattr(type(getattr(mx, "int32", None)), "__eq__", None)
 def _vlm_family_dtype_name(dtype_value):
     """Stable name for a dtype read from an array, or None.
 
-    Dtype property reads mint fresh wrapper objects, so identity cannot
-    name them; comparison goes through the __eq__ captured at import
-    against the dtype singletons captured at import, so later patching of
-    the Dtype class (including its string protocol, which is never
-    entered) cannot forge or hide a name.
+    Dtype reads mint fresh wrapper objects, so identity cannot name them.
+    Comparison uses the __eq__ and dtype singletons captured at import, so
+    later patching of the Dtype class cannot forge or hide a name.
     """
     if _MX_DTYPE_EQ is None:
         return None
@@ -5479,11 +5468,10 @@ _VLM_TYPE_TAG_CACHE = {}
 
 
 def _vlm_family_type_tag(node_type):
-    """First-observation type tag that survives hostile metaclasses: a
-    type whose introspection raises still classifies (as
-    "unidentifiable.type"), and a type whose introspection varies across
-    reads keeps its first observed tag for its lifetime (mx.compile would
-    trace or reject such a batch without ever reading these attributes)."""
+    """First-observation type tag that survives hostile metaclasses: a type
+    whose introspection raises still classifies (as "unidentifiable.type"),
+    and one whose introspection varies across reads keeps its first observed
+    tag for its lifetime."""
     entry = _VLM_TYPE_TAG_CACHE.get(id(node_type))
     if entry is not None and entry[0]() is node_type:
         return entry[1]
@@ -5508,17 +5496,15 @@ def _vlm_family_type_tag(node_type):
 def _vlm_family_encode_key(key):
     """Encoding of one dictionary key for ``_vlm_batch_family``.
 
-    ``mx.compile`` records every key's ``__hash__()`` result. A value
-    encoding is only safe where it is guaranteed at least as fine as that
-    hash within a process, which holds exactly for the built-in types whose
-    hash is value-determined: str/bytes (randomized but value-determined),
-    int/bool, None, non-NaN floats (the bit pattern also splits the
-    ``0.0``/``-0.0`` hash collision), and plain tuples of these. Subclasses
-    can override ``__hash__`` (or ``__int__``/iteration) and typically hash
-    by identity, so any non-exact type — like NaN floats and arbitrary
-    hashable objects — would let one family span several compile keys: it
-    is tagged ``unstable_key`` and ``_vlm_family_is_plannable`` excludes
-    the whole family from shape planning.
+    ``mx.compile`` records every key's ``__hash__()`` result, so a value
+    encoding is safe only where it is at least as fine as that hash within a
+    process. That holds for the exact built-ins whose hash is
+    value-determined: str/bytes, int/bool, None, non-NaN floats (the bit
+    pattern also splits the ``0.0``/``-0.0`` collision), and plain tuples of
+    these. Anything else (subclasses overriding ``__hash__``, NaN floats,
+    arbitrary hashable objects) could let one family span several compile
+    keys, so it is tagged ``unstable_key`` and ``_vlm_family_is_plannable``
+    excludes the whole family from shape planning.
     """
     key_type = type(key)
     if key_type is bool or key_type is int:
@@ -5542,31 +5528,24 @@ def _vlm_batch_family(batch, symbolic_axes=None):
     """Process-stable compile-key family of a prepared VLM batch pytree.
 
     Mirrors the structure walk ``mx.compile`` uses to key its cache (mlx
-    ``python/src/transforms.cpp``), including its container asymmetry:
-    lists are read through raw C storage (``l[i]`` indexing — subclass
-    iteration overrides do not participate) while tuples are read through
-    Python iteration on the object handle (overrides DO participate); both
-    share one sequence marker. Dict entries participate in insertion order
-    via raw ``dict.items``, non-array constants participate by exact value
-    (bools as their integer values, floats by bit pattern), and genuine
-    ``mx.array`` leaves contribute rank/shape/dtype. Value encodings are
-    only used for exact built-in types, whose value determines the hash or
-    cast MLX records; a subclass constant (overridable ``__hash__`` or
-    conversion) becomes an ``unstable_const`` tag instead. Where the
-    encodings differ, this one is finer for every pytree the compile walk
-    accepts — strings and hash-stable dict keys participate by value
-    instead of process-randomized hash — so for plannable families (see
-    ``_vlm_family_is_plannable``) equal families can never reach distinct
-    compile keys, and families compare equal across processes. Structures
-    the compile walk rejects (non-dict mappings, np.ndarray and every other
-    non-``mx.array`` leaf carrying shape/dtype, unsupported leaf types) get
-    stable ``mapping``/``opaque`` tags: they can never produce a compile
-    key at all, and planning skips them.
+    ``python/src/transforms.cpp``), including its container asymmetry: lists
+    are read through raw C storage (subclass iteration overrides do not
+    participate) while tuples are read through Python iteration (overrides
+    do); both share one sequence marker. Dict entries participate in
+    insertion order via raw ``dict.items``, non-array constants by exact
+    value (bools as ints, floats by bit pattern), and ``mx.array`` leaves by
+    rank/shape/dtype. Value encodings apply only to exact built-in types; a
+    subclass constant becomes an ``unstable_const`` tag. Where the encodings
+    differ this one is finer for every pytree the compile walk accepts, so
+    for plannable families (see ``_vlm_family_is_plannable``) equal families
+    can never reach distinct compile keys, and families compare equal across
+    processes. Structures the compile walk rejects (non-dict mappings, non
+    ``mx.array`` leaves carrying shape/dtype, unsupported leaf types) get
+    stable ``mapping``/``opaque`` tags and planning skips them.
 
-    ``symbolic_axes`` maps a leaf path (tuple of dict keys and sequence
-    positions) to the axis whose extent is replaced by the symbolic
-    ``"sequence"`` marker; unmapped arrays keep every dimension concrete and
-    therefore discriminate families exactly.
+    ``symbolic_axes`` maps a leaf path to the axis whose extent is replaced
+    by the symbolic ``"sequence"`` marker; unmapped arrays keep every
+    dimension concrete and so discriminate families exactly.
     """
     def encode(node, path):
         # Dispatch on the raw runtime type, which a lying __class__ cannot mislead,
@@ -5643,15 +5622,12 @@ def _vlm_batch_family(batch, symbolic_axes=None):
 def _vlm_family_is_plannable(family):
     """Whether shape planning may group compiled calls by this family.
 
-    False when the family contains any component whose compile-key mapping
-    is not one-to-one-or-finer: ``unstable_key``/``unstable_const``
-    (subclass or identity-based hashing can split one family across
-    several compile keys) and the ``mapping``/``opaque`` tags (structures
-    the compile walk rejects, which can never produce a compile key).
-    Because one unplannable family can span several compile keys, it must
-    never be admitted to compiled-shape planning — not even as an exact
-    signature; runs containing such batches keep unplanned behavior
-    (eager fallback or strict error).
+    False when any component's compile-key mapping is not one-to-one-or-finer:
+    ``unstable_key``/``unstable_const`` (subclass or identity hashing can
+    split one family across compile keys) and ``mapping``/``opaque``
+    (structures the compile walk rejects). Such a family must never be
+    admitted to planning, not even as an exact signature; runs containing
+    those batches keep unplanned behavior (eager fallback or strict error).
     """
     if not isinstance(family, tuple) or not family:
         return True
@@ -5733,10 +5709,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
 
     Rows hold formatted dataset items (``formatting_func`` is consumed once
     at construction), the schedule holds compact row positions with a mask of
-    distributed pad slots, and the plan-owned cache retains exactly the most
-    recent batch (callers own anything they keep beyond that). Visits are identity-only: merged VLM epoch
-    semantics replay the stored schedule, so epoch permutation remains a
-    text-plan behavior.
+    distributed pad slots, and the plan-owned cache retains only the most
+    recent batch. Visits are identity-only: merged VLM epoch semantics replay
+    the stored schedule, so epoch permutation stays a text-plan behavior.
     """
 
     __slots__ = (
@@ -5852,9 +5827,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
 
     def set_shape_plan(self, shape_plan, planned_widths):
         """Install an admission plan plus each batch's planned event width
-        (the rounded width the planner grouped it by; raw for declined
-        batches). The plan-owned cache is invalidated: nothing built before
-        installation may serve a planned fetch."""
+        (the width the planner grouped it by; raw for declined batches).
+        Invalidates the cache: nothing built before installation may serve a
+        planned fetch."""
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         planned_widths = tuple(
@@ -5871,16 +5846,15 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
 
-        The tensor-bearing cache holds exactly the most recent batch (for
-        its exact requested width) so a repeated fetch (e.g. a
-        compile-failure retry) is free while live scheduled inputs stay
-        bounded by the current batch. ``target_width`` right-pads the
-        text-aligned arrays to an explicit endpoint (explicit widths keep
-        bypass authority); with an installed shape plan, ``phase`` resolves
-        the planned endpoint instead, enforces phase-aware admission, and
-        hard-fails on structural drift from the surveyed family before the
-        batch can reach a compiled call. ``None``/``None`` preserves the
-        historical per-batch-maximum padding byte for byte.
+        The cache holds only the most recent batch at its exact requested
+        width, so a repeated fetch (e.g. a compile-failure retry) is free
+        while live inputs stay bounded by one batch. ``target_width``
+        right-pads to an explicit endpoint and keeps bypass authority; with
+        an installed shape plan, ``phase`` instead resolves the planned
+        endpoint, enforces phase-aware admission, and hard-fails on
+        structural drift from the surveyed family before the batch reaches a
+        compiled call. ``None``/``None`` preserves the historical
+        per-batch-maximum padding byte for byte.
         """
         index = operator.index(index)
         check_drift = False
@@ -5931,9 +5905,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
 
     def supervision_counts(self, max_check=100):
         """(all_masked_rows, trainable_rows) over the first ``max_check``
-        scheduled rows, from construction-time metadata. This method performs
-        no additional processor work or materialization, so a caller's
-        distributed reduction is never preceded by new rank-local work."""
+        scheduled rows, from construction-time metadata. Does no processor
+        work or materialization, so a caller's distributed reduction is never
+        preceded by new rank-local work."""
         seen_bad = 0
         seen_good = 0
         checked = 0
@@ -5956,12 +5930,10 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def ensure_descriptors(self):
         """Survey every scheduled batch's compile-key family, once.
 
-        The plan-owned cache is invalidated up front and never repopulated
-        here, and each batch is built through the complete builder then
-        dropped before the next build, so the survey owns at most one
-        tensor-bearing batch at any moment (a later fetch simply rebuilds).
-        Repeated calls return the stored descriptors without building
-        anything.
+        The cache is invalidated up front and never repopulated here, and
+        each batch is dropped before the next is built, so the survey owns at
+        most one batch at a time. Repeated calls return the stored
+        descriptors without building anything.
         """
         if self._descriptors is not None:
             return self._descriptors
@@ -5994,9 +5966,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
 
     @property
     def pad_token_id(self):
-        """The tokenizer pad id planned padding would use, or None —
-        without one no batch can be widened, so width planning degrades
-        the run to eager before surveying anything."""
+        """The tokenizer pad id planned padding would use, or None. Without
+        one no batch can be widened, so width planning degrades the run to
+        eager before surveying anything."""
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         return getattr(tokenizer, "pad_token_id", None)
 
@@ -6022,11 +5994,10 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def planned_event_widths(self):
         """Per-batch planner event widths from the survey: padable batches
         take the shared rounded width policy capped at the surveyed maximum
-        final width (never ``max_seq_length`` — post-expansion widths may
-        exceed it) and bumped off the union of untouched-array extents;
-        declined batches keep their exact raw widths. Deterministic given
-        the survey, so planning and post-coordination installation derive
-        identical widths."""
+        final width (never ``max_seq_length``, which post-expansion widths may
+        exceed) and bumped off the union of untouched-array extents; declined
+        batches keep their raw widths. Deterministic given the survey, so
+        planning and installation derive identical widths."""
         if self._descriptors is None:
             raise RuntimeError(
                 "Unsloth MLX: VLM batch widths have not been surveyed; "
@@ -6060,10 +6031,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         """Hard-fail when a materialized batch's structure leaves its
         surveyed family. Container structure, dict keys and order, constant
         values, and every array extent outside the detected text axis must
-        hold on every visit (the text axis itself is symbolic for padable
-        batches, so planned width padding is not drift); value
-        nondeterminism inside equal-shaped arrays stays undetected by
-        design."""
+        hold on every visit; that axis is symbolic for padable batches, so
+        planned padding is not drift. Value nondeterminism inside
+        equal-shaped arrays stays undetected by design."""
         index = operator.index(index)
         _width, axes, padable, _forbidden = _vlm_width_survey(
             batch,

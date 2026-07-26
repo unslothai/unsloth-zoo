@@ -705,16 +705,11 @@ def materialize_text_shape_frontier(
 def select_text_shape_padding_budget(frontier, *, exact_signature_threshold=None):
     """Select the smallest retained snapshot within both policy budgets.
 
-    ``exact_signature_threshold`` widens the exact fast-path: any raw catalog
-    at or below it is kept exact (raw widths, zero padding) instead of being
-    compressed toward the padding budget. ``None`` keeps the default small
-    threshold, and explicit values may only widen it — the frontier holds no
-    bounded points for catalogs the default already keeps exact, so a
-    narrower threshold could never be honored. Callers whose padded work
-    cannot be recouped through compile reuse — VLM schedules, where every
-    media family needs its own endpoints and eliminates too few signatures
-    to pay for recurring padded compute — pass the automatic ceiling so
-    compression engages only once the signature cap genuinely binds.
+    ``exact_signature_threshold`` widens the exact fast-path: raw catalogs at
+    or below it stay exact (raw widths, zero padding). It may only widen the
+    default, since the frontier holds no bounded points below it. VLM
+    schedules pass the automatic ceiling because padding there buys no
+    compile reuse.
     """
 
     if not isinstance(frontier, TextShapeFrontier):

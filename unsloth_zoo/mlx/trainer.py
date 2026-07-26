@@ -760,9 +760,9 @@ def _shape_guard_report(
 
 
 class _VLMCompileDecisionError(RuntimeError):
-    """A compile decision that mandates an abort. Never maskable by
-    best-effort degradation: per-architecture strict overrides can set
-    should_raise while the base policy mode stays best_effort."""
+    """A compile decision that mandates an abort, never maskable by
+    best-effort degradation (per-architecture strict overrides set
+    should_raise even while the base policy mode is best_effort)."""
 
 
 def _plan_single_process_vlm_shapes(
@@ -778,16 +778,13 @@ def _plan_single_process_vlm_shapes(
 ):
     """Plan finite VLM shapes for the single-process compiled path.
 
-    Runs only after compile qualification resolved (the descriptor survey
-    materializes every scheduled batch once, so it must not run for
-    unqualified or eager runs). Padable batches take the shared rounded
-    width policy capped at the surveyed maximum final width (post-expansion
-    widths legitimately exceed ``max_seq_length``, which is never
-    consulted), bumped off any extent of an array the pipeline does not
-    pad; batches the width survey declined participate with their exact
-    concrete families at their raw widths. A family the serializer cannot
-    prove stable enough to group (unplannable) forces eager fallback for
-    the run — grouping it could span several compile keys.
+    Must run only after compile qualification resolved: the descriptor
+    survey materializes every scheduled batch once. Padable batches take
+    the shared rounded width policy capped at the surveyed maximum final
+    width (post-expansion widths legitimately exceed ``max_seq_length``,
+    which is never consulted); batches the survey declined join at their
+    exact raw widths. An unplannable family forces eager fallback for the
+    run, since grouping it could span several compile keys.
     """
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
@@ -1431,13 +1428,12 @@ class MLXTrainer:
     ):
         """Require every DDP rank to admit its local finite shape plan.
 
-        ``keep_exact_local`` makes ranks whose automatic selection is exact
-        keep that plan instead of joining shared-cap re-materialization: an
-        exact catalog's size is descriptive, and contributing it to the
-        shared maximum would force budget-bucketed peers above the ceiling
-        to abandon their compression. Such ranks contribute a neutral value
-        to the cap collective and still run every collective in the same
-        order, so the coordinated schedule is unchanged.
+        ``keep_exact_local`` lets ranks whose automatic selection is exact
+        keep that plan instead of joining shared-cap re-materialization,
+        since contributing their descriptive catalog size to the shared
+        maximum would force compressed peers to abandon compression. They
+        still contribute a neutral value and run every collective in the
+        same order, so the coordinated schedule is unchanged.
         """
         if self.distributed_world_size <= 1:
             if local_error is not None:
@@ -4671,10 +4667,9 @@ def _check_all_masked(batches, max_check=100, comm_group=None, world_size=1):
 def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1):
     """_check_all_masked for finite VLM batch plans (construction metadata).
 
-    As in the text path, in DDP ``batches`` is only this rank's shard, so the
-    per-rank bad/good counts are all-summed before deciding. Otherwise a rank
-    whose shard is entirely masked would raise ZeroDivisionError alone while
-    peers advance to the first collective and hang."""
+    As in the text path, under DDP ``batches`` is only this rank's shard, so
+    counts are all-summed before deciding: otherwise a rank whose shard is
+    entirely masked would raise alone and hang its peers."""
     # The checker consumes construction-time plan metadata: no extra processor
     # work or materialization ahead of the collective below, or a failing rank
     # would strand its peers there.
