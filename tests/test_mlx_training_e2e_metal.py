@@ -316,9 +316,8 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     from test_mlx_batching_and_decay import _WidthOnlyProcessor as _Proc
 
     class TinyVLM(nn.Module):
-        # Real nn.Module: keep the genuine train()/state members — the
-        # compiled step threads model.state, so overriding it would leak
-        # traced parameters out of the compiled call.
+        # Keep the genuine train()/state members: the compiled step threads
+        # model.state, so overriding it would leak traced parameters out.
         def __init__(self):
             super().__init__()
             self.embed = nn.Embedding(260, 8)
@@ -413,9 +412,8 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     planned_result, planned_plan, planned_widths = run(planned=True)
     planned_compiled_calls = len(compiled_invocations)
 
-    # The installed-plan run genuinely executes through mx.compile — one
-    # compiled invocation per training step — while the unplanned eager
-    # run never compiles.
+    # The planned run really executes through mx.compile, one invocation per
+    # training step, while the unplanned eager run never compiles.
     assert unplanned_compiled_calls == 0
     assert planned_compiled_calls == 4
     assert planned_result["compile_enabled"] is True
@@ -426,8 +424,8 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     assert planned_result["train_loss"] == pytest.approx(
         unplanned_result["train_loss"], rel=1e-4,
     )
-    # Every compiled input width is a planned endpoint at or above the raw
-    # width, and the planned run exposed at most the admitted variants.
+    # Every compiled width is a planned endpoint at or above the raw width, and
+    # the planned run exposed at most the admitted variants.
     endpoints = {
         planned_plan._shape_plan.endpoint_for(
             planned_plan.batch_family(index),

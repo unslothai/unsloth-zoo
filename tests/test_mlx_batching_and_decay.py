@@ -443,8 +443,7 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
     assert processor.calls == calls_before_check
 
 
-    # No-materialization proof lives in the fake-rank collective test, which
-    # covers this single-process property strictly (poisoned class __call__).
+    # The fake-rank collective test covers no-materialization more strictly.
 
 
 def test_vlm_family_invariant_against_live_mx_compile_traces():
@@ -498,9 +497,8 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
         if kind == "merge":
             assert same_key and fam_left == fam_right and plannable(fam_left)
         elif kind == "split":
-            # Distinct values stay ELIGIBLE while splitting: dodging hazards
-            # by making common constants unplannable would regress every
-            # ordinary batch to eager.
+            # Distinct values stay ELIGIBLE while splitting: making common
+            # constants unplannable would regress ordinary batches to eager.
             assert not same_key and fam_left != fam_right
             assert plannable(fam_left) and plannable(fam_right)
         else:
@@ -564,8 +562,7 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     cached_batch = plan.materialize(0)
     assert processor.calls == 1 and plan._mru is not None
     descriptors = plan.ensure_descriptors()
-    # The pre-populated cache is invalidated, not consulted: the survey
-    # rebuilt every index and holds nothing afterwards.
+    # The pre-populated cache is invalidated, not consulted.
     assert processor.calls == 1 + len(plan) == 4
     assert plan._mru is None
     assert plan.ensure_descriptors() is descriptors
@@ -628,8 +625,7 @@ def test_vlm_plan_survey_releases_each_batch_before_the_next_build(monkeypatch):
             "previous survey batch's tensors still alive at next build"
         )
         batch = inner_build(self, index)
-        # Wrap one array in a nested container so nested leaves are bound
-        # by the tracker too, not just top-level dict values.
+        # Nest one array so the tracker binds nested leaves, not just top level.
         batch["nested"] = [{"probe": mx.zeros((2, 2), dtype=mx.int32)}]
         tracked = 0
         for leaf in _array_leaves(batch):
@@ -668,9 +664,8 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     retyped = {**batch, "input_ids": batch["input_ids"].astype(mx.int16)}
     with pytest.raises(RuntimeError, match=r"'input_ids'.*int16"):
         plan.check_family_drift(1, retyped)
-    # A width change alone is NOT drift (the text axis is symbolic); an
-    # INCONSISTENT width change — one array narrowed while its siblings
-    # keep the old extent — is.
+    # A width change alone is NOT drift (the text axis is symbolic), but an
+    # inconsistent one (one array narrowed, siblings unchanged) is.
     narrowed = {**batch, "input_ids": batch["input_ids"][:, :-1]}
     with pytest.raises(RuntimeError, match=r"batch 1 drifted"):
         plan.check_family_drift(1, narrowed)
@@ -685,8 +680,7 @@ def test_vlm_family_drift_check_fails_hard_with_location():
         for key, value in batch.items()
     }
     assert plan.check_family_drift(1, uniformly_narrowed) is None
-    # Non-first leaves are checked too: a checker pinned to input_ids alone
-    # cannot pass.
+    # Non-first leaves are checked too, so pinning to input_ids cannot pass.
     other_key = next(
         key for key, value in batch.items()
         if key != "input_ids" and isinstance(value, mx.array)

@@ -2386,12 +2386,9 @@ def _build_glm_ocr_position_ids(
 
 _RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
 
-# Text-width-aligned arrays the VLM pipeline itself owns, with the inert
-# value their right-padded tail takes ("pad" resolves to the tokenizer pad
-# id at padding time). Only these keys are ever padded; every other array
-# is left untouched and, when it shares an extent with the text width,
-# conservatively blocks padding for its batch instead of risking a
-# wrong-shaped model input.
+# Text-width-aligned arrays the VLM pipeline owns, with the inert value their
+# right-padded tail takes ("pad" is the tokenizer pad id). Only these are padded;
+# any other array sharing an extent with the text width declines its batch.
 _VLM_WIDTH_PADDABLE_KEYS = {
     "input_ids": "pad",
     "attention_mask": 0,
@@ -2400,13 +2397,10 @@ _VLM_WIDTH_PADDABLE_KEYS = {
     "token_type_ids": 0,
     "mm_token_type_ids": 0,
 }
-# Width-derived arrays generated AFTER width finalization (their sequence
-# axis is the last one, e.g. rope position ids shaped (3, batch, width)).
+# Width-derived arrays generated AFTER width finalization (sequence axis last).
 _VLM_WIDTH_GENERATED_KEYS = ("position_ids",)
-# Model types whose position ids the position-recording prepare phase
-# builds itself (and rebuilds after planned width padding). For every
-# other model type a position_ids array is processor-authored: the
-# pipeline neither pads nor regenerates it, so its batch must decline.
+# Model types whose position ids the position phase builds, and rebuilds after
+# planned padding; elsewhere they are processor-authored, so the batch declines.
 _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen2_vl",
     "qwen2_5_vl",
@@ -2485,10 +2479,9 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
         nonlocal declined
         if declined:
             return
-        # Mirror the family serializer's dispatch exactly: raw runtime
-        # types (a lying __class__ cannot smuggle a non-container in) and
-        # exact built-in constants; anything else has no validated
-        # metadata path and refuses padding rather than guessing.
+        # Mirror the family serializer's dispatch: raw runtime types (a lying
+        # __class__ cannot smuggle a non-container in) and exact built-in
+        # constants. Anything else has no validated metadata and refuses padding.
         node_type = type(node)
         if node_type is _MX_ARRAY_TYPE:
             extents = dims_of(node)
@@ -2505,8 +2498,7 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
             return
         if issubclass(node_type, (list, tuple)):
             if issubclass(node_type, tuple) and node_type is not tuple:
-                # The serializer marks tuple subclasses unstable; padding
-                # judgement must agree.
+                # The serializer marks tuple subclasses unstable; agree with it.
                 declined = True
                 return
             walk = (
@@ -2520,8 +2512,7 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
         if node_type is bool or node_type is float or node_type is str:
             return
         if node_type is int:
-            # Serializer coherence: out-of-int64 constants are opaque
-            # (mx.compile rejects them), so their batches must not pad.
+            # Out-of-int64 constants are opaque to mx.compile, so they cannot pad.
             if -(2 ** 63) <= node < 2 ** 63:
                 return
             declined = True
@@ -2541,14 +2532,10 @@ def _vlm_width_survey(batch_dict, disposable_keys=None):
                 forbidden.update(value_dims)
             continue
         if key in disposable_keys:
-            # The position phase (re)builds this key wholesale for the
-            # current config, so whatever sits here — any layout, any
-            # representation, even a container or opaque value — is
-            # disposable and must neither decline the batch nor forbid
-            # extents. Only a canonical exact-array sequence-last
-            # position_ids earns the symbolic axis; anything else keeps
-            # concrete form in the family, where a genuine post-position
-            # mismatch still surfaces as drift.
+            # The position phase rebuilds this key wholesale, so anything here is
+            # disposable: it neither declines the batch nor forbids extents. Only a
+            # canonical exact-array sequence-last position_ids earns the symbolic
+            # axis; anything else stays concrete and still surfaces drift.
             if (
                 key in _VLM_WIDTH_GENERATED_KEYS
                 and type(value) is _MX_ARRAY_TYPE
@@ -2609,9 +2596,8 @@ def _finalize_vlm_batch_width(
         )
     for key, pad_value in _VLM_WIDTH_PADDABLE_KEYS.items():
         value = batch_dict.get(key)
-        # The admitting survey guarantees paddable keys are exact mx
-        # arrays; metadata goes through the same captured descriptors it
-        # used, so a patched property can neither hide nor skip a pad.
+        # The survey guarantees paddable keys are exact mx arrays, and metadata
+        # uses the same captured descriptors, so a patched property cannot skip a pad.
         if type(value) is not _MX_ARRAY_TYPE:
             continue
         value_shape = tuple(
@@ -2657,9 +2643,8 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         return _vlm_positions_for_compile(batch_dict, config)
     if phase != "content":
         raise ValueError(f"unknown VLM prepare phase: {phase!r}")
-    # The provenance marker is pipeline-private: only the position phase
-    # may set it. Processor output carrying it is a forgery and would
-    # misclassify foreign position ids as regenerated.
+    # The provenance marker is pipeline-private: processor output carrying it is a
+    # forgery that would misclassify foreign position ids as regenerated.
     batch_dict.pop("_unsloth_collated_position_ids", None)
     model_type = _config_get(config, "model_type")
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
@@ -4258,8 +4243,7 @@ class _FiniteVisitMixin:
         count = len(self._schedule)
         if count == 0:
             raise ValueError("cannot resolve a visit on an empty schedule")
-        # operator.index rejects fractional/np-float visits instead of
-        # silently truncating them onto a neighboring visit.
+        # operator.index rejects fractional visits instead of truncating them.
         visit = operator.index(absolute_visit)
         if visit < 0:
             raise ValueError("absolute_visit must be non-negative")
@@ -5326,9 +5310,8 @@ def _build_response_masked_vlm_batch(
         return_prompt_completion=True,
     )
     if target_width is None:
-        # Unplanned: the historical single-pass order, including its
-        # failure ordering (a broken batch raises during position
-        # construction BEFORE the response-mask callback runs).
+        # Unplanned: the historical single-pass order, including its failure
+        # ordering (a broken batch raises before the response-mask callback runs).
         batch_dict = _prepare_vlm_batch_for_compile(batch_dict, config)
         if response_mask_fn is not None and not is_prompt_completion:
             batch_dict = _apply_response_mask_to_vlm_batch(
@@ -5394,9 +5377,8 @@ def _filter_trainable_vlm_indices(
             return_prompt_completion=True,
         )
         valid_rows = _vlm_trainable_label_rows(batch_dict)
-        # Removal keeps the causal-shift predicate; the checker flag uses the
-        # legacy full-row predicate (a 1-token row can be checker-good while
-        # shift-untrainable, and the all-masked checker must match legacy).
+        # Removal keeps the causal-shift predicate; the checker flag keeps the
+        # legacy full-row one (a 1-token row can be good for one and not the other).
         labels = batch_dict.get("labels")
         if labels is None:
             checker_good = True
@@ -5429,18 +5411,12 @@ class _FiniteVLMRow:
         self.checker_good = bool(checker_good)
 
 
-# The serializer's trust boundary is a genuine mlx.core at import time —
-# the same trust the trainer already places in mx.compile itself. Within
-# it, array metadata is read through descriptors captured here and
-# behaviorally validated against a probe array, so LATER patching of
-# mx.array's Python attributes (or of Dtype's string protocol, which the
-# captured-equality dtype naming below never enters) can neither hide nor
-# forge shapes/dtypes from a family. If the captures are missing or fail the
-# probe — test doubles without class descriptors, or a runtime already
-# modified before import — every array leaf degrades to unplannable
-# instead of trusting unverifiable reads. Dtype naming compares wrappers
-# against the captured singletons with the captured __eq__ (property
-# reads mint fresh wrapper objects, so identity cannot name them).
+# The serializer trusts a genuine mlx.core at import time, the same trust the
+# trainer places in mx.compile. Array metadata is read through descriptors
+# captured here and validated against a probe array, so later patching of
+# mx.array's Python attributes cannot hide or forge shapes/dtypes. If the
+# captures are missing or fail the probe, every array leaf degrades to
+# unplannable rather than trusting unverifiable reads.
 _MX_ARRAY_TYPE = mx.array
 _MX_ARRAY_SHAPE = getattr(mx.array, "shape", None)
 _MX_ARRAY_DTYPE = getattr(mx.array, "dtype", None)
@@ -5495,15 +5471,10 @@ def _validate_mx_array_captures():
 _MX_ARRAY_CAPTURES_VALID = _validate_mx_array_captures()
 
 
-# First-read-wins tag per type object. Entries hold the type WEAKLY: a
-# type stays cached exactly as long as instances of it can still appear in
-# a batch (instances keep their type alive), so per-batch dynamic types
-# are reclaimed instead of accumulating, while any type that can recur
-# keeps one stable tag — a surveyed family and a later drift check always
-# agree within a process. Cross-process tag equality holds only for types
-# with honest, deterministic introspection; a metaclass that varies its
-# own name per process cannot be canonicalized by any observation (such
-# families are unplannable anyway).
+# First-read-wins tag per type object, held WEAKLY so dynamic per-batch types are
+# reclaimed while any recurring type keeps one stable tag: a surveyed family and a
+# later drift check always agree within a process. Cross-process equality holds
+# only for types with honest introspection (others are unplannable anyway).
 _VLM_TYPE_TAG_CACHE = {}
 
 
@@ -5598,9 +5569,8 @@ def _vlm_batch_family(batch, symbolic_axes=None):
     therefore discriminate families exactly.
     """
     def encode(node, path):
-        # Dispatch on the raw runtime type: issubclass(type(node), ...)
-        # cannot be misled by a lying __class__ property, matching the
-        # PyDict_Check/PyList_Check calls the compile walk performs.
+        # Dispatch on the raw runtime type, which a lying __class__ cannot mislead,
+        # matching the PyDict_Check/PyList_Check calls the compile walk performs.
         node_type = type(node)
         if issubclass(node_type, dict):
             return ("dict",) + tuple(
@@ -5615,20 +5585,15 @@ def _vlm_batch_family(batch, symbolic_axes=None):
                     for key, value in node.items()
                 )
             except Exception:
-                # mx.compile rejects non-dict mappings before ever reading
-                # them, so a raising items() must not break surveying; the
-                # tag alone still marks the family unplannable.
+                # mx.compile rejects non-dict mappings unread, so a raising items()
+                # must not break surveying; the tag marks the family unplannable.
                 return ("mapping", tag, "unreadable")
             return ("mapping", tag) + entries
         if issubclass(node_type, (list, tuple)):
-            # transforms.cpp indexes lists raw but iterates tuples through
-            # the Python protocol. Raw list storage is read identically by
-            # both walks at any time, so every list instance is eligible.
-            # For tuples only the exact type is eligible: a subclass can
-            # route iteration through overridable descriptors that no
-            # class-attribute inspection can see past (tp_iter is what
-            # runs, not what the attribute reports), letting one walk see
-            # different items than a later compile walk.
+            # transforms.cpp indexes lists raw but iterates tuples through the
+            # Python protocol, so every list is eligible while only exact tuples
+            # are: a tuple subclass can route iteration through tp_iter that no
+            # attribute inspection sees, letting the two walks see different items.
             if issubclass(node_type, tuple) and node_type is not tuple:
                 return ("unstable_const", _vlm_family_type_tag(node_type))
             walk = (
@@ -5641,10 +5606,8 @@ def _vlm_batch_family(batch, symbolic_axes=None):
                 for position, item in enumerate(walk)
             )
         if node_type is _MX_ARRAY_TYPE:
-            # Metadata through the validated import-time descriptors — the
-            # C++ shape and dtype mx.compile keys on — and dtype naming by
-            # captured equality against the captured singleton table, so no
-            # later-patchable protocol participates.
+            # Metadata through the validated import-time descriptors and dtype
+            # naming by captured equality, so no patchable protocol participates.
             # Unvalidated captures never guess: the leaf opts out instead.
             if not _MX_ARRAY_CAPTURES_VALID:
                 return ("unstable_const", _vlm_family_type_tag(node_type))
@@ -5660,8 +5623,7 @@ def _vlm_batch_family(batch, symbolic_axes=None):
                 return ("unstable_const", _vlm_family_type_tag(node_type))
             return ("array", tuple(dims), dtype_name)
         if node_type is bool or node_type is int:
-            # transforms.cpp casts constants to signed 64-bit; anything
-            # outside that range is rejected at trace time, never keyed.
+            # transforms.cpp casts constants to int64; anything outside is rejected.
             if not -(2 ** 63) <= node < 2 ** 63:
                 return ("opaque", "builtins.int")
             return ("int", int(node))
@@ -5939,10 +5901,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         cached = self._mru
         if cached is not None and cached[0] == (index, target_width):
             _key, cached_batch, drift_checked = cached
-            # Cache identity covers shape, not provenance: a batch cached
-            # by an explicit-width fetch has not passed the structural
-            # proof, so a planned fetch must verify it before the compiled
-            # path may consume it.
+            # Cache identity covers shape, not provenance: a batch cached by an
+            # explicit-width fetch has not passed the structural proof, so a planned
+            # fetch must verify it before the compiled path consumes it.
             if check_drift and not drift_checked:
                 self.check_family_drift(index, cached_batch)
                 self._mru = (_key, cached_batch, True)
@@ -6015,9 +5976,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 batch,
                 disposable_keys=_vlm_pipeline_disposable_keys(self._config),
             )
-            # Padable batches get symbolic families (batches differing only
-            # in text width coincide); declined batches keep every extent
-            # concrete and therefore discriminate exactly.
+            # Padable batches get symbolic families (batches differing only in text
+            # width coincide); declined batches keep every extent concrete.
             family = _vlm_batch_family(
                 batch, symbolic_axes=axes if padable else None,
             )
@@ -6234,8 +6194,7 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             f"were -100 after train_on_responses_only masking."
         )
 
-    # Compact remap: store only rows the schedule references, so dropped and
-    # never-scheduled dataset rows are neither formatted nor retained.
+    # Compact remap: store only rows the schedule references.
     used = []
     seen_used = set()
     for batch in schedule:
@@ -6244,10 +6203,9 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
                 seen_used.add(idx)
                 used.append(idx)
     if formatting_func is not None and formatted_items is None:
-        # Consume formatting exactly once per referenced row, in first-visit
-        # order, so lazy re-materialization never re-invokes user code and
-        # unscheduled rows never reach the formatter (legacy parity: the
-        # eager builder only formatted rows it actually batched).
+        # Consume formatting once per referenced row, in first-visit order, so
+        # re-materialization never re-invokes user code and unscheduled rows
+        # never reach the formatter (legacy parity).
         formatted_items = {idx: formatting_func(dataset[idx]) for idx in used}
     position = {idx: pos for pos, idx in enumerate(used)}
     rows = tuple(

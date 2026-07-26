@@ -229,8 +229,8 @@ from .shape_guard import (
     select_text_shape_padding_budget,
 )
 
-# Finite CPU-backed batch plans the trainer consumes through one protocol
-# (visit mapping, __getitem__/materialize, __len__).
+# Finite CPU-backed batch plans sharing one protocol (visit mapping,
+# __getitem__/materialize, __len__).
 _FINITE_BATCH_PLAN_TYPES = (FiniteTextBatchPlan, FiniteVLMBatchPlan)
 
 
@@ -796,9 +796,8 @@ def _plan_single_process_vlm_shapes(
     if compile_decision is not None and getattr(
         compile_decision, "should_raise", False,
     ):
-        # Checked before EVERY applicability class (including streaming):
-        # the decision mandates an abort, and it must surface inside the
-        # coordinated block rather than at a later rank-local raise.
+        # Checked before EVERY applicability class (including streaming) so the
+        # mandated abort surfaces inside the coordinated block, not rank-locally.
         raise _VLMCompileDecisionError(
             "Unsloth: strict mx.compile requested for VLM arch "
             f"'{getattr(compile_decision, 'arch', 'unknown')}', but compile "
@@ -826,9 +825,8 @@ def _plan_single_process_vlm_shapes(
         and max_grad_norm > 0
         and args.gradient_accumulation_steps > 1
     ):
-        # Compilation is disabled later for this configuration; do not pay
-        # the survey (it materializes every batch) for a plan that could
-        # never be compiled.
+        # Compilation is disabled later here, so skip the survey (it materializes
+        # every batch) for a plan that could never be compiled.
         return None, _shape_guard_report(
             "not_applicable", "compile_ineligible_global_norm", cap,
             lazy_batches=lazy,
@@ -850,12 +848,9 @@ def _plan_single_process_vlm_shapes(
         return None, report, False, None
 
     if batches.pad_token_id is None:
-        # Widening writes the tokenizer pad id into input_ids tails.
-        # Without one no endpoint above a batch's raw width can ever
-        # materialize, and padable batches share symbolic families the
-        # planner may legally bucket to wider endpoints — so no width plan
-        # can hold its materializability invariant. Known before any
-        # survey work: degrade to eager without materializing a batch.
+        # Widening writes the tokenizer pad id into input_ids tails, so without
+        # one no endpoint above a batch's raw width can materialize and no width
+        # plan holds. Known before any survey work: degrade to eager for free.
         report = _shape_guard_report(
             "eager", "vlm_pad_token_unavailable", cap, compile_scope,
             cap_selection="not_applicable",
@@ -919,9 +914,8 @@ def _plan_single_process_vlm_shapes(
             events, compile_scope=compile_scope,
         )
         # VLM catalogs keep every media family as its own endpoint group, so
-        # budget compression eliminates too few signatures to pay for its
-        # recurring padded compute. Stay exact up to the automatic ceiling
-        # and compress only once the signature cap genuinely binds.
+        # budget compression drops too few signatures to pay for its padded
+        # compute. Stay exact until the signature cap genuinely binds.
         shape_plan = select_text_shape_padding_budget(
             frontier,
             exact_signature_threshold=AUTOMATIC_TEXT_COMPILE_CEILING,
@@ -2500,21 +2494,13 @@ class MLXTrainer:
                         )
 
             # Coordinated VLM shape-guard preflight. Runs AFTER compile
-            # qualification (the descriptor survey materializes every batch
-            # once, so it must not run for unqualified runs) and after
-            # auto-tuning (planning reads the tuned args), and BEFORE any
-            # optimizer or compiled-callable setup: every rank agrees on
-            # failure, mode, and the shared automatic cap while the run is
-            # still trivial to abort. The setup between the decision block
-            # and this preflight (norm patching, memory limits, tracing) is
-            # rank-deterministic — identical models and args fail
-            # identically on every rank — so it needs no collectives of its
-            # own; asymmetric infrastructure failures there are outside the
-            # guard's scope, exactly as for the text path's post-preflight
-            # setup. A strict abort raised here unwinds through train()'s
-            # finally, which restores the norm-output-cast globals; fp32
-            # norm parameter storage and auto-tuned args persist, and both
-            # are idempotent if train() is called again.
+            # qualification (the survey materializes every batch) and after
+            # auto-tuning (planning reads the tuned args), and BEFORE optimizer
+            # or compiled-callable setup, so every rank agrees on failure, mode
+            # and the shared cap while the run is still trivial to abort. The
+            # setup in between is rank-deterministic and needs no collectives.
+            # A strict abort here unwinds through train()'s finally, and the
+            # state that persists is idempotent if train() is called again.
             if self._is_vlm and hasattr(self, "_batches"):
                 preflight_error = None
                 batches = batch_iter = None
@@ -2524,11 +2510,9 @@ class MLXTrainer:
                 try:
                     if self._batches is None:
                         self._prepared_batches_include_epochs = False
-                    # Deferred checker: preparation stays collective-free,
-                    # so the status reduction below is the FIRST collective
-                    # on every rank no matter where local preparation
-                    # failed, and the checker's all-reduce runs strictly
-                    # after it on every rank that passed.
+                    # Deferred checker: preparation stays collective-free, so the
+                    # status reduction below is the FIRST collective on every rank
+                    # and the checker's all-reduce runs strictly after it.
                     batches, batch_iter = self._prepare_data(
                         True, defer_vlm_checker=True,
                     )
@@ -2553,8 +2537,7 @@ class MLXTrainer:
                 deferred_check = self._deferred_vlm_all_masked_check
                 self._deferred_vlm_all_masked_check = None
                 if deferred_check is not None:
-                    # Global counts: every surviving rank computes the same
-                    # ratio, so an all-masked dataset raises symmetrically.
+                    # Global counts, so an all-masked dataset raises symmetrically.
                     deferred_check()
                 local_plan_error = None
                 shape_plan = None
@@ -2589,20 +2572,13 @@ class MLXTrainer:
                         cap_selection="not_applicable",
                     )
                     compile_allowed = False
-                # Synchronize the planning MODE before coordination:
-                # qualification and applicability resolve rank-locally, and
-                # the coordinator's automatic path enters a max-reduction
-                # only on ranks holding a frontier — mixed planning and
-                # benign non-planning ranks would execute mismatched
-                # collectives there AND divergent compile eligibility later
-                # (only compiling ranks enter the compiled-setup
-                # collectives). Three fixed reductions run on every rank; a
-                # genuinely MIXED state discards plans on planning ranks
-                # and disables compile on every benign/planning rank so all
-                # downstream collective participation stays symmetric.
-                # Uniform benign states (streaming, compile disabled — all
-                # args-derived, hence rank-identical) keep their legacy
-                # unplanned behavior.
+                # Synchronize the planning MODE before coordination: mixed
+                # planning and benign non-planning ranks would run mismatched
+                # collectives and diverge on compile eligibility later. Three
+                # fixed reductions run on every rank; a genuinely MIXED state
+                # discards plans and disables compile everywhere so downstream
+                # participation stays symmetric. Uniform benign states are
+                # args-derived, hence rank-identical, and keep legacy behavior.
                 benign_not_planning = (
                     local_plan_error is None
                     and compile_allowed
@@ -2618,14 +2594,11 @@ class MLXTrainer:
                     and getattr(self._compile_decision, "enabled", False)
                 )
                 if self.distributed_world_size > 1:
-                    # Three fixed reductions on every rank, always in this
-                    # order. Eligibility divergence can hide inside ANY
-                    # uniform applicability class (e.g. streaming ranks
-                    # never inspect the decision), so it is synchronized
-                    # directly: a mixed eligible/ineligible group disables
-                    # compile everywhere, keeping every later
-                    # compiled-setup collective (and rank-local decision
-                    # gate) symmetric.
+                    # Three fixed reductions on every rank, always in this order.
+                    # Eligibility divergence can hide inside ANY uniform
+                    # applicability class, so it is synchronized directly: a mixed
+                    # group disables compile everywhere and keeps later
+                    # compiled-setup collectives symmetric.
                     any_ineligible = self._distributed_any_flag(
                         not decision_eligible,
                     )
@@ -2666,13 +2639,10 @@ class MLXTrainer:
                     local_error=local_plan_error,
                     keep_exact_local=True,
                 )
-                # Mandatory-abort synchronization: a should_raise decision
-                # (per-arch strict overrides can produce one even under a
-                # best-effort base mode, and qualification may diverge
-                # across ranks) must abort EVERY rank, not just the one
-                # holding the error — a lone exit would strand peers at the
-                # next training collective. One fixed reduction after
-                # coordination keeps the schedule pairable in all states.
+                # A should_raise decision must abort EVERY rank, not just the one
+                # holding the error, or a lone exit strands peers at the next
+                # training collective. One fixed reduction after coordination
+                # keeps the schedule pairable in all states.
                 decision_abort = isinstance(
                     local_plan_error, _VLMCompileDecisionError,
                 )
@@ -3645,8 +3615,7 @@ class MLXTrainer:
                             FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE,
                         )
                         # Phase-aware admission through the shared finite-plan
-                        # protocol; a plan without an installed shape plan
-                        # (e.g. unplanned DDP VLM) materializes unpadded.
+                        # protocol; a plan with no shape plan materializes unpadded.
                         and isinstance(batches, _FINITE_BATCH_PLAN_TYPES)
                     ):
                         batch_data = batches.materialize(
@@ -4185,12 +4154,9 @@ class MLXTrainer:
                 batches = [] if plan is None else plan
                 run_checker = _vlm_mask_fn is not None and len(batches) > 0
                 if defer_vlm_checker:
-                    # The coordinated preflight owns the collective
-                    # schedule: rank-local preparation must be entirely
-                    # collective-free so its status reduction is the FIRST
-                    # collective on every rank, with the checker's
-                    # all-reduce running strictly after it. The pending
-                    # check is stashed for the preflight to invoke.
+                    # The coordinated preflight owns the collective schedule, so
+                    # rank-local preparation must stay collective-free. Stash the
+                    # pending check for the preflight to invoke.
                     self._deferred_vlm_all_masked_check = (
                         (lambda: _check_vlm_all_masked(
                             batches,
@@ -4709,11 +4675,9 @@ def _check_vlm_all_masked(batches, max_check=100, comm_group=None, world_size=1)
     per-rank bad/good counts are all-summed before deciding. Otherwise a rank
     whose shard is entirely masked would raise ZeroDivisionError alone while
     peers advance to the first collective and hang."""
-    # The checker consumes construction-time plan metadata: it must not
-    # trigger additional processor work or materialization ahead of the
-    # collective below (a failing rank would strand its peers there). Every
-    # finite VLM training path hands it a plan; eager lists no longer reach
-    # it.
+    # The checker consumes construction-time plan metadata: no extra processor
+    # work or materialization ahead of the collective below, or a failing rank
+    # would strand its peers there.
     seen_bad, seen_good = batches.supervision_counts(max_check)
 
     # Reduce across ranks before deciding so every rank raises/warns together

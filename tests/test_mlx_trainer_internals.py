@@ -595,12 +595,12 @@ def test_text_shape_guard_dispositions_for_vlm_streaming_and_clipped_accum():
     )
 
     cases = (
-        # VLM with no resolved compile decision: planning (and its survey)
-        # must not run before qualification; compiled behavior unchanged.
+        # VLM with no resolved compile decision: planning must not run before
+        # qualification.
         (True, None, MLXTrainingConfig(), "vlm_compile_unqualified"),
         (False, iter(()), MLXTrainingConfig(), "streaming"),
-        # Compiled global-norm clipping with gradient accumulation is
-        # eligible, so the guard plans instead of declining.
+        # Compiled global-norm clipping with accumulation is eligible, so the
+        # guard plans instead of declining.
         (False, None, MLXTrainingConfig(gradient_accumulation_steps=2,
                                         max_grad_norm=1.0), None),
     )
@@ -2006,12 +2006,9 @@ def test_eval_callback_stop_request_synced_before_best_model_track():
 
 
 def _all_masked_vlm_plan():
-    # Response-mask filtering removes all-masked rows outright, so a plan
-    # whose CHECKED rows are all supervision-bad arises only from rows that
-    # bypass or defeat that filter: distributed pad slots, or
-    # prompt/completion rows (which skip response masking) retained with
-    # every label masked. Model that state directly through the class
-    # contract (checker_good=False rows).
+    # Response-mask filtering drops all-masked rows, so an all-bad checked plan
+    # only arises from rows that bypass it (pad slots, prompt/completion rows).
+    # Model that directly through the class contract (checker_good=False rows).
     from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _FiniteVLMRow
 
     return FiniteVLMBatchPlan(
@@ -2026,9 +2023,8 @@ def _all_masked_vlm_plan():
 
 
 def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
-    # VLM mirror of the text-path mask check: a fully-masked local shard must
-    # not raise alone in DDP; plan supervision counts are all-summed before
-    # deciding.
+    # VLM mirror of the text-path mask check: a fully-masked local shard must not
+    # raise alone in DDP, since supervision counts are all-summed first.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
