@@ -1233,6 +1233,7 @@ def _inherit_mlx_vlm_processor_runtime(processor, repaired):
 def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
     """Bind processor recovery to one mlx-vlm load without global mutation."""
 
+    _ensure_vlm_detokenizer_copy()
     if not isinstance(load_callable, types.FunctionType):
         return load_callable
     processor_loader = load_callable.__globals__.get("load_processor")
@@ -2350,6 +2351,9 @@ _MINICPM_SANITIZE_TOKEN_SHA256 = (
 _MINICPM_LEGACY_VISION_TOKEN_SHA256 = (
     "54965adc15f72ca21df0dc646467c8e588f83de19edd2aacad70362690d6648a"
 )
+_MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256 = (
+    "deceb0843cbd9ba04bb86cded962550e7ae0a8814cf321fd61d654a07458262e"
+)
 
 
 def _source_token_sha256(source: str) -> str:
@@ -2379,6 +2383,49 @@ def _source_token_sha256(source: str) -> str:
     except (IndentationError, tokenize.TokenError, TypeError):
         return ""
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+
+def _ensure_vlm_detokenizer_copy() -> None:
+    """Backfill request-local copies for the defective naive detokenizer."""
+
+    try:
+        module = importlib.import_module("mlx_vlm.tokenizer_utils")
+    except Exception:
+        return
+    detokenizer = getattr(module, "NaiveStreamingDetokenizer", None)
+    factory = getattr(module, "make_streaming_detokenizer", None)
+    if (
+        not isinstance(detokenizer, type)
+        or getattr(detokenizer, "__copy__", None) is not None
+        or _source_token_sha256(_safe_getsource(factory))
+        != _MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256
+    ):
+        return
+    base = detokenizer.__mro__[1]
+    text = detokenizer.__dict__.get("text")
+    try:
+        parameters = tuple(
+            inspect.signature(
+                detokenizer.__init__, follow_wrapped=False
+            ).parameters
+        )
+    except (TypeError, ValueError):
+        return
+    if (
+        detokenizer.__module__ != module.__name__
+        or base.__module__ != module.__name__
+        or base.__name__ != "StreamingDetokenizer"
+        or "text" not in getattr(base, "__slots__", ())
+        or not isinstance(text, property)
+        or text.fset is not None
+        or parameters != ("self", "tokenizer")
+    ):
+        return
+
+    def __copy__(self):
+        return type(self)(self._tokenizer)
+
+    detokenizer.__copy__ = __copy__
 
 
 def _unconditionally_sanitizes_mlx_vlm_weights(load_model) -> bool:

@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import types
+from copy import copy
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,11 @@ def _test_bound_vlm_load(model_path):
 
 def _test_bound_model_load(paths, weights):
     return load_model(paths, weights)
+def _test_make_streaming_detokenizer(processor):
+    detokenizer = copy(processor.detokenizer); detokenizer.reset(); return detokenizer
+def _test_naive_detokenizer_init(self, tokenizer):
+    self._tokenizer, self._tokens = tokenizer, []
+def _test_naive_detokenizer_reset(self): self._tokens = []
 def _test_minicpmo_legacy_vision(self, pixel_values, tgt_sizes):
     dtype = self.language_model.model.embed_tokens.weight.dtype
     return _to_mx_array(pixel_values, dtype=dtype)
@@ -900,6 +906,35 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     assert repaired.tokenizer is tokenizer
     assert repaired.chat_template == "{{ messages }}"
     assert tokenizer.chat_template == "{{ messages }}"
+
+
+def test_legacy_naive_detokenizer_copy_is_capability_gated(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module_name = "mlx_vlm.tokenizer_utils"
+    StreamingDetokenizer = type("StreamingDetokenizer", (), {"__module__": module_name, "__slots__": ("text", "tokens", "offset")})
+    NaiveStreamingDetokenizer = type("NaiveStreamingDetokenizer", (StreamingDetokenizer,), {"__module__": module_name, "__init__": _test_naive_detokenizer_init, "reset": _test_naive_detokenizer_reset, "text": property(lambda self: "")})
+    module = types.ModuleType(module_name)
+    module.StreamingDetokenizer, module.NaiveStreamingDetokenizer, module.make_streaming_detokenizer = StreamingDetokenizer, NaiveStreamingDetokenizer, _test_make_streaming_detokenizer
+    monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.setattr(loader, "_MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256", loader._source_token_sha256(loader._safe_getsource(_test_make_streaming_detokenizer)))
+
+    tokenizer = object(); original = NaiveStreamingDetokenizer(tokenizer)
+    with pytest.raises(AttributeError, match="property 'text'"):
+        copy(original)
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    original._tokens.append(1); copied = copy(original)
+    assert copied is not original and copied._tokenizer is tokenizer
+    assert copied._tokens == [] and original._tokens == [1]
+    installed_copy = NaiveStreamingDetokenizer.__copy__
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    assert NaiveStreamingDetokenizer.__copy__ is installed_copy
+
+    native_copy = lambda self: self
+    del NaiveStreamingDetokenizer.__copy__; StreamingDetokenizer.__copy__ = native_copy
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    fixed = NaiveStreamingDetokenizer(tokenizer)
+    assert "__copy__" not in NaiveStreamingDetokenizer.__dict__ and copy(fixed) is fixed
 
 
 def test_declared_mlx_vlm_processor_owns_custom_components_and_recovery(
