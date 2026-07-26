@@ -864,6 +864,21 @@ class MLXTrainingConfig:
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
 
+    def to_dict(self):
+        """Return a TrainingArguments-style dict for integration callbacks."""
+        output = {}
+        for key, value in vars(self).items():
+            if is_dataclass(value):
+                value = asdict(value)
+            elif hasattr(value, "to_dict"):
+                value = value.to_dict()
+            output[key] = value
+        return output
+
+    def to_json_string(self):
+        """Serialize this config like TrainingArguments.to_json_string()."""
+        return json.dumps(self.to_dict(), indent=2, default=str)
+
 
 def _shape_guard_report(
     action,
@@ -1007,21 +1022,6 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
             "Use max_steps instead, or disable streaming."
         )
     raise ValueError("max_steps must be > 0 when using streaming mode.")
-
-    def to_dict(self):
-        """Return a TrainingArguments-style dict for integration callbacks."""
-        output = {}
-        for key, value in vars(self).items():
-            if is_dataclass(value):
-                value = asdict(value)
-            elif hasattr(value, "to_dict"):
-                value = value.to_dict()
-            output[key] = value
-        return output
-
-    def to_json_string(self):
-        """Serialize this config like TrainingArguments.to_json_string()."""
-        return json.dumps(self.to_dict(), indent=2, default=str)
 
 
 class MLXTrainer:
