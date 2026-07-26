@@ -1821,6 +1821,17 @@ class MLXTrainer:
             args.eval_delay = 0
         if not hasattr(args, "include_num_input_tokens_seen"):
             args.include_num_input_tokens_seen = False
+        # Integration-facing fields, at HF's own TrainingArguments defaults.
+        # TrackioCallback and SwanLabCallback read them directly in
+        # on_train_begin, so a missing one aborts the run before step 1.
+        if not hasattr(args, "project"):
+            args.project = "huggingface"
+        for _integration_arg in (
+            "trackio_space_id", "trackio_bucket_id", "trackio_static_space_id",
+            "hub_private_repo", "resume_from_checkpoint",
+        ):
+            if not hasattr(args, _integration_arg):
+                setattr(args, _integration_arg, None)
         if getattr(args, "logging_dir", None) is None:
             args.logging_dir = os.path.join(args.output_dir, "runs")
         if getattr(args, "run_name", None) is None:

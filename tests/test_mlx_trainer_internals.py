@@ -5998,3 +5998,47 @@ def test_log_payloads_carry_epoch(monkeypatch):
     assert [logs["epoch"] for _, logs in seen] == sorted(
         logs["epoch"] for _, logs in seen
     )
+
+
+def test_integration_callback_args_cover_stock_trackio_and_swanlab():
+    # transformers' own TrackioCallback / SwanLabCallback read TrainingArguments
+    # fields straight off args inside on_train_begin, so any field this compat
+    # shim omits aborts a real MLX run with AttributeError before step 1.
+    import inspect
+    import re
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    integration_utils = pytest.importorskip(
+        "transformers.integrations.integration_utils"
+    )
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(output_dir="out")
+    trainer.eval_dataset = None
+    trainer._ensure_callback_args_compat()
+    args = trainer.args
+
+    # HF's own TrainingArguments defaults, so an unconfigured run reaches the
+    # tracking SDK exactly as it would from a Torch Trainer.
+    assert args.project == "huggingface"
+    for name in (
+        "trackio_space_id", "trackio_bucket_id", "trackio_static_space_id",
+        "hub_private_repo", "resume_from_checkpoint",
+    ):
+        assert getattr(args, name) is None
+
+    reader = re.compile(r"(?<![\w.])args\.(\w+)")
+    for name in ("TrackioCallback", "SwanLabCallback"):
+        callback = getattr(integration_utils, name, None)
+        if callback is None:
+            continue
+        for field in sorted(set(reader.findall(inspect.getsource(callback)))):
+            assert hasattr(args, field), f"{name} reads args.{field}"
+
+    # A caller that configures the run keeps their value across the next run.
+    args.project = "my-project"
+    args.hub_private_repo = True
+    trainer._ensure_callback_args_compat()
+    assert args.project == "my-project"
+    assert args.hub_private_repo is True
