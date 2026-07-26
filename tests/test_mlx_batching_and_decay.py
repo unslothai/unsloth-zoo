@@ -951,3 +951,157 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
     )
     assert set(capped_processor.seen_max_length) == {5}
     assert all(batch["input_ids"].shape == (2, 5) for batch in capped)
+
+class _AugProcessor:
+    """Index-deterministic widths, globally-drawn pixel content."""
+
+    def __init__(self):
+        self.calls = 0
+        self.tokenizer = type("T", (), {"pad_token_id": 7})()
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        width = 4 if max(int(t) for t in text) < 2 else 40
+        rows = [([int(t), 200] + [3] * width)[:width] for t in text]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.ones((len(rows), width), dtype=np.int32),
+            "labels": np.array(rows, dtype=np.int32),
+            # Extent 6 never equals a text width, so batches stay padable.
+            "pixel_values": np.stack([
+                np.random.randint(0, 255, size=(6,)) for _ in text
+            ]).astype(np.float32),
+        }
+
+
+def _make_plan():
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    np.random.seed(4321)
+    return _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(6)],
+        processor=_AugProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=64,
+    )
+
+
+def _install(plan):
+    from unsloth_zoo.mlx import shape_guard as SG
+
+    plan.ensure_descriptors()
+    widths = plan.planned_event_widths()
+    counts = {}
+    for i in range(len(plan)):
+        key = (plan.batch_family(i), widths[i], "full_step", len(plan.schedule[i]))
+        counts[key] = counts.get(key, 0) + 1
+    events = tuple(
+        SG.TextShapeEvent(
+            family=f, width=w, phase=p, frequency=n, local_batch_size=b,
+        )
+        for (f, w, p, b), n in counts.items()
+    )
+    plan.set_shape_plan(
+        SG.select_text_shape_padding_budget(
+            SG.build_text_shape_frontier(
+                events, compile_scope=SG.FULL_STEP_SCOPE,
+            ),
+            exact_signature_threshold=SG.AUTOMATIC_TEXT_COMPILE_CEILING,
+        ),
+        widths,
+    )
+    return widths
+
+
+def _pixels(batch):
+    return np.asarray(batch["pixel_values"]).tolist()
+
+
+def test_vlm_plan_is_excluded_from_eager_fallback_refetch():
+    """The fallback refetch is restricted to plans whose rebuild is free.
+
+    FiniteTextBatchPlan rebuilds from stored token ids and touches no RNG, so
+    it keeps unpadding on fallback. FiniteVLMBatchPlan reruns the caller's
+    processor, so it must reuse the materialized batch instead.
+    """
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, FiniteVLMBatchPlan
+
+    assert FiniteTextBatchPlan in trainer_module._FINITE_BATCH_PLAN_TYPES
+    assert FiniteVLMBatchPlan in trainer_module._FINITE_BATCH_PLAN_TYPES
+    # Absent constant means the fallback still refetches every finite plan.
+    refetchable = getattr(
+        trainer_module,
+        "_EAGER_REFETCHABLE_PLAN_TYPES",
+        trainer_module._FINITE_BATCH_PLAN_TYPES,
+    )
+    assert FiniteTextBatchPlan in refetchable
+    assert FiniteVLMBatchPlan not in refetchable
+
+
+def test_vlm_fallback_refetch_would_shift_the_augmentation_stream():
+    """Why the exclusion exists: the refetch is a second processor call whose
+    draws offset every later batch, and the reuse it replaces is loss-safe."""
+    # Reference: an eager-from-start run, which never surveys or materializes.
+    plan = _make_plan()
+    eager = [_pixels(plan[i]) for i in range(len(plan))]
+    eager_tail = int(np.random.randint(0, 1 << 30))
+
+    # What the removed refetch did: materialize, then re-index the same visit.
+    plan = _install_and_get()
+    calls_before = plan._processor.calls
+    plan.materialize(0, phase="full_step")
+    refetched = [_pixels(plan[0])]
+    refetched += [_pixels(plan[i]) for i in range(1, len(plan))]
+    refetch_tail = int(np.random.randint(0, 1 << 30))
+    assert plan._processor.calls - calls_before == len(plan) + 1, (
+        "the refetch is an extra processor call"
+    )
+    assert sum(a != b for a, b in zip(refetched, eager)) == len(eager), (
+        "every batch from the fallback batch onward diverges from an eager run"
+    )
+    assert refetch_tail != eager_tail
+
+    # What the fix does: reuse the materialized batch, drawing nothing extra.
+    plan = _install_and_get()
+    calls_before = plan._processor.calls
+    reused = [_pixels(plan.materialize(0, phase="full_step"))]
+    reused += [_pixels(plan[i]) for i in range(1, len(plan))]
+    reuse_tail = int(np.random.randint(0, 1 << 30))
+    assert plan._processor.calls - calls_before == len(plan)
+    assert reused == eager, "reuse keeps the compiled run bit-identical to eager"
+    assert reuse_tail == eager_tail
+
+
+def _install_and_get():
+    plan = _make_plan()
+    _install(plan)
+    return plan
+
+
+def test_reused_padded_vlm_batch_is_loss_equivalent():
+    """The reused batch carries planned padding; masking makes it free."""
+    plan = _make_plan()
+    widths = _install(plan)
+    raw = [plan.batch_width(i) for i in range(len(plan))]
+    assert widths != tuple(raw), "fixture must actually exercise padding"
+
+    def masked_ce(batch):
+        ids, lab = batch["input_ids"], batch["labels"]
+        base = mx.arange(256, dtype=mx.float32).reshape(1, 1, 256)
+        logits = ids.astype(mx.float32)[..., None] * 0.01 + base * 0.001
+        mask = lab != -100
+        safe = mx.where(mask, lab, mx.zeros_like(lab))
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        picked = mx.take_along_axis(lp, safe[..., None], axis=-1)[..., 0]
+        total = mx.sum(mx.where(mask, -picked, mx.zeros_like(picked)))
+        return float(total.item()), int(mx.sum(mask).item())
+
+    for index in range(len(plan)):
+        padded = plan.materialize(index, phase="full_step")
+        plan._mru = None
+        unpadded = plan[index]
+        assert masked_ce(padded) == masked_ce(unpadded), (
+            f"batch {index}: planned padding changed the masked loss"
+        )

@@ -232,6 +232,11 @@ from .shape_guard import (
 # Finite CPU-backed batch plans sharing one protocol (visit mapping,
 # __getitem__/materialize, __len__).
 _FINITE_BATCH_PLAN_TYPES = (FiniteTextBatchPlan, FiniteVLMBatchPlan)
+# Plans a compile-failure fallback may refetch unpadded. The text plan rebuilds
+# from stored token ids and touches no RNG. The VLM plan reruns the caller's
+# processor, so a refetch would draw twice and offset every later batch; it
+# reuses the materialized batch instead, whose planned padding is masked.
+_EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan,)
 
 
 def _is_hf_tokenizer(tokenizer):
@@ -3592,7 +3597,7 @@ class MLXTrainer:
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
-                if isinstance(batches, _FINITE_BATCH_PLAN_TYPES):
+                if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
                 state = [model.state, optimizer.state, mx.random.state]
                 local_error = None
@@ -3714,7 +3719,7 @@ class MLXTrainer:
                         _use_compile = False
                         _compile_scope = "fallback_eager"
                         _compile_fallback_reason = "runtime_error"
-                        if isinstance(batches, _FINITE_BATCH_PLAN_TYPES):
+                        if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         if rng_state_before is not None:
                             mx.random.state[0] = rng_state_before
