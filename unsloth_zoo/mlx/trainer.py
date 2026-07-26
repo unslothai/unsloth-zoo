@@ -489,6 +489,16 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
     return tree_map(_clip_leaf_norm, grad)
 
 
+def _global_grad_norm_fp32(grad):
+    """Fp32 L2 norm of a gradient tree (one cross-tree reduction)."""
+    norm_squared = tree_reduce(
+        lambda acc, g: acc + mx.sum(mx.square(g.astype(mx.float32))),
+        grad,
+        mx.array(0.0, dtype=mx.float32),
+    )
+    return mx.sqrt(norm_squared)
+
+
 def _clip_grad_norm_fp32(grad, max_norm):
     """Global norm clipping with a float32 norm reduction.
 
@@ -497,12 +507,7 @@ def _clip_grad_norm_fp32(grad, max_norm):
     which computes the clipping norm in fp32. Keep clipped leaves in their
     original dtype, but compute the single global scale in fp32.
     """
-    norm_squared = tree_reduce(
-        lambda acc, g: acc + mx.sum(mx.square(g.astype(mx.float32))),
-        grad,
-        mx.array(0.0, dtype=mx.float32),
-    )
-    total_norm = mx.sqrt(norm_squared)
+    total_norm = _global_grad_norm_fp32(grad)
     scale = mx.minimum(
         mx.array(max_norm, dtype=mx.float32) / (
             total_norm + mx.array(1e-6, dtype=mx.float32)
@@ -651,6 +656,21 @@ class MLXTrainingConfig:
     # Appended last: the initializer binds positional args by field order.
     label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
+    # Opt-in true global grad-norm reporting when global-norm clipping is off.
+    # Declared LAST so every pre-existing field keeps its positional index.
+    # When global-norm clipping is the RESOLVED clip mode, the pre-clip norm
+    # is computed for clipping anyway and is always reported, so this flag has
+    # no effect there. Enabling it adds one cross-tree fp32 reduction per
+    # optimizer update — the same class of peak-memory cost global clipping
+    # itself pays (see the max_grad_norm note above). When False (default) no
+    # reporting reduction exists in the graph; grad_norm is absent from
+    # console/W&B/TB, _grad_norm_history, and the legacy step callback (None).
+    # Reporting never changes update numerics; the reported value is the fp32
+    # norm of the token-normalized gradient — after the accumulation divide,
+    # DDP reduction, and the LoRA+/embedding-LR ratios; before any clipping or
+    # weight decay.
+    report_grad_norm: bool = False
+
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
         if len(args) > len(config_fields):
@@ -687,7 +707,13 @@ class MLXTrainingConfig:
 
         warmup_steps_default = type(self).warmup_steps
         warmup_ratio_default = type(self).warmup_ratio
-        copied_all_fields = len(provided) == len(config_fields)
+        # Fields appended after configs began round-tripping through
+        # full-field dict dumps. A legacy dump predating them is still a
+        # wholesale copy and must be detected as one, or its copied default
+        # warmup_steps would override a non-default warmup_ratio.
+        _appended_fields = {"compile_max_variants", "report_grad_norm"}
+        _field_names = {field.name for field in config_fields}
+        copied_all_fields = (_field_names - _appended_fields) <= set(provided)
         copied_default_warmup_with_ratio = (
             copied_all_fields
             and getattr(self, "warmup_steps", None) == warmup_steps_default
@@ -757,15 +783,6 @@ def _plan_single_process_text_shapes(
         return None, _shape_guard_report(
             "not_applicable", "compile_disabled", cap,
         ), True, None
-    max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
-    if (
-        distributed_world_size <= 1
-        and max_grad_norm > 0
-        and args.gradient_accumulation_steps > 1
-    ):
-        return None, _shape_guard_report(
-            "not_applicable", "compile_ineligible_global_norm", cap,
-        ), False, None
     if not isinstance(batches, FiniteTextBatchPlan):
         report = _shape_guard_report(
             "eager", "unsupported_batch_plan", cap, compile_scope,
@@ -1427,6 +1444,8 @@ class MLXTrainer:
 
         fn(step, total_steps, loss, lr, tokens_sec, peak_gb, elapsed,
            num_tokens, grad_norm=None)
+        grad_norm: fp32 pre-clip norm — a float when global-norm clipping
+        is active or ``report_grad_norm=True``, otherwise None.
         """
         self._step_callbacks.append(fn)
 
@@ -2559,7 +2578,6 @@ class MLXTrainer:
             )
 
         _needs_grad_scaling = use_lora_plus or use_embedding_lr
-        _warned_skip_optimizer_state_grad_norm = False
 
         # Build step functions following mlx-lm's pattern. `max_grad_value`
         # remains an elementwise clamp. MLX's cheap default is now the clearer
@@ -2593,6 +2611,11 @@ class MLXTrainer:
             )
         _clip_grad_value = max_grad_value > 0
         _clip_grad_leaf_norm = max_grad_leaf_norm > 0
+        # Construction-time Python constant: selects one of two step-graph
+        # shapes for the whole run. Never a runtime or mx.array condition —
+        # that would add a report/no-report compile trace signature.
+        _report_grad_norm = bool(getattr(args, "report_grad_norm", False))
+        _compute_report_norm = _report_grad_norm and max_grad_norm <= 0
         state = [model.state, optimizer.state, mx.random.state]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
@@ -2658,57 +2681,11 @@ class MLXTrainer:
                 scale = scale.astype(dtype)
             return scale
 
-        optimizer_v_sum = None
-
-        def _optimizer_v_total():
-            total = mx.array(0.0, dtype=mx.float32)
-            found = False
-            for name, value in tree_flatten(getattr(optimizer, "state", {})):
-                if name != "v" and not name.endswith(".v"):
-                    continue
-                found = True
-                value_f = value.astype(mx.float32)
-                total = total + mx.sum(value_f)
-            return total if found else None
-
-        def _grad_norm_from_optimizer_state():
-            nonlocal optimizer_v_sum
-            betas = getattr(optimizer, "betas", None)
-            if not betas or len(betas) < 2:
-                return None
-            current_v_sum = _optimizer_v_total()
-            if current_v_sum is None:
-                return None
-            previous_v_sum = (
-                optimizer_v_sum
-                if optimizer_v_sum is not None
-                else mx.array(0.0, dtype=mx.float32)
-            )
-            beta2 = mx.array(float(betas[1]), dtype=mx.float32)
-            denom = mx.maximum(
-                mx.array(1.0, dtype=mx.float32) - beta2,
-                mx.array(1e-30, dtype=mx.float32),
-            )
-            grad_norm_sq = mx.maximum(
-                (current_v_sum - beta2 * previous_v_sum) / denom,
-                mx.array(0.0, dtype=mx.float32),
-            )
-            grad_norm = mx.sqrt(grad_norm_sq)
-            mx.eval(current_v_sum, grad_norm)
-            optimizer_v_sum = current_v_sum
-            return grad_norm
-
-        def _can_report_optimizer_state_norm():
-            # Adam-family: recover ||g|| from the second moment after update
-            # (v_t = beta2*v_{t-1} + (1-beta2)*g_t^2), avoiding a second
-            # consumer on the lazy backward graph.
-            return getattr(optimizer, "betas", None)
-
         def _apply_update(grad, toks_f):
             """Scale accumulated grads by supervised-token count, apply the
             selected clipping mode, and update. Global-norm clipping reports
-            its norm; non-global modes report after update from Adam state to
-            keep the backward graph single-consumer.
+            its pre-clip norm; other modes report the same norm only when
+            ``report_grad_norm`` opts in (default: no reporting reduction).
             """
             if distributed_world_size > 1:
                 grad = self._distributed_sum_gradient_tree(grad)
@@ -2731,6 +2708,8 @@ class MLXTrainer:
                 final_grad, grad_norm = _clip_grad_norm_fp32(
                     final_grad, max_norm=max_grad_norm
                 )
+            elif _compute_report_norm:
+                grad_norm = _global_grad_norm_fp32(final_grad)
             if _clip_grad_value:
                 final_grad = _clip_grad_by_value(final_grad, max_grad_value)
             if _clip_grad_leaf_norm:
@@ -2743,7 +2722,7 @@ class MLXTrainer:
             _restore_trainable_storage_dtypes()
             return grad_norm
 
-        def _apply_update_direct(grad):
+        def _apply_update_direct(grad, toks_f):
             """Fast exact path for ``grad_accum == 1`` with no per-leaf scaling.
 
             The raw grads already are the per-token average, so skip the
@@ -2753,6 +2732,23 @@ class MLXTrainer:
             grad_norm = None
             if max_grad_norm > 0:
                 grad, grad_norm = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
+            elif _compute_report_norm:
+                # Report the exact value the accumulated path computes by
+                # emulating its token multiply/divide round-trip on a copy
+                # used only for the norm; the fast-path update itself stays on
+                # the raw gradients (reporting must not change numerics).
+                safe_toks_f = mx.maximum(toks_f, mx.array(1.0, dtype=mx.float32))
+                inv_toks = mx.array(1.0, dtype=mx.float32) / safe_toks_f
+                def _rounded_for_norm(g):
+                    if g.dtype == mx.float16:
+                        # fp16 cannot represent token counts >= 65520 (the
+                        # cast turns inf, zero grads nan): weight fp16 leaves
+                        # in fp32 — exact norm rather than a rounding match.
+                        return g.astype(mx.float32) * toks_f * inv_toks
+                    return (g * toks_f.astype(g.dtype)) * inv_toks.astype(g.dtype)
+
+                rounded = tree_map(_rounded_for_norm, grad)
+                grad_norm = _global_grad_norm_fp32(rounded)
             if _clip_grad_value:
                 grad = _clip_grad_by_value(grad, max_grad_value)
             if _clip_grad_leaf_norm:
@@ -2807,7 +2803,7 @@ class MLXTrainer:
             (lvalue, toks), grad = _loss_and_grad(batch_data)
 
             if _direct_single_step_update:
-                grad_norm = _apply_update_direct(grad)
+                grad_norm = _apply_update_direct(grad, toks.astype(mx.float32))
                 return lvalue, toks, None, grad_norm
 
             toks_f = toks.astype(mx.float32)
@@ -2828,17 +2824,6 @@ class MLXTrainer:
             and _shape_guard_compile_allowed
         )
         _ddp_compile_local_grad = _use_compile and distributed_world_size > 1
-        if (
-            _use_compile
-            and not _ddp_compile_local_grad
-            and max_grad_norm > 0
-            and grad_accum > 1
-        ):
-            _main_print(
-                "Unsloth: mx.compile disabled because MLX global norm "
-                "clipping is enabled with gradient accumulation."
-            )
-            _use_compile = False
         if is_vlm and _use_compile:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:
@@ -3328,31 +3313,16 @@ class MLXTrainer:
             losses += lvalue * toks
             n_tokens += toks
             steps += 1
-            if grad_norm is not None:
-                mx.eval(grad_norm)
+            # One evaluation boundary: the reported norm (when present) is
+            # evaluated together with model/optimizer state and metric
+            # accumulators, never as a separate earlier graph execution.
+            eval_targets = [state, losses, n_tokens]
             if grad_accum_state is not None:
-                mx.eval(state, losses, n_tokens, grad_accum_state[0], grad_accum_state[1])
-            else:
-                mx.eval(state, losses, n_tokens)
-            if (
-                do_update
-                and grad_norm is None
-                and max_grad_norm <= 0
-                and _can_report_optimizer_state_norm()
-            ):
-                grad_norm = _grad_norm_from_optimizer_state()
-            elif (
-                do_update
-                and grad_norm is None
-                and max_grad_norm <= 0
-                and not _can_report_optimizer_state_norm()
-                and not _warned_skip_optimizer_state_grad_norm
-            ):
-                _main_print(
-                    "Unsloth: skipping grad norm reporting for this MLX "
-                    "optimizer/mode to avoid materializing the gradient graph."
-                )
-                _warned_skip_optimizer_state_grad_norm = True
+                eval_targets.append(grad_accum_state[0])
+                eval_targets.append(grad_accum_state[1])
+            if grad_norm is not None:
+                eval_targets.append(grad_norm)
+            mx.eval(*eval_targets)
             global_toks = self._distributed_all_sum(toks, stream=mx.cpu)
             mx.eval(global_toks)
             if int(global_toks.item()) == 0:
