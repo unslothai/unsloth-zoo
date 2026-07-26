@@ -3894,8 +3894,48 @@ def _install_qwen3_get_input_embeddings_patch():
     _PATCHED_ARCHES.add("qwen3_vl")
 
 
+def _legacy_vlm_prefill_kwargs_adapter(original):
+    """Drop generator bookkeeping only for strict legacy language callables."""
+
+    if getattr(original, "_unsloth_legacy_prefill_kwargs", False):
+        return original
+    try:
+        parameters = inspect.signature(original, follow_wrapped=False).parameters
+    except (TypeError, ValueError):
+        return original
+    if (
+        "n_to_process" in parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    ):
+        return original
+
+    @wraps(original)
+    def patched(self, *args, **kwargs):
+        kwargs.pop("n_to_process", None)
+        return original(self, *args, **kwargs)
+
+    patched._unsloth_legacy_prefill_kwargs = True
+    return patched
+
+
+def _install_legacy_llava_prefill_patch():
+    language_module = _try_import_module("mlx_vlm.models.llava.language")
+    language_class = getattr(language_module, "LanguageModel", None)
+    if language_class is None:
+        return
+    original = language_class.__call__
+    adapted = _legacy_vlm_prefill_kwargs_adapter(original)
+    if adapted is not original:
+        _patch_method(language_class, "__call__", adapted)
+
+
 def _install_llama_pixtral_mistral_compile_patches():
     """Install compile-safe multimodal merge patches for llama-like families."""
+
+    _install_legacy_llava_prefill_patch()
 
     def merge_single_image_token_family(
         image_token_index, image_features, inputs_embeds, input_ids
