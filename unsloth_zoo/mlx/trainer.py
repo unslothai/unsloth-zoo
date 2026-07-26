@@ -1898,6 +1898,15 @@ class MLXTrainer:
         # the true fractional epoch (e.g. state.epoch ~ 0.1), matching HF, not a
         # spurious full 1.0.
         if int(getattr(self.args, "max_steps", 0) or 0) > 0:
+            # Prefer the batch plan's own one-pass micro-batch count. The dataset
+            # approximation below cannot see what batching actually retained:
+            # rows under two tokens are dropped, one source item can expand into
+            # several prepared rows, and the tail partial batch is dropped
+            # (floor, not ceil). Using it would fire on_epoch_begin/on_epoch_end
+            # at micro-batches that are not real dataset boundaries.
+            plan_cycle = getattr(batches, "cycle_length", None)
+            if plan_cycle:
+                return max(1, int(plan_cycle))
             per_device = int(getattr(self.args, "per_device_train_batch_size", 0) or 0)
             world = int(getattr(self, "_distributed_world_size", 1) or 1)
             ds = getattr(self, "_mlx_train_dataset_for_batches", None)
@@ -4385,6 +4394,18 @@ class MLXTrainer:
                 # Keep callable scheduler evaluation outside mx.compile. The
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, self._global_step)
+                # HF dispatches on_pre_optimizer_step immediately before
+                # optimizer.step() (transformers trainer.py _inner_training_loop:
+                # clip -> on_pre_optimizer_step -> optimizer.step() ->
+                # on_optimizer_step). MLX fuses clipping and the update inside the
+                # compiled step_fn, so the last point where gradients are still
+                # un-applied is here, right before step_fn runs. Like
+                # on_optimizer_step below, do NOT latch a callback stop now: HF
+                # only breaks after this step's on_step_end + log/eval/save, so
+                # OR-reduce an external cancel only and let the tail _sync_stop()
+                # apply the callback stop.
+                _fire("on_pre_optimizer_step")
+                self._distributed_should_stop()
 
             if _ddp_update_outside_step:
                 lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
@@ -5358,6 +5379,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     rng = random.Random(_normalize_seed(seed))
     schedule = []
     widths = []
+    cycle_length = None
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     for epoch_idx in range(_n_epochs_materialize):
         epoch_order = _order_indices_for_epoch(epoch_idx)
@@ -5392,6 +5414,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         for batch_indices, padded_len in epoch_schedule:
             schedule.append(batch_indices)
             widths.append(padded_len)
+        # One dataset pass == this epoch's micro-batch count (pre-truncation).
+        if cycle_length is None and len(epoch_schedule) > 0:
+            cycle_length = len(epoch_schedule)
 
     # Limit if needed
     if num_batches is not None and len(schedule) > num_batches:
@@ -5408,6 +5433,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             for input_ids, labels in all_items
         ),
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=pad_id,
         minimum_width=2,

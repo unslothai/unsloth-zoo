@@ -4898,3 +4898,115 @@ def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
     resumed = build([Patience()])
     resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
     assert resumed.state.stateful_callbacks["Patience"]["attributes"]["counter"] == 2
+
+
+def test_pre_optimizer_step_callback_fires_before_each_update(monkeypatch):
+    # HF dispatches on_pre_optimizer_step immediately before optimizer.step()
+    # (transformers trainer.py: clip -> on_pre_optimizer_step -> optimizer.step()
+    # -> on_optimizer_step). The MLX loop only fired on_optimizer_step, so any
+    # supplied TrainerCallback relying on the pre-update hook was silently inert
+    # for the whole run even though the callback was otherwise accepted.
+    import tempfile
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class OptimizerHookSpy:
+        def __init__(self):
+            self.events = []
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            self.events.append(("pre", state.global_step))
+            return control
+
+        def on_optimizer_step(self, args, state, control, **kwargs):
+            self.events.append(("post", state.global_step))
+            return control
+
+        def on_substep_end(self, args, state, control, **kwargs):
+            self.events.append(("substep", state.global_step))
+            return control
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    spy = OptimizerHookSpy()
+    args = MLXTrainingConfig(
+        max_steps=2,
+        gradient_accumulation_steps=2,
+        logging_steps=100,
+        save_steps=100,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(4)],
+        args=args,
+        callbacks=[spy],
+    )
+    batches = [make_batch(10) for _ in range(4)]
+    trainer._prepare_data = lambda _is_vlm: (list(batches), None)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+
+    trainer.train()
+
+    kinds = [kind for kind, _step in spy.events]
+    # One pre-update dispatch per optimizer step, never on accumulation substeps.
+    assert kinds.count("pre") == 2, spy.events
+    # ... and each one immediately precedes that step's on_optimizer_step.
+    assert [k for k in kinds if k in ("pre", "post")] == [
+        "pre", "post", "pre", "post",
+    ], spy.events
+    for index, (kind, _step) in enumerate(spy.events):
+        if kind == "pre":
+            assert spy.events[index + 1][0] == "post", spy.events
+
+
+def test_callback_batches_per_epoch_uses_prepared_plan_cycle():
+    # For max_steps runs the callback epoch length must come from the rows
+    # batching actually retained, not from len(dataset). Pretokenized rows under
+    # two tokens are dropped and the tail partial batch is not emitted, so the
+    # raw-dataset approximation ceil(len(ds) / batch) overshoots the real cycle
+    # and on_epoch_begin/on_epoch_end land on micro-batches that are not dataset
+    # boundaries.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import _create_text_batch_plan
+
+    tokenizer = types.SimpleNamespace(pad_token_id=0, eos_token_id=2)
+    # 12 source rows, every third is a single token -> filtered by the >=2 guard,
+    # leaving 8 prepared rows == 4 micro-batches at batch size 2.
+    dataset = [
+        {"input_ids": [1]} if index % 3 == 0 else {"input_ids": [1, 2, 3, 4, 5]}
+        for index in range(12)
+    ]
+    plan = _create_text_batch_plan(
+        dataset, tokenizer, 2, 64, num_batches=8, seed=42,
+    )
+    assert len(plan) == 8, "the max_steps horizon cycles the plan"
+    assert plan.cycle_length == 4, "one dataset pass is 4 micro-batches"
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(max_steps=8, per_device_train_batch_size=2)
+    trainer._distributed_world_size = 1
+    trainer._mlx_train_dataset_for_batches = dataset
+    trainer.train_dataset = dataset
+    trainer._prepared_batches_include_epochs = False
+    # ceil(12 / 2) = 6 is the raw-dataset approximation; the truth is 4.
+    assert trainer._callback_batches_per_epoch(plan) == 4
+
+    # Plain materialized batch lists (no plan metadata) keep the old fallback.
+    assert trainer._callback_batches_per_epoch(list(range(8))) == 6
