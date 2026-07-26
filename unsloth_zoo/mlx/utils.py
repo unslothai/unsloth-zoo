@@ -6688,6 +6688,31 @@ def _copy_source_sidecars(src_path, path):
         copied += 1
     return copied
 
+def _fuse_mlx_module(module, dequantize):
+    """Call ``module.fuse()`` regardless of how the flag is spelled.
+
+    mlx-lm 0.28.3 names the fuse flag ``de_quantize``; 0.28.4 renamed it to
+    ``dequantize``. The supported range starts at 0.28.3, so it spans both
+    spellings: pick whichever the installed implementation accepts instead of
+    hardcoding one. A few modules expose ``fuse()`` with no flag at all (for
+    example mlx-vlm's ``ExtendedLmHead``); those have nothing to dequantize, and
+    ``save_merged_model`` still runs ``dequantize_model`` afterwards, so calling
+    them without the flag stays correct.
+    """
+    fuse = module.fuse
+    try:
+        parameters = inspect.signature(fuse).parameters
+    except (TypeError, ValueError):
+        # C extensions can hide their signature; assume the current spelling.
+        return fuse(dequantize=dequantize)
+
+    for name in ("dequantize", "de_quantize"):
+        if name in parameters:
+            return fuse(**{name: dequantize})
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return fuse(dequantize=dequantize)
+    return fuse()
+
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
@@ -6713,7 +6738,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
     fused_linears = [
-        (n, m.fuse(dequantize=dequantize))
+        (n, _fuse_mlx_module(m, dequantize))
         for n, m in model.named_modules()
         if hasattr(m, "fuse")
     ]
