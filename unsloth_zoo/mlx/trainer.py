@@ -1929,6 +1929,51 @@ class MLXTrainer:
             return None
         return metric_name
 
+    def _export_callback_states(self):
+        """Populate state.stateful_callbacks from ExportableState callbacks.
+
+        HF does this in Trainer._save_checkpoint before writing
+        trainer_state.json, so an `ExportableState` callback's internal
+        bookkeeping (e.g. EarlyStoppingCallback.early_stopping_patience_counter)
+        travels with the checkpoint. Duck-typed on a working `state()` rather
+        than isinstance(ExportableState) to keep this module Torch-free.
+        HF's TrainerControl is deliberately excluded: MLX rebuilds control flags
+        from the loop on every train(), and rehydrating should_training_stop
+        would end a resumed run at step 0.
+        """
+        exported = {}
+        for cb in self.callback_handler.callbacks:
+            state_fn = getattr(cb, "state", None)
+            if not callable(state_fn):
+                continue
+            try:
+                cb_state = state_fn()
+            except NotImplementedError:
+                continue  # ExportableState base, or a non-exporting callback
+            if not isinstance(cb_state, dict):
+                continue
+            name = type(cb).__name__
+            if name in exported:
+                # HF stores duplicates of one class as a list, positionally
+                # matched back to the callbacks on restore.
+                if not isinstance(exported[name], list):
+                    exported[name] = [exported[name]]
+                exported[name].append(cb_state)
+            else:
+                exported[name] = cb_state
+        self.state.stateful_callbacks = exported
+        return exported
+
+    def _restore_callback_states(self, stateful_callbacks):
+        """Seed state.stateful_callbacks from a checkpoint.
+
+        Rehydrating the live callbacks is HF's opt-in
+        restore_callback_states_from_checkpoint path, which this config does not
+        expose, so only the callback-visible state is mirrored here.
+        """
+        if isinstance(stateful_callbacks, dict) and stateful_callbacks:
+            self.state.stateful_callbacks = dict(stateful_callbacks)
+
     def _update_callback_best_metric(self, metrics):
         """Update TrainerState.best_metric after eval callbacks inspect prior state."""
         metric_name = self._metric_for_best_model_name(metrics, require=False)
@@ -3072,6 +3117,13 @@ class MLXTrainer:
                 self._resume_num_input_tokens_seen = int(
                     ts.get("num_input_tokens_seen", 0) or 0
                 )
+                # Stash the checkpoint's ExportableState callback state; it is
+                # applied after _init_callback_state below, which rebuilds
+                # self.state (and would otherwise drop it). .get default keeps
+                # pre-fix checkpoints (no stateful_callbacks key) resumable.
+                self._resume_stateful_callbacks = ts.get(
+                    "stateful_callbacks", None
+                ) or {}
                 # best/ lives in output_dir, not in the checkpoint dir, so a
                 # checkpoint resumed elsewhere (copied dir, new output_dir) can
                 # carry best-model state whose weights aren't present. Keep the
@@ -3104,6 +3156,11 @@ class MLXTrainer:
         self.callback_handler.processing_class = self.processor or self.tokenizer
         self._ensure_callback_args_compat()
         self._init_callback_state(total_steps, _resume_step)
+        # _init_callback_state rebuilds self.state, so seed the callback-visible
+        # stateful_callbacks after it.
+        self._restore_callback_states(
+            getattr(self, "_resume_stateful_callbacks", None) or {}
+        )
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -4035,6 +4092,13 @@ class MLXTrainer:
                                     "num_input_tokens_seen": int(
                                         self.state.num_input_tokens_seen
                                     ),
+                                    # HF writes ExportableState callback state
+                                    # into every checkpoint (unconditionally, in
+                                    # _save_checkpoint); without it the field is
+                                    # permanently empty and no later release can
+                                    # recover it from these checkpoints.
+                                    "stateful_callbacks":
+                                        self._export_callback_states(),
                                 },
                                 ckpt_dir,
                             )

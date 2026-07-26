@@ -4816,3 +4816,85 @@ def test_train_bumps_run_generation_in_finally():
     bump = "self._run_generation = getattr(self, \"_run_generation\", 0) + 1"
     assert bump in src
     assert src.rindex("finally:") < src.index(bump)
+
+
+def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
+    # TrainerState declared stateful_callbacks and nothing ever wrote it, so the
+    # field was permanently {} and checkpoints carried no callback bookkeeping at
+    # all. HF populates it in _save_checkpoint unconditionally (the opt-in flag
+    # gates only the RESTORE side), so without this a checkpoint written today
+    # can never have that state recovered, by this release or a later one.
+    import json
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class Patience:
+        """Shaped like transformers' ExportableState callbacks."""
+        def __init__(self):
+            self.counter = 0
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.counter += 1
+            return control
+
+        def state(self):
+            return {"args": {}, "attributes": {"counter": self.counter}}
+
+    class NotExportable:
+        def state(self):
+            raise NotImplementedError
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    out_dir = tempfile.mkdtemp()
+    args = MLXTrainingConfig(
+        max_steps=4,
+        gradient_accumulation_steps=1,
+        logging_steps=4,
+        save_steps=2,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=out_dir,
+    )
+
+    def build(callbacks):
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+            callbacks=callbacks,
+        )
+        trainer._prepare_data = lambda _is_vlm: ([make_batch(10) for _ in range(4)], None)
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    build([Patience(), NotExportable()]).train()
+
+    with open(os.path.join(out_dir, "checkpoint-4", "trainer_state.json")) as fh:
+        saved = json.load(fh)
+    # The exporting callback is recorded by class name; the one whose state()
+    # raises NotImplementedError is skipped rather than aborting the save.
+    assert saved["stateful_callbacks"] == {
+        "Patience": {"args": {}, "attributes": {"counter": 4}}
+    }
+    assert "NotExportable" not in saved["stateful_callbacks"]
+
+    # Resuming mirrors the checkpoint into the callback-visible state instead of
+    # leaving the declared field empty.
+    resumed = build([Patience()])
+    resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
+    assert resumed.state.stateful_callbacks["Patience"]["attributes"]["counter"] == 2
