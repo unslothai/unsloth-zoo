@@ -5711,15 +5711,11 @@ def _preserved_preprocessing_rng():
     """Run a block without leaving the shared preprocessing RNGs advanced.
 
     The descriptor survey builds every scheduled batch through the real
-    processor purely to read shapes, then discards the tensors. A processor
-    that augments (random crop/flip/jitter) draws from the process-global
-    RNGs while doing so, and those draws are never replayed, so a
-    compile-enabled run would otherwise train on a later augmentation stream
-    than an eager or compile-ineligible run started from the same seed.
-    Snapshotting and restoring the global generators makes the survey
-    RNG-neutral, so enabling compile cannot change which samples training
-    sees. Generators a processor owns privately are outside any general
-    save/restore and stay the caller's responsibility.
+    processor just to read shapes; an augmenting processor draws from the
+    process-global RNGs while doing so and those draws are never replayed, so
+    without this a compile-enabled run would train on a later augmentation
+    stream than an eager run from the same seed. Privately owned generators
+    stay the caller's responsibility.
     """
     states = []
     try:
@@ -5820,9 +5816,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         )
         self._processor = processor
         self._config = config
-        # ``None`` stays ``None``: the VLM builder treats it as "no cap" (the
-        # processor omits ``max_length`` and the truncation helper is a no-op),
-        # and the plan only ever forwards this value, never computes with it.
+        # ``None`` stays ``None``: the VLM builder reads it as "no cap" (no
+        # ``max_length``, truncation a no-op) and the plan only forwards it.
         self.max_seq_length = (
             None if max_seq_length is None else int(max_seq_length)
         )
@@ -5994,13 +5989,11 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def ensure_descriptors(self):
         """Survey every scheduled batch's compile-key family, once.
 
-        The cache is invalidated up front and never repopulated here, and
-        each batch is dropped before the next is built, so the survey owns at
-        most one batch at a time. Repeated calls return the stored
-        descriptors without building anything. The whole survey runs under
-        preserved global preprocessing RNG state, so a stochastic processor's
-        augmentation draws are not consumed here and enabling compile cannot
-        shift the training data stream.
+        The MRU cache is dropped up front and never repopulated here, and each
+        batch is released before the next is built, so the survey owns at most
+        one batch at a time; repeated calls return the stored descriptors.
+        Runs under preserved global preprocessing RNG state, so a stochastic
+        processor's augmentation draws are not consumed here.
         """
         if self._descriptors is not None:
             return self._descriptors

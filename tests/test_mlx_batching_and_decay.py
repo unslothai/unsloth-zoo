@@ -588,10 +588,9 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
 
 
 def test_vlm_plan_survey_does_not_consume_preprocessing_rng():
-    """The descriptor survey is RNG-neutral: a processor that augments from
-    the global generators sees the SAME draws whether or not the survey ran,
-    so enabling compile cannot shift the training data stream. Without the
-    save/restore the surveyed run trains on a later augmentation stream."""
+    """The survey is RNG-neutral: an augmenting processor sees the SAME draws
+    whether or not it ran, so enabling compile cannot shift the training data
+    stream. Without the save/restore the surveyed run augments differently."""
     _skip_if_mlx_core_was_replaced()
     import random as _random
 
@@ -795,10 +794,9 @@ def test_vlm_should_raise_decision_aborts_inside_the_coordinated_block():
 
 
 def test_vlm_shape_planning_follows_the_resolved_override_mode():
-    """The mode in force is the RESOLVED one: an arch override selecting
-    strict under a best_effort base must abort on a shape-planning failure
-    instead of silently degrading to eager, and the reverse override must
-    still degrade under a strict base."""
+    """The RESOLVED mode decides: an arch override selecting strict under a
+    best_effort base must abort on a shape-planning failure, and the reverse
+    override must still degrade under a strict base."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 

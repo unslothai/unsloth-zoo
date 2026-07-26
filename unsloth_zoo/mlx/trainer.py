@@ -773,12 +773,10 @@ class _VLMCompileDecisionError(RuntimeError):
 def _effective_compile_mode(compile_policy, compile_decision):
     """Return the compile mode in force after arch/backend overrides.
 
-    ``resolve_training_compile`` applies the per-architecture and
-    per-backend overrides, so a resolved decision can be strict (fallback
-    disabled) while the base policy mode is best_effort. Strictness checks
-    must follow the resolved mode, or an override-selected strict run would
-    silently degrade to eager. Decisions predating the resolved mode fall
-    back to the base policy mode.
+    ``resolve_training_compile`` can resolve strict under a best_effort base
+    policy, so strictness checks must follow the resolved mode or an
+    override-selected strict run silently degrades to eager. Decisions
+    predating the field fall back to the policy mode.
     """
     mode = getattr(compile_decision, "policy_mode", None)
     return mode if mode else compile_policy.mode
@@ -835,9 +833,8 @@ def _plan_single_process_vlm_shapes(
             "not_applicable", "vlm_compile_unqualified", cap,
             lazy_batches=lazy,
         ), True, None
-    # Every strictness check below follows the RESOLVED mode: an arch or
-    # backend override can select strict for this model while the base
-    # policy stays best_effort, and that run must abort rather than degrade.
+    # Strictness follows the RESOLVED mode: an arch/backend override can select
+    # strict under a best_effort base policy, and that run must abort, not degrade.
     effective_mode = _effective_compile_mode(compile_policy, compile_decision)
     max_grad_norm = _resolve_mlx_grad_clipping(args)[0]
     if (
@@ -1452,16 +1449,12 @@ class MLXTrainer:
     ):
         """Require every DDP rank to admit its local finite shape plan.
 
-        ``compile_mode`` overrides the base policy mode with the resolved
-        one (arch/backend overrides can select strict under a best_effort
-        base), so a strict run aborts here instead of degrading to eager.
-
-        ``keep_exact_local`` lets ranks whose automatic selection is exact
-        keep that plan instead of joining shared-cap re-materialization,
-        since contributing their descriptive catalog size to the shared
-        maximum would force compressed peers to abandon compression. They
-        still contribute a neutral value and run every collective in the
-        same order, so the coordinated schedule is unchanged.
+        ``compile_mode`` is the resolved mode (an override can select strict
+        under a best_effort base), so a strict run aborts rather than degrade to
+        eager. ``keep_exact_local`` keeps an exact automatic plan out of the
+        shared-cap re-materialization, whose maximum would force compressed
+        peers to decompress; those ranks still contribute a neutral value and
+        run every collective in order, so the schedule is unchanged.
         """
         strict_mode = (compile_mode or compile_policy.mode) == "strict"
         if self.distributed_world_size <= 1:
