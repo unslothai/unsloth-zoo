@@ -5593,3 +5593,243 @@ def test_callback_num_train_epochs_mirrors_hf_arithmetic():
     epochs.args = MLXTrainingConfig(num_train_epochs=3, max_steps=-1)
     epochs._prepared_batches_include_epochs = True
     assert epochs._callback_num_train_epochs(0, list(range(12))) == 3
+
+
+def test_callback_best_metric_persisted_across_resume_without_native_tracking(monkeypatch):
+    # The callback-visible watermark (TrainerState.best_metric) advances on every
+    # eval whenever metric_for_best_model is set, but the NATIVE best fields
+    # (self._best_metric/_best_step) are only written by _run_best_tracking, which
+    # is gated on load_best_model_at_end or early_stopping_patience. With both off,
+    # the checkpoint persisted only the null native value, so on resume
+    # _init_callback_state seeded state.best_metric=None: HF callbacks reading it
+    # (EarlyStoppingCallback, transformers/trainer_callback.py:737) treated the
+    # first post-resume eval as a new best and reset their patience. HF has no such
+    # split -- _determine_best_metric updates state.best_metric whenever
+    # metric_for_best_model is set (trainer.py:3143-3168), _save_checkpoint writes
+    # the whole TrainerState to trainer_state.json (trainer.py:3119) and resume
+    # reloads it wholesale (trainer.py:1556).
+    import json
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    class BestSpy:
+        """Records the watermark callbacks see, before it is updated for this eval."""
+        def __init__(self):
+            self.seen = []
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            self.seen.append((state.global_step, state.best_metric,
+                              state.best_global_step))
+            return control
+
+    out_dir = tempfile.mkdtemp()
+
+    def build(max_steps, eval_losses):
+        spy = BestSpy()
+        args = MLXTrainingConfig(
+            max_steps=max_steps,
+            gradient_accumulation_steps=1,
+            logging_steps=100,
+            eval_steps=2,
+            save_steps=2,
+            # Native best tracking OFF: only the callback-visible watermark moves.
+            load_best_model_at_end=False,
+            early_stopping_patience=0,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+            callbacks=[spy],
+        )
+        trainer._prepare_data = lambda _is_vlm: (
+            [make_batch(10) for _ in range(4)], None,
+        )
+        trainer.eval_dataset = [{"input_ids": [1, 2, 3, 4]}]
+        trainer._eval_batches_labeled = ["batch-0"]
+        pending = list(eval_losses)
+
+        def _fake_evaluate(batches, loss_fn, is_vlm=False):
+            value = pending.pop(0)
+            trainer._last_eval_metrics = {"eval_loss": value}
+            return value, 2.0
+
+        trainer._evaluate = _fake_evaluate
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer, spy
+
+    first, first_spy = build(2, [0.9])
+    first.train()
+    # Native tracking never ran; only the callback-visible watermark advanced.
+    assert first._best_metric is None and first._best_step is None
+    assert first.state.best_metric == 0.9
+    assert first.state.best_global_step == 2
+
+    ckpt = os.path.join(out_dir, "checkpoint-2")
+    with open(os.path.join(ckpt, "trainer_state.json")) as fh:
+        saved = json.load(fh)
+    assert saved["best_metric"] is None, "native tracking is off"
+    assert saved["callback_best_metric"] == pytest.approx(0.9)
+    assert saved["callback_best_step"] == 2
+
+    # Resume: the first post-resume eval is WORSE (1.5 > 0.9). Callbacks must see
+    # the restored 0.9 watermark, and it must survive the worse metric.
+    resumed, resumed_spy = build(4, [1.5])
+    resumed.train(resume_from_checkpoint=ckpt)
+    assert resumed_spy.seen == [(4, pytest.approx(0.9), 2)]
+    assert resumed.state.best_metric == pytest.approx(0.9)
+    assert resumed.state.best_global_step == 2
+
+    # Reusing that same trainer for a FRESH run must not carry the watermark over
+    # (HF only loads trainer_state.json when resume_from_checkpoint is given).
+    fresh_spy = BestSpy()
+    resumed.callback_handler.callbacks = [
+        cb for cb in resumed.callback_handler.callbacks
+        if not isinstance(cb, BestSpy)
+    ] + [fresh_spy]
+    fresh_pending = [0.7]
+
+    def _fresh_evaluate(batches, loss_fn, is_vlm=False):
+        value = fresh_pending.pop(0)
+        resumed._last_eval_metrics = {"eval_loss": value}
+        return value, 2.0
+
+    resumed._evaluate = _fresh_evaluate
+    resumed.args.max_steps = 2
+    resumed.train()
+    assert fresh_spy.seen == [(2, None, None)], "no phantom best on a fresh run"
+
+    # A pre-fix checkpoint has no callback_best_* keys and must stay resumable,
+    # falling back to the native value exactly as before.
+    saved.pop("callback_best_metric")
+    saved.pop("callback_best_step")
+    with open(os.path.join(ckpt, "trainer_state.json"), "w") as fh:
+        json.dump(saved, fh)
+    legacy, legacy_spy = build(4, [1.5])
+    legacy.train(resume_from_checkpoint=ckpt)
+    assert legacy_spy.seen == [(4, None, None)]
+
+
+def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
+    # train_loss_token_sum/_total are written only by _run_training_log, so a
+    # checkpoint taken on a step whose completed optimizer updates have not been
+    # logged yet (save_steps not a multiple of logging_steps, or a callback that
+    # requests should_save without should_log) persisted totals covering fewer
+    # steps than its own global_step. Those applied steps were then missing from
+    # the resumed run's final train_loss. The checkpoint payload must fold the
+    # committed window in -- without mutating the live accumulators, or the log
+    # that later folds the same window would double count.
+    import json
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    class StopAfter:
+        """Stands in for a crash/cancel right after the step-2 checkpoint."""
+        def __init__(self, step):
+            self.step = step
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step >= self.step:
+                control.should_training_stop = True
+            return control
+
+    out_dir = tempfile.mkdtemp()
+
+    def build(stop_after=None):
+        args = MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            # No log cadence: the only forced log is the final step, so the
+            # step-2 checkpoint lands with steps 1-2 committed but unlogged.
+            logging_steps=100,
+            save_steps=2,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        # Same init in every run so the frozen-weight losses are comparable
+        # across the reference run and the interrupted/resumed pair.
+        mx.random.seed(1234)
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+            callbacks=[StopAfter(stop_after)] if stop_after else [],
+        )
+        trainer._prepare_data = lambda _is_vlm: (
+            [make_batch(10) for _ in range(4)], None,
+        )
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    # Reference: one uninterrupted 4-step run. The frozen optimizer keeps every
+    # per-batch loss identical, so its totals are exactly twice a 2-step run's.
+    whole = build()
+    whole.train()
+    assert whole._train_loss_token_total > 0
+
+    with open(os.path.join(out_dir, "checkpoint-2", "trainer_state.json")) as fh:
+        saved = json.load(fh)
+    assert saved["global_step"] == 2
+    assert saved["log_history"] == [], "the step-2 window was never logged"
+    # The checkpoint covers the two applied steps, not zero of them ...
+    assert saved["train_loss_token_total"] == whole._train_loss_token_total // 2
+    assert saved["train_loss_token_sum"] == pytest.approx(
+        whole._train_loss_token_sum / 2
+    )
+    # ... and folding it into the payload must not double count in the live run:
+    # the final totals still cover exactly the 4 applied steps.
+    assert whole._train_loss_token_total == 2 * saved["train_loss_token_total"]
+
+    # End to end: stop right after the step-2 checkpoint, resume, and the final
+    # token-weighted train loss matches the uninterrupted run's.
+    interrupted = build(stop_after=2)
+    interrupted.train()
+    resumed = build()
+    resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
+    assert resumed._train_loss_token_total == whole._train_loss_token_total
+    assert resumed._train_loss_token_sum == pytest.approx(
+        whole._train_loss_token_sum
+    )
+    assert (
+        resumed._train_loss_token_sum / resumed._train_loss_token_total
+    ) == pytest.approx(
+        whole._train_loss_token_sum / whole._train_loss_token_total
+    )

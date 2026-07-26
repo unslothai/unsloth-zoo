@@ -1250,6 +1250,12 @@ class MLXTrainer:
         # restored by the resume block, empty on a fresh run so a reused
         # trainer does not carry run-1's entries into a fresh train().
         self._resume_log_history = []
+        # Same contract for the callback-visible best-metric watermark
+        # (TrainerState.best_metric): restored by the resume block, None on a
+        # fresh run so a reused trainer does not carry run-1's watermark into a
+        # fresh train().
+        self._resume_callback_best_metric = None
+        self._resume_callback_best_step = None
         self._distributed_world = None
         self._distributed_initialized = False
         self._distributed_rank = 0
@@ -1935,8 +1941,18 @@ class MLXTrainer:
         # treat the first post-resume eval as the new best and can overwrite the
         # real best with a worse metric, diverging from the native best-model
         # tracking in _run_best_tracking (which uses the restored self._best_metric).
-        self.state.best_metric = self._best_metric
-        self.state.best_global_step = self._best_step
+        # The callback-visible watermark has its own checkpoint key because it
+        # advances even when native tracking is off, so it can be set while
+        # self._best_metric is None; fall back to the native value on a fresh run
+        # and on pre-fix checkpoints (where the resume block seeds it from there).
+        _cb_best_metric = getattr(self, "_resume_callback_best_metric", None)
+        _cb_best_step = getattr(self, "_resume_callback_best_step", None)
+        self.state.best_metric = (
+            self._best_metric if _cb_best_metric is None else _cb_best_metric
+        )
+        self.state.best_global_step = (
+            self._best_step if _cb_best_step is None else _cb_best_step
+        )
         if self._best_step is not None:
             self.state.best_model_checkpoint = f"{args.output_dir}/best"
         self.control = _MLXTrainerControl()
@@ -3253,6 +3269,26 @@ class MLXTrainer:
                     self._best_metric = None
                     self._best_step = None
                     self._es_patience_counter = 0
+                # The callback-visible watermark (TrainerState.best_metric)
+                # advances on every eval whenever metric_for_best_model is set,
+                # including when load_best_model_at_end and native early stopping
+                # are both off -- in which case _run_best_tracking never touches
+                # self._best_metric and "best_metric" above is null. HF keeps this
+                # on TrainerState, which it saves into trainer_state.json
+                # (trainer.py:3119) and reloads wholesale on resume
+                # (trainer.py:1556), so restore it from its own key instead of the
+                # native one: otherwise state.best_metric restarts at None and HF
+                # callbacks that read it (EarlyStoppingCallback,
+                # trainer_callback.py:737) treat the first post-resume eval as a
+                # new best. Read after the best/-missing branch above so pre-fix
+                # checkpoints (no key) keep the exact native fallback they have
+                # today.
+                self._resume_callback_best_metric = ts.get(
+                    "callback_best_metric", self._best_metric,
+                )
+                self._resume_callback_best_step = ts.get(
+                    "callback_best_step", self._best_step,
+                )
                 _main_print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
@@ -4174,6 +4210,34 @@ class MLXTrainer:
 
         def _run_checkpoint(current_step):
             """Save a step checkpoint (rank 0) and dispatch HF on_save."""
+            # Fold the committed-but-unlogged window into the totals WRITTEN to
+            # the checkpoint. losses/n_tokens hold optimizer steps that were
+            # already applied to the model (and to the optimizer state saved
+            # below) but that no log has folded into self._train_loss_token_*,
+            # whose only writer is _run_training_log. A save cadence that is not a
+            # multiple of the log cadence (save_steps=50, logging_steps=20), or a
+            # callback that requests should_save without should_log, would
+            # otherwise persist totals covering fewer steps than the checkpoint's
+            # own global_step, and the resumed run's final train_loss would
+            # silently drop those steps. Only the payload is adjusted:
+            # self._train_loss_token_* stays untouched so the later
+            # _run_training_log that folds this same window does not double count.
+            # The all-sum runs on EVERY rank, before the rank-0 write guard, to
+            # stay in lockstep (same reduction _run_training_log applies to these
+            # counters); steps advances identically on every rank, so the guard is
+            # rank-consistent. Skipped at steps == 0 because the accumulators are
+            # plain-int 0 after a reset and _distributed_all_sum would then return
+            # an int with no .item(). The pending (not-yet-applied) window is
+            # deliberately excluded, exactly as in the post-loop flush.
+            ckpt_loss_sum = float(self._train_loss_token_sum)
+            ckpt_loss_total = int(self._train_loss_token_total)
+            ckpt_committed_steps = steps
+            if ckpt_committed_steps > 0:
+                _ckpt_losses = self._distributed_all_sum(losses, stream=mx.cpu)
+                _ckpt_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
+                mx.eval(_ckpt_losses, _ckpt_tokens)
+                ckpt_loss_sum += float(_ckpt_losses.item())
+                ckpt_loss_total += int(_ckpt_tokens.item())
             checkpoint_error = None
             checkpoint_written = False
             if is_main_process:
@@ -4199,12 +4263,8 @@ class MLXTrainer:
                                     "train_loss_history": list(
                                         self._train_loss_history
                                     ),
-                                    "train_loss_token_sum": float(
-                                        self._train_loss_token_sum
-                                    ),
-                                    "train_loss_token_total": int(
-                                        self._train_loss_token_total
-                                    ),
+                                    "train_loss_token_sum": ckpt_loss_sum,
+                                    "train_loss_token_total": ckpt_loss_total,
                                     "best_metric": self._best_metric,
                                     "best_step": self._best_step,
                                     "es_patience_counter": self._es_patience_counter,
@@ -4214,6 +4274,22 @@ class MLXTrainer:
                                     # num_input_tokens_seen in trainer_state.json).
                                     "num_input_tokens_seen": int(
                                         self.state.num_input_tokens_seen
+                                    ),
+                                    # The callback-visible best-metric watermark
+                                    # lives on HF's TrainerState, which
+                                    # _save_checkpoint persists wholesale. It
+                                    # advances on every eval whenever
+                                    # metric_for_best_model is set, so it is
+                                    # non-null even when "best_metric"/"best_step"
+                                    # above are null (load_best_model_at_end and
+                                    # early stopping both off).
+                                    "callback_best_metric": (
+                                        None if self.state.best_metric is None
+                                        else float(self.state.best_metric)
+                                    ),
+                                    "callback_best_step": (
+                                        None if self.state.best_global_step is None
+                                        else int(self.state.best_global_step)
                                     ),
                                     # HF writes ExportableState callback state
                                     # into every checkpoint (unconditionally, in
