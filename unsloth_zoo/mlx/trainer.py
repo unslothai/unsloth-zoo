@@ -735,8 +735,6 @@ class MLXTrainingConfig:
     # Logging & output
     logging_steps: int = 1
     output_dir: str = "./outputs"
-    logging_dir: str | None = None
-    run_name: str | None = None
     report_to: str = "none"
     save_steps: int = 0  # 0 = only save at end
     save_total_limit: int = -1  # -1 = no limit
@@ -803,6 +801,13 @@ class MLXTrainingConfig:
     # weight decay.
     report_grad_norm: bool = False
 
+    # Callback-visible run metadata (HF TrainingArguments parity). Declared LAST
+    # for the same reason as the two fields above: the initializer binds
+    # positional args by field order, so inserting them mid-list would shift the
+    # positional slot of every field after it.
+    logging_dir: str | None = None
+    run_name: str | None = None
+
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
         if len(args) > len(config_fields):
@@ -843,7 +848,9 @@ class MLXTrainingConfig:
         # full-field dict dumps. A legacy dump predating them is still a
         # wholesale copy and must be detected as one, or its copied default
         # warmup_steps would override a non-default warmup_ratio.
-        _appended_fields = {"compile_max_variants", "report_grad_norm"}
+        _appended_fields = {
+            "compile_max_variants", "report_grad_norm", "logging_dir", "run_name",
+        }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
         copied_default_warmup_with_ratio = (

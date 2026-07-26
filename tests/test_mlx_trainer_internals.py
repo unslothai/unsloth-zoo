@@ -4330,3 +4330,34 @@ def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
         )
         for m in range(8)
     )
+
+
+def test_callback_metadata_config_fields_are_appended_last():
+    # logging_dir / run_name are new callback-visible run metadata. MLXTrainingConfig
+    # binds positional arguments by field order, so a new field declared anywhere but
+    # last silently shifts the positional slot of every field after it. It must also be
+    # registered as an appended field, or a full-field config dict produced by an older
+    # release stops being recognised as a wholesale copy and its default warmup_steps
+    # then overrides an explicitly set warmup_ratio.
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    field_names = [f.name for f in dataclasses.fields(MLXTrainingConfig)]
+    assert field_names[-2:] == ["logging_dir", "run_name"], field_names[-4:]
+    # report_to keeps the positional slot it had before the metadata fields existed.
+    assert field_names.index("report_to") == field_names.index("output_dir") + 1
+
+    # A full-field dump from a release predating logging_dir / run_name still resolves
+    # warmup from the ratio, exactly as a same-version dump does.
+    legacy = {
+        f.name: getattr(MLXTrainingConfig(warmup_ratio = 0.1), f.name)
+        for f in dataclasses.fields(MLXTrainingConfig)
+        if f.name not in ("logging_dir", "run_name")
+    }
+    restored = MLXTrainingConfig(**legacy)
+    assert restored.warmup_ratio == 0.1
+    assert restored._unsloth_mlx_warmup_steps_explicit is False
+    full = MLXTrainingConfig(warmup_ratio = 0.1)
+    same_version = MLXTrainingConfig(
+        **{f.name: getattr(full, f.name) for f in dataclasses.fields(MLXTrainingConfig)}
+    )
+    assert same_version._unsloth_mlx_warmup_steps_explicit is False
