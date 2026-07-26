@@ -5670,8 +5670,7 @@ def _effective_mlx_quantization_map(model):
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
         quantized_types.append(vlm_switch_module.QuantizedSwitchLinear)
-    # A stand-in runtime can export these names as non-class placeholders, which
-    # makes isinstance() below raise instead of returning False.
+    # Drop non-class placeholders a stand-in runtime exports, else isinstance() raises.
     quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
 
     quantized = {}
@@ -6693,13 +6692,10 @@ def _copy_source_sidecars(src_path, path):
 def _fuse_mlx_module(module, dequantize):
     """Call ``module.fuse()`` regardless of how the flag is spelled.
 
-    mlx-lm 0.28.3 names the fuse flag ``de_quantize``; 0.28.4 renamed it to
-    ``dequantize``. The supported range starts at 0.28.3, so it spans both
-    spellings: pick whichever the installed implementation accepts instead of
-    hardcoding one. A few modules expose ``fuse()`` with no flag at all (for
-    example mlx-vlm's ``ExtendedLmHead``); those have nothing to dequantize, and
-    ``save_merged_model`` still runs ``dequantize_model`` afterwards, so calling
-    them without the flag stays correct.
+    mlx-lm renamed it from ``de_quantize`` (0.28.3) to ``dequantize`` (0.28.4)
+    and the supported range spans both, so pick the spelling the installed
+    implementation accepts. A flagless ``fuse()`` (mlx-vlm's ``ExtendedLmHead``)
+    has nothing to dequantize and ``save_merged_model`` dequantizes afterwards.
     """
     fuse = module.fuse
     try:

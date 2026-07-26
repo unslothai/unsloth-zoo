@@ -246,8 +246,7 @@ def _mlx_quantized_switch_module_types():
 def _mlx_quantized_module_types():
     import mlx.nn as nn
 
-    # Filter to real classes: a stand-in runtime can export the switch names as
-    # non-class placeholders, which makes isinstance() raise instead of False.
+    # Drop non-class placeholders a stand-in runtime exports, else isinstance() raises.
     return tuple(
         t for t in (
             nn.QuantizedLinear,

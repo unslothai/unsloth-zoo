@@ -27,10 +27,9 @@ import pytest
 def _real_mlx_runtime():
     """True only when mlx and the routed switch layers are the genuine packages.
 
-    importorskip("mlx") is not enough: sibling files install the mlx_simulation
-    torch stub unconditionally, so `import mlx` still succeeds afterwards. Reject
-    both the pure stub, where SwitchLinear is a placeholder, and the hybrid where
-    switch layers stay real but mlx.core was swapped underneath them.
+    Sibling files install the mlx_simulation stub unconditionally, so `import
+    mlx` still succeeds: reject the pure stub (placeholder SwitchLinear) and the
+    hybrid where mlx.core was swapped under real switch layers.
     """
     try:
         switch_layers = importlib.import_module("mlx_lm.models.switch_layers")
