@@ -4005,11 +4005,10 @@ class FiniteTextBatchPlan:
             else _normalize_seed(visit_seed)
         )
         self._visit_epoch_cache = None
-        # Micro-batches in ONE dataset pass. Differs from len(schedule) whenever a
-        # num_batches horizon cycled/truncated the plan (the max_steps path), and
-        # is the only faithful source for callback epoch accounting: batching
-        # drops sub-two-token rows and can expand one source item into several
-        # prepared rows, so the raw dataset length cannot reproduce it.
+        # Micro-batches in ONE dataset pass, which len(schedule) is not once a
+        # num_batches horizon cycles the plan. Batching drops sub-two-token rows
+        # and can expand one source item into several, so only the plan itself
+        # knows this count; callback epoch accounting reads it.
         self._cycle_length = (
             None if cycle_length is None else max(1, int(cycle_length))
         )
@@ -5878,9 +5877,8 @@ def _create_distributed_text_plan(
 
     schedule = []
     # Micro-batches in ONE dataset pass. Every permutation visits all global
-    # batches and a global batch's local slice is non-empty independently of the
-    # visit order, so this count is the same for every pass -- and stays correct
-    # when a num_batches horizon truncates the first pass mid-way.
+    # batches and a local slice is non-empty regardless of visit order, so this
+    # holds for every pass even if num_batches truncates the first one.
     cycle_length = sum(
         1 for group in batch_idx
         if _rank_slice_distributed_batch(
@@ -6093,10 +6091,9 @@ def _create_ordered_text_plan(
     order_pos = 0
     seen = 0
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the same
-    # length, and a chunk's local slice is non-empty independently of which rows
-    # it holds, so this is constant across epochs and survives num_batches
-    # truncation of the first pass.
+    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
+    # same length and a chunk's local slice is non-empty whatever rows it holds,
+    # so this is constant across epochs even under num_batches truncation.
     cycle_length = sum(
         1 for start in range(0, len(order), global_batch_size)
         if _rank_slice_distributed_batch(

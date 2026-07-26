@@ -1898,12 +1898,10 @@ class MLXTrainer:
         # the true fractional epoch (e.g. state.epoch ~ 0.1), matching HF, not a
         # spurious full 1.0.
         if int(getattr(self.args, "max_steps", 0) or 0) > 0:
-            # Prefer the batch plan's own one-pass micro-batch count. The dataset
-            # approximation below cannot see what batching actually retained:
-            # rows under two tokens are dropped, one source item can expand into
-            # several prepared rows, and the tail partial batch is dropped
-            # (floor, not ceil). Using it would fire on_epoch_begin/on_epoch_end
-            # at micro-batches that are not real dataset boundaries.
+            # Prefer the plan's own one-pass count: the approximation below
+            # cannot see what batching retained (sub-two-token rows dropped, one
+            # source item expanding into several, floored tail), so it fires the
+            # epoch events at micro-batches that are not dataset boundaries.
             plan_cycle = getattr(batches, "cycle_length", None)
             if plan_cycle:
                 return max(1, int(plan_cycle))
@@ -4394,16 +4392,12 @@ class MLXTrainer:
                 # Keep callable scheduler evaluation outside mx.compile. The
                 # compiled step reads the scalar LR already in optimizer state.
                 self._set_optimizer_lr_for_step(optimizer, self._global_step)
-                # HF dispatches on_pre_optimizer_step immediately before
-                # optimizer.step() (transformers trainer.py _inner_training_loop:
-                # clip -> on_pre_optimizer_step -> optimizer.step() ->
-                # on_optimizer_step). MLX fuses clipping and the update inside the
-                # compiled step_fn, so the last point where gradients are still
-                # un-applied is here, right before step_fn runs. Like
-                # on_optimizer_step below, do NOT latch a callback stop now: HF
-                # only breaks after this step's on_step_end + log/eval/save, so
-                # OR-reduce an external cancel only and let the tail _sync_stop()
-                # apply the callback stop.
+                # HF fires this between clipping and optimizer.step(). MLX fuses
+                # both inside the compiled step_fn, so the last point with
+                # gradients still un-applied is here. Like on_optimizer_step
+                # below, do NOT latch a callback stop now (HF only breaks after
+                # this step's on_step_end + log/eval/save): OR-reduce an external
+                # cancel and leave the callback stop to the tail _sync_stop().
                 _fire("on_pre_optimizer_step")
                 self._distributed_should_stop()
 
