@@ -233,8 +233,15 @@ def test_load_mlx_lm_distributed_tensor_uses_strict_fallback(monkeypatch, tmp_pa
 
 
 def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
     calls = []
+    bound_calls = []
+    def bind(sharded):
+        def wrapped(*args, **kwargs):
+            bound_calls.append(True); return sharded(*args, **kwargs)
+        return wrapped
+    monkeypatch.setattr(loader, "_bind_mlx_vlm_quantized_projector_loader", bind)
     model_dir = _write_config(tmp_path, {"model_type": "raw"})
     messages = ["The model does not support pipeline parallelism", "Model type kimi_k25 not supported", "Unsupported model type kimi_k25", "checkpoint exploded"]
 
@@ -268,6 +275,7 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     assert "Unsloth:" not in str(exc_info.value)
     assert calls[0][1:3] == (tensor_group, None)
     assert all(call[1:3] == (None, pipeline_group) for call in calls[1:])
+    assert len(bound_calls) == 5
 
 
 def test_load_mlx_vlm_distributed_applies_llava_processor_geometry(monkeypatch, tmp_path):

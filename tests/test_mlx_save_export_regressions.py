@@ -32,6 +32,7 @@ import pytest
 
 AutoProcessor = None
 load_processor = None
+load_model = skip_multimodal_module = nn = _has_quantized_weights = None
 
 
 def _test_bound_load_processor(model_path, **kwargs):
@@ -40,6 +41,47 @@ def _test_bound_load_processor(model_path, **kwargs):
 
 def _test_bound_vlm_load(model_path):
     return load_processor(model_path)
+
+
+def _test_bound_model_load(paths, weights):
+    return load_model(paths, weights)
+def _test_legacy_model_load(paths, weights):
+    config, skip_vision = {"quantization": {"multi_modal_projector.dense": True}}, True
+    def get_class_predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if p in config["quantization"]:
+            return config["quantization"][p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        return f"{p}.scales" in weights
+    return nn.quantize(paths, class_predicate=get_class_predicate)
+
+
+def _test_fixed_model_load(paths, weights):
+    skip_vision = True
+    def get_class_predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision and not _has_quantized_weights(p, weights):
+            return False
+        return f"{p}.scales" in weights
+    return nn.quantize(paths, class_predicate=get_class_predicate)
+
+
+def _test_positional_model_load(paths, weights):
+    config, skip_vision = {"quantization": {}}, True
+    def get_class_predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if p in config["quantization"]:
+            return config["quantization"][p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        return f"{p}.scales" in weights
+    return nn.quantize(paths, get_class_predicate)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -931,6 +973,30 @@ def test_declared_mlx_vlm_processor_owns_custom_components_and_recovery(
         ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, True),
     ]
     assert load_processor is _test_bound_load_processor
+
+
+def test_legacy_quantized_projector_binding_is_scoped_and_capability_gated(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+    paths = ["multi_modal_projector.quantized", "multi_modal_projector.dense", "vision_model.quantized", "language_model.quantized"]
+    weights = {f"{path}.scales": object() for path in paths if "dense" not in path}
+    def skip(path): return "multi_modal_projector" in path or "vision_model" in path
+    monkeypatch.setitem(globals(), "nn", types.SimpleNamespace(quantize=lambda values, class_predicate: [class_predicate(path, types.SimpleNamespace(to_quantized=True, weight=types.SimpleNamespace(size=64))) for path in values]))
+    monkeypatch.setitem(globals(), "skip_multimodal_module", skip)
+    monkeypatch.setitem(globals(), "load_model", _test_legacy_model_load)
+    assert _test_bound_model_load(paths, weights) == [False, False, False, True]
+    scoped = loader._bind_mlx_vlm_quantized_projector_loader(_test_bound_model_load)
+    assert scoped(paths, weights) == [True, False, False, True]
+    assert load_model is _test_legacy_model_load and skip_multimodal_module is skip
+    monkeypatch.setitem(globals(), "_has_quantized_weights", lambda path, state: f"{path}.scales" in state)
+    monkeypatch.setitem(globals(), "load_model", _test_fixed_model_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(_test_bound_model_load) is _test_bound_model_load
+    monkeypatch.setitem(globals(), "load_model", _test_positional_model_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(_test_bound_model_load) is _test_bound_model_load
+    monkeypatch.setitem(globals(), "load_model", _test_legacy_model_load)
+    monkeypatch.setitem(globals(), "AutoProcessor", types.SimpleNamespace(from_pretrained=lambda *_a, **_k: "processor"))
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    processor_bound = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(processor_bound)("model") == "processor"
 
 
 def test_llava_processor_geometry_uses_temporary_config_view(tmp_path):

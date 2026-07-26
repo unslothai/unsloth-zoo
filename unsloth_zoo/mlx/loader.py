@@ -1025,6 +1025,7 @@ def _load_mlx_vlm_distributed(
         sharded_load,
         allow_remote_code=allow_remote_code,
     )
+    sharded_load = _bind_mlx_vlm_quantized_projector_loader(sharded_load)
 
     try:
         with _temporary_hf_token_env(hf_token):
@@ -1307,6 +1308,171 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
 
     load_globals = dict(load_callable.__globals__)
     load_globals["load_processor"] = scoped_processor_loader
+    scoped_load = types.FunctionType(
+        load_callable.__code__,
+        load_globals,
+        load_callable.__name__,
+        load_callable.__defaults__,
+        load_callable.__closure__,
+    )
+    scoped_load.__kwdefaults__ = load_callable.__kwdefaults__
+    return scoped_load
+
+
+def _bind_mlx_vlm_quantized_projector_loader(load_callable):
+    """Honor checkpoint-quantized projectors in a known legacy loader shape.
+
+    Mlx-vlm briefly skipped every ``multi_modal_projector`` whenever the
+    vision tower was dense, before considering projector tensors that were
+    independently quantized. Keep the installed predicate and alter only that
+    ordering, in this load call, when its source still has the exact legacy
+    branch. Unknown and already checkpoint-aware loaders remain untouched.
+
+    The outer quantize call is part of the capability contract too. Requiring
+    its keyword predicate binding keeps positional or otherwise refactored
+    loaders native, while the scoped ``nn`` proxy ensures no installed module
+    global is changed for concurrent loads.
+    """
+
+    if not isinstance(load_callable, types.FunctionType):
+        return load_callable
+    model_loader = load_callable.__globals__.get("load_model")
+    if not isinstance(model_loader, types.FunctionType):
+        return load_callable
+    original_skip = model_loader.__globals__.get("skip_multimodal_module")
+    original_nn = model_loader.__globals__.get("nn")
+    if not callable(original_skip) or not callable(getattr(original_nn, "quantize", None)):
+        return load_callable
+    try:
+        projector_is_skipped = original_skip("multi_modal_projector.linear_1")
+    except Exception:
+        return load_callable
+
+    try:
+        source_tree = ast.parse(_safe_getsource(model_loader))
+    except (IndentationError, SyntaxError):
+        return load_callable
+    source_predicates = [
+        node
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "get_class_predicate"
+    ]
+    quantize_calls = [
+        node
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "nn"
+        and node.func.attr == "quantize"
+    ]
+    predicate_keywords = [
+        keyword
+        for call in quantize_calls
+        for keyword in call.keywords
+        if keyword.arg == "class_predicate"
+    ]
+    expected_predicate = ast.parse(
+        """
+def get_class_predicate(p, m):
+    if skip_multimodal_module(p) and skip_vision:
+        return False
+    if p in config["quantization"]:
+        return config["quantization"][p]
+    if not hasattr(m, "to_quantized"):
+        return False
+    if hasattr(m, "weight") and m.weight.size % 64 != 0:
+        return False
+    return f"{p}.scales" in weights
+"""
+    ).body[0]
+    predicates = [
+        value
+        for value in model_loader.__code__.co_consts
+        if isinstance(value, types.CodeType)
+        and value.co_name == "get_class_predicate"
+    ]
+    if (
+        not projector_is_skipped
+        or len(predicates) != 1
+        or len(source_predicates) != 1
+        or ast.dump(source_predicates[0]) != ast.dump(expected_predicate)
+        or len(quantize_calls) != 1
+        or len(predicate_keywords) != 1
+        or not isinstance(predicate_keywords[0].value, ast.Name)
+        or predicate_keywords[0].value.id != "get_class_predicate"
+    ):
+        return load_callable
+
+    def checkpoint_aware_skip(path):
+        if "multi_modal_projector" in path:
+            return False
+        return original_skip(path)
+
+    def checkpoint_aware_quantize(model, *args, class_predicate=None, **kwargs):
+        if (
+            not isinstance(class_predicate, types.FunctionType)
+            or class_predicate.__code__ is not predicates[0]
+            or class_predicate.__closure__ is None
+        ):
+            if class_predicate is None:
+                return original_nn.quantize(model, *args, **kwargs)
+            return original_nn.quantize(
+                model, *args, class_predicate=class_predicate, **kwargs,
+            )
+        closure = dict(zip(
+            class_predicate.__code__.co_freevars,
+            (cell.cell_contents for cell in class_predicate.__closure__),
+        ))
+        weights = closure.get("weights")
+        if not isinstance(weights, Mapping):
+            if class_predicate is None:
+                return original_nn.quantize(model, *args, **kwargs)
+            return original_nn.quantize(
+                model, *args, class_predicate=class_predicate, **kwargs,
+            )
+
+        predicate_globals = dict(class_predicate.__globals__)
+        predicate_globals["skip_multimodal_module"] = checkpoint_aware_skip
+        projector_predicate = types.FunctionType(
+            class_predicate.__code__,
+            predicate_globals,
+            class_predicate.__name__,
+            class_predicate.__defaults__,
+            class_predicate.__closure__,
+        )
+
+        def guarded_predicate(path, module):
+            if "multi_modal_projector" not in path:
+                return class_predicate(path, module)
+            if f"{path}.scales" not in weights:
+                return False
+            return projector_predicate(path, module)
+
+        return original_nn.quantize(
+            model, *args, class_predicate=guarded_predicate, **kwargs,
+        )
+
+    class ScopedNN:
+        quantize = staticmethod(checkpoint_aware_quantize)
+
+        def __getattr__(self, name):
+            return getattr(original_nn, name)
+
+    model_globals = dict(model_loader.__globals__)
+    model_globals["nn"] = ScopedNN()
+    scoped_model_loader = types.FunctionType(
+        model_loader.__code__,
+        model_globals,
+        model_loader.__name__,
+        model_loader.__defaults__,
+        model_loader.__closure__,
+    )
+    scoped_model_loader.__kwdefaults__ = model_loader.__kwdefaults__
+
+    load_globals = dict(load_callable.__globals__)
+    load_globals["load_model"] = scoped_model_loader
     scoped_load = types.FunctionType(
         load_callable.__code__,
         load_globals,
@@ -6027,6 +6193,7 @@ class FastMLXModel:
                 vlm_load,
                 allow_remote_code=trust_remote_code,
             )
+            vlm_load = _bind_mlx_vlm_quantized_projector_loader(vlm_load)
 
             if text_only is False and not _is_vlm(config_data):
                 warnings.warn(
