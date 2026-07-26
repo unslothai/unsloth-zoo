@@ -4728,6 +4728,14 @@ def _resolve_embedding_module(model):
     return entry[1], owner_prefix + entry[0]
 
 
+def _is_lora_capable_head(module):
+    """Whether mlx-lm's ``to_lora`` can wrap this output head (it raises for
+    anything else, which would abort the whole ``get_peft_model`` call)."""
+    import mlx.nn as nn
+    return hasattr(module, "to_lora") or isinstance(
+        module, (nn.Linear, nn.QuantizedLinear))
+
+
 def _partition_cpt_targets(model, target_modules, modules_to_save):
     """Split LoRA targets from full-module (continued-pretraining) targets.
 
@@ -4817,8 +4825,18 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
             )
         elif "lm_head" in mts:            # precedence: modules_to_save -> full module
             _add_full(desc.path, desc.module)
-        else:                            # target_modules -> LoRA on the head Linear
-            lm_head_lora_path = desc.path
+        elif _is_lora_capable_head(desc.module):
+            lm_head_lora_path = desc.path  # target_modules -> LoRA on the head
+        else:
+            # mlx-lm's to_lora() raises deep inside linear_to_lora_layers for a
+            # head it cannot wrap (Phixtral's OutputHead is a LayerNorm+Linear
+            # module, not a Linear), which would take the whole run down.
+            unusable = (
+                f"Unsloth: the output head at {desc.path!r} is a "
+                f"{type(desc.module).__name__}, which mlx-lm cannot wrap as a "
+                "LoRA layer, so lm_head cannot be trained. Pass "
+                "modules_to_save=['lm_head'] to train it as a full module."
+            )
         if unusable is not None:
             # modules_to_save names one module and nothing else, so an
             # unusable head there is unambiguous and must fail loudly. In

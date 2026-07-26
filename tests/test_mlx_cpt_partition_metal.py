@@ -187,6 +187,32 @@ def test_unusable_lm_head_keeps_the_other_lora_targets():
                for k in dict(mu.tree_flatten(alt.trainable_parameters())))
 
 
+class _WrappedHead(nn.Module):
+    """Phixtral's OutputHead shape: a LayerNorm+Linear module, not a Linear."""
+
+    def __init__(s, d=32, v=64):
+        super().__init__()
+        s.ln = nn.LayerNorm(d); s.linear = nn.Linear(d, v, bias=False)
+
+    def __call__(s, x):
+        return s.linear(s.ln(x))
+
+
+def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
+    # mlx-lm's to_lora() raises for a head it cannot wrap, which used to take
+    # the whole run down; modules_to_save still trains it as a full module.
+    m = _tiny(); m.lm_head = _WrappedHead()
+    with pytest.warns(UserWarning, match="cannot wrap as a LoRA layer"):
+        _peft(m, target_modules=["q_proj", "lm_head"])
+    assert any(k.endswith("q_proj.lora_a")
+               for k in dict(mu.tree_flatten(m.trainable_parameters())))
+
+    full = _tiny(); full.lm_head = _WrappedHead()
+    _peft(full, target_modules=["q_proj"], modules_to_save=["lm_head"])
+    trn = set(dict(mu.tree_flatten(full.trainable_parameters())))
+    assert "lm_head.linear.weight" in trn
+
+
 def test_unusable_lm_head_still_raises_when_nothing_else_trains():
     # Dropping lm_head must never leave an empty selection to fall through to
     # mlx-lm's auto-discovery, and an explicit modules_to_save request names
