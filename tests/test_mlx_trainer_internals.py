@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import tempfile
 import types
 
 import pytest
@@ -2265,14 +2266,15 @@ def test_train_entry_clears_stale_stop_before_setup():
     inner_idx = src.index("self._train_inner()")
     assert reset_idx < inner_idx
     # It must be the FIRST executable statement (only the docstring + comments
-    # precede it), so no long work runs before the stale stop is cleared.
+    # precede it), so no long work runs before the stale stop is cleared. The
+    # statement is the generation guard, which clears only a PRIOR run's stop.
     body = src[src.index('"""', src.index('"""') + 3) + 3:]
     first_stmt = next(
         line.strip()
         for line in body.splitlines()
         if line.strip() and not line.strip().startswith("#")
     )
-    assert first_stmt == "self.stop_requested = False"
+    assert first_stmt.startswith("if self._stop_request_generation() <")
 
 
 def test_reset_run_state_preserves_in_setup_stop_request():
@@ -4733,3 +4735,84 @@ def test_resume_mid_epoch_fires_epoch_begin(monkeypatch):
     for event in resumed.events:
         depth += 1 if event == "begin" else -1
         assert depth in (0, 1), resumed.events
+
+
+def test_train_entry_preserves_pre_start_cancel(monkeypatch):
+    # An external controller owns stop_requested and may raise it at any moment,
+    # including between construction and train(): Unsloth Studio's cancel poller
+    # does exactly that (studio worker sets trainer.stop_requested = True as soon
+    # as the trainer is registered, well before train() is reached, then reads the
+    # flag back after train() returns to report "cancelled"). An unconditional
+    # clear at train() entry silently discarded that cancel and ran the whole job.
+    # The generation stamp clears only a stop left latched by an EARLIER run.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    steps = []
+
+    class StepSpy:
+        def on_step_end(self, args, state, control, **kwargs):
+            steps.append(state.global_step)
+            return control
+
+    def build():
+        args = MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            logging_steps=4,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+            callbacks=[StepSpy()],
+        )
+        trainer._prepare_data = lambda _is_vlm: ([make_batch(10) for _ in range(4)], None)
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    # Cancelled after construction, before train(): nothing must run.
+    trainer = build()
+    trainer.stop_requested = True
+    trainer.train()
+    assert steps == [], steps
+    # Studio reads the flag after train() returns to distinguish cancelled runs.
+    assert trainer.stop_requested is True
+
+    # A stop still latched from a finished run is stale and must NOT block the
+    # next run of a reused trainer.
+    steps.clear()
+    trainer.train()
+    assert steps == [1, 2, 3, 4], steps
+
+
+def test_train_bumps_run_generation_in_finally():
+    # The stamp only distinguishes runs if every train() closes its generation,
+    # including one that raised, else a stop latched by a failed run would be
+    # treated as belonging to the next run and block it forever.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer.train)
+    bump = "self._run_generation = getattr(self, \"_run_generation\", 0) + 1"
+    assert bump in src
+    assert src.rindex("finally:") < src.index(bump)

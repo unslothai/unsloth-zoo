@@ -1099,10 +1099,13 @@ class MLXTrainer:
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
         # each train() so a reused trainer starts clean); callbacks and
         # pre-created batches persist across runs and stay here.
-        # stop_requested is cleared once at train() entry (before setup) rather
-        # than in _reset_run_state, so an external cancel raised during THIS
-        # run's data prep / optimizer build survives; initialize it here so a
-        # trainer inspected before train() still has the attribute.
+        # stop_requested is cleared at train() entry (before setup) rather than
+        # in _reset_run_state, so an external cancel raised during THIS run's
+        # data prep / optimizer build survives; initialize it here so a trainer
+        # inspected before train() still has the attribute. _run_generation
+        # stamps each request so the entry clear only drops a stop left behind
+        # by an EARLIER run (see the stop_requested property).
+        self._run_generation = 0
         self.stop_requested = False
         self._reset_run_state()
         self._batches = None  # Pre-created batches (skips internal batch creation)
@@ -1156,6 +1159,27 @@ class MLXTrainer:
             )
         elif _init_error is not None:
             raise _init_error
+
+    @property
+    def stop_requested(self):
+        """True while an early stop is pending. Externally owned: a controller
+        (e.g. the Studio cancel button) may set it at ANY time, including after
+        the trainer is built but before train() is called."""
+        return self._stop_requested
+
+    @stop_requested.setter
+    def stop_requested(self, value):
+        self._stop_requested = value
+        # Stamp the request with the run generation it was made in.
+        # _run_generation is bumped when a run finishes, so a stop latched by
+        # run N carries stamp N while any request made after run N ended (a
+        # pre-start cancel for run N+1) carries stamp N+1. train() clears only
+        # the former, so a cancel raised before train() is never discarded.
+        self._stop_requested_generation = getattr(self, "_run_generation", 0)
+
+    def _stop_request_generation(self):
+        """Generation the pending stop request was made in (0 when unset)."""
+        return getattr(self, "_stop_requested_generation", 0)
 
     def _reset_run_state(self):
         """Per-run training/metric state. Reset from __init__ and inside
@@ -2611,9 +2635,13 @@ class MLXTrainer:
         # un-stopped. _reset_run_state (post-setup) no longer touches this, so an
         # external cancel raised DURING this run's setup (e.g. a Studio cancel on
         # a large dataset materializing in _prepare_data) survives to the loop's
-        # top-of-loop _distributed_should_stop() check. Local assignment only, no
-        # DDP collective.
-        self.stop_requested = False
+        # top-of-loop _distributed_should_stop() check. Only a stop stamped by an
+        # EARLIER generation is cleared: a cancel raised after the last run ended
+        # (an external controller cancelling between construction/prior run and
+        # train()) carries the current generation and is honored. Local
+        # assignment only, no DDP collective.
+        if self._stop_request_generation() < getattr(self, "_run_generation", 0):
+            self.stop_requested = False
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
         self._ensure_distributed()
@@ -2848,6 +2876,10 @@ class MLXTrainer:
             except Exception:
                 pass
             self._text_shape_guard_preflight = None
+            # Close this run's generation: a stop still latched from it is now
+            # stale (the next train() clears it), while any request made from
+            # here on belongs to the next run and survives that clear.
+            self._run_generation = getattr(self, "_run_generation", 0) + 1
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
