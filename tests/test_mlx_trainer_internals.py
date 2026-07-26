@@ -5108,3 +5108,160 @@ def test_callback_batches_per_epoch_uses_prepared_plan_cycle():
 
     # Plain materialized batch lists (no plan metadata) keep the old fallback.
     assert trainer._callback_batches_per_epoch(list(range(8))) == 6
+
+
+def test_log_history_persisted_and_restored_across_resume(monkeypatch):
+    # trainer_state.json carried the native loss history but not the
+    # callback-visible TrainerState.log_history, and _init_callback_state reset
+    # it to []. A resumed run therefore reported only its post-resume entries,
+    # so anything reading state.log_history (a history-exporting integration, or
+    # a user plotting the curve) got a truncated experiment record. HF restores
+    # the whole TrainerState, log_history included, from trainer_state.json
+    # (transformers trainer.py, TrainerState.load_from_json on resume).
+    import json
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    out_dir = tempfile.mkdtemp()
+    args = MLXTrainingConfig(
+        max_steps=4,
+        gradient_accumulation_steps=1,
+        logging_steps=1,
+        save_steps=2,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=out_dir,
+    )
+
+    def build():
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+        )
+        trainer._prepare_data = lambda _is_vlm: ([make_batch(10) for _ in range(4)], None)
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    first = build()
+    first.train()
+    assert [entry["step"] for entry in first.state.log_history] == [1, 2, 3, 4]
+
+    with open(os.path.join(out_dir, "checkpoint-2", "trainer_state.json")) as fh:
+        saved = json.load(fh)
+    assert [entry["step"] for entry in saved["log_history"]] == [1, 2]
+
+    resumed = build()
+    resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
+    assert [entry["step"] for entry in resumed.state.log_history] == [1, 2, 3, 4]
+
+    # Reusing that SAME trainer for a fresh run must start from an empty history
+    # (HF only loads trainer_state.json when resume_from_checkpoint is given).
+    resumed.train()
+    assert [entry["step"] for entry in resumed.state.log_history] == [1, 2, 3, 4]
+
+    # A pre-fix checkpoint has no log_history key and must stay resumable.
+    legacy_dir = os.path.join(out_dir, "checkpoint-2")
+    with open(os.path.join(legacy_dir, "trainer_state.json")) as fh:
+        legacy = json.load(fh)
+    legacy.pop("log_history")
+    with open(os.path.join(legacy_dir, "trainer_state.json"), "w") as fh:
+        json.dump(legacy, fh)
+    legacy_run = build()
+    legacy_run.train(resume_from_checkpoint=legacy_dir)
+    assert [entry["step"] for entry in legacy_run.state.log_history] == [3, 4]
+
+
+def test_fractional_step_intervals_resolve_against_total_steps(monkeypatch):
+    # HF accepts logging_steps / eval_steps / save_steps either as a step count
+    # or as a ratio in (0, 1) of the total steps, and expands the ratio in
+    # TrainerState.compute_steps (transformers trainer_callback.py). Casting the
+    # ratio straight to int turned 0.5 into 0, which silently disabled logging
+    # and checkpointing while the synthesized strategy still said "steps", and
+    # made HF's DefaultFlowCallback evaluate state.global_step % 0.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, _resolve_interval_steps,
+    )
+
+    # Mirrors transformers' TrainerState.compute_steps: ceil(max_steps * ratio),
+    # with plain counts passed through untouched.
+    assert _resolve_interval_steps(0.1, 20) == 2
+    assert _resolve_interval_steps(0.25, 20) == 5
+    assert _resolve_interval_steps(0.5, 20) == 10
+    assert _resolve_interval_steps(2, 20) == 2
+    assert _resolve_interval_steps(0, 20) == 0
+    assert _resolve_interval_steps(None, 20) == 0
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    class Flow:
+        """Shaped like transformers' DefaultFlowCallback."""
+        def __init__(self):
+            self.logged_at = []
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if args.logging_strategy == "steps" and state.global_step % state.logging_steps == 0:
+                self.logged_at.append(state.global_step)
+            return control
+
+    out_dir = tempfile.mkdtemp()
+    flow = Flow()
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(4)],
+        args=MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            logging_steps=0.5,
+            save_steps=0.5,
+            eval_steps=0.25,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        ),
+        callbacks=[flow],
+    )
+    trainer._prepare_data = lambda _is_vlm: ([make_batch(10) for _ in range(4)], None)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer.train()
+
+    # 0.5 of 4 steps is every 2 steps, not "never" (and not a modulo by zero).
+    assert trainer.state.logging_steps == 2
+    assert trainer.state.save_steps == 2
+    assert trainer.state.eval_steps == 1
+    assert flow.logged_at == [2, 4]
+    assert [entry["step"] for entry in trainer.state.log_history] == [2, 4]
+    checkpoints = sorted(
+        name for name in os.listdir(out_dir) if name.startswith("checkpoint-")
+    )
+    assert checkpoints == ["checkpoint-2", "checkpoint-4"]
