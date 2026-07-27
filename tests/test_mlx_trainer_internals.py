@@ -716,7 +716,7 @@ def test_text_trainer_bounds_compiled_signatures_and_unpads_fallback(
         def __call__(self, input_ids):
             return self.proj(self.embed(input_ids))
 
-        def train(self):
+        def train(self, mode=True):
             return self
 
         @property
@@ -2333,7 +2333,7 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
         def eval(self):
             self.modes.append("eval")
 
-        def train(self):
+        def train(self, mode=True):
             self.modes.append("train")
 
     trainer = MLXTrainer.__new__(MLXTrainer)
@@ -4443,7 +4443,7 @@ def _tiny_lm_for_loop_tests():
         def __call__(self, input_ids):
             return self.proj(self.embed(input_ids))
 
-        def train(self):
+        def train(self, mode=True):
             return self
 
         @property

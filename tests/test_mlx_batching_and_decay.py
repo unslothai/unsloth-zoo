@@ -1169,7 +1169,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
         def __call__(self, input_ids, **_kwargs):
             return self.embed(input_ids)
 
-        def train(self):
+        def train(self, mode=True):
             return self
 
         def load_weights(self, *_args, **_kwargs):
