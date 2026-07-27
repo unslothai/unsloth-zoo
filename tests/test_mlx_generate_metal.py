@@ -209,16 +209,16 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     events = [event for event in stream_generate(
         model, processor, requests[0].prompt, image=[requests[0].image],
         max_tokens=4, sampler=make_sampler(temp=0.0))]
-    # The terminal event repeats the last token, so it contributes text only.
+    # The terminal event contributes text only: its token is the stopping token,
+    # or a repeat of the last body token when the budget ran out.
     tail = events[-1]
     body = events[:-1]
     assert results[0].token_ids == [int(event.token) for event in body]
     assert results[0].logprobs == pytest.approx(
         [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
     assert results[0].text == "".join(event.text for event in events)
-    # Derived from the stream itself rather than from our own rule: fewer body
-    # events than the budget means it stopped early. The release under test
-    # reports no finish reason of its own, so tail carries the repeated token.
+    # Derived from the stream, not our own rule: fewer body events than the
+    # budget means it stopped early.
     assert tail is not None
     assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
     # Chunking must not pair a prompt with an earlier chunk's embeddings.
