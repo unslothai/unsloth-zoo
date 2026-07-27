@@ -2284,6 +2284,19 @@ def test_unusable_audio_rows_are_rejected(monkeypatch, clip, message, max_len):
         _finalized_collate([row], processor, max_len, None)
 
 
+def test_fixed_budget_families_reject_shortened_runs(monkeypatch):
+    """A fixed per-clip budget detects a run that was clipped, not dropped."""
+    class _Budgeted(_FakeGemmaAudioProcessor):
+        audio_seq_length = 3  # exactly 3 positions per clip
+
+    processor = _Budgeted(truncates=True)
+    _qualify(monkeypatch, processor=processor)
+    # Truncation leaves 2 of 3 placeholders: one run survives, so only the
+    # budget can tell the row was clipped.
+    with pytest.raises(ValueError, match="merges 3 per clip"):
+        _finalized_collate([_audio_row(_CLIP)], processor, 4, None)
+
+
 def test_placeholders_without_features_are_rejected(monkeypatch):
     _qualify(monkeypatch)
     # Pre-rendered text can keep the placeholder after the clip is gone.

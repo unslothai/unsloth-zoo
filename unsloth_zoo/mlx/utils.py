@@ -5477,7 +5477,13 @@ _AUDIO_SOFT_TOKEN_STRINGS = (
 # budget with learned padding embeddings), and mlx-vlm has changed audio
 # preprocessing within its supported span, so an unprobed combination cannot be
 # assumed correct. Entries are added only alongside verified merge contracts.
-_AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {}
+#
+# gemma3n merges a fixed 188 positions per clip, which lets collation verify the
+# placeholder budget outright; its probes (forward, audio conditioning, ragged
+# collation, LoRA training smoke) pass on mlx-vlm 0.4.4.
+_AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {
+    "gemma3n": frozenset({"0.4.4"}),
+}
 
 _AUDIO_CAST_HINT = (
     "Cast the dataset column with "
@@ -5833,6 +5839,7 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
     total_runs = _assert_audio_runs_intact_ids(
         ids, inputs.get("attention_mask"), audio_counts, soft_ids,
         max_seq_length if truncated else None,
+        budget=_audio_fixed_budget(processor),
     )
     # Placeholders with nothing behind them misalign the sequence however they
     # got there -- e.g. a formatter that kept the text but dropped the clip.
@@ -5840,7 +5847,7 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
 
 
 def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
-                                  max_seq_length):
+                                  max_seq_length, budget=None):
     """Run-integrity check over materialized ids (see the caller's contract).
 
     Returns the total number of surviving placeholder runs in the batch.
@@ -5882,6 +5889,18 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
         # Count maximal runs: a rising edge starts a new placeholder run.
         starts = int(np.sum(is_soft & ~np.concatenate(([False], is_soft[:-1]))))
         total_runs += starts
+        if expected_clips and budget:
+            # Fixed-budget families merge exactly `budget` per clip, so this is
+            # what catches a run shortened rather than dropped.
+            placeholders = int(is_soft.sum())
+            if placeholders != budget * expected_clips:
+                raise ValueError(
+                    f"Unsloth MLX: row {index} has {placeholders} audio "
+                    f"placeholder tokens but this model merges {budget} per "
+                    f"clip and the row carries {expected_clips} clip(s). The "
+                    f"row cannot be aligned; shorten it or raise "
+                    f"max_seq_length."
+                )
         if expected_clips and starts != expected_clips:
             raise ValueError(
                 f"Unsloth MLX: row {index} carries {expected_clips} audio "
@@ -7299,6 +7318,32 @@ def _vlm_family_encode_key(key):
         return ("seq",) + tuple(_vlm_family_encode_key(item) for item in key)
     return ("unstable_key", _vlm_family_type_tag(key_type))
 
+
+
+def _audio_fixed_budget(processor, config=None):
+    """Placeholders a family emits per clip, when that count is fixed.
+
+    Gemma 3n always merges the same number of positions per clip, padding short
+    clips with learned padding embeddings, so the count is known before the
+    model runs and a row's placeholders can be checked against it.
+
+    A processor that converts clip duration into a token count has no such
+    constant: its ``audio_soft_tokens_per_image`` is an upper bound rather than
+    the per-clip budget (Gemma 4 reports 750 while emitting 25 placeholders for
+    a one-second clip), so the presence of a per-token duration is what rules
+    the check out. Those families are verified against the encoder's own output
+    instead.
+    """
+    if getattr(processor, "audio_ms_per_token", None):
+        return None
+    for source in (config, getattr(processor, "config", None)):
+        value = _config_get(source, "audio_soft_tokens_per_image", None)
+        if value:
+            return int(value)
+    length = getattr(processor, "audio_seq_length", None)
+    if length:
+        return int(length)
+    return None
 
 
 _AUDIO_TOWER_ATTRS = (
