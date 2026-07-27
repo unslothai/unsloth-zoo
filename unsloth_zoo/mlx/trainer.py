@@ -3889,27 +3889,20 @@ class MLXTrainer:
                         processor = self._resolve_vlm_processor()
                         config = getattr(self.model, "_config", {})
                         _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-                        # Eager VLM training batches used to be built before
-                        # this point, so eval preprocessing could never reach
-                        # the training augmentation stream. A lazy training
-                        # plan builds nothing yet, so these eval builds would
-                        # otherwise consume the draws the first training batch
-                        # is owed; keep them out of that stream.
-                        with _preserved_preprocessing_rng():
-                            return create_vlm_batches(
-                                dataset=eval_dataset,
-                                processor=processor,
-                                config=config,
-                                batch_size=eval_batch_size,
-                                max_seq_length=args.max_seq_length,
-                                image_size=getattr(args, "image_size", None),
-                                seed=args.seed,
-                                response_mask_fn=_vlm_mask_fn,
-                                formatting_func=self.formatting_func,
-                                completion_only_loss=text_completion_only_loss,
-                                comm_group=self.distributed_world,
-                                distributed_pad_mode="empty",
-                            )
+                        return create_vlm_batches(
+                            dataset=eval_dataset,
+                            processor=processor,
+                            config=config,
+                            batch_size=eval_batch_size,
+                            max_seq_length=args.max_seq_length,
+                            image_size=getattr(args, "image_size", None),
+                            seed=args.seed,
+                            response_mask_fn=_vlm_mask_fn,
+                            formatting_func=self.formatting_func,
+                            completion_only_loss=text_completion_only_loss,
+                            comm_group=self.distributed_world,
+                            distributed_pad_mode="empty",
+                        )
                     return self._create_text_eval_batches(
                         eval_dataset,
                         eval_batch_size,
@@ -3917,13 +3910,29 @@ class MLXTrainer:
                         text_assistant_only_loss,
                     )
 
-                if isinstance(self.eval_dataset, dict):
-                    eval_batches = {
-                        key: _create_eval_batches(value)
-                        for key, value in self.eval_dataset.items()
-                    }
+                def _create_every_eval_split():
+                    """Build every eval split, in the order the user declared."""
+                    if isinstance(self.eval_dataset, dict):
+                        return {
+                            key: _create_eval_batches(value)
+                            for key, value in self.eval_dataset.items()
+                        }
+                    return _create_eval_batches(self.eval_dataset)
+
+                if is_vlm:
+                    # Eager VLM training batches used to be built before this
+                    # point, so eval preprocessing could never reach the
+                    # training augmentation stream. A lazy training plan builds
+                    # nothing yet, so these eval builds would otherwise consume
+                    # the draws the first training batch is owed; keep them out
+                    # of that stream. ONE preservation spans every split: one
+                    # per split would restore the same snapshot before each of
+                    # them and replay a single draw sequence for all, where
+                    # sequential construction advanced from split to split.
+                    with _preserved_preprocessing_rng():
+                        eval_batches = _create_every_eval_split()
                 else:
-                    eval_batches = _create_eval_batches(self.eval_dataset)
+                    eval_batches = _create_every_eval_split()
             if eval_batches:
                 lazy_eval = isinstance(eval_batches, _MLXLazyEvalBatchView) or (
                     isinstance(eval_batches, dict)

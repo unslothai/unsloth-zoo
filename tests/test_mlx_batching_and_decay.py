@@ -993,8 +993,13 @@ class _RandomAugmentingProcessor(_ContentProcessor):
     """A processor whose augmentation draws from the process-global RNG.
 
     The drawn value is stamped into the produced ids, so a batch's contents
-    reveal which position of the preprocessing stream built it.
+    reveal which position of the preprocessing stream built it. When ``log``
+    is given, every call also records ``(rows, draw)`` so a test can tell which
+    stretch of the stream built which split.
     """
+
+    def __init__(self, log=None):
+        self.log = log
 
     def __call__(self, text, **_kwargs):
         import random
@@ -1002,6 +1007,8 @@ class _RandomAugmentingProcessor(_ContentProcessor):
         draw = random.random()
         stamp = 300 + int(draw * 1e9) % 997
         rows = [[int(item), 200, stamp, 2] for item in text]
+        if self.log is not None:
+            self.log.append(([str(item) for item in text], draw))
         return {
             "input_ids": np.array(rows, dtype=np.int32),
             "attention_mask": np.array([[1] * 4 for _ in rows], dtype=np.int32),
@@ -1010,7 +1017,7 @@ class _RandomAugmentingProcessor(_ContentProcessor):
 
 def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
                           eval_dataset=None, grad_accum=1, max_steps=4,
-                          seed=3407):
+                          seed=3407, processor_log=None):
     """Run the real training loop and return the ids each micro-step saw.
 
     The model maths are stubbed; every data path (plan construction, eval
@@ -1043,7 +1050,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
         def load_weights(self, *_args, **_kwargs):
             return None
 
-    processor = _RandomAugmentingProcessor()
+    processor = _RandomAugmentingProcessor(log=processor_log)
     output_dir = str(tmp_path)
     trainer = MLXTrainer(
         model=Model(),
@@ -1171,6 +1178,52 @@ def test_vlm_eval_batches_leave_the_training_preprocessing_stream_alone(
 
     assert len(without_eval) == 4
     assert with_eval == without_eval
+
+
+def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
+    monkeypatch, tmp_path,
+):
+    """A dict ``eval_dataset`` must keep the preprocessing stream progressing
+    ACROSS splits.
+
+    Keeping eval builds out of the training stream is one preservation around
+    the whole set of splits, not one per split: restoring between splits hands
+    every split the identical snapshot, so an augmenting processor replays the
+    same draw sequence for each of them instead of progressing the way
+    sequential construction did. The training stream must still be untouched
+    however many splits there are.
+    """
+    _skip_if_mlx_core_was_replaced()
+
+    without_eval = _train_stochastic_vlm(
+        monkeypatch, tmp_path / "plain", max_steps=4,
+    )
+    calls = []
+    with_splits = _train_stochastic_vlm(
+        monkeypatch, tmp_path / "splits", max_steps=4,
+        eval_dataset={
+            "alpha": [{"text": str(100 + i)} for i in range(4)],
+            "beta": [{"text": str(200 + i)} for i in range(4)],
+            "gamma": [{"text": str(300 + i)} for i in range(4)],
+        },
+        processor_log=calls,
+    )
+
+    # Evaluation never moves the training stream, whatever the split count.
+    assert len(without_eval) == 4
+    assert with_splits == without_eval
+
+    per_split = {}
+    for rows, draw in calls:
+        head = int(rows[0])
+        if head >= 100:
+            per_split.setdefault(head // 100, []).append(draw)
+    assert sorted(per_split) == [1, 2, 3]
+    assert [len(draws) for draws in per_split.values()] == [2, 2, 2]
+
+    # No split may replay a draw another split already consumed.
+    eval_draws = [draw for draws in per_split.values() for draw in draws]
+    assert len(set(eval_draws)) == len(eval_draws)
 
 
 def test_vlm_plan_pins_each_visit_against_an_in_place_formatting_func():
