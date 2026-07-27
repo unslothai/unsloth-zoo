@@ -691,6 +691,32 @@ def _validate_label_smoothing(value, is_vlm):
     return eps
 
 
+def _require_complete_resume_checkpoint(resume_from):
+    """Reject an incomplete resume directory and name the warm-start route.
+
+    A saved adapter directory has only adapters.safetensors. Called from every
+    path that reads resume state, so the streaming-prefetch early read raises
+    the same guidance instead of a raw FileNotFoundError from trainer_state.json.
+    """
+    if not resume_from:
+        return
+    _missing_resume = [
+        _f for _f in ("adapters.safetensors",
+                      "optimizer_state.safetensors", "trainer_state.json")
+        if not os.path.isfile(os.path.join(resume_from, _f))
+    ]
+    if _missing_resume:
+        raise RuntimeError(
+            f"Unsloth: resume_from_checkpoint={resume_from!r} is "
+            f"missing resume state file(s) {_missing_resume}. Refusing "
+            f"to silently restart from step 0. If this is a saved "
+            f"adapter directory rather than a training checkpoint and "
+            f"you meant to start a new run from it with a fresh "
+            f"optimizer, load it with FastMLXModel.from_pretrained(<dir>) "
+            f"and train without resume_from_checkpoint."
+        )
+
+
 def _prune_stale_checkpoints(output_dir, save_total_limit):
     """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
 
@@ -839,9 +865,8 @@ class MLXTrainingConfig:
     # reporting reduction exists in the graph; grad_norm is absent from
     # console/W&B/TB, _grad_norm_history, and the legacy step callback (None).
     # Reporting never changes update numerics; the reported value is the fp32
-    # norm of the token-normalized gradient — after the accumulation divide,
-    # DDP reduction, and the LoRA+/embedding-LR ratios; before any clipping or
-    # weight decay.
+    # norm of the token-normalized gradient — after the accumulation divide and
+    # DDP reduction; before clipping, decay, the update and the scoped-LR rescale.
     report_grad_norm: bool = False
 
     # Lazy-streaming fields, appended LAST after every pre-existing field so
@@ -1656,6 +1681,14 @@ class MLXTrainer:
                 "resume_from_checkpoint path."
             )
         if int(missing_total.item()) > 0:
+            # missing_total is all-reduced, so every rank enters this branch
+            # together and raising here cannot strand a peer in a later
+            # collective. A rank that can see adapters.safetensors but not the
+            # rest is holding a saved adapter directory, so give it the same
+            # warm-start guidance the single-process path gives; the plain
+            # visibility failure keeps the coordinated message below.
+            if (path / "adapters.safetensors").is_file():
+                _require_complete_resume_checkpoint(str(path))
             raise RuntimeError(
                 "Unsloth MLX DDP: resume checkpoint is incomplete or not "
                 "visible on every rank. Expected adapters.safetensors, "
@@ -2867,6 +2900,10 @@ class MLXTrainer:
                 self._resume_from_checkpoint
             )
             if _early_resume:
+                # Same completeness gate as the main resume block below, which
+                # this early read would otherwise pre-empt with a raw
+                # FileNotFoundError for trainer_state.json.
+                _require_complete_resume_checkpoint(_early_resume)
                 _early_state = load_trainer_state(_early_resume)
                 self._mlx_resume_state_cache = (_early_resume, _early_state)
                 self._mlx_resume_step_for_prefetch = int(
@@ -2951,6 +2988,9 @@ class MLXTrainer:
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
         if _resume_from:
+            # Up front: a missing file otherwise surfaces as a generic mx.load
+            # RuntimeError that the handler below does not catch.
+            _require_complete_resume_checkpoint(_resume_from)
             try:
                 # 1. Load trained adapter weights into the model. The model
                 #    already has LoRA wrappers applied (Unsloth pipeline does
@@ -3010,7 +3050,7 @@ class MLXTrainer:
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-        # Per-parameter gradient scaling (LoRA+, embedding LR)
+        # Per-group learning rates (LoRA+, embedding LR) via post-update rescale
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
@@ -3027,7 +3067,68 @@ class MLXTrainer:
                 f"(ratio={embedding_lr_ratio:.3f} of main LR {main_lr:.2e})."
             )
 
-        _needs_grad_scaling = use_lora_plus or use_embedding_lr
+        _scoped_lr_requested = use_lora_plus or use_embedding_lr
+
+        # Per-group LR via post-update STEP rescale, not gradient scaling:
+        # update-normalizing optimizers (AdamW/Lion/Adafactor, Muon rank>=2) are
+        # invariant to a constant gradient scale. Rescaling the realized delta
+        # (``param = pre + ratio*(post - pre)``) gives effective LR
+        # ``ratio*base_lr`` for ANY optimizer, scales the decoupled decay with
+        # the step, and adds no optimizer state. Scoped keys: LoRA+ -> lora_b;
+        # embedding LR -> the CPT full-module keys, else a literal fallback.
+        _cpt_full_keys = getattr(
+            model, "_unsloth_cpt_full_module_weight_keys", None) or set()
+
+        def _scoped_step_ratio(name):
+            # mlx-lm may wrap the LoRA halves in nn.Linear children, flattening
+            # lora_b to `...lora_b.weight`.
+            if use_lora_plus and (
+                name == "lora_b" or name.endswith(".lora_b")
+                or name == "lora_b.weight" or name.endswith(".lora_b.weight")
+            ):
+                return lora_plus_ratio
+            if use_embedding_lr:
+                if name in _cpt_full_keys:
+                    return embedding_lr_ratio
+                _seg = name.split(".")
+                if (len(_seg) >= 2 and _seg[-1] == "weight"
+                        and _seg[-2] in ("embed_tokens", "lm_head")):
+                    return embedding_lr_ratio
+            return None
+
+        # The trainable set is fixed after get_peft_model, so classify once.
+        _scoped_ratios = {}
+        if _scoped_lr_requested:
+            for name, _value in tree_flatten(model.trainable_parameters()):
+                r = _scoped_step_ratio(name)
+                # ratio == 1.0 is a no-op; skip it so nothing large is snapshotted.
+                if r is not None and r != 1.0:
+                    _scoped_ratios[name] = r
+        # A no-op ratio then neither snapshots anything nor disables the fast path.
+        _needs_step_rescale = bool(_scoped_ratios)
+
+        def _snapshot_scoped_params():
+            """Pre-update values + ratio per scoped leaf, captured before
+            decoupled decay so the rescale scales the decay too."""
+            if not _scoped_ratios:
+                return {}
+            snap = {}
+            for name, value in tree_flatten(model.trainable_parameters()):
+                r = _scoped_ratios.get(name)
+                if r is not None:
+                    snap[name] = (value, r)
+            return snap
+
+        def _rescale_scoped_params(snap):
+            if not snap:
+                return
+            live = dict(tree_flatten(model.trainable_parameters()))
+            updates = []
+            for name, (pre, ratio) in snap.items():
+                post = live[name]
+                r = mx.array(ratio, dtype=mx.float32).astype(post.dtype)
+                updates.append((name, pre + r * (post - pre)))
+            model.update(tree_unflatten(updates))
 
         # Build step functions following mlx-lm's pattern. `max_grad_value`
         # remains an elementwise clamp. MLX's cheap default is now the clearer
@@ -3072,7 +3173,7 @@ class MLXTrainer:
         _direct_single_step_update = (
             grad_accum == 1 and
             distributed_world_size <= 1 and
-            not _needs_grad_scaling and
+            not _needs_step_rescale and
             max_grad_norm <= 0 and
             not _clip_grad_value and
             not _clip_grad_leaf_norm
@@ -3113,18 +3214,8 @@ class MLXTrainer:
             optimizer.update to promote params/m/v too).
             """
             scale = mx.array(1.0, dtype=mx.float32) / safe_toks_f
-            # Suffix-anchor so lora_b_router.weight doesn't pick up the LoRA+ mult.
-            if use_lora_plus and (name == "lora_b" or name.endswith(".lora_b")):
-                scale = scale * lora_plus_ratio
-            # Segment-anchor so not_lm_head_router.weight doesn't pick up embed LR.
-            if use_embedding_lr:
-                _segments = name.split(".")
-                _is_embed_or_lm_head = (
-                    "embed_tokens" in _segments
-                    or "lm_head" in _segments
-                )
-                if _is_embed_or_lm_head:
-                    scale = scale * embedding_lr_ratio
+            # Scoped ratios are NOT applied here: gradient scaling is a near
+            # no-op under update-normalizing optimizers (see the step rescale).
             if clip_scale is not None:
                 scale = scale * clip_scale
             if dtype is not None and scale.dtype != dtype:
@@ -3164,11 +3255,15 @@ class MLXTrainer:
                 final_grad = _clip_grad_by_value(final_grad, max_grad_value)
             if _clip_grad_leaf_norm:
                 final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
+            # Snapshot BEFORE decay so the rescale covers decay + optimizer step.
+            _scoped_snap = _snapshot_scoped_params() if _needs_step_rescale else None
             # Coupled (SGD) decay folds into the post-clip grad so it feeds
             # momentum; decoupled (AdamW-family) decay shrinks params directly.
             final_grad = self._apply_coupled_weight_decay(model, final_grad)
             self._apply_manual_weight_decay(model, optimizer, final_grad)
             optimizer.update(model, final_grad)
+            if _scoped_snap:
+                _rescale_scoped_params(_scoped_snap)
             _restore_trainable_storage_dtypes()
             return grad_norm
 
