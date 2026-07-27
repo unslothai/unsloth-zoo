@@ -8244,6 +8244,16 @@ def test_streaming_guard_admission_protocol_is_one_collective_per_fetch():
     # One reduction per admission, never two.
     assert len(reductions) == 5
 
+    # An uncertifiable family may span several real cache keys: one eager
+    # batch each time, never spending capacity.
+    uncertifiable = {"input_ids": np.zeros((1, 33), dtype=np.int32), "m": object()}
+    for _ in range(3):
+        assert trainer._admit_stream_batch(
+            registry, uncertifiable, FULL_STEP_SCOPE, 1, 0, 1,
+        ) == "eager_batch"
+    assert registry.uncertified == 3 and registry.uncertified_family
+    assert len(registry.observed) == 1
+
     # Single-process runs add no collective at all.
     solo = _StreamSignatureRegistry(1)
     before = len(reductions)

@@ -509,6 +509,7 @@ from .utils import (
     create_vlm_batches,
     _create_vlm_batch_plan,
     _finite_text_pad_width,
+    _vlm_batch_family,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
     _preserved_preprocessing_rng,
@@ -1428,6 +1429,16 @@ def _stream_batch_signature(batch_data, phase, execution_key):
     mid-run. Finer than the true key is safe: the guard can only degrade
     early, never late.
     """
+    if isinstance(batch_data, dict):
+        # A family the serializer cannot certify may span several real cache
+        # keys, so it is reported rather than recorded: counting it as one
+        # would understate the cache and make the cap unsound.
+        family = _vlm_batch_family(batch_data)
+        if not _vlm_family_is_plannable(family):
+            # None means uncertifiable; the family rides along so a strict
+            # refusal can name what it refused.
+            return None, family
+        return (phase, family, execution_key)
     leaves = []
     values = batch_data if isinstance(batch_data, (tuple, list)) else (batch_data,)
     for value in values:
@@ -1447,13 +1458,18 @@ class _StreamSignatureRegistry:
     stands in for.
     """
 
-    __slots__ = ("cap", "observed", "tripped", "trip_reason")
+    __slots__ = (
+        "cap", "observed", "tripped", "trip_reason", "uncertified",
+        "uncertified_family",
+    )
 
     def __init__(self, cap):
         self.cap = int(cap)
         self.observed = set()
         self.tripped = False
         self.trip_reason = ""
+        self.uncertified = 0
+        self.uncertified_family = ""
 
     def would_trip(self, key):
         return key not in self.observed and len(self.observed) >= self.cap
@@ -2501,6 +2517,7 @@ class MLXTrainer:
         already-eager rank cannot repeat without drawing again from its RNG.
         """
         key = None
+        uncertifiable = False
         error = None
         try:
             if batch_data is not None:
@@ -2509,6 +2526,10 @@ class MLXTrainer:
                     phase_for_microstep(compile_scope, grad_accum, microstep),
                     _stream_execution_key(),
                 )
+                if isinstance(key, tuple) and key and key[0] is None:
+                    registry.uncertified_family = repr(key[1])
+                    key = None
+                uncertifiable = key is None
         except BaseException as exc:
             error = exc
         signal = 2 if error is not None else (
@@ -2526,6 +2547,11 @@ class MLXTrainer:
             return True
         if key is not None:
             registry.record(key)
+        elif uncertifiable:
+            # Neither compiled nor counted, so an uncertifiable family
+            # cannot spend capacity certified ones need.
+            registry.uncertified += 1
+            return "eager_batch"
         return False
 
     def _distributed_sum_gradient_tree(self, grad):
@@ -6580,6 +6606,7 @@ class MLXTrainer:
             # Get next batch
             batch_error = None
             batch_data = None
+            _stream_eager_batch = False
             try:
                 if batch_iter is not None:
                     batch_data = next(batch_iter)
@@ -6635,6 +6662,22 @@ class MLXTrainer:
                     it - 1,
                     distributed_world_size,
                 )
+                if _stream_trip == "eager_batch":
+                    # Uncertifiable family: eager for this batch, compiled
+                    # again next fetch.
+                    if _effective_compile_mode(
+                        compile_policy, _compile_decision,
+                    ) == "strict":
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile cannot certify a "
+                            "streamed batch's compile-key family, so its "
+                            "compiled shapes could not be bounded: "
+                            f"{_stream_registry.uncertified_family}"
+                        )
+                    _stream_eager_batch = True
+                    _stream_trip = False
+                else:
+                    _stream_eager_batch = False
                 if _stream_trip:
                     if _effective_compile_mode(
                         compile_policy, _compile_decision,
@@ -6669,6 +6712,15 @@ class MLXTrainer:
                     _compile_scope = "fallback_eager"
                     _compile_fallback_reason = "stream_signature_cap"
                     state = [model.state, optimizer.state, mx.random.state]
+
+            _step_fn_for_batch = step_fn
+            if _stream_eager_batch:
+                # Only a VLM mapping is uncertifiable and unsized VLM streams
+                # are refused under DDP, so this is single-process today.
+                _step_fn_for_batch = (
+                    _ddp_eager_local_step_fn if _ddp_compile_local_grad
+                    else _uncompiled_step_fn
+                )
 
             do_update = (accum_progress + 1 >= grad_accum)
             # HF forces a sync step on an epoch's last micro-batch, so the epoch is
@@ -6722,12 +6774,16 @@ class MLXTrainer:
                         _rng_state[0].tolist(), dtype=mx.uint32,
                     )
                 try:
-                    lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                    lvalue, toks, grad_accum_state, grad_norm = _step_fn_for_batch(
                         batch_data, grad_accum_state, do_update,
                     )
                 except (ValueError, RuntimeError, TypeError) as e:
                     _is_compile_failure = (
                         _use_compile
+                        # Bypassed the compiled callable, so this is not a
+                        # compile failure: classifying it as one would rerun
+                        # the batch and degrade the whole run.
+                        and not _stream_eager_batch
                         and not _ddp_compile_local_grad
                         and _is_compile_exception(e)
                     )
@@ -7410,6 +7466,12 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
+                # Anchor-free: expansion decides the compile-visible width and
+                # exceeds max_seq_length, so an endpoint below a batch's own
+                # width could never materialize.
+                self._mlx_stream_width_policy = (
+                    _StreamWidthPolicy(StreamShapeGrid()) if vlm_lazy else None
+                )
                 return None, iterate_vlm_training_batches(
                     dataset=train_dataset,
                     processor=processor,
@@ -7431,6 +7493,7 @@ class MLXTrainer:
                         if vlm_prefetch_depth and vlm_lazy else 0
                     ),
                     prefetch_control=self._mlx_prefetch_control,
+                    width_policy=self._mlx_stream_width_policy,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
