@@ -382,6 +382,21 @@ try:
     resume_mismatch = ""
 except RuntimeError as exc:
     resume_mismatch = str(exc)
+adapter_only = Path(sys.argv[1], "resume_adapter_only"); adapter_only.mkdir(exist_ok=True)
+(adapter_only / "adapters.safetensors").write_text("x")
+try:
+    trainer._validate_distributed_resume_checkpoint(adapter_only)
+    resume_adapter_only = ""
+except RuntimeError as exc:
+    resume_adapter_only = str(exc)
+no_adapters = Path(sys.argv[1], "resume_no_adapters"); no_adapters.mkdir(exist_ok=True)
+for name in ("optimizer_state.safetensors", "trainer_state.json"):
+    (no_adapters / name).write_text("x")
+try:
+    trainer._validate_distributed_resume_checkpoint(no_adapters)
+    resume_no_adapters = ""
+except RuntimeError as exc:
+    resume_no_adapters = str(exc)
 def vlm_stream_rejection():
     try:
         next(iter(iterate_vlm_training_batches(ReplayableVLMStream(), TinyProcessor(), {"image_token_id": 20}, batch_size=2, max_seq_length=8, dataset_order="sequential", comm_group=world)))
@@ -448,6 +463,8 @@ payload = {
     "vlm_compile_parity_tokens": int(vlm_compile_parity_result["trained_tokens"]),
     "resume_ok": Path(trainer._validate_distributed_resume_checkpoint(ckpt)).name,
     "resume_mismatch": resume_mismatch,
+    "resume_adapter_only": resume_adapter_only,
+    "resume_no_adapters": resume_no_adapters,
     "default": first_token_rows(create_batches(data, TinyTokenizer(), seed=1, **common)),
     "ordered": first_token_rows(create_ordered_batches(data, TinyTokenizer(), dataset_order="sequential", **common)),
     "labeled": first_token_rows(_create_labeled_batches(data, TinyTokenizer(), keep_all_labels, dataset_order="sequential", **common)),
@@ -561,6 +578,22 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
     assert abs(ranks[0]["vlm_param_sum"] - ranks[1]["vlm_param_sum"]) < 1e-5
     assert [rank["resume_ok"] for rank in ranks] == ["resume_ckpt", "resume_ckpt"]
     assert all("all ranks must either resume" in rank["resume_mismatch"] for rank in ranks)
+    # An adapter-only directory is the mistake the single-process resume gate
+    # names FastMLXModel.from_pretrained for; DDP must name it on every rank
+    # instead of blaming cross-rank file visibility.
+    assert all(
+        "FastMLXModel.from_pretrained" in rank["resume_adapter_only"]
+        and "optimizer_state.safetensors" in rank["resume_adapter_only"]
+        and "trainer_state.json" in rank["resume_adapter_only"]
+        for rank in ranks
+    ), [rank["resume_adapter_only"] for rank in ranks]
+    # A directory that is not adapter-shaped keeps the coordinated
+    # visibility message, which warm-start guidance would not fit.
+    assert all(
+        "not visible on every rank" in rank["resume_no_adapters"]
+        and "FastMLXModel.from_pretrained" not in rank["resume_no_adapters"]
+        for rank in ranks
+    ), [rank["resume_no_adapters"] for rank in ranks]
     for prefix in ("ckpt_adapter", "ckpt_opt", "ckpt_state", "final"):
         assert (tmp_path / f"{prefix}_rank0").exists()
         assert not (tmp_path / f"{prefix}_rank1").exists()

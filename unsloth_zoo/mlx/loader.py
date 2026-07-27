@@ -5509,6 +5509,17 @@ class FastMLXModel:
                 parallel text or VLM inference.
             tensor_group: Optional MLX distributed group for tensor parallel
                 text or VLM inference.
+
+        Reloading a saved LoRA/DoRA adapter directory returns a model whose
+        base is frozen and whose adapter parameters are trainable, so it can be
+        passed straight to a new ``MLXTrainer`` to warm-start continued training
+        with a fresh optimizer and schedule. The reload restores the trainable
+        set the checkpoint recorded, not the adapter-only set of a fresh
+        ``get_peft_model``: a directory written by ``save_trainable_adapters``
+        also holds the non-adapter tensors that were trainable at save time
+        (embeddings, the head, a projector, biases or norms), and those come
+        back trainable too. Freeze them again after loading if the continued
+        run should train the adapters alone.
         """
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
@@ -6044,9 +6055,6 @@ class FastMLXModel:
                                 f"({_missing_before_load[:5]!r})."
                             )
                         model.load_weights(adapter_weights_file, strict=False)
-                        _unfreeze_saved_mlx_non_adapter_parameters(
-                            model, adapter_weights_file,
-                        )
                     else:
                         model = _load_pathless_mlx_adapter(
                             model, local_path, adapter_weights_file,
@@ -6070,6 +6078,32 @@ class FastMLXModel:
                                     f"({_preview}). Refusing to return a "
                                     "partially loaded adapter."
                                 )
+                    # mlx-lm's load_adapters applies the adapter layers but,
+                    # unlike get_peft_model, never freezes the base, so a fresh
+                    # MLXTrainer would full-finetune it at a LoRA learning rate.
+                    # Skipped for full_finetuning, and when there are no LoRA
+                    # modules (a fine_tune_type="full" adapter) since that would
+                    # leave the model fully frozen.
+                    if not full_finetuning:
+                        from .utils import iter_mlx_lora_modules
+                        _lora_modules = list(iter_mlx_lora_modules(model))
+                        if _lora_modules:
+                            _fix_missing_no_grad(model)
+                            model.freeze()
+                            model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+                            # Per module, so an unrelated base parameter named
+                            # "m" is never unfrozen.
+                            for _lora_name, _lora_module in _lora_modules:
+                                if type(_lora_module).__name__.startswith("DoRA"):
+                                    _lora_module.unfreeze(keys=["m"], recurse=False)
+                    # After the freeze above, never before it: an adapter written
+                    # by save_trainable_adapters also carries non-adapter
+                    # trainables (embeddings, head, projector, biases, norms), and
+                    # restoring them earlier would be undone by that freeze.
+                    if os.path.exists(adapter_weights_file):
+                        _unfreeze_saved_mlx_non_adapter_parameters(
+                            model, adapter_weights_file,
+                        )
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
