@@ -2320,3 +2320,124 @@ def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
     # A tuple holding nothing releasable keeps its exact identity.
     plain = {"images": ("a", "b")}
     assert _release_vlm_row_image_handles(plain)["images"] is plain["images"]
+
+
+def test_vlm_plan_reports_a_dataset_that_reuses_one_temporary_image_path(tmp_path):
+    """Releasing a handle makes the FILE the payload, so a reused path aliases
+    exactly like a reused decode buffer: every scheduled row re-opens the last
+    sample. The eager builder decoded each handle before the next read, so this
+    is only reachable once the plan collects every row first."""
+    Image = pytest.importorskip("PIL.Image")
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    shared = tmp_path / "row.png"
+
+    class _OneSharedPath:
+        """Writes every sample to one scratch file, the way a dataset that
+        renders or downloads to a fixed temporary path does."""
+
+        def __init__(self):
+            self.written = []
+
+        def __len__(self):
+            return 6
+
+        def __getitem__(self, index):
+            Image.fromarray(
+                np.full((8, 8, 3), index + 1, dtype=np.uint8)
+            ).save(shared)
+            self.written.append(index + 1)
+            return {"text": str(index), "images": [Image.open(str(shared))]}
+
+    dataset = _OneSharedPath()
+    with pytest.raises(ValueError, match="file backing a dataset image changed"):
+        _create_vlm_batch_plan(
+            dataset=dataset,
+            processor=_ContentProcessor(),
+            config={"image_size": 16, "image_token_id": 200},
+            batch_size=2,
+            max_seq_length=8,
+            num_batches=3,
+            dataset_order="sequential",
+        )
+
+    # Six distinct samples really did go through the one file, and the file now
+    # holds only the last of them -- which is what every row would have read.
+    assert dataset.written == [1, 2, 3, 4, 5, 6]
+    assert int(np.asarray(Image.open(str(shared))).reshape(-1)[0]) == 6
+
+
+def test_vlm_plan_materializes_per_row_image_files_unchanged(tmp_path):
+    """The control for the check above: one file per sample is the normal
+    shape, so it must plan, materialize and read back its own pixels."""
+    Image = pytest.importorskip("PIL.Image")
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    paths = []
+    for index in range(6):
+        path = tmp_path / f"row_{index}.png"
+        Image.fromarray(np.full((8, 8, 3), index + 1, dtype=np.uint8)).save(path)
+        paths.append(str(path))
+
+    class _PerRowPath:
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, index):
+            return {"text": str(index), "images": [Image.open(paths[index])]}
+
+    seen = []
+
+    class _RecordingProcessor(_ContentProcessor):
+        def __call__(self, text, images=None, **kwargs):
+            for image in images or []:
+                for one in (image if isinstance(image, (list, tuple)) else [image]):
+                    seen.append(int(np.asarray(one.convert("RGB")).reshape(-1)[0]))
+            return _ContentProcessor.__call__(self, text, **kwargs)
+
+    plan = _create_vlm_batch_plan(
+        dataset=_PerRowPath(),
+        processor=_RecordingProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=3,
+        dataset_order="sequential",
+    )
+    plan.materialize_all()
+
+    assert seen == [1, 2, 3, 4, 5, 6]
+
+
+def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_path):
+    """The second half of the same window: a released row is only re-opened at
+    materialize, so the file can also be rewritten after the plan is built."""
+    Image = pytest.importorskip("PIL.Image")
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    paths = []
+    for index in range(4):
+        path = tmp_path / f"late_{index}.png"
+        Image.fromarray(np.full((8, 8, 3), index + 1, dtype=np.uint8)).save(path)
+        paths.append(str(path))
+
+    class _PerRowPath:
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, index):
+            return {"text": str(index), "images": [Image.open(paths[index])]}
+
+    plan = _create_vlm_batch_plan(
+        dataset=_PerRowPath(),
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=2,
+        dataset_order="sequential",
+    )
+
+    Image.fromarray(np.full((8, 8, 3), 99, dtype=np.uint8)).save(paths[2])
+    with pytest.raises(ValueError, match="file backing a dataset image changed"):
+        plan.materialize_all()

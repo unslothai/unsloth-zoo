@@ -4041,6 +4041,11 @@ class MLXTrainer:
                     # per split would restore the same snapshot before each of
                     # them and replay a single draw sequence for all, where
                     # sequential construction advanced from split to split.
+                    # It spans the process-global RNGs only, so state owned
+                    # privately -- by the processor, or by a user's
+                    # response_mask_fn, which the plan also calls per batch at
+                    # materialize -- does still advance here. No snapshot of an
+                    # arbitrary object's own counter exists to take.
                     with _preserved_preprocessing_rng():
                         eval_batches = _create_every_eval_split()
                 else:

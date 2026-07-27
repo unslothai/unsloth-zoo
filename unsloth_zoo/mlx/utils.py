@@ -6100,11 +6100,15 @@ def _vlm_media_fingerprint(payload):
     buffer silently rewrites rows already collected. Copying every payload
     instead would cost one image per scheduled slot rather than per row, so
     the plan probes content and reports the corruption rather than paying to
-    prevent it. Undecoded PIL handles are skipped: probing one would force the
-    decode this path exists to defer, and a released handle is re-opened from
-    a stable path, so no reused buffer can reach it.
+    prevent it. Undecoded PIL handles are still skipped, because probing one
+    would force the decode this path exists to defer.
     """
     try:
+        if isinstance(payload, _LazyVLMImage):
+            # A released handle re-opens its path, so the FILE is the payload
+            # and a reused path aliases exactly like a reused buffer. Identity
+            # metadata is O(1) where re-reading the bytes would be O(size).
+            return ("lazyfile", payload.path, _vlm_file_identity(payload.path))
         if isinstance(payload, np.ndarray):
             return ("ndarray", payload.shape, str(payload.dtype),
                     _vlm_media_bytes_digest(payload))
@@ -6139,6 +6143,8 @@ def _verify_vlm_media_pins(pins):
         if taken is None:
             continue
         if _vlm_media_fingerprint(payload) != taken:
+            if isinstance(payload, _LazyVLMImage):
+                _raise_vlm_lazy_file_changed(payload.path)
             raise ValueError(
                 "Unsloth MLX VLM: a dataset image changed after the row "
                 "holding it was read, so stored rows no longer match their "
@@ -6546,6 +6552,35 @@ def _preserved_preprocessing_rng():
                 pass
 
 
+def _vlm_file_identity(path):
+    """``(device, inode, mtime_ns, size)`` of a file, or None if unreadable.
+
+    A released handle is re-opened from its path, so a dataset that writes
+    every sample to ONE shared path would hand every row the last sample's
+    pixels. Identity is what makes that visible: ``stat`` is O(1) where
+    re-reading the bytes would be O(size) per scheduled slot and decoding
+    would be worse still. A file that has become unstat-able reads as None,
+    which differs from any real identity and is reported the same way.
+    """
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
+
+
+def _raise_vlm_lazy_file_changed(path):
+    """Report a released image whose file no longer holds that row's sample."""
+    raise ValueError(
+        "Unsloth MLX VLM: the file backing a dataset image changed after the "
+        f"row holding it was read ({path}), so stored rows no longer match "
+        "their own samples. This happens when __getitem__ writes every sample "
+        "to one shared path and returns Image.open(path). Write one file per "
+        "sample, or return a decoded copy from __getitem__, for example "
+        "Image.open(path).copy()."
+    )
+
+
 class _LazyVLMImage:
     """Stand-in for a file-backed PIL handle whose descriptor was released.
 
@@ -6554,14 +6589,22 @@ class _LazyVLMImage:
     exhaust the process limit on a few hundred rows. The path is re-opened at
     materialization instead, which keeps the plan at O(1) descriptors without
     forcing the O(N) decode that eagerly loading every row would cost.
+
+    The file's identity travels with the path, because a path alone cannot
+    tell a per-sample file from one shared scratch file rewritten per row.
     """
 
-    __slots__ = ("path",)
+    __slots__ = ("path", "identity")
 
     def __init__(self, path):
         self.path = path
+        self.identity = _vlm_file_identity(path)
 
     def open(self):
+        # Checked here as well as at plan build: the file can also be rewritten
+        # between building the plan and materializing this row.
+        if _vlm_file_identity(self.path) != self.identity:
+            _raise_vlm_lazy_file_changed(self.path)
         from PIL import Image as _PIL_Image
 
         return _PIL_Image.open(self.path)
@@ -7236,9 +7279,9 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             _FiniteVLMRow(
                 # Release before pinning, not after: a pin holds its payload so
                 # the probe can re-read it, which would keep every row's file
-                # open for the whole collection. A released image is re-opened
-                # from a stable path at materialize, so no reused decode buffer
-                # can reach it and it needs no content pin.
+                # open for the whole collection. The released stand-in is
+                # pinned by identity instead, which costs a stat and catches a
+                # dataset that rewrites one shared path per row.
                 _snapshot_formatted_vlm_row(
                     _release_vlm_row_image_handles(
                         dataset[idx] if formatting_func is None
