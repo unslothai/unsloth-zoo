@@ -9,6 +9,7 @@ except Exception:
     _METAL = False
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
+VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
 
 class _CompileBlock(nn.Module):
     def __init__(self):
@@ -172,3 +173,41 @@ def test_compiled_training_state_survives_generation():
         assert all(mx.isfinite(value).item() for value in (before, after))
     finally:
         remove_gradient_checkpointing(model)
+
+
+@metal_only
+def test_vlm_batched_generation_is_ordered_and_aligned():
+    from PIL import Image
+    from mlx_vlm import load
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import (
+        GenerationDefaults,
+        GenerationRequest,
+        generate_batch,
+    )
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    # One prompt, several images: many processors reject unequal prompt lengths,
+    # so batching is exercised through the images.
+    prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
+    requests = [
+        GenerationRequest(prompt=prompt, image=Image.new("RGB", size, colour), max_tokens=4)
+        for colour, size in (("red", (64, 64)), ("blue", (64, 64)), ("green", (96, 96)))
+    ]
+    defaults = GenerationDefaults(max_tokens=4)
+    results = generate_batch(model, processor, requests, defaults=defaults)
+    assert len(results) == 3
+    for result in results:
+        # The RL contract: ids come from sampled events, logprobs align to them.
+        assert result.token_ids
+        assert result.logprobs is None or len(result.logprobs) == len(result.token_ids)
+        assert result.finish_reason in ("stop", "length")
+    # Chunking must not pair a prompt with an earlier chunk's embeddings.
+    chunked = generate_batch(model, processor, requests, defaults=GenerationDefaults(
+        max_tokens=4, prefill_batch_size=1, completion_batch_size=1))
+    assert [item.token_ids for item in chunked] == [item.token_ids for item in results]
+    # Concurrent sequences must not share a detokenizer buffer, so text must
+    # match too, not just ids.
+    assert [item.text for item in chunked] == [item.text for item in results]
+    # Independent buffers: no result may carry another's decoded text appended.
+    assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501

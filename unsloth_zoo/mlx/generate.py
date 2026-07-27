@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Batched generation primitives for training-resident MLX text models."""
+"""Batched generation primitives for training-resident MLX models."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ import asyncio
 import importlib
 import inspect
 import math
+import os
 import threading
 import warnings
 from contextlib import contextmanager
@@ -196,11 +197,13 @@ class GenerationDefaults:
 
 @dataclass(frozen=True)
 class GenerationRequest:
-    """One text-generation request.
+    """One generation request.
 
     Exactly one of ``prompt`` and ``prompt_token_ids`` must be provided.
     Rendered prompt strings are encoded as-is; chat templating belongs to the
-    caller.
+    caller. ``image`` (vision models only) accepts a PIL image, an array, or a
+    str/os.PathLike filesystem path or URL, decoded once before grouping; raw
+    bytes and file-like objects are rejected. ``audio`` is not yet supported.
     """
 
     prompt: str | None = None
@@ -213,7 +216,7 @@ class GenerationRequest:
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """Sampled-token output with text from mlx-lm's streaming detokenizer."""
+    """Sampled-token output with text from the backend's streaming detokenizer."""
 
     token_ids: list[int]
     text: str
@@ -297,6 +300,59 @@ def _validate_text_requests(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
             )
+    return validated
+
+
+def _validate_vlm_requests(
+    requests: Sequence[GenerationRequest],
+    defaults: GenerationDefaults,
+) -> list[GenerationRequest]:
+    validated = list(requests)
+    for index, request in enumerate(validated):
+        if not isinstance(request, GenerationRequest):
+            raise TypeError(f"requests[{index}] must be GenerationRequest.")
+        if request.prompt is None or request.prompt_token_ids is not None:
+            raise ValueError(
+                f"requests[{index}] must provide a rendered prompt string; "
+                "token-id prompts are text-model only."
+            )
+        if not isinstance(request.prompt, str):
+            raise TypeError(f"requests[{index}].prompt must be a string.")
+        if request.audio is not None:
+            raise ValueError(
+                f"requests[{index}] carries audio, which batched vision "
+                "generation does not support; use model.generate instead."
+            )
+        if request.max_tokens is not None:
+            _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
+        if request.sampling is not None and not isinstance(
+            request.sampling, SamplingParams
+        ):
+            raise TypeError(f"requests[{index}].sampling must be SamplingParams.")
+        if isinstance(request.image, os.PathLike):
+            # mlx-vlm's loader opens str paths only.
+            validated[index] = replace(request, image=os.fspath(request.image))
+    if defaults.stop_strings:
+        raise ValueError(
+            "stop_strings are not supported for batched vision generation yet; "
+            "omit them or post-process the returned text."
+        )
+    if defaults.prefill_batch_size > defaults.completion_batch_size:
+        # An inverted pair never admits anything on mlx-vlm, so generation would
+        # hang. mlx-lm normalizes the two, so this is vision-specific.
+        raise ValueError(
+            "prefill_batch_size must not exceed completion_batch_size for "
+            "batched vision generation (got "
+            f"{defaults.prefill_batch_size} > {defaults.completion_batch_size})."
+        )
+    if defaults.max_kv_size is not None:
+        # No supported BatchGenerator takes a KV-window control, so say so rather
+        # than drop a memory constraint the caller believes is in force.
+        raise ValueError(
+            "max_kv_size is not supported for batched vision generation; "
+            f"{_installed_mlx_vlm_version()} exposes no KV-window control on "
+            "its batch generator. Omit it, or use model.generate."
+        )
     return validated
 
 
@@ -645,13 +701,25 @@ class _DecodeStreamingDetokenizer:
         return segment
 
 
-def _new_detokenizer(tokenizer):
+def _new_detokenizer(tokenizer, *, require_independent: bool = False):
+    """A detokenizer owned by one sequence.
+
+    Some processors return one shared instance every time, which would
+    interleave concurrent sequences into a single text buffer.
+    """
+
     try:
         detokenizer = tokenizer.detokenizer
     except (AttributeError, TypeError):
         detokenizer = None
     if detokenizer is None:
         return _DecodeStreamingDetokenizer(tokenizer)
+    if require_independent:
+        try:
+            if tokenizer.detokenizer is detokenizer:
+                return _DecodeStreamingDetokenizer(tokenizer)
+        except (AttributeError, TypeError):
+            return _DecodeStreamingDetokenizer(tokenizer)
     reset = getattr(detokenizer, "reset", None)
     if callable(reset):
         reset()
@@ -758,13 +826,22 @@ def _eos_stop_tokens(tokenizer) -> list[list[int]]:
     return [[int(token)] for token in eos_ids if token is not None]
 
 
+def _event_logprob(event) -> float:
+    """Sampled-token logprob, from a scalar field or a vocabulary vector."""
+
+    scalar = getattr(event, "token_logprob", None)
+    if scalar is not None:
+        return float(scalar)
+    return _sampled_logprob(event)
+
+
 def _sampled_logprob(event) -> float:
     try:
         value = event.logprobs[int(event.token)]
     except (IndexError, KeyError, TypeError) as exc:
         raise RuntimeError(
-            "mlx-lm emitted a logprob vector that does not contain the sampled "
-            f"token {event.token}."
+            "the backend emitted a logprob vector that does not contain the "
+            f"sampled token {event.token}."
         ) from exc
     if hasattr(value, "item"):
         value = value.item()
@@ -884,6 +961,516 @@ class _TextBatchAdapter:
                     pass
 
 
+_VLM_BATCH_MODULES = ("mlx_vlm.generate", "mlx_vlm.generate.ar")
+_VLM_STREAM_MODULES = ("mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar")
+_MISSING = object()
+
+
+def _installed_mlx_vlm_version() -> str:
+    """Describe the installed mlx-vlm for diagnostics (see the mlx-lm twin)."""
+
+    try:
+        from importlib.metadata import version
+
+        installed = version("mlx-vlm")
+    except Exception:
+        installed = None
+    if not isinstance(installed, str) or not installed.strip():
+        return "the installed mlx-vlm"
+    return f"mlx-vlm {installed.strip().splitlines()[0]}"
+
+
+def _vlm_api_shape_error(details: str) -> RuntimeError:
+    return RuntimeError(
+        "Unsupported mlx-vlm batch-generation API shape "
+        f"({details}) in {_installed_mlx_vlm_version()}. Batched vision "
+        "generation needs a BatchGenerator that streams per-token events; "
+        "upgrade or reinstall mlx-vlm, or use model.generate for sequential "
+        "decoding."
+    )
+
+
+def _resolve_module_attr(candidates: Sequence[str], attribute: str):
+    """First importable candidate module exposing ``attribute``.
+
+    Which module holds a symbol differs by release, and attribute access on the
+    package can shadow the submodule, so candidates are imported by name.
+    """
+
+    for name in candidates:
+        try:
+            module = importlib.import_module(name)
+        except Exception:
+            continue
+        if getattr(module, attribute, None) is not None:
+            return module
+    return None
+
+
+def _probe_vlm_api(batch_module):
+    """Verify the event-level mlx-vlm control surface used by this adapter."""
+
+    generator = getattr(batch_module, "BatchGenerator", None)
+    if generator is None:
+        raise _vlm_api_shape_error("BatchGenerator missing")
+    response = getattr(generator, "Response", None)
+    if response is None:
+        # Newer releases move the event to the generation batch.
+        batch = getattr(batch_module, "GenerationBatch", None)
+        response = getattr(batch, "Response", None) if batch is not None else None
+    if response is None:
+        raise _vlm_api_shape_error("no per-token Response class found")
+    fields = set(getattr(response, "__dataclass_fields__", {}))
+    required = {"uid", "token", "finish_reason"}
+    missing = sorted(required - fields)
+    if missing:
+        raise _vlm_api_shape_error(
+            f"per-token Response lacks {', '.join(missing)}"
+        )
+    if not fields & {"logprobs", "token_logprob"}:
+        raise _vlm_api_shape_error(
+            "per-token Response exposes neither logprobs nor token_logprob"
+        )
+    for name in ("insert", "next"):
+        if not callable(getattr(generator, name, None)):
+            raise _vlm_api_shape_error(f"BatchGenerator.{name} missing")
+    try:
+        constructor = inspect.signature(generator.__init__).parameters
+        insert = inspect.signature(generator.insert).parameters
+    except (TypeError, ValueError) as exc:
+        raise _vlm_api_shape_error(
+            "BatchGenerator call signatures are unavailable"
+        ) from exc
+    required = {"prefill_batch_size", "completion_batch_size"}
+    absent = sorted(required - set(constructor))
+    if absent:
+        raise _vlm_api_shape_error(
+            f"BatchGenerator constructor missing {', '.join(absent)}"
+        )
+    return constructor, insert
+
+
+def _is_mrope_position_ids(key: str, value) -> bool:
+    shape = getattr(value, "shape", None)
+    return (key == "position_ids" and getattr(value, "ndim", 0) == 3
+            and shape is not None and shape[0] == 3)
+
+
+def _split_prompt_kwargs_fallback(prompt_kwargs: dict, batch_size: int) -> list[dict]:
+    """Per-row split for releases without upstream's splitter.
+
+    MRoPE ``position_ids`` carry the batch on axis 1, so an unconditional
+    axis-0 slice would corrupt them.
+    """
+
+    if batch_size <= 1:
+        return [dict(prompt_kwargs or {})]
+    rows: list[dict] = [{} for _ in range(batch_size)]
+    for key, value in (prompt_kwargs or {}).items():
+        ndim = getattr(value, "ndim", None)
+        if ndim is None or ndim == 0:
+            for row in rows:
+                row[key] = value
+            continue
+        if _is_mrope_position_ids(key, value):
+            for index in range(batch_size):
+                rows[index][key] = (
+                    value[:, index : index + 1, :]
+                    if value.shape[1] == batch_size
+                    else value[:, :1, :]
+                )
+            continue
+        for index in range(batch_size):
+            rows[index][key] = (
+                value[index : index + 1]
+                if value.shape[0] == batch_size
+                else value[:1]
+            )
+    return rows
+
+
+class _VLMBatchAdapter:
+    """Event-level adapter over mlx-vlm's BatchGenerator.
+
+    Bypasses the public batch helper, which templates the prompt and discards
+    per-token data, and reproduces what it owns: image-shape grouping, the
+    release's chunked-prefill policy, and the wired-limit window.
+    """
+
+    def __init__(self, model, processor, defaults: GenerationDefaults):
+        batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
+        if batch_module is None:
+            raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
+        # Bind the module the class is DEFINED in: that is where the private
+        # helpers and event class live, however the package re-exports them.
+        defining = getattr(batch_module.BatchGenerator, "__module__", None)
+        if defining and defining != batch_module.__name__:
+            try:
+                batch_module = importlib.import_module(defining)
+            except Exception:
+                pass
+        self.constructor_params, insert_params = _probe_vlm_api(batch_module)
+        self.batch_module = batch_module
+        self.generator_type = batch_module.BatchGenerator
+        self.per_row_prompt_kwargs = "prompt_kwargs" in insert_params
+        self.stream_module = _resolve_module_attr(_VLM_STREAM_MODULES, "wired_limit")
+        utils = importlib.import_module("mlx_vlm.utils")
+        self.prepare_inputs = utils.prepare_inputs
+        self.process_image = getattr(utils, "process_image", None)
+        sample_utils = importlib.import_module("mlx_lm.sample_utils")
+        _probe_sampler_api(sample_utils)
+        self.make_sampler = sample_utils.make_sampler
+        self.model = model
+        self.processor = processor
+        self.defaults = defaults
+
+    def _wired_limit(self):
+        """Raise the wired limit, which ``generation_mode`` restores but never raises."""
+
+        module = self.stream_module
+        if module is None:
+            return _null_context()
+        # Unconditional: the chunked-prefill policy needs embeddings before the
+        # generator exists, so a release whose constructor raises the limit
+        # would otherwise embed under the trainer's cap. Those releases take one
+        # redundant nested raise.
+        stream = getattr(module, "generation_stream", None)
+        try:
+            return module.wired_limit(self.model, [stream] if stream else None)
+        except Exception:
+            return _null_context()
+
+    def _add_special_tokens(self) -> bool:
+        config = getattr(self.model, "config", None)
+        model_type = getattr(config, "model_type", None)
+        if model_type in ("gemma3", "gemma3n", "gemma4", "gemma4_unified"):
+            return getattr(self.processor, "chat_template", None) is None
+        return True
+
+    def _chunked_prefill_kwargs(self, *, input_ids=None, prefill_kwargs=None) -> dict:
+        """Apply the release's chunked-prefill policy, which needs real inputs."""
+
+        enabled = getattr(self.batch_module, "_chunked_prefill_enabled", None)
+        if callable(enabled):
+            embeds = (prefill_kwargs or {}).get("inputs_embeds")
+            # Every release shipping this helper takes the full keyword form, so
+            # any error is a real policy failure and propagates.
+            allowed = enabled(
+                self.model,
+                input_ids=input_ids,
+                inputs_embeds=embeds,
+                prefill_kwargs=prefill_kwargs,
+            )
+            return {} if allowed else {"prefill_step_size": None}
+        if getattr(self.model, "no_chunked_prefill", False):
+            return {"prefill_step_size": None}
+        return {}
+
+    def _split_prompt_kwargs(self, prompt_kwargs: dict, batch_size: int) -> list[dict]:
+        upstream = getattr(self.batch_module, "_split_prompt_kwargs_per_row", None)
+        mrope_aware = getattr(
+            self.batch_module,
+            "_is_mrope_position_ids_prompt_kwarg",
+            None,
+        )
+        # Only the MRoPE-aware upstream splitter is used; an axis-0 one would
+        # corrupt position ids.
+        if callable(upstream) and callable(mrope_aware):
+            return upstream(prompt_kwargs, batch_size)
+        return _split_prompt_kwargs_fallback(prompt_kwargs, batch_size)
+
+    def _admission_stalled(self, generator) -> bool | None:
+        """True when no prompt can ever be admitted; None when unobservable.
+
+        Prefill legitimately yields eventless polls for as long as a long
+        prompt needs, so a stall is judged by whether a prompt batch is in
+        flight, never by counting empty polls.
+        """
+
+        prompt_batch = getattr(generator, "_prompt_batch", _MISSING)
+        generation_batch = getattr(generator, "_generation_batch", _MISSING)
+        queued = getattr(generator, "_unprocessed_sequences", _MISSING)
+        if _MISSING in (prompt_batch, generation_batch, queued):
+            return None
+        try:
+            return (
+                prompt_batch is None
+                and len(generation_batch) == 0
+                and len(queued) > 0
+            )
+        except TypeError:
+            return None
+
+    def _stall_error(self) -> RuntimeError:
+        return RuntimeError(
+            "mlx-vlm reported pending generation work but has admitted no "
+            "prompt and has no prefill in flight, so generation cannot "
+            "progress. This happens when the free completion capacity is "
+            "smaller than the prefill batch size; check any batch-size "
+            "overrides passed to batched generation."
+        )
+
+    def _group_key(self, request: GenerationRequest):
+        sampling = request.sampling or self.defaults.sampling
+        shape = self._image_shape(request.image)
+        return (
+            sampling.temperature,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+            request.image is None,
+            shape,
+        )
+
+    def _decode_image(self, request: GenerationRequest) -> GenerationRequest:
+        """Load a path or URL image once, before grouping.
+
+        A second fetch would break one-use URLs and could return a different
+        size than grouping saw.
+        """
+
+        image = request.image
+        if image is None or not isinstance(image, (str, bytes)):
+            return request
+        if isinstance(image, bytes) or self.process_image is None:
+            raise ValueError(
+                "Batched vision generation accepts a PIL image, an array, or a "
+                "str/os.PathLike path or URL; raw bytes and file-like objects "
+                "are not supported."
+            )
+        try:
+            decoded = self.process_image(
+                image,
+                None,
+                getattr(self.processor, "image_processor", None),
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Could not load the image {image!r} for batched vision "
+                "generation."
+            ) from exc
+        return replace(request, image=decoded)
+
+    def _image_shape(self, image):
+        """Spatial shape of an already-decoded request image."""
+
+        if image is None:
+            return None
+        shape = getattr(image, "shape", None)
+        if shape is not None:
+            return tuple(shape)
+        size = getattr(image, "size", None)
+        if isinstance(size, tuple):
+            return size
+        if isinstance(size, list):
+            return tuple(size)
+        raise ValueError(
+            "Batched vision generation needs an image whose size is known "
+            "after decoding: pass a PIL image, an array, or a path/URL. "
+            f"Got {type(image).__name__}."
+        )
+
+    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+        requests = [self._decode_image(request) for request in requests]
+        results: list[GenerationResult | None] = [None] * len(requests)
+        groups: dict[Any, list[int]] = {}
+        for index, request in enumerate(requests):
+            groups.setdefault(self._group_key(request), []).append(index)
+        # Older releases slice shared kwargs from row zero on every prefill
+        # batch, pairing later prompts with earlier embeddings, so they run one
+        # chunk per generator. Per-row releases keep the configured sizes.
+        capacity = (
+            None
+            if self.per_row_prompt_kwargs
+            else min(
+                self.defaults.prefill_batch_size,
+                self.defaults.completion_batch_size,
+            )
+        )
+        for indices in groups.values():
+            step = capacity or len(indices)
+            for start in range(0, len(indices), step):
+                chunk = indices[start : start + step]
+                for index, result in zip(chunk, self._run_chunk(requests, chunk)):
+                    results[index] = result
+        return [result for result in results if result is not None]
+
+    def _run_chunk(
+        self,
+        requests: Sequence[GenerationRequest],
+        indices: Sequence[int],
+    ) -> list[GenerationResult]:
+        chunk = [requests[index] for index in indices]
+        batch_size = len(chunk)
+        prompts = [request.prompt for request in chunk]
+        images = [request.image for request in chunk if request.image is not None]
+        sampling = chunk[0].sampling or self.defaults.sampling
+        config = getattr(self.model, "config", None)
+        inputs = self.prepare_inputs(
+            self.processor,
+            images=images or None,
+            audio=None,
+            prompts=prompts,
+            image_token_index=getattr(config, "image_token_index", None),
+            resize_shape=None,
+            add_special_tokens=self._add_special_tokens(),
+            pad_to_uniform_size=False,
+        )
+        input_ids = inputs.get("input_ids")
+        pixel_values = inputs.get("pixel_values")
+        mask = inputs.get("attention_mask")
+        data_kwargs = {
+            key: value
+            for key, value in inputs.items()
+            if key not in ("input_ids", "pixel_values", "attention_mask")
+        }
+        options = {
+            "prefill_batch_size": (
+                self.defaults.prefill_batch_size
+                if self.per_row_prompt_kwargs
+                else batch_size
+            ),
+            "completion_batch_size": (
+                self.defaults.completion_batch_size
+                if self.per_row_prompt_kwargs
+                else batch_size
+            ),
+            "sampler": self.make_sampler(
+                temp=sampling.temperature,
+                top_p=sampling.top_p,
+                top_k=sampling.top_k,
+                min_p=sampling.min_p,
+            ),
+        }
+        if "compute_logprobs" in self.constructor_params:
+            # The public helper turns this off, but logprobs are contract here.
+            options["compute_logprobs"] = True
+        max_tokens = [
+            int(request.max_tokens or self.defaults.max_tokens) for request in chunk
+        ]
+        generator = None
+        active_error = None
+        try:
+            with self._wired_limit():
+                embedding_output = self.model.get_input_embeddings(
+                    input_ids,
+                    pixel_values,
+                    mask=mask,
+                    **data_kwargs,
+                )
+                # Optional fields enumerate as None and would overwrite valid
+                # prepare_inputs values; upstream filters them the same way.
+                gen_kwargs = {**data_kwargs, **{
+                    key: value
+                    for key, value in embedding_output.to_dict().items()
+                    if value is not None
+                }}
+                options.update(
+                    self._chunked_prefill_kwargs(
+                        input_ids=input_ids,
+                        prefill_kwargs=gen_kwargs,
+                    )
+                )
+                options = {
+                    key: value
+                    for key, value in options.items()
+                    if key in self.constructor_params
+                }
+                generator = self.generator_type(
+                    self.model.language_model,
+                    self.processor,
+                    **options,
+                )
+                token_ids = input_ids.tolist()
+                if self.per_row_prompt_kwargs:
+                    uids = generator.insert(
+                        token_ids,
+                        max_tokens,
+                        prompt_kwargs=self._split_prompt_kwargs(
+                            gen_kwargs,
+                            batch_size,
+                        ),
+                    )
+                else:
+                    uids = generator.insert(token_ids, max_tokens)
+                return self._drive(generator, uids, gen_kwargs)
+        except BaseException as exc:
+            active_error = exc
+            raise
+        finally:
+            closer = getattr(generator, "close", None) if generator else None
+            if callable(closer):
+                try:
+                    closer()
+                except BaseException as close_error:
+                    if active_error is None:
+                        raise
+                    try:
+                        warnings.warn(
+                            "BatchGenerator.close() failed while preserving an "
+                            f"active {type(active_error).__name__}: {close_error}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    except BaseException:
+                        pass
+
+    def _drive(self, generator, uids, gen_kwargs) -> list[GenerationResult]:
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        pending = {
+            uid: _PendingResult(
+                detokenizer=_new_detokenizer(tokenizer, require_independent=True),
+                scanner=_StopStringScanner(()),
+            )
+            for uid in uids
+        }
+        completed: dict[int, GenerationResult] = {}
+        while pending:
+            if self.per_row_prompt_kwargs:
+                if not generator.has_work:
+                    raise RuntimeError(
+                        "mlx-vlm ended its event stream before every request "
+                        "reported a finish reason."
+                    )
+                _, events = generator.next()
+            else:
+                events = generator.next(**gen_kwargs)
+            if not events:
+                stalled = self._admission_stalled(generator)
+                if stalled:
+                    raise self._stall_error()
+                if stalled is None and not self.per_row_prompt_kwargs:
+                    raise RuntimeError(
+                        "mlx-vlm ended its event stream before every request "
+                        "reported a finish reason."
+                    )
+                continue
+            for event in events:
+                state = pending.get(event.uid)
+                if state is None:
+                    continue
+                finish_reason = event.finish_reason
+                if finish_reason is None:
+                    state.append(tokenizer, int(event.token), _event_logprob(event))
+                    continue
+                if finish_reason not in ("stop", "length"):
+                    raise RuntimeError(
+                        "mlx-vlm emitted an unsupported finish reason: "
+                        f"{finish_reason!r}."
+                    )
+                if finish_reason == "length":
+                    state.add_terminal(int(event.token), _event_logprob(event))
+                state.finish(tokenizer, finish_reason)
+                completed[event.uid] = state.result(tokenizer)
+                del pending[event.uid]
+        return [completed[uid] for uid in uids]
+
+
+@contextmanager
+def _null_context():
+    yield
+
+
 def generate_batch(
     model,
     tokenizer_or_processor,
@@ -891,28 +1478,40 @@ def generate_batch(
     *,
     defaults: GenerationDefaults | None = None,
 ) -> list[GenerationResult]:
-    """Generate a batch from a training-resident MLX text model.
+    """Generate a batch from a training-resident MLX text or vision model.
 
-    Results preserve input order. ``token_ids`` come directly from mlx-lm's
-    sampled-token events, and ``logprobs`` are aligned one-to-one with them.
+    Results preserve input order. ``token_ids`` come directly from the
+    backend's sampled-token events, and ``logprobs`` are aligned one-to-one
+    with them.
     """
 
-    if getattr(model, "_is_vlm_model", False):
-        raise ValueError(
-            "VLM batched generation is not enabled in this text-only engine."
-        )
     if defaults is None:
         defaults = GenerationDefaults()
     if not isinstance(defaults, GenerationDefaults):
         raise TypeError("defaults must be GenerationDefaults.")
-    validated = _validate_text_requests(requests, defaults)
+    # Routing follows the model, not the request: a vision model preprocesses
+    # text-only prompts too.
+    is_vlm = bool(getattr(model, "_is_vlm_model", False))
+    validated = (
+        _validate_vlm_requests(requests, defaults)
+        if is_vlm
+        else _validate_text_requests(requests, defaults)
+    )
     if not validated:
         return []
     if tokenizer_or_processor is None:
-        raise ValueError("Text batched generation requires a tokenizer.")
+        raise ValueError(
+            "Batched generation requires a processor."
+            if is_vlm
+            else "Text batched generation requires a tokenizer."
+        )
     with generation_mode(model):
         with _generation_cache_hygiene():
-            adapter = _TextBatchAdapter(model, tokenizer_or_processor, defaults)
+            adapter = (
+                _VLMBatchAdapter(model, tokenizer_or_processor, defaults)
+                if is_vlm
+                else _TextBatchAdapter(model, tokenizer_or_processor, defaults)
+            )
             return adapter.generate(validated)
 
 
@@ -940,11 +1539,6 @@ def fast_generate(
     ``generate_batch`` directly.
     """
 
-    if getattr(self, "_is_vlm_model", False):
-        raise ValueError(
-            "Unsloth MLX: fast_generate is currently available for text "
-            "models only."
-        )
     tokenizer = getattr(self, "_tokenizer", None)
     if tokenizer is None:
         raise ValueError("Unsloth MLX: fast_generate requires model._tokenizer.")

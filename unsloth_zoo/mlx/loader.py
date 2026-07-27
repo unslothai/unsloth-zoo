@@ -5938,9 +5938,8 @@ def _patch_mlx_saving(model, tokenizer):
     _patch_mlx_tokenizer_call(tokenizer)
     model._tokenizer = tokenizer
     model.generate               = types.MethodType(_mlx_generate, model)
-    if not getattr(model, "_is_vlm_model", False):
-        from .generate import fast_generate
-        model.fast_generate      = types.MethodType(fast_generate, model)
+    from .generate import fast_generate
+    model.fast_generate          = types.MethodType(fast_generate, model)
     model.save_pretrained        = types.MethodType(_mlx_save_pretrained_merged, model)
     model.save_pretrained_merged = types.MethodType(_mlx_save_pretrained_merged, model)
     model.save_pretrained_gguf   = types.MethodType(_mlx_save_pretrained_gguf, model)
