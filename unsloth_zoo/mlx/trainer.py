@@ -2276,6 +2276,44 @@ class MLXTrainer:
             else "no"
         )
 
+    def _static_eval_cadence_enabled(self):
+        """Whether the loop's own eval_steps cadence applies, as HF decides it.
+
+        _sync_synthesized_arg deliberately preserves a caller-supplied
+        eval_strategy (a real TrainingArguments/SFTConfig carries one, and a
+        hand-set override wins over our derivation), so the loop must read the
+        same field HF's DefaultFlowCallback reads instead of evaluating from
+        eval_steps alone. transformers only raises the step cadence under
+        IntervalStrategy.STEPS (trainer_callback.DefaultFlowCallback.
+        on_step_end), so "no" must not evaluate and "epoch" must leave the
+        cadence to on_epoch_end rather than adding a second evaluation.
+
+        IntervalStrategy is a str Enum, so a plain "steps" and
+        IntervalStrategy.STEPS both normalize here. A missing field means the
+        args object never went through _ensure_callback_args_compat, so keep
+        the legacy eval_steps-only cadence rather than silently disabling eval.
+        """
+        strategy = getattr(self.args, "eval_strategy", None)
+        if strategy is None:
+            return True
+        strategy = getattr(strategy, "value", strategy)
+        return str(strategy).lower() == "steps"
+
+    def _eval_delay_satisfied(self, current_step):
+        """Whether HF's eval_delay allows the step cadence to evaluate yet.
+
+        DefaultFlowCallback gates its step-strategy evaluation on
+        `args.eval_delay <= state.global_step`, so the static cadence honors
+        the same bound. _ensure_callback_args_compat defaults the field to 0,
+        and an unparseable value falls back to "no delay" so a bad override
+        cannot disable evaluation outright.
+        """
+        try:
+            delay = float(getattr(self.args, "eval_delay", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        return delay <= float(current_step)
+
     def _callback_num_train_epochs(self, total_steps, batches):
         """Return the epoch total HF's TrainerState reports for this run.
 
@@ -2859,6 +2897,29 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
+    def _fire_prediction_step(self):
+        """Dispatch HF's on_prediction_step for one processed eval batch.
+
+        transformers fires this once per evaluation batch from its evaluation
+        loop (`self.control = self.callback_handler.on_prediction_step(args,
+        self.state, self.control)` in Trainer.evaluation_loop), which is how
+        stock ProgressCallback advances its evaluation bar and how per-batch
+        evaluation instrumentation is notified. The handler passes its
+        eval_dataloader through, so a sized batch list gives ProgressCallback a
+        real total and a lazy view (no __len__) makes it no-op, like HF's own
+        has_length guard.
+
+        No-ops when the handler is absent: _evaluate is reachable from helper
+        paths that never built one, and evaluation must not start depending on
+        the callback bridge to produce a loss.
+        """
+        handler = getattr(self, "callback_handler", None)
+        if handler is None:
+            return
+        self.control = handler.call_event(
+            "on_prediction_step", self.args, self.state, self.control,
+        )
+
     def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
@@ -2898,6 +2959,13 @@ class MLXTrainer:
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
                     mx.eval(all_losses, ntokens)
+                    # HF dispatches on_prediction_step after each evaluation
+                    # batch is folded into the running totals. Raised inside
+                    # this try on purpose: a callback that fails on one rank
+                    # then joins the same _distributed_eval_status consensus as
+                    # a failed batch, so the peers abort together instead of
+                    # hanging at the next collective.
+                    self._fire_prediction_step()
                 except BaseException as exc:
                     failed = True
                     error = exc
@@ -2994,25 +3062,37 @@ class MLXTrainer:
         if isinstance(eval_batches, dict):
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
-            for split_name, split_batches in eval_batches.items():
-                split_losses, split_tokens = self._evaluate_batch_totals(
-                    split_batches, loss_fn, is_vlm=is_vlm,
-                )
-                split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
-                split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
-                all_losses += split_losses
-                ntokens += split_tokens
-                mx.eval(all_losses, ntokens)
-                split_loss = (
-                    (split_losses / split_tokens).item()
-                    if split_tokens.item() > 0 else 0.0
-                )
-                split_ppl = math.exp(min(split_loss, 100))
-                split_prefix = f"eval_{split_name}"
-                metrics[f"{split_prefix}_loss"] = split_loss
-                metrics[f"{split_prefix}_perplexity"] = split_ppl
-                if self._distributed_should_stop():
-                    break
+            # HF evaluates one split at a time and rebuilds its eval_dataloader
+            # per split, so on_prediction_step reports the split being consumed
+            # rather than the dict of splits (whose len is the split count, and
+            # would give ProgressCallback a nonsense bar total).
+            handler = getattr(self, "callback_handler", None)
+            outer_dataloader = getattr(handler, "eval_dataloader", None)
+            try:
+                for split_name, split_batches in eval_batches.items():
+                    if handler is not None:
+                        handler.eval_dataloader = split_batches
+                    split_losses, split_tokens = self._evaluate_batch_totals(
+                        split_batches, loss_fn, is_vlm=is_vlm,
+                    )
+                    split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
+                    split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
+                    all_losses += split_losses
+                    ntokens += split_tokens
+                    mx.eval(all_losses, ntokens)
+                    split_loss = (
+                        (split_losses / split_tokens).item()
+                        if split_tokens.item() > 0 else 0.0
+                    )
+                    split_ppl = math.exp(min(split_loss, 100))
+                    split_prefix = f"eval_{split_name}"
+                    metrics[f"{split_prefix}_loss"] = split_loss
+                    metrics[f"{split_prefix}_perplexity"] = split_ppl
+                    if self._distributed_should_stop():
+                        break
+            finally:
+                if handler is not None:
+                    handler.eval_dataloader = outer_dataloader
         else:
             all_losses, ntokens = self._evaluate_batch_totals(
                 eval_batches, loss_fn, is_vlm=is_vlm,
@@ -5620,10 +5700,20 @@ class MLXTrainer:
             # Eval (cadence or a synced callback request). _run_eval builds eval
             # batches lazily on every rank, runs the collective eval, then fires
             # on_evaluate on rank 0 and syncs any stop before best tracking.
+            # The static cadence mirrors DefaultFlowCallback's step-strategy
+            # rule (strategy is STEPS, on a multiple of eval_steps, past
+            # eval_delay); an explicit callback request stays independent of
+            # the strategy, exactly as HF honors control.should_evaluate
+            # whoever raised it.
             should_eval = (
                 self.eval_dataset is not None
                 and (
-                    (eval_steps > 0 and current_step % eval_steps == 0)
+                    (
+                        eval_steps > 0
+                        and current_step % eval_steps == 0
+                        and self._static_eval_cadence_enabled()
+                        and self._eval_delay_satisfied(current_step)
+                    )
                     or self.control.should_evaluate
                 )
             )

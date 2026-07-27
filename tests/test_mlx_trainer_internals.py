@@ -8584,3 +8584,285 @@ def test_no_consensus_site_captures_bare_exception():
                     offenders.append((j + 1, src[j].strip(), i + 1))
                 break
     assert offenders == [], offenders
+
+
+def _hf_eval_steps_from_default_flow(
+    *, total_steps, steps_per_epoch, eval_strategy, eval_steps, eval_delay=0,
+):
+    """Ask the installed transformers DefaultFlowCallback which steps evaluate.
+
+    Derived from the shipped implementation rather than hardcoded, so the
+    expectation tracks the 4.x/5.x differences in DefaultFlowCallback (5.x adds
+    a final-step evaluation for the steps strategy) instead of pinning one.
+    """
+    import tempfile
+
+    from transformers import TrainingArguments
+    from transformers.trainer_callback import (
+        DefaultFlowCallback,
+        TrainerControl,
+        TrainerState,
+    )
+
+    args = TrainingArguments(
+        output_dir=tempfile.mkdtemp(),
+        eval_strategy=eval_strategy,
+        eval_steps=eval_steps,
+        eval_delay=eval_delay,
+        logging_steps=10 ** 6,
+        save_strategy="no",
+        report_to=[],
+    )
+    state = TrainerState(
+        max_steps=total_steps, eval_steps=eval_steps,
+        logging_steps=10 ** 6, save_steps=10 ** 6,
+    )
+    flow = DefaultFlowCallback()
+    fires = []
+    for step in range(1, total_steps + 1):
+        state.global_step = step
+        state.epoch = step / steps_per_epoch
+        control = flow.on_step_end(args, state, TrainerControl())
+        # HF clears should_evaluate inside on_evaluate, so a step can only be
+        # evaluated once however many hooks asked for it.
+        if not control.should_evaluate and step % steps_per_epoch == 0:
+            control = flow.on_epoch_end(args, state, TrainerControl())
+        if control.should_evaluate:
+            fires.append(step)
+    return fires
+
+
+def _run_eval_cadence_probe(monkeypatch, *, eval_steps, **arg_overrides):
+    """Run the real loop for 4 steps / 2 epochs and report the eval steps."""
+    import tempfile
+
+    from transformers.trainer_callback import DefaultFlowCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    args = MLXTrainingConfig(
+        max_steps=4,
+        gradient_accumulation_steps=1,
+        logging_steps=10 ** 6,
+        eval_steps=eval_steps,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        eval_dataset=[{"input_ids": [1, 2, 3, 4]}],
+        args=args,
+        callbacks=[DefaultFlowCallback()],
+    )
+    # Eval is live, so the bridge synthesized eval_strategy="steps" already; the
+    # override below is therefore a genuine caller-supplied strategy, exactly
+    # what _sync_synthesized_arg preserves for a real TrainingArguments/
+    # SFTConfig or a hand-set override.
+    assert trainer.args.eval_strategy == "steps"
+    for name, value in arg_overrides.items():
+        setattr(trainer.args, name, value)
+
+    trainer._batches = _make_shape_guard_text_plan((10,) * 4)
+    trainer._callback_batches_per_epoch = lambda _batches: 2
+    trainer._eval_batches_labeled = ["batch-0"]
+
+    evaluated = []
+
+    def _fake_evaluate(batches, loss_fn, is_vlm=False):
+        evaluated.append(trainer.state.global_step)
+        trainer._last_eval_metrics = {"eval_loss": 1.25, "eval_perplexity": 3.5}
+        return 1.25, 3.5
+
+    trainer._evaluate = _fake_evaluate
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer.train()
+    return evaluated
+
+
+def test_static_eval_cadence_honors_caller_supplied_eval_strategy(monkeypatch):
+    # Regression: the loop's static cadence evaluated purely from eval_steps, so
+    # a caller-supplied eval_strategy -- which _sync_synthesized_arg explicitly
+    # preserves -- was ignored. eval_strategy="no" still evaluated on the step
+    # cadence, and eval_strategy="epoch" evaluated on BOTH the step cadence and
+    # DefaultFlowCallback's epoch end, double-counting every epoch for
+    # early-stopping and best-model tracking.
+    for strategy in ("no", "epoch"):
+        expected = _hf_eval_steps_from_default_flow(
+            total_steps=4, steps_per_epoch=2,
+            eval_strategy=strategy, eval_steps=2,
+        )
+        got = _run_eval_cadence_probe(
+            monkeypatch, eval_steps=2, eval_strategy=strategy,
+        )
+        assert got == expected, (strategy, got, expected)
+    # The steps strategy is unchanged, and is still deduplicated against the
+    # identical request DefaultFlowCallback raises on the same step.
+    expected = _hf_eval_steps_from_default_flow(
+        total_steps=4, steps_per_epoch=2, eval_strategy="steps", eval_steps=2,
+    )
+    assert expected == [2, 4]
+    assert _run_eval_cadence_probe(
+        monkeypatch, eval_steps=2, eval_strategy="steps",
+    ) == expected
+
+
+def test_static_eval_cadence_honors_eval_delay(monkeypatch):
+    # DefaultFlowCallback gates its step evaluation on
+    # `args.eval_delay <= state.global_step`; the loop's own cadence bypassed it
+    # entirely and evaluated from step 1.
+    expected = _hf_eval_steps_from_default_flow(
+        total_steps=4, steps_per_epoch=2,
+        eval_strategy="steps", eval_steps=2, eval_delay=3,
+    )
+    assert expected == [4]
+    assert _run_eval_cadence_probe(
+        monkeypatch, eval_steps=2, eval_strategy="steps", eval_delay=3,
+    ) == expected
+
+
+def test_static_eval_cadence_keeps_legacy_behaviour_without_a_strategy():
+    # An args object that never went through _ensure_callback_args_compat has no
+    # eval_strategy at all; the cadence must not silently disable itself.
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = types.SimpleNamespace()
+    assert trainer._static_eval_cadence_enabled() is True
+    assert trainer._eval_delay_satisfied(1) is True
+    # IntervalStrategy is a str Enum, so both spellings normalize.
+    from transformers.trainer_utils import IntervalStrategy
+
+    trainer.args = types.SimpleNamespace(eval_strategy=IntervalStrategy.STEPS)
+    assert trainer._static_eval_cadence_enabled() is True
+    trainer.args = types.SimpleNamespace(eval_strategy=IntervalStrategy.EPOCH)
+    assert trainer._static_eval_cadence_enabled() is False
+    trainer.args = types.SimpleNamespace(eval_strategy="steps", eval_delay="oops")
+    assert trainer._eval_delay_satisfied(0) is True
+
+
+def test_on_prediction_step_fires_once_per_eval_batch():
+    # HF dispatches on_prediction_step after every evaluation batch from
+    # Trainer.evaluation_loop. Stock ProgressCallback advances its evaluation
+    # bar from it, and per-batch evaluation instrumentation hooks into it, so an
+    # evaluation that only emits on_log/on_evaluate silently drops both.
+    import inspect
+
+    import mlx.core as mx
+    from transformers import Trainer
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLXCallbackHandler,
+    )
+
+    assert "callback_handler.on_prediction_step" in inspect.getsource(
+        Trainer.evaluation_loop
+    )
+
+    class PredictionSpy:
+        def __init__(self):
+            self.seen = []
+
+        def on_prediction_step(self, args, state, control, eval_dataloader=None, **kw):
+            self.seen.append(eval_dataloader)
+            return control
+
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8),
+    )
+    spy = PredictionSpy()
+    trainer.callback_handler = _MLXCallbackHandler(
+        [spy], model=None, processing_class=None, optimizer=None, lr_scheduler=None,
+    )
+    batches = ["batch-0", "batch-1", "batch-2"]
+    trainer.callback_handler.eval_dataloader = batches
+
+    def _loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(1.0), mx.array(4)
+
+    def _unpack(batch):
+        return batch, None, None
+
+    _, ntokens = trainer._evaluate_batch_totals(
+        [_unpack(b) for b in batches], _loss_fn,
+    )
+    assert int(ntokens.item()) == 12
+    # One dispatch per evaluation batch, carrying the handler's eval_dataloader
+    # so ProgressCallback's has_length(eval_dataloader) guard sees a real total.
+    assert spy.seen == [batches, batches, batches]
+
+
+def test_on_prediction_step_failure_uses_the_eval_consensus_path():
+    # A callback that raises on one rank must join the same eval-status
+    # consensus as a failed batch, or the peers block in the next collective.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._evaluate_batch_totals)
+    dispatch = src.index("self._fire_prediction_step()")
+    guard = src.index("except BaseException as exc:", src.index("if not failed"))
+    status = src.index("self._distributed_eval_status(failed)")
+    assert dispatch < guard < status, "dispatch must feed the eval consensus"
+
+
+def test_eval_dataloader_tracks_the_split_being_evaluated():
+    # HF rebuilds its eval_dataloader per split, so on_prediction_step reports
+    # the split being consumed; the dict itself has len == split count, which
+    # would give ProgressCallback a nonsense bar total.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLXCallbackHandler,
+    )
+
+    class PredictionSpy:
+        def __init__(self):
+            self.seen = []
+
+        def on_prediction_step(self, args, state, control, eval_dataloader=None, **kw):
+            self.seen.append(list(eval_dataloader))
+            return control
+
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8),
+    )
+    spy = PredictionSpy()
+    trainer.callback_handler = _MLXCallbackHandler(
+        [spy], model=None, processing_class=None, optimizer=None, lr_scheduler=None,
+    )
+    splits = {
+        "a": [("a0", None, None)],
+        "b": [("b0", None, None), ("b1", None, None)],
+    }
+    trainer.callback_handler.eval_dataloader = splits
+    trainer.model = types.SimpleNamespace(
+        eval=lambda: None, train=lambda: None,
+    )
+
+    def _loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(1.0), mx.array(4)
+
+    trainer._evaluate(splits, _loss_fn)
+    assert spy.seen == [splits["a"], splits["b"], splits["b"]]
+    # Restored afterwards, so a later single-split eval is not left pointing at
+    # the last split.
+    assert trainer.callback_handler.eval_dataloader is splits
