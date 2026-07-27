@@ -153,6 +153,54 @@ class _MLXTrainerState:
     stateful_callbacks: dict = field(default_factory=dict)
 
 
+# Probed once from the installed DefaultFlowCallback; None until first asked.
+_DEFAULT_FLOW_FINAL_STEP_EVAL = None
+
+
+def _default_flow_evaluates_final_step():
+    """Whether the installed DefaultFlowCallback forces a final-step evaluation.
+
+    transformers 5.x evaluates again at ``state.global_step >= state.max_steps``
+    when the step interval did not already land there; 4.x has no such block.
+    Ask the shipped callback rather than pinning a version, so the loop's own
+    cadence tracks whichever transformers is installed and a with-flow run and a
+    without-flow run always agree.
+
+    Probed by running the real callback: it reads plain attributes, so the
+    torch-free _MLXTrainerState/_MLXTrainerControl stand in for HF's own and the
+    probe adds no import to the module. No transformers -- or a future one that
+    reads an argument this stand-in lacks -- keeps the 4.x answer, which is what
+    the loop did before this cadence existed.
+    """
+    global _DEFAULT_FLOW_FINAL_STEP_EVAL
+    if _DEFAULT_FLOW_FINAL_STEP_EVAL is None:
+        _DEFAULT_FLOW_FINAL_STEP_EVAL = False
+        try:
+            from transformers.trainer_callback import DefaultFlowCallback
+
+            class _FlowProbeArgs:
+                eval_strategy = "steps"
+                eval_delay = 0
+                logging_strategy = "no"
+                logging_first_step = False
+                save_strategy = "no"
+
+            # 6 % 4 != 0, so only the final-step block can raise the request.
+            control = _MLXTrainerControl()
+            DefaultFlowCallback().on_step_end(
+                _FlowProbeArgs(),
+                _MLXTrainerState(
+                    global_step=6, max_steps=6,
+                    logging_steps=4, eval_steps=4, save_steps=4,
+                ),
+                control,
+            )
+            _DEFAULT_FLOW_FINAL_STEP_EVAL = bool(control.should_evaluate)
+        except Exception:
+            pass
+    return _DEFAULT_FLOW_FINAL_STEP_EVAL
+
+
 def _resolve_interval_steps(value, total_steps):
     """Resolve an HF-style step interval to an absolute number of steps.
 
@@ -2326,6 +2374,23 @@ class MLXTrainer:
         """Whether the loop's own save_steps cadence applies."""
         return self._static_cadence_enabled("save_strategy")
 
+    def _best_save_strategy_enabled(self):
+        """Whether save_strategy asks for HF's save-on-improvement rule.
+
+        SaveStrategy.BEST (transformers >= 4.47) is the one member
+        DefaultFlowCallback never raises: its on_step_end and on_epoch_end act
+        on STEPS and EPOCH only, so HF's Trainer core decides this one itself,
+        immediately after the evaluation that produced the metric. Gating the
+        static cadence on the strategy therefore left "best" with no cadence at
+        all -- the same hole the epoch cadence fills for "epoch". Same str-Enum
+        normalization as the other two; a missing field is not "best".
+        """
+        strategy = getattr(self.args, "save_strategy", None)
+        if strategy is None:
+            return False
+        strategy = getattr(strategy, "value", strategy)
+        return str(strategy).lower() == "best"
+
     def _epoch_cadence_enabled(self, name):
         """Whether a strategy field asks for HF's epoch cadence.
 
@@ -2391,6 +2456,66 @@ class MLXTrainer:
                 self.control.should_evaluate = True
         if self._epoch_cadence_enabled("save_strategy"):
             self.control.should_save = True
+
+    def _request_step_cadence_actions(self):
+        """Raise the non-interval requests DefaultFlowCallback.on_step_end makes.
+
+        The loop's static interval (see _static_cadence_enabled) covers the
+        periodic half of DefaultFlowCallback.on_step_end. This covers the rest:
+        the logging_first_step log at step 1, and the save/eval HF forces once
+        state.global_step reaches state.max_steps. MLXTrainer installs no flow
+        callback of its own, so without these a run whose interval does not
+        divide the step budget silently lost its LAST resumable checkpoint --
+        checkpoint-<max_steps> and its on_save, the one an interrupted run
+        resumes from, which the unconditional final save_model() cannot replace
+        because it holds adapters only, no optimizer or trainer state -- and, on
+        a transformers that forces one, the final evaluation that
+        load_best_model_at_end and EarlyStoppingCallback read last.
+
+        Deduplicated against an installed flow exactly like
+        _request_epoch_cadence_actions: these are the control flags
+        DefaultFlowCallback sets, so both requests coalesce into the single
+        boolean the loop clears when it runs the action -- one on_save, one
+        checkpoint-N write, one eval_loss in log_history. Callers raise it
+        immediately BEFORE on_step_end, which is where the flow raises it (index
+        0 of the callback list), so the callbacks that follow observe the same
+        control state they would under HF.
+
+        The final-step test reads state.max_steps, the same fixed field HF's
+        flow tests, not the loop's live budget: a run whose budget
+        _honor_epoch_stop_skip shrank stops short of max_steps and gets no
+        forced final action, with or without a flow installed.
+
+        DDP-safe with no collective of its own: args and state are
+        rank-consistent, and every call site sits on the near side of the
+        _distributed_sync_control_actions() that follows the on_step_end fire.
+        """
+        args = self.args
+        current_step = int(getattr(self.state, "global_step", 0) or 0)
+        # Deliberately not gated on logging_strategy: HF raises the first-step
+        # log before it tests the strategy, so "no" and "epoch" log step 1 too.
+        if current_step == 1 and getattr(args, "logging_first_step", False):
+            self.control.should_log = True
+        max_steps = int(getattr(self.state, "max_steps", 0) or 0)
+        if max_steps <= 0 or current_step < max_steps:
+            return
+        # HF forces the final save from the strategy alone, with no save_steps
+        # guard, so an interval that does not divide the budget still leaves a
+        # checkpoint at the end.
+        if self._static_save_cadence_enabled():
+            self.control.should_save = True
+        eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
+        if (
+            _default_flow_evaluates_final_step()
+            # HF skips the forced eval when the interval already evaluated here.
+            # Its modulo has no zero guard; a 0 interval means "never" for the
+            # loop's own cadence, so keep it meaning that rather than raising.
+            and eval_steps > 0
+            and current_step % eval_steps != 0
+            and self._static_eval_cadence_enabled()
+            and self._eval_delay_satisfied(current_step)
+        ):
+            self.control.should_evaluate = True
 
     def _eval_delay_satisfied(self, current_step):
         """Whether HF's eval_delay allows the step cadence to evaluate yet.
@@ -2648,13 +2773,20 @@ class MLXTrainer:
             self.state.stateful_callbacks = dict(stateful_callbacks)
 
     def _update_callback_best_metric(self, metrics):
-        """Update TrainerState.best_metric after eval callbacks inspect prior state."""
+        """Update TrainerState.best_metric after eval callbacks inspect prior state.
+
+        Returns whether this evaluation is a new best, like HF's
+        _determine_best_metric, so save_strategy="best" can act on it. No
+        configured metric and a NaN both mean "not a new best", which is also
+        what HF concludes (metric_for_best_model None short-circuits its
+        is_new_best_metric to False, and np.less/np.greater are False on NaN).
+        """
         metric_name = self._metric_for_best_model_name(metrics, require=False)
         if metric_name is None:
-            return
+            return False
         value = metrics[metric_name]
         if value != value:
-            return
+            return False
         greater = bool(getattr(self.args, "greater_is_better", False))
         improved = (
             self.state.best_metric is None
@@ -2663,6 +2795,7 @@ class MLXTrainer:
         if improved:
             self.state.best_metric = value
             self.state.best_global_step = self.state.global_step
+        return improved
 
     @staticmethod
     def _apply_compile_recommendations(args, decision):
@@ -4899,15 +5032,29 @@ class MLXTrainer:
                 getattr(self, "_streaming_epoch_batch_count", 0) or 0
             ) or None
         # A streaming run with NO known length has no dataset boundaries, so
-        # batches_per_epoch stays None and epoch events stay off -- but state.epoch
-        # must still be numeric: HF falls back to
-        # steps_in_epoch = max_steps * grad_accum for a length-less dataloader, and
-        # WandbCallback.on_save does round(state.epoch, 2), a TypeError on None.
+        # batches_per_epoch stays None -- but HF still runs ONE conceptual epoch
+        # over a synthetic horizon: steps_in_epoch = max_steps * grad_accum for a
+        # length-less dataloader, and num_train_epochs = sys.maxsize only means
+        # "re-iterate as needed", so its `for epoch in range(...)` body runs
+        # exactly once and fires one on_epoch_begin / on_epoch_end around it
+        # (transformers _inner_training_loop; measured identical on 4.x and 5.x).
+        # state.epoch needs the same quantity anyway, since WandbCallback.on_save
+        # does round(state.epoch, 2) and raises TypeError on None.
         stream_epoch_microbatches = None
         if not batches_per_epoch and batch_iter is not None:
             _stream_max_steps = int(getattr(args, "max_steps", 0) or 0)
             if _stream_max_steps > 0:
                 stream_epoch_microbatches = _stream_max_steps * grad_accum
+        # Length in micro-batches of the epoch the CALLBACK lifecycle uses, which
+        # is the real dataset pass when there is one and HF's synthetic horizon
+        # otherwise. Kept as a separate name from batches_per_epoch on purpose:
+        # honoring control.should_epoch_stop skips to the next boundary, and for
+        # a length-less stream that means draining micro-batches out of a
+        # producer that cannot replay them (HF restarts its iterator instead), so
+        # _honor_epoch_stop_skip and its two gates stay on batches_per_epoch.
+        # Equal to batches_per_epoch whenever that is set, so every materialized
+        # and declared-length run is unaffected.
+        epoch_event_microbatches = batches_per_epoch or stream_epoch_microbatches
 
         def _run_callback_epoch_begin(epoch_value):
             """Dispatch one epoch-begin event at a dataset boundary (rank 0)."""
@@ -4920,16 +5067,20 @@ class MLXTrainer:
 
         def _maybe_callback_epoch_begin(microstep):
             """Dispatch epoch-begin at finite dataset boundaries."""
-            if not batches_per_epoch or (microstep - 1) % batches_per_epoch != 0:
+            if (not epoch_event_microbatches
+                    or (microstep - 1) % epoch_event_microbatches != 0):
                 return False
-            _run_callback_epoch_begin((microstep - 1) / batches_per_epoch)
+            _run_callback_epoch_begin(
+                (microstep - 1) / epoch_event_microbatches
+            )
             return True
 
         def _maybe_callback_epoch_end(microstep, current_step, grad_norm):
             """Dispatch epoch-end after an optimizer step at a dataset boundary."""
-            if not batches_per_epoch or microstep % batches_per_epoch != 0:
+            if (not epoch_event_microbatches
+                    or microstep % epoch_event_microbatches != 0):
                 return
-            self.state.epoch = microstep / batches_per_epoch
+            self.state.epoch = microstep / epoch_event_microbatches
             # The loop's own "epoch" strategy cadence, raised where HF's flow
             # raises it and folded into the same control flags, so it is a no-op
             # when a DefaultFlowCallback is installed to raise it too.
@@ -5131,7 +5282,23 @@ class MLXTrainer:
             # and hang at the collective. Mirrors the on_log sync in
             # _run_training_log; no-op at world size 1.
             self._distributed_sync_control_actions()
-            self._update_callback_best_metric(metrics)
+            improved = self._update_callback_best_metric(metrics)
+            # save_strategy="best" (SaveStrategy.BEST): DefaultFlowCallback never
+            # raises this one -- its on_step_end/on_epoch_end act on STEPS and
+            # EPOCH only -- so HF's Trainer core decides it here, right after the
+            # evaluation, and it ASSIGNS rather than ORs: `self.control.should_save
+            # = is_new_best_metric` (transformers _maybe_log_save_evaluate,
+            # identical in 4.x and 5.x). The assignment matters -- an evaluation
+            # that did not improve also CLEARS a save some other source requested
+            # for this same step, which is how "best" writes only improving
+            # checkpoints. Gating the static cadence on the strategy would
+            # otherwise leave "best" with no cadence at all, the same hole the
+            # epoch cadence fills for "epoch". Rank-consistent: metrics are
+            # already all-reduced and state.best_metric advances identically on
+            # every rank, so this needs no collective and cannot undo the sync
+            # above on a subset.
+            if self._best_save_strategy_enabled():
+                self.control.should_save = improved
             # An external cancel arriving before/during eval is OR-reduced here so
             # every rank agrees on stop_requested before the divergent best-model /
             # early-stopping branch in _run_best_tracking (its rank-0-guarded best
@@ -5580,8 +5747,10 @@ class MLXTrainer:
         # unpaired on_epoch_end. HF dispatches on_epoch_begin for the resumed
         # partial epoch too, before skipping its trained batches. A stop set here
         # is drained by the loop's first _distributed_should_stop().
-        if batches_per_epoch and microstep % batches_per_epoch:
-            _run_callback_epoch_begin(float(microstep // batches_per_epoch))
+        if epoch_event_microbatches and microstep % epoch_event_microbatches:
+            _run_callback_epoch_begin(
+                float(microstep // epoch_event_microbatches)
+            )
         while self._global_step < total_steps:
             it = microstep + 1
             if self._distributed_should_stop() or self._early_stopped:
@@ -5927,10 +6096,13 @@ class MLXTrainer:
             # reporting an epoch a micro-batch ahead of the last completed step.
             # Epoch boundaries are unaffected: _maybe_callback_epoch_end and the
             # truncated-epoch closes set the epoch themselves before firing.
-            if batches_per_epoch:
-                self.state.epoch = it / batches_per_epoch
-            elif stream_epoch_microbatches:
-                self.state.epoch = it / stream_epoch_microbatches
+            if epoch_event_microbatches:
+                self.state.epoch = it / epoch_event_microbatches
+            # The loop's own step cadence for the two requests the static
+            # interval below cannot express -- logging_first_step and the
+            # final-step force -- raised where HF's flow raises them and folded
+            # into the same control flags, so an installed flow coalesces.
+            self._request_step_cadence_actions()
             _fire("on_step_end")
             # on_step_end may request log/eval/save or a stop, and a rank-dependent
             # callback can do so on a subset. Sync those decisions before the
@@ -6050,16 +6222,17 @@ class MLXTrainer:
         # fires on_epoch_end for the truncated epoch after its inner step loop
         # breaks (transformers _inner_training_loop), so mirror it here before the
         # final metric flush and on_train_end. A natural boundary already fired it
-        # (microstep % batches_per_epoch == 0), as did the should_epoch_stop skip
-        # (which advances microstep to a boundary), so the guard prevents a double
-        # fire. batches_per_epoch and microstep are rank-consistent, so on_epoch_end
-        # and its synced log/eval/save run in DDP lockstep. A streaming run without
-        # a known length has batches_per_epoch = None and never fires epoch
-        # callbacks, so it is unaffected; a declared-length streaming epoch run
-        # carries the same boundaries as a materialized one and closes its final
-        # epoch here on the same terms.
-        if batches_per_epoch and microstep % batches_per_epoch != 0:
-            self.state.epoch = microstep / batches_per_epoch
+        # (microstep % epoch_event_microbatches == 0), as did the should_epoch_stop
+        # skip (which advances microstep to a boundary), so the guard prevents a
+        # double fire. Both quantities are rank-consistent, so on_epoch_end and its
+        # synced log/eval/save run in DDP lockstep. A declared-length streaming
+        # epoch run carries the same boundaries as a materialized one and closes
+        # its final epoch here on the same terms; a length-less stream stopped
+        # short of its synthetic horizon closes that horizon's epoch here, as HF
+        # does after its own should_training_stop break.
+        if (epoch_event_microbatches
+                and microstep % epoch_event_microbatches != 0):
+            self.state.epoch = microstep / epoch_event_microbatches
             # Same for the truncated final epoch: HF's on_epoch_end after the
             # inner loop breaks feeds _maybe_log_save_evaluate, so an "epoch"
             # strategy still gets this boundary's action.

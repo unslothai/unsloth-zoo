@@ -4571,15 +4571,15 @@ def test_on_epoch_end_fires_for_truncated_final_epoch():
     # on_epoch_end for a truncated final epoch after its inner step loop breaks
     # (max_steps ending mid-dataset, or a should_training_stop mid-epoch). The MLX
     # loop's only in-loop on_epoch_end dispatch is gated on
-    # microstep % batches_per_epoch == 0, so a mid-epoch exit would drop the event.
-    # Assert a post-loop dispatch closes the open epoch, guarded against a double
-    # fire at a natural boundary, before on_train_end.
+    # microstep % epoch_event_microbatches == 0, so a mid-epoch exit would drop
+    # the event. Assert a post-loop dispatch closes the open epoch, guarded
+    # against a double fire at a natural boundary, before on_train_end.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     src = inspect.getsource(MLXTrainer._train_inner)
     tail = src[src.index("Close a truncated final epoch"):src.index("avg_loss = (")]
-    assert "microstep % batches_per_epoch != 0" in tail
+    assert "microstep % epoch_event_microbatches != 0" in tail
     assert '_fire("on_epoch_end")' in tail
     # The counter is advanced before the stop-break so a callback-stop exit still
     # leaves microstep pointing at the finished step for the guard above (the
@@ -9315,32 +9315,15 @@ def test_declared_length_streaming_honors_should_epoch_stop(monkeypatch):
     assert trainer.train_dataset.epochs == [0, 1, 2]
 
 
-def test_unsized_streaming_keeps_epoch_events_off_with_a_numeric_epoch(monkeypatch):
-    # Guard the guard for the fix above: a stream with NO declared length still
-    # has no dataset boundaries, so epoch events must stay off (HF has none
-    # either -- num_train_epochs = sys.maxsize and steps_in_epoch =
-    # max_steps * grad_accum for a length-less dataloader) while state.epoch stays
-    # numeric so round(state.epoch, 2) in WandbCallback.on_save still works.
+def _run_unsized_streaming_epoch_probe(monkeypatch, spy, **strategy_overrides):
+    """Drive a length-less streaming max_steps run and return the trainer.
+
+    strategy_overrides are hand-set on trainer.args after construction, the
+    route _sync_synthesized_arg preserves for a caller-supplied strategy.
+    """
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     _patch_value_and_grad_with_aux(monkeypatch)
-
-    class EpochSpy:
-        def __init__(self):
-            self.epoch_events = 0
-            self.epochs = []
-
-        def on_epoch_begin(self, args, state, control, **kwargs):
-            self.epoch_events += 1
-            return control
-
-        def on_epoch_end(self, args, state, control, **kwargs):
-            self.epoch_events += 1
-            return control
-
-        def on_step_end(self, args, state, control, **kwargs):
-            self.epochs.append(round(state.epoch, 2))
-            return control
 
     rows = [{"text": f"{value} {value + 10} {value + 20}"} for value in range(1, 7)]
     args = MLXTrainingConfig(
@@ -9352,6 +9335,7 @@ def test_unsized_streaming_keeps_epoch_events_off_with_a_numeric_epoch(monkeypat
         completion_only_loss=False,
         dataset_order="sequential",
         logging_steps=1000,
+        save_steps=1000,
         use_cce=False,
         compile=False,
         gradient_checkpointing=False,
@@ -9361,21 +9345,117 @@ def test_unsized_streaming_keeps_epoch_events_off_with_a_numeric_epoch(monkeypat
         disable_memory_limits=True,
         output_dir=tempfile.mkdtemp(),
     )
-    spy = EpochSpy()
     trainer = MLXTrainer(
         _tiny_lm_for_loop_tests(),
         _streaming_text_tokenizer(),
-        _CountingTextRows(rows),
+        _CountingTextRows(rows, infinite=True),
         args=args,
         callbacks=[spy],
     )
+    for name, value in strategy_overrides.items():
+        setattr(trainer.args, name, value)
     trainer.save_model = lambda *_a, **_kw: None
+    trainer._save_checkpoint = lambda *_a, **_kw: None
     trainer._build_optimizer = _frozen_optimizer()
     trainer.train()
+    return trainer
+
+
+class _UnsizedStreamEpochSpy:
+    def __init__(self):
+        self.epoch_begin = []
+        self.epoch_end = []
+        self.epochs = []
+        self.saves = []
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        self.epoch_begin.append((state.global_step, round(state.epoch, 2)))
+        return control
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        self.epoch_end.append((state.global_step, round(state.epoch, 2)))
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self.epochs.append(round(state.epoch, 2))
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        self.saves.append((state.global_step, round(state.epoch, 2)))
+        return control
+
+
+def test_unsized_streaming_dispatches_one_synthetic_epoch(monkeypatch):
+    # Regression: a length-less stream has no dataset boundaries, so the loop
+    # kept batches_per_epoch None and fired NO epoch events at all. HF still runs
+    # one conceptual epoch over the synthetic horizon
+    # steps_in_epoch = max_steps * grad_accum: num_train_epochs = sys.maxsize only
+    # means "re-iterate as needed", and the step budget is exhausted inside the
+    # first pass of `for epoch in range(...)`, so exactly one on_epoch_begin and
+    # one on_epoch_end fire. Suppressing them left every on_epoch_* callback dead
+    # and made logging_strategy/eval_strategy/save_strategy="epoch" silently do
+    # nothing for the whole run.
+    # Goldens measured by running a real transformers.Trainer over an unsized
+    # IterableDataset at max_steps=6, grad_accum=1 -- identical on 4.57.6 and
+    # 5.14.1: on_epoch_begin (0, 0.0), on_epoch_end (6, 1.0), num_train_epochs
+    # sys.maxsize, final state.epoch 1.0.
+    spy = _UnsizedStreamEpochSpy()
+    trainer = _run_unsized_streaming_epoch_probe(
+        monkeypatch, spy, save_strategy="no",
+    )
 
     assert trainer._streaming_epoch_batch_count is None
-    assert spy.epoch_events == 0
+    assert spy.epoch_begin == [(0, 0.0)], spy.epoch_begin
+    assert spy.epoch_end == [(3, 1.0)], spy.epoch_end
+    # state.epoch is unchanged, and stays numeric so round(state.epoch, 2) in
+    # WandbCallback.on_save still works.
     assert spy.epochs == [0.33, 0.67, 1.0]
+
+
+def test_unsized_streaming_epoch_strategy_acts_on_the_synthetic_boundary(monkeypatch):
+    # The point of dispatching the lifecycle: an "epoch" strategy now gets its
+    # boundary action, matching the real transformers.Trainer, which fires
+    # on_save and on_evaluate at the close of the same synthetic epoch.
+    # "no" is the control -- the interval is far past the run and the strategy
+    # is not "steps", so nothing else can produce a save here.
+    for strategy, expected in (("no", []), ("epoch", [(3, 1.0)])):
+        spy = _UnsizedStreamEpochSpy()
+        _run_unsized_streaming_epoch_probe(
+            monkeypatch, spy, save_strategy=strategy,
+        )
+        assert spy.saves == expected, (strategy, spy.saves)
+
+
+def test_unsized_streaming_epoch_events_do_not_enable_the_producer_drain(monkeypatch):
+    # The synthetic horizon drives the epoch LIFECYCLE only. Honoring
+    # control.should_epoch_stop skips to the next boundary, and for a length-less
+    # stream _honor_epoch_stop_skip has no index to fast-forward: it drains
+    # micro-batches out of a producer that cannot replay them, where HF simply
+    # rebuilds its iterator. So the two gates stay on batches_per_epoch, and the
+    # rows pulled from the source must not change.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert src.count("if batches_per_epoch and _sync_epoch_stop():") == 2, src.count(
+        "if batches_per_epoch and _sync_epoch_stop():"
+    )
+    assert "epoch_event_microbatches and _sync_epoch_stop()" not in src
+
+    class _StopEpochAtStep1(_UnsizedStreamEpochSpy):
+        def on_step_end(self, args, state, control, **kwargs):
+            super().on_step_end(args, state, control, **kwargs)
+            if state.global_step == 1:
+                control.should_epoch_stop = True
+            return control
+
+    spy = _StopEpochAtStep1()
+    trainer = _run_unsized_streaming_epoch_probe(monkeypatch, spy)
+    # The callback's request is simply not honorable here, exactly as before, so
+    # the source is read straight through and nothing is silently discarded.
+    assert trainer.train_dataset.pulls == 6, trainer.train_dataset.pulls
+    assert trainer._global_step == 3
 
 
 def test_no_consensus_site_captures_bare_exception():
@@ -9679,7 +9759,7 @@ def test_static_log_and_save_cadences_keep_legacy_behaviour_without_a_strategy()
 def _run_log_save_cadence_probe(
     monkeypatch, *, logging_steps, save_steps, total_steps=6,
     steps_per_epoch=3, eval_steps=None, with_flow=True, extra_callbacks=(),
-    **arg_overrides,
+    eval_losses=None, **arg_overrides,
 ):
     """Run the real loop and report the steps that logged, saved and evaluated.
 
@@ -9777,12 +9857,16 @@ def _run_log_save_cadence_probe(
     trainer.save_model = lambda *_a, **_kw: None
     if eval_steps is not None:
         trainer._eval_batches_labeled = ["batch-0"]
+        # eval_losses drives a controlled improve/worsen sequence, which is what
+        # the "best" save strategy keys on; the default is a flat metric.
+        losses = list(eval_losses or ())
 
         def _fake_evaluate(batches, loss_fn, is_vlm=False):
+            loss = losses.pop(0) if losses else 1.25
             trainer._last_eval_metrics = {
-                "eval_loss": 1.25, "eval_perplexity": 3.5,
+                "eval_loss": loss, "eval_perplexity": 3.5,
             }
-            return 1.25, 3.5
+            return loss, 3.5
 
         trainer._evaluate = _fake_evaluate
     result = trainer.train()
@@ -9871,31 +9955,39 @@ _CADENCE_AXES = (
 )
 
 
-def _run_one_axis_cadence_probe(monkeypatch, action, strategy, *, with_flow):
+_CADENCE_INTERVAL_FIELD = {
+    "log": "logging_steps", "save": "save_steps", "evaluate": "eval_steps",
+}
+
+
+def _run_one_axis_cadence_probe(
+    monkeypatch, action, strategy, *, with_flow, interval=2, **extra,
+):
     """Probe one cadence axis at one strategy, with/without the HF flow."""
     field = dict((a, f) for a, f, _ in _CADENCE_AXES)[action]
     key = dict((a, k) for a, _, k in _CADENCE_AXES)[action]
-    # Every axis gets an interval of 2 on a 6-step/3-per-epoch run, so "steps"
-    # (2, 4, 6) and "epoch" (3, 6) cannot be confused. The other two axes keep
-    # an interval far past the run so they never interfere.
-    # 2 divides 6 deliberately: DefaultFlowCallback.on_step_end ALSO forces a
-    # final-step save (both 4.x and 5.x) and, on 5.x, a final-step evaluation
-    # once state.global_step >= state.max_steps. The loop has no equivalent of
-    # that tail, so an interval that does not divide total_steps would compare
-    # the epoch cadence against a separate, still-open gap on the steps axis.
+    # The probed axis gets `interval` on a 6-step/3-per-epoch run, so "steps"
+    # and "epoch" (3, 6) cannot be confused. The other two axes keep an interval
+    # far past the run so they never interfere.
+    # Both intervals are swept: 2 divides 6, 4 does not, and
+    # DefaultFlowCallback.on_step_end forces a final-step save (4.x and 5.x)
+    # and, on 5.x, a final-step evaluation once state.global_step reaches
+    # state.max_steps. The divisible interval hides that tail entirely, which is
+    # why the loop's missing copy of it survived a matrix that only swept 2.
     kwargs = dict(logging_steps=10 ** 6, save_steps=10 ** 6, with_flow=with_flow)
-    kwargs[{"log": "logging_steps", "save": "save_steps",
-            "evaluate": "eval_steps"}[action]] = 2
+    kwargs[_CADENCE_INTERVAL_FIELD[action]] = interval
     kwargs[field] = strategy
+    kwargs.update(extra)
     return _run_log_save_cadence_probe(monkeypatch, **kwargs)[key]
 
 
-def _hf_cadence_reference(action, strategy):
+def _hf_cadence_reference(action, strategy, interval=2, **fields):
     """HF's cadence for one axis, from the installed DefaultFlowCallback."""
     field = dict((a, f) for a, f, _ in _CADENCE_AXES)[action]
-    steps_field = {"log": "logging_steps", "save": "save_steps",
-                   "evaluate": "eval_steps"}[action]
-    expected = _hf_flow_steps(action, **{field: strategy, steps_field: 2})
+    fields = {
+        field: strategy, _CADENCE_INTERVAL_FIELD[action]: interval, **fields,
+    }
+    expected = _hf_flow_steps(action, **fields)
     if action == "log":
         # The loop always flushes the run's last window at the final step so the
         # returned train_loss covers it, whatever the strategy (see
@@ -9917,19 +10009,25 @@ def test_epoch_cadence_fires_without_a_default_flow_callback(monkeypatch):
     # whether or not a flow callback happens to be installed.
     # Collected rather than asserted per cell so a failure names every cell that
     # drifted, not just the first.
+    # Both a step interval that divides the 6-step budget and one that does not
+    # (4), because DefaultFlowCallback's final-step force only shows up in the
+    # second -- see test_step_cadence_forces_the_final_step_action.
     mismatches = []
     for action, _field, _key in _CADENCE_AXES:
         for strategy in ("steps", "epoch", "no"):
-            expected = _hf_cadence_reference(action, strategy)
-            for with_flow in (True, False):
-                got = _run_one_axis_cadence_probe(
-                    monkeypatch, action, strategy, with_flow=with_flow,
-                )
-                if got != expected:
-                    mismatches.append(
-                        (action, strategy, "with_flow" if with_flow
-                         else "no_flow", got, expected)
+            for interval in (2, 4):
+                expected = _hf_cadence_reference(action, strategy, interval)
+                for with_flow in (True, False):
+                    got = _run_one_axis_cadence_probe(
+                        monkeypatch, action, strategy,
+                        with_flow=with_flow, interval=interval,
                     )
+                    if got != expected:
+                        mismatches.append(
+                            (action, strategy, interval,
+                             "with_flow" if with_flow else "no_flow",
+                             got, expected)
+                        )
     assert mismatches == [], mismatches
     # The strategies really are distinguishable at these parameters on every
     # axis, so the assertions above cannot pass by coincidence.
@@ -9940,6 +10038,347 @@ def test_epoch_cadence_fires_without_a_default_flow_callback(monkeypatch):
         assert _hf_cadence_reference(action, "no") == (
             [6] if action == "log" else []
         ), action
+        # And the non-divisible interval keeps the epoch cadence distinct from
+        # the steps one, so the added cells test something the old ones did not.
+        assert _hf_cadence_reference(action, "epoch", 4) == [3, 6], action
+        assert 4 in _hf_cadence_reference(action, "steps", 4), action
+
+
+def test_step_cadence_forces_the_final_step_action(monkeypatch):
+    # Regression: DefaultFlowCallback.on_step_end forces a save once
+    # state.global_step reaches state.max_steps whenever save_strategy is
+    # "steps" (4.x and 5.x), and 5.x forces an evaluation too when the interval
+    # did not already land there. MLXTrainer installs no flow callback, so with
+    # an interval that does not divide the budget the run wrote no
+    # checkpoint-<max_steps> -- the LAST resumable checkpoint, and the only one
+    # carrying optimizer/trainer state, since the unconditional final
+    # save_model() writes adapters alone -- and dispatched no on_save for it. On
+    # 5.x the final evaluation went missing too, so load_best_model_at_end could
+    # restore a stale earlier model and early-stopping/reporting callbacks never
+    # saw the run's last metrics. An interval of 4 over 6 steps is exactly that
+    # gap; the divisible interval the older matrix swept hid it.
+    mismatches = []
+    for action in ("save", "evaluate"):
+        expected = _hf_cadence_reference(action, "steps", 4)
+        for with_flow in (True, False):
+            got = _run_one_axis_cadence_probe(
+                monkeypatch, action, "steps", with_flow=with_flow, interval=4,
+            )
+            if got != expected:
+                mismatches.append(
+                    (action, "with_flow" if with_flow else "no_flow",
+                     got, expected)
+                )
+    assert mismatches == [], mismatches
+    # on_save must advertise exactly the checkpoints that exist on disk, and the
+    # final one is the point of the fix.
+    for with_flow in (True, False):
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=4,
+            save_strategy="steps", with_flow=with_flow,
+        )
+        assert probe["saved"] == [4, 6], (with_flow, probe["saved"])
+        assert probe["checkpoints"] == [4, 6], (with_flow, probe["checkpoints"])
+    # The save axis forces the final step on every supported transformers, so
+    # this cell pins the shape of the fix and cannot pass by coincidence.
+    assert _hf_cadence_reference("save", "steps", 4) == [4, 6]
+    # The eval axis is the 4.x/5.x split, so it stays derived: 5.x forces the
+    # final evaluation, 4.x has no such block. The loop's own answer must be the
+    # installed callback's answer.
+    from unsloth_zoo.mlx.trainer import _default_flow_evaluates_final_step
+
+    eval_reference = _hf_cadence_reference("evaluate", "steps", 4)
+    assert eval_reference in ([4], [4, 6]), eval_reference
+    assert (eval_reference == [4, 6]) is _default_flow_evaluates_final_step()
+
+
+def test_step_cadence_does_not_force_a_budget_the_run_never_reached(monkeypatch):
+    # The forced action is keyed on state.max_steps -- the same fixed field HF's
+    # flow tests -- not on "the last step this run happened to execute". A run
+    # that a callback stops early, or one whose budget _honor_epoch_stop_skip
+    # shrank (epoch-count runs only), ends below max_steps and gets no forced
+    # save from HF, because the flow's block never fires. Keying the loop's copy
+    # on the live budget would save there anyway and put the with-flow and
+    # without-flow cadences back out of step.
+    class _StopAtStep4:
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == 4:
+                control.should_training_stop = True
+            return control
+
+    runs = {}
+    for with_flow in (True, False):
+        runs[with_flow] = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+            save_strategy="steps", with_flow=with_flow,
+            extra_callbacks=[_StopAtStep4()],
+        )
+        # No interval lands inside the run, so any checkpoint here could only be
+        # the forced one -- and the truncated end must not force it.
+        assert runs[with_flow]["saved"] == [], (
+            with_flow, runs[with_flow]["saved"],
+        )
+        assert runs[with_flow]["checkpoints"] == [], with_flow
+        # The run really did stop short of the budget, so the guard is live.
+        state = runs[with_flow]["state"]
+        assert state.global_step == 4 < state.max_steps, (
+            with_flow, state.global_step, state.max_steps,
+        )
+    # And the same run carried to completion does force it, so the assertions
+    # above are about the truncation and not about the fix being inert.
+    assert _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+        save_strategy="steps", with_flow=False,
+    )["saved"] == [6]
+
+
+def test_step_cadence_honors_logging_first_step(monkeypatch):
+    # Regression: DefaultFlowCallback.on_step_end raises should_log at
+    # state.global_step == 1 when args.logging_first_step, BEFORE it tests
+    # logging_strategy -- so "no" and "epoch" log step 1 as well.
+    # _ensure_callback_args_compat exposes and preserves the flag, but the
+    # loop's own cadence only logged interval multiples plus its final-window
+    # flush, so step 1 was silently dropped whenever logging_steps > 1.
+    mismatches = []
+    for strategy in ("steps", "no", "epoch"):
+        expected = _hf_cadence_reference(
+            "log", strategy, 4, logging_first_step=True,
+        )
+        for with_flow in (True, False):
+            got = _run_one_axis_cadence_probe(
+                monkeypatch, "log", strategy, with_flow=with_flow, interval=4,
+                logging_first_step=True,
+            )
+            if got != expected:
+                mismatches.append(
+                    (strategy, "with_flow" if with_flow else "no_flow",
+                     got, expected)
+                )
+    assert mismatches == [], mismatches
+    # First-step logging is not gated on the strategy, the three strategies stay
+    # distinguishable, and the flag is off by default -- so none of the cells
+    # above can pass by coincidence. The trailing 6 is the loop's own
+    # final-window flush.
+    assert _hf_cadence_reference(
+        "log", "steps", 4, logging_first_step=True) == [1, 4, 6]
+    assert _hf_cadence_reference(
+        "log", "no", 4, logging_first_step=True) == [1, 6]
+    assert _hf_cadence_reference(
+        "log", "epoch", 4, logging_first_step=True) == [1, 3, 6]
+    assert _hf_cadence_reference("log", "steps", 4) == [4, 6]
+
+
+def test_default_flow_final_step_eval_probe_matches_the_installed_flow():
+    # The loop asks the shipped DefaultFlowCallback whether it forces a
+    # final-step evaluation instead of pinning a transformers version, so the
+    # probe has to agree with what that callback actually does. A future release
+    # that reads an argument the probe's stand-in lacks falls back to "no forced
+    # evaluation"; this is what makes that fallback visible.
+    from unsloth_zoo.mlx import trainer as trainer_mod
+
+    trainer_mod._DEFAULT_FLOW_FINAL_STEP_EVAL = None
+    probed = trainer_mod._default_flow_evaluates_final_step()
+    # 4 does not divide 6, so a fire at 6 can only come from the forced block.
+    reference = _hf_flow_steps("evaluate", eval_strategy="steps", eval_steps=4)
+    assert reference[:1] == [4], reference
+    assert probed is (reference == [4, 6]), (probed, reference)
+    # Probed once per process: the loop reads it on every final step.
+    assert trainer_mod._DEFAULT_FLOW_FINAL_STEP_EVAL is probed
+
+
+def test_step_cadence_request_reads_the_same_fields_as_the_static_cadence():
+    # Unit contract for the helper the loop calls before every on_step_end.
+    from transformers.trainer_callback import TrainerControl
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    def _requested(*, global_step, max_steps, eval_steps=0, **args_fields):
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = types.SimpleNamespace(**args_fields)
+        trainer.state = types.SimpleNamespace(
+            global_step=global_step, max_steps=max_steps, eval_steps=eval_steps,
+        )
+        trainer.control = TrainerControl()
+        trainer._request_step_cadence_actions()
+        return (
+            trainer.control.should_log,
+            trainer.control.should_evaluate,
+            trainer.control.should_save,
+        )
+
+    # Away from step 1 and the final step the helper asks for nothing.
+    assert _requested(global_step=3, max_steps=6) == (False, False, False)
+    # An unknown budget has no final step to force.
+    assert _requested(
+        global_step=3, max_steps=0, save_strategy="steps",
+    ) == (False, False, False)
+    # logging_first_step fires at step 1 whatever the logging strategy, and only
+    # when the caller asked for it.
+    assert _requested(
+        global_step=1, max_steps=6,
+        logging_first_step=True, logging_strategy="no",
+    )[0] is True
+    assert _requested(global_step=1, max_steps=6, logging_strategy="no")[0] is False
+    # The final save follows save_strategy, and only "steps" -- HF leaves the
+    # epoch strategy to on_epoch_end and "no" to nobody.
+    for strategy, expected in (("steps", True), ("epoch", False), ("no", False)):
+        assert _requested(
+            global_step=6, max_steps=6, save_strategy=strategy,
+        )[2] is expected, strategy
+    # A 0 eval interval means "never" for the loop's own cadence, so it must not
+    # reach HF's unguarded modulo.
+    assert _requested(
+        global_step=6, max_steps=6, eval_strategy="steps", eval_steps=0,
+    )[1] is False
+    # An args object that never went through _ensure_callback_args_compat keeps
+    # the legacy answer on BOTH halves of the same rule: _static_save_cadence_
+    # enabled() says the interval cadence applies, so the final step it belongs
+    # to does too. train() always populates the field, so this is unit-only.
+    assert _requested(global_step=6, max_steps=6)[2] is True
+
+
+def test_save_strategy_best_is_decided_in_the_trainer_core_not_the_flow():
+    # Derived pin for the two facts the loop's copy of the rule depends on:
+    # DefaultFlowCallback never raises SaveStrategy.BEST (it acts on STEPS and
+    # EPOCH only), and HF's Trainer core ASSIGNS the decision rather than ORing
+    # it, so a non-improving evaluation also clears a save requested elsewhere.
+    # If either changes upstream, the loop has to change with it.
+    import inspect
+
+    from transformers import Trainer
+    from transformers.trainer_callback import DefaultFlowCallback
+    from transformers.trainer_utils import SaveStrategy
+
+    assert "best" in [member.value for member in SaveStrategy]
+    core = inspect.getsource(Trainer._maybe_log_save_evaluate)
+    assert "SaveStrategy.BEST" in core, core
+    assert "self.control.should_save = is_new_best_metric" in core, core
+    assert "BEST" not in inspect.getsource(DefaultFlowCallback)
+
+
+def test_save_strategy_best_checkpoints_every_improving_evaluation(monkeypatch):
+    # Regression: gating the static save cadence on save_strategy left "best"
+    # -- the third SaveStrategy member, shipped since transformers 4.47 -- with
+    # no cadence at all, because it is neither "steps" nor "epoch" and
+    # DefaultFlowCallback never raises it. Before the gate the run at least
+    # checkpointed on the save_steps interval; after it, a caller who hand-set
+    # "best" got no resumable checkpoint and no on_save for the whole run, while
+    # the adapters-only final save_model() carries no optimizer or trainer state.
+    # HF writes a normal checkpoint-<global_step> at every improving evaluation
+    # (Trainer._maybe_log_save_evaluate), so mirror that.
+    # Evaluations land on steps 2/4/6; losses improve, worsen, improve.
+    for with_flow in (True, False):
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+            eval_steps=2, save_strategy="best",
+            metric_for_best_model="eval_loss", greater_is_better=False,
+            eval_losses=[1.0, 2.0, 0.5],
+        )
+        assert probe["evaluated"] == [2, 4, 6], (with_flow, probe["evaluated"])
+        assert probe["saved"] == [2, 6], (with_flow, probe["saved"])
+        assert probe["checkpoints"] == [2, 6], (with_flow, probe["checkpoints"])
+        assert probe["state"].best_metric == 0.5
+        assert probe["state"].best_global_step == 6
+    # The other order pins that it is the improvement and not the step index
+    # doing the work.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+        eval_steps=2, save_strategy="best", with_flow=False,
+        metric_for_best_model="eval_loss", greater_is_better=False,
+        eval_losses=[1.0, 0.5, 2.0],
+    )
+    assert probe["saved"] == [2, 4], probe["saved"]
+    # And greater_is_better inverts it, so the comparison is not hardcoded.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+        eval_steps=2, save_strategy="best", with_flow=False,
+        metric_for_best_model="eval_loss", greater_is_better=True,
+        eval_losses=[1.0, 0.5, 2.0],
+    )
+    assert probe["saved"] == [2, 6], probe["saved"]
+
+
+def test_save_strategy_best_clears_a_save_requested_at_an_eval_step(monkeypatch):
+    # HF ASSIGNS `control.should_save = is_new_best_metric` under "best", so an
+    # evaluation that did not improve also CLEARS a save another source
+    # requested for that same step -- an OR would checkpoint a worse model and
+    # advertise it through on_save. A step with no evaluation is untouched,
+    # because HF's assignment sits inside its `if control.should_evaluate`.
+    class _ForceSaveAt:
+        def __init__(self, *steps):
+            self.steps = set(steps)
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step in self.steps:
+                control.should_save = True
+            return control
+
+    # Step 4 evaluates and gets worse: the request is cleared.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+        eval_steps=2, save_strategy="best", with_flow=False,
+        metric_for_best_model="eval_loss", greater_is_better=False,
+        eval_losses=[1.0, 2.0, 3.0], extra_callbacks=[_ForceSaveAt(4)],
+    )
+    assert probe["saved"] == [2], probe["saved"]
+    # Step 3 does not evaluate, so the request stands.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+        eval_steps=2, save_strategy="best", with_flow=False,
+        metric_for_best_model="eval_loss", greater_is_better=False,
+        eval_losses=[1.0, 2.0, 3.0], extra_callbacks=[_ForceSaveAt(3)],
+    )
+    assert probe["saved"] == [2, 3], probe["saved"]
+
+
+def test_save_strategy_best_without_a_usable_metric_writes_nothing(monkeypatch):
+    # An unresolvable metric_for_best_model means _update_callback_best_metric
+    # reports no improvement, which is what HF's _determine_best_metric returns
+    # too (its whole body is under `if args.metric_for_best_model is not None`),
+    # so nothing is saved rather than everything. HF's Trainer.__init__ rejects
+    # "best" without a metric outright; MLXTrainer must at least not checkpoint
+    # indiscriminately.
+    for metric in (None, "does_not_exist"):
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+            eval_steps=2, save_strategy="best", with_flow=False,
+            metric_for_best_model=metric, eval_losses=[1.0, 0.5, 0.25],
+        )
+        assert probe["evaluated"] == [2, 4, 6], (metric, probe["evaluated"])
+        assert probe["saved"] == [], (metric, probe["saved"])
+        assert probe["checkpoints"] == [], (metric, probe["checkpoints"])
+    # MLXTrainingConfig defaults metric_for_best_model to "eval_loss", so the
+    # strategy does work out of the box -- the empty results above are about the
+    # metric being unusable, not about "best" being inert.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+        eval_steps=2, save_strategy="best", with_flow=False,
+        eval_losses=[1.0, 0.5, 0.25],
+    )
+    assert probe["saved"] == [2, 4, 6], probe["saved"]
+
+
+def test_best_save_strategy_helper_normalizes_like_the_other_cadences():
+    # Same str-Enum normalization contract as _static_save_cadence_enabled, and
+    # a missing field is not "best".
+    from transformers.trainer_utils import SaveStrategy
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = types.SimpleNamespace()
+    assert trainer._best_save_strategy_enabled() is False
+    for member, expected in (
+        (SaveStrategy.BEST, True), ("best", True), ("BEST", True),
+        (SaveStrategy.STEPS, False), (SaveStrategy.EPOCH, False),
+        (SaveStrategy.NO, False),
+    ):
+        trainer.args = types.SimpleNamespace(save_strategy=member)
+        assert trainer._best_save_strategy_enabled() is expected, member
+    # And "best" must not switch on either of the other two cadences.
+    trainer.args = types.SimpleNamespace(save_strategy="best")
+    assert trainer._static_save_cadence_enabled() is False
+    assert trainer._epoch_cadence_enabled("save_strategy") is False
 
 
 def test_epoch_cadence_request_is_deduplicated_against_default_flow(monkeypatch):
