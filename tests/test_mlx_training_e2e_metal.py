@@ -302,9 +302,10 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
 
 # ---------------------------------------------------------------------------
 # Warm-starting continued training from a saved adapter: reloading a LoRA/DoRA
-# adapter via FastMLXModel.from_pretrained must give the same trainable state as
-# a fresh get_peft_model (base frozen, adapter trainable). Uses a tiny
-# locally-built Llama so the full_finetuning and DoRA branches stay cheap.
+# adapter via FastMLXModel.from_pretrained must freeze the base and leave the
+# adapter parameters trainable, together with any non-adapter tensors the
+# checkpoint itself recorded as trainable. Uses a tiny locally-built Llama so
+# the full_finetuning and DoRA branches stay cheap.
 # ---------------------------------------------------------------------------
 
 

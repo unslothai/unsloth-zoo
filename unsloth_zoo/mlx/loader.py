@@ -5208,12 +5208,15 @@ class FastMLXModel:
                 text or VLM inference.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
-        base is frozen and whose adapter parameters are trainable — the same
-        state as a fresh ``get_peft_model`` — so it can be passed straight to a
-        new ``MLXTrainer`` to warm-start continued adapter training with a fresh
-        optimizer and schedule. Non-LoRA weights that were separately trained
-        (for example embeddings or a projector) are not re-enabled for training
-        on reload; re-specify them if continued training of those is needed.
+        base is frozen and whose adapter parameters are trainable, so it can be
+        passed straight to a new ``MLXTrainer`` to warm-start continued training
+        with a fresh optimizer and schedule. The reload restores the trainable
+        set the checkpoint recorded, not the adapter-only set of a fresh
+        ``get_peft_model``: a directory written by ``save_trainable_adapters``
+        also holds the non-adapter tensors that were trainable at save time
+        (embeddings, the head, a projector, biases or norms), and those come
+        back trainable too. Freeze them again after loading if the continued
+        run should train the adapters alone.
         """
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
