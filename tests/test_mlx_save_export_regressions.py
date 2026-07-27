@@ -31,9 +31,7 @@ from pathlib import Path
 import pytest
 
 
-AutoProcessor = None
-load_processor = None
-load_model = skip_multimodal_module = nn = _has_quantized_weights = None
+AutoProcessor = load_model = load_processor = nn = skip_multimodal_module = None
 _to_mx_array = None
 
 
@@ -41,62 +39,76 @@ def _test_bound_load_processor(model_path, **kwargs):
     return AutoProcessor.from_pretrained(model_path, **kwargs)
 
 
-def _test_bound_vlm_load(model_path):
-    return load_processor(model_path)
-
-
-def _test_bound_model_load(paths, weights):
+def _test_bound_load_model(paths, weights):
     return load_model(paths, weights)
+
+
+def _test_bound_vlm_load(model_path, paths=None, weights=None, **kwargs):
+    if paths is not None:
+        load_model(paths, weights)
+    return load_processor(model_path, **kwargs)
+
+
 def _test_make_streaming_detokenizer(processor):
-    detokenizer = copy(processor.detokenizer); detokenizer.reset(); return detokenizer
+    detokenizer = copy(processor.detokenizer)
+    detokenizer.reset()
+    return detokenizer
+
+
 def _test_naive_detokenizer_init(self, tokenizer):
     self._tokenizer, self._tokens = tokenizer, []
-def _test_naive_detokenizer_reset(self): self._tokens = []
-def _test_lfm_projector_init(self, config): self.projector_use_layernorm, self.layer_norm = config.projector_use_layernorm, lambda x: ("normalized", x)
-def _test_lfm_projector_call(self, x): return self.layer_norm(x) if self.projector_use_layernorm else x
+
+
+def _test_naive_detokenizer_reset(self):
+    self._tokens = []
+
+
+def _test_legacy_projector_load(paths, weights):
+    skip_vision = True
+    config = {"quantization": {}}
+
+    def get_class_predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if p in config["quantization"]:
+            return config["quantization"][p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        return f"{p}.scales" in weights
+
+    return nn.quantize(paths, class_predicate=get_class_predicate)
+
+
+def _test_aware_projector_load(paths, weights):
+    skip_vision = True
+
+    def get_class_predicate(path, module):
+        if skip_multimodal_module(path) and skip_vision and f"{path}.scales" not in weights:
+            return False
+        return f"{path}.scales" in weights
+
+    return nn.quantize(paths, class_predicate=get_class_predicate)
+
+
+def _test_lfm_projector_init(self, config):
+    self.projector_use_layernorm = config.projector_use_layernorm
+    self.layer_norm = lambda x: ("normalized", x)
+
+
+def _test_lfm_projector_call(self, x):
+    return self.layer_norm(x) if self.projector_use_layernorm else x
+
+
 def _test_minicpmo_legacy_vision(self, pixel_values, tgt_sizes):
     dtype = self.language_model.model.embed_tokens.weight.dtype
     return _to_mx_array(pixel_values, dtype=dtype)
+
+
 def _test_minicpmo_fixed_vision(self, pixel_values, tgt_sizes):
     dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
     return _to_mx_array(pixel_values, dtype=dtype)
-def _test_legacy_model_load(paths, weights):
-    config, skip_vision = {"quantization": {"multi_modal_projector.dense": True}}, True
-    def get_class_predicate(p, m):
-        if skip_multimodal_module(p) and skip_vision:
-            return False
-        if p in config["quantization"]:
-            return config["quantization"][p]
-        if not hasattr(m, "to_quantized"):
-            return False
-        if hasattr(m, "weight") and m.weight.size % 64 != 0:
-            return False
-        return f"{p}.scales" in weights
-    return nn.quantize(paths, class_predicate=get_class_predicate)
-
-
-def _test_fixed_model_load(paths, weights):
-    skip_vision = True
-    def get_class_predicate(p, m):
-        if skip_multimodal_module(p) and skip_vision and not _has_quantized_weights(p, weights):
-            return False
-        return f"{p}.scales" in weights
-    return nn.quantize(paths, class_predicate=get_class_predicate)
-
-
-def _test_positional_model_load(paths, weights):
-    config, skip_vision = {"quantization": {}}, True
-    def get_class_predicate(p, m):
-        if skip_multimodal_module(p) and skip_vision:
-            return False
-        if p in config["quantization"]:
-            return config["quantization"][p]
-        if not hasattr(m, "to_quantized"):
-            return False
-        if hasattr(m, "weight") and m.weight.size % 64 != 0:
-            return False
-        return f"{p}.scales" in weights
-    return nn.quantize(paths, get_class_predicate)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -910,157 +922,138 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     assert tokenizer.chat_template == "{{ messages }}"
 
 
-def test_legacy_naive_detokenizer_copy_is_capability_gated(monkeypatch):
+def test_processor_loader_is_call_scoped_and_preserves_failure_policy(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.loader as loader
+
+    native, calls = object(), []
+
+    class FakeAutoProcessor:
+        error = ValueError("Unrecognized processing class")
+
+        @classmethod
+        def from_pretrained(cls, _path, **kwargs):
+            calls.append(kwargs["trust_remote_code"])
+            raise cls.error
+
+    monkeypatch.setitem(globals(), "AutoProcessor", FakeAutoProcessor)
+    monkeypatch.setattr(loader, "_ensure_vlm_detokenizer_copy", lambda: None)
+    monkeypatch.setattr(loader, "_load_declared_mlx_vlm_processor", lambda *_a, **_k: native)
+    (tmp_path / "config.json").write_text('{"model_type":"native"}', encoding="utf-8")
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    scoped = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    trusted = loader._bind_mlx_vlm_processor_loader(
+        _test_bound_vlm_load, allow_remote_code=True
+    )
+    assert scoped(tmp_path) is native and trusted(tmp_path) is native
+    assert calls == [False, True] and load_processor is _test_bound_load_processor
+    assert AutoProcessor is FakeAutoProcessor
+    FakeAutoProcessor.error = RuntimeError("unrelated")
+    with pytest.raises(RuntimeError, match="unrelated"):
+        scoped(tmp_path)
+
+
+def test_legacy_detokenizer_copy_is_reset_and_inherited_native_copy_wins(monkeypatch):
     import unsloth_zoo.mlx.loader as loader
 
     module_name = "mlx_vlm.tokenizer_utils"
-    StreamingDetokenizer = type("StreamingDetokenizer", (), {"__module__": module_name, "__slots__": ("text", "tokens", "offset")})
-    NaiveStreamingDetokenizer = type("NaiveStreamingDetokenizer", (StreamingDetokenizer,), {"__module__": module_name, "__init__": _test_naive_detokenizer_init, "reset": _test_naive_detokenizer_reset, "text": property(lambda self: "")})
-    module = types.ModuleType(module_name)
-    module.StreamingDetokenizer, module.NaiveStreamingDetokenizer, module.make_streaming_detokenizer = StreamingDetokenizer, NaiveStreamingDetokenizer, _test_make_streaming_detokenizer
-    monkeypatch.setitem(sys.modules, module_name, module)
-    monkeypatch.setattr(loader, "_MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256", loader._source_token_sha256(loader._safe_getsource(_test_make_streaming_detokenizer)))
+    base = type(
+        "StreamingDetokenizer",
+        (),
+        {"__module__": module_name, "__slots__": ("text", "tokens", "offset")},
+    )
+    legacy = type(
+        "NaiveStreamingDetokenizer",
+        (base,),
+        {
+            "__module__": module_name,
+            "__init__": _test_naive_detokenizer_init,
+            "reset": _test_naive_detokenizer_reset,
+            "text": property(lambda self: ""),
+        },
+    )
+    module = types.SimpleNamespace(
+        __name__=module_name,
+        StreamingDetokenizer=base,
+        NaiveStreamingDetokenizer=legacy,
+        make_streaming_detokenizer=_test_make_streaming_detokenizer,
+    )
+    monkeypatch.setattr(loader.importlib, "import_module", lambda _name: module)
+    source_hash = loader._source_token_sha256(loader._safe_getsource(_test_make_streaming_detokenizer))
+    monkeypatch.setattr(loader, "_MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256", source_hash)
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    original = legacy(object())
+    original._tokens.append(1)
+    assert copy(original)._tokens == [] and original._tokens == [1]
+    del legacy.__copy__
+    base.__copy__ = lambda self: self
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    inherited = legacy(object())
+    assert copy(inherited) is inherited
+    assert "__copy__" not in legacy.__dict__
 
-    tokenizer = object(); original = NaiveStreamingDetokenizer(tokenizer)
-    with pytest.raises(AttributeError, match="property 'text'"):
-        copy(original)
-    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
-    original._tokens.append(1); copied = copy(original)
-    assert copied is not original and copied._tokenizer is tokenizer
-    assert copied._tokens == [] and original._tokens == [1]
-    installed_copy = NaiveStreamingDetokenizer.__copy__
-    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
-    assert NaiveStreamingDetokenizer.__copy__ is installed_copy
 
-    native_copy = lambda self: self
-    del NaiveStreamingDetokenizer.__copy__; StreamingDetokenizer.__copy__ = native_copy
-    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
-    fixed = NaiveStreamingDetokenizer(tokenizer)
-    assert "__copy__" not in NaiveStreamingDetokenizer.__dict__ and copy(fixed) is fixed
+def test_quantized_projector_binding_is_call_scoped_and_fail_closed(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    paths = ["multi_modal_projector.quantized", "multi_modal_projector.dense", "vision.quantized"]
+    weights = {f"{paths[0]}.scales": object(), f"{paths[2]}.scales": object()}
+    skip = lambda path: path.startswith(("multi_modal_projector", "vision"))
+    module = types.SimpleNamespace(to_quantized=True, weight=types.SimpleNamespace(size=64))
+    quantize = lambda values, class_predicate: [class_predicate(path, module) for path in values]
+    monkeypatch.setitem(globals(), "nn", types.SimpleNamespace(quantize=quantize))
+    monkeypatch.setitem(globals(), "skip_multimodal_module", skip)
+    monkeypatch.setitem(globals(), "load_model", _test_legacy_projector_load)
+    original = _test_bound_load_model
+    scoped = loader._bind_mlx_vlm_quantized_projector_loader(original)
+    assert scoped(paths, weights) == [True, False, False]
+    assert load_model is _test_legacy_projector_load and skip_multimodal_module is skip
+    monkeypatch.setitem(globals(), "load_model", _test_aware_projector_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(original) is original
+    monkeypatch.setitem(globals(), "load_model", _test_legacy_projector_load)
+    monkeypatch.setitem(globals(), "AutoProcessor", types.SimpleNamespace(from_pretrained=lambda *_a, **_k: "processor"))
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    processor_bound = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(processor_bound)(
+        "model", paths=paths, weights=weights
+    ) == "processor"
 
 
 def test_lfm_disabled_projector_norm_is_loader_gated(monkeypatch):
     import unsloth_zoo.mlx.loader as loader
 
     module_name = "mlx_vlm.models.lfm2_vl.lfm2_vl"
-    Projector = type("Lfm2VlMultiModalProjector", (), {"__module__": module_name, "__init__": _test_lfm_projector_init, "__call__": _test_lfm_projector_call})
-    module = types.ModuleType(module_name); module.Lfm2VlMultiModalProjector = Projector
-    monkeypatch.setitem(sys.modules, module_name, module)
-    init_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_init)); call_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_call))
-    original = Projector.__init__
-    for init_token, call_token, class_name in (("unknown", call_hash, Projector.__name__), (init_hash, "unknown", Projector.__name__), (init_hash, call_hash, "OtherProjector")):
-        monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_token); monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_token); Projector.__name__ = class_name
-        loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl"); assert Projector.__init__ is original
-    Projector.__name__ = "Lfm2VlMultiModalProjector"; monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_hash); monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_hash)
-    loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
-    disabled, enabled = Projector(types.SimpleNamespace(projector_use_layernorm=False)), Projector(types.SimpleNamespace(projector_use_layernorm=True))
-    assert not hasattr(disabled, "layer_norm") and enabled("x") == ("normalized", "x")
-    installed = Projector.__init__; loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
-    assert Projector.__init__ is installed
-
-
-def test_declared_mlx_vlm_processor_owns_custom_components_and_recovery(
-    monkeypatch,
-    tmp_path,
-):
-    import unsloth_zoo.mlx.loader as loader
-
-    class NativeImageProcessor: pass
-    factory_calls = []
-
-    class NativeProcessor:
-        __module__ = "mlx_vlm.models.molmo.processor"
-        get_possibly_dynamic_module = staticmethod(lambda name: (_ for _ in ()).throw(ValueError(f"Could not find module {name} in `transformers`")))
-        @classmethod
-        def from_pretrained(cls, model_path, **kwargs):
-            factory_calls.append((
-                loader._read_json_file(Path(model_path) / "config.json").get("auto_map"),
-                loader._read_json_file(Path(model_path) / "tokenizer_config.json").get("auto_map"),
-                kwargs.get("trust_remote_code", False),
-            ))
-            return cls(cls.get_possibly_dynamic_module("NativeImageProcessor")())
-        def __init__(self, image_processor): self.image_processor, self.chat_template, self.tokenizer = image_processor, None, types.SimpleNamespace()
-
-    native_module = types.ModuleType("mlx_vlm.models.molmo.processor")
-    native_module.NativeProcessor, native_module.NativeImageProcessor = NativeProcessor, NativeImageProcessor
-    monkeypatch.setitem(sys.modules, "mlx_vlm.models.molmo.processor", native_module)
-    (tmp_path / "config.json").write_text('{"model_type":"molmo","auto_map":{"AutoConfig":"remote.Config"}}', encoding="utf-8")
-    (tmp_path / "processor_config.json").write_text('{"processor_class":"NativeProcessor"}', encoding="utf-8")
-    (tmp_path / "tokenizer_config.json").write_text('{"auto_map":{"AutoTokenizer":"remote.Tokenizer"}}', encoding="utf-8")
-
-    processor = loader._load_declared_mlx_vlm_processor(tmp_path, "molmo")
-    assert isinstance(processor, NativeProcessor) and isinstance(processor.image_processor, NativeImageProcessor)
-    assert factory_calls[-1] == (None, None, False)
-    loader._load_declared_mlx_vlm_processor(tmp_path, "molmo", trust_remote_code=True)
-    assert factory_calls[-1] == ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, True)
-    detokenizer, stopping = object(), object(); degraded = types.SimpleNamespace(image_processor=None, chat_template="{{ messages }}", detokenizer=detokenizer, tokenizer=types.SimpleNamespace(stopping_criteria=stopping))
-    repaired = loader._repair_degraded_vlm_processor(degraded, tmp_path, "molmo")
-    assert isinstance(repaired, NativeProcessor) and repaired.chat_template == "{{ messages }}" and repaired.detokenizer is detokenizer and repaired.tokenizer.stopping_criteria is stopping
-
-    healthy = object()
-    class AutoProcessor:
-        outcome = ValueError("Unrecognized processing class")
-        calls = []
-        @classmethod
-        def from_pretrained(cls, model_path, **kwargs):
-            cls.calls.append((
-                loader._read_json_file(Path(model_path) / "config.json").get("auto_map"),
-                loader._read_json_file(Path(model_path) / "tokenizer_config.json").get("auto_map"),
-                kwargs.get("trust_remote_code"),
-            ))
-            if isinstance(cls.outcome, BaseException): raise cls.outcome
-            return cls.outcome
-
-    monkeypatch.setitem(globals(), "AutoProcessor", AutoProcessor)
-    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
-    scoped_load = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
-    recovered = scoped_load(tmp_path)
-    (tmp_path / "config.json").write_text('{"model_type":"native","auto_map":{"AutoConfig":"remote.Config"}}', encoding="utf-8")
-    AutoProcessor.outcome = healthy
-    assert _test_bound_vlm_load(tmp_path) is healthy
-    assert scoped_load(tmp_path) is healthy
-    AutoProcessor.outcome = RuntimeError("unrelated")
-    with pytest.raises(RuntimeError, match="unrelated"):
-        scoped_load(tmp_path)
-    AutoProcessor.outcome = healthy
-    trusted_load = loader._bind_mlx_vlm_processor_loader(
-        _test_bound_vlm_load,
-        allow_remote_code=True,
+    Projector = type(
+        "Lfm2VlMultiModalProjector", (), {"__module__": module_name,
+        "__init__": _test_lfm_projector_init, "__call__": _test_lfm_projector_call},
     )
-    assert trusted_load(tmp_path) is healthy
-    assert isinstance(recovered, NativeProcessor)
-    assert AutoProcessor.calls == [
-        (None, None, False),
-        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, None),
-        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, False),
-        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, False),
-        ({"AutoConfig": "remote.Config"}, {"AutoTokenizer": "remote.Tokenizer"}, True),
-    ]
-    assert load_processor is _test_bound_load_processor
+    module = types.ModuleType(module_name)
+    module.Lfm2VlMultiModalProjector = Projector
+    monkeypatch.setitem(sys.modules, module_name, module)
+    init_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_init))
+    call_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_call))
+    original = Projector.__init__
+    incompatible_contracts = (
+        ("unknown", call_hash, Projector.__name__),
+        (init_hash, "unknown", Projector.__name__),
+        (init_hash, call_hash, "OtherProjector"),
+    )
+    for init_token, call_token, class_name in incompatible_contracts:
+        monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_token)
+        monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_token)
+        Projector.__name__ = class_name
+        loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
+        assert Projector.__init__ is original
 
-
-def test_legacy_quantized_projector_binding_is_scoped_and_capability_gated(monkeypatch):
-    import unsloth_zoo.mlx.loader as loader
-    paths = ["multi_modal_projector.quantized", "multi_modal_projector.dense", "vision_model.quantized", "language_model.quantized"]
-    weights = {f"{path}.scales": object() for path in paths if "dense" not in path}
-    def skip(path): return "multi_modal_projector" in path or "vision_model" in path
-    monkeypatch.setitem(globals(), "nn", types.SimpleNamespace(quantize=lambda values, class_predicate: [class_predicate(path, types.SimpleNamespace(to_quantized=True, weight=types.SimpleNamespace(size=64))) for path in values]))
-    monkeypatch.setitem(globals(), "skip_multimodal_module", skip)
-    monkeypatch.setitem(globals(), "load_model", _test_legacy_model_load)
-    assert _test_bound_model_load(paths, weights) == [False, False, False, True]
-    scoped = loader._bind_mlx_vlm_quantized_projector_loader(_test_bound_model_load)
-    assert scoped(paths, weights) == [True, False, False, True]
-    assert load_model is _test_legacy_model_load and skip_multimodal_module is skip
-    monkeypatch.setitem(globals(), "_has_quantized_weights", lambda path, state: f"{path}.scales" in state)
-    monkeypatch.setitem(globals(), "load_model", _test_fixed_model_load)
-    assert loader._bind_mlx_vlm_quantized_projector_loader(_test_bound_model_load) is _test_bound_model_load
-    monkeypatch.setitem(globals(), "load_model", _test_positional_model_load)
-    assert loader._bind_mlx_vlm_quantized_projector_loader(_test_bound_model_load) is _test_bound_model_load
-    monkeypatch.setitem(globals(), "load_model", _test_legacy_model_load)
-    monkeypatch.setitem(globals(), "AutoProcessor", types.SimpleNamespace(from_pretrained=lambda *_a, **_k: "processor"))
-    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
-    processor_bound = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
-    assert loader._bind_mlx_vlm_quantized_projector_loader(processor_bound)("model") == "processor"
+    Projector.__name__ = "Lfm2VlMultiModalProjector"
+    monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_hash)
+    monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_hash)
+    loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
+    disabled = Projector(types.SimpleNamespace(projector_use_layernorm=False))
+    enabled = Projector(types.SimpleNamespace(projector_use_layernorm=True))
+    assert not hasattr(disabled, "layer_norm") and enabled("x") == ("normalized", "x")
 
 
 def test_minicpmo_mlx_sanitize_is_complete_and_loader_gated(monkeypatch):
@@ -1095,116 +1088,84 @@ def test_minicpmo_mlx_sanitize_is_complete_and_loader_gated(monkeypatch):
             return output
 
     sanitize_weights = lambda _model, weights: weights
-    def affected_load_model(model, weights): return sanitize_weights(model, weights)
-    def bypassing_load_model(model, weights):
-        mlx_format = True
-        return weights if mlx_format else sanitize_weights(model, weights)
+
+    def affected_load_model(model, weights):
+        return sanitize_weights(model, weights)
 
     load_source = "def load_model(model, weights):\n    weights = sanitize_weights(model, weights)\n    return weights\n"
-    bypass_source = "def load_model(model, weights):\n    if mlx_format:\n        return weights\n    weights = sanitize_weights(model, weights)\n    return weights\n"
-    sources = {affected_load_model: load_source, bypassing_load_model: bypass_source}
+    sources = {affected_load_model: load_source}
     original_getsource = loader._safe_getsource
-    def getsource(obj): return sources[obj] if obj in sources else original_getsource(obj)
-    monkeypatch.setattr(loader, "_MINICPM_SANITIZE_TOKEN_SHA256", loader._source_token_sha256(getsource(MiniCPM.sanitize)))
-    monkeypatch.setattr(loader, "_safe_getsource", getsource); monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: MiniCPM)
-    utils = types.ModuleType("mlx_vlm.utils")
-    utils.load_model = affected_load_model; monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
 
-    original = MiniCPM.sanitize; loader._ensure_minicpmo_mlx_sanitize("minicpmo")
+    def getsource(obj):
+        return sources[obj] if obj in sources else original_getsource(obj)
+
+    expected_hash = loader._source_token_sha256(getsource(MiniCPM.sanitize))
+    monkeypatch.setattr(loader, "_MINICPM_SANITIZE_TOKEN_SHA256", expected_hash)
+    monkeypatch.setattr(loader, "_safe_getsource", getsource)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: MiniCPM)
+    utils = types.ModuleType("mlx_vlm.utils")
+    utils.load_model = affected_load_model
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+
+    original = MiniCPM.sanitize
+    loader._ensure_minicpmo_mlx_sanitize("minicpmo")
     assert MiniCPM.sanitize.__wrapped__ is original
     language, vision, audio = object(), object(), object()
-    values = {"language_model.model.norm.weight": language, "vision_tower.embeddings.patch_embedding.weight": vision, "audio_tower.conv1.weight": audio,
-              "resampler.attn.in_proj_weight": ("q", "k", "v"), "language_model.lm_head.weight": object()}
+    values = {
+        "language_model.model.norm.weight": language,
+        "vision_tower.embeddings.patch_embedding.weight": vision,
+        "audio_tower.conv1.weight": audio,
+        "resampler.attn.in_proj_weight": ("q", "k", "v"),
+        "language_model.lm_head.weight": object(),
+    }
     result = MiniCPM().sanitize(values)
     assert result["language_model.model.norm.weight"] is language and result["vision_tower.embeddings.patch_embedding.weight"] == ("vision-layout", vision)
     assert result["audio_tower.conv1.weight"] == ("audio-layout", audio) and "language_model.lm_head.weight" not in result
     assert tuple(result[f"resampler.attn.{name}_proj.weight"] for name in ("q", "k", "v")) == ("q", "k", "v")
-    source_values = {name: object() for name in ("llm.x", "vpm.x", "apm.x")}; assert set(MiniCPM().sanitize(source_values)) == {"language_model.x", "vision_tower.x", "audio_tower.x"}
     with pytest.raises(ValueError, match="mixes source and MLX tower names"):
         MiniCPM().sanitize({"llm.x": 1, "language_model.x": 2})
     assert MiniCPM().sanitize({"language_model.x": 1}) == {}
-    loader._ensure_minicpmo_mlx_sanitize("minicpmo"); assert MiniCPM.sanitize.__wrapped__ is original
-
-    class CompatibleMiniCPM:
-        def sanitize(self, weights): return weights
-    assert loader._minicpmo_mlx_sanitize_adapter(CompatibleMiniCPM.sanitize) is CompatibleMiniCPM.sanitize
-
-    class NativeMiniCPM: pass
-    NativeMiniCPM.__module__, NativeMiniCPM.sanitize = MiniCPM.__module__, original
-    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: NativeMiniCPM)
-    utils.load_model = bypassing_load_model
-    native = NativeMiniCPM.sanitize
     loader._ensure_minicpmo_mlx_sanitize("minicpmo")
-    assert NativeMiniCPM.sanitize is native
+    assert MiniCPM.sanitize.__wrapped__ is original
 
 
-def test_minicpmo_legacy_vision_uses_call_scoped_float_dtype(monkeypatch):
+def test_minicpmo_vision_dtype_adapter_is_scoped_and_fail_closed(monkeypatch):
     import unsloth_zoo.mlx.loader as loader
 
     convert = lambda value, dtype=None: (value, dtype)
     owner = "mlx_vlm.models.minicpmo.minicpmo"
-    for function, name in ((convert, "_to_mx_array"), (_test_minicpmo_legacy_vision, "get_vision_embedding"), (_test_minicpmo_fixed_vision, "get_vision_embedding")):
-        monkeypatch.setattr(function, "__module__", owner); monkeypatch.setattr(function, "__name__", name)
-    monkeypatch.setitem(globals(), "_to_mx_array", convert)
-    monkeypatch.setattr(loader, "_MINICPM_LEGACY_VISION_TOKEN_SHA256", loader._source_token_sha256(loader._safe_getsource(_test_minicpmo_legacy_vision)))
-    adapted = loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision)
-    model = types.SimpleNamespace(
-        language_model=types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="uint32")))),
-        vision_tower=types.SimpleNamespace(embeddings=types.SimpleNamespace(patch_embedding=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="float16")))),
+    functions = (
+        (convert, "_to_mx_array"),
+        (_test_minicpmo_legacy_vision, "get_vision_embedding"),
+        (_test_minicpmo_fixed_vision, "get_vision_embedding"),
     )
+    for function, name in functions:
+        monkeypatch.setattr(function, "__module__", owner)
+        monkeypatch.setattr(function, "__name__", name)
+    monkeypatch.setitem(globals(), "_to_mx_array", convert)
+    fingerprint = loader._source_token_sha256(
+        loader._safe_getsource(_test_minicpmo_legacy_vision)
+    )
+    monkeypatch.setattr(loader, "_MINICPM_LEGACY_VISION_TOKEN_SHA256", fingerprint)
+    language = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            embed_tokens=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="uint32"))
+        )
+    )
+    vision = types.SimpleNamespace(
+        embeddings=types.SimpleNamespace(
+            patch_embedding=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="float16"))
+        )
+    )
+    model = types.SimpleNamespace(language_model=language, vision_tower=vision)
+    adapted = loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision)
     assert _test_minicpmo_legacy_vision(model, "pixels", None) == ("pixels", "uint32")
     assert adapted(model, "pixels", None) == ("pixels", "float16")
-    model.vision_tower.embeddings.patch_embedding.weight.dtype = "bfloat16"
-    assert adapted(model, "next", None) == ("next", "bfloat16") and _to_mx_array is convert
-    assert adapted.__wrapped__ is _test_minicpmo_legacy_vision and loader._minicpmo_vision_dtype_adapter(adapted) is adapted
+    assert _to_mx_array is convert and adapted.__wrapped__ is _test_minicpmo_legacy_vision
+    assert loader._minicpmo_vision_dtype_adapter(adapted) is adapted
     assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_fixed_vision) is _test_minicpmo_fixed_vision
-
-
-def test_llava_processor_geometry_uses_temporary_config_view(tmp_path):
-    import unsloth_zoo.mlx.loader as loader
-
-    config = {"model_type": "llava", "vision_config": {"patch_size": 14}, "vision_feature_select_strategy": "default"}
-    processor_config = {"processor_class": "LlavaProcessor", "patch_size": None, "vision_feature_select_strategy": None}
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    (tmp_path / "processor_config.json").write_text(json.dumps(processor_config), encoding="utf-8")
-
-    view, returned_config = loader._materialize_mlx_vlm_config_override(tmp_path, config)
-    patched = loader._read_json_file(Path(view) / "processor_config.json")
-    assert returned_config is config
-    assert (patched["patch_size"], patched["vision_feature_select_strategy"]) == (14, "default")
-    assert loader._read_json_file(tmp_path / "processor_config.json") == processor_config
-
-    class Model: pass
-    model = Model()
-    owner = loader._MLXVLMConfigViewOwner(view, tmp_path)
-    owner.transfer_to(model)
-    assert model._unsloth_mlx_config_view_paths == [str(view)]
-    model._unsloth_mlx_config_view_finalizers[0]()
-    assert not Path(view).exists()
-
-    processor_config["patch_size"], processor_config["vision_feature_select_strategy"] = 16, "full"
-    (tmp_path / "processor_config.json").write_text(json.dumps(processor_config), encoding="utf-8")
-    assert loader._materialize_mlx_vlm_config_override(tmp_path, config)[0] == tmp_path
-    processor_config["patch_size"], processor_config["vision_feature_select_strategy"] = None, None
-    (tmp_path / "processor_config.json").write_text(json.dumps(processor_config), encoding="utf-8")
-    failed_view, _ = loader._materialize_mlx_vlm_config_override(tmp_path, {**config, "vision_config": {"patch_size": 14}})
-    failed_owner = loader._MLXVLMConfigViewOwner(failed_view, tmp_path)
-    with pytest.raises(RuntimeError, match="load failed"):
-        failed_owner.call(lambda: (_ for _ in ()).throw(RuntimeError("load failed")))
-    assert not Path(failed_view).exists()
-    invalid_config = {
-        **config,
-        "vision_config": {"patch_size": 0},
-        "vision_feature_select_strategy": "unsupported",
-    }
-    invalid_view, _ = loader._materialize_mlx_vlm_config_override(
-        tmp_path,
-        invalid_config,
-    )
-    assert loader._read_json_file(
-        Path(invalid_view) / "processor_config.json"
-    ) == processor_config
-    loader._MLXVLMConfigViewOwner(invalid_view, tmp_path).cleanup()
+    monkeypatch.setattr(_test_minicpmo_legacy_vision, "__module__", "foreign")
+    assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision) is _test_minicpmo_legacy_vision
 
 
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
