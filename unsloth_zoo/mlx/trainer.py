@@ -1179,17 +1179,23 @@ def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
     those keep the flat accumulation model. Mirrors the epoch-count branches of
     MLXTrainer._callback_batches_per_epoch so the budget, the forced boundary
     update and the callback epoch events all land on the same micro-batch.
+
+    num_train_epochs is a float in TrainingArguments/SFTConfig, so the declared
+    count is read as one: truncating it sent 0 < num_train_epochs < 1 down the
+    no-epoch flat path, which budgets a whole pass. Only the prebuilt-epochs
+    split needs a whole number, and that branch keeps its integer guard.
     """
     if batches is None:
         return None
     total = len(batches)
-    epochs = int(getattr(args, "num_train_epochs", 0) or 0)
+    epochs = float(getattr(args, "num_train_epochs", 0) or 0)
     if total <= 0 or epochs <= 0:
         return None
     if int(getattr(args, "max_steps", 0) or 0) > 0:
         return None
-    if includes_epochs and total % epochs == 0:
-        return max(1, total // epochs)
+    whole_epochs = int(epochs)
+    if includes_epochs and whole_epochs > 0 and total % whole_epochs == 0:
+        return max(1, total // whole_epochs)
     return total
 
 
@@ -1296,8 +1302,12 @@ def _plan_single_process_text_shapes(
     if epoch_microbatches:
         # Epoch-count runs visit whole epochs and each epoch's last micro-batch
         # forces the update, so the stream is shorter than total_steps * accum.
-        total_microsteps = epoch_microbatches * (
-            total_steps // _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
+        # A fractional num_train_epochs stops part-way through the final epoch,
+        # and those micro-batches are still fetched, so the catalog counts them
+        # via the same step -> micro-batch mapping the runtime fetch uses.
+        # Whole epoch counts land on an epoch boundary and are unchanged.
+        total_microsteps = _mlx_microstep_for_step(
+            total_steps, epoch_microbatches, grad_accum,
         )
     else:
         total_microsteps = total_steps * grad_accum
@@ -1369,14 +1379,23 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
             # do_sync_step), so an epoch costs ceil(micro-batches / grad_accum)
             # and never the floor, which dropped the ragged tail into the next
             # epoch's window. Divisible epochs are unchanged.
-            total_microbatches = (
-                n_batches if includes_epochs
-                else n_batches * int(args.num_train_epochs)
+            #
+            # num_train_epochs is a float and a fractional one is supported, so
+            # the epoch count multiplies the per-epoch step cost and the product
+            # is rounded up, exactly as transformers does in
+            # set_initial_training_values:
+            #   max_steps = ceil(num_train_epochs * num_update_steps_per_epoch)
+            # Truncating the epoch count instead silently shortened 1.5 to one
+            # epoch and stretched 0.5 to a full pass. Whole epoch counts are
+            # unchanged: ceil(E * steps_per_epoch) == E * steps_per_epoch.
+            steps_per_epoch = _mlx_steps_per_epoch(
+                epoch_microbatches, grad_accum,
             )
-            total_steps = (
-                (total_microbatches // epoch_microbatches)
-                * _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
+            epoch_count = (
+                n_batches / epoch_microbatches if includes_epochs
+                else float(args.num_train_epochs)
             )
+            total_steps = math.ceil(epoch_count * steps_per_epoch)
         else:
             total_steps = n_batches // grad_accum
         return max(1, total_steps)

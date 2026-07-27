@@ -7596,6 +7596,135 @@ def test_epoch_final_microbatch_forces_optimizer_step_budget():
     assert _mlx_steps_per_epoch(4, 2) == 2
 
 
+def test_fractional_num_train_epochs_keeps_its_step_budget():
+    # num_train_epochs is a float in TrainingArguments/SFTConfig
+    # (`num_train_epochs: float = field(default=3.0, ...)`, identical in
+    # transformers 5.14.1 and 4.57.6) and a fractional value is supported:
+    # Trainer.set_initial_training_values takes the epoch-based branch and sets
+    #   max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
+    # with num_update_steps_per_epoch = max(ceil(len_dataloader / grad_accum), 1).
+    # Truncating the epoch count instead collapsed 1.5 onto 1.0 and sent any
+    # value below 1.0 down the no-epoch path, which budgets a whole floored pass.
+    # Every expectation below was measured against a real transformers.Trainer on
+    # both 5.14.1 and 4.57.6, which agree cell for cell.
+    import math
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _mlx_epoch_microbatches,
+        _resolve_training_steps,
+    )
+
+    def steps(n_batches, grad_accum, epochs, includes_epochs=False):
+        args = MLXTrainingConfig(
+            max_steps=-1,
+            num_train_epochs=epochs,
+            gradient_accumulation_steps=grad_accum,
+        )
+        return _resolve_training_steps(
+            args, [0] * n_batches, None, includes_epochs=includes_epochs,
+        )
+
+    # The item's example: 8 micro-batches, grad_accum 2, 1.5 epochs is six
+    # updates (ceil(1.5 * 4)), not the four a truncated 1.0 would budget.
+    assert steps(8, 2, 1.5) == 6
+    # Below one epoch the run is shorter than a pass, never a full floored pass.
+    assert steps(8, 2, 0.5) == 2
+    assert steps(4, 1, 0.5) == 2
+    assert steps(4, 2, 0.5) == 1
+    assert steps(3, 1, 0.5) == 2
+    # Ragged epochs ceil the per-epoch cost first, then scale by the epochs.
+    assert steps(3, 2, 1.5) == 3           # ceil(1.5 * ceil(3/2))
+    assert steps(3, 2, 2.5) == 5
+    assert steps(5, 2, 1.5) == 5           # ceil(1.5 * ceil(5/2))
+    assert steps(5, 1, 2.5) == 13
+    assert steps(4, 3, 1.5) == 3
+    # A whole number of epochs is byte-identical to the integer budget, so no
+    # existing run changes: ceil(E * steps_per_epoch) == E * steps_per_epoch.
+    for n_batches in (3, 4, 5, 6, 8):
+        for grad_accum in (1, 2, 3, 4):
+            for epochs in (1, 2, 3):
+                per_epoch = max(1, math.ceil(n_batches / grad_accum))
+                assert steps(n_batches, grad_accum, epochs) == epochs * per_epoch
+                # A float that happens to be whole must land on the same budget.
+                assert (steps(n_batches, grad_accum, float(epochs))
+                        == epochs * per_epoch)
+    # The prebuilt-every-epoch layout is unchanged as well.
+    assert steps(6, 2, 2, includes_epochs=True) == 4
+    assert steps(8, 2, 2, includes_epochs=True) == 4
+
+    # A sub-one epoch count still declares epoch boundaries: it must not fall
+    # back to the flat no-epoch model, which is what dropped the budget onto a
+    # whole floored pass.
+    half = MLXTrainingConfig(
+        max_steps=-1, num_train_epochs=0.5, gradient_accumulation_steps=2,
+    )
+    assert _mlx_epoch_microbatches(half, [0] * 8) == 8
+    # max_steps still wins over any epoch count, fractional included.
+    capped = MLXTrainingConfig(
+        max_steps=7, num_train_epochs=1.5, gradient_accumulation_steps=2,
+    )
+    assert _resolve_training_steps(capped, [0] * 8, None) == 7
+    assert _mlx_epoch_microbatches(capped, [0] * 8) is None
+
+
+def test_fractional_epoch_shape_catalog_covers_the_partial_epoch():
+    # The compiled text-shape catalog enumerates the micro-batches the run will
+    # fetch. A fractional num_train_epochs stops part-way through its last epoch,
+    # so flooring the budget to whole epochs under-enumerated that tail and left
+    # its widths out of the plan, which a strict compile scope then rejects at
+    # runtime. The enumeration reuses the runtime's own step -> micro-batch
+    # mapping, so whole epoch counts are unchanged.
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _mlx_microstep_for_step,
+        _mlx_microstep_phase,
+        _plan_single_process_text_shapes,
+        _resolve_training_steps,
+    )
+
+    # 4 micro-batches/epoch, grad_accum 2, 1.5 epochs -> 3 updates -> the first
+    # epoch's 4 micro-batches plus 2 more, which is what the loop visits.
+    plan = _make_shape_guard_text_plan((10, 11, 30, 12))
+    args = MLXTrainingConfig(
+        max_steps=-1,
+        num_train_epochs=1.5,
+        gradient_accumulation_steps=2,
+        compile_max_variants=16,
+    )
+    total_steps = _resolve_training_steps(args, plan, None)
+    assert total_steps == 3
+    shape_plan, report, allowed, _ = _plan_single_process_text_shapes(
+        plan, None, args=args, total_steps=total_steps, is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+    assert allowed
+    visited = _mlx_microstep_for_step(total_steps, 4, 2)
+    assert visited == 6
+    # Every micro-batch the loop will fetch is in the catalog, the partial
+    # second epoch included.
+    for microstep in range(visited):
+        index = plan.batch_index_for_visit(microstep)
+        assert shape_plan.allows(
+            plan.batch_family(index),
+            plan.batch_width(index),
+            _mlx_microstep_phase(report.compile_scope, 2, microstep, 4),
+        )
+    # Whole epochs land exactly on a boundary, matching the old floored form.
+    for epoch_microbatches in (3, 4, 5, 8):
+        for grad_accum in (1, 2, 3):
+            per_epoch = max(1, -(-epoch_microbatches // grad_accum))
+            for epochs in (1, 2, 3):
+                assert (
+                    _mlx_microstep_for_step(
+                        epochs * per_epoch, epoch_microbatches, grad_accum,
+                    )
+                    == epochs * epoch_microbatches
+                )
+
+
 def test_max_steps_and_single_pass_budgets_keep_the_flat_model():
     # The forced flush is scoped to epoch-count runs. A max_steps run keeps its
     # fixed budget (batches_per_epoch there is an approximation that must not move
