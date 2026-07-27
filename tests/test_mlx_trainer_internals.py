@@ -8316,3 +8316,27 @@ def test_unsized_streaming_keeps_epoch_events_off_with_a_numeric_epoch(monkeypat
     assert trainer._streaming_epoch_batch_count is None
     assert spy.epoch_events == 0
     assert spy.epochs == [0.33, 0.67, 1.0]
+
+
+def test_no_consensus_site_captures_bare_exception():
+    # A rank that captures only Exception skips _raise_distributed_failure on an
+    # interrupt while its peers enter and block in it, with no way out: the
+    # collective holds the GIL in C so Ctrl-C never reaches Python. Every site
+    # feeding a consensus must therefore capture BaseException.
+    import inspect
+    import re
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+
+    src = inspect.getsource(trainer_mod).splitlines()
+    offenders = []
+    for i, line in enumerate(src):
+        if "_raise_distributed_failure" not in line or line.lstrip().startswith("def "):
+            continue
+        for j in range(i, max(0, i - 40), -1):
+            m = re.search(r"except (BaseException|Exception)\b", src[j])
+            if m:
+                if m.group(1) == "Exception":
+                    offenders.append((j + 1, src[j].strip(), i + 1))
+                break
+    assert offenders == [], offenders
