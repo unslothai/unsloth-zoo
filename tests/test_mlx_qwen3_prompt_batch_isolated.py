@@ -36,7 +36,15 @@ _SCRIPT = textwrap.dedent(
         import mlx.core as mx
         import unsloth_zoo.mlx.compile as mc
         ar = importlib.import_module("mlx_vlm.generate.ar")
-    except Exception as error:
+    except ImportError as error:
+        # Only an absent optional dependency is a skip. An import-time
+        # regression in the modules under test must fail the subprocess, or
+        # this regression test reports success for the very break it exists
+        # to catch.
+        if (getattr(error, "name", "") or "").split(".")[0] not in (
+            "mlx", "mlx_lm", "mlx_vlm",
+        ):
+            raise
         print("SKIP", type(error).__name__, error)
         raise SystemExit(0)
 
@@ -137,3 +145,31 @@ def test_qwen3_mixed_prompt_batch_survives_a_three_row_unequal_batch():
     assert "QWEN3_MIXED_PROMPT_BATCH_OK" in result.stdout, (
         f"stdout={result.stdout}\n---\nstderr={result.stderr}"
     )
+
+
+def test_import_regressions_fail_instead_of_reporting_a_skip(tmp_path):
+    """Only an absent optional dependency may skip the isolated run.
+
+    A blanket ``except Exception`` around the imports turns any import-time
+    break in the modules under test into a successful skip, so the regression
+    test above would report success for exactly the failure it exists to catch.
+    """
+    import os
+
+    shim = tmp_path / "shim"
+    (shim / "mlx").mkdir(parents=True)
+    (shim / "mlx" / "__init__.py").write_text("")
+    (shim / "mlx" / "core.py").write_text(
+        "raise RuntimeError('simulated import-time regression')\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(shim), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    result = subprocess.run(
+        [sys.executable, "-c", _SCRIPT],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode != 0, f"stdout={result.stdout}"
+    assert "SKIP" not in result.stdout, result.stdout
+    assert "simulated import-time regression" in result.stderr, result.stderr
