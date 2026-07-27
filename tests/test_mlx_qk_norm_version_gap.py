@@ -42,7 +42,11 @@ def test_qk_norm_mismatch_raises_actionable_error():
     with pytest.raises(ValueError) as exc:
         _raise_if_qk_norm_version_gap("gemma4", _TESTER_MSG, ValueError("orig"))
     msg = str(exc.value)
-    assert "mlx-lm" in msg and "0.31.3" in msg and "gemma4" in msg
+    assert "mlx-lm" in msg and "q_norm" in msg and "gemma4" in msg
+    assert "unsloth-zoo" in msg and "mlx-vlm" in msg and "mlx-audio" in msg
+    assert "Studio users should rerun installer/repair" in msg
+    assert "strict=False" in msg
+    assert "0.31.3 broke" not in msg and "!=0.31.3" not in msg
 
 
 def test_qwen3_5_q_norm_also_caught():
@@ -129,5 +133,6 @@ def test_vlm_retry_qk_norm_mismatch_raises_actionable_error():
     with pytest.raises(ValueError) as exc:
         _load_mlx_vlm_with_extra_weight_filter("some/model", "gemma4", fake_vlm_load, {}, hf_token=None)
     msg = str(exc.value)
-    assert "mlx-lm" in msg and "0.31.3" in msg and "gemma4" in msg
+    assert "mlx-lm" in msg and "q_norm" in msg and "gemma4" in msg
+    assert "unsloth-zoo" in msg and "mlx-audio" in msg and "!=0.31.3" not in msg
     assert calls["n"] == 2  # it must have entered the filtered retry
