@@ -2537,7 +2537,9 @@ def test_callback_state_num_input_tokens_seen_uses_reduced_global_count():
     # before it is consumed for the callback state.
     reduce_at = src.index("global_input_toks = self._distributed_all_sum(")
     assert reduce_at < m.start()
-    assert "_mlx_batch_input_token_count(batch_data)" in src
+    assert re.search(
+        r"_mlx_batch_input_token_count\(\s*batch_data\b", src,
+    ) is not None
 
 
 def test_num_input_tokens_seen_incremented_before_on_optimizer_step():
@@ -6186,11 +6188,11 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
     consumed = {"i": 0}
     real_count = trainer_mod._mlx_batch_input_token_count
 
-    def _timed_count(batch_data):
+    def _timed_count(batch_data, *args, **kwargs):
         index = consumed["i"]
         consumed["i"] = index + 1
         clock.now += costs[index] if index < len(costs) else 1.0
-        return real_count(batch_data)
+        return real_count(batch_data, *args, **kwargs)
 
     monkeypatch.setattr(trainer_mod, "_mlx_batch_input_token_count", _timed_count)
 
@@ -7886,3 +7888,149 @@ def test_epoch_stop_budget_keeps_untruncated_epochs_whole(monkeypatch):
     assert spy.epoch_end == [(2, 0.8), (5, 2.0)]
     # Epoch 1 abandoned its 5th micro-batch; epoch 2 ran all five of its own.
     assert batches.visits == [0, 1, 2, 3, 0, 1, 2, 3, 4]
+
+
+def test_non_padding_input_token_mode_skips_padded_positions(monkeypatch):
+    # include_num_input_tokens_seen="non_padding" is a distinct COUNTING MODE, not
+    # just another way to enable counting: HF counts the attention mask (falling
+    # back to a pad-token comparison, then to every position) instead of the padded
+    # tensor's numel. The MLX loop honored the gate but always counted numel, so a
+    # "non_padding" run overcounted by the whole padded fraction, and any callback
+    # enforcing a token budget or reporting throughput off
+    # state.num_input_tokens_seen inherited that error.
+    import inspect
+    import tempfile
+
+    from transformers import Trainer, TrainerCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    # 1. Pin the expectation to the installed transformers, whose "non_padding"
+    #    branch sums the attention mask. Same code in 4.57.x (inline in
+    #    _inner_training_loop) and 5.x (Trainer._track_num_input_tokens).
+    hf_owner = getattr(Trainer, "_track_num_input_tokens", None)
+    hf_src = " ".join(
+        inspect.getsource(
+            hf_owner if hf_owner is not None else Trainer._inner_training_loop
+        ).split()
+    )
+    branch_at = hf_src.index('include_num_input_tokens_seen == "non_padding"')
+    branch = hf_src[branch_at:branch_at + 700]
+    assert (
+        'if "attention_mask" in inputs: input_tokens = inputs["attention_mask"].sum()'
+        in branch
+    )
+    assert "pad_token_id" in branch
+    assert "numel()" in branch
+
+    # 2. Two micro-batches, each two rows of DIFFERENT length, so the plan pads:
+    #    widths 10 and 9, so numel is 2*10 + 2*9 = 38 but only 10+4 + 9+3 = 26
+    #    positions are real. Padding is unavoidable in any real batched run.
+    row_lengths = (10, 4, 9, 3)
+    schedule = ((0, 1), (2, 3))
+    padded_numel = 2 * 10 + 2 * 9
+    non_padding = sum(row_lengths)
+    assert (padded_numel, non_padding) == (38, 26)
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class TokenSpy(TrainerCallback):
+        def __init__(self):
+            self.per_step = []
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.per_step.append(int(state.num_input_tokens_seen))
+            return control
+
+    def run(flag):
+        spy = TokenSpy()
+        args = MLXTrainingConfig(
+            max_steps=len(schedule),
+            gradient_accumulation_steps=1,
+            logging_steps=len(schedule),
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        )
+        args.include_num_input_tokens_seen = flag
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [],
+            args=args,
+            callbacks=[spy],
+        )
+        trainer._batches = FiniteTextBatchPlan(
+            tuple(
+                _FiniteTextRow(
+                    tuple(range(1, length + 1)),
+                    offset=1,
+                    labels=tuple(range(1, length + 1)),
+                )
+                for length in row_lengths
+            ),
+            schedule,
+            max_seq_length=64,
+            pad_id=99,
+        )
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        trainer.train()
+        return spy.per_step, int(trainer.state.num_input_tokens_seen)
+
+    # "all"/True keep counting every forwarded position (unchanged behavior).
+    for every in ("all", True):
+        assert run(every) == ([20, 38], padded_numel), every
+    # "non_padding" drops the padded positions, matching real transformers.Trainer
+    # on the equivalent torch batches.
+    assert run("non_padding") == ([14, 26], non_padding)
+
+
+def test_mlx_batch_input_token_count_non_padding_ladder():
+    # The helper mirrors HF's "non_padding" ladder: attention mask first, then the
+    # text tuple batch's lengths column (its exclusive real-token end, i.e. that
+    # batch's attention mask), then a pad-token comparison, then every position.
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import _mlx_batch_input_token_count
+
+    ids = mx.array([[1, 2, 3, 99], [4, 5, 99, 99]], dtype=mx.int32)
+    mask = mx.array([[1, 1, 1, 0], [1, 1, 0, 0]], dtype=mx.int32)
+    lengths = mx.array([[1, 3], [1, 2]], dtype=mx.int32)
+
+    # VLM dict batch: the processor's attention mask wins.
+    dict_batch = {"input_ids": ids, "attention_mask": mask}
+    assert _mlx_batch_input_token_count(dict_batch) == 8
+    assert _mlx_batch_input_token_count(dict_batch, mode="all") == 8
+    assert _mlx_batch_input_token_count(dict_batch, mode="non_padding") == 5
+
+    # Text tuple batch: no attention mask, so lengths[:, 1] is summed.
+    tuple_batch = (ids, lengths, mx.zeros((2, 4), dtype=mx.int32))
+    assert _mlx_batch_input_token_count(tuple_batch) == 8
+    assert _mlx_batch_input_token_count(tuple_batch, mode="non_padding") == 5
+
+    # Neither: the pad id is used when known, else every position (HF's warning
+    # path). 99 appears only as padding here, so both rungs agree with the mask.
+    bare = {"input_ids": ids}
+    assert _mlx_batch_input_token_count(
+        bare, mode="non_padding", pad_token_id=99,
+    ) == 5
+    assert _mlx_batch_input_token_count(bare, mode="non_padding") == 8
+
+    # A tuple whose second element is not a (B, 2) lengths array falls through.
+    assert _mlx_batch_input_token_count(
+        (ids, None, None), mode="non_padding", pad_token_id=99,
+    ) == 5
+    assert _mlx_batch_input_token_count((ids,), mode="non_padding") == 8
+
+    # No input ids at all still degrades to 0 rather than raising, in every mode.
+    assert _mlx_batch_input_token_count(None, mode="non_padding") == 0
+    assert _mlx_batch_input_token_count(
+        {"pixel_values": mx.zeros((2, 3))}, mode="non_padding",
+    ) == 0

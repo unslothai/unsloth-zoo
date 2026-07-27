@@ -847,7 +847,7 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
               f"(save_total_limit={save_total_limit})")
 
 
-def _mlx_batch_input_token_count(batch_data):
+def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
     """Input-token positions in a training microbatch (HF num_input_tokens_seen).
 
     HF's TrainerState.num_input_tokens_seen counts the main input tensor's numel
@@ -857,6 +857,19 @@ def _mlx_batch_input_token_count(batch_data):
     reporting is not undercounted by the masked/prompt fraction (which for
     completion-only / assistant-only loss is most of the sequence).
 
+    ``mode`` is HF's normalized include_num_input_tokens_seen value. "all" (and
+    the un-normalized True a non-TrainingArguments config keeps) counts every
+    forwarded position as above. "non_padding" follows HF's ladder instead --
+    identical in transformers 4.57.x (the inline block in _inner_training_loop)
+    and 5.x (Trainer._track_num_input_tokens): the attention mask when the batch
+    carries one, else a pad-token comparison when the processing class exposes a
+    pad_token_id, else every position. The text/preference/GRPO tuple batch has
+    no attention_mask, but its ``lengths`` column 1 is the exclusive end of the
+    real tokens (the same column the loss masks compare against, and what
+    mlx-lm's iterate_batches emits), and rows are written at ``[0, length)``, so
+    summing it is exactly that batch's attention-mask sum. DDP pad rows carry
+    length 0 and therefore drop out, as they should.
+
     Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
     than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
     GRPO tuple batch (input ids first) and the VLM dict batch (``input_ids`` key);
@@ -864,14 +877,32 @@ def _mlx_batch_input_token_count(batch_data):
     advance rather than raising.
     """
     import math
+    attention_mask = None
+    lengths = None
     if isinstance(batch_data, dict):
         arr = batch_data.get("input_ids")
+        attention_mask = batch_data.get("attention_mask")
     elif isinstance(batch_data, (tuple, list)) and batch_data:
         arr = batch_data[0]
+        lengths = batch_data[1] if len(batch_data) > 1 else None
     else:
         arr = None
     if arr is None or not hasattr(arr, "shape"):
         return 0
+    if mode != "non_padding":
+        return int(math.prod(arr.shape))
+    if attention_mask is not None and hasattr(attention_mask, "shape"):
+        return int(attention_mask.sum().item())
+    if (
+        lengths is not None
+        and hasattr(lengths, "shape")
+        and len(lengths.shape) == 2
+        and lengths.shape[1] == 2
+    ):
+        return int(lengths[:, 1].sum().item())
+    if pad_token_id is not None:
+        return int((arr != pad_token_id).sum().item())
+    # HF's last rung: no mask and no pad id, so every position is counted.
     return int(math.prod(arr.shape))
 
 
@@ -4519,10 +4550,15 @@ class MLXTrainer:
         model.train()
         # HF's include_num_input_tokens_seen gate: "no"/False (its default, and the
         # one _ensure_callback_args_compat applies) skips input-token counting
-        # entirely. Read once so the branch is identical on every rank.
-        track_input_tokens = getattr(
-            args, "include_num_input_tokens_seen", False,
-        ) not in ("no", False)
+        # entirely. The remaining values select the counting MODE ("non_padding"
+        # vs "all"/True). Read once so the branch is identical on every rank.
+        input_token_mode = getattr(args, "include_num_input_tokens_seen", False)
+        track_input_tokens = input_token_mode not in ("no", False)
+        # HF reads the pad id off self.processing_class for the "non_padding"
+        # fallback; this trainer's processing class is processor-or-tokenizer.
+        input_token_pad_id = getattr(
+            self.processor or self.tokenizer, "pad_token_id", None,
+        ) if track_input_tokens else None
         start_time = time.perf_counter()
         # Metric accumulators are split into a "committed" window (loss/tokens
         # from optimizer steps that have already been APPLIED to the model but not
@@ -5352,13 +5388,18 @@ class MLXTrainer:
             # run opted in (track_input_tokens). global_toks above is the loss mask's
             # supervised-token count (used for the zero-token guard), not the
             # input-token count HF's field reports, so counting it would undercount
-            # prompts and masked tokens. Sum the batch input numel and all-reduce it
-            # (same global gather semantics as HF and as global_toks). The gate is
-            # rank-uniform config, so every rank skips or runs it together.
+            # prompts and masked tokens. Sum the batch input positions the selected
+            # mode counts and all-reduce that (same global gather semantics as HF
+            # and as global_toks). The gate and the mode are rank-uniform config,
+            # so every rank skips or runs it together.
             if track_input_tokens:
                 global_input_toks = self._distributed_all_sum(
                     mx.array(
-                        _mlx_batch_input_token_count(batch_data), dtype=mx.int32,
+                        _mlx_batch_input_token_count(
+                            batch_data,
+                            mode=input_token_mode,
+                            pad_token_id=input_token_pad_id,
+                        ), dtype=mx.int32,
                     ),
                     stream=mx.cpu,
                 )
