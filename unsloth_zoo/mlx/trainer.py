@@ -2138,43 +2138,54 @@ class MLXTrainer:
         """Remove and return a Hugging Face TrainerCallback class or instance."""
         return self.callback_handler.pop_callback(callback)
 
-    def _suppress_torch_only_wandb_artifacts(self):
-        """Disable HF WandbCallback final-model artifacts for one on_train_end.
+    def _suppress_torch_only_final_artifacts(self):
+        """Disable HF final-model artifacts for one on_train_end dispatch.
 
-        WandbCallback.on_train_end logs that artifact by building a Torch
-        ``Trainer`` around ``args``/``model``, which raises AttributeError here
-        (``full_determinism`` on 5.x, ``batch_eval_metrics`` on 4.57.x). Adapters
-        are already saved by then, so the only casualty is the caller's
-        MLXTrainOutput. Per-checkpoint artifacts are untouched: on_save never
-        builds a Trainer. Returns (callback, previous_mode) pairs for
-        _restore_wandb_artifact_modes. Duck-typed so unsloth_zoo.mlx still
+        WandbCallback.on_train_end and DVCLiveCallback.on_train_end both log that
+        artifact by building a Torch ``Trainer`` around ``args``/``model``, which
+        raises AttributeError here (``full_determinism`` on 5.x,
+        ``batch_eval_metrics`` on 4.57.x). Adapters are already saved by then, so
+        the casualty is the caller's MLXTrainOutput -- and for DVCLive also the
+        ``self.live.end()`` that trails the artifact block, leaving the tracked
+        run unfinalized. Per-checkpoint artifacts are untouched: neither on_save
+        builds a Trainer, and DVCLive's ``log_model="all"`` (its per-checkpoint
+        mode) never enters the Trainer branch, which upstream gates on
+        ``self._log_model is True``. Returns (callback, previous_mode) pairs for
+        _restore_final_artifact_modes. Duck-typed so unsloth_zoo.mlx still
         imports without Torch.
         """
         suppressed = []
         for callback in getattr(self.callback_handler, "callbacks", ()):
-            # Match the MRO, not just the concrete class: subclassing
-            # WandbCallback to customise logging is a common recipe and
+            # Match the MRO, not just the concrete class: subclassing an
+            # integration callback to customise logging is a common recipe and
             # inherits the same on_train_end.
-            if not any(base.__name__ == "WandbCallback"
-                       for base in type(callback).__mro__):
-                continue
+            names = {base.__name__ for base in type(callback).__mro__}
             mode = getattr(callback, "_log_model", None)
-            if mode is None or not getattr(mode, "is_enabled", False):
-                continue
-            try:
-                # WandbLogModel is a str Enum, so the "false" member is
-                # reachable from the instance without importing transformers.
-                disabled = type(mode)("false")
-            except Exception:
-                continue
-            if getattr(disabled, "is_enabled", True):
+            if "WandbCallback" in names:
+                if mode is None or not getattr(mode, "is_enabled", False):
+                    continue
+                try:
+                    # WandbLogModel is a str Enum, so the "false" member is
+                    # reachable from the instance without importing transformers.
+                    disabled = type(mode)("false")
+                except Exception:
+                    continue
+                if getattr(disabled, "is_enabled", True):
+                    continue
+            elif "DVCLiveCallback" in names:
+                # Mirror upstream's identity test, so "all" keeps logging its
+                # per-checkpoint artifact (on_save, no Trainer) untouched.
+                if mode is not True:
+                    continue
+                disabled = False
+            else:
                 continue
             callback._log_model = disabled
             suppressed.append((callback, mode))
         return suppressed
 
-    def _restore_wandb_artifact_modes(self, suppressed):
-        """Undo _suppress_torch_only_wandb_artifacts on the user's callbacks."""
+    def _restore_final_artifact_modes(self, suppressed):
+        """Undo _suppress_torch_only_final_artifacts on the user's callbacks."""
         for callback, mode in suppressed:
             callback._log_model = mode
 
@@ -5784,23 +5795,26 @@ class MLXTrainer:
             final_save_error,
         )
 
-        # HF's WandbCallback logs its final-model artifact by constructing a
-        # Torch Trainer around this (MLX) model, which raises AttributeError and
-        # would throw away the finished run's result. Skip just that artifact,
-        # keep the rest of on_train_end, restore the user's callback afterwards.
-        _wandb_artifact_modes = self._suppress_torch_only_wandb_artifacts()
-        if _wandb_artifact_modes:
+        # HF's WandbCallback and DVCLiveCallback log their final-model artifact by
+        # constructing a Torch Trainer around this (MLX) model, which raises
+        # AttributeError and would throw away the finished run's result. Skip just
+        # that artifact, keep the rest of on_train_end (DVCLive's live.end() trails
+        # it), restore the user's callbacks afterwards.
+        _final_artifact_modes = self._suppress_torch_only_final_artifacts()
+        if _final_artifact_modes:
+            _suppressed_names = sorted(
+                {type(callback).__name__ for callback, _ in _final_artifact_modes}
+            )
             _main_print(
-                "Unsloth: WandbCallback final-model artifacts need a Torch "
-                "Trainer and a torch.nn.Module, so they are skipped for MLX "
-                "runs. Adapters were still saved to "
-                f"{args.output_dir}; per-checkpoint W&B artifacts are "
-                "unaffected."
+                f"Unsloth: {', '.join(_suppressed_names)} final-model artifacts "
+                "need a Torch Trainer and a torch.nn.Module, so they are skipped "
+                "for MLX runs. Adapters were still saved to "
+                f"{args.output_dir}; per-checkpoint artifacts are unaffected."
             )
         try:
             _fire("on_train_end")
         finally:
-            self._restore_wandb_artifact_modes(_wandb_artifact_modes)
+            self._restore_final_artifact_modes(_final_artifact_modes)
         _sync_stop()
 
         return MLXTrainOutput({

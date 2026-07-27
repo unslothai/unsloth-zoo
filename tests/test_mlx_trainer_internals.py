@@ -5414,7 +5414,7 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
         lr_scheduler=None,
     )
 
-    suppressed = trainer._suppress_torch_only_wandb_artifacts()
+    suppressed = trainer._suppress_torch_only_final_artifacts()
     assert [cb for cb, _ in suppressed] == [
         artifact_cb, checkpoint_cb, subclass_cb,
     ]
@@ -5434,15 +5434,130 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
     assert checkpoint_cb.saw_enabled is False
 
     # The user's callbacks get their requested mode back afterwards.
-    trainer._restore_wandb_artifact_modes(suppressed)
+    trainer._restore_final_artifact_modes(suppressed)
     assert artifact_cb._log_model is _LogModel.END
     assert checkpoint_cb._log_model is _LogModel.CHECKPOINT
 
     # ...and the training loop actually wires it around the real dispatch,
     # with a restore that survives a callback raising.
     source = inspect.getsource(MLXTrainer._train_inner)
-    assert "_suppress_torch_only_wandb_artifacts()" in source
-    assert 'finally:\n            self._restore_wandb_artifact_modes(' in source
+    assert "_suppress_torch_only_final_artifacts()" in source
+    assert 'finally:\n            self._restore_final_artifact_modes(' in source
+
+
+def test_dvclive_artifact_mode_suppressed_for_on_train_end():
+    # transformers' DVCLiveCallback.on_train_end takes the same Torch-only path as
+    # WandbCallback: with log_model=True (or HF_DVCLIVE_LOG_MODEL=TRUE) it builds a
+    # Torch Trainer around args/model to save the final artifact, so a real MLX run
+    # dies with AttributeError ('MLXTrainingConfig' object has no attribute
+    # 'full_determinism' on 5.x, 'batch_eval_metrics' on 4.57.x) after training and
+    # the final adapter save both finished. Two things are lost: the caller's
+    # MLXTrainOutput, and the self.live.end() that trails the artifact block, which
+    # leaves the tracked run unfinalized. log_model="all" must NOT be suppressed:
+    # it is a per-checkpoint on_save artifact that never builds a Trainer.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLXCallbackHandler,
+    )
+
+    integration_utils = pytest.importorskip(
+        "transformers.integrations.integration_utils"
+    )
+
+    # Pin the upstream shape this suppression is written against, so the test
+    # tracks transformers instead of a hand-copied snapshot of it.
+    upstream = inspect.getsource(integration_utils.DVCLiveCallback.on_train_end)
+    assert "Trainer(" in upstream, upstream
+    assert "if self._log_model is True:" in upstream, upstream
+    # live.end() trails the artifact block, so raising inside it skips the
+    # finalization too -- that is why the fix suppresses instead of catching.
+    assert (
+        upstream.index("if self._log_model is True:")
+        < upstream.index("self.live.end()")
+    ), upstream
+
+    class DVCLiveCallback:  # the class NAME is what the bridge matches on
+        def __init__(self, log_model):
+            self._log_model = log_model
+            self._initialized = True
+            self.ended = False
+
+        def on_train_end(self, args, state, control, **kwargs):
+            # Verbatim control flow of the upstream method asserted above.
+            if self._log_model is True:
+                raise AttributeError(
+                    "'MLXTrainingConfig' object has no attribute 'full_determinism'"
+                )
+            self.ended = True
+
+    class CustomDVCLiveCallback(DVCLiveCallback):
+        """Subclassing the integration callback is a common recipe, and it
+        inherits the same on_train_end."""
+
+    class OtherCallback:
+        def __init__(self):
+            self._log_model = True
+
+    artifact_cb = DVCLiveCallback(True)
+    subclass_cb = CustomDVCLiveCallback(True)
+    all_cb = DVCLiveCallback("all")
+    off_cb = DVCLiveCallback(None)
+    other_cb = OtherCallback()
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(max_steps=1)
+    trainer.callback_handler = _MLXCallbackHandler(
+        [artifact_cb, subclass_cb, all_cb, off_cb, other_cb],
+        model=object(),
+        processing_class=None,
+        optimizer=None,
+        lr_scheduler=None,
+    )
+
+    suppressed = trainer._suppress_torch_only_final_artifacts()
+    assert [cb for cb, _ in suppressed] == [artifact_cb, subclass_cb]
+    assert artifact_cb._log_model is False
+    assert subclass_cb._log_model is False
+    # The per-checkpoint mode logs args.output_dir from on_save and never builds a
+    # Trainer, so it keeps working on MLX and must survive untouched -- as must a
+    # same-shaped callback from another library.
+    assert all_cb._log_model == "all"
+    assert off_cb._log_model is None
+    assert other_cb._log_model is True
+
+    # The on_train_end dispatch now completes, so live.end() is reached.
+    trainer.callback_handler.call_event(
+        "on_train_end", trainer.args, object(), object(),
+    )
+    assert artifact_cb.ended is True
+    assert subclass_cb.ended is True
+    assert all_cb.ended is True
+
+    # The user's callbacks get their requested mode back afterwards.
+    trainer._restore_final_artifact_modes(suppressed)
+    assert artifact_cb._log_model is True
+    assert subclass_cb._log_model is True
+
+    # And the real transformers class is matched by the same MRO probe, whenever
+    # the SDK the callback requires is actually installed.
+    if integration_utils.is_dvclive_available():
+        real_cb = integration_utils.DVCLiveCallback(log_model=True)
+        real_cb._initialized = True
+        trainer.callback_handler = _MLXCallbackHandler(
+            [real_cb],
+            model=object(),
+            processing_class=None,
+            optimizer=None,
+            lr_scheduler=None,
+        )
+        real_suppressed = trainer._suppress_torch_only_final_artifacts()
+        assert [cb for cb, _ in real_suppressed] == [real_cb]
+        assert real_cb._log_model is False
+        trainer._restore_final_artifact_modes(real_suppressed)
+        assert real_cb._log_model is True
 
 
 def _tiny_lm_for_loop_tests():
