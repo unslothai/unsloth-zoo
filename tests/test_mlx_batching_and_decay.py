@@ -929,6 +929,57 @@ def test_vlm_shape_planning_follows_the_resolved_override_mode():
     assert not allowed and report.reason == "vlm_unplannable_family"
 
 
+class _TailUnplannableProcessor(_ContentProcessor):
+    """Makes exactly one surveyed batch unplannable, chosen by call order."""
+
+    def __init__(self, poison_call):
+        self.poison_call = poison_call
+        self.calls = 0
+
+    def __call__(self, text, **kwargs):
+        batch = dict(super().__call__(text, **kwargs))
+        self.calls += 1
+        if self.calls == self.poison_call:
+            batch[object()] = 1      # an unstable key: never plannable
+        return batch
+
+
+def test_vlm_admission_covers_only_the_batches_the_loop_visits():
+    """A schedule whose length is not a multiple of the accumulation factor
+    ends in micro-batches the loop never reaches. An unplannable family
+    confined to that tail must not degrade the run to eager or abort strict
+    mode, since no compiled call can ever see it; the same family inside the
+    executed region still must."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.trainer import _plan_single_process_vlm_shapes
+
+    # 10 scheduled batches against 2 steps x 4 accumulation = 8 visits, so
+    # batches 8 and 9 are surveyed and never trained.
+    args = SimpleNamespace(
+        compile_max_variants=None, gradient_accumulation_steps=4,
+    )
+
+    def _plan(poison_call):
+        return _plan_single_process_vlm_shapes(
+            _vlm_planner_fixtures(
+                processor=_TailUnplannableProcessor(poison_call), rows=10,
+            ),
+            None, args=args, total_steps=2, distributed_world_size=1,
+            compile_policy=SimpleNamespace(mode="strict"),
+            compile_decision=SimpleNamespace(enabled=True, policy_mode="strict"),
+        )
+
+    for poison_call in (9, 10):      # calls are 1-based: batches 8 and 9
+        _shape_plan, report, allowed, _frontier = _plan(poison_call)
+        assert allowed and report.reason != "vlm_unplannable_family"
+
+    # Still enforced for a batch the loop does reach.
+    with pytest.raises(RuntimeError, match="cannot plan VLM batch 3"):
+        _plan(4)
+
+
 def test_vlm_automatic_planning_stays_exact_below_ceiling():
     """Below the ceiling: canonical event widths, no budget compression."""
     _skip_if_mlx_core_was_replaced()
@@ -1860,6 +1911,51 @@ def test_vlm_plan_rejects_a_rebuild_that_leaves_its_frozen_endpoint():
     plan.ensure_descriptors()
     processor.training = True
     assert plan.check_family_drift(0, plan._build_batch(0)) is None
+def test_vlm_drift_error_names_the_survey_for_privately_owned_draw_state():
+    """The survey builds every batch through the processor once before
+    training and preserves only the PROCESS RNGs around it, so a processor
+    carrying draw state of its own reaches training one survey further along
+    and drifts. There is no generic way to restore another object's state, so
+    the message has to say where the shift came from: on its own it sends the
+    user to a data pipeline that is fine on the eager path."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _PrivateCounterProcessor(_ContentProcessor):
+        """Carries the reviewer's 'augmentation counter': private state that
+        no RNG preservation reaches, advanced once per call."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, text, **kwargs):
+            batch = dict(super().__call__(text, **kwargs))
+            self.calls += 1
+            if self.calls % 5 == 0:
+                batch["extra_mask"] = np.ones((len(text), 2), dtype=np.int32)
+            return batch
+
+    processor = _PrivateCounterProcessor()
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(4)],
+        processor=processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+    )
+    plan.ensure_descriptors()
+    assert processor.calls == 4      # one private advance per scheduled batch
+
+    rebuilt = plan._build_batch(0)
+    # Training resumes the private stream past the survey, so batch 0 rebuilds
+    # into a structure its own surveyed family never had.
+    assert processor.calls == 5 and "extra_mask" in rebuilt
+    with pytest.raises(RuntimeError) as excinfo:
+        plan.check_family_drift(0, rebuilt)
+    message = str(excinfo.value)
+    assert "shape survey" in message and "compile disabled" in message
+
+
 def test_vlm_plan_releases_the_previous_batch_before_building_the_next(
     monkeypatch,
 ):
@@ -2059,8 +2155,7 @@ def test_vlm_plan_accepts_a_dataset_that_returns_a_fresh_image_per_read():
 def test_vlm_media_probe_sees_a_change_that_a_sparse_sample_would_miss():
     # A sampled probe reads a fixed stride derived from the shape, so a
     # mutation that lands between samples is invisible to it. The digest reads
-    # every byte, and uses two independent reductions so changes that cancel
-    # under a sum still register.
+    # every byte, so a change that cancels under a sum still registers.
     Image = pytest.importorskip("PIL.Image")
     from unsloth_zoo.mlx.utils import _vlm_media_fingerprint
 
@@ -2092,6 +2187,92 @@ def test_vlm_media_probe_sees_a_change_that_a_sparse_sample_would_miss():
     assert _vlm_media_fingerprint(original) != _vlm_media_fingerprint(
         cancelling.reshape(original.shape)
     )
+
+
+def test_vlm_media_probe_sees_an_in_place_byte_permutation():
+    """Geometric augmentation rewrites a buffer with a permutation of its own
+    bytes, which both a byte sum and a byte xor are blind to. The digest must
+    be order sensitive or the plan accepts exactly the corruption it exists to
+    report."""
+    Image = pytest.importorskip("PIL.Image")
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.mlx.utils import _vlm_media_fingerprint
+
+    rows, cols = np.mgrid[0:48, 0:48]
+    base = np.stack(
+        [(cols * 3 + rows).astype(np.uint8), (rows * 5).astype(np.uint8),
+         ((cols ^ rows) * 2).astype(np.uint8)], axis=-1,
+    )
+    base = (base + np.random.RandomState(0).randint(0, 12, base.shape)).astype(
+        np.uint8,
+    )
+    permutations = {
+        "hflip": base[:, ::-1],
+        "vflip": base[::-1],
+        "rot90": np.rot90(base),
+        "transpose": base.transpose(1, 0, 2),
+        "roll_rows": np.roll(base, 7, axis=0),
+        "channel_swap": base[..., ::-1],
+    }
+    for name, view in permutations.items():
+        mutated = np.ascontiguousarray(view)
+        assert np.array_equal(
+            np.sort(base.reshape(-1)), np.sort(mutated.reshape(-1)),
+        ), f"{name} must be a byte permutation, or it is not the gap under test"
+        assert _vlm_media_fingerprint(base) != _vlm_media_fingerprint(mutated), name
+
+    # Byte permutation for float payloads too: reversing an axis moves whole
+    # 4-byte groups, so the byte multiset survives.
+    tensor = torch.from_numpy(base.astype(np.float32) / 255.0)
+    assert _vlm_media_fingerprint(tensor) != _vlm_media_fingerprint(
+        torch.flip(tensor, dims=[1]).contiguous()
+    )
+    assert _vlm_media_fingerprint(Image.fromarray(base)) != _vlm_media_fingerprint(
+        Image.fromarray(np.ascontiguousarray(base[:, ::-1]))
+    )
+
+
+def test_vlm_plan_reports_an_in_place_augmentation_over_a_reused_buffer():
+    """The reachable form of the same gap: one decode buffer plus an in-place
+    flip per read leaves every stored row aliasing the final image, and each
+    read is a byte permutation of the last, so a commutative digest saw no
+    change at all."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _FlipInPlace:
+        """Augments one shared buffer, the way a single-sample or repeated-row
+        dataset with in-place geometric augmentation does."""
+
+        def __init__(self):
+            self.buffer = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+            self.returned = []
+
+        def __len__(self):
+            return 6
+
+        def __getitem__(self, index):
+            self.buffer[:] = (
+                self.buffer[:, ::-1] if index % 2 else self.buffer[::-1]
+            ).copy()
+            self.returned.append(self.buffer.copy())
+            return {"text": str(index), "images": [self.buffer]}
+
+    dataset = _FlipInPlace()
+    with pytest.raises(ValueError, match="changed after the row"):
+        _create_vlm_batch_plan(
+            dataset=dataset,
+            processor=_ContentProcessor(),
+            config={"image_size": 16, "image_token_id": 200},
+            batch_size=2,
+            max_seq_length=8,
+            num_batches=3,
+            dataset_order="sequential",
+        )
+    # Every read really did hand back a permutation of the previous one, so
+    # the sum and the xor were identical at every pin.
+    sums = {int(np.asarray(image).sum()) for image in dataset.returned}
+    assert len(dataset.returned) == 6 and len(sums) == 1
 
 
 def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):

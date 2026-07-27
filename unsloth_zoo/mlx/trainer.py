@@ -1082,9 +1082,24 @@ def _plan_single_process_vlm_shapes(
         return None, report, False, None
 
     batches.ensure_descriptors()
+    # Admit only the batches the loop actually visits. The gradient-accumulation
+    # floor drops the schedule's trailing micro-batches, and an unplannable
+    # family confined to that tail would otherwise degrade the whole run to
+    # eager (or abort strict mode) over a batch no compiled call can reach.
+    # Resume is not resolved yet at this call site, so visits start at 0: that
+    # is a superset of what a resumed loop runs, and a superset only ever
+    # admits more than needed. The survey itself stays whole-schedule, because
+    # planned_event_widths() reduces the maximum padable width and the union of
+    # untouched extents over EVERY batch -- narrowing that input would silently
+    # move the endpoints of the batches that do train.
+    total_microsteps = total_steps * args.gradient_accumulation_steps
+    executed = sorted({
+        batches.batch_index_for_visit(microstep)
+        for microstep in range(total_microsteps)
+    })
     unplannable = [
         index
-        for index in range(len(batches))
+        for index in executed
         if not _vlm_family_is_plannable(batches.batch_family(index))
     ]
     if unplannable:
@@ -1102,7 +1117,6 @@ def _plan_single_process_vlm_shapes(
 
     planned_widths = batches.planned_event_widths()
 
-    total_microsteps = total_steps * args.gradient_accumulation_steps
     event_counts = {}
     for microstep in range(total_microsteps):
         batch_index = batches.batch_index_for_visit(microstep)
@@ -1155,11 +1169,14 @@ def _plan_single_process_vlm_shapes(
     # Only widening writes the tokenizer pad id into a tail, so a pad id is
     # required by the BUILT plan rather than by the processor: uniform-width
     # and declined-only schedules pad nothing and stay compilable without one.
+    # Same admitted set as above, or a tail batch nobody widens (it is only
+    # ever built unpadded, by advance_preprocessing or a plain fetch) would
+    # still demand a pad id the run never uses.
     if batches.pad_token_id is None and any(
         shape_plan.endpoint_for(
             batches.batch_family(index), planned_widths[index],
         ) > batches.batch_width(index)
-        for index in range(len(batches))
+        for index in executed
     ):
         report = _shape_guard_report(
             "eager", "vlm_pad_token_unavailable", cap, compile_scope,

@@ -47,6 +47,7 @@ import threading
 import time
 import warnings
 import weakref
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -6074,23 +6075,22 @@ def _vlm_pil_image_is_decoded(image):
 
 
 def _vlm_media_bytes_digest(array):
-    """Exact (sum, xor) over every byte of an array-like payload.
+    """Order-sensitive CRC-32 over every byte of an array-like payload.
 
     A sparse sample cannot see a mutation that misses its stride, and the
     stride is derivable from the shape, so the probe reads the whole buffer.
-    Two independent byte reductions are used rather than one because a sum
-    alone is blind to changes that cancel. This is a raw-byte view, so it is
-    exact for float payloads too, and it costs a memory-bandwidth pass rather
-    than a cryptographic one: about 1 ms per megapixel against 4 ms for
-    blake2b, paid once per scheduled slot at plan construction.
+    A byte sum and a byte xor are both permutation-invariant, so an in-place
+    geometric augmentation over a reused buffer (flip, rotate, roll, channel
+    swap -- all exact byte permutations, for float payloads too) left both
+    unchanged and the corruption went unreported. CRC-32 is order sensitive,
+    and being one C pass rather than two numpy reductions it is also cheaper
+    than the pair it replaces: 0.62 ms against 1.40 ms per 1024x1024 RGB
+    probe here, against 3.63 ms for blake2b. This is a raw-byte view, so it
+    is exact for float payloads, and it is paid once per scheduled slot at
+    plan construction.
     """
     flat = np.ascontiguousarray(array).reshape(-1).view(np.uint8)
-    if flat.size == 0:
-        return (0, 0)
-    return (
-        int(flat.sum(dtype=np.uint64)),
-        int(np.bitwise_xor.reduce(flat)),
-    )
+    return zlib.crc32(memoryview(flat))
 
 
 def _vlm_media_fingerprint(payload):
@@ -6963,7 +6963,10 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         batch is released before the next is built, so the survey owns at most
         one batch at a time; repeated calls return the stored descriptors.
         Runs under preserved global preprocessing RNG state, so a stochastic
-        processor's augmentation draws are not consumed here.
+        processor's augmentation draws are not consumed here. Draw state a
+        processor owns privately is out of that preservation's reach and does
+        advance by one survey; ``check_family_drift`` names this when the
+        difference reaches the shapes.
         """
         if self._descriptors is not None:
             return self._descriptors
@@ -7085,7 +7088,13 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             raise RuntimeError(
                 f"Unsloth MLX: VLM batch {index} drifted from its surveyed "
                 f"compile family ({divergence}). The data pipeline must "
-                f"produce structurally identical batches on every visit."
+                f"produce structurally identical batches on every visit. The "
+                f"shape survey already built every batch once through the "
+                f"processor, with the process RNGs preserved around it, so a "
+                f"processor drawing from a generator or counter it owns "
+                f"privately arrives at training one survey further along its "
+                f"own stream and drifts here; run that pipeline with compile "
+                f"disabled."
             )
 
 
