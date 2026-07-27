@@ -4435,6 +4435,44 @@ try:
 except ImportError:
     _HUB_INVALID_ID_ERRORS = (HFValidationError,)
 
+# huggingface_hub >= 1.0 dropped support for *addressing* a canonical single
+# segment id. `HfFileSystem.resolve_path` answers a plain
+#     ValueError("Repository id must be 'namespace/name', got 'gpt2'. ...")
+# from a pure argument check placed before `parse_hf_uri` and before
+# `_repo_and_revision_exist`, so it is raised without any network I/O and can
+# never be a transport failure. 0.x has no such check and lists those ids
+# happily, so there the network IS reached and the same catch would swallow a
+# genuine failure. Recording which of the two is installed is what lets the
+# swallow be scoped to the case where it is provably safe.
+def _hub_rejects_single_segment_ids():
+    try:
+        import huggingface_hub
+        return int(str(huggingface_hub.__version__).split(".", 1)[0]) >= 1
+    except Exception:
+        return False
+pass
+_HUB_REJECTS_SINGLE_SEGMENT_IDS = _hub_rejects_single_segment_ids()
+
+# The wording of that rejection, kept as a second, version independent signal
+# so a backport of the check to a 0.x line is still recognised.
+_SINGLE_SEGMENT_REJECTION = re.compile(r"single[\s\-_]?segment|namespace/name", re.IGNORECASE)
+
+def _is_single_segment_id_rejection(model_name, e):
+    """True only for "this version cannot address a single segment id".
+
+    A ValueError *subclass* is never that check, and that distinction is the
+    whole point: measured against a proxy answering 200 with a non-JSON body,
+    `HfFileSystem.ls` raises `requests.exceptions.JSONDecodeError` on 0.36.2 and
+    `json.JSONDecodeError` on 1.24.0. Both are ValueError subclasses, both are
+    transport failures, and on 0.36.2 both reach this catch for a slashless name
+    such as `gpt2`, where reporting "absent" would put a merge straight back on
+    the silent no-op path this module exists to close.
+    """
+    if type(e) is not ValueError: return False        # a subclass is a transport failure
+    if str(model_name).count("/") != 0: return False  # namespace/name is addressable everywhere
+    return _HUB_REJECTS_SINGLE_SEGMENT_IDS or bool(_SINGLE_SEGMENT_REJECTION.search(str(e)))
+pass
+
 # Exceptions that genuinely mean "this repo is not there / not usable".
 # `HfFileSystem.ls` reports an absent repo, revision or path as a plain
 # FileNotFoundError: `hf_file_system._raise_file_not_found` is reached only
@@ -4518,12 +4556,13 @@ def check_hf_model_exists(model_name, token=None):
         # Never a transport failure in any version.
         return False
     except ValueError as e:
-        # huggingface_hub >= 1.0 dropped canonical single segment ids and
-        # rejects them with a *plain* ValueError, which is a statement about the
-        # argument, not about the network. Scoped to single segment names so a
-        # genuine transport failure surfacing as a ValueError on a
-        # `namespace/name` repo still raises below.
-        if str(model_name).count("/") == 0: return False
+        # huggingface_hub >= 1.0 rejects a canonical single segment id with a
+        # *plain* ValueError, which is a statement about the argument, not about
+        # the network, and which that version raises before it opens a socket.
+        # Anything else that arrives here as a ValueError, most obviously a
+        # JSONDecodeError from a proxy mangling the response body, is a
+        # connectivity failure and must not be reported as a missing model.
+        if _is_single_segment_id_rejection(model_name, e): return False
         raise _hub_unreachable_error(model_name, e) from e
     except Exception as e:
         raise _hub_unreachable_error(model_name, e) from e
@@ -4750,8 +4789,22 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         local = check_local_model_exists(base)
         if local and not check_model_quantization_status(local)[0]:
             return local
+    except Exception:
+        return None
+    try:
         if check_hf_model_exists(base, token) and not check_model_quantization_status(base, token)[0]:
             return base
+    except RuntimeError as e:
+        # An unreachable Hub is not "there is no 16bit sibling". Returning None
+        # is still right, because the merge can complete by dequantizing the FP8
+        # weights, but say so: the base actually used is then not the one a
+        # reachable Hub would have chosen, and silently downgrading it is the
+        # same class of mistake as silently reporting a model missing.
+        warnings.warn(
+            f"Unsloth: could not check the Hugging Face Hub for a 16bit sibling of "
+            f"`{model_name}` ({e}). Merging onto the FP8 weights instead."
+        )
+        return None
     except Exception:
         return None
     return None
@@ -4782,13 +4835,28 @@ def determine_base_model_source(model_name, token=None):
         return (local_path, True, "local_mxfp4", True, "mxfp4")
 
     # Only now can the Hub change the answer, so only now is it consulted, and
-    # an unreachable Hub still propagates. Falling back to the priority 5 local
-    # copy here would be worse than it looks: for a 16bit merge of an nf4/fp4
-    # base `merge_and_overwrite_lora` answers `warnings.warn` plus `return None`
-    # and writes nothing, which is the exact silent no-op this branch exists to
-    # remove. Raising is the honest answer, and it is what the parent commit
-    # already did for every input that reaches this line.
-    hf_exists = check_hf_model_exists(model_name, token)
+    # an unreachable Hub still propagates for everything the merge cannot
+    # complete from local weights alone.
+    #
+    # FP8 is the one exception, and it has to be handled here rather than by
+    # hoisting priority 5, because `outputs/mymodel` is simultaneously a valid
+    # repo id and an ordinary directory, so no string test can spare it from the
+    # probe. `merge_and_overwrite_lora` dequantizes an FP8 base for
+    # `merged_16bit` (`_merge_and_overwrite_lora_fp8`), so the local weights are
+    # sufficient and an unreachable Hub must not block a valid offline export.
+    # Catching rather than reordering keeps a reachable Hub authoritative: a
+    # 16bit repo still wins at priority 3, exactly as it does today.
+    #
+    # nf4/fp4 deliberately keeps raising. There the 16bit merge answers
+    # `warnings.warn` plus `return None` and writes nothing, so falling back
+    # would trade a loud failure for the silent no-op this branch exists to
+    # remove. Raising is what the parent commit already did for it.
+    try:
+        hf_exists = check_hf_model_exists(model_name, token)
+    except RuntimeError:
+        if local_path and local_quant_type == "fp8":
+            return (local_path, True, "local_fp8", True, "fp8")
+        raise
 
     hf_is_quantized, hf_quant_type = None, None
     if hf_exists:
