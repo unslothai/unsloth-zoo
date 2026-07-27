@@ -4833,7 +4833,14 @@ def _normalize_prompt_messages(prompt_utils_module, prompt):
         role_content = prompt_utils_module._get_role_content(item)
         if role_content is not None:
             role, content = role_content
-            messages.append({"role": role, "content": content})
+            message = dict(item) if isinstance(item, dict) else {}
+            normalize_tool_calls = getattr(
+                prompt_utils_module, "_normalize_tool_call_arguments", None
+            )
+            if isinstance(item, dict) and callable(normalize_tool_calls):
+                message = normalize_tool_calls(message)
+            message.update(role=role, content=content)
+            messages.append(message)
             continue
 
         messages.append({"role": "user", "content": str(item)})
@@ -4933,18 +4940,22 @@ def _anchor_conversation_media_to_first_user_turn(
             message.get("content", "")
         )
         is_target = i == target_idx and role.lower() not in _NON_USER_ROLES
-        anchored.append(
-            prompt_utils_module.get_message_json(
-                model_type,
-                content,
-                role,
-                skip_image_token=not is_target,
-                skip_audio_token=not is_target,
-                num_images=num_images,
-                num_audios=num_audios,
-                **kwargs,
-            )
+        rendered = prompt_utils_module.get_message_json(
+            model_type,
+            content,
+            role,
+            skip_image_token=not is_target,
+            skip_audio_token=not is_target,
+            num_images=num_images,
+            num_audios=num_audios,
+            **kwargs,
         )
+        if isinstance(message, dict):
+            if isinstance(rendered, dict):
+                rendered = {**message, **rendered}
+            elif set(message).difference(("role", "content")):
+                rendered = {**message, "role": role, "content": rendered}
+        anchored.append(rendered)
     return anchored
 
 

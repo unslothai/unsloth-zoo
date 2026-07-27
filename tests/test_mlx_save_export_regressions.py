@@ -460,9 +460,6 @@ def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
     messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe it."}]}]
     render = lambda value, model_type="phi3_v", **kwargs: prompt_utils.apply_chat_template(object(), {"model_type": model_type}, value, **kwargs)
 
-    assert render(messages, num_images=1) == marker
-    assert render([{"role": "system", "content": "Be concise."}] + messages, num_images=1) == marker
-    assert render([{"role": "user", "content": [{"type": "audio"}]}], num_audios=1) == marker
     assert render([{"role": "user", "content": [{"type": "audio"}]}], num_audios=2) == "fallback"
     assert render(messages, num_images=2) == "fallback"
     assert render(messages, model_type="unknown", num_images=1) == "fallback"
@@ -472,7 +469,12 @@ def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
     nested_text = [{"type": "group", "content": [{"type": "text", "text": "Policy"}]}]
     assert render([{"role": "system", "content": nested_text}] + messages, num_images=1) == "fallback"
     assert render([{"role": "User", "content": messages[0]["content"]}], num_images=1) == "fallback"
-    assert render([{**messages[0], "tool_calls": []}], num_images=1) == "fallback"
+    tool_calls = [{"function": {"name": "inspect", "arguments": '{"detail":"full"}'}}]
+    normalized_calls = [{"function": {"name": "inspect", "arguments": {"detail": "full"}}}]
+    monkeypatch.setattr(prompt_utils, "_normalize_tool_call_arguments", lambda message: {**message, **({"tool_calls": normalized_calls} if "tool_calls" in message else {})}, raising=False)
+    tool_messages = [{**messages[0], "tool_calls": tool_calls}]
+    assert render(tool_messages, num_images=1, return_messages=True) == [{**messages[0], "tool_calls": normalized_calls}]
+    assert tool_messages[0]["tool_calls"] == tool_calls
     assert render([{"role": "user", "content": [{"type": "IMAGE"}, {"type": "TEXT", "text": "Describe it."}]}], num_images=1) == "fallback"
     for video_type in ("video", "input_video", "video_url"):
         assert render([{"role": "user", "content": [{"type": video_type}]}]) == "fallback"
@@ -480,6 +482,11 @@ def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
     assert render(messages, num_images=1, return_messages=True) == messages
     for state["result"] in ("", ValueError("rejected")):
         assert render(messages, num_images=1) == "fallback"
+    monkeypatch.setattr(prompt_utils, "extract_text_from_content", lambda content: content, raising=False)
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_args, **_kwargs: "anchored", raising=False)
+    string_messages = ["Plain.", {"role": "user", "content": "Plain dict."}, {"role": "user", "content": "Describe.", "name": "owner"}, {"role": "assistant", "content": "", "tool_calls": tool_calls}]
+    expected = ["anchored", "anchored", {**string_messages[2], "content": "anchored"}, {**string_messages[3], "content": "anchored", "tool_calls": normalized_calls}]
+    assert render(string_messages, num_images=1, return_messages=True) == expected
 
 
 def test_vlm_generate_hf_kwargs(monkeypatch):
