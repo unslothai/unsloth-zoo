@@ -5182,7 +5182,9 @@ def _processor_class_owns_gemma3n_token_types(cls):
     # Class names can be regenerated or reused by custom processors. Only the
     # module that supplies the effective call identifies the installed owner.
     module = str(getattr(owner, "__module__", "")).lower()
-    return "gemma3n" in module.split(".")
+    # why: remote-code and single-file loads land the marker as a suffix
+    # (`...selfcontained.processing_gemma3n`), never as its own path component.
+    return "gemma3n" in module
 
 
 def _vlm_processor_requests_mm_token_type_ids(processor):

@@ -4006,3 +4006,74 @@ def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
                 if produced > 1000:
                     break
             assert produced > 1000
+
+
+def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
+    """A reused prompt cache must not shift the feature window off the mask."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[1], [2]])]
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+
+    # The mask already covers only the new turn, so an offset carried over from
+    # an earlier turn must not be applied to it a second time.
+    for carried_offset in (0, 6, 20):
+        window_masks, window_embeds = mc._qwen3_visual_window(
+            masks,
+            packed,
+            positions,
+            mask_offsets=(carried_offset,),
+            window=6,
+        )
+        assert window_masks.tolist() == [[0, 0, 1, 1, 0, 0]]
+        assert window_embeds[0].tolist() == [[1], [2]]
+
+
+def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
+    """A row carrying mlx-vlm's own deepstack features keeps them.
+
+    Synthesizing empty compact state for such a row hands the language call
+    zeros in place of its real visual features.
+    """
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 1, 1, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+    compact_row = {
+        "inputs_embeds": mx.zeros((1, 4, 1)),
+        "visual_pos_masks": masks,
+        mc._QWEN3_VISUAL_STATE_KEY: state,
+        mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+    }
+    native_row = {
+        "inputs_embeds": mx.zeros((1, 4, 1)),
+        "visual_pos_masks": masks,
+        # A bare array is what _pack_qwen3_visual_state declines to compact.
+        "deepstack_visual_embeds": mx.array([[7.0], [8.0]]),
+    }
+
+    rows = [native_row, compact_row]
+    assert mc._pad_qwen3_prompt_rows(rows) is rows
+
+    seen = []
+
+    def language(self, inputs, inputs_embeds=None, mask=None, cache=None,
+                 visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs):
+        seen.append(deepstack_visual_embeds)
+
+    padded = mc._pad_qwen3_prompt_rows(rows)[0]
+    call_kwargs = dict(padded)
+    call_kwargs.pop("inputs_embeds")
+    mc._qwen3_visual_state_adapter(language)(
+        object(), mx.zeros((1, 4)), cache=None, **call_kwargs
+    )
+    assert seen[0].tolist() == [[7.0], [8.0]]
+
+    # A mask-only row owns no features, so it still gets an empty state to keep
+    # its slot in the batch.
+    mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
+    filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
+    assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()

@@ -2645,6 +2645,17 @@ def _pad_qwen3_prompt_rows(prompt_kwargs_list):
     if template is None:
         return prompt_kwargs_list
 
+    # why: a row still on mlx-vlm's native deepstack keys owns real features
+    # that no compact state can stand in for, so synthesizing an empty one
+    # would replace them with zeros. Leave the batch exactly as it is.
+    if any(
+        kwargs
+        and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None
+        and kwargs.get("deepstack_visual_embeds") is not None
+        for kwargs in prompt_kwargs_list
+    ):
+        return prompt_kwargs_list
+
     feature_widths = []
     for kwargs in prompt_kwargs_list:
         if not kwargs:
