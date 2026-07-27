@@ -2608,21 +2608,67 @@ def _attach_qwen3_visual_state(features, visual_state, visual_positions):
 def _pad_qwen3_prompt_rows(prompt_kwargs_list):
     """Equalize compact visual widths before generic batch concatenation."""
 
-    max_features = max(
+    template = next(
         (
-            kwargs[_QWEN3_VISUAL_STATE_KEY].shape[1]
+            kwargs
             for kwargs in prompt_kwargs_list
-            if kwargs and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is not None
+            if kwargs
+            and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is not None
+            and kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY) is not None
+            and kwargs.get("visual_pos_masks") is not None
         ),
-        default=0,
+        None,
     )
+    if template is None:
+        return prompt_kwargs_list
+
+    feature_widths = []
+    for kwargs in prompt_kwargs_list:
+        if not kwargs:
+            continue
+        state = kwargs.get(_QWEN3_VISUAL_STATE_KEY)
+        if state is not None:
+            feature_widths.append(state.shape[1])
+        elif (
+            kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY) is None
+            and kwargs.get("visual_pos_masks") is not None
+        ):
+            feature_widths.extend(kwargs["visual_pos_masks"].sum(axis=1).tolist())
+    max_features = max(feature_widths, default=0)
     if not max_features:
         return prompt_kwargs_list
 
     padded_rows = [dict(kwargs) if kwargs else kwargs for kwargs in prompt_kwargs_list]
     for kwargs in padded_rows:
-        if not kwargs or kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None:
+        if not kwargs:
             continue
+        if kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None:
+            if kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY) is not None:
+                continue
+            inputs_embeds = kwargs.get("inputs_embeds")
+            if inputs_embeds is None:
+                continue
+            state = template[_QWEN3_VISUAL_STATE_KEY]
+            visual_mask = template["visual_pos_masks"]
+            if kwargs.get("visual_pos_masks") is None:
+                kwargs["visual_pos_masks"] = mx.zeros(
+                    inputs_embeds.shape[:2],
+                    dtype=visual_mask.dtype,
+                )
+            visual_mask = kwargs["visual_pos_masks"]
+            empty_layers = [
+                mx.zeros(
+                    (int(visual_mask.sum().item()), state.shape[-1]),
+                    dtype=state.dtype,
+                )
+                for _ in range(state.shape[2])
+            ]
+            state, positions = _pack_qwen3_visual_state(
+                visual_mask,
+                empty_layers,
+            )
+            kwargs[_QWEN3_VISUAL_STATE_KEY] = state
+            kwargs[_QWEN3_VISUAL_POSITIONS_KEY] = positions
         state = kwargs[_QWEN3_VISUAL_STATE_KEY]
         positions = kwargs[_QWEN3_VISUAL_POSITIONS_KEY]
         pad = max_features - state.shape[1]

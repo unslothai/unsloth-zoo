@@ -2954,6 +2954,30 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
     assert packed.shape == (2, 3, 1, 1)
     assert positions.tolist() == [[1, 2, 4], [0, 2, 3]]
+    visual_row = dict(
+        inputs_embeds=mx.zeros((1, 6, 1)),
+        visual_pos_masks=masks[:1],
+        _unsloth_qwen3_visual_state=packed[:1],
+        _unsloth_qwen3_visual_positions=positions[:1],
+    )
+    text_row = dict(inputs_embeds=mx.zeros((1, 4, 1)))
+    cold = mc._qwen3_prompt_merge_adapter(lambda rows, _ids: rows)
+    aligned = cold([visual_row, text_row], [range(6), range(4)])
+    assert aligned[0]["_unsloth_qwen3_visual_state"].tolist() == packed[:1].tolist()
+    assert aligned[1]["_unsloth_qwen3_visual_state"].shape == (1, 3, 1, 1)
+    assert not aligned[1]["_unsloth_qwen3_visual_state"].any().item()
+    assert aligned[1]["_unsloth_qwen3_visual_positions"].tolist() == [[-1, -1, -1]]
+    assert aligned[1]["visual_pos_masks"].shape == (1, 4)
+    assert not aligned[1]["visual_pos_masks"].any().item()
+    cached_row = dict(
+        inputs_embeds=visual_row["inputs_embeds"],
+        visual_pos_masks=masks[:1],
+    )
+    cached = cold([cached_row, visual_row], [range(6)] * 2)[0]
+    assert not cached["_unsloth_qwen3_visual_state"].any().item()
+    assert cached["_unsloth_qwen3_visual_positions"].tolist() == [[1, 2, 4]]
+    assert mc._pad_qwen3_prompt_rows([]) == []
+    assert mc._pad_qwen3_prompt_rows([text_row])[0] is text_row
     window_masks, window_embeds = mc._qwen3_visual_window(
         masks, packed, positions, mask_offsets=(1, 1), feature_offsets=(1, 1), window=2
     )
