@@ -50,6 +50,7 @@ import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 
 
@@ -5368,6 +5369,154 @@ def _to_mx_vlm_batch(inputs):
     return batch
 
 
+_PYTORCH_ONLY_PROCESSOR_OUTPUT = (
+    "Only returning PyTorch tensors is currently supported."
+)
+
+
+def _convert_vlm_processor_output(value, return_tensors):
+    """Convert PyTorch-only processor output without changing its containers."""
+
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return mx.array(value) if return_tensors == "mlx" else value.numpy()
+    if isinstance(value, Mapping):
+        converted = copy.copy(value)
+        for key, item in value.items():
+            converted[key] = _convert_vlm_processor_output(item, return_tensors)
+        return converted
+    if isinstance(value, list):
+        return [_convert_vlm_processor_output(item, return_tensors) for item in value]
+    if isinstance(value, tuple):
+        converted = tuple(
+            _convert_vlm_processor_output(item, return_tensors) for item in value
+        )
+        return (
+            type(value)(*converted)
+            if hasattr(value, "_fields")
+            else type(value)(converted)
+        )
+    return value
+
+
+def _call_vlm_processor(processor_call, args, kwargs):
+    """Retry only the Transformers fast-processor PyTorch output contract."""
+
+    return_tensors = kwargs.get("return_tensors")
+    try:
+        return processor_call(*args, **kwargs)
+    except ValueError as error:
+        if (
+            return_tensors not in {"mlx", "np"}
+            or str(error) != _PYTORCH_ONLY_PROCESSOR_OUTPUT
+        ):
+            raise
+
+    retry_kwargs = dict(kwargs)
+    retry_kwargs["return_tensors"] = "pt"
+    output = processor_call(*args, **retry_kwargs)
+    return _convert_vlm_processor_output(output, return_tensors)
+
+
+_VLM_MM_TOKEN_TYPE_PROCESSOR_MARKERS = (
+    "gemma3",
+    "gemma4",
+    "qwen3_vl",
+    "qwen3_5",
+)
+
+
+def _effective_processor_call_owner(cls):
+    """Return the first MRO class that supplies the active processor call.
+
+    Keeping this lookup separate makes the distinction between inherited
+    behavior and a subclass override explicit at the policy boundary.
+    """
+
+    return next(
+        (
+            candidate
+            for candidate in getattr(cls, "__mro__", (cls,))
+            if "__call__" in getattr(candidate, "__dict__", {})
+        ),
+        cls,
+    )
+
+
+def _processor_class_owns_gemma3n_token_types(cls):
+    """Recognize the effective Gemma3n processor call across relocation.
+
+    A subclass can live in a custom namespace, but an override can also replace
+    the inherited call contract. Classify the first MRO class that actually
+    supplies ``__call__`` so both cases keep their own behavior.
+    """
+
+    owner = _effective_processor_call_owner(cls)
+    # Class names can be regenerated or reused by custom processors. Only the
+    # module that supplies the effective call identifies the installed owner.
+    module = str(getattr(owner, "__module__", "")).lower()
+    # why: remote-code and single-file loads land the marker as a suffix
+    # (`...selfcontained.processing_gemma3n`), never as its own path component.
+    return "gemma3n" in module
+
+
+def _vlm_processor_requests_mm_token_type_ids(processor):
+    """Return whether the installed processor owns the multimodal type flag.
+
+    Gemma3n builds token types itself and forwards unknown kwargs to its
+    tokenizer. Follow the effective call owner for both negative and positive
+    classification so relocated inheritance preserves the installed behavior,
+    while a subclass override retains its own request contract.
+    Concrete wrapper names never authorize or suppress the processor flag.
+    """
+
+    cls = processor.__class__
+    owner = _effective_processor_call_owner(cls)
+    module = str(getattr(owner, "__module__", "")).lower()
+    if _processor_class_owns_gemma3n_token_types(cls):
+        return False
+    marker = f"{module}.{getattr(owner, '__name__', '')}".lower()
+    return any(
+        owner in marker
+        for owner in _VLM_MM_TOKEN_TYPE_PROCESSOR_MARKERS
+    )
+
+
+def _mlx_vlm_process_inputs_adapter(original):
+    """Apply the exact PyTorch-only retry to mlx-vlm's processor boundary."""
+
+    if getattr(original, "_unsloth_pytorch_processor_output", False):
+        return original
+
+    @wraps(original)
+    def patched(
+        processor,
+        prompts,
+        images=None,
+        audio=None,
+        add_special_tokens=False,
+        padding=True,
+        padding_side="left",
+        return_tensors="mlx",
+        **kwargs,
+    ):
+        call_kwargs = dict(
+            images=images,
+            audio=audio,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            padding_side=padding_side,
+            return_tensors=return_tensors,
+            **kwargs,
+        )
+        return _call_vlm_processor(original, (processor, prompts), call_kwargs)
+
+    patched._unsloth_pytorch_processor_output = True
+    return patched
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -5400,13 +5549,7 @@ def _processor_vlm_inputs(
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
         base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
-    marker = f"{processor.__class__.__module__}.{processor.__class__.__name__}".lower()
-    if (
-        "gemma3" in marker
-        or "gemma4" in marker
-        or "qwen3_vl" in marker
-        or "qwen3_5" in marker
-    ):
+    if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
     first_error = None
@@ -5419,7 +5562,7 @@ def _processor_vlm_inputs(
                 image_layout=image_layout,
             )
         try:
-            return processor(**proc_kwargs)
+            return _call_vlm_processor(processor, (), proc_kwargs)
         except TypeError as exc:
             if (
                 "add_special_tokens" in str(exc)
@@ -5428,7 +5571,7 @@ def _processor_vlm_inputs(
             ):
                 proc_kwargs.pop("add_special_tokens", None)
                 try:
-                    return processor(**proc_kwargs)
+                    return _call_vlm_processor(processor, (), proc_kwargs)
                 except Exception as retry_exc:
                     if first_error is None:
                         first_error = retry_exc
@@ -5438,7 +5581,7 @@ def _processor_vlm_inputs(
             if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
                 proc_kwargs.pop("padding_side", None)
                 try:
-                    return processor(**proc_kwargs)
+                    return _call_vlm_processor(processor, (), proc_kwargs)
                 except Exception as retry_exc:
                     if first_error is None:
                         first_error = retry_exc

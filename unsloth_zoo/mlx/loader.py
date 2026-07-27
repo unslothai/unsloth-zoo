@@ -22,15 +22,19 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 
 import ast
 import gc
+import hashlib
 import json
 import importlib
 import inspect
+import io
 import math
 import os
 import re
 import shutil
 import sys
 import tempfile
+import textwrap
+import tokenize
 import types
 import warnings
 import weakref
@@ -38,6 +42,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
+from functools import wraps
 from pathlib import Path
 
 from .compile import (
@@ -403,26 +408,39 @@ _KNOWN_MLX_LM_STRICT_FALLBACKS = {
 
 _KNOWN_VLM_EXTRA_WEIGHT_FILTERS = {
     "gemma4": {
-        "message_tokens": (
-            "parameters not in model",
-            "per_layer_model_projection",
-            "scales",
-            "biases",
+        "message_token_sets": (
+            (
+                "parameters not in model",
+                "per_layer_model_projection",
+                "scales",
+                "biases",
+            ),
+            (
+                "parameters not in model",
+                "language_model.model.layers.",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.k_norm",
+            ),
         ),
         "notice": (
-            "Unsloth: Gemma4 VLM checkpoint has extra quantized "
-            "per-layer projection state - ignoring only those known keys."
+            "Unsloth: Gemma4 VLM checkpoint has extra model state - "
+            "ignoring only keys known to be unused by the installed model."
         ),
         "allowed_extra": frozenset({
             "language_model.model.per_layer_model_projection.biases",
             "language_model.model.per_layer_model_projection.scales",
         }),
+        "allow_shared_kv": True,
     },
 }
 
 
 def _message_matches_known_fallback(message, rule):
-    return all(token in message for token in rule.get("message_tokens", ()))
+    token_sets = rule.get("message_token_sets")
+    if token_sets is None:
+        token_sets = (rule.get("message_tokens", ()),)
+    return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
 def _raise_if_qk_norm_version_gap(model_type, message, error):
@@ -572,19 +590,6 @@ def _normalize_tokenizer_config_extra_special_tokens(
     return patched_config, True
 
 
-def _materialize_mlx_vlm_config_data(local_path, config_data):
-    override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name == "config.json":
-            continue
-        _link_or_copy_path(src, dst)
-    with open(os.path.join(override_dir, "config.json"), "w") as f:
-        json.dump(config_data, f, indent=2)
-    return override_dir
-
-
 def _mlx_vlm_config_override_data(config_data):
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     if (
@@ -619,17 +624,64 @@ def _keep_mlx_vlm_config_view_alive(model, override_dir):
         pass
 
 
+class _MLXVLMConfigViewOwner:
+    """Own a temporary load view until its lifetime moves to the model."""
+
+    def __init__(self, local_path, original_local_path):
+        self._path = str(local_path) if local_path else None
+        self._finalizer = None
+        if (
+            self._path
+            and original_local_path
+            and self._path != str(original_local_path)
+        ):
+            self._finalizer = weakref.finalize(
+                self,
+                shutil.rmtree,
+                self._path,
+                ignore_errors=True,
+            )
+
+    def call(self, operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except Exception:
+            self.cleanup()
+            raise
+
+    def cleanup(self):
+        if self._finalizer is not None and self._finalizer.alive:
+            self._finalizer()
+
+    def transfer_to(self, model):
+        if self._finalizer is None:
+            return
+        try:
+            _keep_mlx_vlm_config_view_alive(model, self._path)
+        except Exception:
+            self.cleanup()
+            raise
+        self._finalizer.detach()
+
+
 def _materialize_mlx_vlm_config_override(
     local_path,
     config_data,
     *,
     normalize_tokenizer_config=False,
     supports_list_extra_special_tokens=None,
+    allow_tokenizer_remote_code=True,
 ):
     """Return a load path whose sidecars are compatible with mlx-vlm loaders."""
     if not local_path:
         return local_path, config_data
     patched_files = {}
+    # why: persist a caller-corrected config only when a sidecar exists to
+    # differ from. An absent config.json must not force a temporary view.
+    source_config_path = os.path.join(local_path, "config.json")
+    if os.path.exists(source_config_path):
+        if _read_json_file(source_config_path) != config_data:
+            patched_files["config.json"] = config_data
 
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     patched_config = config_data
@@ -644,35 +696,79 @@ def _materialize_mlx_vlm_config_override(
         patched_config.pop("auto_map", None)
         patched_files["config.json"] = patched_config
 
-    if normalize_tokenizer_config:
+    if normalize_tokenizer_config or not allow_tokenizer_remote_code:
         tokenizer_config = _read_json_file(
             os.path.join(local_path, "tokenizer_config.json")
         )
-        patched_tokenizer_config, patched_tokenizer = (
-            _normalize_tokenizer_config_extra_special_tokens(
-                tokenizer_config,
-                supports_list_extra_special_tokens=supports_list_extra_special_tokens,
+        patched_tokenizer_config = tokenizer_config
+        patched_tokenizer = False
+        if normalize_tokenizer_config:
+            patched_tokenizer_config, patched_tokenizer = (
+                _normalize_tokenizer_config_extra_special_tokens(
+                    patched_tokenizer_config,
+                    supports_list_extra_special_tokens=supports_list_extra_special_tokens,
+                )
             )
-        )
+        if not allow_tokenizer_remote_code:
+            auto_map = patched_tokenizer_config.get("auto_map")
+            if isinstance(auto_map, dict) and auto_map:
+                patched_tokenizer_config = dict(patched_tokenizer_config)
+                patched_tokenizer_config.pop("auto_map", None)
+                patched_tokenizer = True
         if patched_tokenizer:
             patched_files["tokenizer_config.json"] = patched_tokenizer_config
+
+        model_auto_map = patched_config.get("auto_map")
+        if not allow_tokenizer_remote_code and isinstance(model_auto_map, dict):
+            patched_model_config = dict(patched_config)
+            patched_model_config.pop("auto_map", None)
+            patched_config = patched_model_config
+            patched_files["config.json"] = patched_model_config
+
+    if config_data.get("model_type") == "llava":
+        processor_config = _read_json_file(
+            os.path.join(local_path, "processor_config.json")
+        )
+        if processor_config.get("processor_class") == "LlavaProcessor":
+            patched_processor_config = dict(processor_config)
+            vision_config = config_data.get("vision_config")
+            if not isinstance(vision_config, dict):
+                vision_config = {}
+            if patched_processor_config.get("patch_size") is None:
+                patch_size = vision_config.get("patch_size")
+                if (
+                    isinstance(patch_size, int)
+                    and not isinstance(patch_size, bool)
+                    and patch_size > 0
+                ):
+                    patched_processor_config["patch_size"] = patch_size
+            if patched_processor_config.get("vision_feature_select_strategy") is None:
+                strategy = config_data.get("vision_feature_select_strategy")
+                if strategy in {"default", "full"}:
+                    patched_processor_config["vision_feature_select_strategy"] = strategy
+            if patched_processor_config != processor_config:
+                patched_files["processor_config.json"] = patched_processor_config
 
     if not patched_files:
         return local_path, config_data
 
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
-    for name in os.listdir(local_path):
-        src = os.path.join(local_path, name)
-        dst = os.path.join(override_dir, name)
-        if name in patched_files:
-            continue
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            pass
-    for name, data in patched_files.items():
-        with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    try:
+        for name in os.listdir(local_path):
+            src = os.path.abspath(os.path.join(local_path, name))
+            dst = os.path.join(override_dir, name)
+            if name in patched_files:
+                continue
+            try:
+                os.symlink(src, dst)
+            except FileExistsError:
+                pass
+        for name, data in patched_files.items():
+            with open(os.path.join(override_dir, name), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        shutil.rmtree(override_dir, ignore_errors=True)
+        raise
     if corrected_model_type is not None and "config.json" in patched_files:
         print(
             "Unsloth: Routing DeepSeek OCR checkpoint through "
@@ -1032,17 +1128,28 @@ def _load_mlx_vlm_with_extra_weight_filter(
 
         allowed_extra = rule["allowed_extra"]
 
-        # why: nn.Module.load_weights is patched process-globally; lock so
-        # a concurrent load doesn't see the filtered version.
+        # why: nn.Module.load_weights is patched process-globally; the lock
+        # serializes retries and the owner check preserves concurrent native loads.
         with _LOAD_WEIGHTS_PATCH_LOCK:
             original_load_weights = nn.Module.load_weights
+            retry_thread = threading.get_ident()
 
             def _load_weights_without_projection_quant_state(self, file_or_weights, strict=True):
+                if threading.get_ident() != retry_thread:
+                    return original_load_weights(
+                        self, file_or_weights, strict=strict
+                    )
                 if isinstance(file_or_weights, list):
                     file_or_weights = [
                         (key, value)
                         for key, value in file_or_weights
-                        if key not in allowed_extra
+                        if (
+                            key not in allowed_extra
+                            and not (
+                                rule.get("allow_shared_kv", False)
+                                and _gemma4_unused_shared_kv_weight(self, key)
+                            )
+                        )
                     ]
                 return original_load_weights(self, file_or_weights, strict=strict)
 
@@ -1068,6 +1175,7 @@ def _load_mlx_vlm_distributed(
     hf_token=None,
     revision=None,
     config_override_data=None,
+    allow_remote_code=False,
 ):
     pipeline_group, tensor_group = _mlx_active_distributed_groups(
         pipeline_group,
@@ -1085,31 +1193,37 @@ def _load_mlx_vlm_distributed(
             "Unsloth: distributed MLX VLM inference requires mlx-vlm with "
             "sharded_load support. Install or upgrade mlx-vlm on Apple Silicon."
         ) from error
+    sharded_load = _bind_mlx_vlm_processor_loader(
+        sharded_load,
+        allow_remote_code=allow_remote_code,
+    )
+    sharded_load = _bind_mlx_vlm_quantized_projector_loader(sharded_load)
 
     try:
         with _temporary_hf_token_env(hf_token):
-            load_target = get_model_path(model_name, revision=revision)
-            if config_override_data is not None:
-                load_target = _materialize_mlx_vlm_config_data(
-                    str(load_target),
-                    config_override_data,
-                )
-                try:
-                    model, processor = sharded_load(
-                        load_target,
-                        tensor_group=tensor_group,
-                        pipeline_group=pipeline_group,
-                    )
-                except Exception:
-                    shutil.rmtree(load_target, ignore_errors=True)
-                    raise
-                _keep_mlx_vlm_config_view_alive(model, load_target)
-                return model, processor
-            return sharded_load(
-                load_target,
-                tensor_group=tensor_group,
-                pipeline_group=pipeline_group,
+            resolved_path = str(get_model_path(model_name, revision=revision))
+            load_config = config_override_data or _read_json_file(
+                os.path.join(resolved_path, "config.json")
             )
+            load_target, _ = _materialize_mlx_vlm_config_override(
+                resolved_path,
+                load_config,
+                normalize_tokenizer_config=True,
+            )
+            temporary_view = str(load_target) != resolved_path
+            try:
+                model, processor = sharded_load(
+                    load_target,
+                    tensor_group=tensor_group,
+                    pipeline_group=pipeline_group,
+                )
+            except Exception:
+                if temporary_view:
+                    shutil.rmtree(load_target, ignore_errors=True)
+                raise
+            if temporary_view:
+                _keep_mlx_vlm_config_view_alive(model, load_target)
+            return model, processor
     except ValueError as error:
         message = str(error)
         lower_message = message.lower()
@@ -1164,6 +1278,7 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         name
         for module_type in module_types
         for name in (
+            f"mlx_vlm.models.{module_type}.processor",
             f"mlx_vlm.models.{module_type}.processing",
             f"mlx_vlm.models.{module_type}.processing_{module_type}",
         )
@@ -1174,14 +1289,373 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
         except Exception:
             continue
         processor_class = getattr(module, processor_class_name, None)
-        if processor_class is not None:
+        if isinstance(processor_class, type):
             return processor_class
 
     try:
         import transformers
-        return getattr(transformers, processor_class_name, None)
+        processor_class = getattr(transformers, processor_class_name, None)
+        return processor_class if isinstance(processor_class, type) else None
     except Exception:
         return None
+
+
+def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
+    """Construct a sidecar-declared processor with its installed components."""
+
+    if not model_path or not os.path.isdir(str(model_path)):
+        return None
+    processor_config = _read_json_file(
+        os.path.join(str(model_path), "processor_config.json")
+    )
+    preprocessor_config = _read_json_file(
+        os.path.join(str(model_path), "preprocessor_config.json")
+    )
+    processor_class_name = (
+        processor_config.get("processor_class")
+        or preprocessor_config.get("processor_class")
+    )
+    processor_class = _resolve_mlx_vlm_processor_class(
+        model_type, processor_class_name,
+    )
+    if processor_class is None or not str(
+        getattr(processor_class, "__module__", "")
+    ).startswith("mlx_vlm.models."):
+        return None
+
+    component_module = importlib.import_module(processor_class.__module__)
+    inherited_resolver = getattr(
+        processor_class, "get_possibly_dynamic_module", None,
+    )
+    scoped_processor_class = processor_class
+    if inherited_resolver is not None:
+        def resolve_component(class_name):
+            component_class = getattr(component_module, class_name, None)
+            if isinstance(component_class, type):
+                return component_class
+            return inherited_resolver(class_name)
+
+        scoped_processor_class = type(
+            processor_class.__name__,
+            (processor_class,),
+            {
+                "__module__": processor_class.__module__,
+                "get_possibly_dynamic_module": staticmethod(resolve_component),
+            },
+        )
+    processor_load_path = model_path
+    if not kwargs.get("trust_remote_code", False):
+        config_data = _read_json_file(
+            os.path.join(str(model_path), "config.json")
+        )
+        processor_load_path, _ = _materialize_mlx_vlm_config_override(
+            str(model_path),
+            config_data,
+            allow_tokenizer_remote_code=False,
+        )
+    try:
+        return scoped_processor_class.from_pretrained(
+            processor_load_path,
+            **kwargs,
+        )
+    finally:
+        if str(processor_load_path) != str(model_path):
+            shutil.rmtree(processor_load_path, ignore_errors=True)
+
+
+def _is_mlx_vlm_processor_resolution_error(error):
+    """Return whether AutoProcessor failed before native MLX construction."""
+
+    message = str(error).lower()
+    if isinstance(error, ValueError):
+        return any(
+            marker in message
+            for marker in (
+                "contains custom code which must be executed",
+                "unrecognized processing class",
+                "could not find module",
+            )
+        )
+    return isinstance(error, ImportError) and "tensorflow" in message
+
+
+def _inherit_mlx_vlm_processor_runtime(processor, repaired):
+    """Carry mlx-vlm's runtime generation state onto a rebuilt processor."""
+
+    chat_template = getattr(processor, "chat_template", None)
+    if chat_template is not None and getattr(repaired, "chat_template", None) is None:
+        repaired.chat_template = chat_template
+    detokenizer = getattr(processor, "detokenizer", None)
+    if detokenizer is not None:
+        repaired.detokenizer = detokenizer
+
+    source_tokenizer = getattr(processor, "tokenizer", processor)
+    target_tokenizer = getattr(repaired, "tokenizer", repaired)
+    stopping_criteria = getattr(source_tokenizer, "stopping_criteria", None)
+    if stopping_criteria is not None:
+        target_tokenizer.stopping_criteria = stopping_criteria
+    return repaired
+
+
+def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
+    """Bind processor recovery to one mlx-vlm load without global mutation."""
+
+    _ensure_vlm_detokenizer_copy()
+    if not isinstance(load_callable, types.FunctionType):
+        return load_callable
+    processor_loader = load_callable.__globals__.get("load_processor")
+    if not isinstance(processor_loader, types.FunctionType):
+        return load_callable
+    direct_processor_load = load_callable is processor_loader
+    original_auto_processor = processor_loader.__globals__.get("AutoProcessor")
+    if original_auto_processor is None:
+        return load_callable
+
+    class ScopedAutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *args, **kwargs):
+            processor_load_path = model_path
+            call_kwargs = dict(kwargs)
+            call_kwargs["trust_remote_code"] = bool(allow_remote_code)
+            if not allow_remote_code and os.path.isdir(str(model_path)):
+                config_data = _read_json_file(
+                    os.path.join(str(model_path), "config.json")
+                )
+                model_type = config_data.get("model_type")
+                processor_config = _read_json_file(
+                    os.path.join(str(model_path), "processor_config.json")
+                )
+                processor_class = _resolve_mlx_vlm_processor_class(
+                    model_type,
+                    processor_config.get("processor_class"),
+                )
+                processor_owner = str(
+                    getattr(processor_class, "__module__", "")
+                )
+                if (
+                    model_type in {"molmo", "molmo2"}
+                    and processor_owner.startswith("mlx_vlm.models.")
+                ):
+                    processor_load_path, _ = _materialize_mlx_vlm_config_override(
+                        str(model_path),
+                        config_data,
+                        allow_tokenizer_remote_code=False,
+                    )
+            try:
+                try:
+                    return original_auto_processor.from_pretrained(
+                        processor_load_path,
+                        *args,
+                        **call_kwargs,
+                    )
+                except Exception as error:
+                    if not _is_mlx_vlm_processor_resolution_error(error):
+                        raise
+                    config_data = _read_json_file(
+                        os.path.join(str(processor_load_path), "config.json")
+                    )
+                    processor = _load_declared_mlx_vlm_processor(
+                        processor_load_path,
+                        config_data.get("model_type"),
+                        **call_kwargs,
+                    )
+                    if processor is None:
+                        raise
+                    return processor
+            finally:
+                if str(processor_load_path) != str(model_path):
+                    shutil.rmtree(processor_load_path, ignore_errors=True)
+
+    processor_globals = dict(processor_loader.__globals__)
+    processor_globals["AutoProcessor"] = ScopedAutoProcessor
+    scoped_processor_loader = types.FunctionType(
+        processor_loader.__code__,
+        processor_globals,
+        processor_loader.__name__,
+        processor_loader.__defaults__,
+        processor_loader.__closure__,
+    )
+    scoped_processor_loader.__kwdefaults__ = processor_loader.__kwdefaults__
+    if direct_processor_load:
+        return scoped_processor_loader
+
+    load_globals = dict(load_callable.__globals__)
+    load_globals["load_processor"] = scoped_processor_loader
+    scoped_load = types.FunctionType(
+        load_callable.__code__,
+        load_globals,
+        load_callable.__name__,
+        load_callable.__defaults__,
+        load_callable.__closure__,
+    )
+    scoped_load.__kwdefaults__ = load_callable.__kwdefaults__
+    return scoped_load
+
+
+def _bind_mlx_vlm_quantized_projector_loader(load_callable, *, model_type=None):
+    """Honor checkpoint-quantized projectors in a known legacy loader shape.
+
+    Mlx-vlm briefly skipped every ``multi_modal_projector`` whenever the
+    vision tower was dense, before considering projector tensors that were
+    independently quantized. Keep the installed predicate and alter only that
+    ordering, in this load call, when its source still has the exact legacy
+    branch. Unknown and already checkpoint-aware loaders remain untouched.
+
+    The outer quantize call is part of the capability contract too. Requiring
+    its keyword predicate binding keeps positional or otherwise refactored
+    loaders native, while the scoped ``nn`` proxy ensures no installed module
+    global is changed for concurrent loads.
+    """
+
+    _ensure_lfm2_projector_layernorm(model_type)
+    if not isinstance(load_callable, types.FunctionType):
+        return load_callable
+    model_loader = load_callable.__globals__.get("load_model")
+    if not isinstance(model_loader, types.FunctionType):
+        return load_callable
+    original_skip = model_loader.__globals__.get("skip_multimodal_module")
+    original_nn = model_loader.__globals__.get("nn")
+    if not callable(original_skip) or not callable(getattr(original_nn, "quantize", None)):
+        return load_callable
+    try:
+        projector_is_skipped = original_skip("multi_modal_projector.linear_1")
+    except Exception:
+        return load_callable
+
+    try:
+        source_tree = ast.parse(_safe_getsource(model_loader))
+    except (IndentationError, SyntaxError):
+        return load_callable
+    source_predicates = [
+        node
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "get_class_predicate"
+    ]
+    quantize_calls = [
+        node
+        for node in ast.walk(source_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "nn"
+        and node.func.attr == "quantize"
+    ]
+    predicate_keywords = [
+        keyword
+        for call in quantize_calls
+        for keyword in call.keywords
+        if keyword.arg == "class_predicate"
+    ]
+    expected_predicate = ast.parse(
+        """
+def get_class_predicate(p, m):
+    if skip_multimodal_module(p) and skip_vision:
+        return False
+    if p in config["quantization"]:
+        return config["quantization"][p]
+    if not hasattr(m, "to_quantized"):
+        return False
+    if hasattr(m, "weight") and m.weight.size % 64 != 0:
+        return False
+    return f"{p}.scales" in weights
+"""
+    ).body[0]
+    predicates = [
+        value
+        for value in model_loader.__code__.co_consts
+        if isinstance(value, types.CodeType)
+        and value.co_name == "get_class_predicate"
+    ]
+    if (
+        not projector_is_skipped
+        or len(predicates) != 1
+        or len(source_predicates) != 1
+        or ast.dump(source_predicates[0]) != ast.dump(expected_predicate)
+        or len(quantize_calls) != 1
+        or len(predicate_keywords) != 1
+        or not isinstance(predicate_keywords[0].value, ast.Name)
+        or predicate_keywords[0].value.id != "get_class_predicate"
+    ):
+        return load_callable
+
+    def checkpoint_aware_skip(path):
+        if "multi_modal_projector" in path:
+            return False
+        return original_skip(path)
+
+    def checkpoint_aware_quantize(model, *args, class_predicate=None, **kwargs):
+        if (
+            not isinstance(class_predicate, types.FunctionType)
+            or class_predicate.__code__ is not predicates[0]
+            or class_predicate.__closure__ is None
+        ):
+            if class_predicate is None:
+                return original_nn.quantize(model, *args, **kwargs)
+            return original_nn.quantize(
+                model, *args, class_predicate=class_predicate, **kwargs,
+            )
+        closure = dict(zip(
+            class_predicate.__code__.co_freevars,
+            (cell.cell_contents for cell in class_predicate.__closure__),
+        ))
+        weights = closure.get("weights")
+        if not isinstance(weights, Mapping):
+            if class_predicate is None:
+                return original_nn.quantize(model, *args, **kwargs)
+            return original_nn.quantize(
+                model, *args, class_predicate=class_predicate, **kwargs,
+            )
+
+        predicate_globals = dict(class_predicate.__globals__)
+        predicate_globals["skip_multimodal_module"] = checkpoint_aware_skip
+        projector_predicate = types.FunctionType(
+            class_predicate.__code__,
+            predicate_globals,
+            class_predicate.__name__,
+            class_predicate.__defaults__,
+            class_predicate.__closure__,
+        )
+
+        def guarded_predicate(path, module):
+            if "multi_modal_projector" not in path:
+                return class_predicate(path, module)
+            if f"{path}.scales" not in weights:
+                return False
+            return projector_predicate(path, module)
+
+        return original_nn.quantize(
+            model, *args, class_predicate=guarded_predicate, **kwargs,
+        )
+
+    class ScopedNN:
+        quantize = staticmethod(checkpoint_aware_quantize)
+
+        def __getattr__(self, name):
+            return getattr(original_nn, name)
+
+    model_globals = dict(model_loader.__globals__)
+    model_globals["nn"] = ScopedNN()
+    scoped_model_loader = types.FunctionType(
+        model_loader.__code__,
+        model_globals,
+        model_loader.__name__,
+        model_loader.__defaults__,
+        model_loader.__closure__,
+    )
+    scoped_model_loader.__kwdefaults__ = model_loader.__kwdefaults__
+
+    load_globals = dict(load_callable.__globals__)
+    load_globals["load_model"] = scoped_model_loader
+    scoped_load = types.FunctionType(
+        load_callable.__code__,
+        load_globals,
+        load_callable.__name__,
+        load_callable.__defaults__,
+        load_callable.__closure__,
+    )
+    scoped_load.__kwdefaults__ = load_callable.__kwdefaults__
+    return scoped_load
 
 
 def _build_vlm_image_processor_from_config(
@@ -1262,6 +1736,23 @@ def _repair_degraded_vlm_processor(
     )
     if processor_class is None:
         return processor
+
+    native_kwargs = {
+        "use_fast": True,
+        "trust_remote_code": trust_remote_code,
+    }
+    if token:
+        native_kwargs["token"] = token
+    try:
+        repaired = _load_declared_mlx_vlm_processor(
+            model_path,
+            model_type,
+            **native_kwargs,
+        )
+    except Exception:
+        repaired = None
+    if repaired is not None and getattr(repaired, "image_processor", None) is not None:
+        return _inherit_mlx_vlm_processor_runtime(processor, repaired)
 
     image_processor = _build_vlm_image_processor_from_config(
         model_path, processor_config, preprocessor_config, model_type,
@@ -2014,6 +2505,407 @@ def _resolve_mlx_vlm_model_class(model_type):
         if cls is not None:
             return cls
     return None
+
+
+_MINICPM_SOURCE_PREFIXES = ("llm.", "vpm.", "apm.")
+_MINICPM_MLX_PREFIX_ALIASES = {
+    "language_model.": "llm.",
+    "vision_tower.": "vpm.",
+    "audio_tower.": "apm.",
+}
+_MINICPM_SANITIZE_TOKEN_SHA256 = (
+    "0706ec1a5d2252c16b6e9a2e665c7774fb6061aef763494d8e78d3fda68b439b"
+)
+_MINICPM_LEGACY_VISION_TOKEN_SHA256 = (
+    "54965adc15f72ca21df0dc646467c8e588f83de19edd2aacad70362690d6648a"
+)
+_MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256 = (
+    "deceb0843cbd9ba04bb86cded962550e7ae0a8814cf321fd61d654a07458262e"
+)
+_LFM2_PROJECTOR_INIT_TOKEN_SHA256 = (
+    "6534244e2803564731343c4768c75b04d7bc86fc061ae12c59df55c8867b894e"
+)
+_LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
+    "4405529c372e5bc69cf782c1038b674b55b46434e9a515d9db46a2a92e0414fa"
+)
+_GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 = (
+    "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
+)
+
+
+def _source_token_sha256(source: str) -> str:
+    """Hash Python tokens while retaining indentation as semantic markers."""
+
+    ignored = {
+        tokenize.ENCODING,
+        tokenize.COMMENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.ENDMARKER,
+    }
+    parts = []
+    try:
+        tokens = tokenize.generate_tokens(
+            io.StringIO(textwrap.dedent(source)).readline
+        )
+        for token in tokens:
+            if token.type in ignored:
+                continue
+            if token.type == tokenize.INDENT:
+                parts.append("<INDENT>")
+            elif token.type == tokenize.DEDENT:
+                parts.append("<DEDENT>")
+            else:
+                parts.append(token.string)
+    except (IndentationError, tokenize.TokenError, TypeError):
+        return ""
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
+
+
+def _ensure_vlm_detokenizer_copy() -> None:
+    """Backfill request-local copies for the defective naive detokenizer."""
+
+    try:
+        module = importlib.import_module("mlx_vlm.tokenizer_utils")
+    except Exception:
+        return
+    detokenizer = getattr(module, "NaiveStreamingDetokenizer", None)
+    factory = getattr(module, "make_streaming_detokenizer", None)
+    if (
+        not isinstance(detokenizer, type)
+        or getattr(detokenizer, "__copy__", None) is not None
+        or _source_token_sha256(_safe_getsource(factory))
+        != _MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256
+    ):
+        return
+    base = detokenizer.__mro__[1]
+    text = detokenizer.__dict__.get("text")
+    try:
+        parameters = tuple(
+            inspect.signature(
+                detokenizer.__init__, follow_wrapped=False
+            ).parameters
+        )
+    except (TypeError, ValueError):
+        return
+    if (
+        detokenizer.__module__ != module.__name__
+        or base.__module__ != module.__name__
+        or base.__name__ != "StreamingDetokenizer"
+        or "text" not in getattr(base, "__slots__", ())
+        or not isinstance(text, property)
+        or text.fset is not None
+        or parameters != ("self", "tokenizer")
+    ):
+        return
+
+    def __copy__(self):
+        return type(self)(self._tokenizer)
+
+    detokenizer.__copy__ = __copy__
+
+
+def _ensure_lfm2_projector_layernorm(model_type) -> None:
+    """Do not register LFM projector normalization when config disables it."""
+
+    if model_type != "lfm2_vl":
+        return
+    try:
+        module = importlib.import_module(
+            "mlx_vlm.models.lfm2_vl.lfm2_vl"
+        )
+    except Exception:
+        return
+    projector = getattr(module, "Lfm2VlMultiModalProjector", None)
+    if (
+        not isinstance(projector, type)
+        or projector.__module__ != module.__name__
+        or projector.__name__ != "Lfm2VlMultiModalProjector"
+    ):
+        return
+    installed_init = projector.__init__
+    installed_call = projector.__call__
+    if (
+        getattr(installed_init, "_unsloth_disabled_layernorm", False)
+        or _source_token_sha256(_safe_getsource(installed_init))
+        != _LFM2_PROJECTOR_INIT_TOKEN_SHA256
+        or _source_token_sha256(_safe_getsource(installed_call))
+        != _LFM2_PROJECTOR_CALL_TOKEN_SHA256
+    ):
+        return
+
+    @wraps(installed_init)
+    def patched(self, config):
+        installed_init(self, config)
+        if not self.projector_use_layernorm:
+            del self.layer_norm
+
+    patched._unsloth_disabled_layernorm = True
+    projector.__init__ = patched
+
+
+def _gemma4_unused_shared_kv_weight(model, key) -> bool:
+    """Whether the installed Gemma4 model owns this redundant shared-KV key."""
+
+    language_model = getattr(model, "language_model", None)
+    cls = type(language_model)
+    predicate = cls.__dict__.get("_is_unused_shared_kv_weight")
+    if (
+        cls.__module__ != "mlx_vlm.models.gemma4.language"
+        or cls.__name__ != "LanguageModel"
+        or not callable(predicate)
+        or _source_token_sha256(_safe_getsource(predicate))
+        != _GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256
+    ):
+        return False
+    match = re.fullmatch(
+        r"language_model\.model\.layers\.(0|[1-9][0-9]*)"
+        r"\.self_attn\.(?:[kv]_proj\.(?:weight|bias|biases|scales)"
+        r"|[kv]_norm\.weight)",
+        key,
+    )
+    if match is None:
+        return False
+    layers = getattr(getattr(language_model, "model", None), "layers", ())
+    try:
+        layer_index = int(match.group(1))
+        if layer_index >= len(layers):
+            return False
+        return bool(predicate(language_model, key))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+
+
+def _unconditionally_sanitizes_mlx_vlm_weights(load_model) -> bool:
+    """Whether load_model sanitizes model weights without an MLX-format gate."""
+
+    try:
+        tree = ast.parse(textwrap.dedent(_safe_getsource(load_model)))
+    except (IndentationError, SyntaxError):
+        return False
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "load_model"
+    ]
+    if len(functions) != 1:
+        return False
+    function = functions[0]
+    sanitize_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sanitize_weights"
+        and len(node.args) >= 2
+        and all(
+            isinstance(argument, ast.Name) and argument.id == expected
+            for argument, expected in zip(node.args[:2], ("model", "weights"))
+        )
+    ]
+    direct_assignments = [
+        statement
+        for statement in function.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "weights"
+        and sanitize_calls
+        and statement.value is sanitize_calls[0]
+    ]
+    if len(sanitize_calls) != 1 or len(direct_assignments) != 1:
+        return False
+    assignment_index = function.body.index(direct_assignments[0])
+    return not any(
+        isinstance(node, ast.Return)
+        for statement in function.body[:assignment_index]
+        for node in ast.walk(statement)
+    )
+
+
+def _minicpmo_sanitize_requires_source_prefixes(sanitize) -> bool:
+    """Whether MiniCPM accepts source tower names but drops converted names."""
+
+    try:
+        parameters = inspect.signature(
+            sanitize,
+            follow_wrapped=False,
+        ).parameters
+    except (TypeError, ValueError):
+        return False
+    fingerprint = _source_token_sha256(_safe_getsource(sanitize))
+    if (
+        tuple(parameters) != ("self", "weights")
+        or fingerprint != _MINICPM_SANITIZE_TOKEN_SHA256
+    ):
+        return False
+
+    suffixes = (
+        "model.norm._unsloth_probe",
+        "embeddings.norm._unsloth_probe",
+        "layer_norm._unsloth_probe",
+    )
+    source_keys = tuple(
+        prefix + suffix
+        for prefix, suffix in zip(_MINICPM_SOURCE_PREFIXES, suffixes)
+    )
+    mlx_keys = tuple(
+        prefix + suffix
+        for prefix, suffix in zip(_MINICPM_MLX_PREFIX_ALIASES, suffixes)
+    )
+    values = tuple(object() for _ in source_keys)
+    probe = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            text_config=types.SimpleNamespace(tie_word_embeddings=False),
+        ),
+    )
+    try:
+        source_result = sanitize(probe, dict(zip(source_keys, values)))
+        mlx_result = sanitize(probe, dict(zip(mlx_keys, values)))
+    except Exception:
+        return False
+    return (
+        isinstance(source_result, Mapping)
+        and tuple(source_result) == mlx_keys
+        and all(source_result[key] is value for key, value in zip(mlx_keys, values))
+        and isinstance(mlx_result, Mapping)
+        and not mlx_result
+    )
+
+
+def _minicpmo_mlx_sanitize_adapter(original):
+    """Delegate converted MiniCPM tower names through its installed sanitizer."""
+
+    if getattr(original, "_unsloth_minicpmo_mlx_weights", False):
+        return original
+    if not _minicpmo_sanitize_requires_source_prefixes(original):
+        return original
+
+    @wraps(original)
+    def patched(self, weights):
+        if not isinstance(weights, Mapping):
+            return original(self, weights)
+        has_source_names = any(
+            key.startswith(_MINICPM_SOURCE_PREFIXES)
+            for key in weights
+        )
+        mlx_prefix_presence = tuple(
+            any(key.startswith(prefix) for key in weights)
+            for prefix in _MINICPM_MLX_PREFIX_ALIASES
+        )
+        if has_source_names and any(mlx_prefix_presence):
+            raise ValueError(
+                "Unsloth: MiniCPM checkpoint mixes source and MLX tower names."
+            )
+        if not all(mlx_prefix_presence):
+            return original(self, weights)
+
+        prepared = {}
+        for key, value in weights.items():
+            for target, source in _MINICPM_MLX_PREFIX_ALIASES.items():
+                if key.startswith(target):
+                    key = source + key[len(target) :]
+                    break
+            prepared[key] = value
+        return original(self, prepared)
+
+    patched._unsloth_minicpmo_mlx_weights = True
+    return patched
+
+
+def _ensure_minicpmo_mlx_sanitize(model_type: str) -> None:
+    """Preserve converted MiniCPM weights in unconditional sanitize loaders."""
+
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmo.minicpmo"
+        or not hasattr(cls, "sanitize")
+    ):
+        return
+    try:
+        from mlx_vlm.utils import load_model
+    except (ImportError, AttributeError):
+        return
+    if not _unconditionally_sanitizes_mlx_vlm_weights(load_model):
+        return
+    adapted = _minicpmo_mlx_sanitize_adapter(cls.sanitize)
+    if adapted is not cls.sanitize:
+        cls.sanitize = adapted
+
+
+def _minicpmo_vision_dtype_adapter(original):
+    """Use the vision execution dtype in the exact legacy MiniCPM method."""
+
+    if getattr(original, "_unsloth_minicpmo_vision_dtype", False):
+        return original
+    owner = "mlx_vlm.models.minicpmo.minicpmo"
+    if (
+        not isinstance(original, types.FunctionType)
+        or original.__module__ != owner
+        or original.__name__ != "get_vision_embedding"
+    ):
+        return original
+    try:
+        parameters = inspect.signature(
+            original,
+            follow_wrapped=False,
+        ).parameters
+    except (TypeError, ValueError):
+        return original
+    converter = original.__globals__.get("_to_mx_array")
+    if (
+        tuple(parameters) != ("self", "pixel_values", "tgt_sizes")
+        or _source_token_sha256(_safe_getsource(original))
+        != _MINICPM_LEGACY_VISION_TOKEN_SHA256
+        or not isinstance(converter, types.FunctionType)
+        or converter.__module__ != owner
+        or converter.__name__ != "_to_mx_array"
+    ):
+        return original
+
+    @wraps(original)
+    def patched(self, pixel_values, tgt_sizes):
+        try:
+            vision_dtype = (
+                self.vision_tower.embeddings.patch_embedding.weight.dtype
+            )
+        except AttributeError:
+            return original(self, pixel_values, tgt_sizes)
+
+        def convert(value, dtype=None):
+            return converter(value, dtype=vision_dtype)
+
+        scoped_globals = dict(original.__globals__)
+        scoped_globals["_to_mx_array"] = convert
+        scoped = types.FunctionType(
+            original.__code__,
+            scoped_globals,
+            original.__name__,
+            original.__defaults__,
+            original.__closure__,
+        )
+        scoped.__kwdefaults__ = original.__kwdefaults__
+        return scoped(self, pixel_values, tgt_sizes)
+
+    patched._unsloth_minicpmo_vision_dtype = True
+    return patched
+
+
+def _ensure_minicpmo_vision_dtype(model_type: str) -> None:
+    """Patch only the MiniCPM callable that uses packed language dtype."""
+
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if (
+        cls is None
+        or cls.__module__ != "mlx_vlm.models.minicpmo.minicpmo"
+        or not hasattr(cls, "get_vision_embedding")
+    ):
+        return
+    adapted = _minicpmo_vision_dtype_adapter(cls.get_vision_embedding)
+    if adapted is not cls.get_vision_embedding:
+        cls.get_vision_embedding = adapted
 
 
 def _lookup_module_array(root, dotted_key):
@@ -4036,7 +4928,14 @@ def _normalize_prompt_messages(prompt_utils_module, prompt):
         role_content = prompt_utils_module._get_role_content(item)
         if role_content is not None:
             role, content = role_content
-            messages.append({"role": role, "content": content})
+            message = dict(item) if isinstance(item, dict) else {}
+            normalize_tool_calls = getattr(
+                prompt_utils_module, "_normalize_tool_call_arguments", None
+            )
+            if isinstance(item, dict) and callable(normalize_tool_calls):
+                message = normalize_tool_calls(message)
+            message.update(role=role, content=content)
+            messages.append(message)
             continue
 
         messages.append({"role": "user", "content": str(item)})
@@ -4136,18 +5035,22 @@ def _anchor_conversation_media_to_first_user_turn(
             message.get("content", "")
         )
         is_target = i == target_idx and role.lower() not in _NON_USER_ROLES
-        anchored.append(
-            prompt_utils_module.get_message_json(
-                model_type,
-                content,
-                role,
-                skip_image_token=not is_target,
-                skip_audio_token=not is_target,
-                num_images=num_images,
-                num_audios=num_audios,
-                **kwargs,
-            )
+        rendered = prompt_utils_module.get_message_json(
+            model_type,
+            content,
+            role,
+            skip_image_token=not is_target,
+            skip_audio_token=not is_target,
+            num_images=num_images,
+            num_audios=num_audios,
+            **kwargs,
         )
+        if isinstance(message, dict):
+            if isinstance(rendered, dict):
+                rendered = {**message, **rendered}
+            elif set(message).difference(("role", "content")):
+                rendered = {**message, "role": role, "content": rendered}
+        anchored.append(rendered)
     return anchored
 
 
@@ -4456,7 +5359,32 @@ def _ensure_vlm_prompt_utils_patched():
         if getattr(module, "apply_chat_template", None) is _original_vlm_apply_chat_template:
             module.apply_chat_template = patched_apply_chat_template
 
+    # why: the list above only force-imports mlx-vlm's entry points, so an
+    # already-loaded alias keeps the original -- `mlx_vlm` itself re-exports
+    # this. Sweep loaded mlx-vlm modules by identity instead. Read __dict__
+    # rather than getattr so a lazy module __getattr__ is not woken.
+    for name, module in list(sys.modules.items()):
+        if name != "mlx_vlm" and not name.startswith("mlx_vlm."):
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if namespace is None:
+            continue
+        if namespace.get("apply_chat_template") is _original_vlm_apply_chat_template:
+            namespace["apply_chat_template"] = patched_apply_chat_template
+
     _vlm_prompt_utils_patched = True
+
+
+def _ensure_vlm_processor_inputs_patched():
+    """Patch mlx-vlm's processor call without replacing its input preparation."""
+
+    from .utils import _mlx_vlm_process_inputs_adapter
+
+    vlm_utils = importlib.import_module("mlx_vlm.utils")
+    original = vlm_utils.process_inputs
+    adapted = _mlx_vlm_process_inputs_adapter(original)
+    if adapted is not original:
+        vlm_utils.process_inputs = adapted
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
@@ -5680,19 +6608,10 @@ class FastMLXModel:
                 except (json.JSONDecodeError, KeyError):
                     config_data = {}
             original_local_path = local_path
-            original_config_data = dict(config_data)
-            if distributed_requested:
-                patched_config_data = _mlx_vlm_config_override_data(config_data)
-                if patched_config_data is not None:
-                    config_data = patched_config_data
-                    vlm_config_override_data = dict(config_data)
-            else:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                )
-                if local_path != original_local_path or config_data != original_config_data:
-                    vlm_config_override_data = dict(config_data)
+            patched_config_data = _mlx_vlm_config_override_data(config_data)
+            if patched_config_data is not None:
+                config_data = patched_config_data
+                vlm_config_override_data = dict(config_data)
 
         # bitsandbytes-quantized repos store NF4 weights MLX cannot read. When
         # the real bitsandbytes wheel is importable, let bnb dequantize to fp16
@@ -6222,6 +7141,14 @@ class FastMLXModel:
                     "Install via: pip install mlx-vlm\n"
                     "Or pass text_only=True to load as text-only via mlx-lm."
                 )
+            vlm_load = _bind_mlx_vlm_processor_loader(
+                vlm_load,
+                allow_remote_code=trust_remote_code,
+            )
+            vlm_load = _bind_mlx_vlm_quantized_projector_loader(
+                vlm_load,
+                model_type=model_type,
+            )
 
             if text_only is False and not _is_vlm(config_data):
                 warnings.warn(
@@ -6230,16 +7157,12 @@ class FastMLXModel:
                     stacklevel=2,
                 )
 
-            if local_path:
-                local_path, config_data = _materialize_mlx_vlm_config_override(
-                    local_path,
-                    config_data,
-                    normalize_tokenizer_config=True,
-                )
-
             if patch_mode == "patched":
                 install_mlx_compile_patches()
+            _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_minicpmo_mlx_sanitize(model_type)
+            _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
 
             quant_state = _ensure_quantization_compatible(
@@ -6263,13 +7186,37 @@ class FastMLXModel:
             if want_runtime_quant:
                 import mlx.core as mx
                 from mlx_vlm.utils import load_config as _vlm_load_config
+                _patch_deepseek_ocr_transformers_import_compat(model_type)
+            from .utils import (
+                normalize_mlx_chat_template,
+                normalize_vlm_processor_chat_template,
+            )
+
+            vlm_config_view_owner = None
+            if local_path and not distributed_requested:
+                local_path, config_data = _materialize_mlx_vlm_config_override(
+                    local_path,
+                    config_data,
+                    normalize_tokenizer_config=True,
+                )
+                vlm_config_view_owner = _MLXVLMConfigViewOwner(
+                    local_path,
+                    original_local_path,
+                )
+
+            def _run_with_vlm_config_view(operation, *args, **kwargs):
+                if vlm_config_view_owner is None:
+                    return operation(*args, **kwargs)
+                return vlm_config_view_owner.call(operation, *args, **kwargs)
+
+            if want_runtime_quant:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
-                _patch_deepseek_ocr_transformers_import_compat(model_type)
                 vlm_load_target = local_path or model_name
                 with _temporary_hf_token_env(token):
                     try:
-                        model, processor = vlm_load(
+                        model, processor = _run_with_vlm_config_view(
+                            vlm_load,
                             vlm_load_target,
                             lazy=True,
                             revision=revision,
@@ -6280,13 +7227,19 @@ class FastMLXModel:
                         # surface the QK-norm version gap here too.
                         _raise_if_qk_norm_version_gap(model_type, str(error), error)
                         raise
-                    vlm_cfg = _vlm_load_config(vlm_load_target)
-                model, vlm_cfg = _apply_mlx_quantization(
+                    vlm_cfg = _run_with_vlm_config_view(
+                        _vlm_load_config,
+                        vlm_load_target,
+                    )
+                model, vlm_cfg = _run_with_vlm_config_view(
+                    _apply_mlx_quantization,
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
                 )
                 model._config = vlm_cfg
-                mx.eval(model.parameters())
+                _run_with_vlm_config_view(
+                    lambda: mx.eval(model.parameters()),
+                )
             elif distributed_requested:
                 if text_only is False and not _is_vlm(config_data):
                     raise ValueError(
@@ -6300,7 +7253,8 @@ class FastMLXModel:
                 )
                 mode = "tensor" if active_tensor_group is not None else "pipeline"
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (distributed {mode} VLM)...")
-                model, processor = _load_mlx_vlm_distributed(
+                model, processor = _run_with_vlm_config_view(
+                    _load_mlx_vlm_distributed,
                     model_name,
                     model_type,
                     pipeline_group=active_pipeline_group,
@@ -6308,6 +7262,7 @@ class FastMLXModel:
                     hf_token=token,
                     revision=revision,
                     config_override_data=vlm_config_override_data,
+                    allow_remote_code=trust_remote_code,
                 )
             else:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
@@ -6316,7 +7271,8 @@ class FastMLXModel:
                 vlm_kwargs["revision"] = revision
                 if target_dtype is not None:
                     vlm_kwargs["lazy"] = True
-                model, processor = _load_mlx_vlm_with_extra_weight_filter(
+                model, processor = _run_with_vlm_config_view(
+                    _load_mlx_vlm_with_extra_weight_filter,
                     local_path or model_name,
                     model_type,
                     vlm_load,
@@ -6324,7 +7280,8 @@ class FastMLXModel:
                     hf_token=token,
                 )
 
-            processor = _repair_degraded_vlm_processor(
+            processor = _run_with_vlm_config_view(
+                _repair_degraded_vlm_processor,
                 processor,
                 local_path or model_name,
                 model_type,
@@ -6333,18 +7290,20 @@ class FastMLXModel:
             )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
+                _run_with_vlm_config_view(
+                    _convert_mlx_dtype,
+                    model,
+                    target_dtype,
+                    model_type=model_type,
+                )
             elif want_runtime_quant:
-                import mlx.core as mx
-                mx.eval(model.parameters())
-            _fix_gemma3_text_rmsnorm_fp32(model)
+                _run_with_vlm_config_view(
+                    lambda: mx.eval(model.parameters()),
+                )
+            _run_with_vlm_config_view(_fix_gemma3_text_rmsnorm_fp32, model)
 
-            from .utils import (
-                normalize_mlx_chat_template,
+            processor = _run_with_vlm_config_view(
                 normalize_vlm_processor_chat_template,
-            )
-
-            processor = normalize_vlm_processor_chat_template(
                 processor,
                 chat_template=chat_template,
                 model_name=model_name,
@@ -6359,14 +7318,17 @@ class FastMLXModel:
                 model._unsloth_text_only_vlm = True
             model._is_vlm_model = True
             model._processor = processor
-            _fix_gemma4_kv_sharing(model)
-            _fix_gemma3_vision_post_layernorm_eps(model)
-            _fix_gemma3_vision_attention_fp32_sdpa(model)
-            _fix_gemma3_vision_encoder_fp32_layernorm(model)
-            _fix_gemma3_vision_post_layernorm_fp32(model)
-            _fix_gemma3_vision_mlp_fp32_activation(model)
-            _fix_gemma3_language_mlp_fp32_activation(model)
-            _fix_gemma3_multimodal_image_feature_scale(model)
+            for fixup in (
+                _fix_gemma4_kv_sharing,
+                _fix_gemma3_vision_post_layernorm_eps,
+                _fix_gemma3_vision_attention_fp32_sdpa,
+                _fix_gemma3_vision_encoder_fp32_layernorm,
+                _fix_gemma3_vision_post_layernorm_fp32,
+                _fix_gemma3_vision_mlp_fp32_activation,
+                _fix_gemma3_language_mlp_fp32_activation,
+                _fix_gemma3_multimodal_image_feature_scale,
+            ):
+                _run_with_vlm_config_view(fixup, model)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
@@ -6377,26 +7339,43 @@ class FastMLXModel:
             # model_type/auto_map the override drops.
             model._config_src_path = local_path or original_local_path
             model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(
-                original_local_path or local_path
+            model._unsloth_base_commit_hash = _run_with_vlm_config_view(
+                _infer_snapshot_commit,
+                original_local_path or local_path,
             )
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
             if quant_state == "compatible":
-                model._unsloth_quantization_config = _get_existing_mlx_quantization(config_data)
+                model._unsloth_quantization_config = _run_with_vlm_config_view(
+                    _get_existing_mlx_quantization,
+                    config_data,
+                )
                 model._unsloth_quantization_policy = quantization_spec.to_metadata()
                 model._unsloth_quantized_source = "mlx_config"
-            model._unsloth_compile_trait_report = get_compile_trait_report(model)
-            model._unsloth_compile_qualification = get_compile_qualification(model)
-            model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
-            model._unsloth_compile_trace = trace_compile_application(model)
-            model._unsloth_compile_explain = explain_compile_support(model)
-            _patch_mixed_precision_set_dtype(model)
+            model._unsloth_compile_trait_report = _run_with_vlm_config_view(
+                get_compile_trait_report, model,
+            )
+            model._unsloth_compile_qualification = _run_with_vlm_config_view(
+                get_compile_qualification, model,
+            )
+            model._unsloth_compile_backend_qualifications = (
+                _run_with_vlm_config_view(
+                    get_backend_compile_qualifications, model,
+                )
+            )
+            model._unsloth_compile_trace = _run_with_vlm_config_view(
+                trace_compile_application, model,
+            )
+            model._unsloth_compile_explain = _run_with_vlm_config_view(
+                explain_compile_support, model,
+            )
+            _run_with_vlm_config_view(_patch_mixed_precision_set_dtype, model)
 
             public_target = processor
             if force_vlm_text_path:
-                public_target = normalize_mlx_chat_template(
+                public_target = _run_with_vlm_config_view(
+                    normalize_mlx_chat_template,
                     getattr(processor, "tokenizer", processor),
                     chat_template=chat_template,
                     model_name=model_name,
@@ -6406,7 +7385,9 @@ class FastMLXModel:
                 )
                 model._tokenizer = public_target
 
-            _patch_mlx_saving(model, public_target)
+            _run_with_vlm_config_view(_patch_mlx_saving, model, public_target)
+            if vlm_config_view_owner is not None:
+                vlm_config_view_owner.transfer_to(model)
             return model, public_target
         else:
             # Text path via mlx-lm (original behavior)
