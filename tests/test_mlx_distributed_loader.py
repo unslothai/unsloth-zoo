@@ -246,6 +246,8 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
 
     monkeypatch.setattr(loader, "_bind_mlx_vlm_quantized_projector_loader", bind)
     model_dir = _write_config(tmp_path, {"model_type": "raw"})
+    (model_dir / "model.safetensors").write_text("weights")
+    monkeypatch.chdir(tmp_path)
     messages = ["The model does not support pipeline parallelism", "Model type kimi_k25 not supported", "Unsupported model type kimi_k25", "checkpoint exploded"]
 
     class _FakeVLM:
@@ -259,7 +261,7 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
         return _FakeVLM(), types.SimpleNamespace(name="processor")
 
     vlm_utils = types.ModuleType("mlx_vlm.utils")
-    vlm_utils.get_model_path = lambda repo, revision=None: model_dir
+    vlm_utils.get_model_path = lambda repo, revision=None: Path("model")
     vlm_utils.sharded_load = sharded_load
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", vlm_utils)
@@ -272,6 +274,7 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
         _load_mlx_vlm_distributed("fake/vlm", "kimi_k25", pipeline_group=pipeline_group)
     assert calls[0][3] == "patched"
     assert Path(calls[0][0]).exists()
+    assert (Path(calls[0][0]) / "model.safetensors").read_text() == "weights"
     assert model._unsloth_mlx_config_view_paths == [str(calls[0][0])]
     model._unsloth_mlx_config_view_finalizers[0]()
     assert not Path(calls[0][0]).exists()

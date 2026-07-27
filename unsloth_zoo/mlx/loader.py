@@ -741,7 +741,7 @@ def _materialize_mlx_vlm_config_override(
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
     try:
         for name in os.listdir(local_path):
-            src = os.path.join(local_path, name)
+            src = os.path.abspath(os.path.join(local_path, name))
             dst = os.path.join(override_dir, name)
             if name in patched_files:
                 continue
