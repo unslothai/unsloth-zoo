@@ -1721,3 +1721,75 @@ def test_vlm_plan_rejects_a_rebuild_that_leaves_its_frozen_endpoint():
     plan.ensure_descriptors()
     processor.training = True
     assert plan.check_family_drift(0, plan._build_batch(0)) is None
+def test_vlm_plan_releases_the_previous_batch_before_building_the_next(
+    monkeypatch,
+):
+    """A move to the next scheduled batch must not hold two batches at once.
+
+    The training loop clears its own ``batch_data`` reference before every
+    fetch, so the plan's most-recent-batch cache is the last thing that can
+    keep the previous batch alive while the builder allocates the next one.
+    Holding it across the build doubles the batch-side residency at every
+    transition, which for large image batches is a peak-memory cost paid for
+    nothing: the cached batch can no longer serve this fetch. A repeated
+    fetch of the same batch still returns from the cache without rebuilding.
+    """
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _create_vlm_batch_plan
+
+    processor = _CountingProcessor()
+    plan = _create_vlm_batch_plan(
+        dataset=[{"text": str(i)} for i in range(4)],
+        processor=processor,
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=4,
+        dataset_order="sequential",
+    )
+
+    alive = {"now": 0, "peak": 0}
+
+    class _Marker:
+        def __init__(self):
+            alive["now"] += 1
+            alive["peak"] = max(alive["peak"], alive["now"])
+
+        def __del__(self):
+            alive["now"] -= 1
+
+    class _TrackedBatch(dict):
+        """A batch whose lifetime is observable through refcounting."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.marker = _Marker()
+
+    live_at_build_start = []
+    build_batch = FiniteVLMBatchPlan._build_batch
+
+    def _tracked_build(self, index, target_width=None):
+        live_at_build_start.append(alive["now"])
+        return _TrackedBatch(
+            build_batch(self, index, target_width=target_width)
+        )
+
+    monkeypatch.setattr(FiniteVLMBatchPlan, "_build_batch", _tracked_build)
+
+    batch_data = None
+    for index in range(len(plan)):
+        batch_data = None      # what the training loop does before a fetch
+        batch_data = plan.materialize(index)
+    del batch_data
+
+    # No build ever started while a previously built batch was still held.
+    assert live_at_build_start == [0, 0, 0, 0]
+    assert alive["peak"] == 1
+
+    # Releasing the cache early must not cost a rebuild for a repeated fetch.
+    calls_before = processor.calls
+    again = plan.materialize(len(plan) - 1)
+    assert processor.calls == calls_before
+    del again
+
+

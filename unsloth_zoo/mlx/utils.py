@@ -6580,8 +6580,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         """Build one batch through the complete existing VLM builder.
 
         The cache holds only the most recent batch at its exact requested
-        width, so a repeated fetch (e.g. a compile-failure retry) is free
-        while live inputs stay bounded by one batch. ``target_width``
+        width, so a repeated fetch (e.g. a compile-failure retry) is free;
+        a fetch it cannot serve drops it before building, so a transition to
+        the next batch never holds two. ``target_width``
         right-pads to an explicit endpoint and keeps bypass authority; with
         an installed shape plan, ``phase`` instead resolves the planned
         endpoint, enforces phase-aware admission, and hard-fails on
@@ -6615,6 +6616,15 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 self.check_family_drift(index, cached_batch)
                 self._mru = (_key, cached_batch, True)
             return cached_batch
+        # This fetch cannot be served from the cache, so the cached batch is
+        # already dead weight. Release it before the builder allocates its
+        # replacement: the trainer clears its own ``batch_data`` reference
+        # ahead of every fetch, so this entry is the last thing keeping the
+        # previous batch resident, and holding it across the build would put
+        # two complete image/text batches in memory at every transition. A
+        # same-batch retry is unaffected, having returned above.
+        self._mru = None
+        cached = None
         batch_dict = self._build_batch(index, target_width=target_width)
         if check_drift:
             self.check_family_drift(index, batch_dict)
