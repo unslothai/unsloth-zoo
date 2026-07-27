@@ -234,3 +234,39 @@ def test_temporary_patch_exposes_original_init_for_probe(
 
     assert hasattr(base_init.__init__, "_unsloth_original_init")
     assert _tokenizer_supports_list_extra_special_tokens() is False
+
+
+def test_materialize_persists_corrected_config_only_when_sidecar_exists(tmp_path):
+    """A caller-corrected config is written; an absent sidecar stays in place."""
+    from unsloth_zoo.mlx.loader import _materialize_mlx_vlm_config_override
+
+    # No config.json on disk: nothing to reconcile, so load in place.
+    bare_dir = tmp_path / "bare"
+    bare_dir.mkdir()
+    (bare_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    load_path, _ = _materialize_mlx_vlm_config_override(
+        str(bare_dir),
+        {"model_type": "qwen3_vl"},
+    )
+    assert load_path == str(bare_dir)
+
+    # config.json on disk disagrees with the corrected data mlx-vlm must see,
+    # so the override view has to carry the corrected copy.
+    ocr_dir = tmp_path / "ocr"
+    ocr_dir.mkdir()
+    on_disk = {
+        "model_type": "deepseek_vl_v2",
+        "architectures": ["DeepseekOCRForCausalLM"],
+        "auto_map": {"AutoModel": "modeling_deepseekocr.DeepseekOCRForCausalLM"},
+    }
+    (ocr_dir / "config.json").write_text(json.dumps(on_disk), encoding="utf-8")
+    corrected = {
+        "model_type": "deepseekocr",
+        "architectures": ["DeepseekOCRForCausalLM"],
+    }
+    load_path, _ = _materialize_mlx_vlm_config_override(str(ocr_dir), corrected)
+    assert load_path != str(ocr_dir)
+    written = json.loads(
+        (Path(load_path) / "config.json").read_text(encoding="utf-8")
+    )
+    assert written == corrected

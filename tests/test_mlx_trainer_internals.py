@@ -3956,3 +3956,57 @@ def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
                 if produced > 1000:
                     break
             assert produced > 1000
+
+
+def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
+    """A reused prompt cache must not shift the feature window off the mask."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[1], [2]])]
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+
+    # The mask already covers only the new turn, so an offset carried over from
+    # an earlier turn must not be applied to it a second time.
+    for carried_offset in (0, 6, 20):
+        window_masks, window_embeds = mc._qwen3_visual_window(
+            masks,
+            packed,
+            positions,
+            mask_offsets=(carried_offset,),
+            feature_offsets=(carried_offset,),
+            window=6,
+        )
+        assert window_masks.tolist() == [[0, 0, 1, 1, 0, 0]]
+        assert window_embeds[0].tolist() == [[1], [2]]
+
+
+def test_qwen3_visual_window_keeps_rows_apart_under_left_padding():
+    """Left-padded rows keep their own features instead of borrowing a neighbour's."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    # Row 0 is left-padded by 3, so its cache offset is negative at prefill.
+    masks = mx.array([[0, 0, 0, 0, 1, 1], [1, 1, 0, 0, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[1], [2], [3], [4]])]
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+
+    window_masks, window_embeds = mc._qwen3_visual_window(
+        masks,
+        packed,
+        positions,
+        mask_offsets=(0, 0),
+        feature_offsets=(-3, 0),
+        window=6,
+    )
+    assert window_masks.tolist() == masks.tolist()
+    assert window_embeds[0].tolist() == [[1], [2], [3], [4]]
+
+
+def test_qwen3_cache_offsets_accepts_declared_none_left_padding():
+    """Some cache classes declare left_padding as None rather than omitting it."""
+    import unsloth_zoo.mlx.compile as mc
+
+    cache = [types.SimpleNamespace(offset=0, left_padding=None)]
+    assert mc._qwen3_cache_offsets(cache, batch_size=1) == ((0,), (0,))

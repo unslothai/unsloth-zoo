@@ -835,8 +835,13 @@ def test_vlm_processor_inputs_retry_only_exact_pytorch_output_error():
     converted = _call_vlm_processor(
         pytorch_only, (), {"return_tensors": "mlx"}
     )
-    assert isinstance(converted["ids"], mx.array)
-    assert converted["ids"].dtype == mx.int64
+    # why: a sibling module can swap the util's `mx` for the simulation stub,
+    # whose `array` is a factory rather than a type.
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    if "mlx_simulation" not in str(getattr(mlx_utils.mx, "__file__", "")):
+        assert isinstance(converted["ids"], mx.array)
+        assert converted["ids"].dtype == mx.int64
 
     native, native_calls = object(), []
     assert _call_vlm_processor(lambda **kw: native_calls.append(kw["return_tensors"]) or native, (), {"return_tensors": "np"}) is native
@@ -1508,3 +1513,28 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     proc.tokenizer = _PoisonedTokenizer()
     poisoned = U._finalize_vlm_batch(staged)
     assert np.asarray(poisoned["input_ids"]).tolist() == sync_seq[0][0]
+
+
+def test_gemma3n_token_type_ownership_survives_module_relocation():
+    """Gemma3n builds token types itself however its module is named."""
+    from unsloth_zoo.mlx.utils import _vlm_processor_requests_mm_token_type_ids
+
+    def processor(module, name="Gemma3nProcessor"):
+        def __call__(self, *_args, **_kwargs):
+            return {}
+        return type(name, (object,), {"__module__": module, "__call__": __call__})()
+
+    # Remote-code and single-file loads expose the marker only as a suffix of
+    # the module name, never as a standalone path component.
+    for module in (
+        "transformers.models.gemma3n.processing_gemma3n",
+        "transformers_modules.google.gemma-3n-E4B-it.a1b2c3.processing_gemma3n",
+        "processing_gemma3n",
+        "mlx_vlm.models.gemma3n.processing",
+    ):
+        assert _vlm_processor_requests_mm_token_type_ids(processor(module)) is False
+
+    # Gemma3 proper still asks the processor for the multimodal token types.
+    assert _vlm_processor_requests_mm_token_type_ids(
+        processor("transformers.models.gemma3.processing_gemma3", "Gemma3Processor")
+    ) is True

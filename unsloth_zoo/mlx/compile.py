@@ -2458,7 +2458,8 @@ def _qwen3_visual_window(
     for row, (mask_start, feature_start) in enumerate(
         zip(mask_offsets, feature_offsets)
     ):
-        if visual_pos_masks.shape[-1] == window:
+        whole_row = visual_pos_masks.shape[-1] == window
+        if whole_row:
             active_mask = visual_pos_masks[row]
         else:
             row_mask = visual_pos_masks[row]
@@ -2476,8 +2477,14 @@ def _qwen3_visual_window(
         window_masks.append(active_mask[None, :])
 
         row_positions = visual_positions[row]
-        feature_stop = max(0, feature_start + window)
-        feature_start = max(0, feature_start)
+        if whole_row:
+            # why: the whole mask row is consumed, so the feature window spans
+            # the whole row too -- a non-zero cache offset here belongs to an
+            # earlier prompt, not to this mask.
+            feature_start, feature_stop = 0, int(visual_pos_masks.shape[-1])
+        else:
+            feature_stop = max(0, feature_start + window)
+            feature_start = max(0, feature_start)
         feature_before = int(
             ((row_positions >= 0) & (row_positions < feature_start)).sum().item()
         )
@@ -2515,7 +2522,9 @@ def _qwen3_cache_offsets(cache, batch_size):
         return (int(value),) * batch_size
 
     offsets = row_values(getattr(cache_entry, "offset", 0))
-    left_padding = row_values(getattr(cache_entry, "left_padding", 0))
+    # why: some cache classes declare `left_padding` as None rather than omitting it.
+    left_padding = getattr(cache_entry, "left_padding", None)
+    left_padding = row_values(0 if left_padding is None else left_padding)
     if len(offsets) != batch_size or len(left_padding) != batch_size:
         return offsets, offsets
     mask_offsets = tuple(
