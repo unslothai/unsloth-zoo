@@ -4640,6 +4640,68 @@ def _call_vlm_processor(processor_call, args, kwargs):
     return _convert_vlm_processor_output(output, return_tensors)
 
 
+_VLM_MM_TOKEN_TYPE_PROCESSOR_MARKERS = (
+    "gemma3",
+    "gemma4",
+    "qwen3_vl",
+    "qwen3_5",
+)
+
+
+def _effective_processor_call_owner(cls):
+    """Return the first MRO class that supplies the active processor call.
+
+    Keeping this lookup separate makes the distinction between inherited
+    behavior and a subclass override explicit at the policy boundary.
+    """
+
+    return next(
+        (
+            candidate
+            for candidate in getattr(cls, "__mro__", (cls,))
+            if "__call__" in getattr(candidate, "__dict__", {})
+        ),
+        cls,
+    )
+
+
+def _processor_class_owns_gemma3n_token_types(cls):
+    """Recognize the effective Gemma3n processor call across relocation.
+
+    A subclass can live in a custom namespace, but an override can also replace
+    the inherited call contract. Classify the first MRO class that actually
+    supplies ``__call__`` so both cases keep their own behavior.
+    """
+
+    owner = _effective_processor_call_owner(cls)
+    # Class names can be regenerated or reused by custom processors. Only the
+    # module that supplies the effective call identifies the installed owner.
+    module = str(getattr(owner, "__module__", "")).lower()
+    return "gemma3n" in module.split(".")
+
+
+def _vlm_processor_requests_mm_token_type_ids(processor):
+    """Return whether the installed processor owns the multimodal type flag.
+
+    Gemma3n builds token types itself and forwards unknown kwargs to its
+    tokenizer. Follow the effective call owner for both negative and positive
+    classification so relocated inheritance preserves the installed behavior,
+    while a subclass override retains its own request contract.
+    Concrete wrapper names never authorize or suppress the processor flag.
+    """
+
+    cls = processor.__class__
+    owner = _effective_processor_call_owner(cls)
+    module = str(getattr(owner, "__module__", "")).lower()
+    if _processor_class_owns_gemma3n_token_types(cls):
+        return False
+    marker = f"{module}.{getattr(owner, '__name__', '')}".lower()
+    return any(
+        owner in marker
+        for owner in _VLM_MM_TOKEN_TYPE_PROCESSOR_MARKERS
+    )
+
+
 def _mlx_vlm_process_inputs_adapter(original):
     """Apply the exact PyTorch-only retry to mlx-vlm's processor boundary."""
 
@@ -4705,13 +4767,7 @@ def _processor_vlm_inputs(
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
         base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
-    marker = f"{processor.__class__.__module__}.{processor.__class__.__name__}".lower()
-    if (
-        "gemma3" in marker
-        or "gemma4" in marker
-        or "qwen3_vl" in marker
-        or "qwen3_5" in marker
-    ):
+    if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
     first_error = None

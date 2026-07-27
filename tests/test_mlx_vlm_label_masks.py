@@ -779,6 +779,33 @@ def test_vlm_processor_inputs_retry_only_exact_pytorch_output_error():
     assert raised.value is unrelated
 
 
+def test_vlm_processor_multimodal_token_type_ownership():
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    def call(self, text, **kwargs):
+        self.request = kwargs.get("return_mm_token_type_ids")
+        output = {"input_ids": np.ones((len(text), 2))}
+        if self.native_types or self.request is True:
+            output["token_type_ids"] = np.zeros((len(text), 2))
+        return output
+    def processor(model, name="Processor", base=object, native_types=False, inherit_call=False):
+        attrs = {"__module__": f"mlx_vlm.models.{model}.processing", "native_types": native_types}
+        if not inherit_call:
+            attrs["__call__"] = call
+        return type(name, (base,), attrs)()
+    gemma3n = processor("gemma3n", "Gemma3nProcessor", native_types=True)
+    relocated = processor("custom", "CustomGemma3nProcessor", type(gemma3n), True, True)
+    owners = [processor("gemma3", "Gemma3NextProcessor")]
+    for model in ("gemma3", "gemma4", "qwen3_vl", "qwen3_5"):
+        native = processor(model)
+        owners.extend((native, processor("custom", f"Custom{model}Processor", type(native), inherit_call=True)))
+    owners.append(processor("custom", "Gemma3nFlagProcessor", type(gemma3n)))
+    owners.append(processor("custom", "Gemma3nProcessor", type(gemma3n)))
+    for candidate in owners:
+        assert "token_type_ids" in _processor_vlm_inputs(candidate, ["x"], [[]], 8) and candidate.request is True
+    for candidate in (gemma3n, relocated):
+        assert "token_type_ids" in _processor_vlm_inputs(candidate, ["x"], [[]], 8) and candidate.request is None
+
+
 def test_deepseek_ocr_loader_patches_removed_llama_flash_attention(monkeypatch):
     import sys
     import types
