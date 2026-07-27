@@ -6706,6 +6706,19 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+    quantized_types = [
+        nn.QuantizedLinear,
+        nn.QuantizedEmbedding,
+        QuantizedSwitchLinear,
+    ]
+    vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
+    if vlm_switch_module is not None:
+        quantized_types.append(vlm_switch_module.QuantizedSwitchLinear)
+    # Drop non-class placeholders a stand-in runtime exports, else isinstance() raises.
+    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+
     quantized = {}
     config = getattr(model, "_config", None)
     if isinstance(config, dict):
@@ -6721,7 +6734,7 @@ def _effective_mlx_quantization_map(model):
         # isinstance, not an exact class-name match: a training-time subclass of
         # the quantized layer (e.g. NEFTune's _NEFTuneEmbed) must still be
         # recognised, else embed_tokens is silently dropped from the map.
-        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+        if not isinstance(module, quantized_types):
             continue
         name = _canonical_mlx_quantization_path(name)
         entry = {}
@@ -6878,6 +6891,11 @@ def _infer_mlx_lora_rank(module):
             return None
         return int(rank)
 
+    # mlx-lm < 0.28.3 flattened experts into lora_a's leading dimension.
+    if len(lora_a_shape) == 2 and len(lora_b_shape) == 3:
+        experts, _, rank = lora_b_shape
+        return int(rank) if lora_a_shape[0] == experts * rank else None
+
     if len(lora_a_shape) < 2 or len(lora_b_shape) < 2:
         return None
 
@@ -6957,9 +6975,11 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     resolved_map = _effective_mlx_quantization_map(model)
     if resolved_map:
         adapter_config["base_resolved_quantization_map"] = resolved_map
+        adapter_config["base_resolved_quantization_map_supports_switch"] = True
         adapter_config.pop("base_quantization_map", None)
     else:
         adapter_config.pop("base_resolved_quantization_map", None)
+        adapter_config.pop("base_resolved_quantization_map_supports_switch", None)
         adapter_config.pop("base_quantization_map", None)
 
     requires_runtime = False
@@ -7724,6 +7744,28 @@ def _copy_source_sidecars(src_path, path):
         copied += 1
     return copied
 
+def _fuse_mlx_module(module, dequantize):
+    """Call ``module.fuse()`` regardless of how the flag is spelled.
+
+    mlx-lm renamed it from ``de_quantize`` (0.28.3) to ``dequantize`` (0.28.4)
+    and the supported range spans both, so pick the spelling the installed
+    implementation accepts. A flagless ``fuse()`` (mlx-vlm's ``ExtendedLmHead``)
+    has nothing to dequantize and ``save_merged_model`` dequantizes afterwards.
+    """
+    fuse = module.fuse
+    try:
+        parameters = inspect.signature(fuse).parameters
+    except (TypeError, ValueError):
+        # C extensions can hide their signature; assume the current spelling.
+        return fuse(dequantize=dequantize)
+
+    for name in ("dequantize", "de_quantize"):
+        if name in parameters:
+            return fuse(**{name: dequantize})
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return fuse(dequantize=dequantize)
+    return fuse()
+
 def save_merged_model(model, tokenizer, path, dequantize=False):
     """Fuse LoRA weights and save the full merged model.
 
@@ -7749,7 +7791,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
     fused_linears = [
-        (n, m.fuse(dequantize=dequantize))
+        (n, _fuse_mlx_module(m, dequantize))
         for n, m in model.named_modules()
         if hasattr(m, "fuse")
     ]
