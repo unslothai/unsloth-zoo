@@ -2727,7 +2727,13 @@ def test_should_epoch_stop_field_reset_and_honored():
     # _epoch_stop_total_microbatches covers BOTH epoch layouts (the default cycled
     # single-pass and the torch_randperm materialized-all-epochs path); the old
     # flag-gated len(batches) form skipped the default path.
-    assert "(_epoch_stop_total_microbatches - batch_idx) // grad_accum" in src
+    assert "_remaining = _epoch_stop_total_microbatches - batch_idx" in src
+    # The skip lands on an epoch boundary, so what remains is whole epochs and
+    # each costs a ceil'd step count; flooring the micro-batches shortens the
+    # epochs that were never truncated.
+    assert "(_remaining // _epoch_flush_microbatches)" in src
+    assert "_mlx_steps_per_epoch(" in src
+    assert "_remaining // grad_accum" in src
     assert '_epoch_stop_total_microbatches' in src
 
 
@@ -4143,19 +4149,29 @@ def test_epoch_end_fires_on_substep_boundary():
 
 def test_epoch_boundary_can_land_on_substep():
     # Prove the boundary is reachable on a non-update microstep: replicate the
-    # loop's accumulation cadence for grad_accum=2, batches_per_epoch=3. The
-    # microstep at the epoch boundary (it % batches_per_epoch == 0) is a substep,
-    # so on_epoch_end would be dropped without the substep-branch dispatch.
+    # loop's accumulation cadence for grad_accum=2, batches_per_epoch=3. On a
+    # max_steps run (no epoch flush) the microstep at the epoch boundary
+    # (it % batches_per_epoch == 0) is a substep, so on_epoch_end would be
+    # dropped without the substep-branch dispatch. An epoch-count run instead
+    # forces the update there, mirroring HF's do_sync_step.
     grad_accum = 2
     batches_per_epoch = 3
-    accum_progress = 0
-    boundary_is_update = None
-    for it in range(1, batches_per_epoch + 1):
-        do_update = (accum_progress + 1 >= grad_accum)
-        if it % batches_per_epoch == 0:
-            boundary_is_update = do_update
-        accum_progress = 0 if do_update else accum_progress + 1
-    assert boundary_is_update is False
+
+    def boundary_is_update(epoch_flush_microbatches):
+        accum_progress = 0
+        seen = None
+        for it in range(1, batches_per_epoch + 1):
+            do_update = (accum_progress + 1 >= grad_accum)
+            if (epoch_flush_microbatches
+                    and it % epoch_flush_microbatches == 0):
+                do_update = True
+            if it % batches_per_epoch == 0:
+                seen = do_update
+            accum_progress = 0 if do_update else accum_progress + 1
+        return seen
+
+    assert boundary_is_update(None) is False
+    assert boundary_is_update(batches_per_epoch) is True
 
 
 def test_substep_defers_callback_stop_until_after_epoch_end_eval():
@@ -4363,7 +4379,8 @@ def test_epoch_stop_budget_recompute_present_in_source():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     src = inspect.getsource(MLXTrainer._train_inner)
-    assert "(_epoch_stop_total_microbatches - batch_idx) // grad_accum" in src
+    assert "_remaining = _epoch_stop_total_microbatches - batch_idx" in src
+    assert "(_remaining // _epoch_flush_microbatches)" in src
     assert "total_steps - _skipped // grad_accum" not in src
     # The recompute is driven by the conceptual total micro-batches, which is set
     # for both epoch layouts (default cycled pass and torch_randperm), so it is not
@@ -7417,3 +7434,455 @@ def test_input_token_counting_is_gated_on_its_argument(monkeypatch):
 
     # "non_padding" is an enabled mode, not an opt-out.
     assert run("non_padding")[0] == [8, 17, 27, 38]
+
+
+def test_epoch_final_microbatch_forces_optimizer_step_budget():
+    # HF sets do_sync_step on an epoch's last micro-batch
+    # (transformers _run_epoch: `(step + 1) == steps_in_epoch`) and sizes the run
+    # with num_update_steps_per_epoch = ceil(len_dataloader / grad_accum). Flooring
+    # the whole stream left the epoch's tail un-applied at on_epoch_end and folded
+    # it into the next epoch's window. Measured against transformers 5.14.1 and
+    # 4.57.6: 3 micro-batches at grad_accum=2 over 2 epochs runs 4 steps.
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _mlx_steps_per_epoch,
+        _resolve_training_steps,
+    )
+
+    def steps(n_batches, grad_accum, epochs, includes_epochs=False):
+        args = MLXTrainingConfig(
+            max_steps=-1,
+            num_train_epochs=epochs,
+            gradient_accumulation_steps=grad_accum,
+        )
+        return _resolve_training_steps(
+            args, [0] * n_batches, None, includes_epochs=includes_epochs,
+        )
+
+    assert steps(3, 2, 2) == 4          # HF: 4, the old floor gave 3
+    assert steps(2, 4, 4) == 4          # HF: 4, the old floor gave 2
+    assert steps(5, 2, 2) == 6          # HF: 6, the old floor gave 5
+    # Divisible epochs are untouched: ceil == floor, so the numerics do not move.
+    assert steps(4, 2, 2) == 4
+    assert steps(8, 4, 3) == 6
+    assert steps(6, 1, 2) == 12
+    # torch_randperm layout ceils the per-epoch slice, not the whole stream.
+    assert steps(6, 2, 2, includes_epochs=True) == 4
+    assert steps(8, 2, 2, includes_epochs=True) == 4
+    # An epoch shorter than one accumulation window still costs a full step.
+    assert _mlx_steps_per_epoch(2, 4) == 1
+    assert _mlx_steps_per_epoch(3, 2) == 2
+    assert _mlx_steps_per_epoch(4, 2) == 2
+
+
+def test_max_steps_and_single_pass_budgets_keep_the_flat_model():
+    # The forced flush is scoped to epoch-count runs. A max_steps run keeps its
+    # fixed budget (batches_per_epoch there is an approximation that must not move
+    # optimizer steps) and a run with no declared epoch count keeps one floored
+    # pass, so neither changes numerics.
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _mlx_epoch_microbatches,
+        _resolve_training_steps,
+    )
+
+    max_steps_args = MLXTrainingConfig(
+        max_steps=7, num_train_epochs=2, gradient_accumulation_steps=2,
+    )
+    assert _resolve_training_steps(max_steps_args, [0] * 3, None) == 7
+    assert _mlx_epoch_microbatches(max_steps_args, [0] * 3) is None
+
+    no_epochs = MLXTrainingConfig(
+        max_steps=-1, num_train_epochs=-1, gradient_accumulation_steps=2,
+    )
+    assert _resolve_training_steps(no_epochs, [0] * 3, None) == 1  # 3 // 2
+    assert _mlx_epoch_microbatches(no_epochs, [0] * 3) is None
+
+    # Streaming has no materialized epoch, so it keeps the flat cursor too.
+    streaming = MLXTrainingConfig(
+        max_steps=-1, num_train_epochs=2, gradient_accumulation_steps=2,
+    )
+    assert _mlx_epoch_microbatches(streaming, None) is None
+    assert _mlx_epoch_microbatches(streaming, []) is None
+
+
+def test_epoch_microbatches_agrees_with_callback_epoch_length():
+    # The step budget, the forced epoch-final update, the resume cursor and the
+    # on_epoch_begin/end dispatch must all use one epoch length, or the loop
+    # flushes at a micro-batch the callbacks do not consider a boundary.
+    import types as _types
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _mlx_epoch_microbatches,
+    )
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer._distributed_world_size = 1
+    trainer.train_dataset = [{"text": "row"}] * 12
+    trainer._mlx_train_dataset_for_batches = trainer.train_dataset
+    for max_steps, epochs, includes, n_batches in (
+        (-1, 2, False, 3),
+        (-1, 2, False, 4),
+        (-1, 4, False, 2),
+        (-1, 2, True, 6),
+        (-1, 2, True, 7),
+        (-1, -1, False, 5),
+        (6, 2, False, 5),
+        (6, 2, True, 6),
+    ):
+        trainer.args = MLXTrainingConfig(
+            max_steps=max_steps,
+            num_train_epochs=epochs,
+            gradient_accumulation_steps=2,
+            per_device_train_batch_size=2,
+        )
+        trainer._prepared_batches_include_epochs = includes
+        resolved = _mlx_epoch_microbatches(
+            trainer.args, [0] * n_batches, includes_epochs=includes,
+        )
+        if resolved is not None:
+            assert resolved == trainer._callback_batches_per_epoch(
+                [0] * n_batches
+            ), (max_steps, epochs, includes, n_batches)
+    del _types
+
+
+def test_resume_cursor_is_epoch_aligned_for_ragged_epochs():
+    # Once an epoch's tail forces a step, global_step no longer maps flatly onto
+    # micro-batches, so rebuilding the cursor as global_step * grad_accum skips the
+    # next epoch's opening micro-batch and cycles into an unplanned extra pass.
+    # HF rebuilds it per epoch (epochs_trained * steps_in_epoch +
+    # global_step % num_update_steps_per_epoch * grad_accum).
+    from unsloth_zoo.mlx.trainer import _mlx_microstep_for_step
+
+    # 3 micro-batches at grad_accum=2: steps consume 2, 1, 2, 1 micro-batches.
+    consumed = [_mlx_microstep_for_step(step, 3, 2) for step in range(5)]
+    assert consumed == [0, 2, 3, 5, 6]
+    # The flat rule would have produced 4 at step 2, skipping micro-batch 3.
+    assert consumed[2] != 2 * 2
+    # 2 micro-batches at grad_accum=4: one step per epoch.
+    assert [_mlx_microstep_for_step(s, 2, 4) for s in range(5)] == [
+        0, 2, 4, 6, 8,
+    ]
+    # Divisible epochs keep the flat mapping exactly.
+    assert [_mlx_microstep_for_step(s, 6, 2) for s in range(4)] == [0, 2, 4, 6]
+    assert [_mlx_microstep_for_step(s, 4, 2) for s in range(5)] == [
+        0, 2, 4, 6, 8,
+    ]
+
+
+def test_epoch_flush_microstep_phase_marks_the_forced_update():
+    # The compiled step's argument signature changes when the epoch-final
+    # micro-batch forces the update, so the shape guard's enumerated catalog must
+    # use the same per-epoch phase the runtime materialize() call passes.
+    from unsloth_zoo.mlx.shape_guard import (
+        DDP_LOCAL_GRAD_SCOPE,
+        FULL_STEP_SCOPE,
+        phase_for_microstep,
+    )
+    from unsloth_zoo.mlx.trainer import _mlx_microstep_phase
+
+    # 3 micro-batches per epoch, grad_accum=2. Micro-batch 2 (0-based) opens a
+    # fresh window AND forces the update, so it traces the single-batch update.
+    phases = [
+        _mlx_microstep_phase(FULL_STEP_SCOPE, 2, m, 3) for m in range(6)
+    ]
+    assert phases == [
+        "none_no_update", "tree_update", "single",
+        "none_no_update", "tree_update", "single",
+    ]
+    # 3 micro-batches per epoch, grad_accum=3: the boundary already updates.
+    assert _mlx_microstep_phase(FULL_STEP_SCOPE, 3, 2, 3) == "tree_update"
+    # 4 micro-batches per epoch, grad_accum=3: the tail carries a partial tree.
+    assert [
+        _mlx_microstep_phase(FULL_STEP_SCOPE, 3, m, 4) for m in range(4)
+    ] == ["none_no_update", "tree_no_update", "tree_update", "single"]
+    # grad_accum=1 updates on every micro-batch, flush or not.
+    assert _mlx_microstep_phase(FULL_STEP_SCOPE, 1, 2, 3) == "single"
+    # The DDP local-gradient scope never sees do_update, so only the window
+    # position matters, but it still restarts at the epoch boundary.
+    assert [
+        _mlx_microstep_phase(DDP_LOCAL_GRAD_SCOPE, 2, m, 3) for m in range(6)
+    ] == ["none", "tree", "none", "none", "tree", "none"]
+    # Without an epoch length it is exactly the flat mapping.
+    for m in range(12):
+        assert _mlx_microstep_phase(FULL_STEP_SCOPE, 3, m) == (
+            phase_for_microstep(FULL_STEP_SCOPE, 3, m)
+        )
+
+
+def test_epoch_flush_shape_plan_admits_the_runtime_phase_sequence():
+    # The planner enumerates the real micro-batch stream (whole epochs, not
+    # total_steps * grad_accum) with the same phase helper the loop passes to
+    # FiniteTextBatchPlan.materialize, so no visited signature is rejected.
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _mlx_microstep_phase,
+        _plan_single_process_text_shapes,
+        _resolve_training_steps,
+    )
+
+    plan = _make_shape_guard_text_plan((10, 11, 30))
+    args = MLXTrainingConfig(
+        max_steps=-1,
+        num_train_epochs=2,
+        gradient_accumulation_steps=2,
+        compile_max_variants=8,
+    )
+    total_steps = _resolve_training_steps(args, plan, None)
+    assert total_steps == 4
+    shape_plan, report, allowed, _ = _plan_single_process_text_shapes(
+        plan, None, args=args, total_steps=total_steps, is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+    assert allowed
+    # Exactly the 6 micro-batches the loop visits, no phantom third pass.
+    assert shape_plan.raw_catalog == frozenset(
+        (
+            report.compile_scope,
+            _mlx_microstep_phase(report.compile_scope, 2, m, 3),
+            plan.batch_family(plan.batch_index_for_visit(m)),
+            plan.batch_width(plan.batch_index_for_visit(m)),
+        )
+        for m in range(6)
+    )
+    for microstep in range(6):
+        assert shape_plan.allows(
+            plan.batch_family(plan.batch_index_for_visit(microstep)),
+            plan.batch_width(plan.batch_index_for_visit(microstep)),
+            _mlx_microstep_phase(report.compile_scope, 2, microstep, 3),
+        )
+
+
+def test_epoch_flush_wiring_present_in_source():
+    # Guard the three call sites so the flush cannot be silently reverted:
+    # the forced boundary update, the epoch-aligned resume cursor, and the
+    # per-epoch phase handed to the compiled materialize().
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert "_epoch_flush_microbatches = _mlx_epoch_microbatches(" in src
+    assert "and it % _epoch_flush_microbatches == 0" in src
+    assert "_resume_microstep = _mlx_microstep_for_step(" in src
+    assert "batch_idx = _resume_microstep" in src
+    assert "microstep = _resume_microstep" in src
+    # The flat cursor survives only as the non-epoch fallback.
+    assert src.count("= _resume_step * grad_accum") == 1
+    assert "_resume_microstep = _resume_step * grad_accum" in src
+    assert "range(_resume_microstep)" in src
+    assert "phase=_mlx_microstep_phase(" in src
+
+
+def _epoch_flush_loop_trainer(
+    out_dir, *, microbatches_per_epoch, grad_accum, epochs, save_steps=0,
+    callbacks=(),
+):
+    """Trainer wired to run the real loop over recorded micro-batch visits."""
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class RecordingBatches(list):
+        def __init__(self, items):
+            super().__init__(items)
+            self.visits = []
+
+        def __getitem__(self, index):
+            self.visits.append(int(index))
+            return list.__getitem__(self, index)
+
+    def make_batch(seed):
+        ids = mx.array([[seed + 1] * 6], dtype=mx.int32)
+        lengths = mx.array([[0, 5]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    batches = RecordingBatches(
+        [make_batch(i) for i in range(microbatches_per_epoch)]
+    )
+    args = MLXTrainingConfig(
+        max_steps=-1,
+        num_train_epochs=epochs,
+        gradient_accumulation_steps=grad_accum,
+        logging_steps=10 ** 6,
+        save_steps=save_steps,
+        warmup_steps=5,
+        learning_rate=6e-4,
+        lr_scheduler_type="linear",
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=out_dir,
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(microbatches_per_epoch)],
+        args=args,
+        callbacks=list(callbacks),
+    )
+    trainer._prepare_data = lambda _is_vlm: (batches, None)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    return trainer, batches
+
+
+class _EpochScheduleSpy:
+    """Records the (global_step, epoch) pairs HF callbacks observe."""
+
+    def __init__(self):
+        self.epoch_end = []
+        self.step_end = []
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        self.epoch_end.append((state.global_step, round(float(state.epoch), 6)))
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self.step_end.append((state.global_step, round(float(state.epoch), 6)))
+        return control
+
+
+def test_ragged_epoch_schedule_matches_transformers(monkeypatch):
+    # End-to-end through the real loop. Golden values measured by running
+    # transformers.Trainer (5.14.1 and 4.57.6) on the same shape: 6 rows at
+    # per_device_train_batch_size=2 is 3 micro-batches per epoch, grad_accum=2,
+    # num_train_epochs=2. HF runs 4 optimizer steps and fires on_epoch_end at
+    # (2, 1.0) and (4, 2.0); the flat model ran 3 and fired at (1, 1.0), (3, 2.0)
+    # with the epoch's last gradient still pending at the first on_epoch_end.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    spy = _EpochScheduleSpy()
+    trainer, batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=3, grad_accum=2, epochs=2,
+        callbacks=[spy],
+    )
+    trainer.train()
+
+    assert trainer.state.max_steps == 4
+    assert trainer._global_step == 4
+    assert spy.epoch_end == [(2, 1.0), (4, 2.0)]
+    assert spy.step_end == [
+        (1, 0.666667), (2, 1.0), (3, 1.666667), (4, 2.0),
+    ]
+    # Every micro-batch is visited exactly once per epoch and no step straddles
+    # the boundary: visits 0,1 -> step 1; visit 2 -> step 2 (forced).
+    assert batches.visits == [0, 1, 2, 0, 1, 2]
+
+
+def test_divisible_epoch_schedule_is_unchanged(monkeypatch):
+    # Backwards compatibility: when the epoch divides evenly by grad_accum the
+    # ceil equals the floor, no micro-batch is ever a forced flush that was not
+    # already an update, and the schedule is bit-for-bit the pre-fix one (which
+    # also equals transformers: 8 rows at batch 2, grad_accum=2, 2 epochs -> 4).
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    spy = _EpochScheduleSpy()
+    trainer, batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=4, grad_accum=2, epochs=2,
+        callbacks=[spy],
+    )
+    trainer.train()
+
+    assert trainer.state.max_steps == 4
+    assert spy.epoch_end == [(2, 1.0), (4, 2.0)]
+    assert spy.step_end == [(1, 0.5), (2, 1.0), (3, 1.5), (4, 2.0)]
+    assert batches.visits == [0, 1, 2, 3, 0, 1, 2, 3]
+
+
+def test_short_epoch_saves_one_checkpoint_per_epoch(monkeypatch):
+    # 2 micro-batches per epoch at grad_accum=4 used to run 2 optimizer steps for
+    # 4 epochs, so an epoch-end save fired at global_step 0 (writing a
+    # checkpoint-0) and epochs 2 and 3 both wrote checkpoint-1, silently
+    # overwriting each other. transformers writes checkpoint-1..4.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class SaveEachEpochEnd:
+        def on_epoch_end(self, args, state, control, **kwargs):
+            control.should_save = True
+            return control
+
+    out_dir = tempfile.mkdtemp()
+    spy = _EpochScheduleSpy()
+    trainer, _batches = _epoch_flush_loop_trainer(
+        out_dir, microbatches_per_epoch=2, grad_accum=4, epochs=4,
+        callbacks=[spy, SaveEachEpochEnd()],
+    )
+    trainer.train()
+
+    assert trainer.state.max_steps == 4
+    assert spy.epoch_end == [(1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)]
+    assert sorted(
+        d for d in os.listdir(out_dir) if d.startswith("checkpoint-")
+    ) == ["checkpoint-1", "checkpoint-2", "checkpoint-3", "checkpoint-4"]
+    assert not os.path.isdir(os.path.join(out_dir, "checkpoint-0"))
+
+
+def test_epoch_aligned_resume_consumes_each_microbatch_once(monkeypatch):
+    # A ragged-epoch resume must pick up at the epoch boundary the checkpoint
+    # closed. The flat cursor (global_step * grad_accum) skipped the next epoch's
+    # opening micro-batch and ran two micro-batches into a third dataset pass
+    # num_train_epochs never authorised. transformers resumes the same run with
+    # epochs_trained = global_step // num_update_steps_per_epoch and consumes
+    # exactly the 3 remaining micro-batches.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    out_dir = tempfile.mkdtemp()
+    first, first_batches = _epoch_flush_loop_trainer(
+        out_dir, microbatches_per_epoch=3, grad_accum=2, epochs=2, save_steps=1,
+    )
+    first.train()
+    assert first_batches.visits == [0, 1, 2, 0, 1, 2]
+    ckpt = os.path.join(out_dir, "checkpoint-2")
+    assert os.path.isdir(ckpt), sorted(os.listdir(out_dir))
+
+    spy = _EpochScheduleSpy()
+    resumed, resumed_batches = _epoch_flush_loop_trainer(
+        out_dir, microbatches_per_epoch=3, grad_accum=2, epochs=2, save_steps=1,
+        callbacks=[spy],
+    )
+    resumed.train(resume_from_checkpoint=ckpt)
+
+    # Epoch 2 only: 3 micro-batches, 2 optimizer steps, no repeat of epoch 1 and
+    # no third pass.
+    assert resumed_batches.visits == [0, 1, 2]
+    assert resumed._global_step == 4
+    assert spy.step_end == [(3, 1.666667), (4, 2.0)]
+    assert spy.epoch_end == [(4, 2.0)]
+
+
+def test_epoch_stop_budget_keeps_untruncated_epochs_whole(monkeypatch):
+    # A should_epoch_stop callback truncates ONE epoch. Recomputing the remaining
+    # budget with a flat floor also shortened the epochs that were never
+    # truncated, silently dropping their last micro-batch. 5 micro-batches per
+    # epoch at grad_accum=2 over 2 epochs, stopping epoch 1 after step 2:
+    # transformers runs 5 steps (2 + a full 3) and fires on_epoch_end at
+    # (2, 0.8) then (5, 2.0).
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class StopEpochAtStepTwo:
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == 2:
+                control.should_epoch_stop = True
+            return control
+
+    spy = _EpochScheduleSpy()
+    trainer, batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=5, grad_accum=2, epochs=2,
+        callbacks=[spy, StopEpochAtStepTwo()],
+    )
+    trainer.train()
+
+    assert trainer._global_step == 5
+    assert spy.epoch_end == [(2, 0.8), (5, 2.0)]
+    # Epoch 1 abandoned its 5th micro-batch; epoch 2 ran all five of its own.
+    assert batches.visits == [0, 1, 2, 3, 0, 1, 2, 3, 4]

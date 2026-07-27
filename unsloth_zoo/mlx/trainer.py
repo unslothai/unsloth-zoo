@@ -1141,6 +1141,78 @@ def _shape_guard_report(
     )
 
 
+def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
+    """Micro-batches in one epoch when epoch boundaries drive the schedule.
+
+    None for streaming, max_steps runs and runs with no declared epoch count:
+    those keep the flat accumulation model. Mirrors the epoch-count branches of
+    MLXTrainer._callback_batches_per_epoch so the budget, the forced boundary
+    update and the callback epoch events all land on the same micro-batch.
+    """
+    if batches is None:
+        return None
+    total = len(batches)
+    epochs = int(getattr(args, "num_train_epochs", 0) or 0)
+    if total <= 0 or epochs <= 0:
+        return None
+    if int(getattr(args, "max_steps", 0) or 0) > 0:
+        return None
+    if includes_epochs and total % epochs == 0:
+        return max(1, total // epochs)
+    return total
+
+
+def _mlx_steps_per_epoch(epoch_microbatches, grad_accum):
+    """Optimizer steps one epoch costs when its last micro-batch forces a step."""
+    return max(1, math.ceil(
+        int(epoch_microbatches) / max(1, int(grad_accum))
+    ))
+
+
+def _mlx_microstep_for_step(global_step, epoch_microbatches, grad_accum):
+    """Micro-batches consumed once ``global_step`` optimizer steps have run.
+
+    Epochs close on a forced step, so the mapping is per-epoch rather than flat
+    (HF: epochs_trained * steps_in_epoch + global_step % updates_per_epoch *
+    grad_accum). Equals global_step * grad_accum for a divisible epoch.
+    """
+    epoch_microbatches = int(epoch_microbatches)
+    grad_accum = max(1, int(grad_accum))
+    per_epoch = _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
+    epochs_done, steps_into_epoch = divmod(int(global_step), per_epoch)
+    return epochs_done * epoch_microbatches + min(
+        steps_into_epoch * grad_accum, epoch_microbatches,
+    )
+
+
+def _mlx_microstep_phase(
+    compile_scope, grad_accum, index, epoch_microbatches=None,
+):
+    """Compiled-argument phase at one micro-batch, epoch flush included.
+
+    Accumulation windows restart at every epoch boundary and the epoch's last
+    micro-batch forces the update, so both the window position and the update
+    flag are per-epoch once ``epoch_microbatches`` is known.
+    """
+    if not epoch_microbatches:
+        return phase_for_microstep(compile_scope, grad_accum, index)
+    epoch_microbatches = int(epoch_microbatches)
+    position = int(index) % epoch_microbatches
+    phase = phase_for_microstep(compile_scope, grad_accum, position)
+    if (
+        compile_scope != FULL_STEP_SCOPE
+        or position != epoch_microbatches - 1
+    ):
+        return phase
+    # Epoch-final micro-batch: it traces the updating signature even when it is
+    # not the accumulation window's last position.
+    if phase == "none_no_update":
+        return "single"
+    if phase == "tree_no_update":
+        return "tree_update"
+    return phase
+
+
 def _plan_single_process_text_shapes(
     batches,
     batch_iter,
@@ -1151,6 +1223,7 @@ def _plan_single_process_text_shapes(
     distributed_world_size,
     compile_policy,
     install_plan=True,
+    includes_epochs=False,
 ):
     """Plan finite text shapes before optimizer or compiled-callable setup."""
 
@@ -1185,7 +1258,18 @@ def _plan_single_process_text_shapes(
             )
         return None, report, False, None
 
-    total_microsteps = total_steps * args.gradient_accumulation_steps
+    grad_accum = args.gradient_accumulation_steps
+    epoch_microbatches = _mlx_epoch_microbatches(
+        args, batches, includes_epochs=includes_epochs,
+    )
+    if epoch_microbatches:
+        # Epoch-count runs visit whole epochs and each epoch's last micro-batch
+        # forces the update, so the stream is shorter than total_steps * accum.
+        total_microsteps = epoch_microbatches * (
+            total_steps // _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
+        )
+    else:
+        total_microsteps = total_steps * grad_accum
     event_counts = {}
     for microstep in range(total_microsteps):
         # Same visit mapping as the runtime fetch, so the enumerated catalog
@@ -1194,10 +1278,11 @@ def _plan_single_process_text_shapes(
         batch_index = batches.batch_index_for_visit(microstep)
         family = batches.batch_family(batch_index)
         width = batches.batch_width(batch_index)
-        phase = phase_for_microstep(
+        phase = _mlx_microstep_phase(
             compile_scope,
-            args.gradient_accumulation_steps,
+            grad_accum,
             microstep,
+            epoch_microbatches,
         )
         key = (family, width, phase, len(batches.schedule[batch_index]))
         event_counts[key] = event_counts.get(key, 0) + 1
@@ -1245,10 +1330,22 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
         return args.max_steps
     if batches is not None:
         n_batches = len(batches)
-        if includes_epochs:
-            total_steps = n_batches // grad_accum
-        elif args.num_train_epochs > 0:
-            total_steps = (n_batches * args.num_train_epochs) // grad_accum
+        epoch_microbatches = _mlx_epoch_microbatches(
+            args, batches, includes_epochs=includes_epochs,
+        )
+        if epoch_microbatches:
+            # Each epoch's last micro-batch forces an optimizer step (HF's
+            # do_sync_step), so an epoch costs ceil(micro-batches / grad_accum)
+            # and never the floor, which dropped the ragged tail into the next
+            # epoch's window. Divisible epochs are unchanged.
+            total_microbatches = (
+                n_batches if includes_epochs
+                else n_batches * int(args.num_train_epochs)
+            )
+            total_steps = (
+                (total_microbatches // epoch_microbatches)
+                * _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
+            )
         else:
             total_steps = n_batches // grad_accum
         return max(1, total_steps)
@@ -2238,6 +2335,17 @@ class MLXTrainer:
         total = len(batches)
         if total <= 0:
             return None
+        # Epoch-count runs share this length with the step budget and the forced
+        # epoch-final update, so both read it from one place.
+        epoch_microbatches = _mlx_epoch_microbatches(
+            self.args,
+            batches,
+            includes_epochs=getattr(
+                self, "_prepared_batches_include_epochs", False,
+            ),
+        )
+        if epoch_microbatches:
+            return epoch_microbatches
         if getattr(self, "_prepared_batches_include_epochs", False):
             epochs = int(getattr(self.args, "num_train_epochs", 0) or 0)
             if epochs > 0 and total % epochs == 0:
@@ -3259,6 +3367,9 @@ class MLXTrainer:
                     distributed_world_size=self.distributed_world_size,
                     compile_policy=compile_policy,
                     install_plan=False,
+                    includes_epochs=getattr(
+                        self, "_prepared_batches_include_epochs", False,
+                    ),
                 )
             except Exception as exc:
                 local_plan_error = exc
@@ -3607,6 +3718,9 @@ class MLXTrainer:
                 is_vlm=is_vlm,
                 distributed_world_size=distributed_world_size,
                 compile_policy=compile_policy,
+                includes_epochs=getattr(
+                    self, "_prepared_batches_include_epochs", False,
+                ),
             )
         # Shared by the preflight and prepared paths: batch_iter is the
         # streaming producer when active, None otherwise.
@@ -3633,6 +3747,16 @@ class MLXTrainer:
                 _epoch_stop_total_microbatches = (
                     _n_batches * int(args.num_train_epochs)
                 )
+        # Micro-batches in one epoch on an epoch-count-driven run, where the
+        # epoch's last micro-batch forces an optimizer step (HF's do_sync_step).
+        # None for max_steps and streaming runs, which keep the flat model.
+        _epoch_flush_microbatches = _mlx_epoch_microbatches(
+            args,
+            batches,
+            includes_epochs=getattr(
+                self, "_prepared_batches_include_epochs", False,
+            ),
+        )
         self._compile_shape_guard_report = _compile_shape_guard_report
 
         # Build optimizer with LR schedule
@@ -4841,15 +4965,25 @@ class MLXTrainer:
 
         # When resuming, start batch_idx at the resume position so the visit
         # mapping (plan-provided for finite plans, modulo for eager lists)
-        # lands on the same batch the original run would have seen next.
-        batch_idx = _resume_step * grad_accum
+        # lands on the same batch the original run would have seen next. Once an
+        # epoch's tail forces a step, global_step no longer maps flatly onto
+        # micro-batches, so rebuild the cursor per epoch like HF does; otherwise
+        # the resume skips the next epoch's opening micro-batch and cycles into
+        # a pass num_train_epochs never authorised.
+        if _epoch_flush_microbatches:
+            _resume_microstep = _mlx_microstep_for_step(
+                _resume_step, _epoch_flush_microbatches, grad_accum,
+            )
+        else:
+            _resume_microstep = _resume_step * grad_accum
+        batch_idx = _resume_microstep
 
         # Streaming mode: fast-forward the iterator to the resume position.
         # The seed is the same and create_batches/iterate_*_batches is
         # deterministic, so consuming N batches gives us the same data
         # ordering the killed run would have produced.
         if _resume_step > 0 and batch_iter is not None and not _prefetch_active:
-            for _ in range(_resume_step * grad_accum):
+            for _ in range(_resume_microstep):
                 fast_forward_error = None
                 try:
                     next(batch_iter)
@@ -4992,16 +5126,27 @@ class MLXTrainer:
             # max_steps runs keep their fixed budget (_epoch_stop_total_microbatches
             # is None).
             if _epoch_stop_total_microbatches is not None:
-                total_steps = self._global_step + (
-                    (_epoch_stop_total_microbatches - batch_idx) // grad_accum
-                )
+                _remaining = _epoch_stop_total_microbatches - batch_idx
+                if _epoch_flush_microbatches:
+                    # batch_idx now sits on an epoch boundary, so what remains is
+                    # a whole number of epochs and each costs a ceil'd step
+                    # count; flooring the micro-batches shortens the epochs that
+                    # were never truncated.
+                    total_steps = self._global_step + (
+                        (_remaining // _epoch_flush_microbatches)
+                        * _mlx_steps_per_epoch(
+                            _epoch_flush_microbatches, grad_accum,
+                        )
+                    )
+                else:
+                    total_steps = self._global_step + _remaining // grad_accum
             return next_boundary
 
         # DDP-lockstep microstep loop. global_step advances only on optimizer
         # updates; _distributed_should_stop() OR-reduces stop_requested at the
         # top so an early stop (external cancel or an HF stop callback that ran
         # on a subset of ranks) drains every rank together before the next collective.
-        microstep = _resume_step * grad_accum
+        microstep = _resume_microstep
         self._global_step = _resume_step
         # Resuming mid-epoch re-enters an epoch whose boundary already passed, so
         # the loop's predicate never fires its begin and a fresh callback sees an
@@ -5057,10 +5202,11 @@ class MLXTrainer:
                     ):
                         batch_data = batches.materialize(
                             scheduled_index,
-                            phase=phase_for_microstep(
+                            phase=_mlx_microstep_phase(
                                 _compile_scope,
                                 grad_accum,
                                 it - 1,
+                                _epoch_flush_microbatches,
                             ),
                         )
                     else:
@@ -5078,6 +5224,15 @@ class MLXTrainer:
                 raise batch_error
 
             do_update = (accum_progress + 1 >= grad_accum)
+            # HF forces a sync step on an epoch's last micro-batch, so the epoch
+            # is fully applied before on_epoch_end and its tail never mixes into
+            # the next epoch's window. Epoch-count runs only: under max_steps
+            # batches_per_epoch is an approximation that must not move steps.
+            if (
+                _epoch_flush_microbatches
+                and it % _epoch_flush_microbatches == 0
+            ):
+                do_update = True
             if do_update:
                 # Keep callable scheduler evaluation outside mx.compile. The
                 # compiled step reads the scalar LR already in optimizer state.
