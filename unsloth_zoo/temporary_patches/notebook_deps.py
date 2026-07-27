@@ -82,28 +82,39 @@ def _in_venv() -> bool:
     )
 
 
-def _pip_install(pkg: str) -> bool:
-    if pkg in _attempted:
-        return False
-    _attempted.add(pkg)
-    if shutil.which("uv") and _in_venv():
-        cmd = ["uv", "pip", "install", "--quiet", pkg]
-    else:
-        cmd = [
-            sys.executable, "-m", "pip", "install", "--quiet",
-            "--disable-pip-version-check", "--no-input", pkg,
-        ]
-        # Outside a venv on Linux/Mac as non-root: probe write access to
-        # site-packages and fall back to --user. Windows has no geteuid;
-        # site-packages there is usually writable inside the venv anyway.
-        if not _in_venv() and hasattr(os, "geteuid") and os.geteuid() != 0:
-            try:
-                sp = site.getsitepackages()[0]
-                probe = os.path.join(sp, ".unsloth_write_probe")
-                open(probe, "w").close()
-                os.remove(probe)
-            except Exception:
-                cmd.append("--user")
+def _uv_command(pkg: str) -> list:
+    # `--python` pins the install to the interpreter that is actually running
+    # Unsloth. Without it `uv pip install` picks its target from VIRTUAL_ENV /
+    # CONDA_PREFIX / a discovered `.venv`, and a notebook kernel frequently
+    # runs a different interpreter than the environment its process inherited.
+    # In that case the package lands in the activated environment, the
+    # follow-up `find_spec` still fails, and an unrelated environment has been
+    # modified for nothing. This mirrors what the pip fallback below already
+    # does implicitly by invoking `sys.executable -m pip`.
+    return ["uv", "pip", "install", "--quiet", "--python", sys.executable, pkg]
+
+
+def _pip_command(pkg: str) -> list:
+    cmd = [
+        sys.executable, "-m", "pip", "install", "--quiet",
+        "--disable-pip-version-check", "--no-input", pkg,
+    ]
+    # Outside a venv on Linux/Mac as non-root: probe write access to
+    # site-packages and fall back to --user. Windows has no geteuid;
+    # site-packages there is usually writable inside the venv anyway.
+    if not _in_venv() and hasattr(os, "geteuid") and os.geteuid() != 0:
+        try:
+            sp = site.getsitepackages()[0]
+            probe = os.path.join(sp, ".unsloth_write_probe")
+            open(probe, "w").close()
+            os.remove(probe)
+        except Exception:
+            cmd.append("--user")
+    return cmd
+
+
+def _run_install(pkg: str, cmd: list) -> tuple:
+    """Run one installer command. Returns ``(succeeded, retry_with_pip)``."""
     logger.warning(
         f"Unsloth: auto-installing missing notebook dep `{pkg}` via "
         f"`{' '.join(cmd)}`. Set UNSLOTH_AUTO_INSTALL=0 to disable."
@@ -112,17 +123,44 @@ def _pip_install(pkg: str) -> bool:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except Exception as e:
         logger.warning(f"Unsloth: auto-install of `{pkg}` failed to launch: {e}")
+        return False, False
+    if r.returncode == 0:
+        importlib.invalidate_caches()
+        try:
+            list(importlib.metadata.distributions())
+        except Exception:
+            pass
+        return True, False
+    stderr = r.stderr or ""
+    logger.warning(f"Unsloth: auto-install of `{pkg}` failed:\n{stderr[-500:]}")
+    # Retry through pip only when uv could not be aimed at this interpreter at
+    # all: a uv predating `--python` exits with an argument-parser error
+    # ("unexpected argument '--python' found"), and a uv that cannot resolve
+    # the given path exits with a discovery error. Both happen before any
+    # network access, and `sys.executable -m pip` targets the right interpreter
+    # by construction, so falling back there is strictly better than giving up.
+    # A genuine resolution or build failure is NOT retried, otherwise every
+    # real failure would cost two installs.
+    lowered = stderr.lower()
+    retry_with_pip = (
+        "unexpected argument" in lowered
+        or "unrecognized" in lowered
+        or "no virtual environment or system python installation found" in lowered
+    )
+    return False, retry_with_pip
+
+
+def _pip_install(pkg: str) -> bool:
+    if pkg in _attempted:
         return False
-    if r.returncode != 0:
-        tail = (r.stderr or "")[-500:]
-        logger.warning(f"Unsloth: auto-install of `{pkg}` failed:\n{tail}")
-        return False
-    importlib.invalidate_caches()
-    try:
-        list(importlib.metadata.distributions())
-    except Exception:
-        pass
-    return True
+    _attempted.add(pkg)
+    if shutil.which("uv") and _in_venv():
+        ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
+        if ok:
+            return True
+        if not retry_with_pip:
+            return False
+    return _run_install(pkg, _pip_command(pkg))[0]
 
 
 def _try_install_and_import(pkg: str) -> bool:
@@ -138,6 +176,64 @@ def _try_install_and_import(pkg: str) -> bool:
     return importlib.util.find_spec(import_name) is not None
 
 
+def _rebind_requires_backends(wrapper, original) -> None:
+    """
+    ``transformers/utils/__init__.py`` re-exports ``requires_backends``, and
+    modeling files import it from there rather than from ``import_utils``
+    (``models/timm_wrapper/modeling_timm_wrapper.py`` does ``from ...utils
+    import auto_docstring, is_timm_available, requires_backends``). Both of
+    those bind their own name to the function object, so rebinding only
+    ``transformers.utils.import_utils`` leaves the public alias and every
+    already-imported copy on the unwrapped original -- the TimmWrapper path
+    then raises for a missing `timm` without the installer ever running.
+    Point every such alias at the wrapper instead.
+
+    ``vars(module)`` is used rather than ``getattr``: lazy module shims resolve
+    unknown attributes by importing submodules, and this must not trigger
+    imports as a side effect. The ``is original`` identity test means only
+    aliases of the exact function we wrapped are touched, so an unrelated
+    ``requires_backends`` in some other package is left alone.
+    """
+    if original is None or wrapper is None:
+        return
+    for module in list(sys.modules.values()):
+        try:
+            namespace = vars(module)
+            if namespace.get("requires_backends", None) is original:
+                namespace["requires_backends"] = wrapper
+        except Exception:
+            continue
+
+
+def _refresh_backend_availability(iu, backend) -> None:
+    """
+    Make transformers re-evaluate whether ``backend`` is importable.
+
+    The retry re-enters the original ``requires_backends``, which decides from
+    ``BACKENDS_MAPPING[backend][0]()``. On transformers 5.x that entry is an
+    ``functools.lru_cache`` wrapper around ``is_<backend>_available`` which has
+    already cached ``False``, so without clearing it the freshly installed
+    package is still reported missing and the retry raises the very ImportError
+    the install was meant to remove. transformers 4.x instead kept a module
+    level ``_<backend>_available`` flag, which no longer exists in 5.x, so both
+    are handled and neither is required to be present.
+    """
+    flag = f"_{backend.replace('-', '_')}_available"
+    if hasattr(iu, flag):
+        setattr(iu, flag, True)
+    try:
+        available = iu.BACKENDS_MAPPING[backend][0]
+    except Exception:
+        return
+    cache_clear = getattr(available, "cache_clear", None)
+    if cache_clear is None:
+        return
+    try:
+        cache_clear()
+    except Exception:
+        pass
+
+
 def patch_requires_backends_autoinstall():
     """
     Wrap ``transformers.utils.import_utils.requires_backends`` so that an
@@ -150,9 +246,18 @@ def patch_requires_backends_autoinstall():
         from transformers.utils import import_utils as iu
     except Exception:
         return  # transformers absent (MLX-only path) -- nothing to patch.
-    if getattr(iu.requires_backends, "_unsloth_patched", False):
+    current = getattr(iu, "requires_backends", None)
+    if current is None:
+        return  # transformers version without this helper -- nothing to patch.
+    if getattr(current, "_unsloth_patched", False):
+        # Already wrapped. Re-broadcast rather than returning early, because a
+        # transformers module imported since the previous pass holds its own
+        # copy of the original. The wrapper object is the same everywhere, so
+        # `_unsloth_patched` stays a single sentinel rather than becoming one
+        # sentinel per location.
+        _rebind_requires_backends(current, getattr(current, "_unsloth_original", None))
         return
-    _orig = iu.requires_backends
+    _orig = current
 
     def requires_backends(obj, backends):
         try:
@@ -171,13 +276,13 @@ def patch_requires_backends_autoinstall():
             if not installed_any:
                 raise
             for b in wanted:
-                flag = f"_{b.replace('-', '_')}_available"
-                if hasattr(iu, flag):
-                    setattr(iu, flag, True)
+                _refresh_backend_availability(iu, b)
             return _orig(obj, backends)
 
     requires_backends._unsloth_patched = True
+    requires_backends._unsloth_original = _orig
     iu.requires_backends = requires_backends
+    _rebind_requires_backends(requires_backends, _orig)
 
 
 def patch_check_imports_autoinstall():
