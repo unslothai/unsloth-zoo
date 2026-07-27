@@ -1541,7 +1541,7 @@ class MLXTrainer:
                 "on_init_end",
                 self.args, self.state, self.control,
             )
-        except Exception as e:
+        except BaseException as e:
             _init_error = e
         if self.distributed_world_size > 1:
             self._raise_distributed_failure(
@@ -3370,7 +3370,7 @@ class MLXTrainer:
                     ),
                 )
                 compile_policy = build_compile_policy(args=args)
-            except Exception as exc:
+            except BaseException as exc:
                 preflight_error = exc
             if self.distributed_world_size > 1:
                 self._raise_distributed_failure(
@@ -4469,13 +4469,25 @@ class MLXTrainer:
             _fire in lockstep) so every rank aborts with the original error
             surfaced. Single-process keeps re-raising the original exception
             unchanged.
+
+            Interrupts (KeyboardInterrupt/SystemExit and any other
+            BaseException) are captured for the same reason the evaluation,
+            batch-fetch and checkpoint paths capture them: a rank-local Ctrl-C
+            delivered while a rank is inside a callback -- ordinary with a
+            stock host-I/O callback that self-gates on is_world_process_zero,
+            so only one rank spends time in it -- would otherwise skip the
+            consensus below and strand the peers inside it with no timeout and
+            no way to signal them out. _raise_distributed_failure_from_any
+            re-raises a non-Exception unwrapped and without mutating trainer
+            state, so the interrupted rank still exits with the original
+            interrupt.
             """
             call_error = None
             try:
                 self.control = self.callback_handler.call_event(
                     event, args, self.state, self.control, **kwargs,
                 )
-            except Exception as e:
+            except BaseException as e:
                 call_error = e
             if distributed_world_size > 1:
                 self._raise_distributed_failure(
@@ -4585,8 +4597,25 @@ class MLXTrainer:
         grad_accum_state = None
         accum_progress = 0
         batches_per_epoch = self._callback_batches_per_epoch(batches)
-        # Streaming has no dataset length, so batches_per_epoch is None and epoch
-        # events stay off -- but state.epoch must still be numeric: HF falls back to
+        # A streaming source materializes no `batches`, so the helper above returns
+        # None -- but a supported streaming num_train_epochs run DOES have a known
+        # epoch length: _prepare_data resolved the declared source length into
+        # _streaming_epoch_batch_count (the same count total_steps is derived from)
+        # and rejected any source whose per-pass micro-batches are not divisible by
+        # grad_accum, so every boundary lands on an optimizer step. HF dispatches
+        # epoch events and advances state.epoch off exactly this quantity whenever
+        # the dataloader reports a length -- steps_in_epoch = len(epoch_dataloader)
+        # (transformers trainer.py), true for an IterableDataset with __len__ -- so
+        # gate the epoch lifecycle on it here too. Without this the run kept
+        # batches_per_epoch = None: on_epoch_begin/on_epoch_end never fired and
+        # state.epoch stayed None for the whole run.
+        if batches is None and batch_iter is not None and not batches_per_epoch:
+            batches_per_epoch = int(
+                getattr(self, "_streaming_epoch_batch_count", 0) or 0
+            ) or None
+        # A streaming run with NO known length has no dataset boundaries, so
+        # batches_per_epoch stays None and epoch events stay off -- but state.epoch
+        # must still be numeric: HF falls back to
         # steps_in_epoch = max_steps * grad_accum for a length-less dataloader, and
         # WandbCallback.on_save does round(state.epoch, 2), a TypeError on None.
         stream_epoch_microbatches = None
@@ -5621,9 +5650,11 @@ class MLXTrainer:
         # (microstep % batches_per_epoch == 0), as did the should_epoch_stop skip
         # (which advances microstep to a boundary), so the guard prevents a double
         # fire. batches_per_epoch and microstep are rank-consistent, so on_epoch_end
-        # and its synced log/eval/save run in DDP lockstep. Streaming runs have
-        # batches_per_epoch = None and never fire epoch callbacks, so they are
-        # unaffected.
+        # and its synced log/eval/save run in DDP lockstep. A streaming run without
+        # a known length has batches_per_epoch = None and never fires epoch
+        # callbacks, so it is unaffected; a declared-length streaming epoch run
+        # carries the same boundaries as a materialized one and closes its final
+        # epoch here on the same terms.
         if batches_per_epoch and microstep % batches_per_epoch != 0:
             self.state.epoch = microstep / batches_per_epoch
             _fire("on_epoch_end")

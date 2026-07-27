@@ -3891,7 +3891,11 @@ def test_fire_rank_zero_callback_failure_syncs_across_ranks(monkeypatch):
     fire_def = src.index("def _fire(event, **kwargs):")
     fire_body = src[fire_def:src.index("def _sync_stop():", fire_def)]
     assert "call_event" in fire_body
-    assert "except Exception" in fire_body
+    # BaseException, not Exception: an interrupt raised inside a callback
+    # (KeyboardInterrupt from a Ctrl-C landing there, SystemExit) has to reach the
+    # same consensus, or the peers strand in it. See
+    # test_callback_interrupt_joins_the_ddp_failure_consensus.
+    assert "except BaseException" in fire_body
     assert "self._raise_distributed_failure(" in fire_body
 
     # Behavioral world_size == 2 consensus: rank 0 failed, peer succeeded, both
@@ -8034,3 +8038,281 @@ def test_mlx_batch_input_token_count_non_padding_ladder():
     assert _mlx_batch_input_token_count(
         {"pixel_values": mx.zeros((2, 3))}, mode="non_padding",
     ) == 0
+
+
+@pytest.mark.parametrize("interrupt", [SystemExit, KeyboardInterrupt])
+def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interrupt):
+    # Regression for "Route callback interrupts through DDP failure consensus".
+    # _fire captured only `Exception`, so a callback raising a non-Exception
+    # BaseException (KeyboardInterrupt from a Ctrl-C landing inside a callback,
+    # or SystemExit) unwound that rank WITHOUT entering the failure consensus,
+    # while every peer entered it and blocked there forever: MLX collectives have
+    # no timeout and block in C holding the GIL, so the peers cannot even be
+    # signalled out. Verified on a real two-rank `mlx.launch --backend ring` run:
+    # pre-fix the peer was still parked in _distributed_status_mask 25 s later and
+    # needed SIGKILL. Every other consensus call site in this file (batch fetch,
+    # evaluation, optimizer step, checkpoint, best-model restore) already captures
+    # BaseException, and _raise_distributed_failure_from_any already re-raises a
+    # non-Exception unwrapped without mutating trainer state -- that branch was
+    # simply unreachable from _fire.
+    import mlx.core as mx
+
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    # Homogeneous world of 2: the all-sum doubles the local value, so
+    # _distributed_any_flag(True) aborts and _distributed_any_flag(False) does not.
+    monkeypatch.setattr(
+        trainer_mod.mx.distributed, "all_sum",
+        lambda value, group=None, stream=None: value * mx.array(2, dtype=value.dtype),
+    )
+    monkeypatch.setattr(
+        trainer_mod.nn, "average_gradients", lambda grad, group=None, **kw: grad,
+    )
+
+    class InterruptAtSecondStep:
+        def __init__(self, raising):
+            self.raising = raising
+            self.calls = 0
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.calls += 1
+            if self.raising and self.calls == 2:
+                raise interrupt("callback interrupt")
+            return control
+
+    def run(raising):
+        """Return (consensus contexts joined, outcome, stop_requested)."""
+        contexts = []
+        original = MLXTrainer._raise_distributed_failure
+
+        def recording(self, failed, context, exc=None):
+            contexts.append(context)
+            return original(self, failed, context, exc)
+
+        monkeypatch.setattr(MLXTrainer, "_raise_distributed_failure", recording)
+
+        def _pinned_ensure_distributed(self):
+            self._distributed_world = object()
+            self._distributed_rank = 0
+            self._distributed_world_size = 2
+            self._distributed_is_main_process = True
+            self._distributed_initialized = True
+            return self._distributed_world
+
+        monkeypatch.setattr(
+            MLXTrainer, "_ensure_distributed", _pinned_ensure_distributed,
+        )
+        args = MLXTrainingConfig(
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            logging_steps=2,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [],
+            args=args,
+            callbacks=[InterruptAtSecondStep(raising)],
+        )
+        trainer._batches = _make_shape_guard_text_plan((8, 8, 8, 8))
+        trainer.save_model = lambda *_a, **_kw: None
+        trainer._build_optimizer = _frozen_optimizer()
+        outcome = None
+        try:
+            trainer.train()
+        except BaseException as exc:  # noqa: BLE001
+            outcome = exc
+        return contexts, outcome, trainer.stop_requested
+
+    peer_contexts, peer_outcome, _ = run(raising=False)
+    raiser_contexts, raiser_outcome, raiser_stop = run(raising=True)
+
+    # The peer runs to completion and reports no failure of its own.
+    assert peer_outcome is None
+    # The interrupt still reaches the caller unwrapped, exactly as HF's
+    # callback_handler.call_event lets it propagate (transformers
+    # trainer_callback.py wraps nothing).
+    assert type(raiser_outcome) is interrupt
+    assert str(raiser_outcome) == "callback interrupt"
+    # The interrupt branch must not latch a stop into a reusable trainer.
+    assert raiser_stop is False
+
+    # The lockstep invariant the collective actually requires: up to the abort,
+    # the interrupted rank took part in EVERY consensus its peer took part in,
+    # ending with the on_step_end dispatch that raised. Pre-fix the raiser
+    # skipped that last one, and the peer blocked in it with nobody to meet.
+    assert raiser_contexts, "the interrupted rank joined no consensus at all"
+    assert raiser_contexts[-1] == "on_step_end callback"
+    assert raiser_contexts == peer_contexts[:len(raiser_contexts)]
+    assert len(peer_contexts) > len(raiser_contexts)
+
+
+def test_declared_length_streaming_dispatches_callback_epochs(monkeypatch):
+    # Regression for "Use known streaming lengths for callback epoch boundaries".
+    # A streaming num_train_epochs run whose iterable declares a reliable __len__
+    # is supported: _prepare_data resolves _streaming_epoch_batch_count and derives
+    # total_steps from it. The loop, though, built epoch metadata only for
+    # max_steps streams, so batches_per_epoch stayed None: on_epoch_begin /
+    # on_epoch_end never fired and state.epoch stayed None for the whole run, so
+    # epoch-based logging/eval/checkpoint callbacks were silently skipped and
+    # WandbCallback.on_save in checkpoint mode raised
+    # "TypeError: type NoneType doesn't define __round__ method" on
+    # round(state.epoch, 2).
+    #
+    # The expected trace below is what real transformers produces (verified on
+    # 5.14.1 AND 4.57.6) for the equivalent run -- a torch IterableDataset with
+    # __len__ == 6, per_device_train_batch_size=2, num_train_epochs=2,
+    # save_steps=2: len(train_dataloader) == 3, state.max_steps == 6,
+    # on_epoch_begin/on_epoch_end twice each, state.epoch walking
+    # 0 -> 1/3 -> 2/3 -> 1.0 -> 1.0 -> 4/3 -> 5/3 -> 2.0, and checkpoint aliases
+    # epoch_0.67 / epoch_1.33 / epoch_2.0. HF gets there because
+    # steps_in_epoch = len(epoch_dataloader) (transformers trainer.py) and an
+    # IterableDataset with __len__ gives its dataloader a length.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochSpy:
+        def __init__(self):
+            self.events = []
+
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            self.events.append(("on_epoch_begin", state.global_step, state.epoch))
+            return control
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            self.events.append(("on_epoch_end", state.global_step, state.epoch))
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            # Verbatim WandbCallback.on_save with log_model="checkpoint".
+            self.events.append(
+                ("on_save", state.global_step, f"epoch_{round(state.epoch, 2)}"),
+            )
+            return control
+
+    rows = [{"text": f"{value} {value + 10} {value + 20}"} for value in range(1, 7)]
+    args = MLXTrainingConfig(
+        streaming=True,
+        max_steps=0,
+        num_train_epochs=2,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+        completion_only_loss=False,
+        dataset_order="sequential",
+        logging_steps=1000,
+        save_steps=2,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    spy = EpochSpy()
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        _streaming_text_tokenizer(),
+        _DeclaredTextRows(rows),
+        args=args,
+        callbacks=[spy],
+    )
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer._save_checkpoint = lambda *_a, **_kw: None
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.train()
+
+    # The stream really is the length-declaring kind this branch is meant to serve,
+    # and the run length is unchanged -- only the callback lifecycle was missing.
+    assert trainer._streaming_epoch_batch_count == 3
+    assert trainer.state.max_steps == 6
+    assert trainer.state.num_train_epochs == 2
+    # state.epoch is numeric and complete, so round(state.epoch, 2) cannot raise.
+    assert trainer.state.epoch == 2.0
+    assert trainer.train_dataset.epochs == [0, 1]
+
+    assert spy.events == [
+        ("on_epoch_begin", 0, 0.0),
+        ("on_save", 2, "epoch_0.67"),
+        ("on_epoch_end", 3, 1.0),
+        ("on_epoch_begin", 3, 1.0),
+        ("on_save", 4, "epoch_1.33"),
+        ("on_save", 6, "epoch_2.0"),
+        ("on_epoch_end", 6, 2.0),
+    ]
+
+
+def test_unsized_streaming_keeps_epoch_events_off_with_a_numeric_epoch(monkeypatch):
+    # Guard the guard for the fix above: a stream with NO declared length still
+    # has no dataset boundaries, so epoch events must stay off (HF has none
+    # either -- num_train_epochs = sys.maxsize and steps_in_epoch =
+    # max_steps * grad_accum for a length-less dataloader) while state.epoch stays
+    # numeric so round(state.epoch, 2) in WandbCallback.on_save still works.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochSpy:
+        def __init__(self):
+            self.epoch_events = 0
+            self.epochs = []
+
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            self.epoch_events += 1
+            return control
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            self.epoch_events += 1
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.epochs.append(round(state.epoch, 2))
+            return control
+
+    rows = [{"text": f"{value} {value + 10} {value + 20}"} for value in range(1, 7)]
+    args = MLXTrainingConfig(
+        streaming=True,
+        max_steps=3,
+        num_train_epochs=0,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+        completion_only_loss=False,
+        dataset_order="sequential",
+        logging_steps=1000,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    spy = EpochSpy()
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        _streaming_text_tokenizer(),
+        _CountingTextRows(rows),
+        args=args,
+        callbacks=[spy],
+    )
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.train()
+
+    assert trainer._streaming_epoch_batch_count is None
+    assert spy.epoch_events == 0
+    assert spy.epochs == [0.33, 0.67, 1.0]
