@@ -2907,7 +2907,10 @@ def merge_and_overwrite_lora(
             pass
         pass
 
-        final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+        # `save_method` goes in so an unreachable Hub cannot veto a merge that
+        # never needed it. The 4bit merges below fold LoRA into the weights
+        # already loaded, so a local quantized base is all they require.
+        final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token, save_method)
         # For a 16bit merge of an FP8 base, prefer an existing 16bit sibling (e.g.
         # unsloth/GLM-5.2-FP8 -> unsloth/GLM-5.2) and merge LoRA onto full-precision
         # weights, mirroring the 4bit flow. Only dequantize the FP8 if no sibling exists.
@@ -2917,7 +2920,10 @@ def merge_and_overwrite_lora(
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.info(f"Unsloth: FP8 base detected; merging onto 16bit sibling `{_sibling}`.")
                 model_name = _sibling
-                final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token)
+                final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token, save_method)
+        # Reached only when `save_method` is "merged_16bit", which is not one of
+        # the methods the fallback above answers for nf4/fp4, so a Hub outage can
+        # never arrive here carrying a local 4bit copy.
         if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
             warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
             return None
@@ -4810,10 +4816,44 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
     return None
 pass
 
-def determine_base_model_source(model_name, token=None):
+# Save methods that fold LoRA into the weights already in memory. Both hand the
+# live PeftModel to `merge_and_unload()` and write the result straight out, so
+# the base directory is read only to size the shards. Nothing on that path can
+# reach the Hub, which is why an unreachable Hub must not decide it.
+_MERGES_FROM_LOADED_WEIGHTS = ("merged_4bit", "forced_merged_4bit")
+
+def _local_base_completes_without_the_hub(quant_type, save_method):
+    """Is a local quantized copy enough to finish `save_method` with no network?
+
+    Answering True here lets `determine_base_model_source` hand back the local
+    copy instead of propagating an unreachable Hub. That is only sound when the
+    merge really can finish from those local weights, so the two grounds are
+    spelled out rather than defaulted to "local is probably fine":
+
+    FP8, for any save method. `merge_and_overwrite_lora` dequantizes an FP8 base
+    for `merged_16bit` (`_merge_and_overwrite_lora_fp8`) and otherwise keeps the
+    quant config, so the local weights are already sufficient.
+
+    Any quantization, for the 4bit merges. They never read base weights at all.
+
+    Everything else keeps raising. In particular nf4/fp4 under `merged_16bit`,
+    where the merge answers `warnings.warn` plus `return None` and writes
+    nothing: falling back there would trade a loud failure for exactly the
+    silent no-op this whole branch exists to remove.
+    """
+    if quant_type == "fp8": return True
+    return save_method in _MERGES_FROM_LOADED_WEIGHTS
+pass
+
+def determine_base_model_source(model_name, token=None, save_method=None):
     """
     Determine the best source for base model using branched logic
     Returns: (final_model_name, is_local_path, source_info, is_quantized, quant_type)
+
+    `save_method` is optional and only ever consulted when the Hub is
+    unreachable, to decide whether a local quantized copy can still satisfy the
+    request. Leaving it None keeps the strictest behaviour, so callers that do
+    not know the save method are unaffected.
     """
 
     # Look on disk first. It needs no network, and priorities 1 and 2 below
@@ -4838,24 +4878,23 @@ def determine_base_model_source(model_name, token=None):
     # an unreachable Hub still propagates for everything the merge cannot
     # complete from local weights alone.
     #
-    # FP8 is the one exception, and it has to be handled here rather than by
-    # hoisting priority 5, because `outputs/mymodel` is simultaneously a valid
-    # repo id and an ordinary directory, so no string test can spare it from the
-    # probe. `merge_and_overwrite_lora` dequantizes an FP8 base for
-    # `merged_16bit` (`_merge_and_overwrite_lora_fp8`), so the local weights are
-    # sufficient and an unreachable Hub must not block a valid offline export.
-    # Catching rather than reordering keeps a reachable Hub authoritative: a
-    # 16bit repo still wins at priority 3, exactly as it does today.
+    # The exceptions have to be handled here rather than by hoisting priority 5,
+    # because `outputs/mymodel` is simultaneously a valid repo id and an ordinary
+    # directory, so no string test can spare it from the probe. Catching rather
+    # than reordering also keeps a reachable Hub authoritative: a 16bit repo
+    # still wins at priority 3, exactly as it does today, and the fallback is
+    # only ever reached on the exception path.
     #
-    # nf4/fp4 deliberately keeps raising. There the 16bit merge answers
-    # `warnings.warn` plus `return None` and writes nothing, so falling back
-    # would trade a loud failure for the silent no-op this branch exists to
-    # remove. Raising is what the parent commit already did for it.
+    # `_local_base_completes_without_the_hub` decides which those are, and the
+    # answer it gives back is the one priority 5 would have given, so this is
+    # only ever "a request that used to fail now resolves". Nothing that used to
+    # resolve changes, and nothing that used to raise now silently returns None.
     try:
         hf_exists = check_hf_model_exists(model_name, token)
     except RuntimeError:
-        if local_path and local_quant_type == "fp8":
-            return (local_path, True, "local_fp8", True, "fp8")
+        if local_path and local_is_quantized and \
+            _local_base_completes_without_the_hub(local_quant_type, save_method):
+            return (local_path, True, f"local_{local_quant_type}", True, local_quant_type)
         raise
 
     hf_is_quantized, hf_quant_type = None, None
