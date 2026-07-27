@@ -1175,8 +1175,9 @@ def _shape_guard_report(
 def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
     """Micro-batches in one epoch when epoch boundaries drive the schedule.
 
-    None for streaming, max_steps runs and runs with no declared epoch count:
-    those keep the flat accumulation model. Mirrors the epoch-count branches of
+    None for streaming, for runs with no declared epoch count, and for max_steps
+    runs whose batch source cannot report an exact one-pass length: those keep
+    the flat accumulation model. Mirrors the epoch branches of
     MLXTrainer._callback_batches_per_epoch so the budget, the forced boundary
     update and the callback epoch events all land on the same micro-batch.
 
@@ -1188,10 +1189,20 @@ def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
     if batches is None:
         return None
     total = len(batches)
-    epochs = float(getattr(args, "num_train_epochs", 0) or 0)
-    if total <= 0 or epochs <= 0:
+    if total <= 0:
         return None
     if int(getattr(args, "max_steps", 0) or 0) > 0:
+        # HF's forced epoch-final update is not conditional on max_steps:
+        # do_sync_step reads len(dataloader), so max_steps decides when the run
+        # ends, never how an epoch's ragged tail is applied. Returning None here
+        # left that tail pending across on_epoch_end and folded it into the next
+        # epoch. Only the plan's exact one-pass count qualifies: the dataset-size
+        # approximation cannot see what batching retained, so forcing updates on
+        # it would move optimizer steps onto micro-batches that are not boundaries.
+        plan_cycle = getattr(batches, "cycle_length", None)
+        return max(1, int(plan_cycle)) if plan_cycle else None
+    epochs = float(getattr(args, "num_train_epochs", 0) or 0)
+    if epochs <= 0:
         return None
     whole_epochs = int(epochs)
     if includes_epochs and whole_epochs > 0 and total % whole_epochs == 0:
@@ -3879,6 +3890,12 @@ class MLXTrainer:
         # num_train_epochs times, so the conceptual total is
         # len(batches) * num_train_epochs; on the torch_randperm path
         # (_prepared_batches_include_epochs) `batches` already holds every epoch.
+        # The count is ceiled, matching HF's outer loop over
+        # range(ceil(num_train_epochs)). Truncating made a fractional run forfeit
+        # its tail epoch: 1.5 epochs stopped in epoch 1 saw a one-pass horizon, so
+        # the budget went to zero at the stop. That tail epoch stays bounded by the
+        # pre-skip budget via the clamp in _honor_epoch_stop_skip, and whole counts
+        # are unchanged (ceil(E) == int(E)).
         _epoch_stop_total_microbatches = None
         if args.max_steps <= 0 and batches is not None:
             _n_batches = len(batches)
@@ -3886,11 +3903,32 @@ class MLXTrainer:
                 _epoch_stop_total_microbatches = _n_batches
             elif args.num_train_epochs > 0:
                 _epoch_stop_total_microbatches = (
-                    _n_batches * int(args.num_train_epochs)
+                    _n_batches * math.ceil(float(args.num_train_epochs))
                 )
-        # Micro-batches in one epoch on an epoch-count-driven run, where the
-        # epoch's last micro-batch forces an optimizer step (HF's do_sync_step).
-        # None for max_steps and streaming runs, which keep the flat model.
+        elif (
+            args.max_steps <= 0
+            and batch_iter is not None
+            and args.num_train_epochs > 0
+        ):
+            # Declared-length streaming epochs: _prepare_data resolved the source
+            # length into _streaming_epoch_batch_count, so the horizon is that
+            # per-pass count times the ceiled epoch count, as on the materialized
+            # path. Without it a skipped epoch tail kept the full budget and the run
+            # made it up out of the next pass, overtraining past num_train_epochs.
+            # An unsized stream leaves the count 0 and stays None.
+            _stream_epoch_batches = int(
+                getattr(self, "_streaming_epoch_batch_count", 0) or 0
+            )
+            if _stream_epoch_batches > 0:
+                _epoch_stop_total_microbatches = (
+                    _stream_epoch_batches
+                    * math.ceil(float(args.num_train_epochs))
+                )
+        # Micro-batches in one epoch, where the epoch's last micro-batch forces an
+        # optimizer step (HF's do_sync_step). Set for epoch-count runs and for
+        # max_steps runs whose plan reports an exact one-pass length; None for
+        # streaming and for max_steps runs left on the dataset-size
+        # approximation, which keep the flat model.
         _epoch_flush_microbatches = _mlx_epoch_microbatches(
             args,
             batches,
@@ -5288,7 +5326,36 @@ class MLXTrainer:
             next_boundary = (
                 (it_val // batches_per_epoch) + 1
             ) * batches_per_epoch
-            batch_idx += next_boundary - it_val
+            if batch_iter is None:
+                batch_idx += next_boundary - it_val
+            else:
+                # A streaming producer has no index to fast-forward, so discard
+                # the epoch's remaining micro-batches instead. The producer replays
+                # passes back to back, so this lands on the next pass's first batch,
+                # where HF lands too: it rebuilds the iterator every epoch and a
+                # should_epoch_stop break abandons the rest of the current one. Only
+                # declared-length streams reach here, so the count is finite, and it
+                # is rank-consistent, so DDP stays in lockstep; a producer failure
+                # takes the same consensus path as the loop's own fetch. batch_idx
+                # is unused when streaming, so park the cursor on it.
+                _drain_error = None
+                try:
+                    for _ in range(next_boundary - it_val):
+                        next(batch_iter)
+                except StopIteration:
+                    # Exhausted early: the loop's own fetch reports it.
+                    pass
+                except BaseException as _drain_exc:
+                    _drain_error = _drain_exc
+                if distributed_world_size > 1:
+                    self._raise_distributed_failure(
+                        _drain_error is not None,
+                        "skipping to the next streaming epoch boundary",
+                        _drain_error,
+                    )
+                elif _drain_error is not None:
+                    raise _drain_error
+                batch_idx = next_boundary
             # An epoch-count-driven run (num_train_epochs, not max_steps) must
             # shrink the budget after a skip, else the loop keeps cycling into
             # extra passes and overtrains past num_train_epochs. Recompute from the
@@ -5307,14 +5374,20 @@ class MLXTrainer:
                     # a whole number of epochs and each costs a ceil'd step
                     # count; flooring the micro-batches shortens the epochs that
                     # were never truncated.
-                    total_steps = self._global_step + (
+                    _shrunk = self._global_step + (
                         (_remaining // _epoch_flush_microbatches)
                         * _mlx_steps_per_epoch(
                             _epoch_flush_microbatches, grad_accum,
                         )
                     )
                 else:
-                    total_steps = self._global_step + _remaining // grad_accum
+                    _shrunk = self._global_step + _remaining // grad_accum
+                # Never grow the budget. The horizon counts every epoch HF would
+                # enter, but a fractional run's final epoch is cut short by the step
+                # budget itself, as HF stops such a run mid-epoch on
+                # should_training_stop. Whole counts never reach the clamp: each
+                # skipped epoch costs at most steps_per_epoch.
+                total_steps = min(total_steps, _shrunk)
             return next_boundary
 
         # DDP-lockstep microstep loop. global_step advances only on optimizer
@@ -5401,8 +5474,10 @@ class MLXTrainer:
             do_update = (accum_progress + 1 >= grad_accum)
             # HF forces a sync step on an epoch's last micro-batch, so the epoch
             # is fully applied before on_epoch_end and its tail never mixes into
-            # the next epoch's window. Epoch-count runs only: under max_steps
-            # batches_per_epoch is an approximation that must not move steps.
+            # the next epoch's window. It does this under max_steps too
+            # (do_sync_step reads len(dataloader), not the budget), but only an
+            # exact one-pass length qualifies; the dataset-size approximation
+            # leaves _epoch_flush_microbatches None and must not move steps.
             if (
                 _epoch_flush_microbatches
                 and it % _epoch_flush_microbatches == 0
@@ -5617,13 +5692,14 @@ class MLXTrainer:
                 # optimizer update using the ended epoch's tail (and, when
                 # batches_per_epoch is not a multiple of grad_accum, wrapped
                 # next-epoch) batches. Discard the partial gradient and skip to the
-                # next boundary, matching HF. Only for materialized batches; gated
-                # on the all-reduced flag so every rank abandons the same window and
-                # skips the same micro-batches in lockstep. A natural boundary
-                # already fired on_epoch_end via _maybe_callback_epoch_end above, so
-                # only the truncated-epoch skip fires it (mid-epoch).
-                if (batches_per_epoch and batch_iter is None
-                        and _sync_epoch_stop()):
+                # next boundary, matching HF. Runs wherever the epoch length is
+                # known: _honor_epoch_stop_skip advances an index for materialized
+                # batches and drains the producer for declared-length streams; a
+                # length-less stream leaves batches_per_epoch None. Gated on the
+                # all-reduced flag so every rank abandons the same window and skips
+                # the same micro-batches in lockstep. A natural boundary already
+                # fired on_epoch_end above, so only the mid-epoch skip fires it.
+                if batches_per_epoch and _sync_epoch_stop():
                     if it % batches_per_epoch != 0:
                         # Mid-epoch: abandon the partial accumulation window like
                         # HF's mid-window break, then skip the epoch's remaining
@@ -5736,17 +5812,14 @@ class MLXTrainer:
             # break` of the per-epoch step loop: end this epoch now and skip its
             # remaining micro-batches so the next iteration begins a fresh epoch.
             # Applied here at a clean optimizer-step boundary (accum_progress was
-            # just reset to 0), so no partial gradient accumulation is abandoned,
-            # and only for materialized batches (batch_idx is an index we can
-            # advance) -- a streaming iterator cannot be index-skipped, so it keeps
-            # the flag until the next epoch begin resets it, without a data skip.
-            # The skip is rank-consistent arithmetic gated on the all-reduced flag
-            # (_sync_epoch_stop), and its on_epoch_end reuses the same lockstep
-            # collectives, so DDP stays in lockstep. A natural boundary already
-            # fired on_epoch_end via _maybe_callback_epoch_end above, so only skip
-            # when mid-epoch.
-            if (batches_per_epoch and batch_iter is None
-                    and _sync_epoch_stop()):
+            # just reset to 0), so no partial gradient accumulation is abandoned.
+            # Runs for any known epoch length: materialized batches fast-forward
+            # batch_idx, declared-length streams drain the producer to the same
+            # boundary. A length-less stream has batches_per_epoch None and fires no
+            # epoch events at all. The skip is rank-consistent arithmetic gated on
+            # _sync_epoch_stop, so DDP stays in lockstep. A natural boundary already
+            # fired on_epoch_end above, so only skip when mid-epoch.
+            if batches_per_epoch and _sync_epoch_stop():
                 if it % batches_per_epoch != 0:
                     it = _honor_epoch_stop_skip(it, current_step, grad_norm)
                 self.control.should_epoch_stop = False
