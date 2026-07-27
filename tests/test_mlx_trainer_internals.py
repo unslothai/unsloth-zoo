@@ -8896,35 +8896,82 @@ def test_no_consensus_site_captures_bare_exception():
     assert offenders == [], offenders
 
 
-def _hf_eval_steps_from_default_flow(
-    *, total_steps, steps_per_epoch, eval_strategy, eval_steps, eval_delay=0,
-):
-    """Ask the installed transformers DefaultFlowCallback which steps evaluate.
+def _hf_flow_args(*, eval_strategy, eval_steps, eval_delay):
+    """Stand in for TrainingArguments when driving DefaultFlowCallback.
 
-    Derived from the shipped implementation rather than hardcoded, so the
-    expectation tracks the 4.x/5.x differences in DefaultFlowCallback (5.x adds
-    a final-step evaluation for the steps strategy) instead of pinning one.
+    A real TrainingArguments cannot be built on Apple Silicon: pyproject omits
+    accelerate there, and the constructor hard-requires accelerate>=1.1.0
+    whenever torch is importable. Since that is the platform MLX actually runs
+    on, building one would make this file uncollectable for its own users.
+    Only the five attributes DefaultFlowCallback reads matter, and
+    IntervalStrategy/SaveStrategy are str enums, so plain strings compare equal
+    to them. test_hf_flow_args_stand_in_matches_real_training_arguments pins
+    the equivalence wherever a real one can be constructed.
     """
+    return types.SimpleNamespace(
+        eval_strategy=eval_strategy,
+        eval_steps=eval_steps,
+        eval_delay=eval_delay,
+        logging_strategy="steps",
+        logging_steps=10 ** 6,
+        logging_first_step=False,
+        save_strategy="no",
+        save_steps=10 ** 6,
+    )
+
+
+def test_hf_flow_args_stand_in_matches_real_training_arguments():
+    # The stand-in above only holds while it agrees with the real object on
+    # every field DefaultFlowCallback reads, including the enum normalization
+    # TrainingArguments applies in __post_init__. Skipped on the platform that
+    # forced the stand-in, which is exactly where it cannot be checked.
     import tempfile
 
+    from transformers.utils import is_accelerate_available
+
+    # The same predicate the constructor itself raises on, so this skips for a
+    # too-old accelerate as well as for a missing one.
+    if not is_accelerate_available():
+        pytest.skip("TrainingArguments needs accelerate, omitted on arm64 macOS")
     from transformers import TrainingArguments
+
+    read_by_flow = (
+        "eval_strategy", "eval_delay", "logging_strategy",
+        "logging_first_step", "save_strategy",
+    )
+    for strategy, steps, delay in (
+        ("no", 2, 0), ("steps", 2, 0), ("epoch", 2, 0), ("steps", 2, 3),
+    ):
+        real = TrainingArguments(
+            output_dir=tempfile.mkdtemp(),
+            eval_strategy=strategy, eval_steps=steps, eval_delay=delay,
+            logging_steps=10 ** 6, save_strategy="no", report_to=[],
+        )
+        stub = _hf_flow_args(
+            eval_strategy=strategy, eval_steps=steps, eval_delay=delay,
+        )
+        for field in read_by_flow:
+            assert getattr(stub, field) == getattr(real, field), (
+                strategy, delay, field,
+            )
+        # Equal as strings is not enough: the flow compares against enum
+        # members, so the stub must land on the same side of those tests.
+        assert (
+            _flow_fires(stub, total_steps=4, steps_per_epoch=2)
+            == _flow_fires(real, total_steps=4, steps_per_epoch=2)
+        ), (strategy, delay)
+
+
+def _flow_fires(args, *, total_steps, steps_per_epoch):
+    """Steps DefaultFlowCallback asks to evaluate, for a given args object."""
     from transformers.trainer_callback import (
         DefaultFlowCallback,
         TrainerControl,
         TrainerState,
     )
 
-    args = TrainingArguments(
-        output_dir=tempfile.mkdtemp(),
-        eval_strategy=eval_strategy,
-        eval_steps=eval_steps,
-        eval_delay=eval_delay,
-        logging_steps=10 ** 6,
-        save_strategy="no",
-        report_to=[],
-    )
     state = TrainerState(
-        max_steps=total_steps, eval_steps=eval_steps,
+        max_steps=total_steps, eval_steps=args.eval_steps,
         logging_steps=10 ** 6, save_steps=10 ** 6,
     )
     flow = DefaultFlowCallback()
@@ -8940,6 +8987,26 @@ def _hf_eval_steps_from_default_flow(
         if control.should_evaluate:
             fires.append(step)
     return fires
+
+
+def _hf_eval_steps_from_default_flow(
+    *, total_steps, steps_per_epoch, eval_strategy, eval_steps, eval_delay=0,
+):
+    """Ask the installed transformers DefaultFlowCallback which steps evaluate.
+
+    Derived from the shipped implementation rather than hardcoded, so the
+    expectation tracks the 4.x/5.x differences in DefaultFlowCallback (5.x adds
+    a final-step evaluation for the steps strategy) instead of pinning one.
+    """
+    return _flow_fires(
+        _hf_flow_args(
+            eval_strategy=eval_strategy,
+            eval_steps=eval_steps,
+            eval_delay=eval_delay,
+        ),
+        total_steps=total_steps,
+        steps_per_epoch=steps_per_epoch,
+    )
 
 
 def _run_eval_cadence_probe(monkeypatch, *, eval_steps, **arg_overrides):
