@@ -6011,6 +6011,98 @@ def test_stateful_callbacks_exported_into_checkpoints(monkeypatch):
     assert resumed.state.stateful_callbacks["Patience"]["attributes"]["counter"] == 6
 
 
+def test_checkpoint_epoch_reaches_resumed_lifecycle_events(monkeypatch):
+    # The checkpoint payload carried global_step but not state.epoch, so
+    # _init_callback_state opened every resumed run at epoch=None: callbacks saw
+    # no progress at on_train_begin, and a no-op resume (checkpoint already at
+    # max_steps, loop body never runs) kept None through on_train_end, where
+    # HF's stock NotebookProgressCallback does int(state.epoch). HF checkpoints
+    # TrainerState wholesale, so epoch is restored alongside global_step.
+    import json
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochSpy:
+        def __init__(self):
+            self.begin = []
+            self.end = []
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.begin.append(state.epoch)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            self.end.append(state.epoch)
+            return control
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    out_dir = tempfile.mkdtemp()
+
+    def build(spy):
+        args = MLXTrainingConfig(
+            # 4 rows at batch size 1 = 4 micro-batches per epoch, so the
+            # checkpoint at step 2 sits exactly half way through epoch 1.
+            per_device_train_batch_size=1,
+            max_steps=4,
+            gradient_accumulation_steps=1,
+            logging_steps=100,
+            save_steps=2,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(4)],
+            args=args,
+            callbacks=[spy],
+        )
+        trainer._prepare_data = lambda _is_vlm: (
+            [make_batch(10) for _ in range(4)], None,
+        )
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        return trainer
+
+    build(EpochSpy()).train()
+    with open(os.path.join(out_dir, "checkpoint-2", "trainer_state.json")) as fh:
+        assert json.load(fh)["epoch"] == pytest.approx(0.5)
+
+    # Mid-epoch resume: on_train_begin reports the checkpoint's progress, which
+    # is what HF's restored TrainerState carries there.
+    mid = EpochSpy()
+    build(mid).train(
+        resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
+    assert mid.begin == [pytest.approx(0.5)], mid.begin
+
+    # No-op resume: the loop body never runs, so nothing else can supply the
+    # epoch and it must stay the checkpoint's through on_train_end.
+    noop = EpochSpy()
+    reused = build(noop)
+    reused.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-4"))
+    assert noop.begin == [pytest.approx(1.0)], noop.begin
+    assert noop.end == [pytest.approx(1.0)], noop.end
+
+    # Reusing that trainer for a fresh train() must not serve the checkpoint's
+    # epoch: HF only reads trainer_state.json when resume_from_checkpoint is given.
+    reused.train()
+    assert noop.begin[1] is None, noop.begin
+
+
 def test_pre_optimizer_step_callback_fires_before_each_update(monkeypatch):
     # HF dispatches on_pre_optimizer_step immediately before optimizer.step().
     # The MLX loop only fired on_optimizer_step, so a callback relying on the
@@ -9243,3 +9335,92 @@ def test_eval_dataloader_tracks_the_split_being_evaluated():
     # Restored afterwards, so a later single-split eval is not left pointing at
     # the last split.
     assert trainer.callback_handler.eval_dataloader is splits
+
+
+def test_dict_eval_rebuilds_the_prediction_bar_per_split(monkeypatch):
+    # Stock ProgressCallback sizes its evaluation bar from the first
+    # on_prediction_step's eval_dataloader and only tears it down in
+    # on_evaluate, which MLX fires once for the whole dict. The first split's
+    # bar therefore kept counting every later split's batch past its own total:
+    # 2/2 climbed to 9/2 across splits of 2, 3 and 4 batches. HF recurses
+    # Trainer.evaluate per split, so it rebuilds the bar: 2/2, 3/3, 4/4.
+    import mlx.core as mx
+    from transformers.trainer_callback import ProgressCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class RecordingProgress(ProgressCallback):
+        def __init__(self):
+            super().__init__()
+            self.geometry = []
+            self.closing = "<not called>"
+
+        def on_prediction_step(self, args, state, control,
+                               eval_dataloader=None, **kwargs):
+            output = super().on_prediction_step(
+                args, state, control, eval_dataloader=eval_dataloader, **kwargs,
+            )
+            self.geometry.append(
+                (self.prediction_bar.total, self.prediction_bar.n)
+            )
+            return output
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            self.closing = (
+                None if self.prediction_bar is None
+                else (self.prediction_bar.total, self.prediction_bar.n)
+            )
+            return super().on_evaluate(args, state, control, **kwargs)
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    out_dir = tempfile.mkdtemp()
+    args = MLXTrainingConfig(
+        max_steps=2,
+        gradient_accumulation_steps=1,
+        logging_steps=100,
+        eval_steps=2,
+        save_steps=0,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=out_dir,
+    )
+    bar = RecordingProgress()
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(4)],
+        args=args,
+        callbacks=[bar],
+    )
+    trainer._prepare_data = lambda _is_vlm: ([make_batch(10) for _ in range(4)], None)
+    sizes = {"a": 2, "b": 3, "c": 4}
+    trainer.eval_dataset = {name: [{"input_ids": [1, 2, 3, 4]}] for name in sizes}
+    trainer._eval_batches_labeled = {
+        name: [make_batch(10) for _ in range(size)]
+        for name, size in sizes.items()
+    }
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer.train()
+
+    assert bar.geometry == [
+        (2, 1), (2, 2),
+        (3, 1), (3, 2), (3, 3),
+        (4, 1), (4, 2), (4, 3), (4, 4),
+    ], bar.geometry
+    # No bar ever runs past its own total.
+    assert all(seen <= total for total, seen in bar.geometry), bar.geometry
+    # The last split's bar is still torn down by on_evaluate, exactly as in HF.
+    assert bar.closing == (4, 4), bar.closing
+    assert bar.prediction_bar is None

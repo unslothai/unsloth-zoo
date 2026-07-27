@@ -1634,6 +1634,9 @@ class MLXTrainer:
         # Restored from a checkpoint's saved num_input_tokens_seen by the resume
         # block; 0 on a fresh run so a reused trainer starts the counter clean.
         self._resume_num_input_tokens_seen = 0
+        # Same contract for the checkpoint's callback-visible epoch: None on a
+        # fresh run, so a reused trainer opens at HF's unstarted-epoch value.
+        self._resume_epoch = None
         # Same contract for the checkpoint's ExportableState callback states, so a
         # reused trainer does not re-expose run-1's bookkeeping. HF rebuilds these
         # from the LIVE callbacks each run, reading trainer_state.json only on resume.
@@ -2363,6 +2366,10 @@ class MLXTrainer:
         is_main_process = self.is_main_process
         self.state = _MLXTrainerState(
             global_step=int(resume_step),
+            # The checkpoint's epoch on resume (None on a fresh run), so the
+            # lifecycle events dispatched before the loop rebuilds epoch
+            # progress carry the same value HF restores from trainer_state.json.
+            epoch=getattr(self, "_resume_epoch", None),
             max_steps=int(total_steps),
             logging_steps=_resolve_interval_steps(
                 getattr(args, "logging_steps", 0), total_steps,
@@ -2931,6 +2938,35 @@ class MLXTrainer:
             "on_prediction_step", self.args, self.state, self.control,
         )
 
+    def _close_split_prediction_bars(self):
+        """End per-split evaluation progress bars when eval_dataloader rotates.
+
+        HF scores one eval_dataset split per evaluate() call, so its per-split
+        on_evaluate closes ProgressCallback's prediction bar before the next
+        split opens a new one sized to that split. MLX reports the whole dict as
+        one evaluation, so without this the first split's bar keeps counting
+        every later split's batch past its own total (2/2 climbing to 9/2 across
+        three splits). The last split's bar is still closed by on_evaluate, as
+        in HF. Duck-typed to keep this module Torch-free, and a no-op on ranks
+        and callbacks that never opened a bar.
+        """
+        for callback in getattr(
+            getattr(self, "callback_handler", None), "callbacks", ()
+        ) or ():
+            bar = getattr(callback, "prediction_bar", None)
+            if bar is None:
+                continue
+            close = getattr(bar, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass  # a display failure must not abort the evaluation
+            try:
+                callback.prediction_bar = None
+            except AttributeError:
+                pass  # read-only attribute; the close above already ended it
+
     def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
@@ -3080,8 +3116,12 @@ class MLXTrainer:
             handler = getattr(self, "callback_handler", None)
             outer_dataloader = getattr(handler, "eval_dataloader", None)
             try:
-                for split_name, split_batches in eval_batches.items():
+                for split_index, (split_name, split_batches) in enumerate(
+                    eval_batches.items()
+                ):
                     if handler is not None:
+                        if split_index:
+                            self._close_split_prediction_bars()
                         handler.eval_dataloader = split_batches
                     split_losses, split_tokens = self._evaluate_batch_totals(
                         split_batches, loss_fn, is_vlm=is_vlm,
@@ -4003,6 +4043,15 @@ class MLXTrainer:
                 # (no num_input_tokens_seen key) resumable.
                 self._resume_num_input_tokens_seen = int(
                     ts.get("num_input_tokens_seen", 0) or 0
+                )
+                # Restore the callback-visible epoch so on_train_begin reports the
+                # checkpoint's progress instead of None. Without it a no-op resume
+                # (checkpoint already at max_steps, loop body never runs) leaves it
+                # None through on_train_end, where HF's NotebookProgressCallback
+                # does int(state.epoch). .get keeps pre-fix checkpoints resumable.
+                _ckpt_epoch = ts.get("epoch", None)
+                self._resume_epoch = (
+                    None if _ckpt_epoch is None else float(_ckpt_epoch)
                 )
                 # Stash the checkpoint's ExportableState callback state; it is
                 # applied after _init_callback_state, which rebuilds self.state.
@@ -5088,6 +5137,11 @@ class MLXTrainer:
                             save_trainer_state(
                                 {
                                     "global_step": current_step,
+                                    # HF checkpoints TrainerState wholesale, so
+                                    # epoch travels with global_step and a resumed
+                                    # run reports progress from on_train_begin.
+                                    # Same key name as trainer_state.json.
+                                    "epoch": self.state.epoch,
                                     "train_loss_history": list(
                                         self._train_loss_history
                                     ),
