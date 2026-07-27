@@ -202,6 +202,25 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
         assert result.token_ids
         assert result.logprobs is None or len(result.logprobs) == len(result.token_ids)
         assert result.finish_reason in ("stop", "length")
+    # Against upstream's own sequential decoding, not just against ourselves:
+    # this is what proves the bypassed preprocessing agrees with mlx-vlm.
+    from mlx_vlm import stream_generate
+    from mlx_lm.sample_utils import make_sampler
+    events = [event for event in stream_generate(
+        model, processor, requests[0].prompt, image=[requests[0].image],
+        max_tokens=4, sampler=make_sampler(temp=0.0))]
+    # The terminal event repeats the last token, so it contributes text only.
+    tail = events[-1]
+    body = events[:-1]
+    assert results[0].token_ids == [int(event.token) for event in body]
+    assert results[0].logprobs == pytest.approx(
+        [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
+    assert results[0].text == "".join(event.text for event in events)
+    # Derived from the stream itself rather than from our own rule: fewer body
+    # events than the budget means it stopped early. The release under test
+    # reports no finish reason of its own, so tail carries the repeated token.
+    assert tail is not None
+    assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
     # Chunking must not pair a prompt with an earlier chunk's embeddings.
     chunked = generate_batch(model, processor, requests, defaults=GenerationDefaults(
         max_tokens=4, prefill_batch_size=1, completion_batch_size=1))
