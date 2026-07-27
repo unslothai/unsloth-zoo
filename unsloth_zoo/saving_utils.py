@@ -67,7 +67,14 @@ This {model_type} model was trained 2x faster with [Unsloth](https://github.com/
 """
 
 import torch
-import bitsandbytes as bnb
+try:
+    import bitsandbytes as bnb
+    _BNB_LINEAR4BIT = (bnb.nn.Linear4bit,)
+except Exception:
+    # No bnb (e.g. gfx906, whose generic wheel has no kernels) -> no 4bit layers
+    # exist, so the isinstance check below is simply always False.
+    bnb = None
+    _BNB_LINEAR4BIT = ()
 try:
     from huggingface_hub import get_token
 except:
@@ -90,7 +97,7 @@ def find_skipped_quantized_modules(model):
     skipped_modules = []
     quantized_modules = []
     for name, module in model.named_modules():
-        if isinstance(module, bnb.nn.Linear4bit):
+        if isinstance(module, _BNB_LINEAR4BIT):
             if hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
                 quantized_modules.append(name)
             else:
