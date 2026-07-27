@@ -182,6 +182,31 @@ def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
     assert first_epoch != second_epoch
 
 
+def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
+    # int(num_epochs) rounded the requested row count down: 0 < epochs < 1 built
+    # an empty plan, surfacing later as "No training batches created" and
+    # blaming the dataset, and 1.5 built a single pass. Five rows at batch 1 is
+    # 3 batches for half an epoch and 8 for one and a half.
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    def plan_for(num_epochs):
+        return create_ordered_batches(
+            dataset=[{"text": f"{i} {i + 10}"} for i in range(5)],
+            tokenizer=_TinyTokenizer(),
+            batch_size=1,
+            max_seq_length=4,
+            seed=None,
+            dataset_order="torch_randperm",
+            num_epochs=num_epochs,
+        )
+
+    assert len(plan_for(0.5)) == 3
+    assert len(plan_for(1.5)) == 8
+    # Whole counts are unchanged.
+    assert len(plan_for(2)) == 10
+
+
 def test_vlm_torch_randperm_seed_none_and_multi_epoch_batches():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_vlm_batches

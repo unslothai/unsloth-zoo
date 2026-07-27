@@ -32,6 +32,7 @@ import copy
 import inspect
 import importlib
 import json
+import math
 import numbers
 import operator
 import textwrap
@@ -8650,9 +8651,12 @@ def _create_ordered_text_plan(
             pad_source=order,
         )
     )
-    target_items = (
-        len(tokenized) * (1 if num_epochs is None else int(num_epochs))
-        if num_batches is None else None
+    # why: ceil, not int. num_train_epochs is a float, and truncating it built a
+    # plan for 0 rows when 0 < epochs < 1, which surfaces as "No training
+    # batches created", and a single pass for 1.5.
+    target_items = None if num_batches is not None else (
+        len(tokenized) if num_epochs is None
+        else math.ceil(len(tokenized) * float(num_epochs))
     )
     while num_batches is None or len(schedule) < num_batches:
         # Don't mix epochs in one batch; emit a partial then restart at epoch+1.

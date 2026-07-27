@@ -1278,19 +1278,30 @@ def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
     total = len(batches)
     if total <= 0:
         return None
+    # The plan's own one-pass length, when it can report one. Only that exact
+    # count qualifies: the dataset-size approximation cannot see what batching
+    # retained, so forcing updates on it would move optimizer steps onto
+    # micro-batches that are not boundaries.
+    plan_cycle = getattr(batches, "cycle_length", None)
+    plan_cycle = max(1, int(plan_cycle)) if plan_cycle else None
     if int(getattr(args, "max_steps", 0) or 0) > 0:
         # HF's forced epoch-final update is not conditional on max_steps:
         # do_sync_step reads len(dataloader), so max_steps decides when the run
         # ends, never how an epoch's ragged tail is applied. Returning None here
         # left that tail pending across on_epoch_end and folded it into the next
-        # epoch. Only the plan's exact one-pass count qualifies: the dataset-size
-        # approximation cannot see what batching retained, so forcing updates on
-        # it would move optimizer steps onto micro-batches that are not boundaries.
-        plan_cycle = getattr(batches, "cycle_length", None)
-        return max(1, int(plan_cycle)) if plan_cycle else None
+        # epoch.
+        return plan_cycle
     epochs = float(getattr(args, "num_train_epochs", 0) or 0)
     if epochs <= 0:
         return None
+    if plan_cycle is not None:
+        # why: a prebuilt fractional schedule holds a whole number of
+        # micro-batches but a fractional number of passes, so int(epochs) does
+        # not divide it. 1.5 epochs of 5 is 8 batches, and dividing by 1 reads
+        # the lot as one epoch: the boundary at micro-batch 5 disappears, the
+        # accumulation window never restarts there and the budget lands on 4
+        # updates where HF takes 5.
+        return plan_cycle
     whole_epochs = int(epochs)
     if includes_epochs and whole_epochs > 0 and total % whole_epochs == 0:
         return max(1, total // whole_epochs)
@@ -1707,11 +1718,20 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
             steps_per_epoch = _mlx_steps_per_epoch(
                 epoch_microbatches, grad_accum,
             )
-            epoch_count = (
-                n_batches / epoch_microbatches if includes_epochs
-                else float(args.num_train_epochs)
-            )
-            total_steps = math.ceil(epoch_count * steps_per_epoch)
+            if includes_epochs:
+                # A prebuilt schedule may stop part-way through its last epoch,
+                # and that tail costs its own windows, not a pro-rata share of a
+                # full epoch's. Scaling steps_per_epoch by n_batches /
+                # epoch_microbatches over-counts it: 1.5 epochs of 3 at accum 2
+                # is 2 + 1 = 3 updates, where the ratio gives ceil(5/3 * 2) = 4.
+                whole, tail = divmod(n_batches, epoch_microbatches)
+                total_steps = whole * steps_per_epoch + math.ceil(
+                    tail / grad_accum
+                )
+            else:
+                total_steps = math.ceil(
+                    float(args.num_train_epochs) * steps_per_epoch
+                )
         else:
             total_steps = n_batches // grad_accum
         return max(1, total_steps)
@@ -6121,7 +6141,10 @@ class MLXTrainer:
         ):
             fast_forward_error = None
             try:
-                batches.advance_preprocessing(_resume_step * grad_accum)
+                # The same cursor the fetch and the streaming fast-forward use:
+                # the flat product over-advances the augmentation stream once an
+                # epoch's tail has forced a step.
+                batches.advance_preprocessing(_resume_microstep)
             except BaseException as e:
                 fast_forward_error = e
             if distributed_world_size > 1:
@@ -6402,9 +6425,14 @@ class MLXTrainer:
             # (do_sync_step reads len(dataloader), not the budget), but only an
             # exact one-pass length qualifies; the dataset-size approximation
             # leaves _epoch_flush_microbatches None and must not move steps.
-            if (
-                _epoch_flush_microbatches
-                and it % _epoch_flush_microbatches == 0
+            # The run's last authorized micro-batch closes a final epoch that may
+            # be partial, so it forces the update too. Without it a ragged tail
+            # (1.5 epochs of 5 at accum 2 ends three micro-batches into epoch 2)
+            # waits for a window that never fills and pulls one micro-batch past
+            # the plan, wrapping to a row num_train_epochs never authorized.
+            if _epoch_flush_microbatches and (
+                it % _epoch_flush_microbatches == 0
+                or it == _epoch_stop_total_microbatches
             ):
                 do_update = True
             if do_update:
