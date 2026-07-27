@@ -4403,6 +4403,29 @@ def _resize_vlm_images(images, image_size):
     return resized
 
 
+def _vlm_vision_part_state(messages):
+    bare_placeholder_types = set()
+    has_media_payload = False
+    if not isinstance(messages, list):
+        return bare_placeholder_types, has_media_payload
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("image", "image_url", "input_image", "video"):
+                continue
+            if any(key in part for key in ("image", "image_url", "input_image", "video")):
+                has_media_payload = True
+            else:
+                bare_placeholder_types.add(part.get("type"))
+    return bare_placeholder_types, has_media_payload
+
+
 def _extract_vlm_images(
     item,
     messages,
@@ -4411,10 +4434,17 @@ def _extract_vlm_images(
     suppress_process_errors=False,
 ):
     images = []
+    top_level_image = []
+    bare_placeholder_types, has_media_payload = _vlm_vision_part_state(messages)
+    has_only_bare_image_placeholders = bare_placeholder_types == {"image"}
     if isinstance(item, dict):
         image = item.get("images")
         if image is not None:
             images = image if isinstance(image, list) else [image]
+        elif "image" in item:
+            image = item.get("image")
+            if image is not None:
+                top_level_image = image if isinstance(image, list) else [image]
 
     if not images and isinstance(messages, list):
         for message in messages:
@@ -4426,6 +4456,14 @@ def _extract_vlm_images(
                     image = part.get("image")
                     if image is not None:
                         images.append(image)
+
+    if (
+        not images
+        and top_level_image
+        and has_only_bare_image_placeholders
+        and not has_media_payload
+    ):
+        images = top_level_image
 
     if not images and isinstance(messages, list):
         try:
@@ -4448,7 +4486,7 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
     messages = (prompt_messages or []) + (completion_messages or [])
     if messages:
         images = _extract_vlm_images(
-            {},
+            item if isinstance(item, dict) and item.get("images") is None else {},
             messages,
             image_size,
             suppress_process_errors=True,
