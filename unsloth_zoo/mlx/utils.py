@@ -5394,15 +5394,26 @@ def _filter_trainable_vlm_indices(
     return kept_indices, removed, formatted_items, supervision
 
 
-def _snapshot_formatted_vlm_row(item):
-    """Shallow snapshot of one formatted VLM row. A ``formatting_func`` that
+# Deep enough for a chat row (row -> messages -> message -> content -> part);
+# the bound keeps a self-referential row from recursing without end.
+_VLM_ROW_SNAPSHOT_DEPTH = 8
+
+
+def _snapshot_formatted_vlm_row(item, _depth=0):
+    """Snapshot one stored VLM row. A ``formatting_func`` (or dataset) that
     mutates and returns its argument hands every visit the same object, so
     without this a later visit's mutation would rewrite earlier stored visits.
-    Only the container is copied, never the payloads it points at."""
+    Nested containers are rebuilt too, but payloads such as images are only
+    ever referenced, never copied."""
+    if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
+        return item
     if isinstance(item, dict):
-        return copy.copy(item)
+        snapshot = copy.copy(item)
+        for key, value in item.items():
+            snapshot[key] = _snapshot_formatted_vlm_row(value, _depth + 1)
+        return snapshot
     if isinstance(item, list):
-        return list(item)
+        return [_snapshot_formatted_vlm_row(value, _depth + 1) for value in item]
     return item
 
 
@@ -6174,9 +6185,6 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
                 "train_on_responses_only masking. Check instruction_part / "
                 "response_part and max_seq_length."
             )
-    def _item(idx):
-        return formatted_items[idx] if formatted_items is not None else dataset[idx]
-
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
     if not base_indices:
@@ -6237,15 +6245,20 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             f"were -100 after train_on_responses_only masking."
         )
 
-    if formatting_func is not None and formatted_items is None:
-        # One row per scheduled slot, formatted in schedule order: the eager
-        # builder ran the formatter while building every batch, so a stochastic
-        # or epoch-dependent formatter must refresh on every revisit. Consuming
-        # it here still keeps user code out of re-materialization, and each
-        # result is snapshotted so a later visit cannot rewrite an earlier one.
+    if formatted_items is None:
+        # One row per scheduled slot, read in schedule order: the eager builder
+        # indexed the dataset (and ran the formatter) while building every
+        # batch, so a stochastic or epoch-dependent dataset or formatter must
+        # refresh on every revisit. Consuming it here still keeps user code out
+        # of re-materialization, and each result is snapshotted so a later
+        # visit cannot rewrite an earlier one.
         rows = tuple(
             _FiniteVLMRow(
-                _snapshot_formatted_vlm_row(formatting_func(dataset[idx])), True,
+                _snapshot_formatted_vlm_row(
+                    dataset[idx] if formatting_func is None
+                    else formatting_func(dataset[idx])
+                ),
+                True if _supervision is None else _supervision[idx],
             )
             for batch in schedule for idx in batch
         )
@@ -6256,7 +6269,8 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             offset += len(batch)
         schedule = remapped
     else:
-        # Compact remap: store only rows the schedule references.
+        # Compact remap over the filter's already-formatted rows: the eager
+        # builder reused those same per-index objects on every visit.
         used = []
         seen_used = set()
         for batch in schedule:
@@ -6267,7 +6281,7 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         position = {idx: pos for pos, idx in enumerate(used)}
         rows = tuple(
             _FiniteVLMRow(
-                _item(idx),
+                formatted_items[idx],
                 True if _supervision is None else _supervision[idx],
             )
             for idx in used

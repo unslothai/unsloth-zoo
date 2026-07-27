@@ -1015,9 +1015,10 @@ def test_vlm_plan_pins_each_visit_against_an_in_place_formatting_func():
     assert heads == [10, 11, 12, 20, 21, 22]
 
 
-def test_vlm_plan_formats_only_scheduled_rows_and_compacts_without_a_formatter():
-    """Unscheduled rows never reach the formatter, and the plans that need no
-    per-visit formatting keep storing one row per referenced dataset index."""
+def test_vlm_plan_reads_scheduled_rows_only_once_per_occurrence():
+    """Unscheduled rows never reach the formatter or the dataset, and every
+    scheduled slot gets exactly one read, the way the eager builder indexed
+    the dataset while building each batch."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
 
@@ -1040,8 +1041,18 @@ def test_vlm_plan_formats_only_scheduled_rows_and_compacts_without_a_formatter()
     assert seen == [0, 1, 2, 3]
     assert len(plan.rows) == 4
 
+    reads = []
+
+    class _ReadCountingDataset:
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, index):
+            reads.append(int(index))
+            return {"text": str(index)}
+
     plain = _create_vlm_batch_plan(
-        dataset=[{"text": str(i)} for i in range(3)],
+        dataset=_ReadCountingDataset(),
         processor=_ContentProcessor(),
         config={"image_size": 16, "image_token_id": 200},
         batch_size=1,
@@ -1049,7 +1060,89 @@ def test_vlm_plan_formats_only_scheduled_rows_and_compacts_without_a_formatter()
         num_batches=6,
         dataset_order="sequential",
     )
-    assert (len(plain), len(plain.rows)) == (6, 3)
+    assert reads == [0, 1, 2, 3, 0, 1]
+    assert (len(plain), len(plain.rows)) == (6, 6)
+    plain.materialize_all()
+    assert reads == [0, 1, 2, 3, 0, 1]
+
+
+def test_vlm_plan_resamples_a_visit_dependent_dataset_per_occurrence():
+    """A map-style dataset with stochastic __getitem__ augmentation must be
+    re-read on every scheduled visit, so a revisited index does not replay the
+    sample the first visit happened to draw."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _AugmentingDataset:
+        def __init__(self, size):
+            self.size = size
+            self.visits = [0] * size
+
+        def __len__(self):
+            return self.size
+
+        def __getitem__(self, index):
+            visit = self.visits[index]
+            self.visits[index] += 1
+            return {"text": str(10 * index + visit)}
+
+    dataset = _AugmentingDataset(3)
+    plan = _create_vlm_batch_plan(
+        dataset=dataset,
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=6,
+        dataset_order="sequential",
+    )
+
+    assert dataset.visits == [2, 2, 2]
+    heads = [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))]
+    assert heads == [0, 10, 20, 1, 11, 21]
+
+    plan.materialize_all()
+    assert dataset.visits == [2, 2, 2]
+    assert [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))] == heads
+
+
+def test_vlm_plan_pins_each_visit_against_a_nested_in_place_formatting_func():
+    """An in-place formatting_func that reaches a nested container must not let
+    a later visit rewrite an earlier stored visit, and pinning a visit must
+    reference the row's payloads rather than duplicate them."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    payload = object()
+    dataset = [
+        {"holder": {"text": str(i)}, "media": [payload]} for i in range(3)
+    ]
+
+    def formatting_func(item):
+        item["holder"]["text"] = str(int(item["holder"]["text"]) + 10)
+        return {
+            "text": item["holder"]["text"],
+            "holder": item["holder"],
+            "media": item["media"],
+        }
+
+    plan = _create_vlm_batch_plan(
+        dataset=dataset,
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=6,
+        dataset_order="sequential",
+        formatting_func=formatting_func,
+    )
+
+    assert [row.item["holder"]["text"] for row in plan.rows] == [
+        "10", "11", "12", "20", "21", "22",
+    ]
+    heads = [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))]
+    assert heads == [10, 11, 12, 20, 21, 22]
+    assert all(row.item["media"][0] is payload for row in plan.rows)
 
 
 class _AugProcessor:
