@@ -27,6 +27,7 @@ import mlx.nn as nn
 import mlx.utils
 import ast
 import collections
+import contextlib
 import copy
 import inspect
 import importlib
@@ -36,13 +37,17 @@ import operator
 import textwrap
 import numpy as np
 import os
+import random
 import sys
 import shutil
+import struct
 import tempfile
 import queue as _queue_module
 import threading
 import time
 import warnings
+import weakref
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1667,16 +1672,22 @@ class _HostStagedVLMBatch:
         self.pc_opaque = pc_opaque
 
 
-def _finalize_vlm_batch(staged, keep_raw_carrier=False):
+def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
     """The single consumer-thread point converting staged VLM batches to MLX.
 
     Host-staged batches already made every label decision, so only conversion
     and compile preparation run here. Opaque processor-owned payloads (plain-SFT
     with ``label_mask=None``, ``pc_opaque`` prompt/completion carriers) instead
     run their combine and legacy label decisions here.
+
+    ``phase`` is forwarded verbatim to the terminal compile preparation at every
+    exit, so ``"content"`` stops at the width seam and leaves the caller to pad
+    to a planned width and run the ``"positions"`` phase.
     """
     if staged.prefinalized is not None:
-        return _prepare_vlm_batch_for_compile(staged.prefinalized, staged.config)
+        return _prepare_vlm_batch_for_compile(
+            staged.prefinalized, staged.config, phase=phase,
+        )
     if staged.pc_opaque is not None:
         (prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
          completion_only_loss) = staged.pc_opaque
@@ -1687,7 +1698,9 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
             completion_only_loss=completion_only_loss,
         )
         inner.config = staged.config
-        return _finalize_vlm_batch(inner, keep_raw_carrier=keep_raw_carrier)
+        return _finalize_vlm_batch(
+            inner, keep_raw_carrier=keep_raw_carrier, phase=phase,
+        )
     batch = _to_mx_vlm_batch(staged.inputs)
     if staged.label_mask is None:
         # Opaque processor outputs (mlx-vlm wrappers return MLX arrays): run the
@@ -1697,7 +1710,7 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
             batch, ignore_token_ids=staged.ignore_token_ids,
         )
         batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
-        return _prepare_vlm_batch_for_compile(batch, staged.config)
+        return _prepare_vlm_batch_for_compile(batch, staged.config, phase=phase)
     if staged.label_mask is not None:
         # Values ride the same converted ids legacy used, so conversion-time
         # errors match exactly; only the host-decided placement differs.
@@ -1716,7 +1729,7 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False):
                 np.asarray(labels.tolist(), dtype=np.int64)
             )  # legacy completion-branch coercion, verbatim
         batch["labels"] = labels
-    return _prepare_vlm_batch_for_compile(batch, staged.config)
+    return _prepare_vlm_batch_for_compile(batch, staged.config, phase=phase)
 
 
 def _mask_label_token_ids(targets, ignore_token_ids, ignore_index=-100):
@@ -2558,7 +2571,260 @@ def _build_glm_ocr_position_ids(
     return mx.array(position_ids)
 
 
-def _prepare_vlm_batch_for_compile(batch_dict, config):
+_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
+
+# Text-width-aligned arrays the VLM pipeline owns, with the inert value their
+# right-padded tail takes ("pad" is the tokenizer pad id). Only these are padded;
+# any other array sharing an extent with the text width declines its batch.
+_VLM_WIDTH_PADDABLE_KEYS = {
+    "input_ids": "pad",
+    "attention_mask": 0,
+    "labels": -100,
+    _RAW_INPUT_IDS_FOR_LABELS: "pad",
+    "token_type_ids": 0,
+    "mm_token_type_ids": 0,
+}
+# Width-derived arrays generated AFTER width finalization (sequence axis last).
+_VLM_WIDTH_GENERATED_KEYS = ("position_ids",)
+# Model types whose position ids the position phase builds, and rebuilds after
+# planned padding; elsewhere they are processor-authored, so the batch declines.
+_VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "paddleocr_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
+})
+_VLM_POSITION_GENERATING_MODEL_TYPES = (
+    _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
+)
+
+
+def _vlm_pipeline_disposable_keys(config):
+    """Keys the position-recording phase overwrites wholesale for this config.
+
+    Whatever a processor placed under them is disposable for width admission:
+    it can neither decline a batch nor forbid extents."""
+    model_type = _config_get(config, "model_type")
+    if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES:
+        return frozenset(("position_ids",))
+    if model_type == "phi3_v":
+        return frozenset(("image_positions",))
+    return frozenset()
+
+
+def _vlm_width_survey(batch_dict, disposable_keys=None):
+    """(text_width, symbolic_axes, padable, forbidden) for a prepared batch.
+
+    ``text_width`` is the post-prepare ``input_ids`` width. ``symbolic_axes``
+    maps pipeline-owned width-coupled leaf paths to their sequence axis for
+    ``_vlm_batch_family``. ``forbidden`` collects extents appearing at any
+    depth in arrays the pipeline does not pad: a planned endpoint must avoid
+    them, or an untouched array would suddenly share the text width and
+    reclassify the batch. ``padable`` is False (and the axes None) whenever
+    right-padding cannot be proven safe: invalid array-metadata captures, no
+    exact-mx 2-D ``input_ids``, position data under a key outside
+    ``disposable_keys`` (the pipeline neither pads nor regenerates it), a
+    non-mx shape-carrying leaf, an ``attention_mask`` row that is not
+    content-then-padding, or an untouched array already sharing an extent
+    with the text width.
+
+    The walk mirrors the family serializer's traversal and reads metadata
+    only through the import-time captures, so classification and the
+    symbolic family always describe the same pytree.
+    """
+    if not _MX_ARRAY_CAPTURES_VALID:
+        return None, None, False, frozenset()
+
+    def dims_of(value):
+        return tuple(
+            int(dim)
+            for dim in _MX_ARRAY_SHAPE.__get__(value, _MX_ARRAY_TYPE)
+        )
+
+    input_ids = batch_dict.get("input_ids")
+    if type(input_ids) is not _MX_ARRAY_TYPE:
+        return None, None, False, frozenset()
+    ids_shape = dims_of(input_ids)
+    if len(ids_shape) != 2:
+        return None, None, False, frozenset()
+    width = ids_shape[1]
+    if disposable_keys is None:
+        disposable_keys = frozenset()
+    axes = {}
+    forbidden = set()
+    declined = False
+
+    def visit_untouched(node):
+        nonlocal declined
+        if declined:
+            return
+        # Mirror the family serializer's dispatch: raw runtime types (a lying
+        # __class__ cannot smuggle a non-container in) and exact built-in
+        # constants. Anything else has no validated metadata and refuses padding.
+        node_type = type(node)
+        if node_type is _MX_ARRAY_TYPE:
+            extents = dims_of(node)
+            forbidden.update(extents)
+            if width in extents:
+                declined = True
+            return
+        if issubclass(node_type, dict):
+            for value in dict.values(node):
+                visit_untouched(value)
+            return
+        if issubclass(node_type, Mapping):
+            declined = True
+            return
+        if issubclass(node_type, (list, tuple)):
+            if issubclass(node_type, tuple) and node_type is not tuple:
+                # The serializer marks tuple subclasses unstable; agree with it.
+                declined = True
+                return
+            walk = (
+                list.__iter__(node)
+                if issubclass(node_type, list)
+                else tuple.__iter__(node)
+            )
+            for item in walk:
+                visit_untouched(item)
+            return
+        if node_type is bool or node_type is float or node_type is str:
+            return
+        if node_type is int:
+            # Out-of-int64 constants are opaque to mx.compile, so they cannot pad.
+            if -(2 ** 63) <= node < 2 ** 63:
+                return
+            declined = True
+            return
+        if node is None:
+            return
+        declined = True
+
+    for key, value in dict.items(batch_dict):
+        if key in _VLM_WIDTH_PADDABLE_KEYS and type(value) is _MX_ARRAY_TYPE:
+            value_dims = dims_of(value)
+            if len(value_dims) == 2 and value_dims[1] == width:
+                axes[(key,)] = 1
+            elif width in value_dims:
+                declined = True
+            else:
+                forbidden.update(value_dims)
+            continue
+        if key in disposable_keys:
+            # The position phase rebuilds this key wholesale, so anything here is
+            # disposable: it neither declines the batch nor forbids extents. Only a
+            # canonical exact-array sequence-last position_ids earns the symbolic
+            # axis; anything else stays concrete and still surfaces drift.
+            if (
+                key in _VLM_WIDTH_GENERATED_KEYS
+                and type(value) is _MX_ARRAY_TYPE
+            ):
+                value_dims = dims_of(value)
+                if value_dims and value_dims[-1] == width:
+                    axes[(key,)] = len(value_dims) - 1
+            continue
+        visit_untouched(value)
+    if declined:
+        return width, None, False, frozenset(forbidden)
+    attention_mask = batch_dict.get("attention_mask")
+    if type(attention_mask) is _MX_ARRAY_TYPE and (
+        len(dims_of(attention_mask)) == 2
+    ):
+        mask_np = np.asarray(attention_mask)
+        for row in (mask_np != 0).astype(np.int8):
+            content = int(row.sum())
+            if content and not bool(row[:content].all()):
+                return width, None, False, frozenset(forbidden)
+    return width, axes, True, frozenset(forbidden)
+
+
+def _finalize_vlm_batch_width(
+    batch_dict, target_width, pad_token_id, disposable_keys=None,
+):
+    """Right-pad the pipeline-owned text-aligned arrays to ``target_width``.
+
+    Runs after expansion and response masking produce the final content but
+    before width-derived sidecars are generated, so recorded absolute
+    positions refer to the preserved content prefix and sidecars are born at
+    the final width. Padded tails are inert: pad id under a zero attention
+    mask, labels -100. Batches the width survey declines return unchanged; a
+    target below the current width fails hard. ``max_seq_length`` is never
+    consulted, since post-expansion widths may legitimately exceed it.
+    """
+    width, _axes, padable, forbidden = _vlm_width_survey(
+        batch_dict, disposable_keys=disposable_keys,
+    )
+    if not padable:
+        return batch_dict
+    target_width = operator.index(target_width)
+    if target_width < width:
+        raise ValueError(
+            f"Unsloth MLX: VLM width plan endpoint {target_width} is below "
+            f"this batch's prepared width {width}; endpoints must cover "
+            f"every member batch."
+        )
+    if target_width == width:
+        return batch_dict
+    if target_width in forbidden:
+        raise ValueError(
+            f"Unsloth MLX: VLM width plan endpoint {target_width} collides "
+            f"with an extent of an array the pipeline does not pad; "
+            f"endpoints must avoid every member batch's untouched extents."
+        )
+    for key, pad_value in _VLM_WIDTH_PADDABLE_KEYS.items():
+        value = batch_dict.get(key)
+        # The survey guarantees paddable keys are exact mx arrays, and metadata
+        # uses the same captured descriptors, so a patched property cannot skip a pad.
+        if type(value) is not _MX_ARRAY_TYPE:
+            continue
+        value_shape = tuple(
+            int(dim) for dim in _MX_ARRAY_SHAPE.__get__(value, _MX_ARRAY_TYPE)
+        )
+        if len(value_shape) != 2 or value_shape[1] != width:
+            continue
+        fill = pad_token_id if pad_value == "pad" else pad_value
+        if fill is None:
+            raise ValueError(
+                "Unsloth MLX: a tokenizer pad id is required to pad "
+                f"'{key}' to a planned width."
+            )
+        tail = mx.full(
+            (value_shape[0], target_width - width),
+            fill,
+            dtype=_MX_ARRAY_DTYPE.__get__(value, _MX_ARRAY_TYPE),
+        )
+        batch_dict[key] = mx.concatenate([value, tail], axis=1)
+    return batch_dict
+
+
+def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
+    """Prepare a collated VLM batch for the compiled/training path.
+
+    ``phase`` splits the work at the width seam: ``"content"`` runs sidecar
+    normalization and the expansions that may rebuild the text arrays at
+    data-dependent lengths; ``"positions"`` runs the steps that record
+    absolute positions or generate width-derived sidecars and must see the
+    final text width. ``None`` runs both back to back, byte-identical to the
+    historical single pass since each model type takes exactly one of the
+    disjoint branches.
+    """
+    if phase is None:
+        batch_dict = _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="content",
+        )
+        return _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="positions",
+        )
+    if phase == "positions":
+        return _vlm_positions_for_compile(batch_dict, config)
+    if phase != "content":
+        raise ValueError(f"unknown VLM prepare phase: {phase!r}")
+    # The provenance marker is pipeline-private: processor output carrying it is a
+    # forgery that would misclassify foreign position ids as regenerated.
+    batch_dict.pop("_unsloth_collated_position_ids", None)
     model_type = _config_get(config, "model_type")
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
 
@@ -2587,66 +2853,6 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
         batch_dict["images_spatial_crop"] = images_spatial_crop
     if audio_embed_sizes is not None:
         batch_dict["audio_embed_sizes"] = audio_embed_sizes
-
-    if model_type in {
-        "qwen2_vl",
-        "qwen2_5_vl",
-        "paddleocr_vl",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-        "qwen3_5",
-        "qwen3_5_moe",
-    }:
-        input_ids = batch_dict.get("input_ids")
-        if input_ids is not None:
-            input_ids_np = np.asarray(input_ids)
-            attention_mask = batch_dict.get("attention_mask")
-            attention_mask_np = (
-                np.asarray(attention_mask)
-                if attention_mask is not None
-                else None
-            )
-            batch_dict["position_ids"] = _build_qwen_position_ids(
-                input_ids=input_ids_np,
-                attention_mask=attention_mask_np,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                image_token_id=int(_config_get(config, "image_token_id", _config_get(config, "image_token_index"))),
-                video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
-                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
-            )
-            batch_dict["_unsloth_collated_position_ids"] = True
-
-    if model_type == "glm_ocr":
-        input_ids = batch_dict.get("input_ids")
-        if input_ids is not None:
-            input_ids_np = np.asarray(input_ids)
-            attention_mask = batch_dict.get("attention_mask")
-            attention_mask_np = (
-                np.asarray(attention_mask)
-                if attention_mask is not None
-                else None
-            )
-            batch_dict["position_ids"] = _build_glm_ocr_position_ids(
-                input_ids=input_ids_np,
-                attention_mask=attention_mask_np,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                image_start_token_id=int(_config_get(config, "image_start_token_id")),
-                image_token_id=int(_config_get(config, "image_token_id")),
-                video_token_id=int(_config_get(config, "video_token_id")),
-                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
-            )
-            batch_dict["_unsloth_collated_position_ids"] = True
-
-    if model_type == "phi3_v":
-        input_ids = batch_dict.get("input_ids")
-        if input_ids is not None:
-            input_ids_np = np.asarray(input_ids)
-            batch_dict["image_positions"] = tuple(
-                tuple(int(x) for x in pos)
-                for pos in np.argwhere(input_ids_np < 0).tolist()
-            )
 
     if model_type == "multi_modality":
         input_ids = batch_dict.get("input_ids")
@@ -2798,6 +3004,71 @@ def _prepare_vlm_batch_for_compile(batch_dict, config):
                     batch_dict["input_ids"], batch_dict["attention_mask"], batch_dict[_RAW_INPUT_IDS_FOR_LABELS] = _expanded
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
+
+    return batch_dict
+
+
+def _vlm_positions_for_compile(batch_dict, config):
+    """Position-recording prepare steps: absolute-position constants and
+    width-derived sidecars, computed from the final text arrays (after any
+    expansion and planned padding, whose tails never shift a content
+    position)."""
+    model_type = _config_get(config, "model_type")
+    vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
+    image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
+    video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+
+    if model_type in _VLM_QWEN_POSITION_MODEL_TYPES:
+        input_ids = batch_dict.get("input_ids")
+        if input_ids is not None:
+            input_ids_np = np.asarray(input_ids)
+            attention_mask = batch_dict.get("attention_mask")
+            attention_mask_np = (
+                np.asarray(attention_mask)
+                if attention_mask is not None
+                else None
+            )
+            batch_dict["position_ids"] = _build_qwen_position_ids(
+                input_ids=input_ids_np,
+                attention_mask=attention_mask_np,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                image_token_id=int(_config_get(config, "image_token_id", _config_get(config, "image_token_index"))),
+                video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
+                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
+            )
+            batch_dict["_unsloth_collated_position_ids"] = True
+
+    if model_type == "glm_ocr":
+        input_ids = batch_dict.get("input_ids")
+        if input_ids is not None:
+            input_ids_np = np.asarray(input_ids)
+            attention_mask = batch_dict.get("attention_mask")
+            attention_mask_np = (
+                np.asarray(attention_mask)
+                if attention_mask is not None
+                else None
+            )
+            batch_dict["position_ids"] = _build_glm_ocr_position_ids(
+                input_ids=input_ids_np,
+                attention_mask=attention_mask_np,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                image_start_token_id=int(_config_get(config, "image_start_token_id")),
+                image_token_id=int(_config_get(config, "image_token_id")),
+                video_token_id=int(_config_get(config, "video_token_id")),
+                spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
+            )
+            batch_dict["_unsloth_collated_position_ids"] = True
+
+    if model_type == "phi3_v":
+        input_ids = batch_dict.get("input_ids")
+        if input_ids is not None:
+            input_ids_np = np.asarray(input_ids)
+            batch_dict["image_positions"] = tuple(
+                tuple(int(x) for x in pos)
+                for pos in np.argwhere(input_ids_np < 0).tolist()
+            )
 
     return batch_dict
 
@@ -4449,7 +4720,53 @@ def _finite_text_pad_width(raw_width, *, pad_to_multiple=0, minimum_width=1,
     return min(int(max_seq_length), width)
 
 
-class FiniteTextBatchPlan:
+class _FiniteVisitMixin:
+    """Absolute-visit mapping shared by finite CPU batch plans."""
+
+    __slots__ = ()
+
+    _VISIT_POLICIES = ("identity", "epoch_permute")
+
+    @property
+    def visit_policy(self):
+        return self._visit_policy
+
+    def batch_index_for_visit(self, absolute_visit):
+        """Map an absolute batch visit to one stored schedule index.
+
+        Identity plans replay the schedule cyclically (the historical
+        ``visit % len``). ``epoch_permute`` plans replay the stored order for
+        epoch 0, then visit a deterministic permutation of the same batch
+        multiset each later epoch, derived only from the normalized seed and
+        the epoch, never from ambient RNG state.
+        """
+        count = len(self._schedule)
+        if count == 0:
+            raise ValueError("cannot resolve a visit on an empty schedule")
+        # operator.index rejects fractional visits instead of truncating them.
+        visit = operator.index(absolute_visit)
+        if visit < 0:
+            raise ValueError("absolute_visit must be non-negative")
+        epoch, position = divmod(visit, count)
+        if self._visit_policy != "epoch_permute" or epoch == 0:
+            return position
+        cached = self._visit_epoch_cache
+        if cached is None or cached[0] != epoch:
+            cached = (epoch, self._build_visit_permutation(epoch))
+            self._visit_epoch_cache = cached
+        return cached[1][position]
+
+    def _build_visit_permutation(self, epoch):
+        """One O(len) deterministic permutation build per epoch transition."""
+        rng = np.random.RandomState(
+            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
+        )
+        return tuple(
+            int(index) for index in rng.permutation(len(self._schedule))
+        )
+
+
+class FiniteTextBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite text schedule with on-demand MLX materialization."""
 
     __slots__ = (
@@ -4466,8 +4783,6 @@ class FiniteTextBatchPlan:
         "_visit_seed",
         "_visit_epoch_cache",
     )
-
-    _VISIT_POLICIES = ("identity", "epoch_permute")
 
     def __init__(
         self,
@@ -4528,45 +4843,6 @@ class FiniteTextBatchPlan:
 
     def __len__(self):
         return len(self._schedule)
-
-    @property
-    def visit_policy(self):
-        return self._visit_policy
-
-    def batch_index_for_visit(self, absolute_visit):
-        """Map an absolute batch visit to one stored schedule index.
-
-        Identity plans replay the stored schedule cyclically (the historical
-        ``visit % len`` behavior). ``epoch_permute`` plans replay the stored
-        order for epoch 0, then visit a deterministic permutation of the same
-        batch multiset in every later epoch, derived only from the normalized
-        seed and the epoch — never from ambient RNG state.
-        """
-        count = len(self._schedule)
-        if count == 0:
-            raise ValueError("cannot resolve a visit on an empty schedule")
-        # operator.index rejects fractional/np-float visits instead of
-        # silently truncating them onto a neighboring visit.
-        visit = operator.index(absolute_visit)
-        if visit < 0:
-            raise ValueError("absolute_visit must be non-negative")
-        epoch, position = divmod(visit, count)
-        if self._visit_policy != "epoch_permute" or epoch == 0:
-            return position
-        cached = self._visit_epoch_cache
-        if cached is None or cached[0] != epoch:
-            cached = (epoch, self._build_visit_permutation(epoch))
-            self._visit_epoch_cache = cached
-        return cached[1][position]
-
-    def _build_visit_permutation(self, epoch):
-        """One O(len) deterministic permutation build per epoch transition."""
-        rng = np.random.RandomState(
-            (int(self._visit_seed) + int(epoch)) % (2 ** 32)
-        )
-        return tuple(
-            int(index) for index in rng.permutation(len(self._schedule))
-        )
 
     def batch_width(self, index):
         # Explicit widths are authoritative; skip the per-row length scan
@@ -5041,7 +5317,6 @@ def _format_vlm_images_for_processor(all_images, processor=None, image_layout=No
 # Private key used to pass raw (pre-int32-narrowing) input_ids through
 # the VLM batch dict to labels-free / response-mask paths. Stripped from
 # model forward kwargs so the backbone never sees it.
-_RAW_INPUT_IDS_FOR_LABELS = "_unsloth_raw_input_ids_for_labels"
 
 
 def _to_mx_vlm_batch(inputs):
@@ -5632,6 +5907,7 @@ def _build_response_masked_vlm_batch(
     return_prompt_completion=False,
     yield_host_staged=False,
     reject_mlx_valued=False,
+    target_width=None,
 ):
     """Collate VLM rows and apply the CUDA response-mask closure.
 
@@ -5639,6 +5915,11 @@ def _build_response_masked_vlm_batch(
     single ``_finalize_vlm_batch`` call (``yield_host_staged`` defers it for the
     prefetch producer). Response-masked streams run the verbatim legacy
     consumer-side order and are rejected in producer modes.
+
+    ``target_width`` (an installed shape-plan endpoint) splits that finalization
+    at the width seam: the finalizer stops after its content phase, the pad lands
+    after expansion and response masking so padded tails stay inert, and the
+    position phase then runs at the final width.
     """
     staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
@@ -5649,6 +5930,24 @@ def _build_response_masked_vlm_batch(
         return_prompt_completion=True,
     )
     staged.config = config
+    # Unplanned batches keep the historical single-pass order, including its
+    # failure ordering (a broken batch raises before the response-mask callback).
+    phase = None if target_width is None else "content"
+
+    def _seal(batch_dict):
+        """Width seam: pad to the planned endpoint, then record positions."""
+        if target_width is None:
+            return batch_dict
+        tokenizer = getattr(processor, "tokenizer", processor)
+        batch_dict = _finalize_vlm_batch_width(
+            batch_dict, target_width,
+            getattr(tokenizer, "pad_token_id", None),
+            disposable_keys=_vlm_pipeline_disposable_keys(config),
+        )
+        return _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="positions",
+        )
+
     if response_mask_fn is not None and not is_prompt_completion:
         # Closure semantics are defined on the converted, compile-prepared
         # tensors (image-token expansion shifts positions), so response masking
@@ -5660,20 +5959,30 @@ def _build_response_masked_vlm_batch(
                 "streaming_prefetch_batches=0 for response-masked VLM "
                 "streams."
             )
-        batch_dict = _finalize_vlm_batch(staged, keep_raw_carrier=True)
+        batch_dict = _finalize_vlm_batch(
+            staged, keep_raw_carrier=True, phase=phase,
+        )
         batch_dict = _apply_response_mask_to_vlm_batch(
             batch_dict,
             response_mask_fn,
             ignore_token_ids=ignore_token_ids,
         )
+        batch_dict = _seal(batch_dict)
         if return_prompt_completion:
             return batch_dict, is_prompt_completion
         return batch_dict
     if yield_host_staged:
+        if target_width is not None:
+            # Staging defers conversion, so the batch has no width to pad yet.
+            # The sized planner owns every endpoint and never stages.
+            raise ValueError(
+                "Unsloth MLX VLM: a planned target_width cannot be applied to "
+                "a host-staged batch; finalize on the consumer thread first."
+            )
         if return_prompt_completion:
             return staged, is_prompt_completion
         return staged
-    batch_dict = _finalize_vlm_batch(staged)
+    batch_dict = _seal(_finalize_vlm_batch(staged, phase=phase))
     if return_prompt_completion:
         return batch_dict, is_prompt_completion
     return batch_dict
@@ -5694,7 +6003,11 @@ def _filter_trainable_vlm_indices(
     """Filter VLM rows before batching, matching CUDA dataset.filter order."""
     kept_indices = []
     formatted_items = {} if formatting_func is not None else None
+    supervision = {}
     removed = 0
+    # Formatted rows are kept for the batch builder, so they outlive the rows
+    # read after them and carry the same reuse-buffer exposure as the planner.
+    media_pins = []
     for idx in indices:
         item = dataset[idx]
         if formatting_func is not None:
@@ -5711,31 +6024,1172 @@ def _filter_trainable_vlm_indices(
             completion_only_loss=completion_only_loss,
             return_prompt_completion=True,
         )
+        valid_rows = _vlm_trainable_label_rows(batch_dict)
+        # Removal keeps the causal-shift predicate; the checker flag keeps the
+        # legacy full-row one (a 1-token row can be good for one and not the other).
+        labels = batch_dict.get("labels")
+        if labels is None:
+            checker_good = True
+        else:
+            first_row = labels.tolist()[0]
+            checker_good = any(int(x) != -100 for x in first_row)
         if is_prompt_completion:
             kept_indices.append(idx)
+            supervision[idx] = checker_good
             if formatted_items is not None:
-                formatted_items[idx] = item
+                formatted_items[idx] = _snapshot_formatted_vlm_row(
+                    item, _pins=media_pins,
+                )
             continue
-        valid_rows = _vlm_trainable_label_rows(batch_dict)
         if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
             removed += 1
             continue
         kept_indices.append(idx)
+        supervision[idx] = checker_good
         if formatted_items is not None:
-            formatted_items[idx] = item
-    return kept_indices, removed, formatted_items
+            formatted_items[idx] = _snapshot_formatted_vlm_row(
+                item, _pins=media_pins,
+            )
+    _verify_vlm_media_pins(media_pins)
+    return kept_indices, removed, formatted_items, supervision
 
 
-def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
+# Deep enough for a chat row (row -> messages -> message -> content -> part);
+# the bound keeps a self-referential row from recursing without end.
+_VLM_ROW_SNAPSHOT_DEPTH = 8
+
+
+def _vlm_pil_image_is_decoded(image):
+    """True when a PIL image already holds a decoded raster.
+
+    Pillow 11+ raises on ``.im`` before the load and exposes ``._im``; earlier
+    releases only expose ``.im``, left as None until then. Reading ``_im``
+    first keeps this correct on both, and under ``python -O``.
+    """
+    for attribute in ("_im", "im"):
+        try:
+            return getattr(image, attribute) is not None
+        except Exception:
+            continue
+    return True
+
+
+def _vlm_media_bytes_digest(array):
+    """Order-sensitive CRC-32 over every byte of an array-like payload.
+
+    A sparse sample cannot see a mutation that misses its stride, and the
+    stride is derivable from the shape, so the probe reads the whole buffer.
+    A byte sum and a byte xor are both permutation-invariant, so an in-place
+    geometric augmentation over a reused buffer (flip, rotate, roll, channel
+    swap -- all exact byte permutations, for float payloads too) left both
+    unchanged and the corruption went unreported. CRC-32 is order sensitive,
+    and being one C pass rather than two numpy reductions it is also cheaper
+    than the pair it replaces: 0.62 ms against 1.40 ms per 1024x1024 RGB
+    probe here, against 3.63 ms for blake2b. This is a raw-byte view, so it
+    is exact for float payloads, and it is paid once per scheduled slot at
+    plan construction.
+    """
+    flat = np.ascontiguousarray(array).reshape(-1).view(np.uint8)
+    return zlib.crc32(memoryview(flat))
+
+
+def _vlm_media_fingerprint(payload):
+    """Content probe for a mutable media payload, or None to skip it.
+
+    Rows are stored by reference, so a dataset that decodes into one reused
+    buffer silently rewrites rows already collected. Copying every payload
+    instead would cost one image per scheduled slot rather than per row, so
+    the plan probes content and reports the corruption rather than paying to
+    prevent it. Undecoded PIL handles are still skipped, because probing one
+    would force the decode this path exists to defer.
+    """
+    try:
+        if isinstance(payload, _LazyVLMImage):
+            # A released handle re-opens its path, so the FILE is the payload
+            # and a reused path aliases exactly like a reused buffer. Identity
+            # metadata is O(1) where re-reading the bytes would be O(size).
+            return ("lazyfile", payload.path, _vlm_file_identity(payload.path))
+        if isinstance(payload, np.ndarray):
+            return ("ndarray", payload.shape, str(payload.dtype),
+                    _vlm_media_bytes_digest(payload))
+        if isinstance(payload, (bytes, bytearray)):
+            return ("bytes", len(payload),
+                    _vlm_media_bytes_digest(np.frombuffer(bytes(payload), dtype=np.uint8)))
+        pil_image = sys.modules.get("PIL.Image")
+        if pil_image is not None and isinstance(payload, pil_image.Image):
+            if not _vlm_pil_image_is_decoded(payload):
+                return None
+            # Already decoded, so asarray reads the existing raster.
+            return ("image", payload.mode, payload.size,
+                    _vlm_media_bytes_digest(np.asarray(payload)))
+        torch_module = sys.modules.get("torch")
+        if torch_module is not None and isinstance(payload, torch_module.Tensor):
+            return ("tensor", tuple(payload.shape), str(payload.dtype),
+                    _vlm_media_bytes_digest(payload.detach().cpu().numpy()))
+        # mlx arrays support in-place __setitem__, so an mlx-native dataset can
+        # alias exactly like a numpy one.
+        if isinstance(payload, _MX_ARRAY_TYPE):
+            return ("mx", payload.shape, str(payload.dtype),
+                    _vlm_media_bytes_digest(np.asarray(payload)))
+    except Exception:
+        # An unprobeable payload is simply not covered by the check.
+        return None
+    return None
+
+
+def _verify_vlm_media_pins(pins, *, since_construction=False):
+    """Raise when a stored payload changed after the row that holds it was read."""
+    for payload, taken in pins:
+        if taken is None:
+            continue
+        if _vlm_media_fingerprint(payload) != taken:
+            if isinstance(payload, _LazyVLMImage):
+                _raise_vlm_lazy_file_changed(payload.path)
+            if since_construction:
+                raise ValueError(
+                    "Unsloth MLX VLM: a dataset image changed between "
+                    "trainer setup and the batch that uses it, so this batch "
+                    "would train on pixels the sample no longer holds. "
+                    "Batches are built on demand, so a payload mutated in "
+                    "place after setup is still live here. Keep dataset "
+                    "images immutable for the run, or hand the trainer a copy."
+                )
+            raise ValueError(
+                "Unsloth MLX VLM: a dataset image changed after the row "
+                "holding it was read, so stored rows no longer match their "
+                "own samples. This happens when __getitem__ decodes into one "
+                "reused buffer (or returns a view over one) instead of "
+                "returning a fresh image per row. Return a copy from "
+                "__getitem__, for example image.copy() or array.copy()."
+            )
+
+
+def _snapshot_formatted_vlm_row(item, _depth=0, _pins=None):
+    """Snapshot one stored VLM row. A ``formatting_func`` (or dataset) that
+    mutates and returns its argument hands every visit the same object, so
+    without this a later visit's mutation would rewrite earlier stored visits.
+    Nested containers are rebuilt too, but payloads such as images are only
+    ever referenced, never copied. Passing ``_pins`` records a content probe
+    per media payload so the caller can verify none was rewritten later."""
+    if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
+        return item
+    if isinstance(item, dict):
+        snapshot = copy.copy(item)
+        for key, value in item.items():
+            snapshot[key] = _snapshot_formatted_vlm_row(value, _depth + 1, _pins)
+        return snapshot
+    if isinstance(item, list):
+        return [
+            _snapshot_formatted_vlm_row(value, _depth + 1, _pins) for value in item
+        ]
+    if type(item) is tuple:
+        # A tuple is immutable but its elements are not, and the image helpers
+        # accept a tuple wherever they accept a list. Subclasses (namedtuples)
+        # are left alone rather than rebuilt through the wrong constructor.
+        return tuple(
+            _snapshot_formatted_vlm_row(value, _depth + 1, _pins) for value in item
+        )
+    if _pins is not None:
+        fingerprint = _vlm_media_fingerprint(item)
+        if fingerprint is not None:
+            _pins.append((item, fingerprint))
+    return item
+
+
+class _FiniteVLMRow:
+    """CPU-side formatted VLM item plus its checker-supervision flag.
+
+    ``pins`` keeps this row's media probes alive past construction. The eager
+    builder converted every payload to tensors up front, so a caller that
+    mutated one afterwards could not reach training; this plan holds the
+    payload itself until materialize, so the same probe has to be re-read
+    there. The probes cost a stat for a released file and one crc32 pass
+    otherwise, both far below the processor call they precede.
+    """
+
+    __slots__ = ("item", "checker_good", "pins")
+
+    def __init__(self, item, checker_good=True, pins=()):
+        self.item = item
+        self.checker_good = bool(checker_good)
+        self.pins = pins
+
+
+def _pinned_finite_vlm_row(item, checker_good=True, *, _all_pins=None, snapshot=True):
+    """Build one plan row, keeping its media probes for the materialize check."""
+    pins = []
+    stored = _snapshot_formatted_vlm_row(item, _pins=pins)
+    if _all_pins is not None:
+        _all_pins.extend(pins)
+    return _FiniteVLMRow(
+        stored if snapshot else item,
+        checker_good,
+        tuple(pins),
+    )
+
+
+# The serializer trusts a genuine mlx.core at import time, the same trust the
+# trainer places in mx.compile. Array metadata is read through descriptors
+# captured here and validated against a probe array, so later patching of
+# mx.array's Python attributes cannot hide or forge shapes/dtypes. If the
+# captures are missing or fail the probe, every array leaf degrades to
+# unplannable rather than trusting unverifiable reads.
+_MX_ARRAY_TYPE = mx.array
+_MX_ARRAY_SHAPE = getattr(mx.array, "shape", None)
+_MX_ARRAY_DTYPE = getattr(mx.array, "dtype", None)
+_MX_DTYPE_TABLE = tuple(
+    (dtype_obj, dtype_name)
+    for dtype_name in (
+        "bool_", "uint8", "uint16", "uint32", "uint64",
+        "int8", "int16", "int32", "int64",
+        "float16", "float32", "float64", "bfloat16", "complex64",
+    )
+    for dtype_obj in (getattr(mx, dtype_name, None),)
+    if dtype_obj is not None
+)
+_MX_DTYPE_EQ = getattr(type(getattr(mx, "int32", None)), "__eq__", None)
+
+
+def _vlm_family_dtype_name(dtype_value):
+    """Stable name for a dtype read from an array, or None.
+
+    Dtype reads mint fresh wrapper objects, so identity cannot name them.
+    Comparison uses the __eq__ and dtype singletons captured at import, so
+    later patching of the Dtype class cannot forge or hide a name.
+    """
+    if _MX_DTYPE_EQ is None:
+        return None
+    for candidate, name in _MX_DTYPE_TABLE:
+        try:
+            if _MX_DTYPE_EQ(dtype_value, candidate) is True:
+                return name
+        except Exception:
+            return None
+    return None
+
+
+def _validate_mx_array_captures():
+    if _MX_ARRAY_SHAPE is None or _MX_ARRAY_DTYPE is None:
+        return False
+    try:
+        probe = mx.zeros((3, 7), dtype=mx.int16)
+        return (
+            tuple(_MX_ARRAY_SHAPE.__get__(probe, _MX_ARRAY_TYPE)) == (3, 7)
+            and _vlm_family_dtype_name(
+                _MX_ARRAY_DTYPE.__get__(probe, _MX_ARRAY_TYPE)
+            ) == "int16"
+        )
+    except Exception:
+        return False
+
+
+_MX_ARRAY_CAPTURES_VALID = _validate_mx_array_captures()
+
+
+# First-read-wins tag per type object, held WEAKLY so dynamic per-batch types are
+# reclaimed while any recurring type keeps one stable tag: a surveyed family and a
+# later drift check always agree within a process. Cross-process equality holds
+# only for types with honest introspection (others are unplannable anyway).
+_VLM_TYPE_TAG_CACHE = {}
+
+
+def _vlm_family_type_tag(node_type):
+    """First-observation type tag that survives hostile metaclasses: a type
+    whose introspection raises still classifies (as "unidentifiable.type"),
+    and one whose introspection varies across reads keeps its first observed
+    tag for its lifetime."""
+    entry = _VLM_TYPE_TAG_CACHE.get(id(node_type))
+    if entry is not None and entry[0]() is node_type:
+        return entry[1]
+    try:
+        tag = f"{node_type.__module__}.{node_type.__qualname__}"
+    except Exception:
+        tag = "unidentifiable.type"
+    if len(_VLM_TYPE_TAG_CACHE) >= 256:
+        for key in [
+            key
+            for key, (type_ref, _tag) in _VLM_TYPE_TAG_CACHE.items()
+            if type_ref() is None
+        ]:
+            del _VLM_TYPE_TAG_CACHE[key]
+    try:
+        _VLM_TYPE_TAG_CACHE[id(node_type)] = (weakref.ref(node_type), tag)
+    except TypeError:
+        pass
+    return tag
+
+
+def _vlm_family_encode_key(key):
+    """Encoding of one dictionary key for ``_vlm_batch_family``.
+
+    ``mx.compile`` records every key's ``__hash__()`` result, so a value
+    encoding is safe only where it is at least as fine as that hash within a
+    process. That holds for the exact built-ins whose hash is
+    value-determined: str/bytes, int/bool, None, non-NaN floats (the bit
+    pattern also splits the ``0.0``/``-0.0`` collision), and plain tuples of
+    these. Anything else (subclasses overriding ``__hash__``, NaN floats,
+    arbitrary hashable objects) could let one family span several compile
+    keys, so it is tagged ``unstable_key`` and ``_vlm_family_is_plannable``
+    excludes the whole family from shape planning.
+    """
+    key_type = type(key)
+    if key_type is bool or key_type is int:
+        return ("int", int(key))
+    if key_type is float:
+        if key != key:
+            return ("unstable_key", "float-nan")
+        return ("float", struct.pack("<d", key).hex())
+    if key_type is str:
+        return ("str", key)
+    if key_type is bytes:
+        return ("bytes", key)
+    if key is None:
+        return ("none",)
+    if key_type is tuple:
+        return ("seq",) + tuple(_vlm_family_encode_key(item) for item in key)
+    return ("unstable_key", _vlm_family_type_tag(key_type))
+
+
+def _vlm_batch_family(batch, symbolic_axes=None):
+    """Process-stable compile-key family of a prepared VLM batch pytree.
+
+    Mirrors the structure walk ``mx.compile`` uses to key its cache (mlx
+    ``python/src/transforms.cpp``), including its container asymmetry: lists
+    are read through raw C storage (subclass iteration overrides do not
+    participate) while tuples are read through Python iteration (overrides
+    do); both share one sequence marker. Dict entries participate in
+    insertion order via raw ``dict.items``, non-array constants by exact
+    value (bools as ints, floats by bit pattern), and ``mx.array`` leaves by
+    rank/shape/dtype. Value encodings apply only to exact built-in types; a
+    subclass constant becomes an ``unstable_const`` tag. Where the encodings
+    differ this one is finer for every pytree the compile walk accepts, so
+    for plannable families (see ``_vlm_family_is_plannable``) equal families
+    can never reach distinct compile keys, and families compare equal across
+    processes. Structures the compile walk rejects (non-dict mappings, non
+    ``mx.array`` leaves carrying shape/dtype, unsupported leaf types) get
+    stable ``mapping``/``opaque`` tags and planning skips them.
+
+    ``symbolic_axes`` maps a leaf path to the axis whose extent is replaced
+    by the symbolic ``"sequence"`` marker; unmapped arrays keep every
+    dimension concrete and so discriminate families exactly.
+    """
+    def encode(node, path):
+        # Dispatch on the raw runtime type, which a lying __class__ cannot mislead,
+        # matching the PyDict_Check/PyList_Check calls the compile walk performs.
+        node_type = type(node)
+        if issubclass(node_type, dict):
+            return ("dict",) + tuple(
+                (_vlm_family_encode_key(key), encode(value, path + (key,)))
+                for key, value in dict.items(node)
+            )
+        if issubclass(node_type, Mapping):
+            tag = _vlm_family_type_tag(node_type)
+            try:
+                entries = tuple(
+                    (_vlm_family_encode_key(key), encode(value, path + (key,)))
+                    for key, value in node.items()
+                )
+            except Exception:
+                # mx.compile rejects non-dict mappings unread, so a raising items()
+                # must not break surveying; the tag marks the family unplannable.
+                return ("mapping", tag, "unreadable")
+            return ("mapping", tag) + entries
+        if issubclass(node_type, (list, tuple)):
+            # transforms.cpp indexes lists raw but iterates tuples through the
+            # Python protocol, so every list is eligible while only exact tuples
+            # are: a tuple subclass can route iteration through tp_iter that no
+            # attribute inspection sees, letting the two walks see different items.
+            if issubclass(node_type, tuple) and node_type is not tuple:
+                return ("unstable_const", _vlm_family_type_tag(node_type))
+            walk = (
+                list.__iter__(node)
+                if issubclass(node_type, list)
+                else tuple.__iter__(node)
+            )
+            return ("seq",) + tuple(
+                encode(item, path + (position,))
+                for position, item in enumerate(walk)
+            )
+        if node_type is _MX_ARRAY_TYPE:
+            # Metadata through the validated import-time descriptors and dtype
+            # naming by captured equality, so no patchable protocol participates.
+            # Unvalidated captures never guess: the leaf opts out instead.
+            if not _MX_ARRAY_CAPTURES_VALID:
+                return ("unstable_const", _vlm_family_type_tag(node_type))
+            shape = _MX_ARRAY_SHAPE.__get__(node, node_type)
+            dims = [operator.index(dim) for dim in shape]
+            axis = None if symbolic_axes is None else symbolic_axes.get(path)
+            if axis is not None:
+                dims[operator.index(axis)] = "sequence"
+            dtype_name = _vlm_family_dtype_name(
+                _MX_ARRAY_DTYPE.__get__(node, node_type)
+            )
+            if dtype_name is None:
+                return ("unstable_const", _vlm_family_type_tag(node_type))
+            return ("array", tuple(dims), dtype_name)
+        if node_type is bool or node_type is int:
+            # transforms.cpp casts constants to int64; anything outside is rejected.
+            if not -(2 ** 63) <= node < 2 ** 63:
+                return ("opaque", "builtins.int")
+            return ("int", int(node))
+        if node_type is float:
+            return ("float", struct.pack("<d", node).hex())
+        if node_type is str:
+            return ("str", node)
+        if node is None:
+            return ("none",)
+        if issubclass(node_type, (bool, int, float, str, _MX_ARRAY_TYPE)):
+            return ("unstable_const", _vlm_family_type_tag(node_type))
+        return ("opaque", _vlm_family_type_tag(node_type))
+
+    return encode(batch, ())
+
+
+def _vlm_family_is_plannable(family):
+    """Whether shape planning may group compiled calls by this family.
+
+    False when any component's compile-key mapping is not one-to-one-or-finer:
+    ``unstable_key``/``unstable_const`` (subclass or identity hashing can
+    split one family across compile keys) and ``mapping``/``opaque``
+    (structures the compile walk rejects). Such a family must never be
+    admitted to planning, not even as an exact signature; runs containing
+    those batches keep unplanned behavior (eager fallback or strict error).
+    """
+    if not isinstance(family, tuple) or not family:
+        return True
+    if family[0] in ("unstable_key", "unstable_const", "mapping", "opaque"):
+        return False
+    return all(
+        _vlm_family_is_plannable(item)
+        for item in family
+        if isinstance(item, tuple)
+    )
+
+
+def _vlm_family_divergence(expected, observed, path="batch"):
+    """Location and description of the first difference between two families
+    produced by ``_vlm_batch_family``, or ``None`` when they are equal."""
+    if expected == observed:
+        return None
+    if (
+        isinstance(expected, tuple)
+        and isinstance(observed, tuple)
+        and expected[:1] == observed[:1]
+        and expected[:1] and expected[0] in ("dict", "seq")
+    ):
+        kind = expected[0]
+        if len(expected) != len(observed):
+            if kind == "dict":
+                def _key_names(entries):
+                    return {
+                        repr(
+                            key[1]
+                            if key[:1] == ("str",) and len(key) == 2
+                            else key
+                        )
+                        for key, _child in entries
+                    }
+                expected_keys = _key_names(expected[1:])
+                observed_keys = _key_names(observed[1:])
+                added = sorted(observed_keys - expected_keys)
+                missing = sorted(expected_keys - observed_keys)
+                if added or missing:
+                    return (
+                        f"{path}: runtime batch "
+                        + " and ".join(
+                            part for part in (
+                                added and f"added keys {', '.join(added)}",
+                                missing and f"lost keys {', '.join(missing)}",
+                            ) if part
+                        )
+                    )
+            return (
+                f"{path}: {kind} entry count {len(expected) - 1} in the "
+                f"surveyed family vs {len(observed) - 1} at runtime"
+            )
+        for position, (exp, obs) in enumerate(zip(expected[1:], observed[1:])):
+            if kind == "dict":
+                (exp_key, exp_child), (obs_key, obs_child) = exp, obs
+                if exp_key != obs_key:
+                    return (
+                        f"{path}: key {position} is {exp_key!r} in the "
+                        f"surveyed family vs {obs_key!r} at runtime"
+                    )
+                step = (
+                    exp_key[1]
+                    if exp_key[:1] == ("str",) and len(exp_key) == 2
+                    else exp_key
+                )
+                deeper = _vlm_family_divergence(
+                    exp_child, obs_child, f"{path}[{step!r}]",
+                )
+            else:
+                deeper = _vlm_family_divergence(exp, obs, f"{path}[{position}]")
+            if deeper is not None:
+                return deeper
+    return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
+
+
+@contextlib.contextmanager
+def _preserved_preprocessing_rng():
+    """Run a block without leaving the shared preprocessing RNGs advanced.
+
+    The descriptor survey builds every scheduled batch through the real
+    processor just to read shapes; an augmenting processor draws from the
+    process-global RNGs while doing so and those draws are never replayed, so
+    without this a compile-enabled run would train on a later augmentation
+    stream than an eager run from the same seed. Privately owned generators
+    stay the caller's responsibility.
+    """
+    states = []
+    try:
+        states.append((random.setstate, random.getstate()))
+    except Exception:
+        pass
+    try:
+        states.append((np.random.set_state, np.random.get_state()))
+    except Exception:
+        pass
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        try:
+            states.append((
+                torch_module.random.set_rng_state,
+                torch_module.random.get_rng_state(),
+            ))
+        except Exception:
+            pass
+    mx_state = None
+    try:
+        mx_random_state = mx.random.state
+        if isinstance(mx_random_state, list) and mx_random_state:
+            mx_state = mx.array(
+                mx_random_state[0].tolist(), dtype=mx.uint32,
+            )
+    except Exception:
+        mx_state = None
+    try:
+        yield
+    finally:
+        for restore, snapshot in states:
+            try:
+                restore(snapshot)
+            except Exception:
+                pass
+        if mx_state is not None:
+            try:
+                mx.random.state[0] = mx_state
+            except Exception:
+                pass
+
+
+def _vlm_file_identity(path):
+    """``(device, inode, mtime_ns, size)`` of a file, or None if unreadable.
+
+    A released handle is re-opened from its path, so a dataset that writes
+    every sample to ONE shared path would hand every row the last sample's
+    pixels. Identity is what makes that visible: ``stat`` is O(1) where
+    re-reading the bytes would be O(size) per scheduled slot and decoding
+    would be worse still. A file that has become unstat-able reads as None,
+    which differs from any real identity and is reported the same way.
+    """
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
+
+
+def _raise_vlm_lazy_file_changed(path):
+    """Report a released image whose file no longer holds that row's sample."""
+    raise ValueError(
+        "Unsloth MLX VLM: the file backing a dataset image changed after the "
+        f"row holding it was read ({path}), so stored rows no longer match "
+        "their own samples. This happens when __getitem__ writes every sample "
+        "to one shared path and returns Image.open(path). Write one file per "
+        "sample, or return a decoded copy from __getitem__, for example "
+        "Image.open(path).copy()."
+    )
+
+
+class _LazyVLMImage:
+    """Stand-in for a file-backed PIL handle whose descriptor was released.
+
+    ``PIL.Image.open`` leaves the file open until the raster is loaded, so
+    storing one row per scheduled slot would pin one descriptor per row and
+    exhaust the process limit on a few hundred rows. The path is re-opened at
+    materialization instead, which keeps the plan at O(1) descriptors without
+    forcing the O(N) decode that eagerly loading every row would cost.
+
+    The file's identity travels with the path, because a path alone cannot
+    tell a per-sample file from one shared scratch file rewritten per row.
+    """
+
+    __slots__ = ("path", "identity")
+
+    def __init__(self, path):
+        self.path = path
+        self.identity = _vlm_file_identity(path)
+
+    def open(self):
+        # Checked here as well as at plan build: the file can also be rewritten
+        # between building the plan and materializing this row.
+        if _vlm_file_identity(self.path) != self.identity:
+            _raise_vlm_lazy_file_changed(self.path)
+        from PIL import Image as _PIL_Image
+
+        return _PIL_Image.open(self.path)
+
+
+def _vlm_releasable_image_path(value):
+    """Absolute path of an undecoded, PIL-owned, file-backed image, else None.
+
+    Every clause is a reason it would be wrong to release the descriptor:
+    a caller-owned stream cannot be re-opened from a path, an already decoded
+    raster has no descriptor left to save, and a seeked multi-frame handle
+    would come back on frame zero.
+    """
+    if not getattr(value, "_exclusive_fp", False):
+        return None
+    if getattr(value, "fp", None) is None:
+        return None
+    if getattr(value, "_im", None) is not None:
+        return None
+    filename = getattr(value, "filename", None)
+    if not isinstance(filename, str) or not filename:
+        return None
+    tell = getattr(value, "tell", None)
+    if callable(tell):
+        try:
+            if tell() != 0:
+                return None
+        except Exception:
+            return None
+    try:
+        # Absolute so a later chdir cannot break the re-open, and checked now
+        # so an unreadable source fails at build time rather than mid-epoch.
+        path = os.path.abspath(filename)
+        if not os.path.isfile(path):
+            return None
+    except Exception:
+        return None
+    return path
+
+
+def _release_vlm_row_image_handles(item, _depth=0):
+    """Swap file-backed lazy PIL handles in a stored row for path references.
+
+    Returns ``item`` itself when nothing is releasable, so rows that hold no
+    such handle keep their exact identity and behaviour. Never closes the
+    payload: the dataset may still own it, so the descriptor is freed only
+    when the caller's own reference goes away.
+    """
+    if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
+        return item
+    path = _vlm_releasable_image_path(item)
+    if path is not None:
+        return _LazyVLMImage(path)
+    if isinstance(item, dict):
+        released = None
+        for key, value in item.items():
+            new_value = _release_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if released is None:
+                    released = copy.copy(item)
+                released[key] = new_value
+        return item if released is None else released
+    if isinstance(item, tuple):
+        # A stored row can nest media in a tuple; a plain rebuild would also
+        # flatten a namedtuple, so reuse the concrete type when it takes an
+        # iterable and fall back to positional construction when it does not.
+        walked = [_release_vlm_row_image_handles(value, _depth + 1) for value in item]
+        if all(new is old for new, old in zip(walked, item)):
+            return item
+        if type(item) is tuple:
+            return tuple(walked)
+        try:
+            return type(item)(*walked)
+        except TypeError:
+            return tuple(walked)
+    if isinstance(item, list):
+        released = None
+        for position, value in enumerate(item):
+            new_value = _release_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if released is None:
+                    released = list(item)
+                released[position] = new_value
+        return item if released is None else released
+    return item
+
+
+def _restore_vlm_row_image_handles(item, _depth=0):
+    """Re-open the handles ``_release_vlm_row_image_handles`` put aside."""
+    if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
+        return item
+    if isinstance(item, _LazyVLMImage):
+        return item.open()
+    if isinstance(item, dict):
+        restored = None
+        for key, value in item.items():
+            new_value = _restore_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if restored is None:
+                    restored = copy.copy(item)
+                restored[key] = new_value
+        return item if restored is None else restored
+    if isinstance(item, tuple):
+        # A stored row can nest media in a tuple; a plain rebuild would also
+        # flatten a namedtuple, so reuse the concrete type when it takes an
+        # iterable and fall back to positional construction when it does not.
+        walked = [_restore_vlm_row_image_handles(value, _depth + 1) for value in item]
+        if all(new is old for new, old in zip(walked, item)):
+            return item
+        if type(item) is tuple:
+            return tuple(walked)
+        try:
+            return type(item)(*walked)
+        except TypeError:
+            return tuple(walked)
+    if isinstance(item, list):
+        restored = None
+        for position, value in enumerate(item):
+            new_value = _restore_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if restored is None:
+                    restored = list(item)
+                restored[position] = new_value
+        return item if restored is None else restored
+    return item
+
+
+class FiniteVLMBatchPlan(_FiniteVisitMixin):
+    """CPU-backed finite VLM schedule with on-demand MLX materialization.
+
+    Rows hold formatted dataset items (``formatting_func`` is consumed at
+    construction, once per scheduled slot), the schedule holds row positions
+    with a mask of distributed pad slots, and the plan-owned cache retains only
+    the most recent batch. Visits are identity-only: merged VLM epoch semantics
+    replay the stored schedule, so epoch permutation stays a text-plan behavior.
+    """
+
+    __slots__ = (
+        "_rows",
+        "_schedule",
+        "_empty_masks",
+        "_processor",
+        "_config",
+        "max_seq_length",
+        "_image_size",
+        "_response_mask_fn",
+        "_ignore_token_ids",
+        "_completion_only_loss",
+        "_visit_policy",
+        "_visit_seed",
+        "_visit_epoch_cache",
+        "_mru",
+        "_descriptors",
+        "_widths",
+        "_padable",
+        "_forbidden",
+        "_shape_plan",
+        "_planned_widths",
+    )
+
+    def __init__(
+        self,
+        rows,
+        schedule,
+        empty_masks,
+        *,
+        processor,
+        config,
+        max_seq_length,
+        image_size,
+        response_mask_fn=None,
+        ignore_token_ids=None,
+        completion_only_loss=None,
+    ):
+        self._rows = tuple(rows)
+        self._schedule = tuple(tuple(int(i) for i in batch) for batch in schedule)
+        self._empty_masks = (
+            None if empty_masks is None else tuple(
+                None if mask is None else tuple(bool(x) for x in mask)
+                for mask in empty_masks
+            )
+        )
+        self._processor = processor
+        self._config = config
+        # ``None`` stays ``None``: the VLM builder reads it as "no cap" (no
+        # ``max_length``, truncation a no-op) and the plan only forwards it.
+        self.max_seq_length = (
+            None if max_seq_length is None else int(max_seq_length)
+        )
+        self._image_size = image_size
+        self._response_mask_fn = response_mask_fn
+        self._ignore_token_ids = ignore_token_ids
+        self._completion_only_loss = completion_only_loss
+        self._visit_policy = "identity"
+        self._visit_seed = None
+        self._visit_epoch_cache = None
+        self._mru = None
+        self._descriptors = None
+        self._widths = None
+        self._padable = None
+        self._forbidden = None
+        self._shape_plan = None
+        self._planned_widths = None
+        if self._empty_masks is not None and (
+            len(self._empty_masks) != len(self._schedule)
+        ):
+            raise ValueError(
+                "empty_masks must contain one entry per scheduled batch"
+            )
+        for batch in self._schedule:
+            for row_index in batch:
+                if not 0 <= row_index < len(self._rows):
+                    raise ValueError(
+                        "schedule references a row outside the stored rows"
+                    )
+
+    @property
+    def rows(self):
+        return self._rows
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    def __len__(self):
+        return len(self._schedule)
+
+    def _build_batch(self, index, target_width=None):
+        """Build one batch through the complete existing VLM builder,
+        right-padded to ``target_width`` when an endpoint is given."""
+        # Re-read the probes before the payloads reach the processor: the
+        # construction check only covers the read window, and these rows are
+        # still the caller's own objects until here.
+        for i in self._schedule[index]:
+            _verify_vlm_media_pins(self._rows[i].pins, since_construction=True)
+        batch_items = [
+            _restore_vlm_row_image_handles(self._rows[i].item)
+            for i in self._schedule[index]
+        ]
+        batch_dict = _build_response_masked_vlm_batch(
+            batch_items,
+            self._processor,
+            self._config,
+            self.max_seq_length,
+            self._image_size,
+            response_mask_fn=self._response_mask_fn,
+            formatting_func=None,
+            ignore_token_ids=self._ignore_token_ids,
+            completion_only_loss=self._completion_only_loss,
+            target_width=target_width,
+        )
+        empty = (
+            self._empty_masks[index] if self._empty_masks is not None else None
+        )
+        if empty is not None and any(empty):
+            batch_dict = _mask_empty_vlm_padding_rows(
+                batch_dict, list(empty), processor=self._processor,
+            )
+        return batch_dict
+
+    def set_shape_plan(self, shape_plan, planned_widths):
+        """Install an admission plan plus each batch's planned event width
+        (the width the planner grouped it by; raw for declined batches).
+        Invalidates the cache: nothing built before installation may serve a
+        planned fetch."""
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        planned_widths = tuple(
+            operator.index(width) for width in planned_widths
+        )
+        if len(planned_widths) != len(self._schedule):
+            raise ValueError(
+                "planned_widths must contain one entry per scheduled batch"
+            )
+        self._shape_plan = shape_plan
+        self._planned_widths = planned_widths
+        self._mru = None
+
+    def materialize(self, index, target_width=None, *, phase=None):
+        """Build one batch through the complete existing VLM builder.
+
+        The cache holds only the most recent batch at its exact requested
+        width, so a repeated fetch (e.g. a compile-failure retry) is free;
+        a fetch it cannot serve drops it before building, so a transition to
+        the next batch never holds two. ``target_width``
+        right-pads to an explicit endpoint and keeps bypass authority; with
+        an installed shape plan, ``phase`` instead resolves the planned
+        endpoint, enforces phase-aware admission, and hard-fails on
+        structural drift from the surveyed family before the batch reaches a
+        compiled call. ``None``/``None`` preserves the historical
+        per-batch-maximum padding byte for byte.
+        """
+        index = operator.index(index)
+        check_drift = False
+        if (
+            target_width is None
+            and phase is not None
+            and self._shape_plan is not None
+        ):
+            family = self.batch_family(index)
+            event_width = self._planned_widths[index]
+            if not self._shape_plan.allows(family, event_width, phase):
+                raise RuntimeError(
+                    "Unsloth MLX: compiled VLM batch signature was not "
+                    "admitted by the finite shape plan."
+                )
+            target_width = self._shape_plan.endpoint_for(family, event_width)
+            check_drift = True
+        cached = self._mru
+        if cached is not None and cached[0] == (index, target_width):
+            _key, cached_batch, drift_checked = cached
+            # Cache identity covers shape, not provenance: a batch cached by an
+            # explicit-width fetch has not passed the structural proof, so a planned
+            # fetch must verify it before the compiled path consumes it.
+            if check_drift and not drift_checked:
+                self.check_family_drift(index, cached_batch)
+                self._mru = (_key, cached_batch, True)
+            return cached_batch
+        # This fetch cannot be served from the cache, so the cached batch is
+        # already dead weight. Release it before the builder allocates its
+        # replacement: the trainer clears its own ``batch_data`` reference
+        # ahead of every fetch, so this entry is the last thing keeping the
+        # previous batch resident, and holding it across the build would put
+        # two complete image/text batches in memory at every transition. A
+        # same-batch retry is unaffected, having returned above.
+        self._mru = None
+        cached = None
+        batch_dict = self._build_batch(index, target_width=target_width)
+        if check_drift:
+            self.check_family_drift(index, batch_dict)
+        self._mru = ((index, target_width), batch_dict, check_drift)
+        return batch_dict
+
+    def __getitem__(self, index):
+        return self.materialize(index)
+
+    def materialize_all(self):
+        """Eager-list compatibility: build and evaluate every batch."""
+        batches = [self.materialize(index) for index in range(len(self))]
+        all_tensors = []
+        for batch_dict in batches:
+            for value in batch_dict.values():
+                if isinstance(value, mx.array):
+                    all_tensors.append(value)
+        if all_tensors:
+            mx.eval(all_tensors)
+        return batches
+
+    def supervision_counts(self, max_check=100):
+        """(all_masked_rows, trainable_rows) over the first ``max_check``
+        scheduled rows, from construction-time metadata. Does no processor
+        work or materialization, so a caller's distributed reduction is never
+        preceded by new rank-local work."""
+        seen_bad = 0
+        seen_good = 0
+        checked = 0
+        for batch_index, batch in enumerate(self._schedule):
+            empty = (
+                self._empty_masks[batch_index]
+                if self._empty_masks is not None else None
+            )
+            for slot, row_index in enumerate(batch):
+                padded = bool(empty[slot]) if empty is not None else False
+                if padded or not self._rows[row_index].checker_good:
+                    seen_bad += 1
+                else:
+                    seen_good += 1
+                checked += 1
+                if checked >= max_check:
+                    return seen_bad, seen_good
+        return seen_bad, seen_good
+
+    def advance_preprocessing(self, visits):
+        """Replay the processor over the first ``visits`` visits, discarding
+        the batches.
+
+        ``resume_from_checkpoint`` starts the loop past the micro-batches the
+        killed run already consumed. The eager builder had produced every one
+        of them through the real processor, so a preprocessing pipeline that
+        draws from the shared RNGs was already past them when the killed run
+        reached this point; a lazy plan that simply skips them would hand the
+        first resumed batch the opening draw instead. Rebuilding here (MRU
+        dropped, one batch alive at a time) restores that progression exactly,
+        the way the streaming path fast-forwards its iterator. Unlike the
+        descriptor survey this deliberately does NOT preserve RNG state.
+
+        Visits past the stored schedule replayed prebuilt batches eagerly, so
+        the processor ran at most once per scheduled batch however far the
+        killed run reached; the count is clamped to match.
+        """
+        visits = min(operator.index(visits), len(self._schedule))
+        if visits <= 0:
+            return
+        self._mru = None
+        for visit in range(visits):
+            batch = self._build_batch(self.batch_index_for_visit(visit))
+            del batch
+        self._mru = None
+
+    def ensure_descriptors(self):
+        """Survey every scheduled batch's compile-key family, once.
+
+        The MRU cache is dropped up front and never repopulated here, and each
+        batch is released before the next is built, so the survey owns at most
+        one batch at a time; repeated calls return the stored descriptors.
+        Runs under preserved global preprocessing RNG state, so a stochastic
+        processor's augmentation draws are not consumed here. Draw state a
+        processor owns privately is out of that preservation's reach and does
+        advance by one survey; ``check_family_drift`` names this when the
+        difference reaches the shapes.
+        """
+        if self._descriptors is not None:
+            return self._descriptors
+        self._mru = None
+        families = []
+        widths = []
+        padable_flags = []
+        forbidden_sets = []
+        with _preserved_preprocessing_rng():
+            for index in range(len(self._schedule)):
+                batch = self._build_batch(index)
+                width, axes, padable, forbidden = _vlm_width_survey(
+                    batch,
+                    disposable_keys=_vlm_pipeline_disposable_keys(self._config),
+                )
+                # Padable batches get symbolic families (batches differing only in
+                # text width coincide); declined batches keep every extent concrete.
+                family = _vlm_batch_family(
+                    batch, symbolic_axes=axes if padable else None,
+                )
+                del batch
+                families.append(family)
+                widths.append(width)
+                padable_flags.append(bool(padable))
+                forbidden_sets.append(forbidden)
+        self._descriptors = tuple(families)
+        self._widths = tuple(widths)
+        self._padable = tuple(padable_flags)
+        self._forbidden = tuple(forbidden_sets)
+        return self._descriptors
+
+    @property
+    def pad_token_id(self):
+        """The tokenizer pad id planned padding would use, or None. Without
+        one no batch can be widened, so width planning degrades the run to
+        eager before surveying anything."""
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        return getattr(tokenizer, "pad_token_id", None)
+
+    def batch_family(self, index):
+        """Surveyed compile-key family for one scheduled batch."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch families have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return self._descriptors[operator.index(index)]
+
+    def batch_width(self, index):
+        """Surveyed post-prepare text width for one scheduled batch (None
+        when the batch exposes no 2-D input_ids)."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch widths have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return self._widths[operator.index(index)]
+
+    def planned_event_widths(self):
+        """Per-batch planner event widths from the survey: padable batches
+        take the shared rounded width policy capped at the surveyed maximum
+        final width (never ``max_seq_length``, which post-expansion widths may
+        exceed) and bumped off the union of untouched-array extents; declined
+        batches keep their raw widths. Deterministic given the survey, so
+        planning and installation derive identical widths.
+
+        The bump outranks the cap, so an endpoint may land above the surveyed
+        maximum: a width the finalizer would reject as an untouched extent is
+        no endpoint at all, and stepping up costs a few pad columns (at most
+        one per member of the finite union) while declining the capped width
+        instead would split one shared endpoint back into one per raw width --
+        the signature count this plan exists to bound."""
+        if self._descriptors is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch widths have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        forbidden = set()
+        padable_widths = []
+        for index in range(len(self._schedule)):
+            forbidden.update(self._forbidden[index])
+            if self._padable[index]:
+                padable_widths.append(self._widths[index])
+        surveyed_max = max(padable_widths, default=0)
+        widths = []
+        for index in range(len(self._schedule)):
+            raw_width = self._widths[index]
+            if self._padable[index]:
+                width = _finite_text_pad_width(
+                    raw_width,
+                    pad_to_multiple=32,
+                    minimum_width=2,
+                    max_seq_length=surveyed_max,
+                )
+                while width in forbidden:
+                    width += 1
+            else:
+                width = raw_width
+            widths.append(width)
+        return tuple(widths)
+
+    def check_family_drift(self, index, batch):
+        """Hard-fail when a materialized batch's structure leaves its
+        surveyed family. Container structure, dict keys and order, constant
+        values, and every array extent outside the detected text axis must
+        hold on every visit; that axis is symbolic for padable batches, so
+        planned padding is not drift. Value nondeterminism inside
+        equal-shaped arrays stays undetected by design."""
+        index = operator.index(index)
+        _width, axes, padable, _forbidden = _vlm_width_survey(
+            batch,
+            disposable_keys=_vlm_pipeline_disposable_keys(self._config),
+        )
+        divergence = _vlm_family_divergence(
+            self.batch_family(index),
+            _vlm_batch_family(batch, symbolic_axes=axes if padable else None),
+        )
+        if divergence is not None:
+            raise RuntimeError(
+                f"Unsloth MLX: VLM batch {index} drifted from its surveyed "
+                f"compile family ({divergence}). The data pipeline must "
+                f"produce structurally identical batches on every visit. The "
+                f"shape survey already built every batch once through the "
+                f"processor, with the process RNGs preserved around it, so a "
+                f"processor drawing from a generator or counter it owns "
+                f"privately arrives at training one survey further along its "
+                f"own stream and drifts here; run that pipeline with compile "
+                f"disabled."
+            )
+
+
+
+def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_length,
                        num_batches=None, seed=42, response_mask_fn=None,
                        formatting_func=None, dataset_order="default",
                        num_epochs=None, completion_only_loss=None,
                        image_size=None, comm_group=None,
                        distributed_pad_mode="cycle"):
-    """Pre-materialize VLM training batches using the processor directly.
+    """Build the CPU-backed finite VLM batch plan (no materialization).
 
-    Mirrors Unsloth's GPU UnslothVisionDataCollator:
-    resize images → processor(text, images, padding=True) → uniform batches.
+    Mirrors the eager builder's construction exactly — filtering, formatting,
+    epoch/global slicing, rank slicing, and pad-slot resolution — but stores
+    row indices and pad masks instead of built batches. Returns ``None`` for
+    an empty dataset (the wrapper preserves the historical ``[]``).
     """
     import numpy as np
 
@@ -5750,7 +7204,9 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     image_size = _resolve_vlm_image_size(image_size, config, processor)
     ignore_token_ids = _get_vlm_ignore_token_ids(processor=processor, config=config)
 
-    batch_list = []
+    schedule = []
+    empty_masks = []
+    any_empty = False
     seen = 0
     epoch = 0
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
@@ -5759,8 +7215,9 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
     base_indices = list(range(len(dataset)))
     total_removed = 0
     formatted_items = None
+    _supervision = None
     if response_mask_fn is not None:
-        base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+        base_indices, total_removed, formatted_items, _supervision = _filter_trainable_vlm_indices(
             dataset,
             base_indices,
             processor,
@@ -5778,15 +7235,10 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
                 "train_on_responses_only masking. Check instruction_part / "
                 "response_part and max_seq_length."
             )
-    batch_formatting_func = None if formatted_items is not None else formatting_func
-
-    def _item(idx):
-        return formatted_items[idx] if formatted_items is not None else dataset[idx]
-
     if dataset_order not in (None, "default", "sequential", "torch_randperm"):
         raise ValueError(f"Unsupported MLX VLM dataset_order: {dataset_order!r}")
     if not base_indices:
-        return []
+        return None
 
     def _epoch_indices(epoch_idx):
         """Return CUDA-style sampler order over the filtered VLM dataset."""
@@ -5803,7 +7255,7 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
 
     indices = _epoch_indices(epoch)
 
-    while num_batches is None or len(batch_list) < num_batches:
+    while num_batches is None or len(schedule) < num_batches:
         if seen >= len(indices):
             if num_batches is None and target_epochs is not None and epoch + 1 >= target_epochs:
                 break
@@ -5829,28 +7281,13 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             pad_idx = next((idx for idx in bi if idx is not None), None)
             if pad_idx is None:
                 pad_idx = global_indices[0]
-            batch_items = [
-                _item(pad_idx if idx is None else idx)
-                for idx in bi
-            ]
+            resolved = [pad_idx if idx is None else idx for idx in bi]
+            any_empty = True
+            empty_masks.append(tuple(empty_rows))
         else:
-            batch_items = [_item(idx) for idx in bi]
-        batch_dict = _build_response_masked_vlm_batch(
-            batch_items,
-            processor,
-            config,
-            max_seq_length,
-            image_size,
-            response_mask_fn=response_mask_fn,
-            formatting_func=batch_formatting_func,
-            ignore_token_ids=ignore_token_ids,
-            completion_only_loss=completion_only_loss,
-        )
-        if any(empty_rows):
-            batch_dict = _mask_empty_vlm_padding_rows(
-                batch_dict, empty_rows, processor=processor,
-            )
-        batch_list.append(batch_dict)
+            resolved = list(bi)
+            empty_masks.append(None)
+        schedule.append(tuple(resolved))
 
     if total_removed > 0:
         print(
@@ -5858,16 +7295,97 @@ def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
             f"were -100 after train_on_responses_only masking."
         )
 
-    # Evaluate all tensors
-    all_tensors = []
-    for bd in batch_list:
-        for v in bd.values():
-            if isinstance(v, mx.array):
-                all_tensors.append(v)
-    if all_tensors:
-        mx.eval(all_tensors)
+    if formatted_items is None:
+        # One row per scheduled slot, read in schedule order: the eager builder
+        # indexed the dataset (and ran the formatter) while building every
+        # batch, so a stochastic or epoch-dependent dataset or formatter must
+        # refresh on every revisit. Consuming it here still keeps user code out
+        # of re-materialization, and each result is snapshotted so a later
+        # visit cannot rewrite an earlier one.
+        # Media payloads stay referenced: copying them would cost one image per
+        # scheduled slot rather than per row. `media_pins` probes their content
+        # instead, so a dataset that reuses one decode buffer is reported.
+        # The processor also no longer runs between one slot and the next, so a
+        # pipeline whose formatter and processor draw the SAME process-global
+        # RNG sees a different interleaving than the eager builder gave it.
+        # Restoring it would mean processing at construction, which is the
+        # memory this plan exists to save.
+        media_pins = []
+        rows = tuple(
+            # Release before pinning, not after: a pin holds its payload so
+            # the probe can re-read it, which would keep every row's file
+            # open for the whole collection. The released stand-in is
+            # pinned by identity instead, which costs a stat and catches a
+            # dataset that rewrites one shared path per row.
+            _pinned_finite_vlm_row(
+                _release_vlm_row_image_handles(
+                    dataset[idx] if formatting_func is None
+                    else formatting_func(dataset[idx])
+                ),
+                True if _supervision is None else _supervision[idx],
+                _all_pins=media_pins,
+            )
+            for batch in schedule for idx in batch
+        )
+        _verify_vlm_media_pins(media_pins)
+        remapped = []
+        offset = 0
+        for batch in schedule:
+            remapped.append(tuple(range(offset, offset + len(batch))))
+            offset += len(batch)
+        schedule = remapped
+    else:
+        # Compact remap over the filter's already-formatted rows: the eager
+        # builder reused those same per-index objects on every visit.
+        used = []
+        seen_used = set()
+        for batch in schedule:
+            for idx in batch:
+                if idx not in seen_used:
+                    seen_used.add(idx)
+                    used.append(idx)
+        position = {idx: pos for pos, idx in enumerate(used)}
+        # The filter already formatted these, so they are referenced rather
+        # than snapshotted, but they reach the processor just as late.
+        rows = tuple(
+            _pinned_finite_vlm_row(
+                _release_vlm_row_image_handles(formatted_items[idx]),
+                True if _supervision is None else _supervision[idx],
+                snapshot=False,
+            )
+            for idx in used
+        )
+        schedule = [tuple(position[idx] for idx in batch) for batch in schedule]
+    return FiniteVLMBatchPlan(
+        rows,
+        schedule,
+        empty_masks if any_empty else None,
+        processor=processor,
+        config=config,
+        max_seq_length=max_seq_length,
+        image_size=image_size,
+        response_mask_fn=response_mask_fn,
+        ignore_token_ids=ignore_token_ids,
+        completion_only_loss=completion_only_loss,
+    )
 
-    return batch_list
+
+def create_vlm_batches(dataset, processor, config, batch_size, max_seq_length,
+                       num_batches=None, seed=42, response_mask_fn=None,
+                       formatting_func=None, dataset_order="default",
+                       num_epochs=None, completion_only_loss=None,
+                       image_size=None, comm_group=None,
+                       distributed_pad_mode="cycle"):
+    """Eager-list compatibility wrapper over the finite VLM batch plan."""
+    plan = _create_vlm_batch_plan(
+        dataset, processor, config, batch_size, max_seq_length,
+        num_batches=num_batches, seed=seed,
+        response_mask_fn=response_mask_fn, formatting_func=formatting_func,
+        dataset_order=dataset_order, num_epochs=num_epochs,
+        completion_only_loss=completion_only_loss, image_size=image_size,
+        comm_group=comm_group, distributed_pad_mode=distributed_pad_mode,
+    )
+    return [] if plan is None else plan.materialize_all()
 
 
 
@@ -6165,7 +7683,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
         total_removed = 0
         formatted_items = None
         if response_mask_fn is not None:
-            base_indices, total_removed, formatted_items = _filter_trainable_vlm_indices(
+            base_indices, total_removed, formatted_items, _supervision = _filter_trainable_vlm_indices(
                 dataset,
                 base_indices,
                 processor,

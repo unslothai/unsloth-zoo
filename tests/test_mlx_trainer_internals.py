@@ -324,6 +324,41 @@ def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
     assert failed_report.effective_cap == failed_report.cap == 128
 
 
+def test_ddp_vlm_exact_rank_keeps_local_plan_and_neutral_cap_share():
+    """An exact rank must not export its catalog size as the shared cap
+    (widening budget-bucketed peers) and keeps its local plan."""
+    from unsloth_zoo.mlx import shape_guard as sg
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    events = [sg.TextShapeEvent(("vlm",), w, "none") for w in range(10, 50)]
+    frontier = sg.build_text_shape_frontier(
+        events, compile_scope=sg.FULL_STEP_SCOPE,
+    )
+    local_plan = sg.select_text_shape_padding_budget(
+        frontier, exact_signature_threshold=sg.AUTOMATIC_TEXT_COMPILE_CEILING,
+    )
+    assert local_plan.report.action == "exact"
+    contributed = []
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = (
+        lambda cap: contributed.append(cap) or 14  # peer's budget cap wins
+    )
+
+    plan, report, allowed = trainer._coordinate_text_shape_guard(
+        local_plan, frontier, local_plan.report, True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True, keep_exact_local=True,
+    )
+
+    assert contributed == [1]  # neutral share, never the catalog size
+    assert allowed is True and plan is local_plan
+    assert report is local_plan.report and report.action == "exact"
+
+
 def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
     from unsloth_zoo.mlx.compile import build_compile_policy
     from unsloth_zoo.mlx.trainer import (
@@ -560,8 +595,12 @@ def test_text_shape_guard_dispositions_for_vlm_streaming_and_clipped_accum():
     )
 
     cases = (
-        (True, None, MLXTrainingConfig(), "vlm"),
+        # VLM with no resolved compile decision: planning must not run before
+        # qualification.
+        (True, None, MLXTrainingConfig(), "vlm_compile_unqualified"),
         (False, iter(()), MLXTrainingConfig(), "streaming"),
+        # Compiled global-norm clipping with accumulation is eligible, so the
+        # guard plans instead of declining.
         (False, None, MLXTrainingConfig(gradient_accumulation_steps=2,
                                         max_grad_norm=1.0), None),
     )
@@ -2373,9 +2412,26 @@ def test_eval_callback_stop_request_synced_before_best_model_track():
     assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
 
 
+def _all_masked_vlm_plan():
+    # Response-mask filtering drops all-masked rows, so an all-bad checked plan
+    # only arises from rows that bypass it (pad slots, prompt/completion rows).
+    # Model that directly through the class contract (checker_good=False rows).
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _FiniteVLMRow
+
+    return FiniteVLMBatchPlan(
+        rows=[_FiniteVLMRow({"text": "0"}, False)],
+        schedule=((0,),),
+        empty_masks=None,
+        processor=object(),
+        config={},
+        max_seq_length=8,
+        image_size=None,
+    )
+
+
 def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
-    # VLM mirror of the text-path mask check: a fully-masked local shard must
-    # not raise alone in DDP; counts are all-summed before deciding.
+    # VLM mirror of the text-path mask check: a fully-masked local shard must not
+    # raise alone in DDP, since supervision counts are all-summed first.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -2386,18 +2442,16 @@ def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
 
     monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
-    _check_vlm_all_masked(all_bad, comm_group=object(), world_size=2)
+    _check_vlm_all_masked(
+        _all_masked_vlm_plan(), comm_group=object(), world_size=2,
+    )
 
 
 def test_check_vlm_all_masked_single_process_still_raises():
-    import mlx.core as mx
-
     from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
     with pytest.raises(ZeroDivisionError):
-        _check_vlm_all_masked(all_bad)
+        _check_vlm_all_masked(_all_masked_vlm_plan())
 
 
 def test_reset_run_state_clears_last_eval_metrics():
@@ -2496,7 +2550,8 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
 
     forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
-    prepare_source = inspect.getsource(mlx_utils._prepare_vlm_batch_for_compile)
+    # The marker is set by the position-recording prepare phase.
+    prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)
     assert '"_unsloth_collated_position_ids"' in prepare_source
     assert 'not k.startswith("_unsloth_")' in forward_source
     assert 'use_collated_position_ids and "position_ids" in extra_kwargs' in forward_source
@@ -3600,6 +3655,20 @@ def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
         )
         for m in range(8)
     )
+
+
+def test_vlm_checker_consumes_plan_metadata_only():
+    """Call-path contract after the eager internals were deleted: the
+    all-masked checker reads construction-time plan supervision counts and
+    no longer iterates materialized batch dicts."""
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    source = inspect.getsource(_check_vlm_all_masked)
+    assert "supervision_counts" in source
+    assert "for batch_dict in batches" not in source
+    assert "tolist" not in source
 
 
 def test_concat_streaming_eval_is_infinite_when_any_child_is():
