@@ -2920,6 +2920,58 @@ def _rebuild_cpt_full_module_weight_keys(model, restored_keys):
         model._unsloth_cpt_full_module_weight_keys = keys
 
 
+def _is_partial_mlx_checkpoint(model, adapter_weights_file):
+    """Whether the artifact holds only part of the live parameter tree.
+
+    A whole-model save (every live tensor present) is a real full fine-tune and
+    must keep the unfrozen reload. A strict subset came from a selectively
+    frozen tree, so only those tensors should train again.
+    """
+    if not adapter_weights_file or not os.path.exists(adapter_weights_file):
+        return False
+    from safetensors import safe_open
+    from mlx.utils import tree_flatten
+
+    with safe_open(adapter_weights_file, framework="numpy") as adapter_file:
+        saved_keys = set(adapter_file.keys())
+    if not saved_keys:
+        return False
+    live_keys = {name for name, _ in tree_flatten(model.parameters())}
+    # Overlap required: a checkpoint naming nothing live is a mismatch, not a
+    # partition, and the existing missing-key check should own that error.
+    return bool(saved_keys & live_keys) and not live_keys <= saved_keys
+
+
+def _load_pathless_mlx_adapter(
+    model, local_path, adapter_weights_file, adapter_cfg, full_finetuning,
+):
+    """Reload an adapter that records no exact LoRA module paths.
+
+    Continued pretraining that trains only full modules (``embed_tokens`` /
+    ``lm_head``) builds no LoRA, so the artifact is stamped
+    ``fine_tune_type="full"`` with no paths and reload lands here. mlx-lm's
+    ``load_adapters`` binds the saved tensors but never freezes, so every base
+    parameter would come back trainable and the scoped-LR keys would be lost,
+    silently turning a resumed run into a full fine-tune. Freeze first and
+    restore trainability for exactly the tensors the checkpoint holds; a whole-
+    model artifact is a real full fine-tune and keeps the unfrozen route.
+    """
+    from mlx_lm.tuner.utils import load_adapters
+
+    partial_full_module = (
+        not full_finetuning
+        and adapter_cfg.get("fine_tune_type") == "full"
+        and _is_partial_mlx_checkpoint(model, adapter_weights_file)
+    )
+    if partial_full_module:
+        _fix_missing_no_grad(model)
+        model.freeze()
+    model = load_adapters(model, local_path)
+    if partial_full_module:
+        _unfreeze_saved_mlx_non_adapter_parameters(model, adapter_weights_file)
+    return model
+
+
 def _saved_mlx_lora_tensor_shapes(adapter_weights_file):
     """Return raw MLX LoRA A/B shapes grouped by module path."""
     if not adapter_weights_file or not os.path.exists(adapter_weights_file):
@@ -5996,9 +6048,10 @@ class FastMLXModel:
                             model, adapter_weights_file,
                         )
                     else:
-                        from mlx_lm.tuner.utils import load_adapters
-
-                        model = load_adapters(model, local_path)
+                        model = _load_pathless_mlx_adapter(
+                            model, local_path, adapter_weights_file,
+                            adapter_cfg, full_finetuning,
+                        )
                         if os.path.exists(adapter_weights_file):
                             _missing_after_load = _warn_missing_adapter_keys(
                                 model, adapter_weights_file,
@@ -6498,10 +6551,25 @@ class FastMLXModel:
         # vision linears, projector, untied lm_head). Walk the tree for those
         # names rather than collapsing to the canonical 7, which would leave
         # fused-attention archs and MoEs mostly un-LoRA'd.
-        if target_modules == "all-linear" or (
-            isinstance(target_modules, (list, tuple, set, frozenset))
-            and list(target_modules) == ["all-linear"]
-        ):
+        # The sentinel also has to expand inside a mixed list: the CPT recipe
+        # spells continued pretraining as target_modules=["all-linear",
+        # "embed_tokens", "lm_head"], and a literal "all-linear" left in that
+        # list matches no module, so every layer adapter would be dropped.
+        if isinstance(target_modules, str):
+            _expand_all_linear = target_modules == "all-linear"
+            _kept_targets = []
+        elif isinstance(target_modules, (list, tuple, set, frozenset)):
+            _tm_entries = list(target_modules)
+            _expand_all_linear = "all-linear" in _tm_entries
+            # dedup, keep order; the sentinel itself is never a module name.
+            _kept_targets = list(dict.fromkeys(
+                m for m in _tm_entries if m != "all-linear"
+            ))
+        else:
+            _expand_all_linear = False
+            _kept_targets = []
+
+        if _expand_all_linear:
             target_modules = _collect_all_linear_target_names(model)
             # PEFT parity: "all-linear" excludes the output layer; the head is
             # trained explicitly via target_modules=["lm_head"].
@@ -6517,6 +6585,11 @@ class FastMLXModel:
                     "q_proj", "k_proj", "v_proj", "o_proj",
                     "gate_proj", "up_proj", "down_proj",
                 ]
+            # Re-add the co-requested names (embed_tokens / lm_head / an extra
+            # module) that the expansion above does not cover.
+            target_modules = target_modules + [
+                m for m in _kept_targets if m not in target_modules
+            ]
 
         if target_modules is None:
             target_modules = [

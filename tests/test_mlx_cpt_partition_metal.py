@@ -132,6 +132,97 @@ def test_all_linear_sentinel_accepts_set_form():
     assert any(k.endswith("q_proj.lora_a") for k in trn)
 
 
+def test_all_linear_expands_inside_a_mixed_cpt_target_list():
+    # ["all-linear", "embed_tokens"] is the CPT spelling of the sentinel. A
+    # literal "all-linear" left in the list matches no module, and the CPT
+    # entry keeps the no-target guard quiet, so every layer adapter vanished.
+    m = _tiny()
+    _peft(m, target_modules=["all-linear", "embed_tokens"])
+    trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
+    assert "model.embed_tokens.weight" in trn
+    for leaf in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        assert any(k.endswith(f"{leaf}.lora_a") for k in trn), leaf
+    assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
+
+    # The head entry survives the PEFT-parity exclusion of the output layer.
+    h = _tiny()
+    _peft(h, target_modules=["all-linear", "lm_head"])
+    trn = set(dict(mu.tree_flatten(h.trainable_parameters())))
+    assert {"lm_head.lora_a", "lm_head.lora_b"} <= trn
+    assert any(k.endswith("q_proj.lora_a") for k in trn)
+
+    # Set form, and a duplicate sentinel, resolve the same way.
+    s = _tiny()
+    _peft(s, target_modules={"all-linear", "embed_tokens", "lm_head"})
+    trn = set(dict(mu.tree_flatten(s.trainable_parameters())))
+    assert {"lm_head.lora_a", "model.embed_tokens.weight"} <= trn
+    assert any(k.endswith("v_proj.lora_a") for k in trn)
+
+
+def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
+    # No LoRA anywhere, so the artifact is stamped fine_tune_type="full" with
+    # no exact LoRA paths and reload takes the pathless route. mlx-lm's
+    # load_adapters never freezes, so without a selective freeze every base
+    # tensor came back trainable and the scoped-LR keys were lost.
+    import json
+
+    from unsloth_zoo.mlx.loader import (
+        _is_partial_mlx_checkpoint,
+        _load_pathless_mlx_adapter,
+        _mlx_save_lora_adapters,
+        _normalize_mlx_lora_module_paths,
+    )
+
+    m = _tiny()
+    _peft(m, target_modules=["embed_tokens"])
+    assert set(dict(mu.tree_flatten(m.trainable_parameters()))) == {
+        "model.embed_tokens.weight"}
+    d = tempfile.mkdtemp()
+    _mlx_save_lora_adapters(m, d)
+    weights = os.path.join(d, "adapters.safetensors")
+    assert sorted(mx.load(weights)) == ["model.embed_tokens.weight"]
+    with open(os.path.join(d, "adapter_config.json")) as fh:
+        cfg = json.load(fh)
+    assert cfg["fine_tune_type"] == "full"
+    assert not _normalize_mlx_lora_module_paths(
+        cfg.get("unsloth_mlx_lora_module_paths"))
+
+    r = _load_pathless_mlx_adapter(_tiny(), d, weights, cfg, False)
+    assert set(dict(mu.tree_flatten(r.trainable_parameters()))) == {
+        "model.embed_tokens.weight"}
+    assert getattr(r, "_unsloth_cpt_full_module_weight_keys", set()) == {
+        "model.embed_tokens.weight"}
+    assert mx.array_equal(r.model.embed_tokens.weight, m.model.embed_tokens.weight)
+
+    # A full-module head-only checkpoint restores the head, nothing else.
+    hm = _tiny()
+    _peft(hm, target_modules=[], modules_to_save=["lm_head"])
+    hd = tempfile.mkdtemp()
+    _mlx_save_lora_adapters(hm, hd)
+    hw = os.path.join(hd, "adapters.safetensors")
+    with open(os.path.join(hd, "adapter_config.json")) as fh:
+        hcfg = json.load(fh)
+    hr = _load_pathless_mlx_adapter(_tiny(), hd, hw, hcfg, False)
+    assert set(dict(mu.tree_flatten(hr.trainable_parameters()))) == {
+        "lm_head.weight"}
+    assert getattr(hr, "_unsloth_cpt_full_module_weight_keys", set()) == {
+        "lm_head.weight"}
+
+    # A whole-model artifact is a real full fine-tune: keep it unfrozen.
+    fd = tempfile.mkdtemp()
+    whole = _tiny()
+    mx.save_safetensors(
+        os.path.join(fd, "adapters.safetensors"),
+        dict(mu.tree_flatten(whole.parameters())),
+    )
+    assert not _is_partial_mlx_checkpoint(
+        _tiny(), os.path.join(fd, "adapters.safetensors"))
+    # full_finetuning=True never freezes either.
+    ff = _load_pathless_mlx_adapter(_tiny(), d, weights, cfg, True)
+    assert len(dict(mu.tree_flatten(ff.trainable_parameters()))) == len(
+        dict(mu.tree_flatten(ff.parameters())))
+
+
 def test_set_target_modules_respects_finetune_filters():
     # A set selection must still honor finetune_attention_modules=False.
     m = _tiny()
