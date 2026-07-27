@@ -7300,6 +7300,46 @@ def _vlm_family_encode_key(key):
     return ("unstable_key", _vlm_family_type_tag(key_type))
 
 
+
+_AUDIO_TOWER_ATTRS = (
+    "audio_tower", "embed_audio", "audio_encoder", "audio_projection",
+)
+
+
+def freeze_audio_modules(model):
+    """Freeze the audio tower and its projection.
+
+    Audio towers are inference-only here: their encoders carry fp32 promotions,
+    long cumulative reductions and host-synchronizing guards that make them
+    poor training subjects, and the model-side merge assumes their output is a
+    fixed function of the clip. LoRA runs freeze everything by default, but a
+    full fine-tune would otherwise pull these parameters into the optimizer.
+
+    Returns the names of the modules that were frozen.
+    """
+    frozen = []
+    for attr in _AUDIO_TOWER_ATTRS:
+        for owner in (model, getattr(model, "language_model", None)):
+            module = getattr(owner, attr, None) if owner is not None else None
+            if module is None or not hasattr(module, "freeze"):
+                continue
+            module.freeze(recurse=True)
+            frozen.append(attr)
+            break
+    return frozen
+
+
+def _vlm_batch_carries_audio(batch):
+    """Whether a prepared VLM batch carries audio feature tensors.
+
+    Audio feature extents vary per clip and belong to no padable axis, so a
+    batch carrying them cannot participate in compiled-signature planning.
+    """
+    if not isinstance(batch, Mapping):
+        return False
+    return any(batch.get(key) is not None for key in _AUDIO_FEATURE_PAYLOAD_KEYS)
+
+
 def _vlm_batch_family(batch, symbolic_axes=None):
     """Process-stable compile-key family of a prepared VLM batch pytree.
 
@@ -7739,6 +7779,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_mru",
         "_descriptors",
+        "_audio_flags",
         "_widths",
         "_padable",
         "_forbidden",
@@ -7789,6 +7830,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._visit_epoch_cache = None
         self._mru = None
         self._descriptors = None
+        self._audio_flags = None
         self._widths = None
         self._padable = None
         self._forbidden = None
@@ -8014,6 +8056,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         widths = []
         padable_flags = []
         forbidden_sets = []
+        audio_flags = []
         with _preserved_preprocessing_rng():
             for index in range(len(self._schedule)):
                 batch = self._build_batch(index)
@@ -8026,12 +8069,15 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 family = _vlm_batch_family(
                     batch, symbolic_axes=axes if padable else None,
                 )
+                carries_audio = _vlm_batch_carries_audio(batch)
                 del batch
+                audio_flags.append(carries_audio)
                 families.append(family)
                 widths.append(width)
                 padable_flags.append(bool(padable))
                 forbidden_sets.append(forbidden)
         self._descriptors = tuple(families)
+        self._audio_flags = tuple(audio_flags)
         self._widths = tuple(widths)
         self._padable = tuple(padable_flags)
         self._forbidden = tuple(forbidden_sets)
@@ -8044,6 +8090,15 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         eager before surveying anything."""
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         return getattr(tokenizer, "pad_token_id", None)
+
+    def carries_audio(self):
+        """Whether any surveyed batch carries audio feature tensors."""
+        if self._audio_flags is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch families have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return any(self._audio_flags)
 
     def batch_family(self, index):
         """Surveyed compile-key family for one scheduled batch."""

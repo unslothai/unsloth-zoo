@@ -39,6 +39,7 @@ Usage mirrors TRL notebooks:
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
 import concurrent.futures
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -490,6 +491,8 @@ def _mlx_declared_iterable_length(dataset):
 
 
 from .utils import (
+    _vlm_batch_carries_audio,
+    freeze_audio_modules,
     make_cce_loss_fn,
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
@@ -1394,6 +1397,7 @@ def _plan_single_process_vlm_shapes(
     compile_policy,
     compile_decision,
     install_plan=True,
+    carries_audio=None,
 ):
     """Plan finite VLM shapes for the single-process compiled path.
 
@@ -1420,6 +1424,21 @@ def _plan_single_process_vlm_shapes(
             f"cannot be enabled "
             f"({getattr(compile_decision, 'reason', 'unqualified')})."
         )
+    if carries_audio:
+        if _effective_compile_mode(compile_policy, compile_decision) == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan audio training: audio "
+                "feature shapes follow clip duration, so every distinct clip "
+                "length would need its own compiled signature. Train audio "
+                "with compile disabled."
+            )
+        print(
+            "Unsloth: audio inputs detected; training runs eagerly because "
+            "audio feature shapes cannot be compiled into fixed signatures."
+        )
+        return None, _shape_guard_report(
+            "eager", "vlm_audio_inputs", cap, lazy_batches=lazy,
+        ), False, None
     if batch_iter is not None:
         return None, _shape_guard_report(
             "not_applicable", "streaming", cap, lazy_batches=False,
@@ -1467,6 +1486,22 @@ def _plan_single_process_vlm_shapes(
         return None, report, False, None
 
     batches.ensure_descriptors()
+    if batches.carries_audio():
+        if effective_mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan audio training: audio "
+                "feature shapes follow clip duration, so every distinct clip "
+                "length would need its own compiled signature. Train audio "
+                "with compile disabled."
+            )
+        print(
+            "Unsloth: audio inputs detected; training runs eagerly because "
+            "audio feature shapes cannot be compiled into fixed signatures."
+        )
+        return None, _shape_guard_report(
+            "eager", "vlm_audio_inputs", cap, compile_scope,
+            cap_selection="not_applicable",
+        ), False, None
     # Admit only the batches the loop actually visits. The gradient-accumulation
     # floor drops the schedule's trailing micro-batches, and an unplannable
     # family confined to that tail would otherwise degrade the whole run to
@@ -3144,6 +3179,25 @@ class MLXTrainer:
         return applied
 
     @staticmethod
+    def _peek_stream_carries_audio(batch_iter):
+        """Peek one batch for audio and chain it back, consuming nothing.
+
+        Returns ``(carries_audio, batch_iter)``; streaming plans cannot be
+        surveyed and batches are the only place audio is observable.
+        """
+        if batch_iter is None:
+            return False, batch_iter
+        try:
+            first = next(batch_iter)
+        except StopIteration:
+            return False, iter(())
+        payload = first[0] if isinstance(first, tuple) else first
+        return (
+            _vlm_batch_carries_audio(payload),
+            itertools.chain((first,), batch_iter),
+        )
+
+    @staticmethod
     def _ensure_lora_frozen(model):
         """Freeze accidentally trainable norm params when LoRA is active.
 
@@ -4254,6 +4308,10 @@ class MLXTrainer:
                 if deferred_check is not None:
                     # Global counts, so an all-masked dataset raises symmetrically.
                     deferred_check()
+                # No plan to survey: peek one batch, chained back.
+                stream_carries_audio, batch_iter = (
+                    self._peek_stream_carries_audio(batch_iter)
+                )
                 local_plan_error = None
                 shape_plan = None
                 frontier = None
@@ -4272,6 +4330,7 @@ class MLXTrainer:
                         compile_policy=compile_policy,
                         compile_decision=self._compile_decision,
                         install_plan=False,
+                        carries_audio=stream_carries_audio,
                     )
                 except Exception as exc:
                     local_plan_error = exc
@@ -4713,6 +4772,19 @@ class MLXTrainer:
             ),
         )
         self._compile_shape_guard_report = _compile_shape_guard_report
+
+        # Audio towers are never trained here (their encoders are poor training
+        # subjects and the merge assumes their output is a fixed function of the
+        # clip). LoRA runs already freeze everything, but a full fine-tune would
+        # pull the encoder and its projection into the optimizer, so freeze them
+        # before it is built.
+        if self._is_vlm:
+            frozen_audio = freeze_audio_modules(self.model)
+            if frozen_audio:
+                print(
+                    "Unsloth: audio modules kept frozen during training "
+                    f"({', '.join(frozen_audio)})."
+                )
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)

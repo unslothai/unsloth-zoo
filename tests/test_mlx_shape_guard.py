@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import types
 
 import pytest
 
@@ -423,3 +424,84 @@ def test_shared_cap_materialization_preserves_both_padding_budgets():
     assert shared.report.padding_work_fraction <= 0.05
     assert shared.report.max_width_stretch <= 1.5
     assert shared.report.budget_satisfied is True
+
+
+def test_audio_feature_batches_are_detected_for_eager_routing():
+    """Audio feature extents follow clip duration, so they cannot be planned."""
+    from unsloth_zoo.mlx.utils import _vlm_batch_carries_audio
+
+    for batch in ({"input_features": object()}, {"input_audio_embeds": object()}):
+        assert _vlm_batch_carries_audio(batch) is True
+    for batch in ({"pixel_values": object()}, {"input_features": None}, None):
+        assert _vlm_batch_carries_audio(batch) is False
+
+
+def _audio_plan_stub():
+    """Finite plan reporting audio once surveyed."""
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    class _Stub(FiniteVLMBatchPlan):
+        def __init__(self):
+            self.surveyed = False
+
+        def __len__(self):
+            return 1
+
+        def ensure_descriptors(self):
+            self.surveyed = True
+
+        def carries_audio(self):
+            assert self.surveyed, "routing must survey before asking"
+            return True
+
+    return _Stub()
+
+
+def _plan(batches, mode="best_effort", batch_iter=None, carries_audio=None):
+    from unsloth_zoo.mlx import trainer as T
+
+    ns = types.SimpleNamespace
+    return T._plan_single_process_vlm_shapes(
+        batches, batch_iter,
+        args=ns(compile_max_variants=None, gradient_accumulation_steps=1,
+                max_grad_norm=0.0, max_grad_value=None),
+        total_steps=1, distributed_world_size=1,
+        compile_policy=ns(mode=mode),
+        compile_decision=ns(enabled=True, policy_mode=mode, should_raise=False,
+                            arch="gemma3n", reason="qualified"),
+        install_plan=False, carries_audio=carries_audio,
+    )
+
+
+def test_audio_runs_route_eager_before_every_other_exit():
+    """Audio decides routing ahead of streaming and clip-eligibility exits."""
+
+    _, report, compile_allowed, _ = _plan(_audio_plan_stub())
+    assert compile_allowed is False and report.reason == "vlm_audio_inputs"
+    # Streaming: the caller's flag must win over the streaming exit.
+    _, report, compile_allowed, _ = _plan(None, batch_iter=iter(()),
+                                          carries_audio=True)
+    assert compile_allowed is False and report.reason == "vlm_audio_inputs"
+
+    with pytest.raises(RuntimeError, match="cannot plan audio training"):
+        _plan(_audio_plan_stub(), mode="strict")
+
+
+def test_streaming_audio_is_detected_without_consuming_the_stream():
+    """Routing peeks one batch and chains it back, so nothing is lost."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    peek = MLXTrainer._peek_stream_carries_audio
+    audio_batch = {"input_features": object()}
+    plain_batch = {"pixel_values": object()}
+
+    carries, stream = peek(iter([audio_batch, plain_batch]))
+    assert carries is True and list(stream) == [audio_batch, plain_batch]
+
+    # Only the first batch is observable ahead of the run.
+    carries, stream = peek(iter([plain_batch, audio_batch]))
+    assert carries is False and list(stream) == [plain_batch, audio_batch]
+
+    assert peek(None) == (False, None)
+    carries, stream = peek(iter(()))
+    assert carries is False and list(stream) == []

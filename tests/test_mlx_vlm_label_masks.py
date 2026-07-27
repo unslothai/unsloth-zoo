@@ -2165,18 +2165,17 @@ def _qualify(monkeypatch, processor=None, version=None):
         {version or mlx_utils._installed_mlx_vlm_version()})})
 
 
-@pytest.mark.parametrize("setup,message", [
-    (None, "not enabled for any model family"),
-    ("other_family", "is not supported for"),
-    ("other_version", "only been verified"),
+@pytest.mark.parametrize("gate,message", [
+    ({}, "not enabled for any model family"),
+    ({"otherfam": frozenset({"9.9.9"})}, "is not supported for"),
+    (None, "only been verified"),
 ])
-def test_audio_gate_refuses_unverified_family_or_version(monkeypatch, setup, message):
-    if setup == "other_family":
-        from unsloth_zoo.mlx import utils as mlx_utils
-        monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES",
-                            {"otherfam": frozenset({"9.9.9"})})
-    elif setup:
+def test_audio_gate_refuses_unverified_family_or_version(monkeypatch, gate, message):
+    from unsloth_zoo.mlx import utils as mlx_utils
+    if gate is None:  # this family, but a version nothing was probed on
         _qualify(monkeypatch, version="0.0.1-never")
+    else:
+        monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", gate)
     with pytest.raises(NotImplementedError, match=message):
         _finalized_collate([_audio_row(_CLIP)], _FakeGemmaAudioProcessor(), 16, None)
 
