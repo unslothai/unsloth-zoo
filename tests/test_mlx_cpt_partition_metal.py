@@ -36,8 +36,7 @@ import mlx.utils as mu
 
 @pytest.fixture(autouse=True)
 def _require_real_metal():
-    # Re-import: the shim swaps mlx.core in sys.modules after this module
-    # imported real MLX, and these must skip (not fail) under the shim.
+    # Re-import: the shim may have swapped mlx.core in sys.modules since import.
     import mlx.core as _mx
     if not (getattr(_mx, "metal", None) and _mx.metal.is_available()
             and _mx.default_device() == _mx.gpu):
@@ -104,8 +103,7 @@ def test_tied_trains_shared_matrix_and_rejects_lm_head():
     m = _tiny(tied=True)
     _peft(m, target_modules=["embed_tokens"], finetune_language_layers=False)
     assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
-    # The recipe co-requests embed_tokens + lm_head; tied trains the shared
-    # matrix via embed_tokens rather than erroring.
+    # Co-requesting lm_head trains the shared matrix rather than erroring.
     m2 = _tiny(tied=True)
     _peft(m2, target_modules=["embed_tokens", "lm_head"], finetune_language_layers=False)
     assert m2._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
@@ -163,8 +161,8 @@ class _AltHead(nn.Module):
 
 
 def test_unusable_lm_head_keeps_the_other_lora_targets():
-    # An lm_head this backend cannot train must warn and drop, not abort, so
-    # tied and unresolved-head models keep the pre-CPT behaviour.
+    # An untrainable lm_head must warn and drop, not abort, so the other
+    # targets keep the pre-CPT behaviour.
     m = _tiny(tied=True)
     with pytest.warns(UserWarning, match="tied"):
         _peft(m, target_modules=["q_proj", "lm_head"])
@@ -191,8 +189,7 @@ class _WrappedHead(nn.Module):
 
 
 def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
-    # mlx-lm's to_lora() raises for a head it cannot wrap; that must not take
-    # the run down, and modules_to_save still trains it as a full module.
+    # An unwrappable head must warn, not abort; modules_to_save still trains it.
     m = _tiny(); m.lm_head = _WrappedHead()
     with pytest.warns(UserWarning, match="cannot wrap as a LoRA layer"):
         _peft(m, target_modules=["q_proj", "lm_head"])
@@ -206,8 +203,8 @@ def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
 
 
 def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
-    # A wrapper head owns no `.weight`, so recording `lm_head.weight` named a
-    # nonexistent tensor and embedding_learning_rate never reached the head.
+    # A wrapper head owns no `.weight`, so `lm_head.weight` named nothing live
+    # and embedding_learning_rate never reached the head.
     m = _tiny(); m.lm_head = _WrappedHead()
     _peft(m, target_modules=["q_proj"], modules_to_save=["lm_head"])
     keys = m._unsloth_cpt_full_module_weight_keys
@@ -224,8 +221,8 @@ def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
 
 
 def test_quantized_child_of_a_wrapper_head_is_rejected():
-    # Quantization on a wrapper head lives on a descendant, so a leaf-only
-    # `scales` check accepted it and MLX raised at the first backward instead.
+    # A wrapper head carries `scales` on a descendant, which a leaf-only check
+    # missed until MLX raised at the first backward.
     m = _tiny(); m.lm_head = _WrappedHead()
     m.lm_head.linear = nn.QuantizedLinear.from_linear(
         m.lm_head.linear, group_size=32, bits=4)
@@ -242,8 +239,7 @@ def test_quantized_child_of_a_wrapper_head_is_rejected():
 
 
 def test_unusable_lm_head_still_raises_when_nothing_else_trains():
-    # Dropping lm_head must never leave an empty selection to fall through to
-    # auto-discovery, and modules_to_save names one module, so both raise.
+    # Dropping lm_head must never leave an empty selection for auto-discovery.
     with pytest.raises(ValueError, match="tied"):
         _peft(_tiny(tied=True), target_modules=["lm_head"])
     with pytest.raises(ValueError, match="output head could not be resolved"):
@@ -270,8 +266,7 @@ class _VlmCore(nn.Module):
 
 
 def test_root_lm_head_lora_is_attached_outside_the_layer_walk():
-    # The head is a root module, not a layer submodule, so a layer-only walk
-    # never reaches it: head-only must attach it, mixed must not freeze it.
+    # The head is a root module, so a layer-only walk never reaches it.
     head_only = _tiny()
     _peft(head_only, target_modules=["lm_head"])
     assert {"lm_head.lora_a", "lm_head.lora_b"} <= set(
@@ -299,9 +294,8 @@ def test_root_lm_head_lora_is_attached_outside_the_layer_walk():
 
 
 def test_reloaded_cpt_adapter_rebuilds_the_scoped_lr_keys():
-    # Reload restores the full module's trainability, so the scoped-LR key set
-    # must come back too or embedding_learning_rate degrades to the main LR
-    # for every embedding not literally named embed_tokens.
+    # Reload restores trainability, so the scoped-LR keys must come back too or
+    # embedding_learning_rate degrades to the main LR for alt-named embeddings.
     import json
 
     from unsloth_zoo.mlx.loader import (

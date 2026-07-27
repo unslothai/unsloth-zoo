@@ -320,8 +320,8 @@ def linear_to_lora_layers(model, num_layers, config):
             layer.update_modules(tree_unflatten(replacements))
             attached += len(replacements)
 
-    # Root-module pass (mlx-lm parity): a head named in `keys` lives beside the
-    # layers, not inside them, so the layer walk above never reaches it.
+    # Root-module pass: a head named in `keys` sits beside the layers, so the
+    # layer walk above never reaches it.
     root_replacements = [
         (name, _mlx_lora_from_base(module, config, specs=type_specs))
         for name, module in model.named_modules()
@@ -2914,8 +2914,7 @@ def _rebuild_cpt_full_module_weight_keys(model, restored_keys):
         specs.append((head.path, head.module))
     if not specs:
         return
-    # Only tensors this reload actually made trainable: a saved weight the
-    # descriptors do not own stays on the main learning rate.
+    # Only tensors this reload made trainable; anything else stays on the main LR.
     keys = _full_module_weight_keys(model, specs) & set(restored_keys)
     if keys:
         model._unsloth_cpt_full_module_weight_keys = keys
@@ -4496,19 +4495,18 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None):
         collect_mlx_lora_adapter_tensors, iter_mlx_lora_modules,
         _is_base_tensor_inside_lora_module,
     )
-    # Continued pretraining trains full modules (embed_tokens / lm_head weight)
-    # that the LoRA-only writer would silently drop. Detect a trainable non-LoRA
-    # tensor in a selectively frozen tree and use the trainable-tensor writer.
+    # CPT trains full modules (embed_tokens / lm_head weight) that the LoRA-only
+    # writer would drop, so a trainable non-LoRA tensor in a selectively frozen
+    # tree switches to the trainable-tensor writer.
     _trainable = dict(_mu.tree_flatten(self.trainable_parameters()))
     _all = dict(_mu.tree_flatten(self.parameters()))
     _lora = set(collect_mlx_lora_adapter_tensors(self))
     _lora_names = [name for name, _ in iter_mlx_lora_modules(self)]
     _lora_prefixes = tuple(f"{name}." for name in _lora_names if name)
     _root_lora = any(name == "" for name in _lora_names)
-    # A tree nothing has frozen reports EVERY parameter as trainable, which is
-    # not CPT evidence: keep the LoRA-only writer rather than dumping the base
-    # model. The wrapped-base filter matches MLXTrainer.save_model, so a
-    # reload-leaked q_proj.weight under a LoRA-wrapped q_proj does not count.
+    # A tree nothing froze reports EVERY parameter trainable, which is not CPT
+    # evidence: keep the LoRA-only writer. The wrapped-base filter matches
+    # MLXTrainer.save_model, so a reload-leaked q_proj.weight does not count.
     _has_full_module = len(_trainable) < len(_all) and any(
         k not in _lora
         and not _is_base_tensor_inside_lora_module(k, _lora_prefixes, _root_lora)
@@ -5131,9 +5129,9 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
     tied = desc.status == "tied"
 
     if isinstance(target_modules, str):
-        tm = [target_modules]  # a bare module name, not a char iterable
+        tm = [target_modules]  # a bare name, not a char iterable
     elif isinstance(target_modules, (list, tuple, set, frozenset)):
-        tm = list(target_modules)  # accept any selection iterable, incl. sets
+        tm = list(target_modules)
     else:
         tm = []
     if isinstance(modules_to_save, str):
@@ -5152,8 +5150,7 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
     def _add_full(path, module):
         if path is None or path in seen_full:
             return
-        # Quantized modules cannot be full-module trained: the CCE backward
-        # zeroes their gradient, so they would silently never update.
+        # Quantized full modules never update: the CCE backward zeroes the grad.
         quantized_path = _quantized_descendant_path(path, module)
         if quantized_path is not None:
             raise ValueError(
@@ -5181,7 +5178,7 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
         unusable = None
         if tied:
             # A tied head shares embed_tokens' weight, so it trains via that
-            # full module: a co-requested lm_head is already selected.
+            # full module when embed_tokens is co-requested.
             if "embed_tokens" not in tm and "embed_tokens" not in mts:
                 unusable = (
                     "Unsloth: lm_head cannot be trained separately on a tied-"
@@ -5201,8 +5198,8 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
         elif _is_lora_capable_head(desc.module):
             lm_head_lora_path = desc.path  # target_modules -> LoRA on the head
         else:
-            # to_lora() raises deep inside linear_to_lora_layers for a head it
-            # cannot wrap (phixtral's OutputHead is a LayerNorm+Linear).
+            # to_lora() raises inside linear_to_lora_layers for a head it cannot
+            # wrap (phixtral's OutputHead is a LayerNorm+Linear).
             unusable = (
                 f"Unsloth: the output head at {desc.path!r} is a "
                 f"{type(desc.module).__name__}, which mlx-lm cannot wrap as a "
@@ -5210,9 +5207,8 @@ def _partition_cpt_targets(model, target_modules, modules_to_save):
                 "modules_to_save=['lm_head'] to train it as a full module."
             )
         if unusable is not None:
-            # modules_to_save names one module, so an unusable head there must
-            # fail loudly. In target_modules it is one entry among many:
-            # dropping it preserves the pre-CPT behaviour of the other targets.
+            # In modules_to_save the head is the only module, so fail loudly; in
+            # target_modules it is one entry among many, so drop it and warn.
             if "lm_head" in mts or not (lora_targets or full_specs):
                 raise ValueError(unusable)
             warnings.warn(unusable, stacklevel=3)
@@ -6507,9 +6503,8 @@ class FastMLXModel:
             and list(target_modules) == ["all-linear"]
         ):
             target_modules = _collect_all_linear_target_names(model)
-            # PEFT parity: "all-linear" excludes the output layer, so drop the
-            # resolved head's leaf name. The head is trained explicitly via
-            # target_modules=["lm_head"] instead.
+            # PEFT parity: "all-linear" excludes the output layer; the head is
+            # trained explicitly via target_modules=["lm_head"].
             from .utils import describe_output_head
             _hd = describe_output_head(model)
             _head_path = _hd.path or _hd.candidate_path
@@ -6529,9 +6524,8 @@ class FastMLXModel:
                 "gate_proj", "up_proj", "down_proj",
             ]
 
-        # Filter by finetune_attention_modules / finetune_mlp_modules,
-        # whatever the source of target_modules (incl. sets/tuples, not just
-        # lists), so these flags always apply.
+        # Filter by finetune_attention_modules / finetune_mlp_modules, whatever
+        # the source or container type of target_modules, so the flags apply.
         if isinstance(target_modules, (list, tuple, set, frozenset)) and len(target_modules) > 0:
             _ATTN = {
                 "q_proj", "k_proj", "v_proj", "o_proj",
@@ -6562,8 +6556,7 @@ class FastMLXModel:
             {_cpt_lm_head_lora_path} if _cpt_lm_head_lora_path else set()
         )
         # Record the registered full-module weight keys so the trainer scopes
-        # embedding_learning_rate to exactly these tensors, whatever the
-        # module's name or VLM wrapper.
+        # embedding_learning_rate to exactly these tensors, whatever the layout.
         model._unsloth_cpt_full_module_weight_keys = (
             _full_module_weight_keys(model, _cpt_full_specs)
             if _cpt_full_specs else set()
@@ -6584,7 +6577,7 @@ class FastMLXModel:
             _fix_gemma4_kv_sharing(model)
             model.freeze()
 
-            # The key is rooted at `model` but the LoRA call below targets
+            # Keys are rooted at `model`; the LoRA call below targets
             # `model.language_model`, so drop that prefix.
             _vlm_lm_head_keys = {
                 p[len("language_model."):] if p.startswith("language_model.") else p
@@ -6683,15 +6676,14 @@ class FastMLXModel:
             num_layers = len(_mlx_language_layers(model))
             if finetune_last_n_layers is not None and num_layers > 0:
                 num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
-            # Layer LoRA keys, plus the descriptor-rooted lm_head key (a root
-            # module, not a layer submodule).
+            # Layer LoRA keys plus the lm_head key (a root module, not a layer).
             language_lora_keys = (
                 _resolve_lora_keys(model, target_modules)
                 if finetune_language_layers else None
             )
             if _cpt_lm_head_keys or _cpt_full_specs:
-                # Empty layer targets are valid when full modules / an lm_head
-                # adapter still train; never fall through to auto-discovery.
+                # Empty layer targets are valid here (full modules / an lm_head
+                # adapter still train); never fall through to auto-discovery.
                 language_lora_keys = set(language_lora_keys or set()) | _cpt_lm_head_keys
                 _apply_layer_lora = len(language_lora_keys) > 0
             else:
@@ -6728,8 +6720,7 @@ class FastMLXModel:
 
             model.freeze()
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
-            # CPT full modules train at their load dtype, scaled by
-            # embedding_learning_rate.
+            # CPT full modules train at load dtype, scaled by embedding_learning_rate.
             _unfreeze_full_modules(_cpt_full_specs)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)

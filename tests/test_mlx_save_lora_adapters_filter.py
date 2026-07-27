@@ -1551,8 +1551,8 @@ def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
 
 
 def test_save_lora_adapters_method_ignores_a_fully_unfrozen_tree(tmp_path):
-    # load_adapters() never freezes, so a just-reloaded model reports EVERY
-    # base weight as trainable. Not CPT state: keep the LoRA-only writer.
+    # load_adapters() never freezes: every base weight reads trainable, which
+    # is not CPT state, so keep the LoRA-only writer.
     from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
 
     model = _make_model({
