@@ -2955,7 +2955,7 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     assert packed.shape == (2, 3, 1, 1)
     assert positions.tolist() == [[1, 2, 4], [0, 2, 3]]
     window_masks, window_embeds = mc._qwen3_visual_window(
-        masks, packed, positions, mask_offsets=(1, 1), feature_offsets=(1, 1), window=2
+        masks, packed, positions, mask_offsets=(1, 1), window=2
     )
     assert window_masks.tolist() == [[1, 1], [0, 1]]
     assert window_embeds[0].tolist() == [[10], [11], [21]]
@@ -3975,7 +3975,6 @@ def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
             packed,
             positions,
             mask_offsets=(carried_offset,),
-            feature_offsets=(carried_offset,),
             window=6,
         )
         assert window_masks.tolist() == [[0, 0, 1, 1, 0, 0]]
@@ -3997,7 +3996,6 @@ def test_qwen3_visual_window_keeps_rows_apart_under_left_padding():
         packed,
         positions,
         mask_offsets=(0, 0),
-        feature_offsets=(-3, 0),
         window=6,
     )
     assert window_masks.tolist() == masks.tolist()
@@ -4080,3 +4078,41 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
 
     rows = [native_row, compact_row]
     assert mc._pad_qwen3_prompt_rows(rows) is rows
+
+
+def test_qwen3_visual_window_slices_features_in_padded_coordinates():
+    """A chunked window must count features in the same coordinates as the mask.
+
+    _pack_qwen3_visual_state records positions against the padded mask, so
+    slicing features with the unpadded cache offset lets the mask select a
+    visual token whose feature the window excludes. Only reachable when the
+    window is shorter than the row: a whole-row window spans everything and
+    hides the mismatch, which is why it went unnoticed.
+    """
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    pad, seq = 3, 10
+    masks = mx.zeros((1, seq), dtype=mx.bool_)
+    masks[0, 4] = True
+    masks[0, 5] = True
+    packed, positions = mc._pack_qwen3_visual_state(
+        masks, [mx.array([[1], [2]])],
+    )
+    cache = [types.SimpleNamespace(
+        offset=mx.array([1]), left_padding=mx.array([pad]),
+    )]
+    _unpadded, mask_offsets = mc._qwen3_cache_offsets(cache, 1)
+    assert (_unpadded, mask_offsets) == ((1,), (4,)), "padding must shift them apart"
+
+    for window in (4, seq):
+        window_masks, window_embeds = mc._qwen3_visual_window(
+            masks, packed, positions,
+            mask_offsets=mask_offsets, window=window,
+        )
+        selected = int(window_masks.sum().item())
+        supplied = int(window_embeds[0].shape[0])
+        assert selected == supplied, (
+            f"window={window}: mask selected {selected} visual token(s) but "
+            f"the feature slice supplied {supplied}"
+        )

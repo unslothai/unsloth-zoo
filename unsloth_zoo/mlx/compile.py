@@ -2438,26 +2438,26 @@ def _qwen3_visual_window(
     visual_positions,
     *,
     mask_offsets,
-    feature_offsets,
     window,
 ):
-    """Restore flattened Qwen3 features for one compact-state window."""
+    """Restore flattened Qwen3 features for one compact-state window.
+
+    Everything here is in padded mask coordinates, because that is what
+    _pack_qwen3_visual_state records `visual_positions` in. Slicing features
+    with the unpadded cache offset instead lets a chunked prefill select a
+    visual token by mask while excluding its feature.
+    """
 
     batch_size = int(visual_pos_masks.shape[0])
     mask_offsets = tuple(int(offset) for offset in mask_offsets)
-    feature_offsets = tuple(int(offset) for offset in feature_offsets)
     if len(mask_offsets) == 1 and batch_size > 1:
         mask_offsets *= batch_size
-    if len(feature_offsets) == 1 and batch_size > 1:
-        feature_offsets *= batch_size
-    if len(mask_offsets) != batch_size or len(feature_offsets) != batch_size:
+    if len(mask_offsets) != batch_size:
         raise ValueError("Qwen3 visual state does not match the cache batch")
 
     window_masks = []
     feature_slices = [[] for _ in range(visual_state.shape[2])]
-    for row, (mask_start, feature_start) in enumerate(
-        zip(mask_offsets, feature_offsets)
-    ):
+    for row, mask_start in enumerate(mask_offsets):
         whole_row = visual_pos_masks.shape[-1] == window
         if whole_row:
             active_mask = visual_pos_masks[row]
@@ -2483,8 +2483,8 @@ def _qwen3_visual_window(
             # earlier prompt, not to this mask.
             feature_start, feature_stop = 0, int(visual_pos_masks.shape[-1])
         else:
+            feature_start = max(0, mask_start)
             feature_stop = max(0, feature_start + window)
-            feature_start = max(0, feature_start)
         feature_before = int(
             ((row_positions >= 0) & (row_positions < feature_start)).sum().item()
         )
@@ -2815,7 +2815,7 @@ def _qwen3_visual_state_adapter(original):
             compact_state = kwargs.pop(_QWEN3_VISUAL_STATE_KEY, None)
             visual_positions = kwargs.pop(_QWEN3_VISUAL_POSITIONS_KEY, None)
             if compact_state is not None and visual_positions is not None:
-                feature_offsets, mask_offsets = _qwen3_cache_offsets(
+                _unpadded_offsets, mask_offsets = _qwen3_cache_offsets(
                     cache,
                     int(visual_pos_masks.shape[0]),
                 )
@@ -2824,7 +2824,6 @@ def _qwen3_visual_state_adapter(original):
                     compact_state,
                     visual_positions,
                     mask_offsets=mask_offsets,
-                    feature_offsets=feature_offsets,
                     window=int(inputs.shape[1]),
                 )
                 kwargs.pop("n_to_process", None)
