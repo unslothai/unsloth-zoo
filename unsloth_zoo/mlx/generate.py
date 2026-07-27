@@ -30,8 +30,21 @@ from numbers import Integral
 from typing import Any, Literal, Sequence
 
 
-_MLX_LM_PIN = "mlx-lm==0.31.2"
 _TEXT_EVENT_FIELDS = frozenset(("uid", "token", "logprobs", "finish_reason"))
+
+
+def _installed_mlx_lm_version() -> str:
+    """Name the installed mlx-lm, or an unversioned phrase if metadata is unusable."""
+
+    try:
+        from importlib.metadata import version
+
+        installed = version("mlx-lm")
+    except Exception:
+        installed = None
+    if not isinstance(installed, str) or not installed.strip():
+        return "the installed mlx-lm"
+    return f"mlx-lm {installed.strip().splitlines()[0]}"
 
 
 def _current_async_task():
@@ -162,8 +175,9 @@ class GenerationDefaults:
         if unsupported_kv:
             names = " and ".join(unsupported_kv)
             raise ValueError(
-                f"{names} are not supported by {_MLX_LM_PIN}'s "
-                "BatchGenerator; omit these controls."
+                f"{names} are not forwarded by this engine's mlx-lm text "
+                f"path (installed: {_installed_mlx_lm_version()}); omit these "
+                "controls."
             )
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
@@ -289,8 +303,9 @@ def _validate_text_requests(
 def _api_shape_error(details: str) -> RuntimeError:
     return RuntimeError(
         "Unsupported mlx-lm batch-generation API shape "
-        f"({details}). This engine requires the workspace pin {_MLX_LM_PIN}; "
-        "sync the workspace dependencies before using batched generation."
+        f"({details}) in {_installed_mlx_lm_version()}. Batched generation "
+        "needs a BatchGenerator that streams per-token events; upgrade or "
+        "reinstall mlx-lm, or use model.generate for sequential decoding."
     )
 
 
