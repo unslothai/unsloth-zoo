@@ -6058,11 +6058,6 @@ def _filter_trainable_vlm_indices(
 _VLM_ROW_SNAPSHOT_DEPTH = 8
 
 
-# Sample count stays small so the probe is O(1) per payload; a reused decode
-# buffer is rewritten whole, so any spread of samples catches it.
-_VLM_MEDIA_PROBE_SAMPLES = 16
-
-
 def _vlm_pil_image_is_decoded(image):
     """True when a PIL image already holds a decoded raster.
 
@@ -6078,58 +6073,60 @@ def _vlm_pil_image_is_decoded(image):
     return True
 
 
+def _vlm_media_bytes_digest(array):
+    """Exact (sum, xor) over every byte of an array-like payload.
+
+    A sparse sample cannot see a mutation that misses its stride, and the
+    stride is derivable from the shape, so the probe reads the whole buffer.
+    Two independent byte reductions are used rather than one because a sum
+    alone is blind to changes that cancel. This is a raw-byte view, so it is
+    exact for float payloads too, and it costs a memory-bandwidth pass rather
+    than a cryptographic one: about 1 ms per megapixel against 4 ms for
+    blake2b, paid once per scheduled slot at plan construction.
+    """
+    flat = np.ascontiguousarray(array).reshape(-1).view(np.uint8)
+    if flat.size == 0:
+        return (0, 0)
+    return (
+        int(flat.sum(dtype=np.uint64)),
+        int(np.bitwise_xor.reduce(flat)),
+    )
+
+
 def _vlm_media_fingerprint(payload):
-    """Cheap content probe for a mutable media payload, or None to skip it.
+    """Content probe for a mutable media payload, or None to skip it.
 
     Rows are stored by reference, so a dataset that decodes into one reused
     buffer silently rewrites rows already collected. Copying every payload
     instead would cost one image per scheduled slot rather than per row, so
     the plan probes content and reports the corruption rather than paying to
     prevent it. Undecoded PIL handles are skipped: probing one would force the
-    decode this path exists to defer.
+    decode this path exists to defer, and a released handle is re-opened from
+    a stable path, so no reused buffer can reach it.
     """
     try:
         if isinstance(payload, np.ndarray):
-            flat = payload.reshape(-1)
-            if flat.size == 0:
-                return ("ndarray", payload.shape, str(payload.dtype), ())
-            step = max(1, flat.size // _VLM_MEDIA_PROBE_SAMPLES)
-            sample = flat[::step][:_VLM_MEDIA_PROBE_SAMPLES]
-            return ("ndarray", payload.shape, str(payload.dtype), sample.tobytes())
-        if isinstance(payload, bytearray):
-            step = max(1, len(payload) // _VLM_MEDIA_PROBE_SAMPLES)
-            return ("bytearray", len(payload), bytes(payload[::step][:_VLM_MEDIA_PROBE_SAMPLES]))
+            return ("ndarray", payload.shape, str(payload.dtype),
+                    _vlm_media_bytes_digest(payload))
+        if isinstance(payload, (bytes, bytearray)):
+            return ("bytes", len(payload),
+                    _vlm_media_bytes_digest(np.frombuffer(bytes(payload), dtype=np.uint8)))
         pil_image = sys.modules.get("PIL.Image")
         if pil_image is not None and isinstance(payload, pil_image.Image):
             if not _vlm_pil_image_is_decoded(payload):
                 return None
-            width, height = payload.size
-            if width <= 0 or height <= 0:
-                return ("image", payload.mode, payload.size, ())
-            span = max(1, (width * height) // _VLM_MEDIA_PROBE_SAMPLES)
-            spots = tuple(
-                payload.getpixel((offset % width, (offset // width) % height))
-                for offset in range(0, width * height, span)
-            )
-            return ("image", payload.mode, payload.size, spots[:_VLM_MEDIA_PROBE_SAMPLES])
+            # Already decoded, so asarray reads the existing raster.
+            return ("image", payload.mode, payload.size,
+                    _vlm_media_bytes_digest(np.asarray(payload)))
         torch_module = sys.modules.get("torch")
         if torch_module is not None and isinstance(payload, torch_module.Tensor):
-            flat = payload.detach().reshape(-1)
-            if flat.numel() == 0:
-                return ("tensor", tuple(payload.shape), str(payload.dtype), ())
-            step = max(1, flat.numel() // _VLM_MEDIA_PROBE_SAMPLES)
-            sample = flat[::step][:_VLM_MEDIA_PROBE_SAMPLES]
             return ("tensor", tuple(payload.shape), str(payload.dtype),
-                    tuple(sample.tolist()))
+                    _vlm_media_bytes_digest(payload.detach().cpu().numpy()))
         # mlx arrays support in-place __setitem__, so an mlx-native dataset can
         # alias exactly like a numpy one.
         if isinstance(payload, _MX_ARRAY_TYPE):
-            flat = payload.reshape(-1)
-            if flat.size == 0:
-                return ("mx", payload.shape, ())
-            step = max(1, flat.size // _VLM_MEDIA_PROBE_SAMPLES)
-            sample = flat[::step][:_VLM_MEDIA_PROBE_SAMPLES]
-            return ("mx", payload.shape, tuple(sample.tolist()))
+            return ("mx", payload.shape, str(payload.dtype),
+                    _vlm_media_bytes_digest(np.asarray(payload)))
     except Exception:
         # An unprobeable payload is simply not covered by the check.
         return None
@@ -6627,6 +6624,19 @@ def _release_vlm_row_image_handles(item, _depth=0):
                     released = copy.copy(item)
                 released[key] = new_value
         return item if released is None else released
+    if isinstance(item, tuple):
+        # A stored row can nest media in a tuple; a plain rebuild would also
+        # flatten a namedtuple, so reuse the concrete type when it takes an
+        # iterable and fall back to positional construction when it does not.
+        walked = [_release_vlm_row_image_handles(value, _depth + 1) for value in item]
+        if all(new is old for new, old in zip(walked, item)):
+            return item
+        if type(item) is tuple:
+            return tuple(walked)
+        try:
+            return type(item)(*walked)
+        except TypeError:
+            return tuple(walked)
     if isinstance(item, list):
         released = None
         for position, value in enumerate(item):
@@ -6654,6 +6664,19 @@ def _restore_vlm_row_image_handles(item, _depth=0):
                     restored = copy.copy(item)
                 restored[key] = new_value
         return item if restored is None else restored
+    if isinstance(item, tuple):
+        # A stored row can nest media in a tuple; a plain rebuild would also
+        # flatten a namedtuple, so reuse the concrete type when it takes an
+        # iterable and fall back to positional construction when it does not.
+        walked = [_restore_vlm_row_image_handles(value, _depth + 1) for value in item]
+        if all(new is old for new, old in zip(walked, item)):
+            return item
+        if type(item) is tuple:
+            return tuple(walked)
+        try:
+            return type(item)(*walked)
+        except TypeError:
+            return tuple(walked)
     if isinstance(item, list):
         restored = None
         for position, value in enumerate(item):

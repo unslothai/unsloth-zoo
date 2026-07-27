@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import inspect
 
 import numpy as np
@@ -2037,3 +2038,88 @@ def test_vlm_plan_accepts_a_dataset_that_returns_a_fresh_image_per_read():
     plan.materialize_all()
     assert [int(np.asarray(row.item["images"][0]).reshape(-1)[0]) for row in plan.rows] \
         == [1, 2, 3, 4]
+
+
+def test_vlm_media_probe_sees_a_change_that_a_sparse_sample_would_miss():
+    # A sampled probe reads a fixed stride derived from the shape, so a
+    # mutation that lands between samples is invisible to it. The digest reads
+    # every byte, and uses two independent reductions so changes that cancel
+    # under a sum still register.
+    Image = pytest.importorskip("PIL.Image")
+    from unsloth_zoo.mlx.utils import _vlm_media_fingerprint
+
+    original = np.random.RandomState(0).randint(
+        0, 255, (64, 64, 3), dtype=np.uint8,
+    )
+    mutated = original.copy()
+    flat = mutated.reshape(-1)
+    stride = max(1, flat.size // 16)
+    off_sample = next(i for i in range(flat.size) if i % stride)
+    flat[off_sample] = (int(flat[off_sample]) + 7) % 256
+
+    sampled = original.reshape(-1)[::stride][:16].tobytes()
+    assert sampled == mutated.reshape(-1)[::stride][:16].tobytes(), (
+        "the mutation must be invisible to a 16-sample probe, or this test "
+        "is not exercising the gap it exists for"
+    )
+    assert _vlm_media_fingerprint(original) != _vlm_media_fingerprint(mutated)
+    assert _vlm_media_fingerprint(original) == _vlm_media_fingerprint(
+        original.copy()
+    )
+    # Same gap through PIL, whose probe used spread getpixel reads.
+    assert _vlm_media_fingerprint(Image.fromarray(original)) \
+        != _vlm_media_fingerprint(Image.fromarray(mutated))
+    # A sum alone is blind to a change that cancels; the xor half is not.
+    cancelling = original.copy().reshape(-1)
+    cancelling[1] = (int(cancelling[1]) + 3) % 256
+    cancelling[2] = (int(cancelling[2]) - 3) % 256
+    assert _vlm_media_fingerprint(original) != _vlm_media_fingerprint(
+        cancelling.reshape(original.shape)
+    )
+
+
+def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
+    # The snapshot walker traverses tuples, so the release and restore walkers
+    # must too: a row shaped {"images": (Image.open(path),)} otherwise keeps
+    # every descriptor open for the life of the plan.
+    Image = pytest.importorskip("PIL.Image")
+    from unsloth_zoo.mlx.utils import (
+        _release_vlm_row_image_handles,
+        _restore_vlm_row_image_handles,
+    )
+
+    paths = []
+    for index in range(24):
+        path = tmp_path / f"tuple_{index}.png"
+        Image.fromarray(
+            np.full((8, 8, 3), index + 1, dtype=np.uint8)
+        ).save(path)
+        paths.append(str(path))
+
+    before = _open_fd_count()
+    released = [
+        _release_vlm_row_image_handles({"images": (Image.open(path),)})
+        for path in paths
+    ]
+    held = _open_fd_count() - before
+    assert held <= 2, (
+        f"the plan pinned {held} descriptors for {len(paths)} tuple-nested "
+        f"rows; a stored row must not keep its image file open"
+    )
+
+    restored = _restore_vlm_row_image_handles(released[5])
+    assert isinstance(restored["images"], tuple)
+    assert int(np.asarray(restored["images"][0]).reshape(-1)[0]) == 6
+
+    # A namedtuple keeps its type rather than collapsing to a plain tuple.
+    holder = collections.namedtuple("holder", "left right")
+    row = {"media": holder(left=Image.open(paths[0]), right="caption")}
+    out = _release_vlm_row_image_handles(row)
+    assert type(out["media"]) is holder
+    assert out["media"].right == "caption"
+    back = _restore_vlm_row_image_handles(out)
+    assert int(np.asarray(back["media"].left).reshape(-1)[0]) == 1
+
+    # A tuple holding nothing releasable keeps its exact identity.
+    plain = {"images": ("a", "b")}
+    assert _release_vlm_row_image_handles(plain)["images"] is plain["images"]
