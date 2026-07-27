@@ -8125,3 +8125,132 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+
+def test_stream_width_policy_and_registry_contracts():
+    """A disarmed policy leaves both staging rules untouched, and the registry
+    separates every axis a compiled call keys on."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.trainer import (
+        _StreamSignatureRegistry, _StreamWidthPolicy, _stream_batch_signature,
+    )
+    from unsloth_zoo.mlx.utils import (
+        _stage_text_batch_from_items, _stage_tokenized_text_batch,
+    )
+
+    class _Tok:
+        pad_token_id = 0
+
+    policy = _StreamWidthPolicy(StreamShapeGrid(anchor=512))
+    # Labeled, so label bytes are compared and not just their absence.
+    rows = [([1] * 40, [2] * 40), ([1] * 55, [3] * 55)]
+    raw = [[1] * 40, [1] * 55]
+    plain = _stage_tokenized_text_batch(rows, 512, pad_id=0)
+    plain_raw = _stage_text_batch_from_items(raw, _Tok(), 512)
+    assert policy(55) is None
+    # Disarmed: both paths stage byte-identically.
+    for staged, reference in (
+        (_stage_tokenized_text_batch(rows, 512, pad_id=0, width_policy=policy), plain),
+        (_stage_text_batch_from_items(raw, _Tok(), 512, width_policy=policy), plain_raw),
+    ):
+        assert np.array_equal(np.asarray(staged.ids), np.asarray(reference.ids))
+        assert np.array_equal(
+            np.asarray(staged.lengths_info), np.asarray(reference.lengths_info),
+        )
+        assert np.array_equal(
+            np.asarray(staged.labels), np.asarray(reference.labels),
+        )
+
+    policy.armed = True
+    guarded = _stage_tokenized_text_batch(
+        rows, 512, pad_id=0, width_policy=policy,
+    )
+    # Widened, with true lengths kept so masking never sees the tail.
+    assert guarded.ids.shape == (2, 65)
+    assert np.array_equal(guarded.lengths_info, plain.lengths_info)
+
+    registry = _StreamSignatureRegistry(1)
+
+    def _key(width, rows=2, phase="single", execution=("gpu", "s0")):
+        batch = (np.zeros((rows, width), dtype=np.int32), None, None)
+        return _stream_batch_signature(batch, phase, execution)
+
+    registry.record(_key(33))
+    # A repeat never trips; every keyed axis is distinct.
+    assert not registry.would_trip(_key(33))
+    assert all(registry.would_trip(other) for other in (
+        _key(65), _key(33, rows=4), _key(33, phase="tree_update"),
+        _key(33, execution=("gpu", "s1")),
+    ))
+
+
+
+
+def test_streaming_guard_admission_protocol_is_one_collective_per_fetch():
+    """One reduction per fetch, failure outranking a trip, a peer-only trip
+    switching this rank, and non-compiled microsteps still participating."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, _StreamSignatureRegistry, _stream_batch_signature,
+        _stream_execution_key,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_rank = 0
+    trainer.stop_requested = False
+    reductions = []
+    peer_signal = 0
+
+    def _fake_max_int(value):
+        reductions.append(value)
+        return max(value, peer_signal)
+
+    trainer._distributed_max_int = _fake_max_int
+    registry = _StreamSignatureRegistry(1)
+    batch = (np.zeros((2, 33), dtype=np.int32), None, None)
+
+    def _admit(world=2, data=batch):
+        return trainer._admit_stream_batch(
+            registry, data, FULL_STEP_SCOPE, 1, 0, world,
+        )
+
+    # Admitted and recorded; one reduction, contributing 0.
+    assert _admit() is False
+    assert reductions == [0] and len(registry.observed) == 1
+
+    # A second distinct shape exceeds the cap.
+    wide = (np.zeros((2, 65), dtype=np.int32), None, None)
+    assert _admit(data=wide) is True
+    assert reductions[-1] == 1
+
+    peer_signal = 1
+    assert _admit() is True
+    peer_signal = 0
+
+    # A microstep with no compiled call still participates.
+    before = len(reductions)
+    assert _admit(data=None) is False
+    assert len(reductions) == before + 1 and reductions[-1] == 0
+
+    # A peer failure outranks everything.
+    peer_signal = 2
+    with pytest.raises(RuntimeError, match="peer rank failed"):
+        _admit()
+    # One reduction per admission, never two.
+    assert len(reductions) == 5
+
+    # Single-process runs add no collective at all.
+    solo = _StreamSignatureRegistry(1)
+    before = len(reductions)
+    assert trainer._admit_stream_batch(
+        solo, batch, FULL_STEP_SCOPE, 1, 0, 1,
+    ) is False
+    assert len(reductions) == before
+    assert _stream_batch_signature(
+        batch, "single", _stream_execution_key(),
+    ) in solo.observed

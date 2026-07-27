@@ -4631,8 +4631,12 @@ def _stage_tokenized_text_batch(
     pad_id=0,
     labels_expected=None,
     host_valued=None,
+    width_policy=None,
 ):
     """Host staging of one pretokenized text batch (no MLX work).
+
+    ``width_policy`` maps this batch's width to the width it is staged at;
+    ``None`` keeps the exact batch maximum, as unguarded runs do.
 
     ``host_valued=None`` computes the flag from the items; the lazy pipeline
     instead passes the stream-level flag recorded at row normalization, where
@@ -4646,6 +4650,13 @@ def _stage_tokenized_text_batch(
     max_length = max(lengths)
     if max_length == 0:
         max_length = min(2, max_seq_length)
+    if width_policy is not None:
+        # Widen onto the grid so compiled signatures live only at grid
+        # points; true lengths stay in lengths_info, so masking is unaffected.
+        # A policy returning None is not in force.
+        endpoint = width_policy(max_length)
+        if endpoint is not None:
+            max_length = endpoint
     batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
     has_labels = (
         valid_items[0][1] is not None
@@ -8332,8 +8343,13 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
     )
 
 
-def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_valued=True):
-    """Build a text training batch from tokenized items."""
+def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length,
+                                 host_valued=True, width_policy=None):
+    """Build a text training batch from tokenized items.
+
+    ``width_policy`` replaces the mlx-lm rounding rule; ``None`` keeps it, as
+    unguarded runs do.
+    """
     valid_items = [item for item in batch_items if item is not None]
     with_offsets = bool(
         valid_items
@@ -8365,12 +8381,16 @@ def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_va
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    max_length = _finite_text_pad_width(
-        max(lengths),
-        pad_to_multiple=32,
-        minimum_width=2,
-        max_seq_length=max_seq_length,
-    )
+    # The grid replaces the rounding rule (it caps at max_seq_length and
+    # carries its own floor); a policy returning None is not in force.
+    max_length = None if width_policy is None else width_policy(max(lengths))
+    if max_length is None:
+        max_length = _finite_text_pad_width(
+            max(lengths),
+            pad_to_multiple=32,
+            minimum_width=2,
+            max_seq_length=max_seq_length,
+        )
     batch_ids = []
     truncated_lengths = []
     for ids, length in zip(batch, lengths):
@@ -9501,6 +9521,7 @@ def _iterate_lazy_text_training_batches(
     yield_host_staged=False,
     reject_mlx_valued=False,
     should_stop=None,
+    width_policy=None,
 ):
     """Yield text batches without materializing an unsized source.
 
@@ -9578,6 +9599,7 @@ def _iterate_lazy_text_training_batches(
                     tokenizer,
                     max_seq_length,
                     host_valued=state.get("host_valued", True),
+                    width_policy=width_policy,
                 )
             return _stage_tokenized_text_batch(
                 local_items,
@@ -9585,6 +9607,7 @@ def _iterate_lazy_text_training_batches(
                 pad_id=_mlx_text_pad_id(tokenizer),
                 labels_expected=state.get("label_state"),
                 host_valued=state.get("host_valued", True),
+                width_policy=width_policy,
             )
 
         def _yield_value(local_items):
@@ -10202,7 +10225,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              length_window_batches=1,
                              prefetch_batches=0,
                              prefetch_skip_batches=0,
-                             prefetch_control=None):
+                             prefetch_control=None,
+                             width_policy=None):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -10238,6 +10262,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             expected_rows_per_pass=expected_rows_per_pass,
             length_window_batches=length_window_batches,
             window_seed=seed,
+            width_policy=width_policy,
         )
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
