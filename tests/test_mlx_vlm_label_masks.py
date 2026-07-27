@@ -1538,3 +1538,64 @@ def test_gemma3n_token_type_ownership_survives_module_relocation():
     assert _vlm_processor_requests_mm_token_type_ids(
         processor("transformers.models.gemma3.processing_gemma3", "Gemma3Processor")
     ) is True
+
+
+def test_qwen3_mixed_prompt_batch_keeps_every_row_through_the_real_merger():
+    """mlx-vlm's shipped merger must return one visual row per input_ids row.
+
+    A server batches a text-only request next to an image request, so only the
+    image row carries the compact visual keys. mlx-vlm concatenates an optional
+    key over just the rows that hold it, so the batch dimension has to be filled
+    in beforehand or the features land on the wrong row.
+    """
+    import importlib
+
+    pytest.importorskip("mlx_vlm")
+    try:
+        ar = importlib.import_module("mlx_vlm.generate.ar")
+    except Exception:
+        pytest.skip("mlx-vlm without the batched generate module")
+    merge = getattr(ar, "_merge_prefill_prompt_kwargs", None)
+    if merge is None:
+        pytest.skip("mlx-vlm without _merge_prefill_prompt_kwargs")
+    # Call the shipped function directly, whether or not the patches are live.
+    merge = getattr(merge, "__wrapped__", merge)
+
+    import unsloth_zoo.mlx.compile as mc
+
+    # why: a sibling module can swap these modules' `mx` for the simulation
+    # stub, which cannot consume the real MLX arrays this file builds.
+    for module in (mc, ar):
+        if "mlx_simulation" in str(getattr(module, "__file__", "")) or (
+            "mlx_simulation" in str(getattr(getattr(module, "mx", None), "__file__", ""))
+        ):
+            pytest.skip("module is bound to the MLX simulation stub")
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+    text_ids = [7, 8, 9, 10, 11, 12]
+    visual_ids = [7, 1, 2, 2, 3, 12]
+    rows = [
+        {"inputs_embeds": mx.zeros((1, 6, 4))},
+        {
+            "inputs_embeds": mx.zeros((1, 6, 4)),
+            "visual_pos_masks": masks,
+            mc._QWEN3_VISUAL_STATE_KEY: state,
+            mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+        },
+    ]
+
+    _, merged = merge(mc._pad_qwen3_prompt_rows(rows), [text_ids, visual_ids])
+
+    for key in (
+        "visual_pos_masks",
+        mc._QWEN3_VISUAL_STATE_KEY,
+        mc._QWEN3_VISUAL_POSITIONS_KEY,
+    ):
+        assert merged[key].shape[0] == 2, (
+            f"{key} came back with {merged[key].shape[0]} of 2 rows"
+        )
+    # Only the image row owns live feature positions.
+    assert merged[mc._QWEN3_VISUAL_POSITIONS_KEY].tolist() == [[-1, -1], [2, 3]]
+    assert merged["visual_pos_masks"].tolist()[0] == [False] * 6
+    assert merged["visual_pos_masks"].tolist()[1] == masks.tolist()[0]

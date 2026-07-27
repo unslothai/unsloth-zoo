@@ -270,3 +270,50 @@ def test_materialize_persists_corrected_config_only_when_sidecar_exists(tmp_path
         (Path(load_path) / "config.json").read_text(encoding="utf-8")
     )
     assert written == corrected
+
+
+def test_config_view_links_resolve_from_a_relative_model_directory(tmp_path, monkeypatch):
+    """A relative local model dir must still yield links a loader can open."""
+    import os
+    import shutil
+
+    from unsloth_zoo.mlx.loader import _materialize_mlx_vlm_config_override
+
+    model_dir = tmp_path / "relmodel"
+    model_dir.mkdir()
+    config = {
+        "model_type": "llava",
+        "vision_config": {"patch_size": 14},
+        "vision_feature_select_strategy": "default",
+    }
+    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    # Missing patch_size: the repair rewrites processor_config.json, which is
+    # what forces the temporary view in the first place.
+    (model_dir / "processor_config.json").write_text(
+        json.dumps({"processor_class": "LlavaProcessor"}), encoding="utf-8"
+    )
+    (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"\x00" * 16)
+
+    # mlx-lm hands a local directory straight back, so a relative model name
+    # reaches the view builder still relative to the caller's cwd.
+    monkeypatch.chdir(tmp_path)
+    load_path, _ = _materialize_mlx_vlm_config_override("relmodel", config)
+    try:
+        assert load_path != "relmodel"
+        dangling = sorted(
+            name
+            for name in os.listdir(load_path)
+            if not os.path.exists(os.path.join(load_path, name))
+        )
+        assert dangling == [], f"config view has dangling links: {dangling}"
+        assert (Path(load_path) / "model.safetensors").read_bytes() == b"\x00" * 16
+        assert json.loads(
+            (Path(load_path) / "config.json").read_text(encoding="utf-8")
+        ) == config
+        # Links still point at the caller's directory, not into the view.
+        target = os.readlink(os.path.join(load_path, "model.safetensors"))
+        assert os.path.isabs(target)
+        assert Path(target).parent == model_dir
+    finally:
+        shutil.rmtree(load_path, ignore_errors=True)

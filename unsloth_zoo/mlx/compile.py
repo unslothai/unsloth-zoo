@@ -2614,25 +2614,70 @@ def _attach_qwen3_visual_state(features, visual_state, visual_positions):
     return features
 
 
+def _qwen3_prompt_row_length(kwargs):
+    """Prompt length of one merge row, read off its required inputs_embeds."""
+
+    embeds = kwargs.get("inputs_embeds") if kwargs else None
+    shape = getattr(embeds, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    return int(shape[1])
+
+
 def _pad_qwen3_prompt_rows(prompt_kwargs_list):
     """Equalize compact visual widths before generic batch concatenation."""
 
-    max_features = max(
-        (
-            kwargs[_QWEN3_VISUAL_STATE_KEY].shape[1]
-            for kwargs in prompt_kwargs_list
-            if kwargs and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is not None
-        ),
-        default=0,
-    )
-    if not max_features:
+    states = [
+        kwargs.get(_QWEN3_VISUAL_STATE_KEY) if kwargs else None
+        for kwargs in prompt_kwargs_list
+    ]
+    present = [state for state in states if state is not None]
+    if not present:
         return prompt_kwargs_list
+    max_features = max(state.shape[1] for state in present)
+
+    # why: mlx-vlm concatenates an optional prompt key only over the rows that
+    # actually carry it, so a text-only row in a mixed batch drops out and
+    # every visual row slides onto the wrong batch entry. Absent rows need an
+    # empty state plus an empty mask so all three keys keep the input_ids batch.
+    absent_rows = [
+        kwargs
+        for kwargs, state in zip(prompt_kwargs_list, states)
+        if state is None and kwargs
+    ]
+    mask_template = next(
+        (
+            kwargs["visual_pos_masks"]
+            for kwargs, state in zip(prompt_kwargs_list, states)
+            if state is not None and kwargs.get("visual_pos_masks") is not None
+        ),
+        None,
+    )
+    for kwargs in absent_rows:
+        # A row still on mlx-vlm's native deepstack path cannot be reconciled
+        # with the compact one, so leave the batch exactly as it is today.
+        if kwargs.get("visual_pos_masks") is not None:
+            return prompt_kwargs_list
+        if _qwen3_prompt_row_length(kwargs) is None or mask_template is None:
+            return prompt_kwargs_list
 
     padded_rows = [dict(kwargs) if kwargs else kwargs for kwargs in prompt_kwargs_list]
-    for kwargs in padded_rows:
-        if not kwargs or kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None:
+    for kwargs, state in zip(padded_rows, states):
+        if not kwargs:
             continue
-        state = kwargs[_QWEN3_VISUAL_STATE_KEY]
+        if state is None:
+            kwargs[_QWEN3_VISUAL_STATE_KEY] = mx.zeros(
+                (1, max_features) + tuple(present[0].shape[2:]),
+                dtype=present[0].dtype,
+            )
+            kwargs[_QWEN3_VISUAL_POSITIONS_KEY] = mx.full(
+                (1, max_features), -1, dtype=mx.int32
+            )
+            kwargs["visual_pos_masks"] = mx.zeros(
+                (1, _qwen3_prompt_row_length(kwargs)),
+                dtype=mask_template.dtype,
+            )
+            continue
         positions = kwargs[_QWEN3_VISUAL_POSITIONS_KEY]
         pad = max_features - state.shape[1]
         if pad <= 0:

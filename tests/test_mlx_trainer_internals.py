@@ -4010,3 +4010,73 @@ def test_qwen3_cache_offsets_accepts_declared_none_left_padding():
 
     cache = [types.SimpleNamespace(offset=0, left_padding=None)]
     assert mc._qwen3_cache_offsets(cache, batch_size=1) == ((0,), (0,))
+
+
+def test_qwen3_prompt_rows_keep_a_slot_for_text_only_rows():
+    """A text-only row in a mixed batch must not vacate its batch position."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(
+        masks, [mx.array([[1.0], [2.0]]), mx.array([[3.0], [4.0]])]
+    )
+    text_row = {"inputs_embeds": mx.zeros((1, 4, 1))}
+    visual_row = {
+        "inputs_embeds": mx.zeros((1, 6, 1)),
+        "visual_pos_masks": masks,
+        mc._QWEN3_VISUAL_STATE_KEY: state,
+        mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+    }
+
+    padded = mc._pad_qwen3_prompt_rows([text_row, visual_row])
+
+    # mlx-vlm concatenates an optional prompt key only over the rows that carry
+    # it, so an absent row slides every later row onto the wrong batch entry.
+    assert all(
+        row.get(mc._QWEN3_VISUAL_STATE_KEY) is not None
+        and row.get(mc._QWEN3_VISUAL_POSITIONS_KEY) is not None
+        and row.get("visual_pos_masks") is not None
+        for row in padded
+    ), "a text-only row must still carry an empty visual state, positions and mask"
+
+    empty_state = padded[0][mc._QWEN3_VISUAL_STATE_KEY]
+    assert tuple(empty_state.shape) == tuple(state.shape)
+    assert float(mx.abs(empty_state).max().item()) == 0.0
+    assert padded[0][mc._QWEN3_VISUAL_POSITIONS_KEY].tolist() == [[-1, -1]]
+    # The synthesized mask spans the row's own prompt so mlx-vlm's
+    # sequence-aligned left padding still recognizes and pads it.
+    assert tuple(padded[0]["visual_pos_masks"].shape) == (1, 4)
+    assert padded[0]["visual_pos_masks"].tolist() == [[False, False, False, False]]
+
+    # The visual row is untouched.
+    assert padded[1][mc._QWEN3_VISUAL_POSITIONS_KEY].tolist() == positions.tolist()
+    assert padded[1]["visual_pos_masks"].tolist() == masks.tolist()
+
+
+def test_qwen3_prompt_rows_left_alone_without_any_visual_row():
+    """Text-only batches keep mlx-vlm's original prompt kwargs untouched."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    rows = [{"inputs_embeds": mx.zeros((1, 4, 1))}, {"inputs_embeds": mx.zeros((1, 5, 1))}]
+    assert mc._pad_qwen3_prompt_rows(rows) is rows
+
+
+def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
+    """A row still on mlx-vlm's own deepstack keys is left exactly as it is."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 1, 1, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+    compact_row = {
+        "inputs_embeds": mx.zeros((1, 4, 1)),
+        "visual_pos_masks": masks,
+        mc._QWEN3_VISUAL_STATE_KEY: state,
+        mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+    }
+    native_row = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
+
+    rows = [native_row, compact_row]
+    assert mc._pad_qwen3_prompt_rows(rows) is rows

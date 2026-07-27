@@ -742,9 +742,13 @@ def _materialize_mlx_vlm_config_override(
         return local_path, config_data
 
     override_dir = tempfile.mkdtemp(prefix="unsloth_mlx_vlm_config_")
+    # why: a relative model dir would make every link resolve against the
+    # temporary directory instead of the caller's cwd, dangling the weights and
+    # tokenizer. Only the link targets change; the returned path is untouched.
+    source_dir = os.path.abspath(local_path)
     try:
-        for name in os.listdir(local_path):
-            src = os.path.join(local_path, name)
+        for name in os.listdir(source_dir):
+            src = os.path.join(source_dir, name)
             dst = os.path.join(override_dir, name)
             if name in patched_files:
                 continue
