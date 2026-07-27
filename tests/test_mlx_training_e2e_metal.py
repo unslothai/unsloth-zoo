@@ -451,17 +451,24 @@ def test_full_finetuning_reload_keeps_base_trainable(tmp_path):
 
 
 @metal_only
-def test_resume_from_adapter_dir_names_warm_start(tmp_path):
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_resume_from_adapter_dir_names_warm_start(tmp_path, prefetch):
     base = _tiny_base(tmp_path / "base")
     adapter = _save_lora_adapter(base, tmp_path / "adapter")
 
     model, tok = FastMLXModel.from_pretrained(
         str(adapter), load_in_4bit=False, max_seq_length=64,
     )
+    # Single-process streaming prefetch reads resume state early, before the
+    # main resume block; that read must not pre-empt the completeness check
+    # with a raw FileNotFoundError for trainer_state.json.
+    extra = (
+        dict(streaming=True, streaming_prefetch_batches=2) if prefetch else {}
+    )
     cfg = MLXTrainingConfig(
         output_dir=str(tmp_path / "out"), per_device_train_batch_size=2,
         max_steps=2, learning_rate=1e-3, compile=False, use_cce=False,
-        report_to="none",
+        report_to="none", **extra,
     )
     trainer = MLXTrainer(
         model=model, tokenizer=tok,
@@ -471,3 +478,40 @@ def test_resume_from_adapter_dir_names_warm_start(tmp_path):
     # rather than silently restarting.
     with pytest.raises(RuntimeError, match="from_pretrained"):
         trainer.train(resume_from_checkpoint=str(adapter))
+
+
+@metal_only
+def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
+    from unsloth_zoo.mlx.utils import save_trainable_adapters
+
+    base = _tiny_base(tmp_path / "base")
+    model, _ = FastMLXModel.from_pretrained(
+        str(base), load_in_4bit=False, max_seq_length=64,
+    )
+    model = FastMLXModel.get_peft_model(
+        model, r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"],
+    )
+    # Non-adapter tensors a user legitimately trains alongside LoRA.
+    aux = set()
+    modules = dict(model.named_modules())
+    for path in ("model.embed_tokens", "lm_head", "model.norm"):
+        modules[path].unfreeze(recurse=True)
+        aux.update(
+            f"{path}.{name}" for name, _ in tree_flatten(modules[path].parameters())
+        )
+    assert aux <= _trainable_names(model)
+
+    adapter = tmp_path / "adapter"
+    save_trainable_adapters(model, str(adapter))
+    saved = set(mx.load(str(adapter / "adapters.safetensors")).keys())
+    assert aux <= saved
+
+    reloaded, _ = FastMLXModel.from_pretrained(
+        str(adapter), load_in_4bit=False, max_seq_length=64,
+    )
+    trainable = _trainable_names(reloaded)
+    # The base freeze must not silently drop the saved auxiliary trainables.
+    assert aux <= trainable, sorted(aux - trainable)
+    assert _adapter_keys(reloaded) <= trainable
+    # Still a warm start, not a full finetune: nothing beyond adapters + aux.
+    assert trainable == _adapter_keys(reloaded) | aux

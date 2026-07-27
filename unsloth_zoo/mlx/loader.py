@@ -5749,9 +5749,6 @@ class FastMLXModel:
                                 f"({_missing_before_load[:5]!r})."
                             )
                         model.load_weights(adapter_weights_file, strict=False)
-                        _unfreeze_saved_mlx_non_adapter_parameters(
-                            model, adapter_weights_file,
-                        )
                     else:
                         from mlx_lm.tuner.utils import load_adapters
 
@@ -5792,6 +5789,14 @@ class FastMLXModel:
                             for _lora_name, _lora_module in _lora_modules:
                                 if type(_lora_module).__name__.startswith("DoRA"):
                                     _lora_module.unfreeze(keys=["m"], recurse=False)
+                    # After the freeze above, never before it: an adapter written
+                    # by save_trainable_adapters also carries non-adapter
+                    # trainables (embeddings, head, projector, biases, norms), and
+                    # restoring them earlier would be undone by that freeze.
+                    if os.path.exists(adapter_weights_file):
+                        _unfreeze_saved_mlx_non_adapter_parameters(
+                            model, adapter_weights_file,
+                        )
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)
                     is_vlm_model = bool(getattr(model, "_is_vlm_model", False))
