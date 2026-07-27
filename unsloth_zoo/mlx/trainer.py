@@ -2572,6 +2572,33 @@ class MLXTrainer:
         for callback, mode in suppressed:
             callback._log_model = mode
 
+    def _suppress_torch_only_wandb_watch(self):
+        """Neutralize WANDB_WATCH for one on_train_begin dispatch.
+
+        WandbCallback.setup calls wandb.watch(model, ...) when WANDB_WATCH is
+        gradients/parameters/all, and wandb.watch raises TypeError("Expected a
+        pytorch model (torch.nn.Module)") on an mlx Module, so the opt-in aborts
+        training during callback setup. Upstream reads the environment variable
+        directly, so this is the lever that does not monkeypatch wandb. Returns
+        the previous value for _restore_wandb_watch, or None when there is
+        nothing to suppress.
+        """
+        previous = os.environ.get("WANDB_WATCH", "false")
+        if previous not in ("all", "parameters", "gradients"):
+            return None
+        if not any(
+            "WandbCallback" in {base.__name__ for base in type(callback).__mro__}
+            for callback in getattr(self.callback_handler, "callbacks", ())
+        ):
+            return None
+        os.environ["WANDB_WATCH"] = "false"
+        return previous
+
+    def _restore_wandb_watch(self, previous):
+        """Undo _suppress_torch_only_wandb_watch."""
+        if previous is not None:
+            os.environ["WANDB_WATCH"] = previous
+
     def _ensure_callback_args_compat(self):
         """Populate TrainingArguments-style fields read by common callbacks."""
         args = self.args
@@ -2881,10 +2908,15 @@ class MLXTrainer:
         is_main_process = self.is_main_process
         self.state = _MLXTrainerState(
             global_step=int(resume_step),
-            # The checkpoint's epoch on resume (None on a fresh run), so the
-            # lifecycle events dispatched before the loop rebuilds epoch
-            # progress carry the same value HF restores from trainer_state.json.
-            epoch=getattr(self, "_resume_epoch", None),
+            # The checkpoint's epoch on resume, so the lifecycle events
+            # dispatched before the loop rebuilds epoch progress carry the same
+            # value HF restores from trainer_state.json. A fresh run starts at
+            # 0.0, TrainerState's own default: leaving it None meant a run
+            # cancelled before the loop (an on_train_begin stop, or an external
+            # stop already pending) dispatched on_train_end with epoch=None, and
+            # stock callbacks read it as a number -- NotebookProgressCallback
+            # does int(state.epoch) there.
+            epoch=getattr(self, "_resume_epoch", None) or 0.0,
             max_steps=int(total_steps),
             logging_steps=_resolve_interval_steps(
                 getattr(args, "logging_steps", 0), total_steps,
@@ -5505,7 +5537,16 @@ class MLXTrainer:
 
         self.callback_handler.train_dataloader = batches if batches is not None else batch_iter
         self.control.should_training_stop = False
-        _fire("on_train_begin")
+        _watch_mode = self._suppress_torch_only_wandb_watch()
+        if _watch_mode:
+            _main_print(
+                f"Unsloth: WANDB_WATCH={_watch_mode} needs a Torch module, so "
+                "gradient/parameter watching is off for this MLX run."
+            )
+        try:
+            _fire("on_train_begin")
+        finally:
+            self._restore_wandb_watch(_watch_mode)
         _sync_stop()
 
         features = []
@@ -6072,6 +6113,16 @@ class MLXTrainer:
                 else 0
             ) > 0
             if checkpoint_written_any:
+                # HF's _save_checkpoint records the best checkpoint's path on
+                # every save, so on_save and on_train_end callbacks can find it.
+                # Without this the field stayed None for the whole run whenever
+                # best tracking is callback-side rather than native, and no
+                # integration could locate a checkpoint that was on disk.
+                _best_step = self.state.best_global_step
+                if _best_step:
+                    _best_dir = f"{args.output_dir}/checkpoint-{int(_best_step)}"
+                    if os.path.isdir(_best_dir):
+                        self.state.best_model_checkpoint = _best_dir
                 _fire("on_save")
 
         def _run_callback_control_actions(current_step, grad_norm):

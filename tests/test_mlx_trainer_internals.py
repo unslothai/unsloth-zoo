@@ -4429,6 +4429,136 @@ def test_wandb_artifact_mode_suppressed_for_on_train_end():
     assert 'finally:\n            self._restore_final_artifact_modes(' in source
 
 
+def test_wandb_watch_is_neutralized_for_the_on_train_begin_dispatch():
+    # transformers' WandbCallback.setup runs on the first on_train_begin and,
+    # when WANDB_WATCH is gradients/parameters/all, calls wandb.watch(model),
+    # which raises TypeError("Expected a pytorch model (torch.nn.Module)") on an
+    # mlx Module. The opt-in therefore aborts training during callback setup.
+    # Upstream reads the environment variable, so that is the lever.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLXCallbackHandler,
+    )
+
+    class WandbCallback:  # the class NAME is what the bridge matches on
+        def __init__(self):
+            self.saw = "unset"
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.saw = os.environ.get("WANDB_WATCH")
+
+    def _trainer(callbacks):
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = MLXTrainingConfig(max_steps=1)
+        trainer.callback_handler = _MLXCallbackHandler(
+            callbacks, model=object(), processing_class=None,
+            optimizer=None, lr_scheduler=None,
+        )
+        return trainer
+
+    previous = os.environ.get("WANDB_WATCH")
+    try:
+        os.environ["WANDB_WATCH"] = "gradients"
+        wandb_cb = WandbCallback()
+        trainer = _trainer([wandb_cb])
+        mode = trainer._suppress_torch_only_wandb_watch()
+        assert mode == "gradients"
+        trainer.callback_handler.call_event(
+            "on_train_begin", trainer.args, object(), object(),
+        )
+        assert wandb_cb.saw == "false"
+        trainer._restore_wandb_watch(mode)
+        assert os.environ["WANDB_WATCH"] == "gradients"
+
+        # No WandbCallback in the handler: the environment is left alone.
+        assert _trainer([object()])._suppress_torch_only_wandb_watch() is None
+        assert os.environ["WANDB_WATCH"] == "gradients"
+
+        # An opt-out is not something to suppress.
+        os.environ["WANDB_WATCH"] = "false"
+        assert _trainer([WandbCallback()])._suppress_torch_only_wandb_watch() is None
+    finally:
+        if previous is None:
+            os.environ.pop("WANDB_WATCH", None)
+        else:
+            os.environ["WANDB_WATCH"] = previous
+
+    # The loop wires it around the real dispatch, restoring even if a callback
+    # raises.
+    source = inspect.getsource(MLXTrainer._train_inner)
+    assert "_suppress_torch_only_wandb_watch()" in source
+    assert "finally:\n            self._restore_wandb_watch(" in source
+
+
+def test_pre_loop_stop_still_reports_a_numeric_epoch(monkeypatch):
+    # A callback that stops the run from on_train_begin exits before the loop
+    # sets state.epoch. HF's TrainerState defaults it to 0, and stock callbacks
+    # rely on that: NotebookProgressCallback.on_train_end does int(state.epoch),
+    # so a zero-step cancellation raised TypeError instead of returning.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class _StopAtBegin:
+        def __init__(self):
+            self.epochs = []
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            control.should_training_stop = True
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            self.epochs.append(int(state.epoch))
+            return control
+
+    spy = _StopAtBegin()
+    trainer, _batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=4, grad_accum=2, epochs=1,
+        callbacks=[spy],
+    )
+    trainer.train()
+
+    assert trainer._global_step == 0
+    assert spy.epochs == [0]
+
+
+def test_best_checkpoint_path_is_recorded_for_callbacks(monkeypatch):
+    # HF's _save_checkpoint records checkpoint-<best_global_step> on state so
+    # on_save and on_train_end callbacks can find the best checkpoint. Ours left
+    # the field None for the whole run whenever best tracking is callback-side,
+    # so integrations could not locate a directory that was on disk.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class _SaveSpy:
+        def __init__(self):
+            self.paths = []
+
+        def on_step_end(self, args, state, control, **kwargs):
+            # Stands in for an improving evaluation: HF's _determine_best_metric
+            # advances best_global_step and nothing else.
+            state.best_global_step = state.best_global_step or state.global_step
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            self.paths.append(state.best_model_checkpoint)
+            return control
+
+    spy = _SaveSpy()
+    out_dir = tempfile.mkdtemp()
+    trainer, _batches = _epoch_flush_loop_trainer(
+        out_dir, microbatches_per_epoch=4, grad_accum=2, epochs=1, save_steps=1,
+        callbacks=[spy],
+    )
+    trainer.train()
+
+    expected = os.path.join(out_dir, "checkpoint-1")
+    assert os.path.isdir(expected)
+    # Visible to on_save at the time it fires, not only afterwards.
+    assert spy.paths[-1] == expected
+    assert trainer.state.best_model_checkpoint == expected
+
+
 def _tiny_lm_for_loop_tests():
     """Minimal MLX module the training loop can run end to end."""
     import mlx.nn as nn
@@ -4755,9 +4885,11 @@ def test_checkpoint_epoch_reaches_resumed_lifecycle_events(monkeypatch):
     assert noop.end == [pytest.approx(1.0)], noop.end
 
     # Reusing that trainer for a fresh train() must not serve the checkpoint's
-    # epoch: HF only reads trainer_state.json when resume_from_checkpoint is given.
+    # epoch: HF only reads trainer_state.json when resume_from_checkpoint is
+    # given. It opens at TrainerState's own default instead, not None, so a run
+    # cancelled before the loop still hands callbacks a number.
     reused.train()
-    assert noop.begin[1] is None, noop.begin
+    assert noop.begin[1] == pytest.approx(0.0), noop.begin
 
 
 def _periodic_log_steps(state):
